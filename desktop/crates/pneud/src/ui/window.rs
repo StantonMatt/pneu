@@ -17,7 +17,8 @@ slint::slint! {
     export component PneuWindow inherits Window {
         title: "Pneu";
         icon: @image-url("../../../../assets/pneu.svg");
-        min-width: 400px; max-width: 400px;
+        private property <length> window-width: root.paired ? 400px : max(400px, root.qr.width * 1px + 36px);
+        min-width: window-width; max-width: window-width;
         min-height: layout.preferred-height; max-height: layout.preferred-height;
         background: Palette.background;
         in property <bool> paired;
@@ -71,18 +72,18 @@ slint::slint! {
                 spacing: 12px;
                 if root.network && root.pairing == "": HorizontalLayout {
                     Rectangle { horizontal-stretch: 1; }
-                    Rectangle { width: 232px; height: 232px; border-radius: 6px; background: white; clip: true;
-                        Image { source: root.qr; width: 232px; height: 232px; image-rendering: pixelated; }
+                    Rectangle { width: root.qr.width * 1px; height: root.qr.height * 1px; border-radius: 6px; background: white; clip: true;
+                        Image { source: root.qr; width: parent.width; height: parent.height; image-rendering: pixelated; }
                     }
                     Rectangle { horizontal-stretch: 1; }
                 }
                 if root.pairing != "": VerticalLayout {
-                    height: 232px; alignment: center; spacing: 12px;
+                    height: max(280px, root.qr.height * 1px); alignment: center; spacing: 12px;
                     HorizontalLayout { alignment: center; Spinner { width: 32px; height: 32px; } }
                     Text { text: "Pairing with " + root.pairing + "…"; color: Palette.foreground; horizontal-alignment: center; }
                 }
                 if !root.network && root.pairing == "": VerticalLayout {
-                    height: 232px; alignment: center; spacing: 12px;
+                    height: 280px; alignment: center; spacing: 12px;
                     HorizontalLayout { alignment: center; Image { source: root.network-icon; width: 48px; height: 48px; } }
                     Text { text: "Connect this PC to a network to pair"; color: Palette.foreground; horizontal-alignment: center; }
                 }
@@ -103,8 +104,8 @@ slint::slint! {
             Rectangle { height: 1px; background: Palette.border; }
             HorizontalLayout {
                 spacing: 6px;
-                Text { text: "Save to:"; color: Palette.foreground; }
-                Text { text: root.folder; color: Palette.foreground; horizontal-stretch: 1; overflow: elide; }
+                Text { text: "Save to:"; color: Palette.foreground; vertical-alignment: center; }
+                Text { text: root.folder; color: Palette.foreground; horizontal-stretch: 1; overflow: elide; vertical-alignment: center; }
                 Button { text: "Change…"; clicked => { root.choose-folder(); } }
             }
             if root.paired: Rectangle { height: 1px; background: Palette.border; }
@@ -336,17 +337,17 @@ fn render_theme_svg(svg: &str, palette: &super::palette::Colors, size: u32) -> R
 pub fn qr_pixels(uri: &str) -> Result<slint::SharedPixelBuffer<slint::Rgba8Pixel>> {
     let code = qrcode::QrCode::with_error_correction_level(uri.as_bytes(), qrcode::EcLevel::M)?;
     let modules = code.width();
-    let scale = 232 / (modules + 8);
-    anyhow::ensure!(scale > 0, "pairing QR too large");
-    let offset = (232 - modules * scale) / 2;
-    let mut image = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(232, 232);
+    let scale = 4;
+    let offset = 4 * scale;
+    let size = (modules + 8) * scale;
+    let mut image = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(size as u32, size as u32);
     image.make_mut_bytes().fill(255);
     for y in 0..modules {
         for x in 0..modules {
             if code[(x, y)] == qrcode::Color::Dark {
                 for py in offset + y * scale..offset + (y + 1) * scale {
                     for px in offset + x * scale..offset + (x + 1) * scale {
-                        let index = (py * 232 + px) * 4;
+                        let index = (py * size + px) * 4;
                         image.make_mut_bytes()[index..index + 3].fill(0);
                     }
                 }
@@ -678,11 +679,42 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn qr_has_white_quiet_zone_and_fixed_dimensions() -> Result<()> {
-        let image = qr_pixels("pneu://pair?test")?;
-        assert_eq!((image.width(), image.height()), (232, 232));
-        assert!(image.as_bytes()[..232 * 4 * 4].iter().all(|b| *b == 255));
-        assert!(image.as_bytes().contains(&0));
+    fn qr_has_four_pixel_modules_and_four_module_white_quiet_zone() -> Result<()> {
+        let invitation = pneu_proto::PairingUri {
+            version: 1,
+            name: "desktop-pc".into(),
+            fingerprint: pneu_proto::Hash::new("ab".repeat(32))?,
+            addresses: vec![
+                "100.67.144.28:47821".into(),
+                "192.168.1.20:47821".into(),
+                "10.20.0.10:47821".into(),
+            ],
+            token: pneu_proto::Hash::new("cd".repeat(32))?,
+            expires_at: 1_800_000_000_000,
+        };
+        for uri in ["pneu://pair?test".into(), invitation.build()?] {
+            let code =
+                qrcode::QrCode::with_error_correction_level(uri.as_bytes(), qrcode::EcLevel::M)?;
+            let image = qr_pixels(&uri)?;
+            let size = (code.width() + 8) * 4;
+            assert_eq!((image.width(), image.height()), (size as u32, size as u32));
+            for y in 0..size {
+                for x in 0..size {
+                    let in_code = (16..size - 16).contains(&x) && (16..size - 16).contains(&y);
+                    let dark = in_code && code[((x - 16) / 4, (y - 16) / 4)] == qrcode::Color::Dark;
+                    let index = (y * size + x) * 4;
+                    let rgb = if dark { 0 } else { 255 };
+                    assert_eq!(&image.as_bytes()[index..index + 4], &[rgb, rgb, rgb, 255]);
+                }
+            }
+            if uri.starts_with("pneu://pair?v=") {
+                assert!(
+                    (260..=292).contains(&size),
+                    "typical pairing QR is {size}px"
+                );
+                assert!(size + 36 <= 400, "QR must fit within the window padding");
+            }
+        }
         Ok(())
     }
     #[test]

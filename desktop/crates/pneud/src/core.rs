@@ -916,7 +916,7 @@ impl Core {
         });
     }
     pub async fn start_pairing(&self) -> Result<PairingUri> {
-        let addresses: Vec<String> = crate::discovery::candidates()?
+        let addresses: Vec<String> = crate::discovery::pairing_candidates()?
             .into_iter()
             .map(|i| SocketAddr::new(i.ip, self.bound_port()).to_string())
             .collect();
@@ -932,7 +932,7 @@ impl Core {
         if let Some(uri) = self.pairing_status().1 {
             return Ok(uri);
         }
-        let addresses = crate::discovery::candidates()?
+        let addresses = crate::discovery::pairing_candidates()?
             .into_iter()
             .map(|i| SocketAddr::new(i.ip, self.bound_port()).to_string())
             .collect();

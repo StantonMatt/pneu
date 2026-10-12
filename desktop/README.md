@@ -22,11 +22,19 @@ expiry in UTC milliseconds, and a terminal QR. Treat the URI as a secret; the
 service never logs it. An invitation expires after five minutes. Reuse, TLS admission
 and pairing completion share one predicate: both wall-clock and monotonic expiry
 must remain in the future. `pneud
-close-pairing` also invalidates it. The QR includes actual interface addresses,
-prioritized as Tailscale IPv4, default-route interfaces, then other physical LAN
-interfaces before the eight-address limit. Docker/bridge/veth/virbr, loopback and
-link-local addresses are excluded. mDNS advertises the same shortlist and refreshes
-on network changes within a minute; DNS address records themselves are unordered.
+close-pairing` also invalidates it. The CLI and window share a pairing invitation
+with at most three interface addresses, selected in three rounds:
+
+1. One best address per eligible interface: IPv4 if present, otherwise IPv6 with
+   global, non-temporary addresses preferred. Interfaces are ordered Tailscale
+   IPv4, default-route, then other physical LAN interfaces.
+2. Each dual-stack interface's best global, non-temporary IPv6 address, in the
+   same interface order.
+3. Remaining aliases, until the three-address limit is reached.
+
+Docker/bridge/veth/virbr, loopback and link-local addresses are excluded. mDNS
+advertises every eligible address and refreshes on network changes within a
+minute; DNS address records themselves are unordered.
 Discovery failures are reported and retried without stopping the TCP daemon; an
 empty candidate list fails the pairing command. Addresses never establish trust.
 

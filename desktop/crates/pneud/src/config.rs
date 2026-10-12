@@ -61,7 +61,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            name: "Pneu PC".into(),
+            name: machine_hostname(),
             save_to_folder: true,
             save_path: PathBuf::from(env::var_os("HOME").unwrap_or_else(|| ".".into()))
                 .join("Pictures/Pneu"),
@@ -98,7 +98,7 @@ impl Config {
             );
             ensure!(fs::metadata(path)?.len() <= 65536, "config is too large");
         }
-        let config = if path.exists() {
+        let mut config: Self = if path.exists() {
             toml::from_str(std::str::from_utf8(&crate::storage::read_bounded(
                 path, 65536,
             )?)?)?
@@ -108,6 +108,10 @@ impl Config {
             c
         };
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        if config.name == "Pneu PC" {
+            config.name = machine_hostname();
+            config.save(path)?;
+        }
         config.validate()?;
         Ok(config)
     }
@@ -115,6 +119,12 @@ impl Config {
         self.validate()?;
         atomic_private(path, toml::to_string_pretty(self)?.as_bytes())
     }
+}
+fn machine_hostname() -> String {
+    rustix::system::uname()
+        .nodename()
+        .to_string_lossy()
+        .into_owned()
 }
 pub fn private_dir(path: &Path) -> Result<()> {
     let folder = crate::storage::Folder::open_private(path)?;
@@ -169,6 +179,53 @@ pub fn sync_parent(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn default_name_is_the_machine_hostname() -> Result<()> {
+        let hostname = machine_hostname();
+        assert_eq!(Config::default().name, hostname);
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.toml");
+        assert_eq!(Config::load(&path)?.name, hostname);
+        fs::write(&path, "port = 47822\n")?;
+        assert_eq!(Config::load(&path)?.name, hostname);
+        Ok(())
+    }
+    #[test]
+    fn legacy_name_is_migrated_and_saved_without_changing_preferences() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.toml");
+        let legacy = Config {
+            name: "Pneu PC".into(),
+            notification_preview: false,
+            save_path: dir.path().join("pictures"),
+            port: 47822,
+            ..Config::default()
+        };
+        legacy.save(&path)?;
+        let loaded = Config::load(&path)?;
+        assert_eq!(loaded.name, machine_hostname());
+        assert!(!loaded.notification_preview);
+        assert_eq!(loaded.save_path, legacy.save_path);
+        assert_eq!(loaded.port, legacy.port);
+        let saved: Config = toml::from_str(&fs::read_to_string(&path)?)?;
+        assert_eq!(saved.name, loaded.name);
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        Ok(())
+    }
+    #[test]
+    fn custom_name_is_preserved_on_load() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.toml");
+        let custom = Config {
+            name: "My Pneu PC".into(),
+            ..Config::default()
+        };
+        custom.save(&path)?;
+        let before = fs::read(&path)?;
+        assert_eq!(Config::load(&path)?.name, custom.name);
+        assert_eq!(fs::read(&path)?, before);
+        Ok(())
+    }
     #[test]
     fn failed_atomic_write_cleans_its_temporary_file_and_preserves_destination() -> Result<()> {
         let dir = tempfile::tempdir()?;
