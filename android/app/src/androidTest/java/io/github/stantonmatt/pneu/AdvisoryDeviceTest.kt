@@ -189,7 +189,11 @@ class AdvisoryDeviceTest {
         seed();app.preferences.toggle("originals",false)
         val failed=Outgoing().apply {mediaId=randomId();transferId=randomId();kind="photo";automatic=true;attempted=true;state="failed";error="id_conflict";nextAttempt=Long.MAX_VALUE}
         assertTrue(app.enqueueFixture(failed));app.connection.state.value=io.github.stantonmatt.pneu.connection.LinkState(cellular=true)
-        launch();assertTrue(device.findObject(UiSelector().text("Failed · id conflict")).waitForExists(4000))
+        launch();assertTrue(device.findObject(UiSelector().text("Failed")).waitForExists(4000))
+        assertTrue(device.findObject(UiSelector().description("Retry")).exists())
+        assertTrue(device.findObject(UiSelector().description("Remove")).exists())
+        val retained=app.queue.find(failed.mediaId)!!
+        assertEquals("failed",retained.state);assertEquals("id_conflict",retained.error);assertEquals(Long.MAX_VALUE,retained.nextAttempt)
     }
     @Test(timeout=45000) fun blockedStatusChannelOpensChannelSettingsImmediately()=runBlocking {
         val nm=context.getSystemService(NotificationManager::class.java);nm.deleteNotificationChannel("status");nm.createNotificationChannel(NotificationChannel("status","Status",NotificationManager.IMPORTANCE_NONE))

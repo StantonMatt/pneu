@@ -47,23 +47,23 @@ class FifthReviewUiDeviceTest {
             withTimeout(4000) {while(failedPauses.get()<2)delay(20)};assertFalse(app.preferences.flow.first().paused);device.pressBack()
             app.preferences.beforeMutation={if(it=="forget")throw GeneralSecurityException("Synthetic Keystore preparation failure")}
             UiScrollable(UiSelector().scrollable(true)).scrollTextIntoView("Unpair");click("Unpair");click("Unpair")
-            assertTrue(visible("Couldn't finish unpairing. Try again."));assertEquals(before.peer,app.preferences.flow.first().peer);assertEquals(before.deviceId,app.preferences.flow.first().deviceId);screen("unpair-write-failed")
+            assertTrue(visible("Couldn't unpair"));assertEquals(before.peer,app.preferences.flow.first().peer);assertEquals(before.deviceId,app.preferences.flow.first().deviceId);screen("unpair-write-failed")
             click("Close");assertTrue(visible("Trusted PC"))
             app.preferences.beforeMutation={if(it=="shareSheet")throw IOException("Synthetic setting write failure")}
             UiScrollable(UiSelector().scrollable(true)).scrollTextIntoView("Show in share sheet");val original=app.preferences.flow.first().shareSheet
-            click("Show in share sheet");assertTrue(visible("Couldn't save setting. Try again."));assertEquals(original,app.preferences.flow.first().shareSheet)
+            click("Show in share sheet");assertTrue(visible("Couldn't save setting"));assertEquals(original,app.preferences.flow.first().shareSheet)
             app.preferences.beforeMutation={};click("Try again");withTimeout(5000) {app.prefs.first {it.shareSheet!=original}}
             // Failed replacement retains the same approved URI and existing binding.
             app.preferences.beforeMutation={if(it=="pending")throw IOException("Synthetic pairing write failure")}
             val replacement=raw.replace("Trusted%20PC","New%20PC").replace("a".repeat(64),"c".repeat(64))
             c.startActivity(Intent(Intent.ACTION_VIEW,Uri.parse(replacement),c,MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
-            click("Replace");assertTrue(visible("Couldn't start pairing. Try again."));assertEquals(before.peer,app.preferences.flow.first().peer);assertNull(app.preferences.flow.first().pending);screen("pair-write-failed")
+            click("Replace");assertTrue(visible("Couldn't start pairing"));assertEquals(before.peer,app.preferences.flow.first().peer);assertNull(app.preferences.flow.first().pending);screen("pair-write-failed")
             app.preferences.beforeMutation={};click("Try again");assertTrue(visible("Replace Trusted PC with New PC?"));click("Cancel")
             // Partial durable revocation: failed cleanup must show the actual unpaired state.
             c.startActivity(Intent(c,MainActivity::class.java).putExtra("home",true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK));assertTrue(device.findObject(UiSelector().description("Settings")).waitForExists(5000));device.findObject(UiSelector().description("Settings")).click()
             app.queue.insert(io.github.stantonmatt.pneu.data.Outgoing().apply {mediaId=randomId();transferId=randomId()})
             val db=app.database.openHelper.writableDatabase;db.execSQL("CREATE TRIGGER fail_cleanup BEFORE DELETE ON outgoing BEGIN SELECT RAISE(ABORT,'Synthetic cleanup failure'); END")
-            UiScrollable(UiSelector().scrollable(true)).scrollTextIntoView("Unpair");click("Unpair");click("Unpair");assertTrue(visible("Couldn't finish unpairing. Try again."));assertNull(app.preferences.flow.first().peer);assertTrue(app.preferences.flow.first().deliveryReset);screen("unpair-cleanup-failed")
+            UiScrollable(UiSelector().scrollable(true)).scrollTextIntoView("Unpair");click("Unpair");click("Unpair");assertTrue(visible("Couldn't unpair"));assertNull(app.preferences.flow.first().peer);assertTrue(app.preferences.flow.first().deliveryReset);screen("unpair-cleanup-failed")
             db.execSQL("DROP TRIGGER fail_cleanup")
             // The foreground service stops on local unpair; explicitly own a
             // background recovery loop to coordinate cleanup before this retry.

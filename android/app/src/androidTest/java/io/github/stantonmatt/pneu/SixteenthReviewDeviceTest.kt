@@ -51,7 +51,7 @@ class SixteenthReviewDeviceTest {
         assertTrue(device.findObject(UiSelector().text("Pair with Ready PC?")).waitForExists(5000))
         val original=app.preferences.read();app.preferences.setString("deviceId",randomId());withTimeout(3000) {app.prefs.first {it.deviceId!=original.deviceId}}
         device.findObject(UiSelector().text("Pair")).click()
-        assertTrue(device.findObject(UiSelector().text("Couldn't start pairing. Try again.")).waitForExists(5000));assertNull(app.preferences.read().pending)
+        assertTrue(device.findObject(UiSelector().text("Couldn't start pairing")).waitForExists(5000));assertNull(app.preferences.read().pending)
     }
     @Test(timeout=15000) fun interruptedOptimizationReusesExactPublishedSnapshot()=runBlocking<Unit> {
         val row=item(1).apply {kind="photo";mime="image/png";fileName="fixture.png"}

@@ -46,7 +46,7 @@ class FifteenthReviewDeviceTest {
         UiScrollable(UiSelector().scrollable(true)).scrollTextIntoView("Unpair");click("Unpair");assertTrue(visible("Unpair from Original?"))
         bind("Replacement",'c');val row=item();val replacement=app.preferences.read();delay(200)
         assertTrue(visible("Unpair from Original?"));click("Unpair")
-        assertTrue(visible("Couldn't finish unpairing. Try again."));assertEquals(replacement.peer,app.preferences.read().peer);assertEquals(replacement.deviceId,app.preferences.read().deviceId);assertNotNull(app.queue.find(row.mediaId));assertTrue(File(row.path).exists())
+        assertTrue(visible("Couldn't unpair"));assertEquals(replacement.peer,app.preferences.read().peer);assertEquals(replacement.deviceId,app.preferences.read().deviceId);assertNotNull(app.queue.find(row.mediaId));assertTrue(File(row.path).exists())
         assertTrue(c.getSystemService(android.app.NotificationManager::class.java).activeNotifications.any {it.id==1})
         click("Try again");assertTrue(visible("Unpair from Replacement?"));click("Cancel")
     }
@@ -75,7 +75,7 @@ class FifteenthReviewDeviceTest {
         c.startActivity(Intent(Intent.ACTION_VIEW,Uri.parse(proposed),c,MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
         assertTrue(visible("Replace Original with Proposed?"));bind("Replacement",'a');val replacement=app.preferences.read();delay(200)
         assertTrue(visible("Replace Original with Proposed?"));click("Replace")
-        assertTrue(visible("Couldn't start pairing. Try again."));assertNull(app.preferences.read().pending);assertEquals(replacement.peer,app.preferences.read().peer)
+        assertTrue(visible("Couldn't start pairing"));assertNull(app.preferences.read().pending);assertEquals(replacement.peer,app.preferences.read().peer)
         click("Try again");assertTrue(visible("Replace Replacement with Proposed?"));click("Cancel")
     }
     @Test(timeout=15000) fun queueActionsNeverExpandTheirSelectionOrRemoveNewerRows()=runBlocking<Unit> {

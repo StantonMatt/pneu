@@ -67,7 +67,7 @@ class FourteenthReviewDeviceTest {
             UiScrollable(UiSelector().scrollable(true)).scrollTextIntoView("Unpair");click("Unpair");click("Unpair")
             withTimeout(5000) {entered.await()};bind("Replacement",'c');val row=image();val replacement=app.preferences.read()
             app.connection.beforeUnpairRemoval={};release.complete(Unit)
-            assertTrue(visible("Couldn't finish unpairing. Try again."));click("Close");assertTrue(visible("Replacement"))
+            assertTrue(visible("Couldn't unpair"));click("Close");assertTrue(visible("Replacement"))
             assertEquals(replacement.peer,app.preferences.read().peer);assertNotNull(app.queue.find(row.mediaId));assertTrue(File(row.path).exists())
             assertTrue("Foreground service retained",c.getSystemService(android.app.NotificationManager::class.java).activeNotifications.any {it.id==1})
         }finally {release.complete(Unit)}

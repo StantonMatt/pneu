@@ -17,6 +17,7 @@ import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -125,7 +126,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
     LaunchedEffect(refresh,p.recordings,p.neverSleeping) { health=context.health() }
     LaunchedEffect(p.setup,p.deviceId) { if(screen == null && p.deviceId.isNotEmpty()) screen=if(!p.setup) "setup" else if(p.peer == null && !p.pairingLost) "pair" else "home" }
     LaunchedEffect(requested) { requested?.let { screen=it; consume() } }
-    LaunchedEffect(p.peer,p.pending,p.pairingLost) { if(!p.pairingLost && (p.pending != null || (p.peer != null && screen != "pair"))) actions.run("Couldn't start connection. Open Pneu and try again.") {PneuService.start(context)}
+    LaunchedEffect(p.peer,p.pending,p.pairingLost) { if(!p.pairingLost && (p.pending != null || (p.peer != null && screen != "pair"))) actions.run("Couldn't start connection") {PneuService.start(context)}
         if(p.peer == null && !p.pairingLost && p.setup && screen == "home") screen="pair" }
     BackHandler(enabled=screen in listOf("settings","permissions") || (screen=="pair" && p.peer != null)) { screen=if(screen=="permissions") permissionOrigin else "home" }
     CompositionLocalProvider(LocalUiActions provides actions) {
@@ -134,7 +135,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
         Surface(Modifier.fillMaxSize(),color=background) {
             when(screen) {
                 "setup","permissions" -> SetupScreen(screen=="setup",health,refresh,{ screen=permissionOrigin },{health=context.health()}) {
-                    scope.launch {if(actions.run("Couldn't save setup. Try again.") {app.preferences.toggle("setup",true)})screen="pair"}
+                    scope.launch {if(actions.run("Couldn't save setup") {app.preferences.toggle("setup",true)})screen="pair"}
                 }
                 "pair" -> PairScreen(p,link,{ screen="home" },{ if(p.peer != null) screen="home" else (context as Activity).finish() },{offerPair(it)},lastAttemptedInvitation=lastAttemptedInvitation)
                 "home" -> Scaffold(containerColor=background,topBar={ TopAppBar(title={Text("Pneu")},actions={ IconButton(onClick={screen="settings"}) { Symbol(R.drawable.ic_settings,"Settings") } },colors=TopAppBarDefaults.topAppBarColors(containerColor=background)) }) { padding ->
@@ -152,14 +153,14 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
             // Both camera and deep-link confirmations use this owner. Retain before
             // starting so a rejected attempt/pending removal cannot erase Retry.
             lastAttemptedInvitation=raw
-            scope.launch {if(actions.run("Couldn't start pairing. Try again.",{confirmationAttempt++;offerPair(raw)}) {beginPair(context,raw,target)})offerPair(null)}
+            scope.launch {if(actions.run("Couldn't start pairing",{confirmationAttempt++;offerPair(raw)}) {beginPair(context,raw,target)})offerPair(null)}
         }
         fun finishApproved() {
             val approved=permissionPair ?: return
             val target=ConfirmedBinding(approved[1],approved[2].ifEmpty {null},approved[3].ifEmpty {null},approved[4].toLong(),approved[5])
             if(approved[0]!=candidate || !target.matches(p)) {
                 permissionPair=null
-                if(approved[0]==candidate)actionError="Couldn't start pairing. Try again." to {confirmationAttempt++;offerPair(approved[0])}
+                if(approved[0]==candidate)actionError="Couldn't start pairing" to {confirmationAttempt++;offerPair(approved[0])}
                 return
             }
             permissionPair=null
@@ -173,7 +174,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
             val approved=permissionPair
             if(approved!=null && (approved[0]!=candidate || approved[1]!=p.deviceId || approved[2]!=p.peer?.pin.orEmpty() || approved[3]!=p.peer?.deviceId.orEmpty() || approved[4]!=p.pairingRevision.toString())) {
                 permissionPair=null
-                if(approved[0]==candidate)actionError="Couldn't start pairing. Try again." to {confirmationAttempt++;offerPair(approved[0])}
+                if(approved[0]==candidate)actionError="Couldn't start pairing" to {confirmationAttempt++;offerPair(approved[0])}
             }
             else if(approved!=null && context.granted(Manifest.permission.ACCESS_LOCAL_NETWORK))finishApproved()
         }
@@ -181,9 +182,8 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
         LaunchedEffect(candidate) {if(candidate!=null && proposed==null) {app.connection.state.update {it.copy(pairing="That isn't a Pneu code")};offerPair(null)}}
         if(proposed!=null && pairingTarget!=null && p.deviceId.isNotEmpty())AlertDialog(onDismissRequest={offerPair(null)},
             title={Text(if(pairingTarget.pin!=null)"Replace ${pairingTarget.pcName} with ${proposed.name}?" else "Pair with ${proposed.name}?")},
-            text={Text(if(pairingTarget.pin!=null)"${proposed.name} will replace ${pairingTarget.pcName} and receive your screenshots, shared items and clipboard." else "${proposed.name} will receive your screenshots, shared items and clipboard.")},
             confirmButton={TextButton(onClick={
-                if(!pairingTarget.matches(p))actionError="Couldn't start pairing. Try again." to {confirmationAttempt++;offerPair(candidate)}
+                if(!pairingTarget.matches(p))actionError="Couldn't start pairing" to {confirmationAttempt++;offerPair(candidate)}
                 else if(Build.VERSION.SDK_INT>=37 && !context.granted(Manifest.permission.ACCESS_LOCAL_NETWORK)) {
                     permissionPair=listOf(candidate!!,pairingTarget.phoneId,pairingTarget.pin.orEmpty(),pairingTarget.pcId.orEmpty(),pairingTarget.revision.toString(),pairingTarget.pcName)
                     if(networkSettings)PermissionRequests.openSettings(context)
@@ -193,13 +193,12 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
             }) {Text(if(networkSettings)"Open settings" else if(pairingTarget.pin!=null)"Replace" else "Pair")}},dismissButton={TextButton(onClick={offerPair(null)}) {Text("Cancel")}})
         unpair?.let {confirmed->AlertDialog(onDismissRequest={unpair=null},title={Text(if(confirmed.pin!=null)"Unpair from ${confirmed.pcName}?" else "Finish unpairing?")},
             text=if(waiting>0) ({Text(context.resources.getQuantityString(R.plurals.unpair_text,waiting,waiting))}) else null,
-            confirmButton={TextButton(onClick={unpair=null;scope.launch {actions.run("Couldn't finish unpairing. Try again.",{unpair=ConfirmedBinding.from(app.prefs.value)}) {
+            confirmButton={TextButton(onClick={unpair=null;scope.launch {actions.run("Couldn't unpair",{unpair=ConfirmedBinding.from(app.prefs.value)}) {
                 check(app.connection.unpair(confirmed)) {"Binding changed during unpair"}
                 context.stopService(Intent(context,PneuService::class.java));screen="pair"
             }}}) {Text("Unpair")}},
             dismissButton={TextButton(onClick={unpair=null}) {Text("Cancel")}})}
         actionError?.let {error->AlertDialog(onDismissRequest={actionError=null},title={Text(error.first)},
-            text={Text("Check phone storage or reopen Pneu, then try again. Your saved settings are still shown.")},
             confirmButton={TextButton(onClick={actionError=null;error.second?.invoke()}) {Text(if(error.second!=null)"Try again" else "Close")}},
             dismissButton=if(error.second!=null)({TextButton(onClick={actionError=null}) {Text("Close")}}) else null)}
     }
@@ -224,16 +223,13 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
         PermissionRequests.mark(context,*names)
         permissions.launch(arrayOf(*names))
     }
-    LaunchedEffect(refresh) { if(returnedFromSleeping && actions.run("Couldn't save battery settings. Try again.") {withContext(Dispatchers.IO) {ServiceEvidence.acknowledge(context)};context.graph.preferences.toggle("neverSleeping",true)}) {returnedFromSleeping=false;recheck++;repair()} }
+    LaunchedEffect(refresh) { if(returnedFromSleeping && actions.run("Couldn't save battery settings") {withContext(Dispatchers.IO) {ServiceEvidence.acknowledge(context)};context.graph.preferences.toggle("neverSleeping",true)}) {returnedFromSleeping=false;recheck++;repair()} }
     Scaffold(containerColor=Color.Transparent,topBar={LargeTopAppBar(title={Text(if(first) "Set up Pneu" else "Permissions and battery")},navigationIcon={if(!first) NavIcon(back)},colors=TopAppBarDefaults.topAppBarColors(containerColor=Color.Transparent))},bottomBar={if(first) Box(Modifier.navigationBarsPadding().padding(16.dp)) { Button(next,Modifier.fillMaxWidth().height(56.dp)) {Text("Continue")} }}) { padding ->
         Column(Modifier.padding(padding).fillMaxWidth().widthIn(max=600.dp).padding(horizontal=16.dp).verticalScroll(rememberScrollState())) {
             Group {
                 val activity=context as Activity
                 if(Build.VERSION.SDK_INT>=37)PermissionRow("Local network",R.drawable.ic_computer,checked.localNetwork,if(PermissionRequests.settings(activity,Manifest.permission.ACCESS_LOCAL_NETWORK))"Settings" else "Allow") {
                     if(PermissionRequests.settings(activity,Manifest.permission.ACCESS_LOCAL_NETWORK))details() else request(Manifest.permission.ACCESS_LOCAL_NETWORK)
-                }
-                PermissionRow("Camera",R.drawable.ic_photo_camera,context.granted(Manifest.permission.CAMERA),if(PermissionRequests.settings(activity,Manifest.permission.CAMERA))"Settings" else "Allow") {
-                    if(PermissionRequests.settings(activity,Manifest.permission.CAMERA))details() else request(Manifest.permission.CAMERA)
                 }
                 val notificationSettings=checked.channelBlocked || context.granted(Manifest.permission.POST_NOTIFICATIONS) || PermissionRequests.settings(activity,Manifest.permission.POST_NOTIFICATIONS)
                 PermissionRow("Notifications",R.drawable.ic_notifications,checked.notifications,if(notificationSettings)"Settings" else "Allow") {
@@ -249,12 +245,11 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
                     if(PermissionPolicy.batterySettings(checked.backgroundRestricted))details()
                     else runCatching {context.startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,Uri.parse("package:${context.packageName}")))}.onFailure {details()}
                 }
-                if(checked.killed)PermissionRow("Background service",R.drawable.ic_bedtime_off,false,"Acknowledge","Pneu was stopped in the background") {
-                    scope.launch {if(actions.run("Couldn't acknowledge background stop. Try again.") {withContext(Dispatchers.IO) {ServiceEvidence.acknowledge(context)}}) {recheck++;repair()}}
+                if(checked.killed && !Build.MANUFACTURER.equals("samsung",true))PermissionRow("Pneu was stopped in the background",R.drawable.ic_bedtime_off,false,"Dismiss") {
+                    scope.launch {if(actions.run("Couldn't acknowledge background stop") {withContext(Dispatchers.IO) {ServiceEvidence.acknowledge(context)}}) {recheck++;repair()}}
                 }
                 if(Build.MANUFACTURER.equals("samsung",true)) PermissionRow("Never sleeping apps",R.drawable.ic_bedtime_off,checked.sleeping,"Open",if(checked.sleeping) null else "Add Pneu to the list") {
-                    val intents=listOf(Intent().setComponent(ComponentName("com.samsung.android.lool","com.samsung.android.sm.battery.ui.BatteryNeverSleepingAppsActivity")),Intent().setComponent(ComponentName("com.samsung.android.lool","com.samsung.android.sm.battery.ui.BatteryActivity")),Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,Uri.parse("package:${context.packageName}")))
-                    intents.firstOrNull { it.resolveActivity(context.packageManager)!=null }?.let { returnedFromSleeping=true;context.startActivity(it) }
+                    returnedFromSleeping=SettingsNavigation.openSamsungBattery(context.packageName,context::startActivity)
                 }
             }
         }
@@ -287,7 +282,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
     val disconnected=link.status !in listOf("Connected","Connecting…")
     val snackbar=remember { SnackbarHostState() }
     val permission=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { camera=it;cameraAsked=true }
-    LaunchedEffect(Unit) { if(!camera && !PermissionRequests.settings(context as Activity,Manifest.permission.CAMERA))actions.run("Couldn't request camera access. Try again.") {PermissionRequests.mark(context,Manifest.permission.CAMERA);permission.launch(Manifest.permission.CAMERA)} }
+    LaunchedEffect(Unit) { if(!camera && !PermissionRequests.settings(context as Activity,Manifest.permission.CAMERA))actions.run("Couldn't request camera access") {PermissionRequests.mark(context,Manifest.permission.CAMERA);permission.launch(Manifest.permission.CAMERA)} }
     val lifecycle=androidx.lifecycle.compose.LocalLifecycleOwner.current
     DisposableEffect(lifecycle) {
         val observer=androidx.lifecycle.LifecycleEventObserver { _,e -> if(e==androidx.lifecycle.Lifecycle.Event.ON_RESUME) camera=context.granted(Manifest.permission.CAMERA) }
@@ -350,7 +345,17 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
             }
             TopAppBar(title={Text("Pair with PC",color=Color.White)},navigationIcon={IconButton(onClick=back,enabled=!busy){Symbol(R.drawable.ic_arrow_back,"Back",tint=Color.White)}},colors=TopAppBarDefaults.topAppBarColors(containerColor=Color.Transparent))
             SnackbarHost(snackbar,Modifier.align(Alignment.BottomCenter).navigationBarsPadding())
-            if(dialog) AlertDialog(onDismissRequest={},title={Text("Can't reach your PC")},text={Text("Make sure both are on the same Wi-Fi, or that Tailscale is connected.")},confirmButton={TextButton(onClick={val confirmed=ConfirmedBinding.from(p);val pending=p.pending;val code=lastAttemptedInvitation ?: lastCode.takeIf(String::isNotEmpty);dialog=false;feedbackTimedOut=false;scope.launch {if(code!=null)offerPair(code) else actions.run("Couldn't retry connection. Try again.",{dialog=true}) {check(context.graph.retryConnection(confirmed,pending,feedback=pending==null)) {"Pairing changed during retry"}}}}) {Text("Try again")}},dismissButton={TextButton(onClick={val confirmed=ConfirmedBinding.from(p);val pending=p.pending;dialog=false;scope.launch {actions.run("Couldn't cancel pairing. Try again.",{dialog=true}) {check(context.graph.cancelPairing(pending,confirmed)) {"Pairing changed during cancellation"};context.graph.connection.state.update {it.copy(pairing="")};context.graph.connection.retry();if(p.peer==null) context.stopService(Intent(context,PneuService::class.java))}}}){Text("Cancel")}})
+            if(dialog) AlertDialog(onDismissRequest={},title={Text("Can't reach your PC")},text={Text("Make sure both are on the same Wi-Fi, or that Tailscale is connected.")},confirmButton={TextButton(onClick={val confirmed=ConfirmedBinding.from(p);val pending=p.pending;val code=lastAttemptedInvitation ?: lastCode.takeIf(String::isNotEmpty);dialog=false;feedbackTimedOut=false;scope.launch {if(code!=null)offerPair(code) else actions.run("Couldn't retry connection",{dialog=true}) {check(context.graph.retryConnection(confirmed,pending,feedback=pending==null)) {"Pairing changed during retry"}}}}) {Text("Try again")}},dismissButton={TextButton(onClick={val confirmed=ConfirmedBinding.from(p);val pending=p.pending;dialog=false;scope.launch {actions.run("Couldn't cancel pairing",{dialog=true}) {check(context.graph.cancelPairing(pending,confirmed)) {"Pairing changed during cancellation"};context.graph.connection.state.update {it.copy(pairing="")};context.graph.connection.retry();if(p.peer==null) context.stopService(Intent(context,PneuService::class.java))}}}){Text("Cancel")}})
+        }
+    }
+}
+
+@Composable private fun HomeBanner(text:String,action:String,click:()->Unit) {
+    Surface(shape=RoundedCornerShape(16.dp),color=MaterialTheme.colorScheme.errorContainer,modifier=Modifier.fillMaxWidth().padding(bottom=16.dp)) {
+        Row(Modifier.padding(start=16.dp,end=4.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(12.dp)) {
+            Symbol(R.drawable.ic_warning,tint=MaterialTheme.colorScheme.onErrorContainer)
+            Text(text,Modifier.weight(1f),style=MaterialTheme.typography.bodyMedium,color=MaterialTheme.colorScheme.onErrorContainer,maxLines=1,overflow=TextOverflow.Ellipsis)
+            TextButton(click) {Text(action,color=MaterialTheme.colorScheme.onErrorContainer)}
         }
     }
 }
@@ -369,26 +374,18 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
         "Connected" -> "${p.peer?.name.orEmpty()} · ${link.route}"
         "Connecting…" -> p.peer?.name.orEmpty()
         "Waiting for Wi-Fi" -> "Mobile data is off in settings"
-        else -> if(tailscaleOff) "Tailscale isn't connected" else "Last connected ${lastConnectedLabel(context,p.lastConnected)}"
+        else -> if(tailscaleOff) "Tailscale isn't connected" else if(p.lastConnected>0) "Last connected ${lastConnectedLabel(context,p.lastConnected)}" else ""
     }
     Box(modifier.fillMaxSize(),contentAlignment=Alignment.TopCenter) {
         LazyColumn(Modifier.widthIn(max=600.dp).fillMaxWidth().padding(horizontal=16.dp),contentPadding=PaddingValues(bottom=24.dp)) {
             if(p.localCapacity) item {
-                Surface(shape=RoundedCornerShape(16.dp),color=MaterialTheme.colorScheme.errorContainer,modifier=Modifier.fillMaxWidth().padding(bottom=16.dp)) {
-                    Row(Modifier.padding(16.dp),verticalAlignment=Alignment.CenterVertically) {
-                        Text("Pneu storage is full",Modifier.weight(1f),style=MaterialTheme.typography.bodyMedium)
-                        TextButton(onClick={val selected=ConfirmedQueue.from(p,app.work.value);scope.launch {actions.run("Couldn't clear queue. Try again.") {check(app.discardAll(selected)) {"Queue changed"}}}}) {Text("Clear queue")}
-                    }
+                HomeBanner("No room for more waiting items","Don't send any") {
+                    val selected=ConfirmedQueue.from(p,app.work.value)
+                    scope.launch {actions.run("Couldn't clear queue") {check(app.discardAll(selected)) {"Queue changed"}}}
                 }
             }
-            if(health.issues.isNotEmpty()) item {
-                Surface(shape=RoundedCornerShape(16.dp),color=MaterialTheme.colorScheme.errorContainer,modifier=Modifier.fillMaxWidth().padding(bottom=16.dp)) {
-                    Row(Modifier.padding(start=16.dp,end=4.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(12.dp)) {
-                        Symbol(R.drawable.ic_warning,tint=MaterialTheme.colorScheme.onErrorContainer)
-                        Text(if(health.issues.size==1) health.issues.single() else context.resources.getQuantityString(R.plurals.banner_many,health.issues.size,health.issues.size),Modifier.weight(1f),style=MaterialTheme.typography.bodyMedium,color=MaterialTheme.colorScheme.onErrorContainer,maxLines=1,overflow=TextOverflow.Ellipsis)
-                        TextButton(permissions) {Text("Fix",color=MaterialTheme.colorScheme.onErrorContainer)}
-                    }
-                }
+            else if(health.issues.isNotEmpty()) item {
+                HomeBanner(if(health.issues.size==1) health.issues.single() else context.resources.getQuantityString(R.plurals.banner_many,health.issues.size,health.issues.size),"Fix",permissions)
             }
             item {
                 Surface(shape=RoundedCornerShape(28.dp),color=groupColor(),modifier=Modifier.fillMaxWidth()) {
@@ -403,13 +400,13 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
                             }
                         }
                         Text(title,Modifier.padding(top=12.dp),style=MaterialTheme.typography.headlineSmall)
-                        Text(detail,Modifier.padding(top=4.dp),style=MaterialTheme.typography.bodyMedium,color=MaterialTheme.colorScheme.onSurfaceVariant,maxLines=2,overflow=TextOverflow.Ellipsis,textAlign=TextAlign.Center)
+                        if(detail.isNotEmpty()) Text(detail,Modifier.padding(top=4.dp),style=MaterialTheme.typography.bodyMedium,color=MaterialTheme.colorScheme.onSurfaceVariant,maxLines=2,overflow=TextOverflow.Ellipsis,textAlign=TextAlign.Center)
                         FlowRow(Modifier.fillMaxWidth().padding(top=20.dp),horizontalArrangement=Arrangement.spacedBy(8.dp),verticalArrangement=Arrangement.spacedBy(8.dp),maxItemsInEachRow=if(androidx.compose.ui.platform.LocalDensity.current.fontScale>1.3f)1 else 2) {
                             if(p.pairingLost) Button(pair,Modifier.fillMaxWidth().height(48.dp)) {Symbol(R.drawable.ic_qr_code_scanner);Spacer(Modifier.width(8.dp));Text("Pair again")}
                             else {
                                 FilledTonalButton(onClick={if(tailscaleOff) context.packageManager.getLaunchIntentForPackage("com.tailscale.ipn")?.let { context.startActivity(it) } else context.startActivity(ManualEntries.clipboardIntent(context,p))},modifier=Modifier.weight(1f).height(48.dp),enabled=link.status=="Connected" || tailscaleOff,contentPadding=PaddingValues(horizontal=12.dp)) {Symbol(if(tailscaleOff)R.drawable.ic_open_in_new else R.drawable.ic_content_paste_go);Spacer(Modifier.width(8.dp));Text(if(tailscaleOff) "Open Tailscale" else "Send clipboard")}
-                                if(p.paused) Button(onClick={scope.launch {actions.run("Couldn't resume. Try again.") {app.preferences.toggle("paused",false)}}},modifier=Modifier.weight(1f).height(48.dp)) {Symbol(R.drawable.ic_play_arrow);Spacer(Modifier.width(8.dp));Text("Resume")}
-                                else OutlinedButton(onClick={scope.launch {actions.run("Couldn't pause. Try again.") {app.preferences.toggle("paused",true)}}},modifier=Modifier.weight(1f).height(48.dp)) {Symbol(R.drawable.ic_pause);Spacer(Modifier.width(8.dp));Text("Pause")}
+                                if(p.paused) Button(onClick={scope.launch {actions.run("Couldn't resume") {app.preferences.toggle("paused",false)}}},modifier=Modifier.weight(1f).height(48.dp)) {Symbol(R.drawable.ic_play_arrow);Spacer(Modifier.width(8.dp));Text("Resume")}
+                                else OutlinedButton(onClick={scope.launch {actions.run("Couldn't pause") {app.preferences.toggle("paused",true)}}},modifier=Modifier.weight(1f).height(48.dp)) {Symbol(R.drawable.ic_pause);Spacer(Modifier.width(8.dp));Text("Pause")}
                             }
                         }
                     }
@@ -421,34 +418,34 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
                     if(waiting>0) Box {
                         TextButton(onClick={queueMenu=true}) {Text(context.resources.getQuantityString(R.plurals.recent_waiting,waiting,waiting));Symbol(R.drawable.ic_arrow_drop_down)}
                         DropdownMenu(queueMenu,{queueMenu=false}) {
-                            DropdownMenuItem(text={Text("Send now")},onClick={val confirmed=ConfirmedBinding.from(p);val pending=p.pending;queueMenu=false;scope.launch {actions.run("Couldn't retry connection. Try again.") {check(app.retryConnection(confirmed,pending)) {"Pairing changed during retry"}}}})
-                            DropdownMenuItem(text={Text("Don't send any")},onClick={val selected=ConfirmedQueue.from(p,app.work.value);queueMenu=false;scope.launch {actions.run("Couldn't clear queue. Try again.") {check(app.discardAll(selected)) {"Queue changed"}}}})
+                            DropdownMenuItem(text={Text("Send now")},onClick={val confirmed=ConfirmedBinding.from(p);val pending=p.pending;queueMenu=false;scope.launch {actions.run("Couldn't retry connection") {check(app.retryConnection(confirmed,pending)) {"Pairing changed during retry"}}}})
+                            DropdownMenuItem(text={Text("Don't send any")},onClick={val selected=ConfirmedQueue.from(p,app.work.value);queueMenu=false;scope.launch {actions.run("Couldn't clear queue") {check(app.discardAll(selected)) {"Queue changed"}}}})
                         }
                     }
                 }
             }
             if(recent.isEmpty()) item {Group {Column(Modifier.fillMaxWidth().height(120.dp),horizontalAlignment=Alignment.CenterHorizontally,verticalArrangement=Arrangement.Center) {Symbol(R.drawable.ic_image,modifier=Modifier.size(32.dp),tint=MaterialTheme.colorScheme.onSurfaceVariant);Text("Nothing sent yet",Modifier.padding(top=8.dp),style=MaterialTheme.typography.bodyMedium,color=MaterialTheme.colorScheme.onSurfaceVariant)}}}
             else items(recent,key={it.mediaId}) {row ->
-                Surface(color=groupColor(),modifier=Modifier.animateItem().fillMaxWidth(),shape=when(row) {recent.first()->RoundedCornerShape(topStart=24.dp,topEnd=24.dp);recent.last()->RoundedCornerShape(bottomStart=24.dp,bottomEnd=24.dp);else->RoundedCornerShape(0.dp)}) {
+                Surface(color=groupColor(),modifier=Modifier.animateItem().fillMaxWidth(),shape=RoundedCornerShape(topStart=if(row==recent.first())24.dp else 0.dp,topEnd=if(row==recent.first())24.dp else 0.dp,bottomStart=if(row==recent.last())24.dp else 0.dp,bottomEnd=if(row==recent.last())24.dp else 0.dp)) {
                     val progress=link.transferMediaId==row.mediaId
                     Row(Modifier.fillMaxWidth().heightIn(min=72.dp).clickable(enabled=row.state=="sent" && (if(row.kind=="text")row.text.matches(Regex("""https?://\S+""")) else row.uri.isNotEmpty())) {scope.launch {if(row.kind=="text")runCatching {context.startActivity(Intent(Intent.ACTION_VIEW,Uri.parse(row.text)))} else RecentItems.openOriginal(context,row)}}.padding(horizontal=16.dp,vertical=8.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(16.dp)) {
                         MediaThumb(row)
                         Column(Modifier.weight(1f)) {
-                            Text(when(row.kind) {"photo"->"Photo";"recording"->"Screen recording";"file"->row.fileName;"text"->row.text.lineSequence().firstOrNull().orEmpty().removePrefix("https://");"clipboard_image"->"Clipboard image";else->"Screenshot"},style=MaterialTheme.typography.bodyLarge,maxLines=1,overflow=if(row.kind=="file")TextOverflow.MiddleEllipsis else TextOverflow.Ellipsis)
+                            Text(when(row.kind) {"photo"->"Photo";"recording"->"Screen recording";"file"->row.fileName;"text"->row.text.lineSequence().firstOrNull().orEmpty().removePrefix("https://");"clipboard_image"->"Image";else->"Screenshot"},style=MaterialTheme.typography.bodyLarge,maxLines=1,overflow=if(row.kind=="file")TextOverflow.MiddleEllipsis else TextOverflow.Ellipsis)
                             val supporting=when {
                                 progress -> "Sending · ${android.text.format.Formatter.formatShortFileSize(context,link.sent)} of ${android.text.format.Formatter.formatShortFileSize(context,link.total)}"
                                 row.state=="sent" -> (if(row.kind=="clipboard_image" || row.kind=="text" && row.origin=="clipboard")"Clipboard · " else "")+lastConnectedLabel(context,row.createdAt)
-                                row.error=="disk_full" -> "Failed · PC disk is full"
-                                row.error=="not_writable" -> "Failed · PC can't save files"
-                                row.error=="local_capacity" -> "Failed · Phone storage is full"
-                                row.state=="failed" -> "Failed · ${row.error.replace('_',' ')}"
+                                row.state=="failed" -> UiPresentation.failedItem(row.error)
                                 DeliveryPolicy.hold(row.kind,row.automatic,false,network.mobile,p.originals,row.attempted,row.optimized) -> "Waiting for Wi-Fi"
                                 else -> "Waiting"
                             }
                             Text(supporting,style=MaterialTheme.typography.bodyMedium,color=if(row.state=="failed") MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,maxLines=1,overflow=TextOverflow.Ellipsis)
                         }
-                        if(row.state=="failed") IconButton(onClick={val selected=ConfirmedQueue(ConfirmedBinding.from(p),listOf(ConfirmedItem.from(row)));scope.launch {actions.run("Couldn't retry item. Try again.") {check(app.retry(row.mediaId,selected)) {"Queue item changed"}}}}) {Symbol(R.drawable.ic_refresh,"Retry")}
-                        if(row.state!="sent") IconButton(onClick={val selected=ConfirmedQueue(ConfirmedBinding.from(p),listOf(ConfirmedItem.from(row)));scope.launch {actions.run("Couldn't remove item. Try again.") {check(app.discard(selected)) {"Queue item changed"}}}}) {Symbol(R.drawable.ic_close,if(progress)"Cancel" else if(row.state=="failed")"Remove" else "Don't send")}
+                        if(row.state=="failed") IconButton(onClick={val selected=ConfirmedQueue(ConfirmedBinding.from(p),listOf(ConfirmedItem.from(row)));scope.launch {actions.run("Couldn't retry item") {check(app.retry(row.mediaId,selected)) {"Queue item changed"}}}}) {Symbol(R.drawable.ic_refresh,"Retry")}
+                        if(row.state!="sent") Box(contentAlignment=Alignment.Center) {
+                            if(progress) CircularProgressIndicator(progress={if(link.total>0)(link.sent.toFloat()/link.total).coerceIn(0f,1f) else 0f},modifier=Modifier.size(40.dp),strokeWidth=2.dp)
+                            IconButton(onClick={val selected=ConfirmedQueue(ConfirmedBinding.from(p),listOf(ConfirmedItem.from(row)));scope.launch {actions.run("Couldn't remove item") {check(app.discard(selected)) {"Queue item changed"}}}}) {Symbol(R.drawable.ic_close,if(progress)"Cancel" else if(row.state=="failed")"Remove" else "Don't send")}
+                        }
                     }
                 }
             }
@@ -464,7 +461,9 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
         val b=bitmap
         if(b!=null) androidx.compose.foundation.Image(b.asImageBitmap(),null,contentScale=androidx.compose.ui.layout.ContentScale.Crop)
         else Box(contentAlignment=Alignment.Center) {Symbol(when {row.kind=="text" && row.text.matches(Regex("""https?://\S+"""))->R.drawable.ic_link;row.kind=="text"->R.drawable.ic_content_paste;row.kind=="file"->R.drawable.ic_description;else->R.drawable.ic_image})}
-        if(row.mime.startsWith("video/")) Box(Modifier.fillMaxSize(),contentAlignment=Alignment.BottomStart) {Symbol(R.drawable.ic_play_arrow,modifier=Modifier.size(16.dp))}
+        if(row.mime.startsWith("video/")) Box(Modifier.fillMaxSize().padding(4.dp),contentAlignment=Alignment.BottomStart) {
+            Box(Modifier.size(20.dp).background(Color.Black.copy(alpha=.5f),CircleShape),contentAlignment=Alignment.Center) {Symbol(R.drawable.ic_play_arrow,modifier=Modifier.size(16.dp),tint=Color.White)}
+        }
     }
 }
 
@@ -473,10 +472,10 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
     val context=LocalContext.current;val app=context.graph;val scope=rememberCoroutineScope();val actions=LocalUiActions.current;val snackbar=remember {SnackbarHostState()}
     var pendingMedia by rememberSaveable {mutableStateOf("")}
     fun mediaPermissionFor(key:String)=if(key=="recordings")Manifest.permission.READ_MEDIA_VIDEO else Manifest.permission.READ_MEDIA_IMAGES
-    LaunchedEffect(refresh,pendingMedia) {if(pendingMedia.isNotEmpty() && context.granted(mediaPermissionFor(pendingMedia))) {val key=pendingMedia;if(actions.run("Couldn't save setting. Try again.") {app.preferences.toggle(key,true)})pendingMedia=""}}
+    LaunchedEffect(refresh,pendingMedia) {if(pendingMedia.isNotEmpty() && context.granted(mediaPermissionFor(pendingMedia))) {val key=pendingMedia;if(actions.run("Couldn't save setting") {app.preferences.toggle(key,true)})pendingMedia=""}}
     val mediaPermission=rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {result ->
         val key=pendingMedia
-        if(key.isNotEmpty() && result[mediaPermissionFor(key)]==true) {scope.launch {if(actions.run("Couldn't save setting. Try again.") {app.preferences.toggle(key,true)})pendingMedia=""}}
+        if(key.isNotEmpty() && result[mediaPermissionFor(key)]==true) {scope.launch {if(actions.run("Couldn't save setting") {app.preferences.toggle(key,true)})pendingMedia=""}}
     }
     val tailscaleInstalled=remember {runCatching {context.packageManager.getPackageInfo("com.tailscale.ipn",0)}.isSuccess}
     fun toggle(key: String,value: Boolean) {
@@ -486,7 +485,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
             pendingMedia=key
             if(PermissionRequests.settings(context as Activity,mediaPermissionFor(key)))PermissionRequests.openSettings(context)
             else {PermissionRequests.mark(context,mediaPermissionFor(key));mediaPermission.launch(arrayOf(mediaPermissionFor(key)))}
-        } else scope.launch {actions.run("Couldn't save setting. Try again.",{toggle(key,value)}) {try {app.preferences.toggle(key,value)}catch(_:IllegalArgumentException) {snackbar.showSnackbar("Pneu needs Wi-Fi or Tailscale")}}}
+        } else scope.launch {actions.run("Couldn't save setting",{toggle(key,value)}) {try {app.preferences.toggle(key,value)}catch(_:IllegalArgumentException) {snackbar.showSnackbar("Pneu needs Wi-Fi or Tailscale")}}}
     }
     Scaffold(containerColor=Color.Transparent,topBar={LargeTopAppBar(title={Text("Settings")},navigationIcon={NavIcon(back)},colors=TopAppBarDefaults.topAppBarColors(containerColor=Color.Transparent))},snackbarHost={SnackbarHost(snackbar)}) {padding ->
         Box(Modifier.padding(padding).fillMaxSize(),contentAlignment=Alignment.TopCenter) {
@@ -512,7 +511,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
                 }
                 Header("Paired PC")
                 Group {
-                    SettingRow(if(p.pairingLost)"Pairing lost" else p.peer?.name ?: "Not paired",if(p.pairingLost)p.lostPcName else p.peer?.addresses?.joinToString(" · ") {it.host})
+                    SettingRow(if(p.pairingLost)"Pairing lost" else p.peer?.name ?: "Not paired",if(p.pairingLost)p.lostPcName else p.peer?.addresses?.let {UiPresentation.pairedAddresses(it).joinToString(" · ").ifEmpty {null}})
                     SettingRow("Unpair",error=true,click=unpair)
                 }
                 Header("This phone")

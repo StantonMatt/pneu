@@ -1,10 +1,12 @@
 package io.github.stantonmatt.pneu.features
 
+import io.github.stantonmatt.pneu.data.Outgoing
+
 object ClipboardFeedback {
-    fun result(state:String?)=when(state) {
+    fun result(row:Outgoing?)=when(row?.state) {
         "sent"->"Clipboard sent"
         "superseded"->"Replaced by newer clipboard"
-        "discarded",null->"Clipboard send cancelled"
-        else->"Delivery unconfirmed. Still pending."
+        "waiting","sending","failed"->if(row.nextAttempt==Long.MAX_VALUE) "Couldn't send clipboard" else "Still sending clipboard"
+        else->"Clipboard send cancelled"
     }
 }

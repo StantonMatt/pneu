@@ -99,7 +99,7 @@ internal class ManualEntryViewModel(application:Application):AndroidViewModel(ap
                     completed.add(row.mediaId)
                     app.scope.launch {PostCommit.maintainSuspending {
                         withTimeoutOrNull(120000) {app.queue.work().recoverReads().first {rows->rows.none {it.mediaId==row.mediaId}}}
-                        val feedback=ClipboardFeedback.result(app.queue.find(row.mediaId)?.state)
+                        val feedback=ClipboardFeedback.result(app.queue.find(row.mediaId))
                         withContext(Dispatchers.Main) {Toast.makeText(app.context,feedback,Toast.LENGTH_SHORT).show()}
                     }}
                     EntryResult()

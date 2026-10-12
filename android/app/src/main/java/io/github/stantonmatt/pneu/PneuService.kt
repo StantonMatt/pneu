@@ -73,7 +73,7 @@ class PneuService : Service() {
             s.status == "Connecting…" -> p.pending?.name ?: p.peer?.name.orEmpty()
             count > 0 -> resources.getQuantityString(R.plurals.waiting,count,count)
             s.status == "Waiting for Wi-Fi" -> "Mobile data is off in settings"
-            else -> "Last connected ${lastConnectedLabel(this,p.lastConnected)}"
+            else -> if(p.lastConnected>0) "Last connected ${lastConnectedLabel(this,p.lastConnected)}" else null
         }
         val pause=PendingIntent.getService(this,2,Intent(this,PneuService::class.java).setAction(ACTION_PAUSE),PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         return NotificationCompat.Builder(this,"status").setSmallIcon(R.drawable.ic_stat_pneu).setColor(Color.rgb(15,110,104))

@@ -125,7 +125,7 @@
 <plurals name="banner_many"><item quantity="one">%d settings need attention</item><item quantity="other">%d settings need attention</item></plurals>
 <plurals name="recent_waiting"><item quantity="one">%d waiting</item><item quantity="other">%d waiting</item></plurals>
 <plurals name="pref_permissions_issues"><item quantity="one">%d needs attention</item><item quantity="other">%d need attention</item></plurals>
-<plurals name="unpair_text"><item quantity="one">%d waiting items won\'t be sent.</item><item quantity="other">%d waiting items won\'t be sent.</item></plurals>
+<plurals name="unpair_text"><item quantity="one">%d waiting item won\'t be sent.</item><item quantity="other">%d waiting items won\'t be sent.</item></plurals>
 <plurals name="notif_sending_many"><item quantity="one">Sending %d items</item><item quantity="other">Sending %d items</item></plurals>
 <plurals name="notif_waiting"><item quantity="one">%d waiting</item><item quantity="other">%d waiting</item></plurals>
 <plurals name="toast_sending_many"><item quantity="one">Sending %d items to PC</item><item quantity="other">Sending %d items to PC</item></plurals>

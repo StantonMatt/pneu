@@ -69,12 +69,12 @@ class FourthReviewUiDeviceTest {
             assertTrue("Video grant",c.granted(Manifest.permission.READ_MEDIA_VIDEO));withTimeoutOrNull(5000) {app.prefs.first {it.recordings}} ?: fail("Recording toggle did not resume after settings")
             launch("permissions");rowSettings("Notifications")
             assertTrue(device.wait(Until.hasObject(By.pkg("com.android.settings")),4000));grant(Manifest.permission.POST_NOTIFICATIONS);device.pressBack()
-            // Generic permissions UI exposes network/camera and can clear system-kill evidence.
+            // Camera stays on Pair; generic permissions UI can clear system-kill evidence.
             c.getSharedPreferences("service_evidence",Context.MODE_PRIVATE).edit().putBoolean("running",false).putLong("kill",System.currentTimeMillis()+1000).putLong("acknowledged",0).commit()
             assertTrue(ServiceEvidence.killed(c));launch("permissions")
-            assertTrue(visible("Local network"));assertTrue(visible("Camera"));assertTrue(visible("Notifications"))
-            val scroll=device.findObject(UiSelector().scrollable(true));if(scroll.exists())UiScrollable(UiSelector().scrollable(true)).scrollTextIntoView("Acknowledge")
-            assertTrue(visible("Acknowledge"));device.findObject(UiSelector().text("Acknowledge")).click()
+            assertTrue(visible("Local network"));assertFalse(device.findObject(UiSelector().text("Camera")).exists());assertTrue(visible("Notifications"))
+            val scroll=device.findObject(UiSelector().scrollable(true));if(scroll.exists())UiScrollable(UiSelector().scrollable(true)).scrollTextIntoView("Dismiss")
+            assertTrue(visible("Pneu was stopped in the background"));assertTrue(visible("Dismiss"));device.findObject(UiSelector().text("Dismiss")).click()
             withTimeout(4000) {while(ServiceEvidence.killed(c))delay(30)}
             assertFalse(c.health().killed)
             device.pressBack();launch("home");assertFalse(visible("Pneu was stopped in the background"))
