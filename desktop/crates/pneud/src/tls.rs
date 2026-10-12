@@ -1,4 +1,4 @@
-//! Full-certificate pins with P-256/self-signature/validity checks. CertificateVerify
+//! P-256/self-signature/validity checks with post-handshake client admission. CertificateVerify
 //! is delegated to rustls's ring verifier, never asserted without verification.
 use crate::identity::Identity;
 use pneu_proto::{Hash, Id, certificate_fingerprint};
@@ -44,11 +44,32 @@ pub struct ClientVerifier {
     pub admission: Arc<Mutex<Admission>>,
     provisional: AtomicBool,
     slot: Arc<AtomicBool>,
-    blocked: AtomicBool,
 }
 impl ClientVerifier {
-    pub fn blocked(&self) -> bool {
-        self.blocked.load(Ordering::SeqCst)
+    /// Authorize only after rustls has verified CertificateVerify and completed TLS.
+    /// Unknown identities still complete TLS so the PC can send ERROR unauthorized.
+    pub fn admit(&self, fp: &Hash) -> bool {
+        let mut state = self.admission.lock().expect("admission");
+        if !state.peers.contains_key(fp) {
+            let instant = Instant::now();
+            if !state.invitation.as_ref().is_some_and(Invitation::is_active)
+                || state
+                    .last_unknown
+                    .is_some_and(|t| instant.duration_since(t).as_secs() < 1)
+            {
+                return false;
+            }
+            if self
+                .slot
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return false;
+            }
+            self.provisional.store(true, Ordering::SeqCst);
+            state.last_unknown = Some(instant);
+        }
+        true
     }
     pub fn release_provisional(&self) {
         if self.provisional.swap(false, Ordering::SeqCst) {
@@ -58,7 +79,6 @@ impl ClientVerifier {
     pub fn new(admission: Arc<Mutex<Admission>>, slot: Arc<AtomicBool>) -> Self {
         Self {
             admission,
-            blocked: AtomicBool::new(false),
             provisional: AtomicBool::new(false),
             slot,
         }
@@ -132,28 +152,6 @@ impl ClientCertVerifier for ClientVerifier {
         now: UnixTime,
     ) -> Result<ClientCertVerified, Error> {
         validate_certificate(cert, intermediates, now)?;
-        let fp = certificate_fingerprint(cert.as_ref());
-        let mut state = self.admission.lock().map_err(|_| invalid())?;
-        if !state.peers.contains_key(&fp) {
-            let instant = Instant::now();
-            if !state.invitation.as_ref().is_some_and(Invitation::is_active)
-                || state
-                    .last_unknown
-                    .is_some_and(|t| instant.duration_since(t).as_secs() < 1)
-            {
-                self.blocked.store(true, Ordering::SeqCst);
-                return Err(invalid());
-            }
-            if self
-                .slot
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-            {
-                return Err(invalid());
-            }
-            self.provisional.store(true, Ordering::SeqCst);
-            state.last_unknown = Some(instant);
-        }
         Ok(ClientCertVerified::assertion())
     }
     fn verify_tls12_signature(
@@ -283,7 +281,7 @@ mod tests {
         }
     }
     #[test]
-    fn tls_admission_uses_same_two_clock_invitation_expiry() -> anyhow::Result<()> {
+    fn post_handshake_admission_uses_same_two_clock_invitation_expiry() -> anyhow::Result<()> {
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
         let cert =
             rcgen::CertificateParams::new(vec!["unused.invalid".into()])?.self_signed(&key)?;
@@ -313,13 +311,50 @@ mod tests {
                 })),
                 Arc::new(AtomicBool::new(false)),
             );
-            assert_eq!(
-                verifier.verify_client_cert(cert.der(), &[], time).is_ok(),
-                active
-            );
+            verifier.verify_client_cert(cert.der(), &[], time)?;
+            assert_eq!(verifier.admit(&certificate_fingerprint(cert.der())), active);
             assert_eq!(active, !wall_expired && !monotonic_expired);
-            assert_eq!(verifier.blocked(), !active);
         }
+        Ok(())
+    }
+    #[test]
+    fn admission_preserves_rate_slot_and_paired_bypass() -> anyhow::Result<()> {
+        let fp = Hash::new("c".repeat(64))?;
+        let known = Hash::new("d".repeat(64))?;
+        let state = Arc::new(Mutex::new(Admission {
+            peers: HashMap::from([(known.clone(), Id::from_bytes([1; 16]))]),
+            invitation: Some(test_invitation(
+                crate::now_ms() + 300_000,
+                Instant::now() + std::time::Duration::from_secs(300),
+            )),
+            ..Default::default()
+        }));
+        let slot = Arc::new(AtomicBool::new(false));
+        let first = ClientVerifier::new(state.clone(), slot.clone());
+        assert!(first.admit(&fp));
+        first.release_provisional();
+        let next = ClientVerifier::new(state.clone(), slot.clone());
+        assert!(!next.admit(&fp), "rate bound applies even with a free slot");
+        state.lock().unwrap().last_unknown =
+            Some(Instant::now() - std::time::Duration::from_secs(2));
+        assert!(next.admit(&fp));
+        state.lock().unwrap().last_unknown =
+            Some(Instant::now() - std::time::Duration::from_secs(2));
+        let concurrent = ClientVerifier::new(state.clone(), slot.clone());
+        assert!(
+            !concurrent.admit(&fp),
+            "slot bound applies after rate interval"
+        );
+        assert!(
+            concurrent.admit(&known),
+            "paired identity bypasses pairing quotas"
+        );
+        drop(next);
+        assert!(
+            !slot.load(Ordering::SeqCst),
+            "disconnect releases provisional slot"
+        );
+        assert!(concurrent.admit(&fp));
         Ok(())
     }
     #[test]

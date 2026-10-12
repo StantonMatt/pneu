@@ -14,6 +14,23 @@ use std::{
 use tokio::{io::AsyncReadExt, net::TcpStream, time::Instant};
 use tokio_rustls::{TlsConnector, client::TlsStream};
 
+/// An authenticated protocol rejection, preserving the exact frame for test tools.
+#[derive(Debug)]
+pub struct PcRejection(pub ErrorMessage);
+impl std::fmt::Display for PcRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.code == ErrorCode::Unauthorized {
+            write!(
+                f,
+                "PC ERROR unauthorized: Pairing lost or pairing admission denied"
+            )
+        } else {
+            write!(f, "PC ERROR {:?}", self.0.code)
+        }
+    }
+}
+impl std::error::Error for PcRejection {}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Binding {
     pub fingerprint: Hash,
@@ -168,7 +185,7 @@ impl Phone {
                     connector.connect(rustls::pki_types::ServerName::try_from("pneu.local")?, tcp),
                 )
                 .await??;
-                crate::transport::send(
+                let sent = crate::transport::send(
                     &mut tls,
                     &Message::Hello(Hello {
                         version: 1,
@@ -179,13 +196,19 @@ impl Phone {
                     }),
                     Duration::from_secs(10),
                 )
-                .await?;
+                .await;
+                // A fatal frame may already be waiting even if HELLO hit a closed socket.
                 let pc = match tokio::time::timeout(Duration::from_secs(10), read_frame(&mut tls))
                     .await??
                 {
                     Some(Message::Hello(h)) => h,
-                    _ => bail!("expected PC HELLO"),
+                    Some(Message::Error(error)) => return Err(PcRejection(error).into()),
+                    _ => {
+                        sent?;
+                        bail!("expected PC HELLO");
+                    }
                 };
+                sent?;
                 ensure!(pc.version == 1, "PC version mismatch");
                 if let Some(expected) = expected_id {
                     ensure!(*expected == pc.device_id, "PC device binding mismatch");
@@ -216,6 +239,7 @@ impl Phone {
             .await;
             match result {
                 Ok(c) => return Ok(c),
+                Err(e) if e.downcast_ref::<PcRejection>().is_some() => return Err(e),
                 Err(e) => last = Some(e),
             }
         }

@@ -1487,21 +1487,7 @@ impl Core {
                 TlsAcceptor::from(Arc::new(config)).accept(stream),
             )
             .await;
-            let mut tls = match handshake {
-                Ok(Ok(tls)) => tls,
-                failure => {
-                    if verifier.blocked() {
-                        self.event(Event::Blocked {
-                            address: peer_address.ip().to_string(),
-                        });
-                    }
-                    return match failure {
-                        Ok(Err(error)) => Err(error.into()),
-                        Err(error) => Err(error.into()),
-                        _ => unreachable!(),
-                    };
-                }
-            };
+            let mut tls = handshake??;
             let fp = certificate_fingerprint(
                 tls.get_ref()
                     .1
@@ -1509,6 +1495,21 @@ impl Core {
                     .context("missing client cert")?[0]
                     .as_ref(),
             );
+            if !verifier.admit(&fp) {
+                self.event(Event::Blocked {
+                    address: peer_address.ip().to_string(),
+                });
+                crate::transport::close(
+                    &mut tls,
+                    &[Message::Error(ErrorMessage {
+                        code: ErrorCode::Unauthorized,
+                        message: Some("Client certificate is not admitted".into()),
+                        supported_version: None,
+                    })],
+                )
+                .await?;
+                return Ok(());
+            }
             let hello = match read_handshake(&mut tls).await? {
                 Message::Hello(h) => h,
                 Message::Error(_) => return Ok(()),

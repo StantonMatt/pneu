@@ -154,8 +154,9 @@ backpressure. Once read, PING schedules PONG ahead of queued outgoing frames;
 a storage stall can delay reading until the peer's PONG deadline. All writes
 flush within their deadlines. Idle file workers have no transfer deadline.
 One outgoing DB query survives select iterations instead of spawning jobs for
-each status/config event. One provisional TLS connection and sixteen total
-connections are admitted; unknown admission is limited to once per second.
+each status/config event. One provisional pairing connection and sixteen total
+connections (including unknown clients and in-flight TLS handshakes) are admitted;
+unknown pairing admission is limited to once per second.
 PC initiates no periodic PINGs. Cache pruning runs hourly. Successful retries
 retire failed-save previews by reopening without following links and checking
 recorded device, inode, size and nanosecond modification/change times, relative
@@ -166,10 +167,17 @@ Staging, temporary-config and runtime-socket cleanup also check identity and
 use retained directory handles, preserving replacement entries.
 Tray icons use the same anchored atomic writes and refuse symlinked descendants.
 
-TLS is 1.3 only, with resumption/0-RTT disabled. Both verifiers check exact DER
-fingerprints, P-256, certificate self-signature, validity dates and rustls's real
-ECDSA P-256 CertificateVerify. Pairing has the prescribed HELLO/restricted state,
-constant-time token comparison, error ordering, durable binding and one-time
+TLS is 1.3 only, with resumption/0-RTT disabled. Both verifiers check P-256,
+certificate self-signature, validity dates and rustls's real ECDSA P-256
+CertificateVerify. Phones also check the exact DER PC pin during TLS. The daemon
+completes TLS for cryptographically valid client certificates, then checks their
+fingerprints before reading any protocol frame. A client neither paired nor
+admissible under an active invitation receives `ERROR unauthorized` with a short
+message and closes within the two-second fatal-close bound. Phones can recognize
+this authenticated rejection from their pinned PC as "Pairing lost" after offline
+unpairing. The simulator reports `unauthorized` explicitly, including before PC
+HELLO. Pairing has the prescribed HELLO/restricted state, constant-time token
+comparison, error ordering, durable binding and one-time
 consumption. Before sending PAIR_REQUEST, the simulator persists the PC pin, addresses and
 token. A lost success reply keeps this pending record; reconnect repeats the
 request even after invitation expiry. An already-bound certificate/device gets

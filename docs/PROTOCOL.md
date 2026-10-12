@@ -24,14 +24,22 @@ replacing a certificate requires re-pairing. Keep private keys in platform secur
 storage and restrict PC key/config permissions to their owner.
 
 No CA-chain or DNS-hostname validation is performed: addresses are routing hints,
-and the certificate fingerprint is the identity. MUST verify the expected pin,
-P-256 public key, certificate self-signature, current certificate validity dates,
-and the TLS CertificateVerify signature. A custom Android TrustManager or rustls
+and the certificate fingerprint is the identity. Phones MUST verify the expected
+PC pin; PCs check client fingerprint admission immediately after TLS. Both MUST
+verify the P-256 public key, certificate self-signature, current certificate
+validity dates, and the TLS CertificateVerify signature. A custom Android TrustManager or rustls
 verifier MUST NOT bypass CertificateVerify. Disable TLS 0-RTT and session
 resumption in v1 so every connection presents and checks both certificates.
 An absent certificate or a mismatching PC pin fails TLS before protocol traffic.
-During pairing only, the PC provisionally admits an unknown client certificate as
-specified below; otherwise unknown client fingerprints fail TLS.
+The PC completes TLS for any client certificate that passes all cryptographic and
+structural checks. Immediately after TLS, before reading any protocol frame, it
+checks the client fingerprint. Unless it is paired or admissible under an active
+pairing invitation and admission quotas, the PC sends `ERROR unauthorized` with a
+short message and closes within the 2 s fatal-close bound. Unknown clients count
+toward the same total connection and handshake limits. During pairing only,
+admitted unknown clients enter the restricted provisional state specified below.
+Phones treat `ERROR unauthorized` from a PC authenticated against the stored pin
+as a revocation signal ("Pairing lost"), rather than a network failure.
 
 PC advertises mDNS service `_pneu._tcp.local.` (service type `_pneu._tcp`), SRV
 port and TXT keys `v=1`, `fp=<PC fingerprint>`. Instance name is for display only.
@@ -359,10 +367,13 @@ Suppress clipboard watchers for received operations; never echo them with new ID
 ## Connection and pairing state machines
 
 1. **DISCONNECTED → TCP → TLS.** Phone authenticates PC against QR/stored pin.
-   PC requires a client certificate. Outside an explicit pairing window it must
-   already be pinned. During a pairing window, unknown P-256 client certificates
-   may proceed only into a restricted provisional state. Limit provisional
-   connections to one and rate-limit admission/token failures locally.
+   PC requires a cryptographically valid client certificate and completes TLS
+   before checking fingerprint admission. An unknown fingerprint outside an
+   active pairing window, or denied by admission quotas, receives
+   `ERROR unauthorized` and closes before PC reads any frame. During a pairing window,
+   admitted unknown clients may proceed only into a restricted provisional state.
+   Limit provisional connections to one and rate-limit admission/token failures
+   locally; total connection and handshake limits also cover unknown clients.
 2. **HELLO exchange.** Phone sends HELLO first within 10 s of TLS completion. PC
    replies with HELLO within 10 s of receiving it. No other message is allowed
    before both HELLOs except ERROR. Each endpoint sends HELLO exactly once.

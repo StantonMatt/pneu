@@ -4,7 +4,7 @@ use pneu_proto::*;
 use pneud::{
     Config, Core, Paths,
     actions::{PcActions, ReceivedFile},
-    client::{Phone, PhoneConnection},
+    client::{PcRejection, Phone, PhoneConnection},
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -200,6 +200,40 @@ impl Harness {
             .collect::<std::io::Result<Vec<_>>>()?)
     }
 }
+type PhoneTls = tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
+async fn raw_connect(h: &Harness, phone: &Phone) -> Result<PhoneTls> {
+    let config = pneud::tls::client_config(&phone.identity, h.core.identity.fingerprint.clone())?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let tcp = tokio::net::TcpStream::connect(&h.address).await?;
+    Ok(tokio::time::timeout(
+        Duration::from_secs(2),
+        connector.connect(rustls::pki_types::ServerName::try_from("pneu.local")?, tcp),
+    )
+    .await??)
+}
+fn admission_rejection() -> Message {
+    Message::Error(ErrorMessage {
+        code: ErrorCode::Unauthorized,
+        message: Some("Client certificate is not admitted".into()),
+        supported_version: None,
+    })
+}
+async fn assert_admission_rejection(tls: &mut PhoneTls) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        assert_eq!(read_frame(tls).await?, Some(admission_rejection()));
+        assert_eq!(read_frame(tls).await?, None, "fatal rejection closes TLS");
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?
+}
+fn assert_simulator_rejection(error: &anyhow::Error) {
+    let rejection = error
+        .downcast_ref::<PcRejection>()
+        .expect("authenticated PC ERROR");
+    assert_eq!(Message::Error(rejection.0.clone()), admission_rejection());
+    assert!(error.to_string().contains("unauthorized"));
+}
+
 fn metadata(id: Id, bytes: &[u8]) -> FileBegin {
     FileBegin {
         transfer_id: id,
@@ -318,16 +352,19 @@ async fn mid_transfer_disconnect_replays_from_zero() -> Result<()> {
 async fn unknown_cert_is_rejected_and_used_token_cannot_pair_again() -> Result<()> {
     let h = Harness::new().await?;
     let phone = h.phone("phone")?;
-    assert!(
-        phone
-            .connect(
-                std::slice::from_ref(&h.address),
-                h.core.identity.fingerprint.clone(),
-                None
-            )
-            .await
-            .is_err()
-    );
+    // No HELLO is sent: rejection must follow the completed TLS handshake itself.
+    let mut tls = raw_connect(&h, &phone).await?;
+    assert_admission_rejection(&mut tls).await?;
+    let error = phone
+        .connect(
+            std::slice::from_ref(&h.address),
+            h.core.identity.fingerprint.clone(),
+            None,
+        )
+        .await
+        .err()
+        .expect("unknown phone rejected");
+    assert_simulator_rejection(&error);
     let invitation = h
         .core
         .start_pairing_with_addresses(vec![h.address.clone()])
@@ -338,6 +375,187 @@ async fn unknown_cert_is_rejected_and_used_token_cannot_pair_again() -> Result<(
     drop(c);
     h.stop().await
 }
+#[tokio::test]
+async fn forgotten_offline_phone_receives_unauthorized_before_hello() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut events = h.core.subscribe();
+    let mut connection = h.pair(&phone).await?;
+    connection.close().await?;
+    drop(connection);
+    event_matching(&mut events, |event| {
+        matches!(
+            event,
+            pneud::Event::ConnectionChanged {
+                connected: false,
+                ..
+            }
+        )
+    })
+    .await?;
+    // A paired reconnect still exchanges HELLO and carries application data.
+    let mut connection = phone.reconnect().await?;
+    connection
+        .send_text(phone.text("still paired".into(), ClipboardOrigin::Clipboard)?)
+        .await?;
+    connection.close().await?;
+    drop(connection);
+    event_matching(&mut events, |event| {
+        matches!(
+            event,
+            pneud::Event::ConnectionChanged {
+                connected: false,
+                ..
+            }
+        )
+    })
+    .await?;
+    h.core
+        .unpair_device(phone.identity.device_id.clone())
+        .await?;
+    assert!(
+        phone.directory.join("binding.json").exists(),
+        "offline phone retains its pin"
+    );
+    // Several retries must each receive the exact authenticated frame, including
+    // when the phone does not send HELLO, and without opening a pairing window.
+    for _ in 0..3 {
+        let mut tls = raw_connect(&h, &phone).await?;
+        assert_admission_rejection(&mut tls).await?;
+        let error = phone
+            .reconnect()
+            .await
+            .err()
+            .expect("forgotten phone rejected");
+        assert_simulator_rejection(&error);
+    }
+    h.stop().await
+}
+
+#[tokio::test]
+async fn invalid_client_certificates_still_fail_tls() -> Result<()> {
+    use rustls::pki_types::PrivatePkcs8KeyDer;
+    let h = Harness::new().await?;
+    // Open pairing to prove rejection is cryptographic, not fingerprint admission.
+    h.core
+        .start_pairing_with_addresses(vec![h.address.clone()])
+        .await?;
+    let mut phone = h.phone("invalid")?;
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
+    let valid = rcgen::CertificateParams::new(vec!["pneu.local".into()])?.self_signed(&key)?;
+    let mut expired = rcgen::CertificateParams::new(vec!["pneu.local".into()])?;
+    expired.not_after = rcgen::date_time_ymd(2000, 1, 1);
+    let expired = expired.self_signed(&key)?;
+    let mut broken = valid.der().to_vec();
+    *broken.last_mut().unwrap() ^= 1;
+    let p384 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384)?;
+    let wrong_curve =
+        rcgen::CertificateParams::new(vec!["pneu.local".into()])?.self_signed(&p384)?;
+    for (cert, private_key) in [
+        (expired.der().clone(), key.serialize_der()),
+        (broken.into(), key.serialize_der()),
+        (wrong_curve.der().clone(), p384.serialize_der()),
+    ] {
+        phone.identity.cert = cert;
+        phone.identity.key = PrivatePkcs8KeyDer::from(private_key).into();
+        // TLS 1.3 clients can finish their half before consuming the server alert.
+        // If so, the next read must fail TLS, never yield a protocol ERROR.
+        if let Ok(mut tls) = raw_connect(&h, &phone).await {
+            assert!(
+                tokio::time::timeout(Duration::from_secs(2), read_frame(&mut tls))
+                    .await?
+                    .is_err()
+            );
+        }
+    }
+    // Failed certificate checks must not consume the provisional admission slot.
+    let valid_phone = h.phone("valid")?;
+    let invitation = h
+        .core
+        .start_pairing_with_addresses(vec![h.address.clone()])
+        .await?;
+    drop(valid_phone.pair(&invitation).await?);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn unknown_clients_obey_provisional_and_total_connection_quotas() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("paired")?;
+    let mut events = h.core.subscribe();
+    let mut connection = h.pair(&phone).await?;
+    connection.close().await?;
+    drop(connection);
+    event_matching(&mut events, |event| {
+        matches!(
+            event,
+            pneud::Event::ConnectionChanged {
+                connected: false,
+                ..
+            }
+        )
+    })
+    .await?;
+    tokio::time::sleep(Duration::from_millis(1050)).await;
+    h.core
+        .start_pairing_with_addresses(vec![h.address.clone()])
+        .await?;
+    let candidate = h.phone("candidate")?;
+    let mut provisional = raw_connect(&h, &candidate).await?;
+    // Complete HELLO to ensure the provisional slot is held while waiting for token.
+    write_frame(
+        &mut provisional,
+        &Message::Hello(Hello {
+            version: 1,
+            device_id: candidate.identity.device_id.clone(),
+            name: "candidate".into(),
+            capabilities: vec![],
+            paused: None,
+        }),
+    )
+    .await?;
+    assert!(matches!(
+        read_frame(&mut provisional).await?,
+        Some(Message::Hello(_))
+    ));
+    let stranger = h.phone("stranger")?;
+    let mut tls = raw_connect(&h, &stranger).await?;
+    assert_admission_rejection(&mut tls).await?; // admission throttle
+    tokio::time::sleep(Duration::from_millis(1050)).await;
+    let mut tls = raw_connect(&h, &stranger).await?;
+    assert_admission_rejection(&mut tls).await?; // still occupied after throttle expires
+    // Paired clients bypass the provisional slot, but hold a total connection
+    // permit even while waiting for HELLO, as do unfinished TLS handshakes.
+    let mut held = Vec::new();
+    for _ in 0..14 {
+        held.push(raw_connect(&h, &phone).await?);
+    }
+    // Reserve the last permit with a handshake paused before client authentication.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let config = pneud::tls::client_config(&phone.identity, h.core.identity.fingerprint.clone())?;
+    let mut client = rustls::ClientConnection::new(
+        Arc::new(config),
+        rustls::pki_types::ServerName::try_from("pneu.local")?,
+    )?;
+    let mut hello = Vec::new();
+    client.write_tls(&mut hello)?;
+    let mut handshake = tokio::net::TcpStream::connect(&h.address).await?;
+    handshake.write_all(&hello).await?;
+    let mut byte = [0];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), handshake.read(&mut byte)).await??,
+        1
+    );
+    assert!(
+        raw_connect(&h, &stranger).await.is_err(),
+        "all sixteen connection permits held"
+    );
+    drop(held);
+    drop(handshake);
+    drop(provisional);
+    h.stop().await
+}
+
 #[tokio::test]
 async fn known_cert_cannot_claim_another_hello_identity() -> Result<()> {
     let h = Harness::new().await?;
