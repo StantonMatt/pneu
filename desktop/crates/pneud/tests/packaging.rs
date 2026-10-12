@@ -41,7 +41,7 @@ source "$1"
             String::from_utf8_lossy(&output.stderr)
         );
         let calls = std::fs::read_to_string(trace)?;
-        let mut expected = "build\ninstall\ninstall\n--user daemon-reload\n--user reenable pneud.service\n--user is-active --quiet graphical-session.target\n".to_owned();
+        let mut expected = "build\ninstall\ninstall\ninstall\ninstall\ninstall\ninstall\ninstall\ninstall\ninstall\n--user daemon-reload\n--user reenable pneud.service\n--user is-active --quiet graphical-session.target\n".to_owned();
         if active {
             expected.push_str("--user restart pneud.service\n");
         }

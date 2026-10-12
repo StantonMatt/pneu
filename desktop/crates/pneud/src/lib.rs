@@ -9,9 +9,10 @@ mod storage;
 mod store;
 pub mod tls;
 mod transport;
+pub mod ui;
 mod work;
 pub use config::{Config, Paths};
-pub use core::{Core, Event};
+pub use core::{ClipboardTarget, Core, Event};
 pub fn random_hex(bytes: usize) -> String {
     use rand::TryRngCore;
     let mut value = vec![0; bytes];

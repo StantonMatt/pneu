@@ -10,8 +10,12 @@ fn main() -> Result<()> {
     if args.first().is_some_and(|s| s == "clipboard-helper") {
         return pneud::actions::clipboard_helper(args.get(1).context("MIME argument")?.clone());
     }
+    if args.first().is_some_and(|s| s == "ui-window") {
+        return pneud::ui::window::run(Paths::from_env()?);
+    }
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
+        .thread_stack_size(8 * 1024 * 1024)
         .enable_all()
         .build()?
         .block_on(async_main(args))
@@ -19,6 +23,16 @@ fn main() -> Result<()> {
 async fn async_main(args: Vec<String>) -> Result<()> {
     let paths = Paths::from_env()?;
     match args.first().map(String::as_str) {
+        Some("window") => {
+            ipc::request(
+                &paths.socket,
+                Command::ShowWindow {
+                    choose_folder: false,
+                },
+            )
+            .await?;
+            Ok(())
+        }
         Some("pair") => {
             let reply = ipc::request(&paths.socket, Command::Pair).await?;
             let uri = reply["uri"].as_str().context("pairing reply")?;
@@ -81,7 +95,7 @@ async fn async_main(args: Vec<String>) -> Result<()> {
         }
         Some("--help" | "help") => {
             println!(
-                "pneud [run|pair|close-pairing|status|reload|unpair DEVICE|clipboard DEVICE TEXT|discard-clipboard DEVICE]"
+                "pneud [run|window|pair|close-pairing|status|reload|unpair DEVICE|clipboard DEVICE TEXT|discard-clipboard DEVICE]"
             );
             Ok(())
         }
@@ -93,42 +107,42 @@ async fn run(paths: Paths) -> Result<()> {
     // Claim IPC before loading/recovering the data store, so a second daemon
     // cannot recover staging files owned by the running instance.
     let (ipc_listener, _instance_lock) = ipc::bind(&paths.socket)?;
-    let socket = paths.socket.clone();
-    let result = async {
+    async {
         paths.prepare()?;
         let config = Config::load(&paths.config)?;
-        let listener = tokio::net::TcpListener::bind(("::", config.port)).await?;
         let actions = Arc::new(DesktopActions::new(paths.cache.clone()));
-        let core = Core::new(paths, config, actions).await?;
+        let port = config.port;
+        let core = Core::new(paths, config, actions.clone()).await?;
         let (stop, rx) = tokio::sync::watch::channel(false);
-        let ipc = tokio::spawn(ipc::serve(core.clone(), ipc_listener, rx));
-        let mut events = core.subscribe();
-        let event_log = tokio::spawn(async move {
-            loop {
-                match events.recv().await {
-                    Ok(pneud::Event::Error { message, .. }) => eprintln!("pneud: {message}"),
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(_) => break,
+        let ipc = tokio::spawn(Box::pin(ipc::serve(core.clone(), ipc_listener, rx)));
+        let ui = tokio::spawn(Box::pin(pneud::ui::runtime::run(core.clone(),actions.clone(),stop.subscribe())));
+        let signals_core=core.clone();
+        let signals=tokio::spawn(Box::pin(async move {
+            let mut terminate=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            tokio::select! { _=tokio::signal::ctrl_c()=>{},_=terminate.recv()=>{} }
+            signals_core.request_shutdown();Ok::<_,anyhow::Error>(())
+        }));
+        let mut notified=false;
+        let serving=async {
+            let listener=loop {
+                match tokio::net::TcpListener::bind(("::",port)).await {
+                    Ok(listener)=>{core.clear_port_error();break listener;},
+                    Err(error) if error.kind()==std::io::ErrorKind::AddrInUse=>{
+                        core.set_receive_error(Some(pneud::ui::ReceiveError::Port(port)));
+                        if !notified {notified=true;let _=actions.notice(pneud::ui::notifications::Notice::port(port),Vec::new(),None,0,None).await;}
+                        tokio::select! { _=core.wait_shutdown()=>return Ok(()),_=tokio::time::sleep(std::time::Duration::from_secs(30))=>{} }
+                    }
+                    Err(error)=>return Err(error.into()),
                 }
-            }
-        });
-        let server = core.clone().serve(listener, true);
-        tokio::pin!(server);
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        let serving = tokio::select! {
-            result = &mut server => result,
-            _ = tokio::signal::ctrl_c() => { core.request_shutdown(); server.await },
-            _ = terminate.recv() => { core.request_shutdown(); server.await },
-        };
-        let _ = stop.send(true);
-        let _ = ipc.await;
-        event_log.abort();
-        let _ = event_log.await;
+            };
+            core.clone().serve(listener,true).await
+        }.await;
+        let _=stop.send(true);
+        let _=ipc.await;
+        let _=ui.await;
+        signals.abort();let _=signals.await;
         core.shutdown_actions().await?;
         serving
     }
-    .await;
-    let _ = std::fs::remove_file(socket);
-    result
+    .await
 }

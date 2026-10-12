@@ -43,10 +43,15 @@ pub enum Metadata {
 }
 
 pub(crate) const RECENT_TEXT_LIMIT: usize = 64;
+const CACHE_OWNER_LIMIT: usize = 128;
+struct CacheOwner {
+    path: PathBuf,
+    file: crate::storage::OwnedFile,
+}
 #[derive(Clone)]
 pub struct Store {
     connection: Arc<Mutex<Connection>>,
-    _ownership: Arc<fs::File>,
+    _ownership: Arc<StoreOwnership>,
     folder: Folder,
     reserve: Arc<AtomicU64>,
     work: Arc<Work>,
@@ -54,6 +59,9 @@ pub struct Store {
     generation: Arc<AtomicU64>,
     peer_generation: Option<u64>,
     staging_ready: Arc<Mutex<HashSet<(u64, u64)>>>,
+    // Nonpersistent, bounded metadata proof for failed-save previews (no file FDs). A restart or
+    // eviction deliberately leaves retirement to normal cache pruning.
+    cache_owners: Arc<Mutex<HashMap<(Id, Id), CacheOwner>>>,
     #[cfg(test)]
     peer_write_barrier: Arc<Mutex<Option<PeerWriteBarrier>>>,
 }
@@ -61,6 +69,16 @@ pub struct Store {
 struct PeerWriteBarrier {
     entered: tokio::sync::oneshot::Sender<()>,
     release: std::sync::mpsc::Receiver<()>,
+}
+/// Closing a CLOEXEC descriptor is insufficient during another thread's fork:
+/// the child briefly inherits the same flock/open-file description before exec.
+/// Release explicitly when the final daemon owner ends, even if a child still
+/// holds an inherited descriptor. Remaining Store jobs keep this Arc alive.
+struct StoreOwnership(fs::File);
+impl Drop for StoreOwnership {
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
+    }
 }
 /// Immutable authority captured before scheduling work, never refreshed by a
 /// delayed blocking job or by reuse of a device ID after re-pairing.
@@ -123,20 +141,13 @@ impl TextClaim {
     }
     fn release(&mut self) -> Result<()> {
         if let Some(token) = &self.token {
-            let result = self.store.peer_write(self.epoch.clone(), |tx| {
-                tx.execute(
-                    "DELETE FROM receipts WHERE device=? AND id=? AND destination=?",
-                    params![self.device.as_str(), self.text.transfer_id.as_str(), token],
-                )?;
-                Ok(())
-            });
-            if let Err(error) = result {
-                // Revocation removed the old claim. Never acquire cleanup
-                // authority over a replacement pairing, even with the same ID.
-                if error.downcast_ref::<PairingRevoked>().is_none() {
-                    return Err(error);
-                }
-            }
+            release_text_claim(
+                &self.store,
+                self.epoch.clone(),
+                &self.device,
+                &self.text.transfer_id,
+                token,
+            )?;
             self.token.take();
         }
         Ok(())
@@ -170,19 +181,16 @@ impl TextClaim {
 impl Drop for TextClaim {
     fn drop(&mut self) {
         if let Some(token) = self.token.take() {
-            let mut cleanup = TextClaim {
-                work: self.work.take(),
-                epoch: self.epoch.clone(),
-                store: self.store.clone(),
-                device: self.device.clone(),
-                text: self.text.clone(),
-                token: Some(token),
-            };
-            self.store.start_blocking(move |_| {
-                let result = cleanup.release();
-                // On store failure retain the claim until startup cleanup; never
-                // spin/re-enqueue failed cleanup or erase another owner's row.
-                cleanup.token.take();
+            // Only plain data enters the cleanup task. If runtime shutdown drops
+            // the queued closure, it must not drop another TextClaim and recursively
+            // enqueue cleanup. Startup removes any abandoned reservation.
+            let work = self.work.take();
+            let epoch = self.epoch.clone();
+            let device = self.device.clone();
+            let id = self.text.transfer_id.clone();
+            self.store.start_blocking(move |store| {
+                let _work = work;
+                let result = release_text_claim(store, epoch, &device, &id, &token);
                 if let Err(error) = &result {
                     eprintln!("text claim cleanup deferred: {error}");
                 }
@@ -190,6 +198,29 @@ impl Drop for TextClaim {
             });
         }
     }
+}
+fn release_text_claim(
+    store: &Store,
+    epoch: PeerEpoch,
+    device: &Id,
+    id: &Id,
+    token: &str,
+) -> Result<()> {
+    let result = store.peer_write(epoch, |tx| {
+        tx.execute(
+            "DELETE FROM receipts WHERE device=? AND id=? AND destination=?",
+            params![device.as_str(), id.as_str(), token],
+        )?;
+        Ok(())
+    });
+    if let Err(error) = result {
+        // Revocation removed the old claim. Never acquire cleanup authority
+        // over a replacement pairing, even with the same ID.
+        if error.downcast_ref::<PairingRevoked>().is_none() {
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 fn record_text(tx: &Transaction<'_>, device: &Id, text: &Clipboard) -> Result<()> {
     tx.execute("INSERT INTO clipboard_clock VALUES (?,?) ON CONFLICT(device) DO UPDATE SET created_at=max(created_at,excluded.created_at)", params![device.as_str(), text.created_at as i64])?;
@@ -228,6 +259,7 @@ impl Store {
           CREATE TABLE IF NOT EXISTS outgoing(seq INTEGER PRIMARY KEY AUTOINCREMENT,device TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,payload TEXT NOT NULL,retry_at INTEGER NOT NULL DEFAULT 0);
           CREATE TABLE IF NOT EXISTS clipboard_clock(device TEXT PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,created_at INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS clipboard_recent(device TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,id TEXT NOT NULL,meta TEXT NOT NULL,PRIMARY KEY(device,id));
+          CREATE TABLE IF NOT EXISTS failed_cache(device TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,id TEXT NOT NULL,meta TEXT NOT NULL,destination TEXT NOT NULL,PRIMARY KEY(device,id));
           CREATE TABLE IF NOT EXISTS staging_folders(path TEXT PRIMARY KEY);
           CREATE TABLE IF NOT EXISTS pairing_epoch(singleton INTEGER PRIMARY KEY CHECK(singleton=1),generation INTEGER NOT NULL,last_outgoing_at INTEGER NOT NULL DEFAULT 0);
           INSERT OR IGNORE INTO pairing_epoch(singleton,generation) VALUES (1,0);")?;
@@ -289,7 +321,7 @@ impl Store {
         folder.file.sync_all()?;
         Ok(Self {
             connection: Arc::new(Mutex::new(conn)),
-            _ownership: Arc::new(lock),
+            _ownership: Arc::new(StoreOwnership(lock)),
             folder,
             reserve: Arc::new(AtomicU64::new(16 * 1024 * 1024)),
             work: Arc::new(Work::default()),
@@ -297,6 +329,7 @@ impl Store {
             generation: Arc::new(AtomicU64::new(generation as u64)),
             peer_generation: None,
             staging_ready: Arc::new(Mutex::new(HashSet::new())),
+            cache_owners: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             peer_write_barrier: Arc::new(Mutex::new(None)),
         })
@@ -450,7 +483,10 @@ impl Store {
             let result = store.locked(|c| {
                 let tx = c.transaction()?;
                 epoch.check(&tx)?;
-                tx.execute("DELETE FROM peers WHERE id=?", [device.as_str()])?;
+                ensure!(
+                    tx.execute("DELETE FROM peers WHERE id=?", [device.as_str()])? == 1,
+                    "pairing was not removed"
+                );
                 tx.execute(
                     "UPDATE pairing_epoch SET generation=generation+1 WHERE singleton=1",
                     [],
@@ -574,6 +610,10 @@ impl Store {
                 "staging size mismatch"
             );
             stage.0.file.sync_all()?;
+            let mut obsolete_cache = None;
+            // Serialize journal changes and ownership publication/retirement.
+            let mut owners = store.cache_owners.lock().expect("cache ownership");
+            let key = (device.clone(), begin.transfer_id.clone());
             let result = store.peer_write(epoch, |tx| {
                 if let Some((meta, _)) =
                     receipt_row(tx, device.as_str(), begin.transfer_id.as_str())?
@@ -581,6 +621,7 @@ impl Store {
                     ensure!(meta == Metadata::File(begin.clone()), ReceiptConflict);
                     return Ok(false);
                 }
+                validate_failed_file(tx, &device, &begin)?;
                 capacity(&store.folder, store.reserve.load(Ordering::SeqCst))?;
                 stage.place()?;
                 tx.execute(
@@ -592,11 +633,78 @@ impl Store {
                         stage.destination_path()?.to_str()
                     ],
                 )?;
+                if let Some(path) = failed_file(tx, &device, &begin)?.map(|(_, path)| path) {
+                    tx.execute(
+                        "DELETE FROM failed_cache WHERE device=? AND id=?",
+                        params![device.as_str(), begin.transfer_id.as_str()],
+                    )?;
+                    obsolete_cache = Some(path);
+                }
                 Ok(true)
             });
+            if matches!(result, Ok(true))
+                && let Some(path) = obsolete_cache
+            {
+                // A journal pathname alone never authorises deletion. Keep the
+                // original directory and verify the recorded inode/metadata.
+                if let Some(owner) = owners.remove(&key)
+                    && owner.path == path
+                {
+                    let _ = owner.file.remove();
+                }
+            }
             // Never roll back a final file, nor infer ownership after restart.
             // A crash/failure after rename but before commit may leave a duplicate
             // on replay; only disposable staging is automatically deleted.
+            let _ = stage.cleanup();
+            result
+        })
+        .await
+    }
+    /// Retain a failed folder save without minting a receipt. A later phone
+    /// retry must still attempt the folder save.
+    pub async fn commit_cache(
+        &self,
+        device: Id,
+        verified: VerifiedFile,
+        stage: Stage,
+    ) -> Result<bool> {
+        let epoch = self.peer_epoch(&device);
+        self.blocking(move |store| {
+            let begin = verified.metadata();
+            ensure!(
+                stage.0.file.metadata()?.len() == begin.size,
+                "cache staging size mismatch"
+            );
+            stage.0.file.sync_all()?;
+            let mut owners = store.cache_owners.lock().expect("cache ownership");
+            let key = (device.clone(), begin.transfer_id.clone());
+            let result = store.peer_write(epoch, |tx| {
+                if let Some((meta, _)) = receipt_row(tx, device.as_str(), begin.transfer_id.as_str())? {
+                    ensure!(meta == Metadata::File(begin.clone()), ReceiptConflict);
+                    return Ok(false);
+                }
+                validate_failed_file(tx, &device, &begin)?;
+                if let Some((_, path)) = failed_file(tx, &device, &begin)?
+                    && owners.get(&key).is_some_and(|owner|
+                        owner.path == path && owner.file.matches_path(&path).unwrap_or(false)) {
+                    return Ok(false);
+                }
+                capacity(&store.folder, store.reserve.load(Ordering::SeqCst))?;
+                stage.place()?;
+                tx.execute("INSERT INTO failed_cache(device,id,meta,destination) VALUES (?,?,?,?) ON CONFLICT(device,id) DO UPDATE SET destination=excluded.destination",
+                    params![device.as_str(),begin.transfer_id.as_str(),serde_json::to_string(&Metadata::File(begin.clone()))?,stage.destination_path()?.to_str()])?;
+                Ok(true)
+            });
+            if matches!(result, Ok(true)) {
+                // Publish evidence only after the placement AND journal commit
+                // succeeded. Failure to record identity merely skips retirement.
+                if let (Ok(path), Ok(file)) = (stage.destination_path(), stage.record_placed()) {
+                    if owners.len() == CACHE_OWNER_LIMIT && !owners.contains_key(&key)
+                        && let Some(old) = owners.keys().next().cloned() { owners.remove(&old); }
+                    owners.insert(key, CacheOwner { path, file });
+                }
+            }
             let _ = stage.cleanup();
             result
         })
@@ -613,6 +721,12 @@ impl Store {
         self.blocking(move |store| {
             store.peer_write(epoch.clone(), |tx| {
                 let expected = Metadata::Text((&text).into());
+                let cached: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM failed_cache WHERE device=? AND id=?)",
+                    params![device.as_str(), text.transfer_id.as_str()],
+                    |r| r.get(0),
+                )?;
+                ensure!(!cached, ReceiptConflict);
                 if let Some((previous, complete)) =
                     receipt_row(tx, device.as_str(), text.transfer_id.as_str())?
                 {
@@ -707,6 +821,17 @@ impl Store {
     }
     /// Local timestamp assignment and enqueue share one peer write transaction.
     pub async fn enqueue_clipboard(&self, device: Id, text: String) -> Result<Clipboard> {
+        self.prepare_clipboard(device, text, true).await
+    }
+    pub async fn ephemeral_clipboard(&self, device: Id, text: String) -> Result<Clipboard> {
+        self.prepare_clipboard(device, text, false).await
+    }
+    async fn prepare_clipboard(
+        &self,
+        device: Id,
+        text: String,
+        persist: bool,
+    ) -> Result<Clipboard> {
         let epoch = self.peer_epoch(&device);
         self.blocking(move |store| {
             store.peer_write(epoch, |tx| {
@@ -721,7 +846,15 @@ impl Store {
                     created_at: crate::now_ms().max((previous as u64).saturating_add(1)),
                     origin: ClipboardOrigin::Clipboard,
                 };
-                replace_outgoing(store, tx, &device, &text)?;
+                if persist {
+                    replace_outgoing(store, tx, &device, &text)?;
+                } else {
+                    pneu_proto::encode_frame(&pneu_proto::Message::Clipboard(text.clone()))?;
+                    tx.execute(
+                        "UPDATE pairing_epoch SET last_outgoing_at=? WHERE singleton=1",
+                        [text.created_at as i64],
+                    )?;
+                }
                 Ok(text)
             })
         })
@@ -829,6 +962,27 @@ fn capacity(folder: &Folder, reserve: u64) -> Result<()> {
     );
     Ok(())
 }
+fn failed_file(
+    c: &Connection,
+    device: &Id,
+    begin: &FileBegin,
+) -> Result<Option<(Metadata, PathBuf)>> {
+    let row: Option<(String, String)> = c
+        .query_row(
+            "SELECT meta,destination FROM failed_cache WHERE device=? AND id=?",
+            params![device.as_str(), begin.transfer_id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    row.map(|(meta, path)| Ok((serde_json::from_str(&meta)?, PathBuf::from(path))))
+        .transpose()
+}
+fn validate_failed_file(c: &Connection, device: &Id, begin: &FileBegin) -> Result<()> {
+    if let Some((meta, _)) = failed_file(c, device, begin)? {
+        ensure!(meta == Metadata::File(begin.clone()), ReceiptConflict);
+    }
+    Ok(())
+}
 fn receipt_row(c: &Connection, device: &str, id: &str) -> Result<Option<(Metadata, bool)>> {
     let row: Option<(String, bool)> = c.query_row("SELECT meta,json_extract(meta,'$.operation')!='Text' FROM receipts WHERE device=? AND id=? UNION ALL SELECT meta,1 FROM clipboard_recent WHERE device=? AND id=?", params![device,id,device,id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
     row.map(|(m, complete)| Ok((serde_json::from_str(&m)?, complete)))
@@ -880,6 +1034,20 @@ mod tests {
             created_at: 0,
             source_media_id: None,
         }
+    }
+    // Join completion can precede runtime teardown of the job's lock-owning
+    // environment. Restart fixtures wait for every owner, not just the result.
+    async fn close_for_restart(store: Store) -> Result<()> {
+        store.drain().await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while Arc::strong_count(&store._ownership) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("store jobs retained restart ownership")?;
+        drop(store);
+        Ok(())
     }
     async fn fixture() -> Result<(tempfile::TempDir, Store, Id)> {
         let dir = tempfile::tempdir()?;
@@ -1012,6 +1180,46 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    async fn restart_releases_lock_even_while_concurrent_child_is_before_exec() -> Result<()> {
+        use std::os::{fd::AsRawFd, unix::process::CommandExt};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (dir, store, _) = fixture().await?;
+        let lock_fd = store._ownership.0.as_raw_fd();
+        let (parent, child_control) = std::os::unix::net::UnixStream::pair()?;
+        parent.set_nonblocking(true)?;
+        let mut parent = tokio::net::UnixStream::from_std(parent)?;
+        let child = tokio::task::spawn_blocking(move || -> Result<()> {
+            let control = child_control.as_raw_fd();
+            let mut command = std::process::Command::new("/bin/true");
+            // Only async-signal-safe syscalls in the child; this forces the fork
+            // window that concurrent D-Bus test process launches can otherwise hit.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::fcntl(lock_fd, libc::F_GETFD) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let mut byte = 1u8;
+                    if libc::write(control, (&byte as *const u8).cast(), 1) != 1
+                        || libc::read(control, (&mut byte as *mut u8).cast(), 1) != 1
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let status = command.spawn()?.wait()?;
+            anyhow::ensure!(status.success(), "test child failed");
+            Ok(())
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), parent.read_u8()).await??;
+        close_for_restart(store).await?;
+        let reopened = Store::open(&dir.path().join("state.sqlite3"));
+        parent.write_u8(1).await?;
+        child.await??;
+        reopened?.drain().await;
+        Ok(())
+    }
+    #[tokio::test]
     async fn pairing_generation_and_outgoing_clock_survive_restart() -> Result<()> {
         let (dir, store, device) = fixture().await?;
         let generation = store.generation.load(Ordering::SeqCst);
@@ -1022,7 +1230,7 @@ mod tests {
             .pair(device.clone(), Hash::new(crate::random_hex(32))?)
             .await?;
         store.drain().await;
-        drop(store);
+        close_for_restart(store).await?;
         let store = Store::open(&dir.path().join("state.sqlite3"))?;
         assert_eq!(store.generation.load(Ordering::SeqCst), generation + 2);
         let clipboard = store
@@ -1044,7 +1252,7 @@ mod tests {
             })
             .await?;
         store.drain().await;
-        drop(store);
+        close_for_restart(store).await?;
         let store = Store::open(&dir.path().join("state.sqlite3"))?;
         let newest = store
             .enqueue_clipboard(device.clone(), "new local text".into())
@@ -1137,7 +1345,7 @@ mod tests {
         assert_eq!(count, RECENT_TEXT_LIMIT as i64);
         assert!(!meta.contains("clipboard secret"));
         store.drain().await;
-        drop(store);
+        close_for_restart(store).await?;
         let store = Store::open(&dir.path().join("state.sqlite3"))?;
         assert!(store.text_is_stale(device.clone(), first).await?);
         assert!(!store.text_is_stale(device, text(101)).await?);
@@ -1185,7 +1393,7 @@ mod tests {
             )?;
             symlink(&external, path.join(".pneu-staging/link"))?;
         }
-        drop(store);
+        close_for_restart(store).await?;
         let store = Store::open(&dir.path().join("state.sqlite3"))?;
         store
             .clean_staging(vec![dir.path().join("unrelated-current-config")])
@@ -1208,7 +1416,7 @@ mod tests {
         fs::remove_file(&placed)?;
         fs::write(&placed, b"foreign replacement")?;
         store.drain().await;
-        drop(store);
+        close_for_restart(store).await?;
         let store = Store::open(&dir.path().join("state.sqlite3"))?;
         store.clean_staging(vec![]).await?;
         assert_eq!(
@@ -1216,6 +1424,326 @@ mod tests {
             Some((Metadata::File(meta), true))
         );
         assert_eq!(fs::read(placed)?, b"foreign replacement");
+        Ok(())
+    }
+    #[tokio::test]
+    async fn cache_retry_reuses_only_unchanged_identity_and_keeps_verified_replacement()
+    -> Result<()> {
+        for change in [
+            "none",
+            "truncate",
+            "edit",
+            "replace",
+            "symlink",
+            "directory",
+            "missing",
+            "parent",
+            "parent_symlink",
+            "restart",
+            "evicted",
+        ] {
+            let (dir, mut store, device) = fixture().await?;
+            let cache = dir.path().join("cache");
+            let staged = stage(&store, cache.clone(), b"owned").await?;
+            let old_path = staged.destination_path()?;
+            let meta = begin(b"owned");
+            assert!(
+                store
+                    .commit_cache(device.clone(), VerifiedFile::fixture(meta.clone()), staged)
+                    .await?
+            );
+            let foreign = dir.path().join("foreign");
+            fs::write(&foreign, b"foreign")?;
+            match change {
+                "truncate" => {
+                    fs::File::options()
+                        .write(true)
+                        .open(&old_path)?
+                        .set_len(1)?;
+                }
+                "edit" => {
+                    let original = fs::metadata(&old_path)?.modified()?;
+                    fs::write(&old_path, b"other")?;
+                    // Even restoring mtime cannot conceal the in-place edit.
+                    fs::File::open(&old_path)?
+                        .set_times(fs::FileTimes::new().set_modified(original))?;
+                }
+                "replace" | "symlink" | "directory" | "missing" => {
+                    fs::remove_file(&old_path)?;
+                    match change {
+                        "replace" => {
+                            fs::copy(&foreign, &old_path)?;
+                        }
+                        "symlink" => symlink(&foreign, &old_path)?,
+                        "directory" => fs::create_dir(&old_path)?,
+                        _ => {}
+                    }
+                }
+                "parent" | "parent_symlink" => {
+                    fs::rename(&cache, dir.path().join("moved"))?;
+                    if change == "parent_symlink" {
+                        let external = dir.path().join("external");
+                        fs::create_dir(&external)?;
+                        symlink(&external, &cache)?;
+                    } else {
+                        fs::create_dir(&cache)?;
+                    }
+                    fs::write(&old_path, b"foreign")?;
+                }
+                "restart" => {
+                    close_for_restart(store).await?;
+                    store = Store::open(&dir.path().join("state.sqlite3"))?;
+                }
+                "evicted" => store.cache_owners.lock().unwrap().clear(),
+                _ => {}
+            }
+            let retry_folder = if change == "parent_symlink" {
+                dir.path().join("fresh-cache")
+            } else {
+                cache
+            };
+            let retry = stage(&store, retry_folder, b"owned").await?;
+            let retry_path = retry.destination_path()?;
+            assert_ne!(retry_path, old_path);
+            let kept = store
+                .commit_cache(device.clone(), VerifiedFile::fixture(meta.clone()), retry)
+                .await?;
+            assert_eq!(kept, change != "none", "{change}");
+            let destination = store
+                .call(move |c| Ok(failed_file(c, &device, &meta)?.unwrap().1))
+                .await?;
+            if kept {
+                assert_eq!(destination, retry_path);
+                assert_eq!(fs::read(&retry_path)?, b"owned");
+            } else {
+                assert_eq!(destination, old_path);
+                assert!(!retry_path.exists());
+            }
+            match change {
+                "truncate" => assert_eq!(fs::read(&old_path)?, b"o"),
+                "edit" => assert_eq!(fs::read(&old_path)?, b"other"),
+                "replace" | "parent" | "parent_symlink" => {
+                    assert_eq!(fs::read(&old_path)?, b"foreign")
+                }
+                "symlink" => {
+                    assert!(fs::symlink_metadata(&old_path)?.file_type().is_symlink())
+                }
+                "directory" => assert!(old_path.is_dir()),
+                "missing" => assert!(!old_path.exists()),
+                _ => assert_eq!(fs::read(&old_path)?, b"owned"),
+            }
+            assert_eq!(fs::read(&foreign)?, b"foreign");
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn failed_cache_retirement_requires_live_inode_and_directory_ownership() -> Result<()> {
+        for replacement in [
+            "none",
+            "file",
+            "symlink",
+            "parent",
+            "parent_symlink",
+            "missing",
+            "restart",
+        ] {
+            let (dir, mut store, device) = fixture().await?;
+            let cache = dir.path().join("cache");
+            let staged = stage(&store, cache.clone(), b"owned").await?;
+            let path = staged.destination_path()?;
+            let name = path.file_name().unwrap().to_owned();
+            let meta = begin(b"owned");
+            assert!(
+                store
+                    .commit_cache(device.clone(), VerifiedFile::fixture(meta.clone()), staged)
+                    .await?
+            );
+            let foreign = dir.path().join("foreign");
+            fs::write(&foreign, b"foreign")?;
+            match replacement {
+                "file" | "symlink" | "missing" => {
+                    fs::remove_file(&path)?;
+                    match replacement {
+                        "file" => fs::write(&path, b"replacement")?,
+                        "symlink" => symlink(&foreign, &path)?,
+                        _ => {}
+                    }
+                }
+                "parent" | "parent_symlink" => {
+                    fs::rename(&cache, dir.path().join("moved"))?;
+                    if replacement == "parent" {
+                        fs::create_dir(&cache)?;
+                    } else {
+                        fs::create_dir(dir.path().join("external"))?;
+                        symlink(dir.path().join("external"), &cache)?;
+                    }
+                    fs::write(&path, b"replacement")?;
+                }
+                "restart" => {
+                    close_for_restart(store).await?;
+                    store = Store::open(&dir.path().join("state.sqlite3"))?;
+                }
+                _ => {}
+            }
+            let retry = stage(&store, dir.path().join("save"), b"owned").await?;
+            assert!(
+                store
+                    .commit_file(device.clone(), VerifiedFile::fixture(meta.clone()), retry)
+                    .await?
+            );
+            assert!(store.receipt(device, meta.transfer_id).await?.is_some());
+            match replacement {
+                "none" | "missing" => assert!(!path.exists()),
+                "file" => assert_eq!(fs::read(&path)?, b"replacement"),
+                "symlink" => assert!(fs::symlink_metadata(&path)?.file_type().is_symlink()),
+                "parent" | "parent_symlink" => {
+                    assert_eq!(fs::read(&path)?, b"replacement");
+                    assert!(!dir.path().join("moved").join(name).exists());
+                }
+                "restart" => assert_eq!(fs::read(&path)?, b"owned"),
+                _ => unreachable!(),
+            }
+            assert_eq!(fs::read(foreign)?, b"foreign");
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn failed_cache_ownership_is_bounded_and_eviction_skips_retirement() -> Result<()> {
+        let (dir, store, device) = fixture().await?;
+        let mut cached = Vec::new();
+        for _ in 0..=CACHE_OWNER_LIMIT {
+            let staged = stage(&store, dir.path().join("cache"), b"owned").await?;
+            let path = staged.destination_path()?;
+            let meta = begin(b"owned");
+            store
+                .commit_cache(device.clone(), VerifiedFile::fixture(meta.clone()), staged)
+                .await?;
+            cached.push((meta, path));
+        }
+        let (meta, path) = {
+            let owners = store.cache_owners.lock().unwrap();
+            assert_eq!(owners.len(), CACHE_OWNER_LIMIT);
+            cached
+                .into_iter()
+                .find(|(meta, _)| !owners.contains_key(&(device.clone(), meta.transfer_id.clone())))
+                .unwrap()
+        };
+        let retry = stage(&store, dir.path().join("save"), b"owned").await?;
+        store
+            .commit_file(device, VerifiedFile::fixture(meta), retry)
+            .await?;
+        assert_eq!(fs::read(path)?, b"owned");
+        Ok(())
+    }
+    #[tokio::test]
+    async fn cache_evidence_never_pins_expired_files_across_pairing_lifecycles() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        for lifecycle in ["prune", "unpair", "repair"] {
+            let (dir, store, device) = fixture().await?;
+            let cache = dir.path().join("cache");
+            let staged = store
+                .create_stage(
+                    cache.clone(),
+                    format!("received-{}", crate::random_hex(16)),
+                    5,
+                )
+                .await?;
+            (&staged.0.file).write_all(b"owned")?;
+            let path = staged.destination_path()?;
+            store
+                .commit_cache(
+                    device.clone(),
+                    VerifiedFile::fixture(begin(b"owned")),
+                    staged,
+                )
+                .await?;
+            store.drain().await;
+            let meta = fs::metadata(&path)?;
+            if lifecycle == "unpair" {
+                store.unpair_then(device.clone(), |_| {}).await?;
+            }
+            if lifecycle == "repair" {
+                store
+                    .pair(device, Hash::new(crate::random_hex(32))?)
+                    .await?;
+            }
+            let folder = Folder::open(&cache, false)?;
+            crate::storage::prune_cache(
+                &folder,
+                std::time::SystemTime::now() + std::time::Duration::from_secs(1),
+            )?;
+            assert!(!path.exists());
+            // On Linux an open descriptor pins the deleted inode and its blocks.
+            // Wait for finite stage-cleanup jobs, then prove no owner retains it.
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let held = fs::read_dir("/proc/self/fd")?
+                        .filter_map(|e| e.ok())
+                        .any(|entry| {
+                            fs::metadata(entry.path())
+                                .is_ok_and(|m| (m.dev(), m.ino()) == (meta.dev(), meta.ino()))
+                        });
+                    if !held {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await??;
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn cache_retirement_preserves_files_modified_since_commit() -> Result<()> {
+        for change_size in [true, false] {
+            let (dir, store, device) = fixture().await?;
+            let staged = stage(&store, dir.path().join("cache"), b"owned").await?;
+            let path = staged.destination_path()?;
+            let meta = begin(b"owned");
+            store
+                .commit_cache(device.clone(), VerifiedFile::fixture(meta.clone()), staged)
+                .await?;
+            if change_size {
+                fs::write(&path, b"modified by another user action")?;
+            } else {
+                fs::File::open(&path)?.set_times(
+                    fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH),
+                )?;
+            }
+            let expected = fs::read(&path)?;
+            let retry = stage(&store, dir.path().join("saved"), b"owned").await?;
+            store
+                .commit_file(device, VerifiedFile::fixture(meta), retry)
+                .await?;
+            assert_eq!(fs::read(path)?, expected);
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn stage_cleanup_and_drop_preserve_replaced_entries() -> Result<()> {
+        for explicit in [false, true] {
+            for link in [false, true] {
+                let (dir, store, _) = fixture().await?;
+                let staged = stage(&store, dir.path().join("save"), b"owned").await?;
+                let path = staged.path()?;
+                let foreign = dir.path().join("foreign");
+                fs::write(&foreign, b"foreign")?;
+                fs::remove_file(&path)?;
+                if link {
+                    symlink(&foreign, &path)?;
+                } else {
+                    fs::write(&path, b"foreign")?;
+                }
+                if explicit {
+                    staged.cleanup()?;
+                }
+                drop(staged);
+                store.drain().await;
+                assert_eq!(fs::read(&path)?, b"foreign");
+                assert_eq!(fs::symlink_metadata(path)?.file_type().is_symlink(), link);
+                assert_eq!(fs::read(foreign)?, b"foreign");
+            }
+        }
         Ok(())
     }
     #[tokio::test]
@@ -1484,6 +2012,56 @@ mod tests {
         );
         Ok(())
     }
+    #[test]
+    fn shutdown_drops_queued_claim_cleanup_without_recursively_rescheduling() -> Result<()> {
+        use std::time::Duration;
+        let directory = tempfile::tempdir()?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()?;
+        let store = Store::open(&directory.path().join("state.sqlite3"))?;
+        let device = Id::new(crate::random_hex(16))?;
+        let pending = text(1);
+        let claim = runtime.block_on(async {
+            store
+                .pair(device.clone(), Hash::new(crate::random_hex(32))?)
+                .await?;
+            store
+                .claim_text(device.clone(), pending.clone())
+                .await?
+                .context("claim")
+        })?;
+        // Occupy the blocking worker so cleanup remains queued at shutdown.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = runtime.spawn_blocking(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2))?;
+        runtime.block_on(async {
+            drop(claim);
+        });
+        runtime.shutdown_timeout(Duration::from_millis(20));
+        release_tx.send(())?;
+        // Joining proves the occupied worker exits, even though the runtime is gone.
+        let observer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        observer.block_on(blocker)?;
+        observer.block_on(store.drain());
+        assert_eq!(store.work.active(), 0);
+        observer.block_on(close_for_restart(store))?;
+        let reopened = Store::open(&directory.path().join("state.sqlite3"))?;
+        assert!(
+            observer
+                .block_on(reopened.receipt(device, pending.transfer_id))?
+                .is_none()
+        );
+        Ok(())
+    }
     #[tokio::test]
     async fn obsolete_claim_cleanup_cannot_delete_same_id_after_repair() -> Result<()> {
         let (_dir, store, device) = fixture().await?;
@@ -1532,7 +2110,7 @@ mod tests {
             .unwrap();
         abandoned.token.take(); // Simulate process death before the effect/finalization.
         drop(abandoned);
-        drop(store);
+        close_for_restart(store).await?;
         let store = Store::open(&dir.path().join("state.sqlite3"))?;
         assert!(
             store
@@ -1562,7 +2140,7 @@ mod tests {
         }).await?;
         fs::write(folder.join(".pneu-staging/orphan"), b"partial")?;
         store.drain().await;
-        drop(store);
+        close_for_restart(store).await?;
         let store = Store::open(&dir.path().join("state.sqlite3"))?;
         store.clean_staging(vec![]).await?;
         assert_eq!(fs::read_dir(folder.join(".pneu-staging"))?.count(), 0);

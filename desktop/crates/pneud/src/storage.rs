@@ -183,7 +183,13 @@ fn wipe(directory: &File) -> Result<()> {
             );
             unlink(directory, name, AtFlags::REMOVEDIR)?;
         } else {
-            unlink(directory, name, AtFlags::empty())?;
+            let file = File::from(rustix::fs::openat(
+                directory,
+                name,
+                OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?);
+            remove_file(directory, name, &file)?;
         }
     }
     Ok(())
@@ -231,6 +237,13 @@ impl Stage {
             cleanup: Mutex::new(None),
         })))
     }
+    pub fn record_placed(&self) -> Result<OwnedFile> {
+        Ok(OwnedFile {
+            folder: self.0.folder.clone(),
+            name: self.0.destination.clone(),
+            identity: FileIdentity::read(&self.0.file)?,
+        })
+    }
     pub fn destination_path(&self) -> Result<PathBuf> {
         Ok(self.0.folder.path()?.join(&self.0.destination))
     }
@@ -239,7 +252,7 @@ impl Stage {
         Ok(self.0.directory.path()?.join(&self.0.name))
     }
     pub fn cleanup(&self) -> Result<()> {
-        unlink(&self.0.directory.file, &self.0.name, AtFlags::empty())?;
+        remove_file(&self.0.directory.file, &self.0.name, &self.0.file)?;
         self.0.directory.file.sync_all()?;
         self.0.cleanup.lock().expect("stage cleanup").take();
         Ok(())
@@ -279,8 +292,13 @@ impl Drop for StageInner {
     fn drop(&mut self) {
         let directory = self.directory.clone();
         let name = self.name.clone();
+        // If FD duplication fails, startup can sweep the disposable stage;
+        // never delete a pathname without the original ownership evidence.
+        let Ok(file) = self.file.try_clone() else {
+            return;
+        };
         let clean = move || {
-            unlink(&directory.file, &name, AtFlags::empty())?;
+            remove_file(&directory.file, &name, &file)?;
             directory.file.sync_all()?;
             Ok(())
         };
@@ -301,19 +319,128 @@ impl Drop for StageInner {
         let _ = clean();
     }
 }
+/// Unlink only the entry still naming our retained inode, relative to its
+/// original directory. Retaining the file FD prevents inode-number reuse.
+pub(crate) fn remove_file(
+    parent: &File,
+    name: impl rustix::path::Arg + Clone,
+    file: &File,
+) -> Result<()> {
+    remove_owned(parent, name, file, AtFlags::empty())
+}
 pub(crate) fn remove_directory(
     parent: &File,
     name: impl rustix::path::Arg + Clone,
     directory: &File,
 ) -> Result<()> {
-    let own = rustix::fs::fstat(directory)?;
+    remove_owned(parent, name, directory, AtFlags::REMOVEDIR)
+}
+fn remove_owned(
+    parent: &File,
+    name: impl rustix::path::Arg + Clone,
+    file: &File,
+    flags: AtFlags,
+) -> Result<()> {
+    let own = rustix::fs::fstat(file)?;
     match rustix::fs::statat(parent, name.clone(), AtFlags::SYMLINK_NOFOLLOW) {
         Ok(named) if (own.st_dev, own.st_ino) == (named.st_dev, named.st_ino) => {
-            unlink(parent, name, AtFlags::REMOVEDIR)
+            unlink(parent, name, flags)
         }
         Ok(_) | Err(rustix::io::Errno::NOENT) => Ok(()),
         Err(e) => Err(e.into()),
     }
+}
+/// Recorded ownership evidence without an open file that could pin unlinked
+/// cache blocks. Keep only the directory anchor; reopen without following links
+/// and verify identity and unchanged metadata when retirement is requested.
+pub(crate) struct OwnedFile {
+    folder: Folder,
+    name: String,
+    identity: FileIdentity,
+}
+#[derive(PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+impl FileIdentity {
+    fn read(file: &File) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        ensure!(meta.is_file(), "placed file must be regular");
+        Ok(Self {
+            device: meta.dev(),
+            inode: meta.ino(),
+            size: meta.len(),
+            modified: (meta.mtime(), meta.mtime_nsec()),
+            changed: (meta.ctime(), meta.ctime_nsec()),
+        })
+    }
+}
+impl OwnedFile {
+    /// A journal path is reusable only while it names the original directory
+    /// and the unchanged regular file. Never follow a replaced ancestor/link.
+    pub fn matches_path(&self, path: &Path) -> Result<bool> {
+        if path.file_name() != Some(std::ffi::OsStr::new(&self.name)) {
+            return Ok(false);
+        }
+        let folder = Folder::open(path.parent().context("cache parent")?, false)?;
+        if folder.identity()? != self.folder.identity()? {
+            return Ok(false);
+        }
+        Ok(self.open_matching()?.is_some())
+    }
+    fn open_matching(&self) -> Result<Option<File>> {
+        let file = match rustix::fs::openat(
+            &*self.folder.file,
+            &self.name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => File::from(fd),
+            Err(rustix::io::Errno::NOENT | rustix::io::Errno::LOOP) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        Ok((FileIdentity::read(&file)? == self.identity).then_some(file))
+    }
+    pub fn remove(self) -> Result<()> {
+        let Some(file) = self.open_matching()? else {
+            return Ok(());
+        };
+        remove_file(&self.folder.file, &self.name, &file)?;
+        self.folder.file.sync_all()?;
+        Ok(())
+    }
+}
+/// Retention policy selects old regular cache files, then anchors its checks and
+/// deletion to opened descriptors. This is also the restart orphan sweep.
+pub(crate) fn prune_cache(folder: &Folder, cutoff: std::time::SystemTime) -> Result<()> {
+    for entry in rustix::fs::Dir::read_from(&*folder.file)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if !name.to_bytes().starts_with(b"received-") {
+            continue;
+        }
+        let file = match rustix::fs::openat(
+            &*folder.file,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => File::from(fd),
+            Err(rustix::io::Errno::NOENT | rustix::io::Errno::LOOP) => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let meta = file.metadata()?;
+        if meta.is_file() && meta.modified()? < cutoff {
+            remove_file(&folder.file, name, &file)?;
+        }
+    }
+    folder.file.sync_all()?;
+    Ok(())
 }
 pub(crate) fn unlink(dir: &File, name: impl rustix::path::Arg, flags: AtFlags) -> Result<()> {
     match rustix::fs::unlinkat(dir, name, flags) {
@@ -374,6 +501,39 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn cache_pruning_is_anchored_and_selects_only_old_regular_received_files() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cache = dir.path().join("cache");
+        std::fs::create_dir(&cache)?;
+        let folder = Folder::open(&cache, false)?;
+        std::fs::write(cache.join("received-old"), b"old")?;
+        File::open(cache.join("received-old"))?
+            .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))?;
+        std::fs::write(cache.join("received-new"), b"new")?;
+        std::fs::write(cache.join("unrelated"), b"keep")?;
+        std::os::unix::fs::symlink(cache.join("unrelated"), cache.join("received-link"))?;
+        std::fs::create_dir(cache.join("received-directory"))?;
+        let moved = dir.path().join("moved");
+        std::fs::rename(&cache, &moved)?;
+        std::fs::create_dir(&cache)?;
+        std::fs::write(cache.join("received-old"), b"foreign")?;
+        prune_cache(
+            &folder,
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
+        )?;
+        assert!(!moved.join("received-old").exists());
+        assert_eq!(std::fs::read(moved.join("received-new"))?, b"new");
+        assert_eq!(std::fs::read(moved.join("unrelated"))?, b"keep");
+        assert!(
+            std::fs::symlink_metadata(moved.join("received-link"))?
+                .file_type()
+                .is_symlink()
+        );
+        assert!(moved.join("received-directory").is_dir());
+        assert_eq!(std::fs::read(cache.join("received-old"))?, b"foreign");
+        Ok(())
+    }
     #[test]
     fn cleanup_and_reuse_never_chmod_existing_staging_roots() -> Result<()> {
         let dir = tempfile::tempdir()?;

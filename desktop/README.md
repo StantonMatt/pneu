@@ -8,15 +8,20 @@ and framing in `pneu-proto`. Nothing in this directory installs automatically.
 cd desktop
 # This workspace's dependency cache is writable in the worker sandbox.
 export CARGO_HOME="$PWD/target/cargo-home"
+export QMAKE=qmake6 # Qt 6 development tools are required for the native backend
 heavy cargo test
 heavy cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 heavy cargo build --release -p pneud -p pneu-sim
 ```
 
-Run `pneud run`, then `pneud pair` in another terminal. Pairing prints the URI,
+Run `pneud run` to start the daemon and tray. An unpaired daemon opens its
+pairing window automatically; tray activation or `pneud window` opens the same
+window later. `pneud pair` also remains available for headless use and prints the URI,
 expiry in UTC milliseconds, and a terminal QR. Treat the URI as a secret; the
-service never logs it. An invitation expires after five minutes. `pneud
+service never logs it. An invitation expires after five minutes. Reuse, TLS admission
+and pairing completion share one predicate: both wall-clock and monotonic expiry
+must remain in the future. `pneud
 close-pairing` also invalidates it. The QR includes actual interface addresses,
 prioritized as Tailscale IPv4, default-route interfaces, then other physical LAN
 interfaces before the eight-address limit. Docker/bridge/veth/virbr, loopback and
@@ -47,7 +52,7 @@ share` marks shared text, and `send-file PATH file MIME` sends an ordinary file.
 It checks the PC's advertised clipboard-image capability before sending that kind.
 
 `install.sh` builds the release daemon through `heavy`, installs it into
-`~/.local/bin`, writes the systemd user unit, and reenables it for `graphical-session.target`.
+`~/.local/bin`, installs the app/tray icons and desktop entry, writes the systemd user unit, and reenables it for `graphical-session.target`.
 An active graphical session starts/restarts the daemon immediately, including
 reinstalls; otherwise it starts with the next graphical session. Run it only
 when installation is intended. The unit uses an owner-only umask, follows the
@@ -64,7 +69,11 @@ Construct `Arc<Core>` with `Paths`, `Config`, and `Arc<dyn PcActions>`, then cal
 integration tests. The executable binds dual-stack `[::]:47821` by default.
 
 - `start_pairing()` returns `PairingUri` (including `expires_at`); call `build()`
-  for the QR contents. `close_pairing()` is the pairing window's close handler.
+  for the QR contents. CLI pairing replaces the active invitation;
+  `ensure_pairing()` lets the window reuse it. `pairing_status()` and
+  `wait_pairing_change(revision)` provide the owner-only invitation subscription.
+  `close_pairing_if(token)` invalidates only the invitation the window displayed;
+  `close_pairing()` closes pairing unconditionally.
 - `unpair_device(Id)` refuses new registration, durably removes the certificate
   binding, receipts and queued text, then sends best-effort UNPAIR and closes.
   Persistence failure closes without UNPAIR and retains trust for retry/reconnect.
@@ -89,11 +98,40 @@ integration tests. The executable binds dual-stack `[::]:47821` by default.
 
 The CLI's owner-only `$XDG_RUNTIME_DIR/pneud.sock` accepts bounded newline JSON
 `ipc::Command` requests. Rust UI code can call `Core` directly; it does not need
-IPC. There is no clipboard watcher in this core: a future event-driven desktop
-watcher can call `send_clipboard`, suppressing changes applied by `PcActions`.
-PC-to-phone images are outside this core command API; the v1 plan postpones PC
-file sending. The tray, pairing/settings window, and final notification copy
-remain the UI follow-up.
+IPC. The ksni tray runs in the daemon and remains optional: the transport works
+without a StatusNotifier host. A single supervised `pneud ui-window` child runs
+Slint's native Qt event loop and communicates through owner-only IPC (`UiStatus`,
+`ShowWindow`, `ClosePairingIf`). This isolates window/backend failures from the
+transport. The window uses native Breeze widgets, an error-correction-M QR with
+five-minute refresh, and the XDG portal folder chooser. UI snapshots read the phone
+ID, metadata, connection generation and status together; UiStatus and Status never
+combine separate phone reads. Cached metadata carries its device ID. A replaced
+pairing or legacy/mismatched cache displays “Phone” until current metadata arrives.
+Core owns one invitation
+shared by CLI and window; owner-only IPC subscriptions immediately update the QR
+when CLI pairing replaces it. Closing hides the window and invalidates its
+displayed token if still active; the next request raises it.
+
+The Wayland data-control watcher observes only CLIPBOARD offers. It skips password
+markers, Pneu's origin MIME and recent content hashes, debounces 300 ms, and sends
+only to the exact connected, unpaused phone. Observation captures policy before
+queuing data reads to a separate reader with one pending offer. New selections
+cancel earlier reads, including slow password markers; shutdown joins both
+threads. `send_automatic_clipboard` and
+`send_automatic_image` share an ephemeral latest-only selection slot. Automatic
+text persists only its monotonic timestamp, never its contents; every new offer, disconnect, pause
+or changing sync/image policy invalidates pending automatic selections, including
+content already prepared in Core or queued to the writer. Automatic work retains
+its session/offer token until the writer accepts its first byte; later offer/policy
+changes drop unsent work, while a begun frame or image finishes as in-flight.
+Selection removal checks ownership atomically. Explicit IPC sends retain their durable outbox. Include Images defaults off, requires
+the peer's `clipboard_image` capability, and sends PNG up to 10 MiB. General PC
+file sending remains outside this API.
+
+Tray SVGs are bundled and installed. The default ARGB fallback uses kdeglobals'
+active Plasma desktop theme palette (or the window scheme for adaptive themes), refreshed by KGlobalSettings
+`notifyChange` and periodically as a fallback. `PNEU_TRAY_NAMED_ICONS=1` enables
+the named-icon spike; `PNEU_KDEGLOBALS` selects an isolated color configuration.
 
 ## Durability, tasks and desktop actions
 
@@ -105,7 +143,8 @@ in while trust is being removed. Pairing epochs cancel queued and running deskto
 actions and the viewer debounce.
 
 SQLite uses WAL, `synchronous=FULL`, owner-only files and foreign-key cascades.
-It stores the single binding, completed file receipts, clipboard timestamp and
+It stores the single binding, completed file receipts, one failed-save cache
+reference per transfer (metadata and path, never a success receipt), clipboard timestamp and
 64 recent text IDs (hash, timestamp, origin), latest outgoing text, and ever-used
 staging folders. There are no pending inbound text barriers or delivery leases.
 Calls use one connection mutex in Tokio's blocking pool. Shutdown drains tracked
@@ -117,7 +156,15 @@ flush within their deadlines. Idle file workers have no transfer deadline.
 One outgoing DB query survives select iterations instead of spawning jobs for
 each status/config event. One provisional TLS connection and sixteen total
 connections are admitted; unknown admission is limited to once per second.
-PC initiates no periodic PINGs. Cache pruning runs hourly.
+PC initiates no periodic PINGs. Cache pruning runs hourly. Successful retries
+retire failed-save previews by reopening without following links and checking
+recorded device, inode, size and nanosecond modification/change times, relative
+to the original directory handle. The evidence holds no file descriptors, so
+pruning reclaims blocks even without a retry. Evidence is bounded to 128 entries;
+after restart or eviction, previews remain for normal retention pruning.
+Staging, temporary-config and runtime-socket cleanup also check identity and
+use retained directory handles, preserving replacement entries.
+Tray icons use the same anchored atomic writes and refuse symlinked descendants.
 
 TLS is 1.3 only, with resumption/0-RTT disabled. Both verifiers check exact DER
 fingerprints, P-256, certificate self-signature, validity dates and rustls's real
@@ -161,13 +208,35 @@ OS denial retains nothing and NACKs `clipboard_unavailable`. A sender may retry,
 drop or supersede it. A crash before history commit may repeat an application.
 There is no FIFO or pending-operation barrier. No clipboard contents appear in
 events or logs. Completed file IDs have no expiry; cached files expire with a
-seven-day default retention.
+one-day default retention.
 
 `PcActions` isolates OS integration from protocol tests. Production uses zbus
-notifications with a bounded inline image preview, Open/default and Show
-in folder actions; Show uses FileManager1.ShowItems. Open passes the retained
+notifications with the approved text, actions, urgency and transient hints.
+File notifications use `x-kde-urls` for Plasma thumbnails; explicit clipboard
+images use a bounded inline image preview. Open/default and Show
+in folder actions are supported; Show uses FileManager1.ShowItems. Arrivals within
+four seconds replace the notification with every item URL, latest first. Both
+the gap and 30-second lifetime use transfer arrival times, so action-queue
+delays cannot change grouping; clipboard debounce likewise uses offer arrival.
+Burst folder actions retain pathnames and only the latest file descriptor. Bursts start
+a new notification at 128 items or after 30 seconds, bounding each message. Open passes the retained
 file descriptor through the desktop portal's OpenFile method (no pathname
-fallback). Clipboard bytes and previews use the same received-file descriptor,
+fallback). Portal calls subscribe before requesting and wait for Response;
+subscription/activation and method acceptance have five-second deadlines. Requests
+bind to the issuing unique bus owner; losing the portal service releases pending
+choosers/viewers and interaction slots, and Close never targets a replacement.
+Interactive responses wait
+until completion or cancellation, including application choosers and URI dialogs.
+Viewer requests are authorised and issued under the action gate; their human
+responses run in separately tracked tasks. Notification buttons also issue requests
+without waiting for interaction in the signal loop. Each consumer permits eight
+outstanding interactions and ignores further opens until capacity is available.
+Shutdown cancels and joins these waits; viewer waits also cancel when their pairing
+scope or connection generation is revoked. Unpair confirmation retains the phone
+ID and name displayed when it opened, so pairing a replacement cannot retarget it.
+Portal URI failures/acceptance timeouts use a
+bounded `xdg-open` fallback. The folder chooser reports portal failures
+and treats cancellation as no selection. Clipboard bytes and previews use the same received-file descriptor,
 so replacement of the saved pathname cannot redirect an action to other bytes.
 Automatic clipboard actions support PNG, JPEG, GIF, WebP and BMP with recognizable
 content. Viewer launches additionally require a matching extension. HEIF/HEIC
@@ -182,6 +251,11 @@ best-effort "Couldn't copy image" notification; the saved-file ACK is unaffected
 Explicit clipboard images use cache, copy regardless of the ordinary-image toggle,
 never open a viewer, and get a dedicated action-free thumbnail notification after
 copying succeeds. Preview reads share the 16 MiB input cap and resist file growth.
+Storage failures identify the destination actually attempted: the selected save
+folder or the daemon cache. Only folder errors offer Choose Folder; disabling
+folder saving or changing the folder clears that error, while a successful cache
+transfer clears a cache error. Listener errors take precedence. Clipboard-image
+storage failures report failure without claiming a successful copy.
 Notification closure removes its action mapping; at most 256 button mappings
 are retained, so older notifications may lose their buttons' actions.
 
@@ -194,6 +268,9 @@ images remain saved/ACKed and emit a clipboard-action error. Text is protocol-bo
 after its READY reply; shutdown kills and reaps it. Optional clipboard and
 notification failures cannot select an older image for the debounced viewer:
 the newest eligible image wins independently of those actions' timeouts.
+Echo hashes replace the previous successful selection only after the helper's
+READY response, including hashes for converted image formats; failed clipboard
+writes preserve the previous guard.
 
 Manual clipboard verification uses the same Wayland library:
 
@@ -238,3 +315,36 @@ scope even if its caller was cancelled; failed replacement preserves the old
 connection, action scope and invitation. Outgoing clipboard timestamps are
 assigned inside the enqueue transaction, and replacement retains only the greater
 `created_at` so concurrent IPC requests cannot overwrite newer pending text.
+
+UI folder changes and tray toggles use field-specific Core mutations under the
+config lock. A portal folder request runs alongside window status/QR polling and
+is closed when the Pneu window closes. Open Folder falls back to `xdg-open` when
+the portal is absent or fails. Ordinary image copy-failure notifications retain
+the received descriptor for their Open action. Window icons are recolored from
+the actual window palette, including custom schemes. Production Tokio workers
+and the window IPC thread use 8 MiB stacks; connection/session/action/UI futures
+are boxed at task boundaries to reduce nested async stack usage.
+
+Failed-save retention follows DESIGN.md's cache-preview requirement despite
+PROTOCOL.md's older no-retained-copy sentence. Repeated failures retain one copy
+and perform desktop effects only on its first placement; a successful retry
+retires the cached copy after committing the folder receipt.
+
+Shutdown claim cleanup captures plain data rather than another RAII claim, so a
+canceled blocking task cannot recursively schedule its own cleanup. A debugger
+capture of the parallel-test overflow identified that recursion; a queued-cleanup
+runtime-shutdown regression exercises it with one occupied blocking worker.
+
+Phone freshness is persisted on disconnect and orderly shutdown with generation
+checks, including unpair failure/cancellation callbacks. Session replacement and
+all pairing/session endings reset both active transfers and receiving grace.
+Folder recovery clears only the resolved folder's error; listener recovery clears
+only port errors. Transfer progress does not drive SVG rendering or tray updates:
+the tray refreshes icons on theme changes or five-second timer deadlines, and the
+window caches rendered icons until its theme configuration changes.
+
+Outgoing receipt timers start on the writer's flushed text frame or FILE_END
+completion, never while queued or streaming image chunks. Frame write/flush
+progress remains bounded separately. The store explicitly releases its flock
+when the final Store owner ends: a concurrent child between fork and exec cannot
+prolong ownership merely by inheriting a CLOEXEC descriptor.

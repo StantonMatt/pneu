@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Pneu
+Exec=pneud window
+Icon=pneu
+NoDisplay=true
+Terminal=false
+Categories=Utility;
+StartupWMClass=pneu

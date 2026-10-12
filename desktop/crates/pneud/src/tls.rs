@@ -20,9 +20,18 @@ use subtle::ConstantTimeEq;
 
 #[derive(Debug)]
 pub struct Invitation {
+    pub uri: pneu_proto::PairingUri,
     pub token: Hash,
     pub expires_at: u64,
     pub deadline: Instant,
+}
+impl Invitation {
+    pub fn is_active(&self) -> bool {
+        self.is_active_at(crate::now_ms(), Instant::now())
+    }
+    fn is_active_at(&self, wall_now: u64, monotonic_now: Instant) -> bool {
+        self.expires_at > wall_now && self.deadline > monotonic_now
+    }
 }
 #[derive(Debug, Default)]
 pub struct Admission {
@@ -35,8 +44,12 @@ pub struct ClientVerifier {
     pub admission: Arc<Mutex<Admission>>,
     provisional: AtomicBool,
     slot: Arc<AtomicBool>,
+    blocked: AtomicBool,
 }
 impl ClientVerifier {
+    pub fn blocked(&self) -> bool {
+        self.blocked.load(Ordering::SeqCst)
+    }
     pub fn release_provisional(&self) {
         if self.provisional.swap(false, Ordering::SeqCst) {
             self.slot.store(false, Ordering::SeqCst);
@@ -45,6 +58,7 @@ impl ClientVerifier {
     pub fn new(admission: Arc<Mutex<Admission>>, slot: Arc<AtomicBool>) -> Self {
         Self {
             admission,
+            blocked: AtomicBool::new(false),
             provisional: AtomicBool::new(false),
             slot,
         }
@@ -122,14 +136,12 @@ impl ClientCertVerifier for ClientVerifier {
         let mut state = self.admission.lock().map_err(|_| invalid())?;
         if !state.peers.contains_key(&fp) {
             let instant = Instant::now();
-            if !state
-                .invitation
-                .as_ref()
-                .is_some_and(|i| i.expires_at > crate::now_ms() && i.deadline > instant)
+            if !state.invitation.as_ref().is_some_and(Invitation::is_active)
                 || state
                     .last_unknown
                     .is_some_and(|t| instant.duration_since(t).as_secs() < 1)
             {
+                self.blocked.store(true, Ordering::SeqCst);
                 return Err(invalid());
             }
             if self
@@ -237,6 +249,79 @@ pub fn client_config(identity: &Identity, pin: Hash) -> anyhow::Result<rustls::C
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_invitation(expires_at: u64, deadline: Instant) -> Invitation {
+        let uri = pneu_proto::PairingUri {
+            version: 1,
+            name: "PC".into(),
+            fingerprint: Hash::new("a".repeat(64)).unwrap(),
+            addresses: vec!["127.0.0.1:47821".into()],
+            token: Hash::new("b".repeat(64)).unwrap(),
+            expires_at,
+        };
+        Invitation {
+            token: uri.token.clone(),
+            expires_at,
+            deadline,
+            uri,
+        }
+    }
+    #[test]
+    fn invitation_expiry_requires_both_clocks_including_boundaries() {
+        let monotonic = Instant::now();
+        let invitation = test_invitation(1000, monotonic);
+        for wall in [999, 1000, 1001] {
+            for instant in [
+                monotonic - std::time::Duration::from_nanos(1),
+                monotonic,
+                monotonic + std::time::Duration::from_nanos(1),
+            ] {
+                assert_eq!(
+                    invitation.is_active_at(wall, instant),
+                    wall < 1000 && instant < monotonic
+                );
+            }
+        }
+    }
+    #[test]
+    fn tls_admission_uses_same_two_clock_invitation_expiry() -> anyhow::Result<()> {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
+        let cert =
+            rcgen::CertificateParams::new(vec!["unused.invalid".into()])?.self_signed(&key)?;
+        let time =
+            UnixTime::since_unix_epoch(std::time::Duration::from_secs(crate::now_ms() / 1000));
+        for (wall_expired, monotonic_expired) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let now = Instant::now();
+            let invitation = test_invitation(
+                if wall_expired {
+                    crate::now_ms() - 1
+                } else {
+                    crate::now_ms() + 300_000
+                },
+                if monotonic_expired {
+                    now - std::time::Duration::from_secs(1)
+                } else {
+                    now + std::time::Duration::from_secs(300)
+                },
+            );
+            let active = invitation.is_active();
+            let verifier = ClientVerifier::new(
+                Arc::new(Mutex::new(Admission {
+                    invitation: Some(invitation),
+                    ..Default::default()
+                })),
+                Arc::new(AtomicBool::new(false)),
+            );
+            assert_eq!(
+                verifier.verify_client_cert(cert.der(), &[], time).is_ok(),
+                active
+            );
+            assert_eq!(active, !wall_expired && !monotonic_expired);
+            assert_eq!(verifier.blocked(), !active);
+        }
+        Ok(())
+    }
     #[test]
     fn rejects_non_p256_expired_and_broken_self_signature() -> anyhow::Result<()> {
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;

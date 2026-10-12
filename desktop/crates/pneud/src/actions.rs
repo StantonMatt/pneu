@@ -119,7 +119,63 @@ pub trait PcActions: Send + Sync {
     async fn open_received(&self, file: &ReceivedFile) -> Result<()> {
         self.open(file.path()).await
     }
+    /// Issue a viewer request promptly. Human interaction belongs exclusively
+    /// to the returned future. Noninteractive backends can use this default.
+    async fn begin_open_received(
+        &self,
+        file: &ReceivedFile,
+    ) -> Result<crate::ui::portal::Interaction> {
+        self.open_received(file).await?;
+        Ok(Box::pin(async { Ok(()) }))
+    }
     async fn notify_clipboard_failure(&self) -> Result<()> {
+        Ok(())
+    }
+    async fn notify_file(
+        &self,
+        file: &ReceivedFile,
+        metadata: &pneu_proto::FileBegin,
+        _saved: bool,
+        _save_error: Option<pneu_proto::NackCode>,
+        _folder: &Path,
+    ) -> Result<()> {
+        self.notify_received(file, &metadata.mime).await
+    }
+    /// Queued callers carry the transfer arrival so backend grouping is
+    /// independent of time spent on earlier desktop effects.
+    async fn notify_file_at(
+        &self,
+        file: &ReceivedFile,
+        metadata: &pneu_proto::FileBegin,
+        saved: bool,
+        save_error: Option<pneu_proto::NackCode>,
+        folder: &Path,
+        _arrived: std::time::Instant,
+    ) -> Result<()> {
+        self.notify_file(file, metadata, saved, save_error, folder)
+            .await
+    }
+    async fn notify_image_failure(
+        &self,
+        _file: &ReceivedFile,
+        _metadata: &pneu_proto::FileBegin,
+        _saved: bool,
+    ) -> Result<()> {
+        self.notify_clipboard_failure().await
+    }
+    async fn notify_text_failure(&self) -> Result<()> {
+        Ok(())
+    }
+    async fn notify_save_failure(
+        &self,
+        _metadata: &pneu_proto::FileBegin,
+        _code: pneu_proto::NackCode,
+        _destination: crate::ui::ReceiveDestination,
+        _folder: &Path,
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn notify_text(&self, _text: &str) -> Result<()> {
         Ok(())
     }
     async fn shutdown(&self) -> Result<()> {
@@ -136,13 +192,47 @@ pub struct DesktopActions {
     cache: PathBuf,
     notifications: Mutex<Option<Notifications>>,
     jobs: Arc<crate::work::Work>,
+    pub echo: Arc<crate::ui::clipboard::EchoGuard>,
+    commands: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<crate::ui::Command>>>>,
+    copy_results: Mutex<HashMap<PathBuf, bool>>,
+    burst: Mutex<Option<Burst>>,
     #[cfg(test)]
     bus: Option<zbus::Connection>,
+    #[cfg(test)]
+    helper: Option<PathBuf>,
+}
+#[derive(Clone)]
+struct Target {
+    files: Vec<ReceivedFile>,
+    urls: Vec<String>,
+    link: Option<String>,
+}
+struct Burst {
+    id: u32,
+    urls: Vec<String>,
+    kind: Option<pneu_proto::FileKind>,
+    count: usize,
+    arrived: std::time::Instant,
+    started: std::time::Instant,
+    saved: bool,
+}
+impl Burst {
+    fn accepts(&self, arrived: std::time::Instant) -> bool {
+        arrived
+            .checked_duration_since(self.arrived)
+            .is_some_and(|gap| gap < std::time::Duration::from_secs(4))
+            && arrived
+                .checked_duration_since(self.started)
+                .is_some_and(|span| span < std::time::Duration::from_secs(30))
+            && self.count < 128
+    }
 }
 struct Notifications {
     proxy: zbus::Proxy<'static>,
     task: JoinHandle<()>,
+    stop: tokio::sync::watch::Sender<bool>,
     paths: Arc<Mutex<HashMap<u32, ReceivedFile>>>,
+    targets: Arc<Mutex<HashMap<u32, Target>>>,
 }
 const NOTIFICATION_ACTION_LIMIT: usize = 256;
 fn remember_notification(paths: &mut HashMap<u32, ReceivedFile>, id: u32, path: ReceivedFile) {
@@ -162,9 +252,18 @@ impl DesktopActions {
             cache,
             notifications: Mutex::new(None),
             jobs: Arc::new(crate::work::Work::default()),
+            echo: Arc::new(crate::ui::clipboard::EchoGuard::default()),
+            commands: Arc::new(std::sync::Mutex::new(None)),
+            copy_results: Mutex::new(HashMap::new()),
+            burst: Mutex::new(None),
             #[cfg(test)]
             bus: None,
+            #[cfg(test)]
+            helper: None,
         }
+    }
+    pub fn set_commands(&self, commands: tokio::sync::mpsc::Sender<crate::ui::Command>) {
+        *self.commands.lock().expect("UI commands") = Some(commands);
     }
     async fn copy(
         &self,
@@ -184,7 +283,19 @@ impl DesktopActions {
         } else {
             None
         };
-        let mut command = Command::new(std::env::current_exe()?);
+        use sha2::{Digest, Sha256};
+        // Prepare the candidate hashes without altering the successful selection.
+        let mut hashes = Vec::new();
+        if let Some(bytes) = &bytes {
+            hashes.push(Sha256::digest(bytes).into());
+        }
+        if let Some(text) = text {
+            hashes.push(Sha256::digest(text.as_bytes()).into());
+        }
+        let executable = std::env::current_exe()?;
+        #[cfg(test)]
+        let executable = self.helper.clone().unwrap_or(executable);
+        let mut command = Command::new(executable);
         command
             .arg("clipboard-helper")
             .arg(mime)
@@ -202,18 +313,25 @@ impl DesktopActions {
             input.write_all(text.as_bytes()).await?;
         }
         drop(input);
-        let mut output = BufReader::new(child.stdout.take().context("helper stdout")?.take(16));
+        let mut output = BufReader::new(child.stdout.take().context("helper stdout")?.take(256));
         let mut line = String::new();
         let ready = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             output.read_line(&mut line),
         )
         .await;
-        if !matches!(ready, Ok(Ok(n)) if n > 0) || line.trim() != "READY" {
+        if !matches!(ready, Ok(Ok(n)) if n > 0) || line.split_whitespace().next() != Some("READY") {
             let _ = child.kill().await;
             let _ = child.wait().await;
             bail!("Wayland data-control clipboard unavailable");
         }
+        for hash in line.split_whitespace().skip(1) {
+            let mut digest = [0; 32];
+            if hex::decode_to_slice(hash, &mut digest).is_ok() {
+                hashes.push(digest);
+            }
+        }
+        self.echo.replace_hashes(hashes);
         if let Some(mut previous) = self.clipboard.lock().await.replace(child) {
             let _ = previous.kill().await;
             let _ = previous.wait().await;
@@ -258,26 +376,116 @@ impl DesktopActions {
             let mut closed = proxy.receive_signal("NotificationClosed").await?;
             let paths = Arc::new(Mutex::new(HashMap::<u32, ReceivedFile>::new()));
             let action_paths = paths.clone();
-            let task = tokio::spawn(async move {
+            let targets = Arc::new(Mutex::new(HashMap::<u32, Target>::new()));
+            let action_targets = targets.clone();
+            let commands = self.commands.clone();
+            let (stop, mut stopped) = tokio::sync::watch::channel(false);
+            let task = tokio::spawn(Box::pin(async move {
+                let mut interactions = crate::ui::portal::Interactions::new();
                 loop {
-                    tokio::select! {
+                    tokio::select! { biased;
+                        _=stopped.changed()=>break,
                         signal=closed.next()=>{
                             let Some(signal)=signal else {break;};
-                            if let Ok((id,_reason))=signal.body().deserialize::<(u32,u32)>() {action_paths.lock().await.remove(&id);}
+                            if let Ok((id,_reason))=signal.body().deserialize::<(u32,u32)>() {action_paths.lock().await.remove(&id);action_targets.lock().await.remove(&id);}
                         },
                         signal=signals.next()=>{
                             let Some(signal)=signal else {break;};
                             if let Ok((id,action))=signal.body().deserialize::<(u32,String)>() {
+                                let target=action_targets.lock().await.get(&id).cloned();
+                                if let Some(target)=target {
+                                    match action.as_str() {
+                                        "default"|"open" => { if interactions.available() && let Some(file)=target.files.first() && let Ok(wait)=begin_open_received_file(file,&action_connection).await { interactions.push(async move { let _=wait.await; }); } },
+                                        "show" => { let _=show_files(&target.urls,&action_connection).await; },
+                                        "link" => { if interactions.available() && let Some(link)=target.link { let wait=begin_open_uri(&link,&action_connection).await; interactions.push(async move { let _=wait.await; }); } },
+                                        "folder"|"pair" => { if let Some(commands)=commands.lock().expect("UI commands").clone() { let _=commands.try_send(if action=="folder" { crate::ui::Command::ChooseFolder } else { crate::ui::Command::Window }); } },
+                                        _=>{},
+                                    }
+                                    continue;
+                                }
                                 let path=action_paths.lock().await.get(&id).cloned();
-                                if let Some(path)=path {match action.as_str() {"default"|"open"=>{let _=open_received_file(&path, &action_connection).await;},"show"=>{let _=show_path(path.path()).await;},_=>{}}}
+                                if let Some(path)=path {match action.as_str() {"default"|"open"=>{if interactions.available() && let Ok(wait)=begin_open_received_file(&path, &action_connection).await { interactions.push(async move { let _=wait.await; }); }},"show"=>{let _=show_path(path.path()).await;},_=>{}}}
                             }
                         }
                     }
                 }
+                interactions.shutdown().await;
+            }));
+            *current = Some(Notifications {
+                proxy,
+                task,
+                stop,
+                paths,
+                targets,
             });
-            *current = Some(Notifications { proxy, task, paths });
         }
         Ok(current)
+    }
+    pub async fn notice(
+        &self,
+        notice: crate::ui::notifications::Notice,
+        files: Vec<ReceivedFile>,
+        link: Option<String>,
+        replaces: u32,
+        preview: Option<&ReceivedFile>,
+    ) -> Result<u32> {
+        let current = self.notifications().await?;
+        let n = current.as_ref().context("notification proxy")?;
+        let mut hints = HashMap::<&str, zbus::zvariant::Value<'_>>::new();
+        hints.insert("desktop-entry", zbus::zvariant::Value::from("pneu"));
+        hints.insert("urgency", zbus::zvariant::Value::from(notice.urgency));
+        if notice.transient {
+            hints.insert("transient", zbus::zvariant::Value::from(true));
+        }
+        let urls = if notice.urls.is_empty() {
+            files
+                .iter()
+                .map(|f| file_uri(f.path()))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            notice.urls.clone()
+        };
+        if !urls.is_empty() {
+            hints.insert("x-kde-urls", zbus::zvariant::Value::from(urls.clone()));
+            hints.insert("category", zbus::zvariant::Value::from("transfer.complete"));
+        }
+        if let Some(file) = preview
+            && let Ok(preview) = self.preview(file).await
+        {
+            hints.insert(
+                "image-data",
+                zbus::zvariant::Value::from(zbus::zvariant::Structure::from(preview)),
+            );
+        }
+        let mut targets = n.targets.lock().await;
+        let id: u32 = n
+            .proxy
+            .call(
+                "Notify",
+                &(
+                    "Pneu",
+                    replaces,
+                    "pneu",
+                    &notice.summary,
+                    &notice.body,
+                    notice
+                        .actions
+                        .iter()
+                        .flat_map(|(id, label)| [*id, *label])
+                        .collect::<Vec<_>>(),
+                    hints,
+                    notice.expires,
+                ),
+            )
+            .await?;
+        if targets.len() >= NOTIFICATION_ACTION_LIMIT
+            && !targets.contains_key(&id)
+            && let Some(old) = targets.keys().min().copied()
+        {
+            targets.remove(&old);
+        }
+        targets.insert(id, Target { files, urls, link });
+        Ok(id)
     }
 }
 #[async_trait]
@@ -291,7 +499,13 @@ impl PcActions for DesktopActions {
             .await
     }
     async fn clipboard_received(&self, file: &ReceivedFile, mime: &str) -> Result<()> {
-        self.copy(Some(file), None, mime).await
+        let result = self.copy(Some(file), None, mime).await;
+        let mut copies = self.copy_results.lock().await;
+        if copies.len() >= 256 {
+            copies.clear();
+        }
+        copies.insert(file.path().to_owned(), result.is_ok());
+        result
     }
     async fn notify(&self, path: &Path, mime: &str) -> Result<()> {
         self.notify_received(&ReceivedFile::open(path)?, mime).await
@@ -310,7 +524,7 @@ impl PcActions for DesktopActions {
                 zbus::zvariant::Value::from(zbus::zvariant::Structure::from(preview)),
             );
         }
-        hints.insert("desktop-entry", zbus::zvariant::Value::from("pneud"));
+        hints.insert("desktop-entry", zbus::zvariant::Value::from("pneu"));
         let summary = path
             .file_name()
             .and_then(|s| s.to_str())
@@ -325,10 +539,10 @@ impl PcActions for DesktopActions {
                 &(
                     "Pneu",
                     0u32,
-                    "image-x-generic",
+                    "pneu",
                     summary,
                     "",
-                    vec!["default", "Open", "open", "Open", "show", "Show in folder"],
+                    vec!["default", "Open", "open", "Open", "show", "Show in Folder"],
                     hints,
                     -1i32,
                 ),
@@ -350,6 +564,7 @@ impl PcActions for DesktopActions {
             "image-data",
             zbus::zvariant::Value::from(zbus::zvariant::Structure::from(preview)),
         );
+        hints.insert("desktop-entry", zbus::zvariant::Value::from("pneu"));
         hints.insert("transient", zbus::zvariant::Value::from(true));
         hints.insert("urgency", zbus::zvariant::Value::from(0u8));
         let _: u32 = n
@@ -374,6 +589,7 @@ impl PcActions for DesktopActions {
         let current = self.notifications().await?;
         let n = current.as_ref().context("notification proxy")?;
         let mut hints = HashMap::<&str, zbus::zvariant::Value<'_>>::new();
+        hints.insert("desktop-entry", zbus::zvariant::Value::from("pneu"));
         hints.insert("transient", zbus::zvariant::Value::from(true));
         let _: u32 = n
             .proxy
@@ -393,11 +609,183 @@ impl PcActions for DesktopActions {
             .await?;
         Ok(())
     }
+    async fn notify_image_failure(
+        &self,
+        file: &ReceivedFile,
+        metadata: &pneu_proto::FileBegin,
+        saved: bool,
+    ) -> Result<()> {
+        self.notice(
+            crate::ui::notifications::Notice::file(
+                metadata,
+                saved,
+                false,
+                true,
+                None,
+                "",
+                crate::ui::ReceiveDestination::Cache,
+            ),
+            if metadata.kind == pneu_proto::FileKind::ClipboardImage {
+                Vec::new()
+            } else {
+                vec![file.clone()]
+            },
+            None,
+            0,
+            if metadata.kind == pneu_proto::FileKind::ClipboardImage {
+                Some(file)
+            } else {
+                None
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+    async fn notify_text_failure(&self) -> Result<()> {
+        let mut notice = crate::ui::notifications::Notice::new("Copied from phone");
+        notice.body = "Couldn't copy to clipboard".into();
+        self.notice(notice, Vec::new(), None, 0, None)
+            .await
+            .map(|_| ())
+    }
+    async fn notify_save_failure(
+        &self,
+        metadata: &pneu_proto::FileBegin,
+        code: pneu_proto::NackCode,
+        destination: crate::ui::ReceiveDestination,
+        folder: &Path,
+    ) -> Result<()> {
+        let mut notice = crate::ui::notifications::Notice::file(
+            metadata,
+            false,
+            false,
+            false,
+            Some(code),
+            &crate::ui::display_path(folder),
+            destination,
+        );
+        notice
+            .actions
+            .retain(|(id, _)| !matches!(*id, "default" | "open"));
+        self.notice(notice, Vec::new(), None, 0, None)
+            .await
+            .map(|_| ())
+    }
+    async fn notify_text(&self, text: &str) -> Result<()> {
+        self.notice(
+            crate::ui::notifications::Notice::text(text),
+            Vec::new(),
+            crate::ui::notifications::single_url(text),
+            0,
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+    async fn notify_file(
+        &self,
+        file: &ReceivedFile,
+        metadata: &pneu_proto::FileBegin,
+        saved: bool,
+        save_error: Option<pneu_proto::NackCode>,
+        folder: &Path,
+    ) -> Result<()> {
+        self.notify_file_at(
+            file,
+            metadata,
+            saved,
+            save_error,
+            folder,
+            std::time::Instant::now(),
+        )
+        .await
+    }
+    async fn notify_file_at(
+        &self,
+        file: &ReceivedFile,
+        metadata: &pneu_proto::FileBegin,
+        saved: bool,
+        save_error: Option<pneu_proto::NackCode>,
+        folder: &Path,
+        arrived: std::time::Instant,
+    ) -> Result<()> {
+        let copied = self.copy_results.lock().await.remove(file.path());
+        let mut notice = crate::ui::notifications::Notice::file(
+            metadata,
+            saved,
+            copied == Some(true),
+            copied == Some(false),
+            save_error,
+            &crate::ui::display_path(folder),
+            crate::ui::ReceiveDestination::SaveFolder,
+        );
+        let mut burst = self.burst.lock().await;
+        let mut urls = vec![file_uri(file.path())?];
+        let mut replaces = 0;
+        let mut count = 1;
+        let mut kind = Some(metadata.kind);
+        let mut all_saved = saved;
+        let mut started = arrived;
+        if save_error.is_none()
+            && copied != Some(false)
+            && let Some(previous) = burst.as_ref()
+            && previous.accepts(arrived)
+        {
+            let current = self.notifications().await?;
+            if current
+                .as_ref()
+                .context("notifications")?
+                .targets
+                .lock()
+                .await
+                .contains_key(&previous.id)
+            {
+                replaces = previous.id;
+                count = previous.count + 1;
+                started = previous.started;
+                kind = if previous.kind == kind { kind } else { None };
+                all_saved = saved && previous.saved;
+                urls.extend(previous.urls.iter().cloned());
+                notice = crate::ui::notifications::Notice::burst(
+                    count,
+                    kind,
+                    copied == Some(true),
+                    all_saved,
+                );
+            }
+        }
+        notice.urls = urls.clone();
+        // Burst folder actions need every pathname, but only the latest file's
+        // descriptor is needed for Open. Avoid retaining one FD per arrival.
+        let id = self
+            .notice(notice, vec![file.clone()], None, replaces, None)
+            .await?;
+        *burst = if save_error.is_none() && copied != Some(false) {
+            Some(Burst {
+                id,
+                urls,
+                kind,
+                count,
+                arrived,
+                started,
+                saved: all_saved,
+            })
+        } else {
+            None
+        };
+        Ok(())
+    }
     async fn open(&self, path: &Path) -> Result<()> {
         self.open_received(&ReceivedFile::open(path)?).await
     }
     async fn open_received(&self, file: &ReceivedFile) -> Result<()> {
-        open_received_file(file, &self.bus_connection().await?).await
+        self.begin_open_received(file).await?.await
+    }
+    async fn begin_open_received(
+        &self,
+        file: &ReceivedFile,
+    ) -> Result<crate::ui::portal::Interaction> {
+        begin_open_received_file(file, &self.bus_connection().await?).await
     }
     async fn shutdown(&self) -> Result<()> {
         let _guard = self.clipboard_gate.lock().await;
@@ -407,7 +795,7 @@ impl PcActions for DesktopActions {
         }
         self.jobs.drain().await;
         if let Some(n) = self.notifications.lock().await.take() {
-            n.task.abort();
+            n.stop.send_replace(true);
             let _ = n.task.await;
         }
         Ok(())
@@ -420,23 +808,38 @@ fn file_uri(path: &Path) -> Result<String> {
 }
 /// OpenFile transfers an FD to the portal, including ownership across the
 /// asynchronous viewer launch. There is deliberately no pathname fallback.
+#[cfg(test)]
 async fn open_received_file(file: &ReceivedFile, connection: &zbus::Connection) -> Result<()> {
-    let proxy = zbus::Proxy::new(
-        connection,
-        "org.freedesktop.portal.Desktop",
-        "/org/freedesktop/portal/desktop",
-        "org.freedesktop.portal.OpenURI",
-    )
-    .await?;
+    begin_open_received_file(file, connection).await?.await
+}
+async fn begin_open_received_file(
+    file: &ReceivedFile,
+    connection: &zbus::Connection,
+) -> Result<crate::ui::portal::Interaction> {
+    let request = crate::ui::portal::Request::new(connection).await?;
+    let proxy = request
+        .method_proxy("org.freedesktop.portal.OpenURI")
+        .await?;
     let descriptor = file.viewer_descriptor()?;
     let fd = zbus::zvariant::Fd::from(&descriptor);
-    let _: zbus::zvariant::OwnedObjectPath = proxy
-        .call(
-            "OpenFile",
-            &("", fd, HashMap::<&str, zbus::zvariant::Value<'_>>::new()),
-        )
-        .await?;
-    Ok(())
+    let path = crate::ui::portal::accept(proxy.call(
+        "OpenFile",
+        &(
+            "",
+            fd,
+            HashMap::from([(
+                "handle_token",
+                zbus::zvariant::Value::from(request.token.as_str()),
+            )]),
+        ),
+    ))
+    .await?;
+    Ok(Box::pin(async move {
+        let result = request.response(path).await;
+        drop(descriptor); // Retain the read-only FD throughout interactive launch.
+        result?;
+        Ok(())
+    }))
 }
 async fn show_path(path: &Path) -> Result<()> {
     let connection = zbus::Connection::session().await?;
@@ -451,6 +854,70 @@ async fn show_path(path: &Path) -> Result<()> {
         .call("ShowItems", &(vec![file_uri(path)?], ""))
         .await?;
     Ok(())
+}
+async fn show_files(urls: &[String], connection: &zbus::Connection) -> Result<()> {
+    let proxy = zbus::Proxy::new(
+        connection,
+        "org.freedesktop.FileManager1",
+        "/org/freedesktop/FileManager1",
+        "org.freedesktop.FileManager1",
+    )
+    .await?;
+    let _: () = proxy.call("ShowItems", &(urls, "")).await?;
+    Ok(())
+}
+pub async fn open_uri(uri: &str, connection: &zbus::Connection) -> Result<()> {
+    begin_open_uri(uri, connection).await.await
+}
+async fn begin_open_uri(
+    uri: &str,
+    connection: &zbus::Connection,
+) -> crate::ui::portal::Interaction {
+    let portal = begin_open_uri_portal(uri, connection).await;
+    let uri = uri.to_owned();
+    Box::pin(async move {
+        crate::ui::portal::with_fallback(async { portal?.await }, || async {
+            let status = tokio::process::Command::new("xdg-open")
+                .arg(&uri)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .status()
+                .await?;
+            anyhow::ensure!(status.success(), "URI opener exited unsuccessfully");
+            Ok(())
+        })
+        .await
+    })
+}
+pub(crate) async fn open_uri_portal(uri: &str, connection: &zbus::Connection) -> Result<()> {
+    begin_open_uri_portal(uri, connection).await?.await
+}
+async fn begin_open_uri_portal(
+    uri: &str,
+    connection: &zbus::Connection,
+) -> Result<crate::ui::portal::Interaction> {
+    let request = crate::ui::portal::Request::new(connection).await?;
+    let proxy = request
+        .method_proxy("org.freedesktop.portal.OpenURI")
+        .await?;
+    let path = crate::ui::portal::accept(proxy.call(
+        "OpenURI",
+        &(
+            "",
+            uri,
+            HashMap::from([(
+                "handle_token",
+                zbus::zvariant::Value::from(request.token.as_str()),
+            )]),
+        ),
+    ))
+    .await?;
+    Ok(Box::pin(async move {
+        request.response(path).await?;
+        Ok(())
+    }))
 }
 fn decode_image(bytes: &[u8]) -> Result<image::DynamicImage> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
@@ -480,6 +947,10 @@ fn clipboard_sources(
         });
     }
     sources.push(MimeSource {
+        source: Source::Bytes(b"pneu".to_vec().into()),
+        mime_type: MimeType::Specific(crate::ui::clipboard::ORIGIN_MIME.into()),
+    });
+    sources.push(MimeSource {
         source: Source::Bytes(bytes.into()),
         mime_type: MimeType::Specific(mime),
     });
@@ -497,8 +968,28 @@ pub fn clipboard_helper(mime: String) -> Result<()> {
     );
     let mut options = wl_clipboard_rs::copy::Options::new();
     options.foreground(true);
-    let selection = options.prepare_copy_multi(clipboard_sources(mime, bytes)?)?;
-    println!("READY");
+    use sha2::{Digest, Sha256};
+    let sources = clipboard_sources(mime, bytes)?;
+    let hashes = sources
+        .iter()
+        .filter_map(|source| {
+            if source.mime_type
+                == wl_clipboard_rs::copy::MimeType::Specific(
+                    crate::ui::clipboard::ORIGIN_MIME.into(),
+                )
+            {
+                return None;
+            }
+            if let wl_clipboard_rs::copy::Source::Bytes(bytes) = &source.source {
+                Some(hex::encode(Sha256::digest(bytes)))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let selection = options.prepare_copy_multi(sources)?;
+    println!("READY {hashes}");
     std::io::stdout().flush()?;
     selection.serve()?;
     Ok(())
@@ -507,17 +998,93 @@ pub fn clipboard_helper(mime: String) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn burst_membership_uses_arrival_gaps_span_order_and_count() {
+        use std::time::{Duration, Instant};
+        let started = Instant::now() - Duration::from_secs(60);
+        let mut burst = Burst {
+            id: 1,
+            urls: vec![],
+            kind: None,
+            count: 1,
+            arrived: started,
+            started,
+            saved: true,
+        };
+        assert!(burst.accepts(started + Duration::from_secs(3)));
+        assert!(!burst.accepts(started + Duration::from_secs(4)));
+        assert!(!burst.accepts(started - Duration::from_secs(1)));
+        burst.arrived = started + Duration::from_secs(28);
+        assert!(burst.accepts(started + Duration::from_secs(29)));
+        assert!(!burst.accepts(started + Duration::from_secs(30)));
+        burst.count = 128;
+        assert!(!burst.accepts(started + Duration::from_secs(29)));
+    }
+    #[test]
     fn clipboard_offers_original_and_real_png_bytes() -> Result<()> {
         let image = image::DynamicImage::new_rgb8(2, 2);
         let mut jpeg = std::io::Cursor::new(Vec::new());
         image.write_to(&mut jpeg, image::ImageFormat::Jpeg)?;
         let sources = clipboard_sources("image/jpeg".into(), jpeg.into_inner())?;
-        assert_eq!(sources.len(), 2);
+        assert_eq!(sources.len(), 3);
         let wl_clipboard_rs::copy::Source::Bytes(bytes) = &sources[0].source else {
             panic!("expected bytes")
         };
         assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert_eq!(decode_image(bytes)?.width(), 2);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn echo_guard_commits_successful_selection_and_keeps_it_on_every_failure() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir()?;
+        let mut actions = DesktopActions::new(dir.path().to_owned());
+        let helper = dir.path().join("helper");
+        use sha2::{Digest, Sha256};
+        let converted = hex::encode(Sha256::digest(b"converted image"));
+        std::fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh
+cat >/dev/null
+printf 'READY {converted}\n'
+exec sleep 60
+"
+            ),
+        )?;
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))?;
+        actions.helper = Some(helper);
+        actions.echo.remember(b"previous");
+        actions
+            .copy(None, Some("new successful text"), "text/plain")
+            .await?;
+        assert!(!actions.echo.contains(b"previous"));
+        assert!(actions.echo.contains(b"new successful text"));
+        assert!(actions.echo.contains(b"converted image"));
+        for helper in [
+            PathBuf::from("/no/such/helper"),
+            PathBuf::from("/bin/false"),
+        ] {
+            actions.helper = Some(helper);
+            assert!(
+                actions
+                    .copy(None, Some("failed local text"), "text/plain")
+                    .await
+                    .is_err()
+            );
+            let path = dir.path().join("image");
+            std::fs::write(&path, b"failed image")?;
+            assert!(
+                actions
+                    .copy(Some(&ReceivedFile::open(&path)?), None, "image/png")
+                    .await
+                    .is_err()
+            );
+            assert!(!actions.echo.contains(b"failed local text"));
+            assert!(!actions.echo.contains(b"failed image"));
+            assert!(actions.echo.contains(b"new successful text"));
+            assert!(actions.echo.contains(b"converted image"));
+        }
+        actions.shutdown().await?;
         Ok(())
     }
     #[tokio::test]
@@ -596,6 +1163,7 @@ mod tests {
     struct NotificationServer(
         std::sync::atomic::AtomicU32,
         Arc<std::sync::Mutex<HashMap<String, zbus::zvariant::OwnedValue>>>,
+        Arc<std::sync::Mutex<Vec<String>>>,
     );
     #[zbus::interface(name = "org.freedesktop.Notifications")]
     impl NotificationServer {
@@ -607,22 +1175,93 @@ mod tests {
             _icon: &str,
             _summary: &str,
             _body: &str,
-            _actions: Vec<String>,
+            actions: Vec<String>,
             hints: HashMap<String, zbus::zvariant::OwnedValue>,
             _timeout: i32,
         ) -> u32 {
             *self.1.lock().unwrap() = hints;
+            *self.2.lock().unwrap() = actions;
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
         }
     }
-    struct PortalServer(Arc<std::sync::Mutex<Vec<u8>>>);
+    struct PortalServer(
+        Arc<std::sync::Mutex<Vec<u8>>>,
+        Arc<std::sync::atomic::AtomicU32>,
+        Arc<std::sync::Mutex<Option<String>>>,
+        Arc<std::sync::atomic::AtomicU32>,
+        Arc<std::sync::atomic::AtomicU32>,
+    );
+    struct PortalRequest(Arc<std::sync::atomic::AtomicU32>);
+    #[zbus::interface(name = "org.freedesktop.portal.Request")]
+    impl PortalRequest {
+        fn close(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    struct FileManagerServer(Arc<std::sync::atomic::AtomicU32>);
+    #[zbus::interface(name = "org.freedesktop.FileManager1")]
+    impl FileManagerServer {
+        fn show_items(&self, _urls: Vec<String>, _startup: &str) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    impl PortalServer {
+        async fn respond(
+            &self,
+            options: HashMap<String, zbus::zvariant::OwnedValue>,
+            header: zbus::message::Header<'_>,
+            connection: &zbus::Connection,
+        ) -> zbus::zvariant::OwnedObjectPath {
+            let token: String = options
+                .get("handle_token")
+                .unwrap()
+                .try_clone()
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let sender = header
+                .sender()
+                .unwrap()
+                .as_str()
+                .trim_start_matches(':')
+                .replace('.', "_");
+            let path = format!("/org/freedesktop/portal/desktop/request/{sender}/{token}");
+            self.3.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            connection
+                .object_server()
+                .at(path.clone(), PortalRequest(self.4.clone()))
+                .await
+                .unwrap();
+            if self.1.load(std::sync::atomic::Ordering::SeqCst) == 3 {
+                *self.2.lock().unwrap() = Some(path.clone());
+                return path.try_into().unwrap();
+            }
+            // Emit before returning acceptance to exercise the subscription race.
+            connection
+                .emit_signal(
+                    None::<&str>,
+                    path.as_str(),
+                    "org.freedesktop.portal.Request",
+                    "Response",
+                    &(
+                        self.1.load(std::sync::atomic::Ordering::SeqCst),
+                        HashMap::<String, zbus::zvariant::OwnedValue>::new(),
+                    ),
+                )
+                .await
+                .unwrap();
+            path.try_into().unwrap()
+        }
+    }
     #[zbus::interface(name = "org.freedesktop.portal.OpenURI")]
     impl PortalServer {
-        fn open_file(
+        async fn open_file(
             &self,
             _parent: &str,
             fd: zbus::zvariant::Fd<'_>,
-            _options: HashMap<String, zbus::zvariant::OwnedValue>,
+            options: HashMap<String, zbus::zvariant::OwnedValue>,
+            #[zbus(header)] header: zbus::message::Header<'_>,
+            #[zbus(connection)] connection: &zbus::Connection,
         ) -> zbus::zvariant::OwnedObjectPath {
             use std::io::Read;
             use std::os::fd::AsFd;
@@ -630,10 +1269,18 @@ mod tests {
             let mut bytes = Vec::new();
             file.take(1024).read_to_end(&mut bytes).unwrap();
             *self.0.lock().unwrap() = bytes;
-            zbus::zvariant::OwnedObjectPath::try_from(
-                "/org/freedesktop/portal/desktop/request/test",
-            )
-            .unwrap()
+            self.respond(options, header, connection).await
+        }
+        #[zbus(name = "OpenURI")]
+        async fn open_uri(
+            &self,
+            _parent: &str,
+            _uri: &str,
+            options: HashMap<String, zbus::zvariant::OwnedValue>,
+            #[zbus(header)] header: zbus::message::Header<'_>,
+            #[zbus(connection)] connection: &zbus::Connection,
+        ) -> zbus::zvariant::OwnedObjectPath {
+            self.respond(options, header, connection).await
         }
     }
     #[tokio::test]
@@ -690,19 +1337,37 @@ mod tests {
             .await?;
         let address = line.trim();
         let portal_bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let portal_code = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let deferred_response = Arc::new(std::sync::Mutex::new(None));
         let notification_hints = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let notification_actions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let issued = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let closed = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let shown = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let server = zbus::connection::Builder::address(address)?
             .name("org.freedesktop.Notifications")?
             .name("org.freedesktop.portal.Desktop")?
+            .name("org.freedesktop.FileManager1")?
+            .serve_at(
+                "/org/freedesktop/FileManager1",
+                FileManagerServer(shown.clone()),
+            )?
             .serve_at(
                 "/org/freedesktop/portal/desktop",
-                PortalServer(portal_bytes.clone()),
+                PortalServer(
+                    portal_bytes.clone(),
+                    portal_code.clone(),
+                    deferred_response.clone(),
+                    issued.clone(),
+                    closed.clone(),
+                ),
             )?
             .serve_at(
                 "/org/freedesktop/Notifications",
                 NotificationServer(
                     std::sync::atomic::AtomicU32::new(0),
                     notification_hints.clone(),
+                    notification_actions.clone(),
                 ),
             )?
             .build()
@@ -710,7 +1375,7 @@ mod tests {
         let connection = zbus::connection::Builder::address(address)?.build().await?;
         let dir = tempfile::tempdir()?;
         let mut actions = DesktopActions::new(dir.path().to_owned());
-        actions.bus = Some(connection);
+        actions.bus = Some(connection.clone());
         let original = dir.path().join("viewer.png");
         std::fs::write(&original, b"verified viewer bytes")?;
         let file = ReceivedFile::open(&original)?;
@@ -797,7 +1462,346 @@ mod tests {
             }
         })
         .await?;
+        // Verify production notification hints, including replacement bursts and
+        // transient clipboard notifications, against the real zbus transport.
+        let final_path = dir.path().join("final.png");
+        std::fs::write(&final_path, &image_bytes)?;
+        let final_file = ReceivedFile::open(&final_path)?;
+        let metadata = pneu_proto::FileBegin {
+            transfer_id: pneu_proto::Id::from_bytes([7; 16]),
+            file_name: "final.png".into(),
+            mime: "image/png".into(),
+            size: image_bytes.len() as u64,
+            sha256: pneu_proto::Hash::new("0".repeat(64))?,
+            kind: pneu_proto::FileKind::Screenshot,
+            created_at: 0,
+            source_media_id: None,
+        };
+        for _ in 0..72 {
+            actions
+                .notify_file(&final_file, &metadata, true, None, dir.path())
+                .await?;
+        }
+        {
+            let hints = notification_hints.lock().unwrap();
+            assert!(hints.contains_key("x-kde-urls"));
+            assert!(!hints.contains_key("image-data"));
+            assert!(!hints.contains_key("image-path"));
+            assert!(!hints.contains_key("transient"));
+            let urls: Vec<String> = hints["x-kde-urls"].try_clone()?.try_into()?;
+            assert_eq!(urls.len(), 72);
+            assert_eq!(u8::try_from(&hints["urgency"])?, 1);
+            assert_eq!(
+                String::try_from(hints["desktop-entry"].try_clone()?)?,
+                "pneu"
+            );
+        }
+        actions.notify_text("https://example.com/").await?;
+        {
+            let hints = notification_hints.lock().unwrap();
+            assert!(bool::try_from(&hints["transient"])?);
+            assert_eq!(u8::try_from(&hints["urgency"])?, 0);
+            assert!(!hints.contains_key("x-kde-urls"));
+        }
+        for _ in 0..128 {
+            actions
+                .notify_file(&final_file, &metadata, true, None, dir.path())
+                .await?;
+        }
+        {
+            let current = actions.notifications().await?;
+            let targets = current.as_ref().unwrap().targets.lock().await;
+            assert!(targets.values().all(|t| t.urls.len() <= 128));
+            assert_eq!(actions.burst.lock().await.as_ref().unwrap().count, 72);
+        }
+        actions.burst.lock().await.as_mut().unwrap().started =
+            std::time::Instant::now() - std::time::Duration::from_secs(31);
+        actions
+            .notify_file(&final_file, &metadata, true, None, dir.path())
+            .await?;
+        assert_eq!(actions.burst.lock().await.as_ref().unwrap().count, 1);
+        // Queued jobs are dispatched back-to-back, but their arrivals govern
+        // both the four-second gap and the thirty-second burst lifetime.
+        *actions.burst.lock().await = None;
+        let arrived = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        for (seconds, count) in [
+            (0, 1),
+            (5, 1),
+            (7, 2),
+            (10, 3),
+            (13, 4),
+            (16, 5),
+            (19, 6),
+            (22, 7),
+            (25, 8),
+            (28, 9),
+            (31, 10),
+            (34, 11),
+            (35, 1),
+            (34, 1),
+        ] {
+            actions
+                .notify_file_at(
+                    &final_file,
+                    &metadata,
+                    true,
+                    None,
+                    dir.path(),
+                    arrived + std::time::Duration::from_secs(seconds),
+                )
+                .await?;
+            assert_eq!(actions.burst.lock().await.as_ref().unwrap().count, count);
+        }
+        actions
+            .notify_image_failure(&final_file, &metadata, false)
+            .await?;
+        assert!(
+            !notification_actions
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|id| id == "show")
+        );
+        actions
+            .notify_image_failure(&final_file, &metadata, true)
+            .await?;
+        assert!(
+            notification_actions
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|id| id == "show")
+        );
+        let id = {
+            let current = actions.notifications().await?;
+            let targets = current.as_ref().unwrap().targets.lock().await;
+            *targets.keys().max().unwrap()
+        };
+        portal_bytes.lock().unwrap().clear();
+        server
+            .emit_signal(
+                None::<&str>,
+                "/org/freedesktop/Notifications",
+                "org.freedesktop.Notifications",
+                "ActionInvoked",
+                &(id, "open"),
+            )
+            .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while *portal_bytes.lock().unwrap() != image_bytes {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        // A response failure (after acceptance) falls back; cancellation never does.
+        for code in [0, 1, 2] {
+            portal_code.store(code, std::sync::atomic::Ordering::SeqCst);
+            let fallback = std::sync::atomic::AtomicBool::new(false);
+            crate::ui::portal::with_fallback(
+                open_uri_portal("https://example.com", &connection),
+                || async {
+                    fallback.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await?;
+            assert_eq!(
+                fallback.load(std::sync::atomic::Ordering::SeqCst),
+                code == 2
+            );
+            assert_eq!(
+                open_received_file(&final_file, &connection).await.is_err(),
+                code == 2
+            );
+        }
+        // Acceptance is immediate, but an application chooser may take time.
+        portal_code.store(3, std::sync::atomic::Ordering::SeqCst);
+        let file = final_file.clone();
+        let viewer_bus = connection.clone();
+        let viewer = tokio::spawn(async move { open_received_file(&file, &viewer_bus).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while deferred_response.lock().unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        assert!(
+            !viewer.is_finished(),
+            "interactive chooser was prematurely canceled"
+        );
+        let path = deferred_response.lock().unwrap().take().unwrap();
+        server
+            .emit_signal(
+                None::<&str>,
+                path.as_str(),
+                "org.freedesktop.portal.Request",
+                "Response",
+                &(0u32, HashMap::<String, zbus::zvariant::OwnedValue>::new()),
+            )
+            .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), viewer).await???;
+        // Leave all three interactive entry points pending: legacy Open,
+        // structured Open, and Open Link. Signals and cleanup must still run.
+        portal_code.store(3, std::sync::atomic::Ordering::SeqCst);
+        let baseline = issued.load(std::sync::atomic::Ordering::SeqCst);
+        let pending_id = actions
+            .notice(
+                crate::ui::notifications::Notice::blocked("phone"),
+                vec![final_file.clone()],
+                Some("https://example.com".into()),
+                0,
+                None,
+            )
+            .await?;
+        for (id, action) in [(2, "open"), (pending_id, "open"), (pending_id, "link")]
+            .into_iter()
+            .chain(std::iter::repeat_n((pending_id, "open"), 10))
+        {
+            server
+                .emit_signal(
+                    None::<&str>,
+                    "/org/freedesktop/Notifications",
+                    "org.freedesktop.Notifications",
+                    "ActionInvoked",
+                    &(id, action),
+                )
+                .await?;
+        }
+        // Notifications were already initialized with no sender; resolve at dispatch.
+        for action in ["pair", "folder"] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+            actions.set_commands(tx); // Also exercise replacement of a previous sender.
+            let id = actions
+                .notice(
+                    crate::ui::notifications::Notice::blocked("phone"),
+                    Vec::new(),
+                    None,
+                    0,
+                    None,
+                )
+                .await?;
+            server
+                .emit_signal(
+                    None::<&str>,
+                    "/org/freedesktop/Notifications",
+                    "org.freedesktop.Notifications",
+                    "ActionInvoked",
+                    &(id, action),
+                )
+                .await?;
+            let command = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await?
+                .context("notification command")?;
+            assert!(matches!(
+                (action, command),
+                ("pair", crate::ui::Command::Window) | ("folder", crate::ui::Command::ChooseFolder)
+            ));
+        }
+        assert_eq!(
+            issued.load(std::sync::atomic::Ordering::SeqCst) - baseline,
+            crate::ui::portal::Interactions::LIMIT as u32,
+            "limit must apply before issuing requests"
+        );
+        server
+            .emit_signal(
+                None::<&str>,
+                "/org/freedesktop/Notifications",
+                "org.freedesktop.Notifications",
+                "ActionInvoked",
+                &(pending_id, "show"),
+            )
+            .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while shown.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        for id in [2, pending_id] {
+            server
+                .emit_signal(
+                    None::<&str>,
+                    "/org/freedesktop/Notifications",
+                    "org.freedesktop.Notifications",
+                    "NotificationClosed",
+                    &(id, 2u32),
+                )
+                .await?;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let current = actions.notifications().await?;
+                let n = current.as_ref().unwrap();
+                if !n.paths.lock().await.contains_key(&2)
+                    && !n.targets.lock().await.contains_key(&pending_id)
+                {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                drop(current);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await??;
         actions.shutdown().await?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while closed.load(std::sync::atomic::Ordering::SeqCst)
+                < crate::ui::portal::Interactions::LIMIT as u32
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        // All request kinds share ownership-loss handling. Viewer and URI waits
+        // must free their bounded slots without involving the real URI fallback.
+        let mut waiting = crate::ui::portal::Interactions::new();
+        let failed = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        for index in 0..crate::ui::portal::Interactions::LIMIT {
+            let wait = if index % 2 == 0 {
+                begin_open_received_file(&final_file, &connection).await?
+            } else {
+                begin_open_uri_portal("https://example.com", &connection).await?
+            };
+            let failed = failed.clone();
+            waiting.push(async move {
+                assert!(wait.await.is_err());
+                failed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+        assert!(!waiting.available());
+        assert!(
+            server
+                .release_name("org.freedesktop.portal.Desktop")
+                .await?
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while failed.load(std::sync::atomic::Ordering::SeqCst)
+                != crate::ui::portal::Interactions::LIMIT as u32
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(waiting.available());
+        portal_code.store(0, std::sync::atomic::Ordering::SeqCst);
+        let replacement = zbus::connection::Builder::address(address)?
+            .name("org.freedesktop.portal.Desktop")?
+            .serve_at(
+                "/org/freedesktop/portal/desktop",
+                PortalServer(
+                    portal_bytes.clone(),
+                    portal_code,
+                    deferred_response,
+                    issued,
+                    closed,
+                ),
+            )?
+            .build()
+            .await?;
+        open_received_file(&final_file, &connection).await?;
+        open_uri_portal("https://example.com", &connection).await?;
+        waiting.shutdown().await;
+        drop(replacement);
         drop(server);
         bus.kill().await?;
         bus.wait().await?;

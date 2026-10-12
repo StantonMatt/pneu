@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
@@ -51,6 +51,7 @@ pub struct Config {
     pub copy_image_to_clipboard: bool,
     pub open_in_viewer: bool,
     pub clipboard_sync_to_phone: bool,
+    pub clipboard_include_images: bool,
     pub port: u16,
     /// Cache only: completed files can expire; dedupe records never expire.
     pub cache_retention_days: u32,
@@ -68,8 +69,9 @@ impl Default for Config {
             copy_image_to_clipboard: true,
             open_in_viewer: false,
             clipboard_sync_to_phone: true,
+            clipboard_include_images: false,
             port: pneu_proto::DEFAULT_PORT,
-            cache_retention_days: 7,
+            cache_retention_days: 1,
             max_file_bytes: pneu_proto::MAX_FILE_SIZE,
         }
     }
@@ -123,24 +125,59 @@ pub fn private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 pub fn atomic_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension(format!("{}-tmp", crate::random_hex(16)));
+    let folder = crate::storage::Folder::open(path.parent().context("no parent")?, false)?;
+    atomic_private_in(&folder, path.file_name().context("file name")?, bytes)
+}
+/// Write and replace one entry within an already retained, no-follow parent.
+pub(crate) fn atomic_private_in(
+    folder: &crate::storage::Folder,
+    destination: &std::ffi::OsStr,
+    bytes: &[u8],
+) -> Result<()> {
+    ensure!(
+        Path::new(destination).file_name() == Some(destination),
+        "invalid file name"
+    );
+    let tmp = format!("pneu-{}-tmp", crate::random_hex(16));
+    let name = tmp.as_str();
+    let mut file = fs::File::from(rustix::fs::openat(
+        &*folder.file,
+        name,
+        rustix::fs::OFlags::WRONLY
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::EXCL
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::from_raw_mode(0o600),
+    )?);
     let result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(&tmp, path)?;
-        sync_parent(path)
+        rustix::fs::renameat(&*folder.file, name, &*folder.file, destination)?;
+        folder.file.sync_all()?;
+        Ok(())
     })();
     if result.is_err() {
-        let _ = fs::remove_file(tmp);
+        let _ = crate::storage::remove_file(&folder.file, name, &file);
     }
     result
 }
 pub fn sync_parent(path: &Path) -> Result<()> {
     fs::File::open(path.parent().context("no parent")?)?.sync_all()?;
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn failed_atomic_write_cleans_its_temporary_file_and_preserves_destination() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let destination = dir.path().join("config");
+        fs::create_dir(&destination)?;
+        fs::write(destination.join("keep"), b"foreign")?;
+        assert!(atomic_private(&destination, b"new config").is_err());
+        assert_eq!(fs::read(destination.join("keep"))?, b"foreign");
+        assert_eq!(fs::read_dir(dir.path())?.count(), 1);
+        Ok(())
+    }
 }

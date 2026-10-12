@@ -33,6 +33,22 @@ struct Actions {
     copy_failures: std::sync::atomic::AtomicUsize,
     image_entered: tokio::sync::Notify,
     image_release: tokio::sync::Notify,
+    block_notice: std::sync::atomic::AtomicBool,
+    notice_entered: tokio::sync::Notify,
+    notice_release: tokio::sync::Notify,
+    receipt_notices: Mutex<Vec<String>>,
+    failure_saved: Mutex<Vec<bool>>,
+}
+impl Actions {
+    async fn receipt_notice(&self, notice: String) -> Result<()> {
+        if self.block_notice.load(std::sync::atomic::Ordering::SeqCst) {
+            self.notice_entered.notify_one();
+            self.notice_release.notified().await;
+        }
+        self.receipt_notices.lock().unwrap().push(notice);
+        self.changed.notify_one();
+        Ok(())
+    }
 }
 #[async_trait]
 impl PcActions for Actions {
@@ -86,6 +102,31 @@ impl PcActions for Actions {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.changed.notify_one();
         Ok(())
+    }
+    async fn notify_text(&self, text: &str) -> Result<()> {
+        self.receipt_notice(text.into()).await
+    }
+    async fn notify_text_failure(&self) -> Result<()> {
+        self.receipt_notice("text failed".into()).await
+    }
+    async fn notify_save_failure(
+        &self,
+        _: &FileBegin,
+        code: NackCode,
+        destination: pneud::ui::ReceiveDestination,
+        _: &Path,
+    ) -> Result<()> {
+        self.receipt_notice(format!("{destination:?}: {code:?}"))
+            .await
+    }
+    async fn notify_image_failure(
+        &self,
+        _: &ReceivedFile,
+        _: &FileBegin,
+        saved: bool,
+    ) -> Result<()> {
+        self.failure_saved.lock().unwrap().push(saved);
+        self.notify_clipboard_failure().await
     }
     async fn open(&self, path: &Path) -> Result<()> {
         self.opens.lock().unwrap().push(path.into());
@@ -943,6 +984,8 @@ async fn incoming_unpair_clears_pairing_receipts_and_active_staging() -> Result<
         )
     })
     .await?;
+    assert!(!h.core.ui_snapshot().receiving);
+    assert!(!h.core.ui_snapshot().paired);
     for table in [
         "peers",
         "receipts",
@@ -974,7 +1017,7 @@ async fn incoming_unpair_clears_pairing_receipts_and_active_staging() -> Result<
 }
 
 #[tokio::test]
-async fn missing_uncreatable_save_folder_nacks_then_retries_without_a_copy() -> Result<()> {
+async fn missing_uncreatable_save_folder_retains_cache_and_retries_without_receipt() -> Result<()> {
     let h = Harness::new().await?;
     let phone = h.phone("phone")?;
     let mut c = h.pair(&phone).await?;
@@ -994,7 +1037,59 @@ async fn missing_uncreatable_save_folder_nacks_then_retries_without_a_copy() -> 
         })
     ));
     assert_eq!(device_rows(&h, &phone.identity.device_id, "receipts")?, 0);
+    let cached: Vec<_> = std::fs::read_dir(&h.core.paths.cache)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .collect();
+    assert_eq!(cached.len(), 1);
+    assert_eq!(std::fs::read(cached[0].path())?, b"retry bytes");
+    for _ in 0..3 {
+        begin_chunks(&mut c, &meta, b"retry bytes").await?;
+        assert!(matches!(
+            end(&mut c, meta.transfer_id.clone()).await?,
+            Message::Nack(Nack {
+                code: NackCode::NotWritable,
+                ..
+            })
+        ));
+        let copies = std::fs::read_dir(&h.core.paths.cache)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .count();
+        assert_eq!(
+            copies, 1,
+            "retries must retain only one cache copy per operation"
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        h.actions.notices.lock().unwrap().len(),
+        1,
+        "cached retries must not repeat desktop effects"
+    );
+    assert!(matches!(
+        h.core.ui_snapshot().error,
+        Some(pneud::ui::ReceiveError::Storage {
+            destination: pneud::ui::ReceiveDestination::SaveFolder,
+            ..
+        })
+    ));
     assert_eq!(std::fs::read(&blocker)?, b"keep me");
+    let conflicting_text = Clipboard {
+        transfer_id: meta.transfer_id.clone(),
+        text: "cannot replace failed file".into(),
+        created_at: 1,
+        origin: ClipboardOrigin::Clipboard,
+    };
+    c.write(&Message::Clipboard(conflicting_text)).await?;
+    assert!(matches!(
+        c.read(Duration::from_secs(2)).await?,
+        Message::Nack(Nack {
+            code: NackCode::IdConflict,
+            ..
+        })
+    ));
+    assert!(h.actions.text.lock().unwrap().is_empty());
     let db = rusqlite::Connection::open(h.core.paths.data.join("state.sqlite3"))?;
     assert_eq!(
         db.query_row(
@@ -1016,6 +1111,10 @@ async fn missing_uncreatable_save_folder_nacks_then_retries_without_a_copy() -> 
         })
     ));
     assert_eq!(h.saved()?.len(), 1);
+    assert!(
+        !cached[0].path().exists(),
+        "successful receipt must retire the failed cache copy"
+    );
     drop(c);
     h.stop().await
 }
@@ -1460,8 +1559,17 @@ async fn new_pairing_replaces_old_and_cancels_its_running_and_queued_actions() -
                 .await?;
         }
     }
+    let mut transfer_events = h.core.subscribe();
+    let unfinished = metadata(Id::new(pneud::random_hex(16))?, bytes);
+    begin_chunks(&mut c, &unfinished, bytes).await?;
+    event_matching(&mut transfer_events, |event|matches!(event,pneud::Event::TransferProgress {transfer_id,..} if *transfer_id==unfinished.transfer_id)).await?;
+    assert!(h.core.ui_snapshot().receiving);
     tokio::time::sleep(Duration::from_secs(1)).await;
     let mut replacement = h.pair(&next).await?;
+    assert!(
+        !h.core.ui_snapshot().receiving,
+        "new pairing must discard the old unfinished receive"
+    );
     h.actions
         .block_image
         .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -1499,6 +1607,133 @@ async fn new_pairing_replaces_old_and_cancels_its_running_and_queued_actions() -
     drop(c);
     drop(replacement);
     h.stop().await
+}
+
+#[tokio::test]
+async fn immediate_disconnect_after_receipt_preserves_text_link_and_failure_notices() -> Result<()>
+{
+    for mode in ["text", "link", "copy failure", "cache failure"] {
+        let h = Harness::new().await?;
+        let phone = h.phone("phone")?;
+        let mut c = h.pair(&phone).await?;
+        h.actions
+            .block_notice
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut events = h.core.subscribe();
+        let expected = if mode == "cache failure" {
+            std::fs::rename(&h.core.paths.cache, h.dir.path().join("old-cache"))?;
+            std::fs::write(&h.core.paths.cache, b"blocked cache")?;
+            let bytes = b"image";
+            let mut meta = metadata(Id::new(pneud::random_hex(16))?, bytes);
+            meta.kind = FileKind::ClipboardImage;
+            begin_chunks(&mut c, &meta, bytes).await?;
+            assert!(matches!(
+                end(&mut c, meta.transfer_id).await?,
+                Message::Nack(Nack {
+                    code: NackCode::NotWritable,
+                    ..
+                })
+            ));
+            "Cache: NotWritable"
+        } else {
+            let text = if mode == "link" {
+                "https://example.com/"
+            } else {
+                "text"
+            };
+            let failed = mode == "copy failure";
+            h.actions
+                .denied
+                .store(failed, std::sync::atomic::Ordering::SeqCst);
+            c.write(&Message::Clipboard(Clipboard {
+                transfer_id: Id::new(pneud::random_hex(16))?,
+                text: text.into(),
+                created_at: 0,
+                origin: ClipboardOrigin::Clipboard,
+            }))
+            .await?;
+            let receipt = c.read(Duration::from_secs(2)).await?;
+            if failed {
+                assert!(matches!(
+                    receipt,
+                    Message::Nack(Nack {
+                        code: NackCode::ClipboardUnavailable,
+                        ..
+                    })
+                ));
+            } else {
+                assert!(matches!(receipt, Message::Ack(_)));
+            }
+            if failed { "text failed" } else { text }
+        };
+        // A delayed backend cannot delay the receipt, and is independent of READY.
+        tokio::time::timeout(Duration::from_secs(2), h.actions.notice_entered.notified()).await?;
+        c.close().await?;
+        event_matching(&mut events, |event| {
+            matches!(
+                event,
+                pneud::Event::ConnectionChanged {
+                    connected: false,
+                    ..
+                }
+            )
+        })
+        .await?;
+        assert!(h.actions.receipt_notices.lock().unwrap().is_empty());
+        h.actions.notice_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while h.actions.receipt_notices.lock().unwrap().is_empty() {
+                h.actions.changed.notified().await;
+            }
+        })
+        .await?;
+        assert_eq!(&*h.actions.receipt_notices.lock().unwrap(), &[expected]);
+        h.stop().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn copy_failure_without_regular_notifications_keeps_actual_save_outcome() -> Result<()> {
+    for (save, bytes) in [
+        (true, &b"\x89PNG\r\n\x1a\nimage"[..]),
+        (false, &b"\x89PNG\r\n\x1a\nimage"[..]),
+        (true, &b"invalid image"[..]),
+    ] {
+        let h = Harness::new().await?;
+        let phone = h.phone("phone")?;
+        let mut c = h.pair(&phone).await?;
+        let mut config = h.core.config();
+        config.save_to_folder = save;
+        config.notification_preview = false;
+        h.core.update_config(config).await?;
+        h.actions
+            .deny_image
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut meta = metadata(Id::new(pneud::random_hex(16))?, bytes);
+        // Invalid explicit content uses the same saved=false failure API.
+        if bytes == b"invalid image" {
+            meta.kind = FileKind::ClipboardImage;
+        }
+        begin_chunks(&mut c, &meta, bytes).await?;
+        assert!(matches!(
+            end(&mut c, meta.transfer_id).await?,
+            Message::Ack(_)
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while h.actions.failure_saved.lock().unwrap().is_empty() {
+                h.actions.changed.notified().await;
+            }
+        })
+        .await?;
+        assert_eq!(
+            &*h.actions.failure_saved.lock().unwrap(),
+            &[save && bytes != b"invalid image"]
+        );
+        c.close().await?;
+        h.stop().await?;
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -1886,7 +2121,11 @@ async fn failed_clipboard_has_no_barrier_or_receipt_to_conflict_with_interleaved
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let bytes = b"file bytes";
     let meta = metadata(Id::new(pneud::random_hex(16))?, bytes);
+    let mut events = h.core.subscribe();
     c.write(&Message::FileBegin(meta.clone())).await?;
+    // File and text have separate workers. Establish this test's intended
+    // interleaving rather than assuming wire order establishes processing order.
+    event_matching(&mut events, |event| matches!(event, pneud::Event::TransferStarted { metadata, .. } if metadata.transfer_id == meta.transfer_id)).await?;
     let mut text = phone.text("failed".into(), ClipboardOrigin::Clipboard)?;
     text.transfer_id = meta.transfer_id.clone();
     assert!(c.send_text(text).await.is_err());
@@ -1946,38 +2185,559 @@ async fn received_image_descriptor_survives_swap_while_copy_is_blocked() -> Resu
 #[tokio::test]
 async fn text_claim_rejects_interleaved_file_before_placement() -> Result<()> {
     use std::sync::atomic::Ordering;
+    for fallback in [false, true] {
+        let h = Harness::new().await?;
+        if fallback {
+            let blocker = h.dir.path().join("blocked-folder");
+            std::fs::write(&blocker, b"blocker")?;
+            let mut config = h.core.config();
+            config.save_path = blocker.join("child");
+            h.core.update_config(config).await?;
+        }
+        let phone = h.phone("phone")?;
+        let mut c = h.pair(&phone).await?;
+        h.actions.block_text.store(true, Ordering::SeqCst);
+        let text = phone.text("claimed text".into(), ClipboardOrigin::Clipboard)?;
+        let bytes = b"conflicting file";
+        let meta = metadata(text.transfer_id.clone(), bytes);
+        let mut events = h.core.subscribe();
+        begin_chunks(&mut c, &meta, bytes).await?;
+        event_matching(&mut events, |e| matches!(e, pneud::Event::TransferProgress {transfer_id,received,..} if *transfer_id == meta.transfer_id && *received == bytes.len() as u64)).await?;
+        // The file has a live stage but no receipt yet. Text claims its ID while
+        // blocked inside clipboard integration; FILE_END must conflict at commit.
+        c.write(&Message::Clipboard(text.clone())).await?;
+        tokio::time::timeout(Duration::from_secs(2), h.actions.text_entered.notified()).await?;
+        assert!(matches!(
+            end(&mut c, meta.transfer_id).await?,
+            Message::Nack(Nack {
+                code: NackCode::IdConflict,
+                ..
+            })
+        ));
+        assert!(h.actions.text.lock().unwrap().is_empty());
+        h.actions.text_release.notify_one();
+        assert!(matches!(
+            c.read(Duration::from_secs(3)).await?,
+            Message::Ack(Ack {
+                deduplicated: false,
+                ..
+            })
+        ));
+        assert_eq!(&*h.actions.text.lock().unwrap(), &["claimed text"]);
+        assert!(h.saved().unwrap_or_default().is_empty());
+        drop(c);
+        h.stop().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn outgoing_clipboard_images_require_capability_and_keep_latest_while_receipting()
+-> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    drop(h.pair(&phone).await?);
+    let mut config = h.core.config();
+    config.clipboard_include_images = true;
+    h.core.update_config(config).await?;
+    assert!(
+        h.core
+            .send_clipboard_image(
+                phone.identity.device_id.clone(),
+                b"\x89PNG\r\n\x1a\nunsupported".to_vec()
+            )
+            .await
+            .is_err()
+    );
+    let config = pneud::tls::client_config(&phone.identity, h.core.identity.fingerprint.clone())?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let tcp = tokio::net::TcpStream::connect(&h.address).await?;
+    let mut tls = connector
+        .connect(rustls::pki_types::ServerName::try_from("pneu.local")?, tcp)
+        .await?;
+    let mut events = h.core.subscribe();
+    write_frame(
+        &mut tls,
+        &Message::Hello(Hello {
+            version: 1,
+            device_id: phone.identity.device_id.clone(),
+            name: "Image phone".into(),
+            capabilities: vec![
+                "files".into(),
+                "clipboard_text".into(),
+                "clipboard_image".into(),
+            ],
+            paused: Some(false),
+        }),
+    )
+    .await?;
+    assert!(matches!(
+        read_frame(&mut tls).await?,
+        Some(Message::Hello(_))
+    ));
+    event_matching(&mut events, |event| {
+        matches!(
+            event,
+            pneud::Event::ConnectionChanged {
+                connected: true,
+                ..
+            }
+        )
+    })
+    .await?;
+    let initial = h
+        .core
+        .send_clipboard(phone.identity.device_id.clone(), "hold this receipt".into())
+        .await?;
+    assert!(
+        matches!(read_frame(&mut tls).await?,Some(Message::Clipboard(text)) if text.transfer_id==initial)
+    );
+    let prepared = h.core.observe_clipboard_offer().unwrap();
+    h.core
+        .send_observed_image(prepared.clone(), b"\x89PNG\r\n\x1a\nprepared".to_vec())
+        .await?;
+    h.core.observe_clipboard_offer(); // a secret/unsupported/cleared offer invalidates images too
+    assert!(
+        h.core
+            .send_observed_image(prepared, b"\x89PNG\r\n\x1a\nstale".to_vec())
+            .await
+            .is_err()
+    );
+    let observed = h.core.observe_clipboard_offer().unwrap();
+    h.core
+        .toggle_setting(pneud::ui::Toggle::IncludeImages)
+        .await?;
+    h.core
+        .toggle_setting(pneud::ui::Toggle::IncludeImages)
+        .await?;
+    assert!(
+        h.core
+            .send_observed_image(observed, b"\x89PNG\r\n\x1a\npolicy".to_vec())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        device_rows(&h, &phone.identity.device_id, "outgoing")?,
+        1,
+        "image preparation must retain the explicit outbox"
+    );
+    let observed = h.core.observe_clipboard_offer().unwrap();
+    write_frame(&mut tls, &Message::Status(Status { paused: true })).await?;
+    event_matching(&mut events, |event| {
+        matches!(event, pneud::Event::PhonePaused { paused: true, .. })
+    })
+    .await?;
+    write_frame(&mut tls, &Message::Status(Status { paused: false })).await?;
+    event_matching(&mut events, |event| {
+        matches!(event, pneud::Event::PhonePaused { paused: false, .. })
+    })
+    .await?;
+    assert!(
+        h.core
+            .send_observed_image(observed, b"\x89PNG\r\n\x1a\npause".to_vec())
+            .await
+            .is_err()
+    );
+    write_frame(
+        &mut tls,
+        &Message::Ack(Ack {
+            transfer_id: initial,
+            deduplicated: false,
+        }),
+    )
+    .await?;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), read_frame(&mut tls))
+            .await
+            .is_err(),
+        "an invalidated prepared image must not be sent"
+    );
+    let initial = h
+        .core
+        .send_clipboard(
+            phone.identity.device_id.clone(),
+            "hold another receipt".into(),
+        )
+        .await?;
+    assert!(
+        matches!(read_frame(&mut tls).await?, Some(Message::Clipboard(text)) if text.transfer_id == initial)
+    );
+    let first = b"\x89PNG\r\n\x1a\nold".to_vec();
+    let mut newest = b"\x89PNG\r\n\x1a\n".to_vec();
+    newest.extend(vec![7; CHUNK_SIZE * 3]);
+    h.core
+        .send_clipboard_image(phone.identity.device_id.clone(), first)
+        .await?;
+    let image_id = h
+        .core
+        .send_clipboard_image(phone.identity.device_id.clone(), newest.clone())
+        .await?;
+    write_frame(
+        &mut tls,
+        &Message::Ack(Ack {
+            transfer_id: initial,
+            deduplicated: false,
+        }),
+    )
+    .await?;
+    let Some(Message::FileBegin(begin)) =
+        tokio::time::timeout(Duration::from_secs(2), read_frame(&mut tls)).await??
+    else {
+        panic!("expected image FILE_BEGIN")
+    };
+    assert_eq!(begin.transfer_id, image_id);
+    assert_eq!(begin.kind, FileKind::ClipboardImage);
+    assert_eq!(begin.size, newest.len() as u64);
+    let challenge = Ping {
+        nonce: Nonce::new("1".repeat(16))?,
+    };
+    write_frame(&mut tls, &Message::Ping(challenge.clone())).await?;
+    let mut received = Vec::new();
+    let mut pong = false;
+    let mut ended = false;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !pong || !ended {
+            match read_frame(&mut tls).await?.expect("image frame") {
+                Message::FileChunk(chunk) => {
+                    assert_eq!(chunk.transfer_id, image_id);
+                    assert_eq!(chunk.offset, received.len() as u64);
+                    received.extend(chunk.data);
+                }
+                Message::FileEnd(end) => {
+                    assert_eq!(end.transfer_id, image_id);
+                    ended = true;
+                }
+                Message::Pong(p) => {
+                    assert_eq!(p, challenge);
+                    pong = true;
+                }
+                other => panic!("unexpected image frame {other:?}"),
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    assert_eq!(received, newest);
+    assert_eq!(
+        begin.sha256.as_str(),
+        hex::encode(Sha256::digest(&received))
+    );
+    write_frame(
+        &mut tls,
+        &Message::Ack(Ack {
+            transfer_id: image_id.clone(),
+            deduplicated: false,
+        }),
+    )
+    .await?;
+    event_matching(&mut events,|event|matches!(event,pneud::Event::ClipboardSent {transfer_id,..} if *transfer_id==image_id)).await?;
+    write_frame(&mut tls, &Message::Status(Status { paused: true })).await?;
+    event_matching(&mut events, |event| {
+        matches!(event, pneud::Event::PhonePaused { paused: true, .. })
+    })
+    .await?;
+    assert!(
+        h.core
+            .send_clipboard_image(phone.identity.device_id.clone(), received)
+            .await
+            .is_err()
+    );
+    tls.shutdown().await?;
+    drop(tls);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn automatic_clipboard_text_is_latest_only_and_never_queued_across_connections() -> Result<()>
+{
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut events = h.core.subscribe();
+    let mut connection = h.pair(&phone).await?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while h.core.clipboard_target().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    let (device, generation) = h.core.clipboard_target().unwrap();
+    let first = h
+        .core
+        .send_clipboard(device.clone(), "in flight".into())
+        .await?;
+    assert!(
+        matches!(connection.read(Duration::from_secs(2)).await?,Message::Clipboard(text) if text.transfer_id==first)
+    );
+    h.core
+        .send_automatic_clipboard(device.clone(), generation, "old selection".into())
+        .await?;
+    let newest = h
+        .core
+        .send_automatic_clipboard(device.clone(), generation, "newest selection".into())
+        .await?;
+    assert_eq!(
+        device_rows(&h, &device, "outgoing")?,
+        1,
+        "automatic preparation must preserve the explicit send awaiting ACK"
+    );
+    connection
+        .write(&Message::Ack(Ack {
+            transfer_id: first,
+            deduplicated: false,
+        }))
+        .await?;
+    assert!(
+        matches!(connection.read(Duration::from_secs(2)).await?,Message::Clipboard(text) if text.transfer_id==newest && text.text=="newest selection")
+    );
+    h.core
+        .send_automatic_clipboard(device.clone(), generation, "pending at disconnect".into())
+        .await?;
+    connection.close().await?;
+    drop(connection);
+    event_matching(&mut events, |event| {
+        matches!(
+            event,
+            pneud::Event::ConnectionChanged {
+                connected: false,
+                ..
+            }
+        )
+    })
+    .await?;
+    let mut connection = phone.reconnect().await?;
+    event_matching(&mut events, |event| {
+        matches!(
+            event,
+            pneud::Event::ConnectionChanged {
+                connected: true,
+                ..
+            }
+        )
+    })
+    .await?;
+    assert!(
+        h.core
+            .send_automatic_clipboard(device.clone(), generation, "stale offer".into())
+            .await
+            .is_err()
+    );
+    assert!(
+        connection.read(Duration::from_millis(200)).await.is_err(),
+        "disconnected selection must not arrive on reconnect"
+    );
+    assert_eq!(device_rows(&h, &device, "outgoing")?, 0);
+    connection.close().await?;
+    drop(connection);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn offers_policy_changes_and_stale_discard_cannot_send_prepared_clipboard() -> Result<()> {
     let h = Harness::new().await?;
     let phone = h.phone("phone")?;
     let mut c = h.pair(&phone).await?;
-    h.actions.block_text.store(true, Ordering::SeqCst);
-    let text = phone.text("claimed text".into(), ClipboardOrigin::Clipboard)?;
-    let bytes = b"conflicting file";
-    let meta = metadata(text.transfer_id.clone(), bytes);
+    let device = phone.identity.device_id.clone();
+    let explicit = h
+        .core
+        .send_clipboard(device.clone(), "explicit awaiting receipt".into())
+        .await?;
+    assert!(
+        matches!(c.read(Duration::from_secs(2)).await?,Message::Clipboard(text) if text.transfer_id==explicit)
+    );
+    let prepared = h.core.observe_clipboard_offer().unwrap();
+    h.core
+        .send_observed_clipboard(prepared, "prepared A".into())
+        .await?;
+    let stale = h.core.observe_clipboard_offer().unwrap(); // clear, unsupported and secret offers all follow this path
+    assert!(
+        h.core
+            .send_observed_clipboard(stale.clone(), "slow offer".into())
+            .await
+            .is_ok()
+    );
+    h.core.observe_clipboard_offer();
+    assert!(
+        h.core
+            .send_observed_clipboard(stale, "stale async offer".into())
+            .await
+            .is_err()
+    );
+    assert_eq!(device_rows(&h, &device, "outgoing")?, 1);
+    c.write(&Message::Ack(Ack {
+        transfer_id: explicit,
+        deduplicated: false,
+    }))
+    .await?;
+    assert!(c.read(Duration::from_millis(150)).await.is_err());
+    let observed = h.core.observe_clipboard_offer().unwrap();
+    c.write(&Message::Status(Status { paused: true })).await?;
     let mut events = h.core.subscribe();
-    begin_chunks(&mut c, &meta, bytes).await?;
-    event_matching(&mut events, |e| matches!(e, pneud::Event::TransferProgress {transfer_id,received,..} if *transfer_id == meta.transfer_id && *received == bytes.len() as u64)).await?;
-    // The file has a live stage but no receipt yet. Text claims its ID while
-    // blocked inside clipboard integration; FILE_END must conflict at commit.
-    c.write(&Message::Clipboard(text.clone())).await?;
-    tokio::time::timeout(Duration::from_secs(2), h.actions.text_entered.notified()).await?;
-    assert!(matches!(
-        end(&mut c, meta.transfer_id).await?,
-        Message::Nack(Nack {
-            code: NackCode::IdConflict,
-            ..
-        })
-    ));
-    assert!(h.actions.text.lock().unwrap().is_empty());
-    h.actions.text_release.notify_one();
-    assert!(matches!(
-        c.read(Duration::from_secs(3)).await?,
-        Message::Ack(Ack {
-            deduplicated: false,
-            ..
-        })
-    ));
-    assert_eq!(&*h.actions.text.lock().unwrap(), &["claimed text"]);
-    assert!(h.saved().unwrap_or_default().is_empty());
+    // Querying generation while STATUS is handled avoids relying on sleeps.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while h.core.phone_paused(&device) != Some(true) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    c.write(&Message::Status(Status { paused: false })).await?;
+    event_matching(&mut events, |e| {
+        matches!(e, pneud::Event::PhonePaused { paused: false, .. })
+    })
+    .await?;
+    assert!(
+        h.core
+            .send_observed_clipboard(observed, "debounced before pause".into())
+            .await
+            .is_err()
+    );
+    let observed = h.core.observe_clipboard_offer().unwrap();
+    h.core.toggle_setting(pneud::ui::Toggle::Clipboard).await?;
+    h.core.toggle_setting(pneud::ui::Toggle::Clipboard).await?;
+    assert!(
+        h.core
+            .send_observed_clipboard(observed, "debounced before policy change".into())
+            .await
+            .is_err()
+    );
+    let replacement = h.phone("replacement")?;
     drop(c);
+    // A different unknown certificate must respect the one-second admission throttle.
+    tokio::time::sleep(Duration::from_millis(1050)).await;
+    let mut newer = h.pair(&replacement).await?;
+    let generation = h.core.observe_clipboard_offer().unwrap();
+    let latest = h
+        .core
+        .send_observed_clipboard(generation, "new phone selection".into())
+        .await?;
+    assert!(h.core.discard_clipboard(device).await.is_err());
+    assert!(
+        matches!(newer.read(Duration::from_secs(2)).await?,Message::Clipboard(text) if text.transfer_id==latest)
+    );
+    drop(newer);
     h.stop().await
+}
+#[tokio::test]
+async fn field_specific_settings_preserve_concurrent_folder_and_toggle_changes() -> Result<()> {
+    let h = Harness::new().await?;
+    for index in 0..12 {
+        let folder = h.dir.path().join(format!("folder-{index}"));
+        let (a, b) = tokio::join!(
+            h.core.change_save_folder(folder.clone()),
+            h.core.toggle_setting(pneud::ui::Toggle::Notifications)
+        );
+        a?;
+        b?;
+        assert_eq!(h.core.config().save_path, folder);
+        assert_eq!(h.core.config().notification_preview, index % 2 != 0);
+        assert_eq!(Config::load(&h.core.paths.config)?.save_path, folder);
+    }
+    h.stop().await
+}
+
+#[tokio::test]
+async fn unfinished_receive_resets_on_reconnect_and_unpair() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut old = h.pair(&phone).await?;
+    let mut events = h.core.subscribe();
+    let bytes = b"partial transfer";
+    let meta = metadata(Id::new(pneud::random_hex(16))?, bytes);
+    begin_chunks(&mut old, &meta, bytes).await?;
+    event_matching(&mut events,|event|matches!(event,pneud::Event::TransferProgress {transfer_id,..} if *transfer_id==meta.transfer_id)).await?;
+    assert!(h.core.ui_snapshot().receiving);
+    let mut replacement = phone.reconnect().await?;
+    event_matching(&mut events, |event| {
+        matches!(
+            event,
+            pneud::Event::ConnectionChanged {
+                connected: true,
+                ..
+            }
+        )
+    })
+    .await?;
+    assert!(
+        !h.core.ui_snapshot().receiving,
+        "reconnect must clear unfinished transfer and receiving grace"
+    );
+    assert_eq!(h.core.ui_snapshot().icon(), "pneu-tray-connected");
+    let meta = metadata(Id::new(pneud::random_hex(16))?, bytes);
+    begin_chunks(&mut replacement, &meta, bytes).await?;
+    event_matching(&mut events,|event|matches!(event,pneud::Event::TransferProgress {transfer_id,..} if *transfer_id==meta.transfer_id)).await?;
+    assert!(h.core.ui_snapshot().receiving);
+    h.core
+        .unpair_device(phone.identity.device_id.clone())
+        .await?;
+    assert!(!h.core.ui_snapshot().receiving);
+    assert!(!h.core.ui_snapshot().paired);
+    assert_eq!(h.core.ui_snapshot().icon(), "pneu-tray-disconnected");
+    drop(old);
+    drop(replacement);
+    h.stop().await
+}
+#[tokio::test]
+async fn disconnect_and_orderly_shutdown_keep_last_seen_after_restart() -> Result<()> {
+    for shutdown in [false, true] {
+        let h = Harness::new().await?;
+        let phone = h.phone("phone")?;
+        let mut c = h.pair(&phone).await?;
+        let ping = Ping {
+            nonce: Nonce::new("c".repeat(16))?,
+        };
+        c.write(&Message::Ping(ping.clone())).await?;
+        assert_eq!(c.read(Duration::from_secs(2)).await?, Message::Pong(ping)); // admission persistence finished
+        let before = h.core.ui_snapshot().phone.last_seen;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if !shutdown {
+            let mut events = h.core.subscribe();
+            c.close().await?;
+            event_matching(&mut events, |event| {
+                matches!(
+                    event,
+                    pneud::Event::ConnectionChanged {
+                        connected: false,
+                        ..
+                    }
+                )
+            })
+            .await?;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let disk: pneud::ui::Phone = serde_json::from_slice(&std::fs::read(
+                        h.core.paths.data.join("phone.json"),
+                    )?)?;
+                    if disk.last_seen > before {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await??;
+        }
+        let Harness {
+            dir,
+            core,
+            task,
+            actions,
+            ..
+        } = h;
+        let paths = core.paths.clone();
+        let config = core.config();
+        core.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(3), task).await???;
+        let final_seen = core.ui_snapshot().phone.last_seen;
+        assert!(final_seen > before);
+        assert!(!core.ui_snapshot().receiving);
+        drop(c);
+        drop(core);
+        let restarted = Core::new(paths, config, actions).await?;
+        assert_eq!(restarted.ui_snapshot().phone.last_seen, final_seen);
+        assert!(!restarted.ui_snapshot().connected);
+        restarted.shutdown_actions().await?;
+        drop(restarted);
+        drop(dir);
+    }
+    Ok(())
 }
