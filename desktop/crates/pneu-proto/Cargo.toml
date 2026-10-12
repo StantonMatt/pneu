@@ -1,0 +1,16 @@
+[package]
+name = "pneu-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pneu v1 wire framing, messages and pairing URI codec"
+
+[dependencies]
+hex.workspace = true
+percent-encoding.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

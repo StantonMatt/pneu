@@ -1,0 +1,15 @@
+[Unit]
+Description=Pneu phone transfer daemon
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/pneud run
+Restart=on-failure
+RestartSec=3
+UMask=0077
+TimeoutStopSec=150
+
+[Install]
+WantedBy=graphical-session.target

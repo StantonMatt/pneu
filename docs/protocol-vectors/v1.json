@@ -1,0 +1,1333 @@
+{
+  "protocol_version": 1,
+  "notes": "Synthetic public secrets, not credentials. Full frame hex includes the u32 length. Chunk decoded.data is hex only in fixtures; wire data is raw.",
+  "frames": [
+    {
+      "name": "hello_phone",
+      "frame_hex": "0000008f017b2276657273696f6e223a312c226465766963655f6964223a223030313132323333343435353636373738383939616162626363646465656666222c226e616d65223a2253616d73756e67205332352b222c226361706162696c6974696573223a5b2266696c6573222c22636c6970626f6172645f74657874222c22636c6970626f6172645f696d616765225d7d",
+      "decoded": {
+        "type": "hello",
+        "payload": {
+          "version": 1,
+          "device_id": "00112233445566778899aabbccddeeff",
+          "name": "Samsung S25+",
+          "capabilities": [
+            "files",
+            "clipboard_text",
+            "clipboard_image"
+          ]
+        }
+      }
+    },
+    {
+      "name": "hello_pc",
+      "frame_hex": "00000091017b2276657273696f6e223a312c226465766963655f6964223a226666656564646363626261613939383837373636353534343333323231313030222c226e616d65223a224f666963696e6120e28093205043222c226361706162696c6974696573223a5b2266696c6573222c22636c6970626f6172645f74657874222c22636c6970626f6172645f696d616765225d7d",
+      "decoded": {
+        "type": "hello",
+        "payload": {
+          "version": 1,
+          "device_id": "ffeeddccbbaa99887766554433221100",
+          "name": "Oficina – PC",
+          "capabilities": [
+            "files",
+            "clipboard_text",
+            "clipboard_image"
+          ]
+        }
+      }
+    },
+    {
+      "name": "hello_future",
+      "frame_hex": "0000006e017b2276657273696f6e223a322c226465766963655f6964223a223030313132323333343435353636373738383939616162626363646465656666222c226e616d65223a2250686f6e65222c226361706162696c6974696573223a5b226675747572655f66656174757265225d7d",
+      "decoded": {
+        "type": "hello",
+        "payload": {
+          "version": 2,
+          "device_id": "00112233445566778899aabbccddeeff",
+          "name": "Phone",
+          "capabilities": [
+            "future_feature"
+          ]
+        }
+      }
+    },
+    {
+      "name": "hello_unknown_field",
+      "frame_hex": "00000090017b0a20202276657273696f6e223a20312c0a2020226465766963655f6964223a20223030313132323333343435353636373738383939616162626363646465656666222c0a2020226e616d65223a202250686f6e65222c0a2020226361706162696c6974696573223a205b5d2c0a202022667574757265223a207b0a202020202278223a20747275650a20207d0a7d",
+      "decoded": {
+        "type": "hello",
+        "payload": {
+          "version": 1,
+          "device_id": "00112233445566778899aabbccddeeff",
+          "name": "Phone",
+          "capabilities": []
+        }
+      }
+    },
+    {
+      "name": "pair_request",
+      "frame_hex": "0000004d027b22746f6b656e223a2262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262227d",
+      "decoded": {
+        "type": "pair_request",
+        "payload": {
+          "token": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      }
+    },
+    {
+      "name": "pair_accepted",
+      "frame_hex": "00000012037b226163636570746564223a747275657d",
+      "decoded": {
+        "type": "pair_result",
+        "payload": {
+          "accepted": true
+        }
+      }
+    },
+    {
+      "name": "pair_rejected_invalid_token",
+      "frame_hex": "00000047037b226163636570746564223a66616c73652c22636f6465223a22696e76616c69645f746f6b656e222c226d657373616765223a2250616972696e672072656a6563746564227d",
+      "decoded": {
+        "type": "pair_result",
+        "payload": {
+          "accepted": false,
+          "code": "invalid_token",
+          "message": "Pairing rejected"
+        }
+      }
+    },
+    {
+      "name": "pair_rejected_expired_token",
+      "frame_hex": "00000047037b226163636570746564223a66616c73652c22636f6465223a22657870697265645f746f6b656e222c226d657373616765223a2250616972696e672072656a6563746564227d",
+      "decoded": {
+        "type": "pair_result",
+        "payload": {
+          "accepted": false,
+          "code": "expired_token",
+          "message": "Pairing rejected"
+        }
+      }
+    },
+    {
+      "name": "pair_rejected_pairing_closed",
+      "frame_hex": "00000048037b226163636570746564223a66616c73652c22636f6465223a2270616972696e675f636c6f736564222c226d657373616765223a2250616972696e672072656a6563746564227d",
+      "decoded": {
+        "type": "pair_result",
+        "payload": {
+          "accepted": false,
+          "code": "pairing_closed",
+          "message": "Pairing rejected"
+        }
+      }
+    },
+    {
+      "name": "pair_rejected_already_paired",
+      "frame_hex": "00000048037b226163636570746564223a66616c73652c22636f6465223a22616c72656164795f706169726564222c226d657373616765223a2250616972696e672072656a6563746564227d",
+      "decoded": {
+        "type": "pair_result",
+        "payload": {
+          "accepted": false,
+          "code": "already_paired",
+          "message": "Pairing rejected"
+        }
+      }
+    },
+    {
+      "name": "pair_rejected_storage_failed",
+      "frame_hex": "00000048037b226163636570746564223a66616c73652c22636f6465223a2273746f726167655f6661696c6564222c226d657373616765223a2250616972696e672072656a6563746564227d",
+      "decoded": {
+        "type": "pair_result",
+        "payload": {
+          "accepted": false,
+          "code": "storage_failed",
+          "message": "Pairing rejected"
+        }
+      }
+    },
+    {
+      "name": "ping",
+      "frame_hex": "0000001d047b226e6f6e6365223a2230303030303030303030303030303031227d",
+      "decoded": {
+        "type": "ping",
+        "payload": {
+          "nonce": "0000000000000001"
+        }
+      }
+    },
+    {
+      "name": "pong",
+      "frame_hex": "0000001d057b226e6f6e6365223a2230303030303030303030303030303031227d",
+      "decoded": {
+        "type": "pong",
+        "payload": {
+          "nonce": "0000000000000001"
+        }
+      }
+    },
+    {
+      "name": "ping_unsigned_max",
+      "frame_hex": "0000001d047b226e6f6e6365223a2266666666666666666666666666666666227d",
+      "decoded": {
+        "type": "ping",
+        "payload": {
+          "nonce": "ffffffffffffffff"
+        }
+      }
+    },
+    {
+      "name": "file_begin",
+      "frame_hex": "0000011f107b227472616e736665725f6964223a223031323334353637383961626364656666656463626139383736353433323130222c2266696c655f6e616d65223a22636170747572652e62696e222c226d696d65223a226170706c69636174696f6e2f6f637465742d73747265616d222c2273697a65223a372c22736861323536223a2238633166663266333565636135346633303930323261353034643462373962393566383165613832316232313039396338316262326465323562653138383666222c226b696e64223a2266696c65222c22637265617465645f6174223a313830303030303030303030302c22736f757263655f6d656469615f6964223a2265787465726e616c5f7072696d6172793a696d616765733a3132333435227d",
+      "decoded": {
+        "type": "file_begin",
+        "payload": {
+          "transfer_id": "0123456789abcdeffedcba9876543210",
+          "file_name": "capture.bin",
+          "mime": "application/octet-stream",
+          "size": 7,
+          "sha256": "8c1ff2f35eca54f309022a504d4b79b95f81ea821b21099c81bb2de25be1886f",
+          "kind": "file",
+          "created_at": 1800000000000,
+          "source_media_id": "external_primary:images:12345"
+        }
+      }
+    },
+    {
+      "name": "file_chunk_0",
+      "frame_hex": "0000001d110123456789abcdeffedcba98765432100000000000000000506e6575",
+      "decoded": {
+        "type": "file_chunk",
+        "payload": {
+          "transfer_id": "0123456789abcdeffedcba9876543210",
+          "offset": 0,
+          "data": "506e6575"
+        }
+      }
+    },
+    {
+      "name": "file_chunk_4",
+      "frame_hex": "0000001c110123456789abcdeffedcba9876543210000000000000000400ff0a",
+      "decoded": {
+        "type": "file_chunk",
+        "payload": {
+          "transfer_id": "0123456789abcdeffedcba9876543210",
+          "offset": 4,
+          "data": "00ff0a"
+        }
+      }
+    },
+    {
+      "name": "file_end",
+      "frame_hex": "00000033127b227472616e736665725f6964223a223031323334353637383961626364656666656463626139383736353433323130227d",
+      "decoded": {
+        "type": "file_end",
+        "payload": {
+          "transfer_id": "0123456789abcdeffedcba9876543210"
+        }
+      }
+    },
+    {
+      "name": "file_ack",
+      "frame_hex": "00000048137b227472616e736665725f6964223a223031323334353637383961626364656666656463626139383736353433323130222c2264656475706c696361746564223a66616c73657d",
+      "decoded": {
+        "type": "ack",
+        "payload": {
+          "transfer_id": "0123456789abcdeffedcba9876543210",
+          "deduplicated": false
+        }
+      }
+    },
+    {
+      "name": "file_ack_duplicate",
+      "frame_hex": "00000047137b227472616e736665725f6964223a223031323334353637383961626364656666656463626139383736353433323130222c2264656475706c696361746564223a747275657d",
+      "decoded": {
+        "type": "ack",
+        "payload": {
+          "transfer_id": "0123456789abcdeffedcba9876543210",
+          "deduplicated": true
+        }
+      }
+    },
+    {
+      "name": "empty_begin",
+      "frame_hex": "000000d1107b227472616e736665725f6964223a223131313131313131313131313131313131313131313131313131313131313131222c2266696c655f6e616d65223a22656d7074792e747874222c226d696d65223a22746578742f706c61696e222c2273697a65223a302c22736861323536223a2265336230633434323938666331633134396166626634633839393666623932343237616534316534363439623933346361343935393931623738353262383535222c226b696e64223a2266696c65222c22637265617465645f6174223a307d",
+      "decoded": {
+        "type": "file_begin",
+        "payload": {
+          "transfer_id": "11111111111111111111111111111111",
+          "file_name": "empty.txt",
+          "mime": "text/plain",
+          "size": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "kind": "file",
+          "created_at": 0
+        }
+      }
+    },
+    {
+      "name": "empty_end",
+      "frame_hex": "00000033127b227472616e736665725f6964223a223131313131313131313131313131313131313131313131313131313131313131227d",
+      "decoded": {
+        "type": "file_end",
+        "payload": {
+          "transfer_id": "11111111111111111111111111111111"
+        }
+      }
+    },
+    {
+      "name": "empty_ack",
+      "frame_hex": "00000048137b227472616e736665725f6964223a223131313131313131313131313131313131313131313131313131313131313131222c2264656475706c696361746564223a66616c73657d",
+      "decoded": {
+        "type": "ack",
+        "payload": {
+          "transfer_id": "11111111111111111111111111111111",
+          "deduplicated": false
+        }
+      }
+    },
+    {
+      "name": "begin_screenshot",
+      "frame_hex": "000000f3107b227472616e736665725f6964223a223031323334353637383961626364656666656463626139383736353433323130222c2266696c655f6e616d65223a22636170747572652e62696e222c226d696d65223a226170706c69636174696f6e2f6f637465742d73747265616d222c2273697a65223a372c22736861323536223a2238633166663266333565636135346633303930323261353034643462373962393566383165613832316232313039396338316262326465323562653138383666222c226b696e64223a2273637265656e73686f74222c22637265617465645f6174223a313830303030303030303030307d",
+      "decoded": {
+        "type": "file_begin",
+        "payload": {
+          "transfer_id": "0123456789abcdeffedcba9876543210",
+          "file_name": "capture.bin",
+          "mime": "application/octet-stream",
+          "size": 7,
+          "sha256": "8c1ff2f35eca54f309022a504d4b79b95f81ea821b21099c81bb2de25be1886f",
+          "kind": "screenshot",
+          "created_at": 1800000000000
+        }
+      }
+    },
+    {
+      "name": "begin_photo",
+      "frame_hex": "000000ee107b227472616e736665725f6964223a223031323334353637383961626364656666656463626139383736353433323130222c2266696c655f6e616d65223a22636170747572652e62696e222c226d696d65223a226170706c69636174696f6e2f6f637465742d73747265616d222c2273697a65223a372c22736861323536223a2238633166663266333565636135346633303930323261353034643462373962393566383165613832316232313039396338316262326465323562653138383666222c226b696e64223a2270686f746f222c22637265617465645f6174223a313830303030303030303030307d",
+      "decoded": {
+        "type": "file_begin",
+        "payload": {
+          "transfer_id": "0123456789abcdeffedcba9876543210",
+          "file_name": "capture.bin",
+          "mime": "application/octet-stream",
+          "size": 7,
+          "sha256": "8c1ff2f35eca54f309022a504d4b79b95f81ea821b21099c81bb2de25be1886f",
+          "kind": "photo",
+          "created_at": 1800000000000
+        }
+      }
+    },
+    {
+      "name": "begin_recording",
+      "frame_hex": "000000f2107b227472616e736665725f6964223a223031323334353637383961626364656666656463626139383736353433323130222c2266696c655f6e616d65223a22636170747572652e62696e222c226d696d65223a226170706c69636174696f6e2f6f637465742d73747265616d222c2273697a65223a372c22736861323536223a2238633166663266333565636135346633303930323261353034643462373962393566383165613832316232313039396338316262326465323562653138383666222c226b696e64223a227265636f7264696e67222c22637265617465645f6174223a313830303030303030303030307d",
+      "decoded": {
+        "type": "file_begin",
+        "payload": {
+          "transfer_id": "0123456789abcdeffedcba9876543210",
+          "file_name": "capture.bin",
+          "mime": "application/octet-stream",
+          "size": 7,
+          "sha256": "8c1ff2f35eca54f309022a504d4b79b95f81ea821b21099c81bb2de25be1886f",
+          "kind": "recording",
+          "created_at": 1800000000000
+        }
+      }
+    },
+    {
+      "name": "begin_clipboard_image",
+      "frame_hex": "000000e9107b227472616e736665725f6964223a223031323334353637383961626364656666656463626139383736353433323130222c2266696c655f6e616d65223a22636170747572652e62696e222c226d696d65223a22696d6167652f706e67222c2273697a65223a372c22736861323536223a2238633166663266333565636135346633303930323261353034643462373962393566383165613832316232313039396338316262326465323562653138383666222c226b696e64223a22636c6970626f6172645f696d616765222c22637265617465645f6174223a313830303030303030303030307d",
+      "decoded": {
+        "type": "file_begin",
+        "payload": {
+          "transfer_id": "0123456789abcdeffedcba9876543210",
+          "file_name": "capture.bin",
+          "mime": "image/png",
+          "size": 7,
+          "sha256": "8c1ff2f35eca54f309022a504d4b79b95f81ea821b21099c81bb2de25be1886f",
+          "kind": "clipboard_image",
+          "created_at": 1800000000000
+        }
+      }
+    },
+    {
+      "name": "nack_hash_mismatch",
+      "frame_hex": "00000077147b227472616e736665725f6964223a223031323334353637383961626364656666656463626139383736353433323130222c22636f6465223a22686173685f6d69736d61746368222c22726574727961626c65223a747275652c226d657373616765223a2244656c6976657279206661696c6564227d",
+      "decoded": {
+        "type": "nack",
+        "payload": {
+          "transfer_id": "0123456789abcdeffedcba9876543210",
+          "code": "hash_mismatch",
+          "retryable": true,
+          "message": "Delivery failed"
+        }
+      }
+    },
+    {
+      "name": "nack_size_mismatch",
+      "frame_hex": "00000077147b227472616e736665725f6964223a223031323334353637383961626364656666656463626139383736353433323130222c22636f6465223a2273697a655f6d69736d61746368222c22726574727961626c65223a747275652c226d657373616765223a2244656c6976657279206661696c6564227d",
+      "decoded": {
+        "type": "nack",
+        "payload": {
+          "transfer_id": "0123456789abcdeffedcba9876543210",
+          "code": "size_mismatch",
+          "retryable": true,
+          "message": "Delivery failed"
+        }
+      }
+    },
+    {
+      "name": "nack_storage_failed",
+      "frame_hex": "00000078147b227472616e736665725f6964223a223031323334353637383961626364656666656463626139383736353433323130222c22636f6465223a2273746f726167655f6661696c6564222c22726574727961626c65223a747275652c226d657373616765223a2244656c6976657279206661696c6564227d",
+      "decoded": {
+        "type": "nack",
+        "payload": {
+          "transfer_id": "0123456789abcdeffedcba9876543210",
+          "code": "storage_failed",
+          "retryable": true,
+          "message": "Delivery failed"
+        }
+      }
+    },
+    {
+      "name": "nack_unsupported_kind",
+      "frame_hex": "0000007b147b227472616e736665725f6964223a223031323334353637383961626364656666656463626139383736353433323130222c22636f6465223a22756e737570706f727465645f6b696e64222c22726574727961626c65223a66616c73652c226d657373616765223a2244656c6976657279206661696c6564227d",
+      "decoded": {
+        "type": "nack",
+        "payload": {
+          "transfer_id": "0123456789abcdeffedcba9876543210",
+          "code": "unsupported_kind",
+          "retryable": false,
+          "message": "Delivery failed"
+        }
+      }
+    },
+    {
+      "name": "nack_id_conflict",
+      "frame_hex": "00000076147b227472616e736665725f6964223a223031323334353637383961626364656666656463626139383736353433323130222c22636f6465223a2269645f636f6e666c696374222c22726574727961626c65223a66616c73652c226d657373616765223a2244656c6976657279206661696c6564227d",
+      "decoded": {
+        "type": "nack",
+        "payload": {
+          "transfer_id": "0123456789abcdeffedcba9876543210",
+          "code": "id_conflict",
+          "retryable": false,
+          "message": "Delivery failed"
+        }
+      }
+    },
+    {
+      "name": "nack_clipboard_unavailable",
+      "frame_hex": "0000007f147b227472616e736665725f6964223a223031323334353637383961626364656666656463626139383736353433323130222c22636f6465223a22636c6970626f6172645f756e617661696c61626c65222c22726574727961626c65223a747275652c226d657373616765223a2244656c6976657279206661696c6564227d",
+      "decoded": {
+        "type": "nack",
+        "payload": {
+          "transfer_id": "0123456789abcdeffedcba9876543210",
+          "code": "clipboard_unavailable",
+          "retryable": true,
+          "message": "Delivery failed"
+        }
+      }
+    },
+    {
+      "name": "clipboard_text",
+      "frame_hex": "0000007f207b227472616e736665725f6964223a223232323232323232323232323232323232323232323232323232323232323232222c2274657874223a22486f6c6120f09f918b5c6e68747470733a2f2f6578616d706c652e6f72672f3f613d3126623d32222c22637265617465645f6174223a313830303030303030303030307d",
+      "decoded": {
+        "type": "clipboard",
+        "payload": {
+          "transfer_id": "22222222222222222222222222222222",
+          "text": "Hola 👋\nhttps://example.org/?a=1&b=2",
+          "created_at": 1800000000000
+        }
+      }
+    },
+    {
+      "name": "clipboard_clear",
+      "frame_hex": "0000004c207b227472616e736665725f6964223a223333333333333333333333333333333333333333333333333333333333333333222c2274657874223a22222c22637265617465645f6174223a307d",
+      "decoded": {
+        "type": "clipboard",
+        "payload": {
+          "transfer_id": "33333333333333333333333333333333",
+          "text": "",
+          "created_at": 0
+        }
+      }
+    },
+    {
+      "name": "error_version_mismatch",
+      "frame_hex": "0000004f7f7b22636f6465223a2276657273696f6e5f6d69736d61746368222c226d657373616765223a2250726f746f636f6c20636c6f73696e67222c22737570706f727465645f76657273696f6e223a317d",
+      "decoded": {
+        "type": "error",
+        "payload": {
+          "code": "version_mismatch",
+          "message": "Protocol closing",
+          "supported_version": 1
+        }
+      }
+    },
+    {
+      "name": "error_unauthorized",
+      "frame_hex": "000000357f7b22636f6465223a22756e617574686f72697a6564222c226d657373616765223a2250726f746f636f6c20636c6f73696e67227d",
+      "decoded": {
+        "type": "error",
+        "payload": {
+          "code": "unauthorized",
+          "message": "Protocol closing"
+        }
+      }
+    },
+    {
+      "name": "error_unexpected_message",
+      "frame_hex": "0000003b7f7b22636f6465223a22756e65787065637465645f6d657373616765222c226d657373616765223a2250726f746f636f6c20636c6f73696e67227d",
+      "decoded": {
+        "type": "error",
+        "payload": {
+          "code": "unexpected_message",
+          "message": "Protocol closing"
+        }
+      }
+    },
+    {
+      "name": "error_malformed_message",
+      "frame_hex": "0000003a7f7b22636f6465223a226d616c666f726d65645f6d657373616765222c226d657373616765223a2250726f746f636f6c20636c6f73696e67227d",
+      "decoded": {
+        "type": "error",
+        "payload": {
+          "code": "malformed_message",
+          "message": "Protocol closing"
+        }
+      }
+    },
+    {
+      "name": "error_frame_too_large",
+      "frame_hex": "000000387f7b22636f6465223a226672616d655f746f6f5f6c61726765222c226d657373616765223a2250726f746f636f6c20636c6f73696e67227d",
+      "decoded": {
+        "type": "error",
+        "payload": {
+          "code": "frame_too_large",
+          "message": "Protocol closing"
+        }
+      }
+    },
+    {
+      "name": "error_unknown_message",
+      "frame_hex": "000000387f7b22636f6465223a22756e6b6e6f776e5f6d657373616765222c226d657373616765223a2250726f746f636f6c20636c6f73696e67227d",
+      "decoded": {
+        "type": "error",
+        "payload": {
+          "code": "unknown_message",
+          "message": "Protocol closing"
+        }
+      }
+    },
+    {
+      "name": "error_timeout",
+      "frame_hex": "000000307f7b22636f6465223a2274696d656f7574222c226d657373616765223a2250726f746f636f6c20636c6f73696e67227d",
+      "decoded": {
+        "type": "error",
+        "payload": {
+          "code": "timeout",
+          "message": "Protocol closing"
+        }
+      }
+    },
+    {
+      "name": "error_busy",
+      "frame_hex": "0000002d7f7b22636f6465223a2262757379222c226d657373616765223a2250726f746f636f6c20636c6f73696e67227d",
+      "decoded": {
+        "type": "error",
+        "payload": {
+          "code": "busy",
+          "message": "Protocol closing"
+        }
+      }
+    },
+    {
+      "name": "error_connection_replaced",
+      "frame_hex": "0000003c7f7b22636f6465223a22636f6e6e656374696f6e5f7265706c61636564222c226d657373616765223a2250726f746f636f6c20636c6f73696e67227d",
+      "decoded": {
+        "type": "error",
+        "payload": {
+          "code": "connection_replaced",
+          "message": "Protocol closing"
+        }
+      }
+    },
+    {
+      "name": "error_closing",
+      "frame_hex": "000000307f7b22636f6465223a22636c6f73696e67222c226d657373616765223a2250726f746f636f6c20636c6f73696e67227d",
+      "decoded": {
+        "type": "error",
+        "payload": {
+          "code": "closing",
+          "message": "Protocol closing"
+        }
+      }
+    },
+    {
+      "name": "hello_paused",
+      "frame_hex": "0000009d017b2276657273696f6e223a312c226465766963655f6964223a223030313132323333343435353636373738383939616162626363646465656666222c226e616d65223a2253616d73756e67205332352b222c226361706162696c6974696573223a5b2266696c6573222c22636c6970626f6172645f74657874222c22636c6970626f6172645f696d616765225d2c22706175736564223a747275657d",
+      "decoded": {
+        "type": "hello",
+        "payload": {
+          "version": 1,
+          "device_id": "00112233445566778899aabbccddeeff",
+          "name": "Samsung S25+",
+          "capabilities": [
+            "files",
+            "clipboard_text",
+            "clipboard_image"
+          ],
+          "paused": true
+        }
+      }
+    },
+    {
+      "name": "status_paused",
+      "frame_hex": "00000010067b22706175736564223a747275657d",
+      "decoded": {
+        "type": "status",
+        "payload": {
+          "paused": true
+        }
+      }
+    },
+    {
+      "name": "hello_resumed",
+      "frame_hex": "0000009e017b2276657273696f6e223a312c226465766963655f6964223a223030313132323333343435353636373738383939616162626363646465656666222c226e616d65223a2253616d73756e67205332352b222c226361706162696c6974696573223a5b2266696c6573222c22636c6970626f6172645f74657874222c22636c6970626f6172645f696d616765225d2c22706175736564223a66616c73657d",
+      "decoded": {
+        "type": "hello",
+        "payload": {
+          "version": 1,
+          "device_id": "00112233445566778899aabbccddeeff",
+          "name": "Samsung S25+",
+          "capabilities": [
+            "files",
+            "clipboard_text",
+            "clipboard_image"
+          ],
+          "paused": false
+        }
+      }
+    },
+    {
+      "name": "status_resumed",
+      "frame_hex": "00000011067b22706175736564223a66616c73657d",
+      "decoded": {
+        "type": "status",
+        "payload": {
+          "paused": false
+        }
+      }
+    },
+    {
+      "name": "status_unknown_field",
+      "frame_hex": "0000001b067b22706175736564223a747275652c22667574757265223a317d",
+      "decoded": {
+        "type": "status",
+        "payload": {
+          "paused": true
+        }
+      }
+    },
+    {
+      "name": "unpair",
+      "frame_hex": "00000003077b7d",
+      "decoded": {
+        "type": "unpair",
+        "payload": {}
+      }
+    },
+    {
+      "name": "unpair_unknown_field",
+      "frame_hex": "00000010077b22667574757265223a747275657d",
+      "decoded": {
+        "type": "unpair",
+        "payload": {}
+      }
+    },
+    {
+      "name": "clipboard_origin_clipboard",
+      "frame_hex": "00000094207b227472616e736665725f6964223a223232323232323232323232323232323232323232323232323232323232323232222c2274657874223a22486f6c6120f09f918b5c6e68747470733a2f2f6578616d706c652e6f72672f3f613d3126623d32222c22637265617465645f6174223a313830303030303030303030302c226f726967696e223a22636c6970626f617264227d",
+      "decoded": {
+        "type": "clipboard",
+        "payload": {
+          "transfer_id": "22222222222222222222222222222222",
+          "text": "Hola 👋\nhttps://example.org/?a=1&b=2",
+          "created_at": 1800000000000,
+          "origin": "clipboard"
+        }
+      }
+    },
+    {
+      "name": "clipboard_origin_share",
+      "frame_hex": "00000090207b227472616e736665725f6964223a223232323232323232323232323232323232323232323232323232323232323232222c2274657874223a22486f6c6120f09f918b5c6e68747470733a2f2f6578616d706c652e6f72672f3f613d3126623d32222c22637265617465645f6174223a313830303030303030303030302c226f726967696e223a227368617265227d",
+      "decoded": {
+        "type": "clipboard",
+        "payload": {
+          "transfer_id": "22222222222222222222222222222222",
+          "text": "Hola 👋\nhttps://example.org/?a=1&b=2",
+          "created_at": 1800000000000,
+          "origin": "share"
+        }
+      }
+    },
+    {
+      "name": "nack_disk_full",
+      "frame_hex": "00000057147b227472616e736665725f6964223a223232323232323232323232323232323232323232323232323232323232323232222c22636f6465223a226469736b5f66756c6c222c22726574727961626c65223a747275657d",
+      "decoded": {
+        "type": "nack",
+        "payload": {
+          "transfer_id": "22222222222222222222222222222222",
+          "code": "disk_full",
+          "retryable": true
+        }
+      }
+    },
+    {
+      "name": "nack_not_writable",
+      "frame_hex": "0000005a147b227472616e736665725f6964223a223232323232323232323232323232323232323232323232323232323232323232222c22636f6465223a226e6f745f7772697461626c65222c22726574727961626c65223a747275657d",
+      "decoded": {
+        "type": "nack",
+        "payload": {
+          "transfer_id": "22222222222222222222222222222222",
+          "code": "not_writable",
+          "retryable": true
+        }
+      }
+    },
+    {
+      "name": "file_begin_kind_file",
+      "frame_hex": "0000011f107b227472616e736665725f6964223a223031323334353637383961626364656666656463626139383736353433323130222c2266696c655f6e616d65223a22636170747572652e62696e222c226d696d65223a226170706c69636174696f6e2f6f637465742d73747265616d222c2273697a65223a372c22736861323536223a2238633166663266333565636135346633303930323261353034643462373962393566383165613832316232313039396338316262326465323562653138383666222c226b696e64223a2266696c65222c22637265617465645f6174223a313830303030303030303030302c22736f757263655f6d656469615f6964223a2265787465726e616c5f7072696d6172793a696d616765733a3132333435227d",
+      "decoded": {
+        "type": "file_begin",
+        "payload": {
+          "transfer_id": "0123456789abcdeffedcba9876543210",
+          "file_name": "capture.bin",
+          "mime": "application/octet-stream",
+          "size": 7,
+          "sha256": "8c1ff2f35eca54f309022a504d4b79b95f81ea821b21099c81bb2de25be1886f",
+          "kind": "file",
+          "created_at": 1800000000000,
+          "source_media_id": "external_primary:images:12345"
+        }
+      }
+    },
+    {
+      "name": "chunk_offset_16909060",
+      "frame_hex": "0000001a1100112233445566778899aabbccddeeff000000000102030442",
+      "decoded": {
+        "type": "file_chunk",
+        "payload": {
+          "transfer_id": "00112233445566778899aabbccddeeff",
+          "offset": 16909060,
+          "data": "42"
+        }
+      }
+    },
+    {
+      "name": "chunk_offset_4328719365",
+      "frame_hex": "0000001a1100112233445566778899aabbccddeeff000000010203040542",
+      "decoded": {
+        "type": "file_chunk",
+        "payload": {
+          "transfer_id": "00112233445566778899aabbccddeeff",
+          "offset": 4328719365,
+          "data": "42"
+        }
+      }
+    },
+    {
+      "name": "pair_recovery_consumed_or_expired_token",
+      "frame_hex": "0000004d027b22746f6b656e223a2262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262227d",
+      "decoded": {
+        "type": "pair_request",
+        "payload": {
+          "token": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      }
+    },
+    {
+      "name": "pair_recovery_already_bound_accepted",
+      "frame_hex": "00000012037b226163636570746564223a747275657d",
+      "decoded": {
+        "type": "pair_result",
+        "payload": {
+          "accepted": true
+        }
+      }
+    }
+  ],
+  "transfers": [
+    {
+      "name": "two_chunk_file",
+      "frames": [
+        "file_begin",
+        "file_chunk_0",
+        "file_chunk_4",
+        "file_end",
+        "file_ack"
+      ],
+      "data_hex": "506e657500ff0a",
+      "size": 7,
+      "sha256": "8c1ff2f35eca54f309022a504d4b79b95f81ea821b21099c81bb2de25be1886f"
+    },
+    {
+      "name": "empty_file",
+      "frames": [
+        "empty_begin",
+        "empty_end",
+        "empty_ack"
+      ],
+      "data_hex": "",
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "pairing_uris": [
+    {
+      "name": "lan_and_tailscale",
+      "uri": "pneu://pair?v=1&name=Office%20PC&fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&addr=192.168.1.10%3A47821&addr=100.67.144.28%3A47821&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&exp=1800000300000",
+      "canonical_uri": "pneu://pair?v=1&name=Office%20PC&fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&addr=192.168.1.10%3A47821&addr=100.67.144.28%3A47821&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&exp=1800000300000",
+      "decoded": {
+        "version": 1,
+        "name": "Office PC",
+        "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "addresses": [
+          "192.168.1.10:47821",
+          "100.67.144.28:47821"
+        ],
+        "token": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "expires_at": 1800000300000
+      }
+    },
+    {
+      "name": "ipv6_and_dns_utf8",
+      "uri": "pneu://pair?v=1&name=PC%20de%20Jos%C3%A9&fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&addr=%5Bfd00%3A%3A1%5D%3A47821&addr=pneu-pc.local%3A47821&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&exp=1800000300000",
+      "canonical_uri": "pneu://pair?v=1&name=PC%20de%20Jos%C3%A9&fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&addr=%5Bfd00%3A%3A1%5D%3A47821&addr=pneu-pc.local%3A47821&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&exp=1800000300000",
+      "decoded": {
+        "version": 1,
+        "name": "PC de José",
+        "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "addresses": [
+          "[fd00::1]:47821",
+          "pneu-pc.local:47821"
+        ],
+        "token": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "expires_at": 1800000300000
+      }
+    },
+    {
+      "name": "form_plus_space",
+      "uri": "pneu://pair?v=1&name=Office+PC&fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&addr=192.168.1.10%3A47821&addr=100.67.144.28%3A47821&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&exp=1800000300000",
+      "canonical_uri": "pneu://pair?v=1&name=Office%20PC&fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&addr=192.168.1.10%3A47821&addr=100.67.144.28%3A47821&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&exp=1800000300000",
+      "decoded": {
+        "version": 1,
+        "name": "Office PC",
+        "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "addresses": [
+          "192.168.1.10:47821",
+          "100.67.144.28:47821"
+        ],
+        "token": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "expires_at": 1800000300000
+      }
+    },
+    {
+      "name": "pending_pairing_expired_invitation_is_syntactically_valid",
+      "uri": "pneu://pair?v=1&name=Office%20PC&fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&addr=192.168.1.10%3A47821&addr=100.67.144.28%3A47821&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&exp=1",
+      "canonical_uri": "pneu://pair?v=1&name=Office%20PC&fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&addr=192.168.1.10%3A47821&addr=100.67.144.28%3A47821&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&exp=1",
+      "decoded": {
+        "version": 1,
+        "name": "Office PC",
+        "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "addresses": [
+          "192.168.1.10:47821",
+          "100.67.144.28:47821"
+        ],
+        "token": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "expires_at": 1
+      }
+    }
+  ],
+  "invalid_frames": [
+    {
+      "name": "zero_length",
+      "frame_hex": "00000000",
+      "reason": "zero length"
+    },
+    {
+      "name": "oversized_length",
+      "frame_hex": "0004001a",
+      "reason": "length limit before body read"
+    },
+    {
+      "name": "short_prefix",
+      "frame_hex": "000000",
+      "reason": "truncated prefix"
+    },
+    {
+      "name": "truncated_payload",
+      "frame_hex": "00000003047b",
+      "reason": "truncated body"
+    },
+    {
+      "name": "unknown_type",
+      "frame_hex": "00000001ff",
+      "reason": "unassigned type"
+    },
+    {
+      "name": "chunk_empty",
+      "frame_hex": "00000019110123456789abcdeffedcba98765432100000000000000000",
+      "reason": "empty chunk forbidden"
+    },
+    {
+      "name": "chunk_header_short",
+      "frame_hex": "00000018110000000000000000000000000000000000000000000000",
+      "reason": "chunk header too short"
+    },
+    {
+      "name": "chunk_offset_overflow",
+      "frame_hex": "0000001a110123456789abcdeffedcba9876543210ffffffffffffffff78",
+      "reason": "offset exceeds 64 GiB"
+    },
+    {
+      "name": "invalid_utf8",
+      "frame_hex": "0000000e047b226e6f6e6365223a22ff227d",
+      "reason": "invalid UTF-8"
+    },
+    {
+      "name": "json_bom",
+      "frame_hex": "0000002004efbbbf7b226e6f6e6365223a2230303030303030303030303030303031227d",
+      "reason": "BOM forbidden"
+    },
+    {
+      "name": "trailing_json",
+      "frame_hex": "0000001f047b226e6f6e6365223a2230303030303030303030303030303031227d7b7d",
+      "reason": "trailing object"
+    },
+    {
+      "name": "not_object",
+      "frame_hex": "00000003045b5d",
+      "reason": "JSON payload not object"
+    },
+    {
+      "name": "missing_field",
+      "frame_hex": "00000003047b7d",
+      "reason": "required nonce missing"
+    },
+    {
+      "name": "duplicate_known_field",
+      "frame_hex": "00000038047b226e6f6e6365223a2230303030303030303030303030303031222c226e6f6e6365223a2230303030303030303030303030303032227d",
+      "reason": "duplicate known nonce"
+    },
+    {
+      "name": "uppercase_nonce",
+      "frame_hex": "0000001d047b226e6f6e6365223a2241424344454630303030303030303031227d",
+      "reason": "hex must be lowercase"
+    },
+    {
+      "name": "pair_result_null",
+      "frame_hex": "0000001f037b226163636570746564223a66616c73652c22636f6465223a6e756c6c7d",
+      "reason": "optional field cannot be null"
+    },
+    {
+      "name": "pair_result_no_code",
+      "frame_hex": "00000013037b226163636570746564223a66616c73657d",
+      "reason": "rejection needs code"
+    },
+    {
+      "name": "pair_result_success_code",
+      "frame_hex": "00000029037b226163636570746564223a747275652c22636f6465223a22696e76616c69645f746f6b656e227d",
+      "reason": "success cannot have code"
+    },
+    {
+      "name": "path_traversal",
+      "frame_hex": "0000012a107b227472616e736665725f6964223a20223031323334353637383961626364656666656463626139383736353433323130222c202266696c655f6e616d65223a20222e2e2f6576696c222c20226d696d65223a20226170706c69636174696f6e2f6f637465742d73747265616d222c202273697a65223a20372c2022736861323536223a202238633166663266333565636135346633303930323261353034643462373962393566383165613832316232313039396338316262326465323562653138383666222c20226b696e64223a202266696c65222c2022637265617465645f6174223a20313830303030303030303030302c2022736f757263655f6d656469615f6964223a202265787465726e616c5f7072696d6172793a696d616765733a3132333435227d",
+      "reason": "unsafe filename"
+    },
+    {
+      "name": "file_size_over_limit",
+      "frame_hex": "00000138107b227472616e736665725f6964223a20223031323334353637383961626364656666656463626139383736353433323130222c202266696c655f6e616d65223a2022636170747572652e62696e222c20226d696d65223a20226170706c69636174696f6e2f6f637465742d73747265616d222c202273697a65223a2036383731393437363733372c2022736861323536223a202238633166663266333565636135346633303930323261353034643462373962393566383165613832316232313039396338316262326465323562653138383666222c20226b696e64223a202266696c65222c2022637265617465645f6174223a20313830303030303030303030302c2022736f757263655f6d656469615f6964223a202265787465726e616c5f7072696d6172793a696d616765733a3132333435227d",
+      "reason": "size exceeds 64 GiB"
+    },
+    {
+      "name": "unsafe_timestamp",
+      "frame_hex": "00000131107b227472616e736665725f6964223a20223031323334353637383961626364656666656463626139383736353433323130222c202266696c655f6e616d65223a2022636170747572652e62696e222c20226d696d65223a20226170706c69636174696f6e2f6f637465742d73747265616d222c202273697a65223a20372c2022736861323536223a202238633166663266333565636135346633303930323261353034643462373962393566383165613832316232313039396338316262326465323562653138383666222c20226b696e64223a202266696c65222c2022637265617465645f6174223a20393030373139393235343734303939322c2022736f757263655f6d656469615f6964223a202265787465726e616c5f7072696d6172793a696d616765733a3132333435227d",
+      "reason": "timestamp exceeds safe integer"
+    },
+    {
+      "name": "null_source_media_id",
+      "frame_hex": "00000113107b227472616e736665725f6964223a20223031323334353637383961626364656666656463626139383736353433323130222c202266696c655f6e616d65223a2022636170747572652e62696e222c20226d696d65223a20226170706c69636174696f6e2f6f637465742d73747265616d222c202273697a65223a20372c2022736861323536223a202238633166663266333565636135346633303930323261353034643462373962393566383165613832316232313039396338316262326465323562653138383666222c20226b696e64223a202266696c65222c2022637265617465645f6174223a20313830303030303030303030302c2022736f757263655f6d656469615f6964223a206e756c6c7d",
+      "reason": "omit optional source id instead of null"
+    },
+    {
+      "name": "filename_utf8_byte_limit",
+      "frame_hex": "00000423107b227472616e736665725f6964223a20223031323334353637383961626364656666656463626139383736353433323130222c202266696c655f6e616d65223a20225c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c75303065395c7530306539222c20226d696d65223a20226170706c69636174696f6e2f6f637465742d73747265616d222c202273697a65223a20372c2022736861323536223a202238633166663266333565636135346633303930323261353034643462373962393566383165613832316232313039396338316262326465323562653138383666222c20226b696e64223a202266696c65222c2022637265617465645f6174223a20313830303030303030303030302c2022736f757263655f6d656469615f6964223a202265787465726e616c5f7072696d6172793a696d616765733a3132333435227d",
+      "reason": "256 UTF-8 bytes"
+    },
+    {
+      "name": "duplicate_capabilities",
+      "frame_hex": "00000075017b2276657273696f6e223a20312c20226465766963655f6964223a20223030313132323333343435353636373738383939616162626363646465656666222c20226e616d65223a202250686f6e65222c20226361706162696c6974696573223a205b2266696c6573222c202266696c6573225d7d",
+      "reason": "capabilities unique"
+    },
+    {
+      "name": "image_without_files",
+      "frame_hex": "00000076017b2276657273696f6e223a20312c20226465766963655f6964223a20223030313132323333343435353636373738383939616162626363646465656666222c20226e616d65223a202250686f6e65222c20226361706162696c6974696573223a205b22636c6970626f6172645f696d616765225d7d",
+      "reason": "image requires files"
+    },
+    {
+      "name": "zero_version",
+      "frame_hex": "00000065017b2276657273696f6e223a20302c20226465766963655f6964223a20223030313132323333343435353636373738383939616162626363646465656666222c20226e616d65223a202250686f6e65222c20226361706162696c6974696573223a205b5d7d",
+      "reason": "positive version required"
+    },
+    {
+      "name": "incorrect_retryable",
+      "frame_hex": "0000005e147b227472616e736665725f6964223a20223031323334353637383961626364656666656463626139383736353433323130222c2022636f6465223a202269645f636f6e666c696374222c2022726574727961626c65223a20747275657d",
+      "reason": "retryable contradicts code"
+    },
+    {
+      "name": "version_error_without_version",
+      "frame_hex": "0000001c7f7b22636f6465223a2276657273696f6e5f6d69736d61746368227d",
+      "reason": "supported_version required"
+    },
+    {
+      "name": "closing_with_version",
+      "frame_hex": "000000297f7b22636f6465223a22636c6f73696e67222c22737570706f727465645f76657273696f6e223a317d",
+      "reason": "supported_version only on mismatch"
+    },
+    {
+      "name": "nul_clipboard",
+      "frame_hex": "00000057207b227472616e736665725f6964223a20223031323334353637383961626364656666656463626139383736353433323130222c202274657874223a20225c7530303030222c2022637265617465645f6174223a20307d",
+      "reason": "NUL forbidden"
+    },
+    {
+      "name": "clipboard_image_wrong_mime",
+      "frame_hex": "000000f8107b227472616e736665725f6964223a223031323334353637383961626364656666656463626139383736353433323130222c2266696c655f6e616d65223a22636170747572652e62696e222c226d696d65223a226170706c69636174696f6e2f6f637465742d73747265616d222c2273697a65223a372c22736861323536223a2238633166663266333565636135346633303930323261353034643462373962393566383165613832316232313039396338316262326465323562653138383666222c226b696e64223a22636c6970626f6172645f696d616765222c22637265617465645f6174223a313830303030303030303030307d",
+      "reason": "clipboard_image requires image MIME"
+    },
+    {
+      "name": "nack_disk_full_not_retryable",
+      "frame_hex": "00000058147b227472616e736665725f6964223a223232323232323232323232323232323232323232323232323232323232323232222c22636f6465223a226469736b5f66756c6c222c22726574727961626c65223a66616c73657d",
+      "reason": "code requires retryable=true"
+    },
+    {
+      "name": "nack_disk_full_retryable_null",
+      "frame_hex": "00000057147b227472616e736665725f6964223a223232323232323232323232323232323232323232323232323232323232323232222c22636f6465223a226469736b5f66756c6c222c22726574727961626c65223a6e756c6c7d",
+      "reason": "retryable must be boolean"
+    },
+    {
+      "name": "nack_not_writable_not_retryable",
+      "frame_hex": "0000005b147b227472616e736665725f6964223a223232323232323232323232323232323232323232323232323232323232323232222c22636f6465223a226e6f745f7772697461626c65222c22726574727961626c65223a66616c73657d",
+      "reason": "code requires retryable=true"
+    },
+    {
+      "name": "nack_not_writable_retryable_null",
+      "frame_hex": "0000005a147b227472616e736665725f6964223a223232323232323232323232323232323232323232323232323232323232323232222c22636f6465223a226e6f745f7772697461626c65222c22726574727961626c65223a6e756c6c7d",
+      "reason": "retryable must be boolean"
+    },
+    {
+      "name": "status_wrong_type_0",
+      "frame_hex": "00000010067b22706175736564223a6e756c6c7d",
+      "reason": "paused must be boolean"
+    },
+    {
+      "name": "hello_paused_wrong_type_0",
+      "frame_hex": "0000009d017b2276657273696f6e223a312c226465766963655f6964223a223030313132323333343435353636373738383939616162626363646465656666222c226e616d65223a2253616d73756e67205332352b222c226361706162696c6974696573223a5b2266696c6573222c22636c6970626f6172645f74657874222c22636c6970626f6172645f696d616765225d2c22706175736564223a6e756c6c7d",
+      "reason": "optional paused must be boolean, never null"
+    },
+    {
+      "name": "status_wrong_type_1",
+      "frame_hex": "0000000d067b22706175736564223a307d",
+      "reason": "paused must be boolean"
+    },
+    {
+      "name": "hello_paused_wrong_type_1",
+      "frame_hex": "0000009a017b2276657273696f6e223a312c226465766963655f6964223a223030313132323333343435353636373738383939616162626363646465656666222c226e616d65223a2253616d73756e67205332352b222c226361706162696c6974696573223a5b2266696c6573222c22636c6970626f6172645f74657874222c22636c6970626f6172645f696d616765225d2c22706175736564223a307d",
+      "reason": "optional paused must be boolean, never null"
+    },
+    {
+      "name": "status_wrong_type_2",
+      "frame_hex": "00000012067b22706175736564223a2274727565227d",
+      "reason": "paused must be boolean"
+    },
+    {
+      "name": "hello_paused_wrong_type_2",
+      "frame_hex": "0000009f017b2276657273696f6e223a312c226465766963655f6964223a223030313132323333343435353636373738383939616162626363646465656666222c226e616d65223a2253616d73756e67205332352b222c226361706162696c6974696573223a5b2266696c6573222c22636c6970626f6172645f74657874222c22636c6970626f6172645f696d616765225d2c22706175736564223a2274727565227d",
+      "reason": "optional paused must be boolean, never null"
+    },
+    {
+      "name": "status_wrong_type_3",
+      "frame_hex": "0000000e067b22706175736564223a5b5d7d",
+      "reason": "paused must be boolean"
+    },
+    {
+      "name": "hello_paused_wrong_type_3",
+      "frame_hex": "0000009b017b2276657273696f6e223a312c226465766963655f6964223a223030313132323333343435353636373738383939616162626363646465656666222c226e616d65223a2253616d73756e67205332352b222c226361706162696c6974696573223a5b2266696c6573222c22636c6970626f6172645f74657874222c22636c6970626f6172645f696d616765225d2c22706175736564223a5b5d7d",
+      "reason": "optional paused must be boolean, never null"
+    },
+    {
+      "name": "status_wrong_type_4",
+      "frame_hex": "0000000e067b22706175736564223a7b7d7d",
+      "reason": "paused must be boolean"
+    },
+    {
+      "name": "hello_paused_wrong_type_4",
+      "frame_hex": "0000009b017b2276657273696f6e223a312c226465766963655f6964223a223030313132323333343435353636373738383939616162626363646465656666222c226e616d65223a2253616d73756e67205332352b222c226361706162696c6974696573223a5b2266696c6573222c22636c6970626f6172645f74657874222c22636c6970626f6172645f696d616765225d2c22706175736564223a7b7d7d",
+      "reason": "optional paused must be boolean, never null"
+    },
+    {
+      "name": "status_missing_paused",
+      "frame_hex": "00000003067b7d",
+      "reason": "required paused missing"
+    },
+    {
+      "name": "status_duplicate_paused",
+      "frame_hex": "0000001f067b22706175736564223a747275652c22706175736564223a66616c73657d",
+      "reason": "duplicate known field"
+    },
+    {
+      "name": "hello_duplicate_paused",
+      "frame_hex": "000000b5017b2276657273696f6e223a20312c20226465766963655f6964223a20223030313132323333343435353636373738383939616162626363646465656666222c20226e616d65223a202253616d73756e67205332352b222c20226361706162696c6974696573223a205b2266696c6573222c2022636c6970626f6172645f74657874222c2022636c6970626f6172645f696d616765225d2c22706175736564223a747275652c22706175736564223a66616c73657d",
+      "reason": "duplicate known field"
+    },
+    {
+      "name": "unpair_invalid_payload_0",
+      "frame_hex": "00000003075b5d",
+      "reason": "must be one valid JSON object"
+    },
+    {
+      "name": "status_invalid_payload_0",
+      "frame_hex": "00000003065b5d",
+      "reason": "must be one valid JSON object with paused"
+    },
+    {
+      "name": "unpair_invalid_payload_1",
+      "frame_hex": "00000005076e756c6c",
+      "reason": "must be one valid JSON object"
+    },
+    {
+      "name": "status_invalid_payload_1",
+      "frame_hex": "00000005066e756c6c",
+      "reason": "must be one valid JSON object with paused"
+    },
+    {
+      "name": "unpair_invalid_payload_2",
+      "frame_hex": "000000050774727565",
+      "reason": "must be one valid JSON object"
+    },
+    {
+      "name": "status_invalid_payload_2",
+      "frame_hex": "000000050674727565",
+      "reason": "must be one valid JSON object with paused"
+    },
+    {
+      "name": "unpair_invalid_payload_3",
+      "frame_hex": "00000003072222",
+      "reason": "must be one valid JSON object"
+    },
+    {
+      "name": "status_invalid_payload_3",
+      "frame_hex": "00000003062222",
+      "reason": "must be one valid JSON object with paused"
+    },
+    {
+      "name": "unpair_invalid_payload_4",
+      "frame_hex": "00000005077b7d7b7d",
+      "reason": "must be one valid JSON object"
+    },
+    {
+      "name": "status_invalid_payload_4",
+      "frame_hex": "00000005067b7d7b7d",
+      "reason": "must be one valid JSON object with paused"
+    },
+    {
+      "name": "unpair_invalid_payload_5",
+      "frame_hex": "00000002077b",
+      "reason": "must be one valid JSON object"
+    },
+    {
+      "name": "status_invalid_payload_5",
+      "frame_hex": "00000002067b",
+      "reason": "must be one valid JSON object with paused"
+    },
+    {
+      "name": "clipboard_invalid_origin_0",
+      "frame_hex": "00000095207b227472616e736665725f6964223a223232323232323232323232323232323232323232323232323232323232323232222c2274657874223a22486f6c61205c75643833645c75646334625c6e68747470733a2f2f6578616d706c652e6f72672f3f613d3126623d32222c22637265617465645f6174223a313830303030303030303030302c226f726967696e223a6e756c6c7d",
+      "reason": "origin must be clipboard or share, never null"
+    },
+    {
+      "name": "clipboard_invalid_origin_1",
+      "frame_hex": "00000099207b227472616e736665725f6964223a223232323232323232323232323232323232323232323232323232323232323232222c2274657874223a22486f6c61205c75643833645c75646334625c6e68747470733a2f2f6578616d706c652e6f72672f3f613d3126623d32222c22637265617465645f6174223a313830303030303030303030302c226f726967696e223a22736861726564227d",
+      "reason": "origin must be clipboard or share, never null"
+    },
+    {
+      "name": "clipboard_invalid_origin_2",
+      "frame_hex": "00000097207b227472616e736665725f6964223a223232323232323232323232323232323232323232323232323232323232323232222c2274657874223a22486f6c61205c75643833645c75646334625c6e68747470733a2f2f6578616d706c652e6f72672f3f613d3126623d32222c22637265617465645f6174223a313830303030303030303030302c226f726967696e223a2266696c65227d",
+      "reason": "origin must be clipboard or share, never null"
+    },
+    {
+      "name": "clipboard_invalid_origin_3",
+      "frame_hex": "00000098207b227472616e736665725f6964223a223232323232323232323232323232323232323232323232323232323232323232222c2274657874223a22486f6c61205c75643833645c75646334625c6e68747470733a2f2f6578616d706c652e6f72672f3f613d3126623d32222c22637265617465645f6174223a313830303030303030303030302c226f726967696e223a225348415245227d",
+      "reason": "origin must be clipboard or share, never null"
+    },
+    {
+      "name": "clipboard_invalid_origin_4",
+      "frame_hex": "00000092207b227472616e736665725f6964223a223232323232323232323232323232323232323232323232323232323232323232222c2274657874223a22486f6c61205c75643833645c75646334625c6e68747470733a2f2f6578616d706c652e6f72672f3f613d3126623d32222c22637265617465645f6174223a313830303030303030303030302c226f726967696e223a307d",
+      "reason": "origin must be clipboard or share, never null"
+    },
+    {
+      "name": "clipboard_invalid_origin_5",
+      "frame_hex": "00000095207b227472616e736665725f6964223a223232323232323232323232323232323232323232323232323232323232323232222c2274657874223a22486f6c61205c75643833645c75646334625c6e68747470733a2f2f6578616d706c652e6f72672f3f613d3126623d32222c22637265617465645f6174223a313830303030303030303030302c226f726967696e223a747275657d",
+      "reason": "origin must be clipboard or share, never null"
+    },
+    {
+      "name": "clipboard_duplicate_origin",
+      "frame_hex": "000000b2207b227472616e736665725f6964223a20223232323232323232323232323232323232323232323232323232323232323232222c202274657874223a2022486f6c61205c75643833645c75646334625c6e68747470733a2f2f6578616d706c652e6f72672f3f613d3126623d32222c2022637265617465645f6174223a20313830303030303030303030302c226f726967696e223a227368617265222c226f726967696e223a22636c6970626f617264227d",
+      "reason": "duplicate known field"
+    },
+    {
+      "name": "file_begin_obsolete_shared_kind",
+      "frame_hex": "00000121107b227472616e736665725f6964223a223031323334353637383961626364656666656463626139383736353433323130222c2266696c655f6e616d65223a22636170747572652e62696e222c226d696d65223a226170706c69636174696f6e2f6f637465742d73747265616d222c2273697a65223a372c22736861323536223a2238633166663266333565636135346633303930323261353034643462373962393566383165613832316232313039396338316262326465323562653138383666222c226b696e64223a22736861726564222c22637265617465645f6174223a313830303030303030303030302c22736f757263655f6d656469615f6964223a2265787465726e616c5f7072696d6172793a696d616765733a3132333435227d",
+      "reason": "shared was renamed file"
+    },
+    {
+      "name": "unpair_invalid_utf8_unknown_value",
+      "frame_hex": "0000000a077b2278223a22ff227d",
+      "reason": "invalid UTF-8 in ignored value"
+    },
+    {
+      "name": "status_invalid_utf8_nested_key",
+      "frame_hex": "0000001c067b22706175736564223a747275652c2278223a7b22ff223a317d7d",
+      "reason": "invalid UTF-8 in ignored nested key"
+    },
+    {
+      "name": "hello_version_1.0",
+      "frame_hex": "00000091017b2276657273696f6e223a312e302c226465766963655f6964223a223030313132323333343435353636373738383939616162626363646465656666222c226e616d65223a2253616d73756e67205332352b222c226361706162696c6974696573223a5b2266696c6573222c22636c6970626f6172645f74657874222c22636c6970626f6172645f696d616765225d7d",
+      "reason": "integer fields prohibit fractions and exponents"
+    },
+    {
+      "name": "hello_version_1e0",
+      "frame_hex": "00000091017b2276657273696f6e223a3165302c226465766963655f6964223a223030313132323333343435353636373738383939616162626363646465656666222c226e616d65223a2253616d73756e67205332352b222c226361706162696c6974696573223a5b2266696c6573222c22636c6970626f6172645f74657874222c22636c6970626f6172645f696d616765225d7d",
+      "reason": "integer fields prohibit fractions and exponents"
+    },
+    {
+      "name": "file_begin_size_1.0",
+      "frame_hex": "00000121107b227472616e736665725f6964223a223031323334353637383961626364656666656463626139383736353433323130222c2266696c655f6e616d65223a22636170747572652e62696e222c226d696d65223a226170706c69636174696f6e2f6f637465742d73747265616d222c2273697a65223a312e302c22736861323536223a2238633166663266333565636135346633303930323261353034643462373962393566383165613832316232313039396338316262326465323562653138383666222c226b696e64223a2266696c65222c22637265617465645f6174223a313830303030303030303030302c22736f757263655f6d656469615f6964223a2265787465726e616c5f7072696d6172793a696d616765733a3132333435227d",
+      "reason": "integer fields prohibit fractions and exponents"
+    },
+    {
+      "name": "file_begin_size_1e0",
+      "frame_hex": "00000121107b227472616e736665725f6964223a223031323334353637383961626364656666656463626139383736353433323130222c2266696c655f6e616d65223a22636170747572652e62696e222c226d696d65223a226170706c69636174696f6e2f6f637465742d73747265616d222c2273697a65223a3165302c22736861323536223a2238633166663266333565636135346633303930323261353034643462373962393566383165613832316232313039396338316262326465323562653138383666222c226b696e64223a2266696c65222c22637265617465645f6174223a313830303030303030303030302c22736f757263655f6d656469615f6964223a2265787465726e616c5f7072696d6172793a696d616765733a3132333435227d",
+      "reason": "integer fields prohibit fractions and exponents"
+    },
+    {
+      "name": "file_begin_created_at_1.0",
+      "frame_hex": "00000115107b227472616e736665725f6964223a223031323334353637383961626364656666656463626139383736353433323130222c2266696c655f6e616d65223a22636170747572652e62696e222c226d696d65223a226170706c69636174696f6e2f6f637465742d73747265616d222c2273697a65223a372c22736861323536223a2238633166663266333565636135346633303930323261353034643462373962393566383165613832316232313039396338316262326465323562653138383666222c226b696e64223a2266696c65222c22637265617465645f6174223a312e302c22736f757263655f6d656469615f6964223a2265787465726e616c5f7072696d6172793a696d616765733a3132333435227d",
+      "reason": "integer fields prohibit fractions and exponents"
+    },
+    {
+      "name": "file_begin_created_at_1e0",
+      "frame_hex": "00000115107b227472616e736665725f6964223a223031323334353637383961626364656666656463626139383736353433323130222c2266696c655f6e616d65223a22636170747572652e62696e222c226d696d65223a226170706c69636174696f6e2f6f637465742d73747265616d222c2273697a65223a372c22736861323536223a2238633166663266333565636135346633303930323261353034643462373962393566383165613832316232313039396338316262326465323562653138383666222c226b696e64223a2266696c65222c22637265617465645f6174223a3165302c22736f757263655f6d656469615f6964223a2265787465726e616c5f7072696d6172793a696d616765733a3132333435227d",
+      "reason": "integer fields prohibit fractions and exponents"
+    },
+    {
+      "name": "clipboard_created_at_1.0",
+      "frame_hex": "0000007d207b227472616e736665725f6964223a223232323232323232323232323232323232323232323232323232323232323232222c2274657874223a22486f6c61205c75643833645c75646334625c6e68747470733a2f2f6578616d706c652e6f72672f3f613d3126623d32222c22637265617465645f6174223a312e307d",
+      "reason": "integer fields prohibit fractions and exponents"
+    },
+    {
+      "name": "clipboard_created_at_1e0",
+      "frame_hex": "0000007d207b227472616e736665725f6964223a223232323232323232323232323232323232323232323232323232323232323232222c2274657874223a22486f6c61205c75643833645c75646334625c6e68747470733a2f2f6578616d706c652e6f72672f3f613d3126623d32222c22637265617465645f6174223a3165307d",
+      "reason": "integer fields prohibit fractions and exponents"
+    },
+    {
+      "name": "error_supported_version_1.0",
+      "frame_hex": "000000517f7b22636f6465223a2276657273696f6e5f6d69736d61746368222c226d657373616765223a2250726f746f636f6c20636c6f73696e67222c22737570706f727465645f76657273696f6e223a312e307d",
+      "reason": "integer fields prohibit fractions and exponents"
+    },
+    {
+      "name": "error_supported_version_1e0",
+      "frame_hex": "000000517f7b22636f6465223a2276657273696f6e5f6d69736d61746368222c226d657373616765223a2250726f746f636f6c20636c6f73696e67222c22737570706f727465645f76657273696f6e223a3165307d",
+      "reason": "integer fields prohibit fractions and exponents"
+    }
+  ],
+  "invalid_pairing_uris": [
+    {
+      "name": "duplicate_v",
+      "uri": "pneu://pair?v=1&name=Office%20PC&fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&addr=192.168.1.10%3A47821&addr=100.67.144.28%3A47821&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&exp=1800000300000&v=1"
+    },
+    {
+      "name": "unknown_key",
+      "uri": "pneu://pair?v=1&name=Office%20PC&fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&addr=192.168.1.10%3A47821&addr=100.67.144.28%3A47821&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&exp=1800000300000&future=1"
+    },
+    {
+      "name": "wrong_scheme",
+      "uri": "https://pair?v=1&name=Office%20PC&fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&addr=192.168.1.10%3A47821&addr=100.67.144.28%3A47821&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&exp=1800000300000"
+    },
+    {
+      "name": "path",
+      "uri": "pneu://pair/?v=1&name=Office%20PC&fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&addr=192.168.1.10%3A47821&addr=100.67.144.28%3A47821&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&exp=1800000300000"
+    },
+    {
+      "name": "userinfo",
+      "uri": "pneu://user@pair?v=1&name=Office%20PC&fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&addr=192.168.1.10%3A47821&addr=100.67.144.28%3A47821&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&exp=1800000300000"
+    },
+    {
+      "name": "fragment",
+      "uri": "pneu://pair?v=1&name=Office%20PC&fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&addr=192.168.1.10%3A47821&addr=100.67.144.28%3A47821&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&exp=1800000300000#fragment"
+    },
+    {
+      "name": "missing_token",
+      "uri": "pneu://pair?v=1&name=Office%20PC&fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&addr=192.168.1.10%3A47821&addr=100.67.144.28%3A47821&exp=1800000300000"
+    },
+    {
+      "name": "bad_percent",
+      "uri": "pneu://pair?v=1&name=Office%2GPC&fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&addr=192.168.1.10%3A47821&addr=100.67.144.28%3A47821&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&exp=1800000300000"
+    },
+    {
+      "name": "invalid_utf8",
+      "uri": "pneu://pair?v=1&name=%ff&fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&addr=192.168.1.10%3A47821&addr=100.67.144.28%3A47821&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&exp=1800000300000"
+    },
+    {
+      "name": "duplicate_address",
+      "uri": "pneu://pair?v=1&name=Office%20PC&fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&addr=192.168.1.10%3A47821&addr=100.67.144.28%3A47821&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&exp=1800000300000&addr=192.168.1.10%3A47821"
+    },
+    {
+      "name": "zero_port",
+      "uri": "pneu://pair?v=1&name=Office%20PC&fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&addr=192.168.1.10%3A0&addr=100.67.144.28%3A47821&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&exp=1800000300000"
+    },
+    {
+      "name": "invalid_ipv4",
+      "uri": "pneu://pair?v=1&name=Office%20PC&fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&addr=999.1.1.1%3A47821&addr=100.67.144.28%3A47821&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&exp=1800000300000"
+    },
+    {
+      "name": "unbracketed_ipv6",
+      "uri": "pneu://pair?v=1&name=Office%20PC&fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&addr=fd00%3A%3A1%3A47821&addr=100.67.144.28%3A47821&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&exp=1800000300000"
+    },
+    {
+      "name": "expiry_overflow",
+      "uri": "pneu://pair?v=1&name=Office%20PC&fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&addr=192.168.1.10%3A47821&addr=100.67.144.28%3A47821&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&exp=9007199254740992"
+    },
+    {
+      "name": "uppercase_fingerprint",
+      "uri": "pneu://pair?v=1&name=Office%20PC&fp=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&addr=192.168.1.10%3A47821&addr=100.67.144.28%3A47821&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&exp=1800000300000"
+    },
+    {
+      "name": "negative_version",
+      "uri": "pneu://pair?v=-1&name=Office%20PC&fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&addr=192.168.1.10%3A47821&addr=100.67.144.28%3A47821&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&exp=1800000300000"
+    },
+    {
+      "name": "zero_version",
+      "uri": "pneu://pair?v=0&name=Office%20PC&fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&addr=192.168.1.10%3A47821&addr=100.67.144.28%3A47821&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&exp=1800000300000"
+    },
+    {
+      "name": "bad_dns_label",
+      "uri": "pneu://pair?v=1&name=Office%20PC&fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&addr=-pc.local%3A47821&addr=100.67.144.28%3A47821&token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&exp=1800000300000"
+    }
+  ],
+  "fingerprints": [
+    {
+      "der_hex": "616263",
+      "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+      "note": "Hash helper input only, deliberately not an X.509 certificate"
+    }
+  ]
+}

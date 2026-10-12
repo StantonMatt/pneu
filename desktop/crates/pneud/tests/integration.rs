@@ -1,0 +1,1983 @@
+use anyhow::Result;
+use async_trait::async_trait;
+use pneu_proto::*;
+use pneud::{
+    Config, Core, Paths,
+    actions::{PcActions, ReceivedFile},
+    client::{Phone, PhoneConnection},
+};
+use sha2::{Digest, Sha256};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::{net::TcpListener, task::JoinHandle};
+
+#[derive(Default)]
+struct Actions {
+    text: Mutex<Vec<String>>,
+    images: Mutex<Vec<PathBuf>>,
+    image_bytes: Mutex<Vec<Vec<u8>>>,
+    notices: Mutex<Vec<PathBuf>>,
+    notice_mimes: Mutex<Vec<String>>,
+    changed: tokio::sync::Notify,
+    denied: std::sync::atomic::AtomicBool,
+    opens: Mutex<Vec<PathBuf>>,
+    block_image: std::sync::atomic::AtomicBool,
+    deny_image: std::sync::atomic::AtomicBool,
+    block_text: std::sync::atomic::AtomicBool,
+    text_entered: tokio::sync::Notify,
+    text_release: tokio::sync::Notify,
+    clipboard_notices: Mutex<Vec<PathBuf>>,
+    copy_failures: std::sync::atomic::AtomicUsize,
+    image_entered: tokio::sync::Notify,
+    image_release: tokio::sync::Notify,
+}
+#[async_trait]
+impl PcActions for Actions {
+    async fn clipboard_text(&self, text: &str) -> Result<()> {
+        if self.block_text.load(std::sync::atomic::Ordering::SeqCst) {
+            self.text_entered.notify_one();
+            self.text_release.notified().await;
+        }
+        anyhow::ensure!(
+            !self.denied.load(std::sync::atomic::Ordering::SeqCst),
+            "clipboard unavailable"
+        );
+        self.text.lock().unwrap().push(text.into());
+        self.changed.notify_one();
+        Ok(())
+    }
+    async fn clipboard_image(&self, path: &Path, _: &str) -> Result<()> {
+        if self.block_image.load(std::sync::atomic::Ordering::SeqCst) {
+            self.image_entered.notify_one();
+            self.image_release.notified().await;
+        }
+        anyhow::ensure!(
+            !self.deny_image.load(std::sync::atomic::Ordering::SeqCst),
+            "image copy denied"
+        );
+        self.images.lock().unwrap().push(path.into());
+        self.changed.notify_one();
+        Ok(())
+    }
+    async fn clipboard_received(&self, file: &ReceivedFile, mime: &str) -> Result<()> {
+        self.clipboard_image(file.path(), mime).await?;
+        self.image_bytes
+            .lock()
+            .unwrap()
+            .push(file.read_bounded(16 * 1024 * 1024)?);
+        Ok(())
+    }
+    async fn notify(&self, path: &Path, mime: &str) -> Result<()> {
+        self.notices.lock().unwrap().push(path.into());
+        self.notice_mimes.lock().unwrap().push(mime.into());
+        self.changed.notify_one();
+        Ok(())
+    }
+    async fn notify_clipboard_image(&self, path: &Path, _: &str) -> Result<()> {
+        self.clipboard_notices.lock().unwrap().push(path.to_owned());
+        self.changed.notify_one();
+        Ok(())
+    }
+    async fn notify_clipboard_failure(&self) -> Result<()> {
+        self.copy_failures
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.changed.notify_one();
+        Ok(())
+    }
+    async fn open(&self, path: &Path) -> Result<()> {
+        self.opens.lock().unwrap().push(path.into());
+        Ok(())
+    }
+}
+struct Harness {
+    dir: tempfile::TempDir,
+    core: Arc<Core>,
+    task: JoinHandle<Result<()>>,
+    actions: Arc<Actions>,
+    address: String,
+}
+impl Harness {
+    async fn new() -> Result<Self> {
+        let dir = tempfile::tempdir()?;
+        let actions = Arc::new(Actions::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?.to_string();
+        let paths = Paths {
+            data: dir.path().join("data"),
+            cache: dir.path().join("cache"),
+            config: dir.path().join("config/config.toml"),
+            socket: dir.path().join("pneud.sock"),
+        };
+        let config = Config {
+            port: listener.local_addr()?.port(),
+            save_path: dir.path().join("saved"),
+            ..Config::default()
+        };
+        let core = Core::new(paths, config, actions.clone()).await?;
+        let task = tokio::spawn(core.clone().serve(listener, false));
+        Ok(Self {
+            dir,
+            core,
+            task,
+            actions,
+            address,
+        })
+    }
+    fn phone(&self, name: &str) -> Result<Phone> {
+        Phone::new(self.dir.path().join(name))
+    }
+    async fn pair(&self, phone: &Phone) -> Result<PhoneConnection> {
+        let invitation = self
+            .core
+            .start_pairing_with_addresses(vec![self.address.clone()])
+            .await?;
+        let mut events = self.core.subscribe();
+        let connection = phone.pair(&invitation).await?;
+        event_matching(&mut events, |e| matches!(e, pneud::Event::ConnectionChanged { device, connected: true } if *device == phone.identity.device_id)).await?;
+        Ok(connection)
+    }
+    async fn stop(self) -> Result<()> {
+        self.core.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(15), self.task).await??
+    }
+    async fn wait_images(&self, n: usize) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while self.actions.images.lock().unwrap().len() < n {
+                self.actions.changed.notified().await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
+    fn saved(&self) -> Result<Vec<PathBuf>> {
+        Ok(std::fs::read_dir(self.core.config().save_path)?
+            .filter(|r| r.as_ref().is_ok_and(|e| e.path().is_file()))
+            .map(|r| r.map(|e| e.path()))
+            .collect::<std::io::Result<Vec<_>>>()?)
+    }
+}
+fn metadata(id: Id, bytes: &[u8]) -> FileBegin {
+    FileBegin {
+        transfer_id: id,
+        file_name: "capture.png".into(),
+        mime: "image/png".into(),
+        size: bytes.len() as u64,
+        sha256: Hash::new(hex::encode(Sha256::digest(bytes))).unwrap(),
+        kind: FileKind::Screenshot,
+        created_at: 0,
+        source_media_id: None,
+    }
+}
+async fn begin_chunks(
+    connection: &mut PhoneConnection,
+    meta: &FileBegin,
+    bytes: &[u8],
+) -> Result<()> {
+    connection.write(&Message::FileBegin(meta.clone())).await?;
+    if !bytes.is_empty() {
+        connection
+            .write(&Message::FileChunk(FileChunk {
+                transfer_id: meta.transfer_id.clone(),
+                offset: 0,
+                data: bytes.to_vec(),
+            }))
+            .await?;
+    }
+    Ok(())
+}
+async fn end(connection: &mut PhoneConnection, id: Id) -> Result<Message> {
+    connection
+        .write(&Message::FileEnd(FileEnd { transfer_id: id }))
+        .await?;
+    connection.read(Duration::from_secs(3)).await
+}
+
+#[tokio::test]
+async fn pair_file_durable_ack_duplicate_and_clipboard() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    let bytes = b"\x89PNG\r\n\x1a\noriginal image bytes";
+    let source = h.dir.path().join("original.png");
+    std::fs::write(&source, bytes)?;
+    let meta = metadata(Id::new(pneud::random_hex(16))?, bytes);
+    assert!(!c.send_file(meta.clone(), &source).await?.deduplicated);
+    h.wait_images(1).await?;
+    let paths = h.saved()?;
+    assert_eq!(paths.len(), 1);
+    assert_eq!(std::fs::read(&paths[0])?, bytes);
+    assert!(c.send_file(meta.clone(), &source).await?.deduplicated);
+    assert_eq!(h.saved()?.len(), 1);
+    assert_eq!(h.actions.images.lock().unwrap().len(), 1);
+    assert_eq!(h.actions.notices.lock().unwrap().len(), 1);
+    let text = Clipboard {
+        transfer_id: Id::new(pneud::random_hex(16))?,
+        text: "hola ☃".into(),
+        created_at: 0,
+        origin: pneu_proto::ClipboardOrigin::Clipboard,
+    };
+    assert!(!c.send_text(text.clone()).await?.deduplicated);
+    assert!(c.send_text(text.clone()).await?.deduplicated);
+    assert_eq!(&*h.actions.text.lock().unwrap(), &["hola ☃"]);
+    let mut conflict = meta;
+    conflict.file_name = "other.png".into();
+    begin_chunks(&mut c, &conflict, bytes).await?;
+    assert!(matches!(
+        end(&mut c, conflict.transfer_id).await?,
+        Message::Nack(Nack {
+            code: NackCode::IdConflict,
+            retryable: false,
+            ..
+        })
+    ));
+    let conflict = metadata(text.transfer_id, bytes);
+    begin_chunks(&mut c, &conflict, bytes).await?;
+    assert!(matches!(
+        end(&mut c, conflict.transfer_id).await?,
+        Message::Nack(Nack {
+            code: NackCode::IdConflict,
+            ..
+        })
+    ));
+    drop(c);
+    h.stop().await
+}
+#[tokio::test]
+async fn mid_transfer_disconnect_replays_from_zero() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    let bytes = vec![77; CHUNK_SIZE + 17];
+    let source = h.dir.path().join("recording.bin");
+    std::fs::write(&source, &bytes)?;
+    let mut meta = metadata(Id::new(pneud::random_hex(16))?, &bytes);
+    meta.file_name = "recording.bin".into();
+    meta.mime = "application/octet-stream".into();
+    meta.kind = FileKind::Recording;
+    c.write(&Message::FileBegin(meta.clone())).await?;
+    c.write(&Message::FileChunk(FileChunk {
+        transfer_id: meta.transfer_id.clone(),
+        offset: 0,
+        data: bytes[..1024].to_vec(),
+    }))
+    .await?;
+    drop(c);
+    let mut c = phone.reconnect().await?;
+    assert!(!c.send_file(meta.clone(), &source).await?.deduplicated);
+    let paths = h.saved()?;
+    assert_eq!(paths.len(), 1);
+    assert_eq!(std::fs::read(&paths[0])?, bytes);
+    drop(c);
+    h.stop().await
+}
+#[tokio::test]
+async fn unknown_cert_is_rejected_and_used_token_cannot_pair_again() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    assert!(
+        phone
+            .connect(
+                std::slice::from_ref(&h.address),
+                h.core.identity.fingerprint.clone(),
+                None
+            )
+            .await
+            .is_err()
+    );
+    let invitation = h
+        .core
+        .start_pairing_with_addresses(vec![h.address.clone()])
+        .await?;
+    let c = phone.pair(&invitation).await?;
+    let stranger = h.phone("stranger")?;
+    assert!(stranger.pair(&invitation).await.is_err());
+    drop(c);
+    h.stop().await
+}
+#[tokio::test]
+async fn known_cert_cannot_claim_another_hello_identity() -> Result<()> {
+    let h = Harness::new().await?;
+    let mut phone = h.phone("phone")?;
+    drop(h.pair(&phone).await?);
+    phone.identity.device_id = Id::new(pneud::random_hex(16))?;
+    let mut c = phone.reconnect().await?;
+    assert!(matches!(
+        c.read(Duration::from_secs(2)).await?,
+        Message::Error(ErrorMessage {
+            code: ErrorCode::Unauthorized,
+            ..
+        })
+    ));
+    drop(c);
+    h.stop().await
+}
+#[tokio::test]
+async fn digest_and_short_file_nacks_drain_without_a_visible_file() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    let meta = metadata(Id::new(pneud::random_hex(16))?, b"correct");
+    begin_chunks(&mut c, &meta, b"badbyte").await?;
+    assert!(matches!(
+        end(&mut c, meta.transfer_id.clone()).await?,
+        Message::Nack(Nack {
+            code: NackCode::HashMismatch,
+            ..
+        })
+    ));
+    begin_chunks(&mut c, &meta, b"short").await?;
+    assert!(matches!(
+        end(&mut c, meta.transfer_id.clone()).await?,
+        Message::Nack(Nack {
+            code: NackCode::SizeMismatch,
+            ..
+        })
+    ));
+    assert_eq!(h.saved()?.len(), 0);
+    begin_chunks(&mut c, &meta, b"correct").await?;
+    assert!(matches!(
+        end(&mut c, meta.transfer_id).await?,
+        Message::Ack(_)
+    ));
+    drop(c);
+    h.stop().await
+}
+#[tokio::test]
+async fn outbound_clipboard_keeps_latest_unsent_and_acknowledges_inflight() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    let a = h
+        .core
+        .send_clipboard(phone.identity.device_id.clone(), "first".into())
+        .await?;
+    let inflight = c.read(Duration::from_secs(3)).await?;
+    assert!(matches!(&inflight, Message::Clipboard(t) if t.transfer_id==a));
+    h.core
+        .send_clipboard(phone.identity.device_id.clone(), "superseded".into())
+        .await?;
+    let latest = h
+        .core
+        .send_clipboard(phone.identity.device_id.clone(), "latest".into())
+        .await?;
+    c.handle(inflight).await?;
+    let message = c.read(Duration::from_secs(3)).await?;
+    assert!(matches!(&message, Message::Clipboard(t) if t.transfer_id==latest && t.text=="latest"));
+    c.handle(message).await?;
+    drop(c);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn unpair_closes_session_and_removes_trust() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    let mut events = h.core.subscribe();
+    h.core
+        .unpair_device(phone.identity.device_id.clone())
+        .await?;
+    assert!(matches!(
+        c.read(Duration::from_secs(3)).await?,
+        Message::Unpair(_)
+    ));
+    assert!(matches!(
+        c.read(Duration::from_secs(3)).await?,
+        Message::Error(ErrorMessage {
+            code: ErrorCode::Closing,
+            ..
+        })
+    ));
+    event_matching(&mut events, |e| matches!(e, pneud::Event::Unpaired { .. })).await?;
+    assert!(phone.reconnect().await.is_err());
+    assert!(c.handle(Message::Unpair(Unpair {})).await.is_err());
+    assert!(!phone.directory.join("binding.json").exists());
+    for table in [
+        "peers",
+        "receipts",
+        "outgoing",
+        "clipboard_clock",
+        "clipboard_recent",
+    ] {
+        assert_eq!(device_rows(&h, &phone.identity.device_id, table)?, 0);
+    }
+    assert!(h.core.paired_devices().is_empty());
+    drop(c);
+    h.stop().await
+}
+#[tokio::test]
+async fn empty_file_and_capacity_policy() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    let empty = metadata(Id::new(pneud::random_hex(16))?, b"");
+    begin_chunks(&mut c, &empty, b"").await?;
+    assert!(matches!(
+        end(&mut c, empty.transfer_id).await?,
+        Message::Ack(_)
+    ));
+    let mut config = h.core.config();
+    config.max_file_bytes = 0;
+    h.core.update_config(config).await?;
+    let meta = metadata(Id::new(pneud::random_hex(16))?, b"oversize");
+    begin_chunks(&mut c, &meta, b"oversize").await?;
+    assert!(matches!(
+        end(&mut c, meta.transfer_id).await?,
+        Message::Nack(Nack {
+            code: NackCode::StorageFailed,
+            retryable: true,
+            ..
+        })
+    ));
+    drop(c);
+    h.stop().await
+}
+#[tokio::test]
+async fn missing_certificate_verify_private_key_is_rejected() -> Result<()> {
+    use rustls::{
+        SignatureScheme, client::ResolvesClientCert, pki_types::ServerName, sign::CertifiedKey,
+    };
+    #[derive(Debug)]
+    struct WrongSigner(Arc<CertifiedKey>);
+    impl ResolvesClientCert for WrongSigner {
+        fn resolve(&self, _: &[&[u8]], _: &[SignatureScheme]) -> Option<Arc<CertifiedKey>> {
+            Some(self.0.clone())
+        }
+        fn has_certs(&self) -> bool {
+            true
+        }
+    }
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    drop(h.pair(&phone).await?);
+    let wrong = h.phone("wrong-key")?;
+    let key = rustls::crypto::ring::sign::any_supported_type(&wrong.identity.key)?;
+    let mut config =
+        pneud::tls::client_config(&phone.identity, h.core.identity.fingerprint.clone())?;
+    config.client_auth_cert_resolver = Arc::new(WrongSigner(Arc::new(CertifiedKey::new(
+        vec![phone.identity.cert.clone()],
+        key,
+    ))));
+    let tcp = tokio::net::TcpStream::connect(&h.address).await?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let rejected = match connector
+        .connect(ServerName::try_from("pneu.local")?, tcp)
+        .await
+    {
+        Err(_) => true,
+        Ok(mut stream) => {
+            let hello = Message::Hello(Hello {
+                version: 1,
+                device_id: phone.identity.device_id.clone(),
+                name: "spoof".into(),
+                capabilities: vec![],
+                paused: None,
+            });
+            write_frame(&mut stream, &hello).await.is_err()
+                || !matches!(
+                    tokio::time::timeout(Duration::from_secs(2), read_frame(&mut stream)).await,
+                    Ok(Ok(Some(Message::Hello(_))))
+                )
+        }
+    };
+    assert!(
+        rejected,
+        "CertificateVerify must prove possession of the certificate key"
+    );
+    h.stop().await
+}
+
+#[tokio::test]
+async fn cache_mode_and_restart_required_port_change() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    let original_port = h.core.bound_port();
+    let mut changed = h.core.config();
+    changed.port = if original_port == u16::MAX {
+        original_port - 1
+    } else {
+        original_port + 1
+    };
+    assert_eq!(
+        h.core.update_config(changed).await.unwrap_err().to_string(),
+        "changing the port takes effect after restarting pneud"
+    );
+    assert_eq!(h.core.bound_port(), original_port);
+    let mut config = h.core.config();
+    config.save_to_folder = false;
+    config.copy_image_to_clipboard = false;
+    h.core.update_config(config).await?;
+    let bytes = b"cache item";
+    let meta = metadata(Id::new(pneud::random_hex(16))?, bytes);
+    begin_chunks(&mut c, &meta, bytes).await?;
+    assert!(matches!(
+        end(&mut c, meta.transfer_id.clone()).await?,
+        Message::Ack(_)
+    ));
+    let files = std::fs::read_dir(&h.core.paths.cache)?
+        .filter(|e| e.as_ref().is_ok_and(|e| e.path().is_file()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    assert_eq!(files.len(), 1);
+    assert!(
+        files[0]
+            .file_name()
+            .to_string_lossy()
+            .starts_with("received-")
+    );
+    assert_eq!(std::fs::read(files[0].path())?, bytes);
+    // Other settings and ordinary connection replacement still work on the
+    // original endpoint; changing it requires a restart.
+    let mut replacement = phone.reconnect().await?;
+    assert!(matches!(
+        c.read(Duration::from_secs(3)).await?,
+        Message::Error(ErrorMessage {
+            code: ErrorCode::ConnectionReplaced,
+            ..
+        })
+    ));
+    begin_chunks(&mut replacement, &meta, bytes).await?;
+    assert!(matches!(
+        end(&mut replacement, meta.transfer_id).await?,
+        Message::Ack(Ack {
+            deduplicated: true,
+            ..
+        })
+    ));
+    drop(c);
+    drop(replacement);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn denied_clipboard_keeps_nothing_and_newer_text_wins_over_stale_replays() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    h.actions
+        .denied
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut first = phone.text("first".into(), ClipboardOrigin::Clipboard)?;
+    first.created_at = 1;
+    let mut second = phone.text("second".into(), ClipboardOrigin::Clipboard)?;
+    second.created_at = 2;
+    assert!(c.send_text(first.clone()).await.is_err());
+    assert_eq!(
+        device_rows(&h, &phone.identity.device_id, "clipboard_recent")?,
+        0
+    );
+    h.actions
+        .denied
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(!c.send_text(second.clone()).await?.deduplicated);
+    assert!(c.send_text(first).await?.deduplicated);
+    assert!(c.send_text(second).await?.deduplicated);
+    assert_eq!(&*h.actions.text.lock().unwrap(), &["second"]);
+    drop(c);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn mime_hint_does_not_automatically_launch_executable_filename() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    let mut config = h.core.config();
+    config.open_in_viewer = true;
+    h.core.update_config(config).await?;
+    let bytes = b"\x89PNG\r\n\x1a\n[Desktop Entry]";
+    let mut meta = metadata(Id::new(pneud::random_hex(16))?, bytes);
+    meta.file_name = "untrusted.desktop".into();
+    begin_chunks(&mut c, &meta, bytes).await?;
+    assert!(matches!(
+        end(&mut c, meta.transfer_id).await?,
+        Message::Ack(_)
+    ));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while h.actions.notices.lock().unwrap().is_empty() {
+            h.actions.changed.notified().await;
+        }
+    })
+    .await?;
+    assert_eq!(h.actions.images.lock().unwrap().len(), 1);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(h.actions.opens.lock().unwrap().is_empty());
+    drop(c);
+    h.stop().await
+}
+#[tokio::test]
+async fn paired_reconnect_survives_lost_pair_result_and_daemon_restart() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let invitation = h
+        .core
+        .start_pairing_with_addresses(vec![h.address.clone()])
+        .await?;
+    let mut c = phone
+        .connect(&invitation.addresses, invitation.fingerprint.clone(), None)
+        .await?;
+    c.write(&Message::PairRequest(PairRequest {
+        token: invitation.token,
+    }))
+    .await?;
+    drop(c);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !h.core.paired_devices().contains(&phone.identity.device_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    let mut c = phone
+        .connect(&invitation.addresses, invitation.fingerprint.clone(), None)
+        .await?;
+    let text = Clipboard {
+        transfer_id: Id::new(pneud::random_hex(16))?,
+        text: "recovered".into(),
+        created_at: 0,
+        origin: pneu_proto::ClipboardOrigin::Clipboard,
+    };
+    assert!(!c.send_text(text.clone()).await?.deduplicated);
+    drop(c);
+    let paths = h.core.paths.clone();
+    let config = h.core.config();
+    let actions = h.actions.clone();
+    h.core.request_shutdown();
+    h.task.await??;
+    drop(h.core);
+    let core = Core::new(paths, config, actions.clone()).await?;
+    let listener = TcpListener::bind(&h.address).await?;
+    let task = tokio::spawn(core.clone().serve(listener, false));
+    let mut c = phone
+        .connect(&invitation.addresses, invitation.fingerprint, None)
+        .await?;
+    assert!(c.send_text(text).await?.deduplicated);
+    assert_eq!(&*actions.text.lock().unwrap(), &["recovered"]);
+    drop(c);
+    core.request_shutdown();
+    task.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn replacement_closes_old_socket_even_during_slow_desktop_action() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut old = h.pair(&phone).await?;
+    h.actions
+        .block_image
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let bytes = b"\x89PNG\r\n\x1a\nimage bytes";
+    let meta = metadata(Id::new(pneud::random_hex(16))?, bytes);
+    begin_chunks(&mut old, &meta, bytes).await?;
+    assert!(matches!(
+        end(&mut old, meta.transfer_id).await?,
+        Message::Ack(_)
+    ));
+    tokio::time::timeout(Duration::from_secs(3), h.actions.image_entered.notified()).await?;
+    let mut replacement = phone.reconnect().await?;
+    assert!(matches!(
+        old.read(Duration::from_secs(3)).await?,
+        Message::Error(ErrorMessage {
+            code: ErrorCode::ConnectionReplaced,
+            ..
+        })
+    ));
+    let next = metadata(Id::new(pneud::random_hex(16))?, b"next");
+    begin_chunks(&mut replacement, &next, b"next").await?;
+    assert!(matches!(
+        end(&mut replacement, next.transfer_id).await?,
+        Message::Ack(_)
+    ));
+    let nonce = Nonce::new("1234567890abcdef")?;
+    replacement
+        .write(&Message::Ping(Ping {
+            nonce: nonce.clone(),
+        }))
+        .await?;
+    assert!(
+        matches!(replacement.read(Duration::from_secs(1)).await?,Message::Pong(p) if p.nonce==nonce)
+    );
+    h.actions
+        .block_image
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    h.actions.image_release.notify_one();
+    h.wait_images(1).await?;
+    let final_connection = phone.reconnect().await?;
+    drop(final_connection);
+    drop(replacement);
+    drop(old);
+    h.stop().await
+}
+
+async fn event_matching(
+    events: &mut tokio::sync::broadcast::Receiver<pneud::Event>,
+    matches: impl Fn(&pneud::Event) -> bool,
+) -> Result<pneud::Event> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let event = events.recv().await?;
+            if matches(&event) {
+                return Ok::<_, anyhow::Error>(event);
+            }
+        }
+    })
+    .await?
+}
+fn device_rows(h: &Harness, device: &Id, table: &str) -> Result<i64> {
+    let db = rusqlite::Connection::open(h.core.paths.data.join("state.sqlite3"))?;
+    let key = if table == "peers" { "id" } else { "device" };
+    Ok(db.query_row(
+        &format!("SELECT count(*) FROM {table} WHERE {key}=?"),
+        [device.as_str()],
+        |r| r.get(0),
+    )?)
+}
+
+#[tokio::test]
+async fn hello_and_status_report_pause_without_receipts_and_keep_manual_sends() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    phone.set_paused(true)?;
+    let mut events = h.core.subscribe();
+    let mut c = h.pair(&phone).await?;
+    assert_eq!(c.pc.paused, None, "PC HELLO omits phone-only state");
+    event_matching(&mut events, |e| {
+        matches!(e, pneud::Event::PhonePaused { paused: true, .. })
+    })
+    .await?;
+    assert_eq!(h.core.phone_paused(&phone.identity.device_id), Some(true));
+    // New PC clipboard operations are dropped while the phone is paused.
+    assert!(
+        h.core
+            .send_clipboard(phone.identity.device_id.clone(), "to phone".into())
+            .await
+            .is_err()
+    );
+    let nonce = Nonce::new("0123456789abcdef")?;
+    c.write(&Message::Ping(Ping {
+        nonce: nonce.clone(),
+    }))
+    .await?;
+    assert!(matches!(c.read(Duration::from_secs(3)).await?, Message::Pong(p) if p.nonce == nonce));
+    assert!(c.read(Duration::from_millis(100)).await.is_err());
+    let manual = Clipboard {
+        transfer_id: Id::new(pneud::random_hex(16))?,
+        text: "manual share while paused".into(),
+        created_at: 0,
+        origin: ClipboardOrigin::Share,
+    };
+    assert!(!c.send_text(manual).await?.deduplicated);
+    c.send_status(false).await?;
+    event_matching(&mut events, |e| {
+        matches!(e, pneud::Event::PhonePaused { paused: false, .. })
+    })
+    .await?;
+    assert_eq!(h.core.phone_paused(&phone.identity.device_id), Some(false));
+    let id = h
+        .core
+        .send_clipboard(phone.identity.device_id.clone(), "to phone".into())
+        .await?;
+    let clipboard = c.read(Duration::from_secs(3)).await?;
+    assert!(matches!(&clipboard, Message::Clipboard(text) if text.transfer_id == id));
+    c.handle(clipboard).await?;
+    // STATUS itself has no receipt, and paused state is sent again in HELLO.
+    c.send_status(true).await?;
+    event_matching(&mut events, |e| {
+        matches!(e, pneud::Event::PhonePaused { paused: true, .. })
+    })
+    .await?;
+    drop(c);
+    let mut c = phone.reconnect().await?;
+    event_matching(&mut events, |e| {
+        matches!(e, pneud::Event::PhonePaused { paused: true, .. })
+    })
+    .await?;
+    assert!(c.read(Duration::from_millis(100)).await.is_err());
+    drop(c);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn omitted_hello_paused_defaults_to_false() -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    drop(h.pair(&phone).await?);
+    let config = pneud::tls::client_config(&phone.identity, h.core.identity.fingerprint.clone())?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let tcp = tokio::net::TcpStream::connect(&h.address).await?;
+    let mut tls = connector
+        .connect(rustls::pki_types::ServerName::try_from("pneu.local")?, tcp)
+        .await?;
+    let mut events = h.core.subscribe();
+    write_frame(
+        &mut tls,
+        &Message::Hello(Hello {
+            version: 1,
+            device_id: phone.identity.device_id.clone(),
+            name: "Phone".into(),
+            capabilities: vec!["clipboard_text".into()],
+            paused: None,
+        }),
+    )
+    .await?;
+    assert!(matches!(
+        read_frame(&mut tls).await?,
+        Some(Message::Hello(_))
+    ));
+    event_matching(&mut events, |e| {
+        matches!(e, pneud::Event::PhonePaused { paused: false, .. })
+    })
+    .await?;
+    assert_eq!(h.core.phone_paused(&phone.identity.device_id), Some(false));
+    tls.shutdown().await?;
+    drop(tls);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn file_kind_and_clipboard_origin_survive_receipts_dedupe_and_events() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    let mut events = h.core.subscribe();
+    let source = h.dir.path().join("shared.txt");
+    std::fs::write(&source, b"shared file")?;
+    let meta = phone
+        .file_metadata(&source, FileKind::File, "text/plain".into())
+        .await?;
+    assert!(!c.send_file(meta.clone(), &source).await?.deduplicated);
+    event_matching(&mut events, |e| matches!(e, pneud::Event::TransferStarted { metadata, .. } if metadata.kind == FileKind::File)).await?;
+    assert!(c.send_file(meta, &source).await?.deduplicated);
+    for origin in [ClipboardOrigin::Clipboard, ClipboardOrigin::Share] {
+        let mut text = phone.text("a link".into(), origin)?;
+        text.created_at = if origin == ClipboardOrigin::Clipboard {
+            1
+        } else {
+            2
+        };
+        assert!(!c.send_text(text.clone()).await?.deduplicated);
+        event_matching(&mut events, |e| matches!(e, pneud::Event::ClipboardReceived { origin: actual, .. } if *actual == origin)).await?;
+        assert!(c.send_text(text.clone()).await?.deduplicated);
+        let mut conflicting = text;
+        conflicting.origin = if origin == ClipboardOrigin::Share {
+            ClipboardOrigin::Clipboard
+        } else {
+            ClipboardOrigin::Share
+        };
+        c.write(&Message::Clipboard(conflicting)).await?;
+        assert!(matches!(
+            c.read(Duration::from_secs(3)).await?,
+            Message::Nack(Nack {
+                code: NackCode::IdConflict,
+                ..
+            })
+        ));
+    }
+    assert_eq!(h.actions.text.lock().unwrap().len(), 2);
+    // Omission and explicit clipboard have the same semantic default for dedupe.
+    let text = Clipboard {
+        transfer_id: Id::new(pneud::random_hex(16))?,
+        text: "default".into(),
+        created_at: 3,
+        origin: ClipboardOrigin::Clipboard,
+    };
+    // Sending an omitted origin is covered by raw vectors; the decoded value is
+    // identical to explicit origin and serialized durable metadata uses that value.
+    assert!(!c.send_text(text.clone()).await?.deduplicated);
+    assert!(c.send_text(text).await?.deduplicated);
+    drop(c);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn incoming_unpair_clears_pairing_receipts_and_active_staging() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    let device = &phone.identity.device_id;
+    let text = Clipboard {
+        transfer_id: Id::new(pneud::random_hex(16))?,
+        text: "received".into(),
+        created_at: 0,
+        origin: ClipboardOrigin::Share,
+    };
+    c.send_text(text).await?;
+    let complete = metadata(Id::new(pneud::random_hex(16))?, b"saved");
+    begin_chunks(&mut c, &complete, b"saved").await?;
+    assert!(matches!(
+        end(&mut c, complete.transfer_id).await?,
+        Message::Ack(_)
+    ));
+    assert_eq!(device_rows(&h, device, "receipts")?, 1);
+    assert_eq!(device_rows(&h, device, "clipboard_recent")?, 1);
+    h.core
+        .send_clipboard(device.clone(), "pending".into())
+        .await?;
+    assert_eq!(device_rows(&h, device, "outgoing")?, 1);
+    phone.set_paused(true)?;
+    let mut events = h.core.subscribe();
+    c.send_status(true).await?;
+    event_matching(&mut events, |e| {
+        matches!(e, pneud::Event::PhonePaused { paused: true, .. })
+    })
+    .await?;
+    let partial = metadata(Id::new(pneud::random_hex(16))?, b"unfinished");
+    begin_chunks(&mut c, &partial, b"part").await?;
+    event_matching(&mut events, |e| {
+        matches!(e, pneud::Event::TransferProgress { .. })
+    })
+    .await?;
+    c.unpair().await?;
+    event_matching(&mut events, |e| matches!(e, pneud::Event::Unpaired { .. })).await?;
+    event_matching(&mut events, |e| {
+        matches!(
+            e,
+            pneud::Event::ConnectionChanged {
+                connected: false,
+                ..
+            }
+        )
+    })
+    .await?;
+    for table in [
+        "peers",
+        "receipts",
+        "outgoing",
+        "clipboard_clock",
+        "clipboard_recent",
+    ] {
+        assert_eq!(device_rows(&h, device, table)?, 0);
+    }
+    assert_eq!(h.saved()?.len(), 1, "completed user files survive unpair");
+    assert!(h.core.paired_devices().is_empty());
+    assert_eq!(h.core.phone_paused(device), None);
+    assert!(!phone.directory.join("binding.json").exists());
+    assert!(phone.reconnect().await.is_err());
+    drop(c);
+    // Fresh approval may re-pair the same simulator identity; old dedupe is gone.
+    // Respect the existing one-second provisional-admission rate limit.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let mut c = h.pair(&phone).await?;
+    let text = Clipboard {
+        transfer_id: partial.transfer_id,
+        text: "fresh".into(),
+        created_at: 0,
+        origin: ClipboardOrigin::Clipboard,
+    };
+    assert!(!c.send_text(text).await?.deduplicated);
+    drop(c);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn missing_uncreatable_save_folder_nacks_then_retries_without_a_copy() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    let blocker = h.dir.path().join("not-a-directory");
+    std::fs::write(&blocker, b"keep me")?;
+    let mut config = h.core.config();
+    config.save_path = blocker.join("missing");
+    h.core.update_config(config).await?;
+    let meta = metadata(Id::new(pneud::random_hex(16))?, b"retry bytes");
+    begin_chunks(&mut c, &meta, b"retry bytes").await?;
+    assert!(matches!(
+        end(&mut c, meta.transfer_id.clone()).await?,
+        Message::Nack(Nack {
+            code: NackCode::NotWritable,
+            retryable: true,
+            ..
+        })
+    ));
+    assert_eq!(device_rows(&h, &phone.identity.device_id, "receipts")?, 0);
+    assert_eq!(std::fs::read(&blocker)?, b"keep me");
+    let db = rusqlite::Connection::open(h.core.paths.data.join("state.sqlite3"))?;
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE name='stages'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        0
+    );
+    let mut config = h.core.config();
+    config.save_path = h.dir.path().join("new-folder");
+    h.core.update_config(config).await?;
+    begin_chunks(&mut c, &meta, b"retry bytes").await?;
+    assert!(matches!(
+        end(&mut c, meta.transfer_id).await?,
+        Message::Ack(Ack {
+            deduplicated: false,
+            ..
+        })
+    ));
+    assert_eq!(h.saved()?.len(), 1);
+    drop(c);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn actual_pair_api_recovers_lost_result_after_expiry_and_restart() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let invitation = h
+        .core
+        .start_pairing_with_addresses(vec![h.address.clone()])
+        .await?;
+    let mut events = h.core.subscribe();
+    // Cancel the actual pairing API after persistence, before it can consume
+    // PAIR_RESULT. The biased event branch makes this deterministic.
+    tokio::select! {biased;
+        result=event_matching(&mut events,|e|matches!(e,pneud::Event::Paired {..}))=>{result?;},
+        result=phone.pair(&invitation)=>{result?;anyhow::bail!("pair result unexpectedly consumed");}
+    }
+    assert!(!phone.directory.join("binding.json").exists());
+    let mut pending: PairingUri = serde_json::from_slice(&std::fs::read(
+        phone.directory.join("pending-pairing.json"),
+    )?)?;
+    pending.expires_at = 0;
+    pending.token = Hash::new("f".repeat(64))?;
+    pneud::config::atomic_private(
+        &phone.directory.join("pending-pairing.json"),
+        &serde_json::to_vec(&pending)?,
+    )?;
+    let paths = h.core.paths.clone();
+    let config = h.core.config();
+    let actions = h.actions.clone();
+    h.core.request_shutdown();
+    h.task.await??;
+    drop(h.core);
+    let core = Core::new(paths, config, actions).await?;
+    let listener = TcpListener::bind(&h.address).await?;
+    let task = tokio::spawn(core.clone().serve(listener, false));
+    let mut c = phone.reconnect().await?;
+    assert!(phone.directory.join("binding.json").exists());
+    assert!(!phone.directory.join("pending-pairing.json").exists());
+    let binding: pneud::client::Binding =
+        serde_json::from_slice(&std::fs::read(phone.directory.join("binding.json"))?)?;
+    assert_eq!(binding.device_id, core.identity.device_id);
+    assert_eq!(binding.fingerprint, core.identity.fingerprint);
+    c.send_text(phone.text("recovered API".into(), ClipboardOrigin::Share)?)
+        .await?;
+    c.write(&Message::PairRequest(PairRequest {
+        token: pending.token,
+    }))
+    .await?;
+    assert!(matches!(
+        c.read(Duration::from_secs(2)).await?,
+        Message::Error(ErrorMessage {
+            code: ErrorCode::UnexpectedMessage,
+            ..
+        })
+    ));
+    drop(c);
+    core.request_shutdown();
+    task.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ping_is_prompt_during_an_unstalled_multichunk_transfer() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    let bytes = vec![0x5a; 4 * 1024 * 1024];
+    let meta = metadata(Id::new(pneud::random_hex(16))?, &bytes);
+    c.write(&Message::FileBegin(meta.clone())).await?;
+    for (index, data) in bytes.chunks(CHUNK_SIZE).enumerate() {
+        c.write(&Message::FileChunk(FileChunk {
+            transfer_id: meta.transfer_id.clone(),
+            offset: (index * CHUNK_SIZE) as u64,
+            data: data.to_vec(),
+        }))
+        .await?;
+        // Check several PINGs while the file is still in progress, rather than
+        // after END when the file worker has already finished.
+        if index % 4 == 0 {
+            let nonce = Nonce::new(format!("{index:016x}"))?;
+            c.write(&Message::Ping(Ping {
+                nonce: nonce.clone(),
+            }))
+            .await?;
+            assert!(
+                matches!(c.read(Duration::from_secs(1)).await?, Message::Pong(p) if p.nonce == nonce)
+            );
+        }
+    }
+    assert!(matches!(end(&mut c, meta.transfer_id.clone()).await?,
+        Message::Ack(Ack { transfer_id, deduplicated: false }) if transfer_id == meta.transfer_id));
+    let saved = h.saved()?;
+    assert_eq!(saved.len(), 1);
+    assert_eq!(tokio::fs::read(&saved[0]).await?, bytes);
+    drop(c);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn explicit_image_overflow_reports_failure_without_coalescing_or_blocking_delivery()
+-> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    let mut events = h.core.subscribe();
+    h.actions
+        .block_image
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let bytes = b"\x89PNG\r\n\x1a\nimage";
+    for index in 0..10 {
+        let mut meta = metadata(Id::new(pneud::random_hex(16))?, bytes);
+        meta.kind = FileKind::ClipboardImage;
+        meta.file_name = format!("explicit-{index}.png");
+        begin_chunks(&mut c, &meta, bytes).await?;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), end(&mut c, meta.transfer_id)).await??,
+            Message::Ack(_)
+        ));
+        if index == 0 {
+            tokio::time::timeout(Duration::from_secs(2), h.actions.image_entered.notified())
+                .await?;
+        }
+    }
+    event_matching(&mut events, |e| matches!(e, pneud::Event::Error {message, ..} if message.contains("explicit image queue is full"))).await?;
+    h.actions
+        .block_image
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    h.actions.image_release.notify_one();
+    h.wait_images(9).await?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while h
+            .actions
+            .copy_failures
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            h.actions.changed.notified().await;
+        }
+    })
+    .await?;
+    let images = h.actions.images.lock().unwrap().clone();
+    assert_eq!(images.len(), 9);
+    for (index, image) in images.iter().enumerate() {
+        assert!(
+            image
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(&format!("explicit-{index}.png"))
+        );
+    }
+    assert_eq!(
+        h.actions
+            .copy_failures
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    drop(c);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn automatic_actions_coalesce_without_backpressuring_files_and_keep_explicit_requests()
+-> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    let mut config = h.core.config();
+    config.open_in_viewer = true;
+    h.core.update_config(config).await?;
+    h.actions
+        .block_image
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let bytes = b"\x89PNG\r\n\x1a\nimage";
+    for index in 0..67 {
+        let mut meta = metadata(Id::new(pneud::random_hex(16))?, bytes);
+        meta.file_name = if index == 66 {
+            "latest.png".into()
+        } else {
+            format!("automatic-{index}.png")
+        };
+        begin_chunks(&mut c, &meta, bytes).await?;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(750), end(&mut c, meta.transfer_id))
+                .await??,
+            Message::Ack(_)
+        ));
+        if index == 0 {
+            tokio::time::timeout(Duration::from_secs(2), h.actions.image_entered.notified())
+                .await?;
+        }
+    }
+    for index in 0..3 {
+        let mut meta = metadata(Id::new(pneud::random_hex(16))?, bytes);
+        meta.kind = FileKind::ClipboardImage;
+        meta.file_name = format!("explicit-{index}.png");
+        begin_chunks(&mut c, &meta, bytes).await?;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(750), end(&mut c, meta.transfer_id))
+                .await??,
+            Message::Ack(_)
+        ));
+    }
+    assert_eq!(h.saved()?.len(), 67);
+    h.actions
+        .block_image
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    h.actions.image_release.notify_one();
+    h.wait_images(5).await?;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while h.actions.opens.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await?;
+    let images = h.actions.images.lock().unwrap().clone();
+    assert_eq!(
+        images.len(),
+        5,
+        "only running, explicit and latest automatic copies survive"
+    );
+    assert!(
+        images[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("automatic-0.png")
+    );
+    for index in 0..3 {
+        assert!(images.iter().any(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(&format!("explicit-{index}.png"))
+        }));
+    }
+    assert!(
+        images
+            .last()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("latest.png")
+    );
+    assert_eq!(
+        &*h.actions.opens.lock().unwrap(),
+        &[images.last().unwrap().clone()]
+    );
+    assert!(h.actions.notices.lock().unwrap().len() <= 16);
+    drop(c);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn slow_clipboard_does_not_block_file_ping_or_outgoing_receipt() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    h.actions
+        .block_text
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    c.write(&Message::Clipboard(
+        phone.text("blocked".into(), ClipboardOrigin::Clipboard)?,
+    ))
+    .await?;
+    tokio::time::timeout(Duration::from_secs(2), h.actions.text_entered.notified()).await?;
+    let meta = metadata(Id::new(pneud::random_hex(16))?, b"file alongside text");
+    begin_chunks(&mut c, &meta, b"file alongside text").await?;
+    assert!(matches!(
+        end(&mut c, meta.transfer_id).await?,
+        Message::Ack(_)
+    ));
+    let mut events = h.core.subscribe();
+    let id = h
+        .core
+        .send_clipboard(phone.identity.device_id.clone(), "reverse".into())
+        .await?;
+    let message = c.read(Duration::from_secs(2)).await?;
+    assert!(matches!(&message,Message::Clipboard(t) if t.transfer_id==id));
+    c.handle(message).await?;
+    event_matching(&mut events, |e| {
+        matches!(e, pneud::Event::ClipboardSent { .. })
+    })
+    .await?;
+    let nonce = Nonce::new("cafebabecafebabe")?;
+    c.write(&Message::Ping(Ping {
+        nonce: nonce.clone(),
+    }))
+    .await?;
+    assert!(matches!(c.read(Duration::from_secs(1)).await?,Message::Pong(p) if p.nonce==nonce));
+    h.actions
+        .block_text
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    h.actions.text_release.notify_one();
+    assert!(matches!(
+        c.read(Duration::from_secs(2)).await?,
+        Message::Ack(_)
+    ));
+    drop(c);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn shutdown_cancels_a_tls_connection_waiting_for_hello() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    drop(h.pair(&phone).await?);
+    let config = pneud::tls::client_config(&phone.identity, h.core.identity.fingerprint.clone())?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let tcp = tokio::net::TcpStream::connect(&h.address).await?;
+    let mut tls = connector
+        .connect(rustls::pki_types::ServerName::try_from("pneu.local")?, tcp)
+        .await?;
+    h.core.request_shutdown();
+    let hello = Message::Hello(Hello {
+        version: 1,
+        device_id: phone.identity.device_id.clone(),
+        name: "late".into(),
+        capabilities: vec![],
+        paused: None,
+    });
+    let _ = write_frame(&mut tls, &hello).await;
+    tokio::time::timeout(Duration::from_secs(2), h.task).await???;
+    assert!(h.core.connected_devices().is_empty());
+    drop(tls);
+    Ok(())
+}
+
+#[tokio::test]
+async fn changing_save_path_applies_to_new_transfers_without_waiting_for_active_transfer()
+-> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    let old = h.core.config().save_path;
+    let bytes = b"\x89PNG\r\n\x1a\nimage";
+    let first = metadata(Id::new(pneud::random_hex(16))?, bytes);
+    let mut events = h.core.subscribe();
+    begin_chunks(&mut c, &first, bytes).await?;
+    event_matching(&mut events, |e| {
+        matches!(e, pneud::Event::TransferProgress { .. })
+    })
+    .await?;
+    let mut config = h.core.config();
+    config.save_path = h.dir.path().join("new-save");
+    tokio::time::timeout(Duration::from_millis(500), h.core.update_config(config)).await??;
+    assert!(matches!(
+        end(&mut c, first.transfer_id).await?,
+        Message::Ack(_)
+    ));
+    assert_eq!(std::fs::read_dir(old.join(".pneu-staging"))?.count(), 0);
+    assert_eq!(
+        std::fs::read_dir(&old)?
+            .filter(|e| e.as_ref().is_ok_and(|e| e.path().is_file()))
+            .count(),
+        1
+    );
+    let second = metadata(Id::new(pneud::random_hex(16))?, bytes);
+    begin_chunks(&mut c, &second, bytes).await?;
+    assert!(matches!(
+        end(&mut c, second.transfer_id).await?,
+        Message::Ack(_)
+    ));
+    assert!(h.core.config().save_path.join(".pneu-staging").is_dir());
+    assert_eq!(h.saved()?.len(), 1);
+    assert_eq!(
+        h.core.connected_devices(),
+        vec![phone.identity.device_id.clone()]
+    );
+    drop(c);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn image_copy_uses_content_and_only_viewer_launches_require_extensions() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    let mut config = h.core.config();
+    config.open_in_viewer = true;
+    h.core.update_config(config).await?;
+    let bytes = b"\x89PNG\r\n\x1a\nimage";
+    for name in ["clipboard", "clipboard.bin", "clipboard.exe"] {
+        let mut meta = metadata(Id::new(pneud::random_hex(16))?, bytes);
+        meta.kind = FileKind::ClipboardImage;
+        meta.file_name = name.into();
+        begin_chunks(&mut c, &meta, bytes).await?;
+        assert!(matches!(
+            end(&mut c, meta.transfer_id).await?,
+            Message::Ack(_)
+        ));
+    }
+    // Ordinary image copying has the same content rule, with viewer safety
+    // independently checking the extension.
+    let mut meta = metadata(Id::new(pneud::random_hex(16))?, bytes);
+    meta.file_name = "screenshot.bin".into();
+    begin_chunks(&mut c, &meta, bytes).await?;
+    assert!(matches!(
+        end(&mut c, meta.transfer_id).await?,
+        Message::Ack(_)
+    ));
+    h.wait_images(4).await?;
+    let invalid = b"executable bytes with an image filename and MIME";
+    let meta = metadata(Id::new(pneud::random_hex(16))?, invalid);
+    begin_chunks(&mut c, &meta, invalid).await?;
+    assert!(matches!(
+        end(&mut c, meta.transfer_id).await?,
+        Message::Ack(_)
+    ));
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(h.actions.images.lock().unwrap().len(), 4);
+    assert_eq!(h.actions.clipboard_notices.lock().unwrap().len(), 3);
+    assert!(h.actions.opens.lock().unwrap().is_empty());
+    drop(c);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn new_pairing_replaces_old_and_cancels_its_running_and_queued_actions() -> Result<()> {
+    let h = Harness::new().await?;
+    let old = h.phone("old")?;
+    let next = h.phone("next")?;
+    let mut c = h.pair(&old).await?;
+    let bytes = b"\x89PNG\r\n\x1a\nimage";
+    h.actions
+        .block_image
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    for index in 0..2 {
+        let mut meta = metadata(Id::new(pneud::random_hex(16))?, bytes);
+        meta.file_name = "old.png".into();
+        begin_chunks(&mut c, &meta, bytes).await?;
+        assert!(matches!(
+            end(&mut c, meta.transfer_id).await?,
+            Message::Ack(_)
+        ));
+        if index == 0 {
+            tokio::time::timeout(Duration::from_secs(2), h.actions.image_entered.notified())
+                .await?;
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let mut replacement = h.pair(&next).await?;
+    h.actions
+        .block_image
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    h.actions.image_release.notify_one();
+    assert_eq!(
+        h.core.paired_devices(),
+        vec![next.identity.device_id.clone()]
+    );
+    assert!(old.reconnect().await.is_err());
+    for table in [
+        "peers",
+        "receipts",
+        "clipboard_clock",
+        "clipboard_recent",
+        "outgoing",
+    ] {
+        assert_eq!(device_rows(&h, &old.identity.device_id, table)?, 0);
+    }
+    let mut meta = metadata(Id::new(pneud::random_hex(16))?, bytes);
+    meta.file_name = "new.png".into();
+    begin_chunks(&mut replacement, &meta, bytes).await?;
+    assert!(matches!(
+        end(&mut replacement, meta.transfer_id).await?,
+        Message::Ack(_)
+    ));
+    h.wait_images(1).await?;
+    assert!(
+        h.actions
+            .images
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|p| p.to_string_lossy().ends_with("new.png"))
+    );
+    drop(c);
+    drop(replacement);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn immediate_disconnect_after_file_ack_preserves_queued_desktop_effects() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    let mut config = h.core.config();
+    config.open_in_viewer = true;
+    h.core.update_config(config).await?;
+    h.actions
+        .block_image
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let bytes = b"\x89PNG\r\n\x1a\nimage";
+    let first = metadata(Id::new(pneud::random_hex(16))?, bytes);
+    begin_chunks(&mut c, &first, bytes).await?;
+    assert!(matches!(
+        end(&mut c, first.transfer_id).await?,
+        Message::Ack(_)
+    ));
+    tokio::time::timeout(Duration::from_secs(2), h.actions.image_entered.notified()).await?;
+    let source = h.dir.path().join("latest.png");
+    std::fs::write(&source, bytes)?;
+    let meta = phone
+        .file_metadata(&source, FileKind::Screenshot, "image/png".into())
+        .await?;
+    let mut events = h.core.subscribe();
+    assert!(!c.send_file(meta, &source).await?.deduplicated);
+    // Exactly the simulator's send-file lifecycle: close immediately on ACK.
+    c.close().await?;
+    event_matching(&mut events, |e| {
+        matches!(
+            e,
+            pneud::Event::ConnectionChanged {
+                connected: false,
+                ..
+            }
+        )
+    })
+    .await?;
+    assert!(h.core.connected_devices().is_empty());
+    assert!(h.actions.images.lock().unwrap().is_empty());
+    h.actions
+        .block_image
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    h.actions.image_release.notify_one();
+    h.wait_images(2).await?;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while h.actions.notices.lock().unwrap().len() < 2
+            || h.actions.opens.lock().unwrap().is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    let latest = h
+        .saved()?
+        .into_iter()
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("latest.png")
+        })
+        .unwrap();
+    assert_eq!(h.actions.images.lock().unwrap().last(), Some(&latest));
+    assert!(h.actions.notices.lock().unwrap().contains(&latest));
+    assert_eq!(&*h.actions.opens.lock().unwrap(), &[latest]);
+    drop(c);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn unpair_from_either_side_cancels_the_pending_viewer_debounce() -> Result<()> {
+    for incoming in [false, true] {
+        let h = Harness::new().await?;
+        let phone = h.phone("phone")?;
+        let mut c = h.pair(&phone).await?;
+        let mut config = h.core.config();
+        config.open_in_viewer = true;
+        h.core.update_config(config).await?;
+        let bytes = b"\x89PNG\r\n\x1a\nimage";
+        let meta = metadata(Id::new(pneud::random_hex(16))?, bytes);
+        begin_chunks(&mut c, &meta, bytes).await?;
+        assert!(matches!(
+            end(&mut c, meta.transfer_id).await?,
+            Message::Ack(_)
+        ));
+        h.wait_images(1).await?;
+        if incoming {
+            let mut events = h.core.subscribe();
+            c.unpair().await?;
+            event_matching(&mut events, |e| matches!(e, pneud::Event::Unpaired { .. })).await?;
+        } else {
+            h.core
+                .unpair_device(phone.identity.device_id.clone())
+                .await?;
+        }
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(h.actions.opens.lock().unwrap().is_empty());
+        assert_eq!(h.saved()?.len(), 1, "unpair leaves completed user files");
+        drop(c);
+        h.stop().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn clipboard_images_use_cache_copy_regardless_of_toggles_and_never_open() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    let mut config = h.core.config();
+    config.copy_image_to_clipboard = false;
+    config.open_in_viewer = true;
+    h.core.update_config(config).await?;
+    let bytes = b"\x89PNG\r\n\x1a\nimage";
+    let mut meta = metadata(Id::new(pneud::random_hex(16))?, bytes);
+    meta.kind = FileKind::ClipboardImage;
+    begin_chunks(&mut c, &meta, bytes).await?;
+    assert!(matches!(
+        end(&mut c, meta.transfer_id.clone()).await?,
+        Message::Ack(_)
+    ));
+    h.wait_images(1).await?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while h.actions.clipboard_notices.lock().unwrap().is_empty() {
+            h.actions.changed.notified().await;
+        }
+    })
+    .await?;
+    let image = h.actions.images.lock().unwrap()[0].clone();
+    assert!(image.starts_with(&h.core.paths.cache));
+    assert!(!h.core.config().save_path.exists());
+    assert!(h.actions.notices.lock().unwrap().is_empty());
+    begin_chunks(&mut c, &meta, bytes).await?;
+    assert!(matches!(
+        end(&mut c, meta.transfer_id).await?,
+        Message::Ack(Ack {
+            deduplicated: true,
+            ..
+        })
+    ));
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(h.actions.opens.lock().unwrap().is_empty());
+    assert_eq!(h.actions.images.lock().unwrap().len(), 1);
+    drop(c);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn long_image_names_preserve_extension_and_bursts_open_only_latest() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::new().await?;
+    std::fs::create_dir(&h.core.config().save_path)?;
+    std::fs::set_permissions(
+        h.core.config().save_path,
+        std::fs::Permissions::from_mode(0o775),
+    )?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    let mut config = h.core.config();
+    config.open_in_viewer = true;
+    h.core.update_config(config).await?;
+    let bytes = b"\x89PNG\r\n\x1a\nimage";
+    for index in 0..3 {
+        let mut meta = metadata(Id::new(pneud::random_hex(16))?, bytes);
+        meta.file_name = format!("{index}-{}.png", "é".repeat(122));
+        begin_chunks(&mut c, &meta, bytes).await?;
+        assert!(matches!(
+            end(&mut c, meta.transfer_id).await?,
+            Message::Ack(_)
+        ));
+    }
+    h.wait_images(1).await?;
+    assert!(h.actions.opens.lock().unwrap().is_empty());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while h.actions.opens.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await?;
+    let images = h.actions.images.lock().unwrap().clone();
+    let opens = h.actions.opens.lock().unwrap().clone();
+    let newest = h
+        .saved()?
+        .into_iter()
+        .find(|p| p.file_name().unwrap().to_string_lossy().contains("-2-"))
+        .unwrap();
+    assert_eq!(opens, vec![newest.clone()]);
+    assert_eq!(images.last(), Some(&newest));
+    assert!(
+        images
+            .iter()
+            .all(|p| p.extension().is_some_and(|e| e == "png"))
+    );
+    assert_eq!(
+        std::fs::metadata(h.core.config().save_path)?
+            .permissions()
+            .mode()
+            & 0o777,
+        0o775
+    );
+    drop(c);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn simulator_checks_image_capability_and_never_creates_an_outbox() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    c.pc.capabilities.retain(|cap| cap != "clipboard_image");
+    let source = h.dir.path().join("image.png");
+    std::fs::write(&source, b"\x89PNG\r\n\x1a\nimage")?;
+    let meta = phone
+        .file_metadata(&source, FileKind::ClipboardImage, "image/png".into())
+        .await?;
+    assert!(c.send_file(meta, &source).await.is_err());
+    c.send_text(phone.text("independent of files".into(), ClipboardOrigin::Share)?)
+        .await?;
+    assert!(!phone.directory.join("outbox").exists());
+    drop(c);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn reenabled_clipboard_sync_wakes_an_idle_reconnected_session() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut events = h.core.subscribe();
+    let mut c = h.pair(&phone).await?;
+    let id = h
+        .core
+        .send_clipboard(
+            phone.identity.device_id.clone(),
+            "queued without receipt".into(),
+        )
+        .await?;
+    let initial = c.read(Duration::from_secs(2)).await?;
+    assert!(matches!(initial,Message::Clipboard(t) if t.transfer_id == id));
+    let mut config = h.core.config();
+    config.clipboard_sync_to_phone = false;
+    h.core.update_config(config.clone()).await?;
+    c.close().await?;
+    drop(c);
+    event_matching(&mut events, |e| {
+        matches!(
+            e,
+            pneud::Event::ConnectionChanged {
+                connected: false,
+                ..
+            }
+        )
+    })
+    .await?;
+    let mut c = phone.reconnect().await?;
+    event_matching(&mut events, |e| {
+        matches!(
+            e,
+            pneud::Event::ConnectionChanged {
+                connected: true,
+                ..
+            }
+        )
+    })
+    .await?;
+    config.clipboard_sync_to_phone = true;
+    h.core.update_config(config).await?;
+    let message = c.read(Duration::from_secs(2)).await?;
+    assert!(matches!(&message,Message::Clipboard(t) if t.transfer_id == id));
+    c.handle(message).await?;
+    event_matching(
+        &mut events,
+        |e| matches!(e,pneud::Event::ClipboardSent {transfer_id,..} if *transfer_id == id),
+    )
+    .await?;
+    drop(c);
+    h.stop().await
+}
+#[tokio::test]
+async fn heif_and_avif_are_ordinary_files_and_explicit_heic_is_unsupported() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    let mut config = h.core.config();
+    config.open_in_viewer = true;
+    h.core.update_config(config).await?;
+    let bytes = b"\0\0\0\x18ftypheic\0\0\0\0heicmif1";
+    for (mime, extension) in [
+        ("image/heic", "heic"),
+        ("image/heif", "heif"),
+        ("image/avif", "avif"),
+    ] {
+        let mut meta = metadata(Id::new(pneud::random_hex(16))?, bytes);
+        meta.mime = mime.into();
+        meta.file_name = format!("ordinary.{extension}");
+        meta.kind = FileKind::Photo;
+        begin_chunks(&mut c, &meta, bytes).await?;
+        assert!(matches!(
+            end(&mut c, meta.transfer_id).await?,
+            Message::Ack(_)
+        ));
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while h.actions.notices.lock().unwrap().len() < 3 {
+            h.actions.changed.notified().await;
+        }
+    })
+    .await?;
+    assert_eq!(
+        &*h.actions.notice_mimes.lock().unwrap(),
+        &["application/octet-stream"; 3]
+    );
+    let mut events = h.core.subscribe();
+    let mut meta = metadata(Id::new(pneud::random_hex(16))?, bytes);
+    meta.mime = "image/heic".into();
+    meta.kind = FileKind::ClipboardImage;
+    meta.file_name = "explicit.heic".into();
+    begin_chunks(&mut c, &meta, bytes).await?;
+    assert!(matches!(
+        end(&mut c, meta.transfer_id).await?,
+        Message::Ack(_)
+    ));
+    event_matching(
+        &mut events,
+        |e| matches!(e, pneud::Event::Error { message, .. } if message.contains("unsupported")),
+    )
+    .await?;
+    assert!(h.actions.images.lock().unwrap().is_empty());
+    assert!(h.actions.clipboard_notices.lock().unwrap().is_empty());
+    assert!(h.actions.opens.lock().unwrap().is_empty());
+    assert_eq!(h.saved()?.len(), 3);
+    assert_eq!(
+        std::fs::read_dir(&h.core.paths.cache)?
+            .filter(|e| e.as_ref().is_ok_and(|e| e.path().is_file()))
+            .count(),
+        1
+    );
+    drop(c);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn denied_clipboard_image_never_reports_copied_success() -> Result<()> {
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    h.actions
+        .deny_image
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut events = h.core.subscribe();
+    let bytes = b"\x89PNG\r\n\x1a\nimage";
+    let mut meta = metadata(Id::new(pneud::random_hex(16))?, bytes);
+    meta.kind = FileKind::ClipboardImage;
+    begin_chunks(&mut c, &meta, bytes).await?;
+    assert!(matches!(
+        end(&mut c, meta.transfer_id.clone()).await?,
+        Message::Ack(_)
+    ));
+    event_matching(&mut events,|e|matches!(e,pneud::Event::Error {message,..} if message.contains("image clipboard unavailable"))).await?;
+    assert!(h.actions.images.lock().unwrap().is_empty());
+    assert!(h.actions.clipboard_notices.lock().unwrap().is_empty());
+    assert!(h.actions.notices.lock().unwrap().is_empty());
+    begin_chunks(&mut c, &meta, bytes).await?;
+    assert!(matches!(
+        end(&mut c, meta.transfer_id).await?,
+        Message::Ack(Ack {
+            deduplicated: true,
+            ..
+        })
+    ));
+    drop(c);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn failed_clipboard_has_no_barrier_or_receipt_to_conflict_with_interleaved_file() -> Result<()>
+{
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    h.actions
+        .denied
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let bytes = b"file bytes";
+    let meta = metadata(Id::new(pneud::random_hex(16))?, bytes);
+    c.write(&Message::FileBegin(meta.clone())).await?;
+    let mut text = phone.text("failed".into(), ClipboardOrigin::Clipboard)?;
+    text.transfer_id = meta.transfer_id.clone();
+    assert!(c.send_text(text).await.is_err());
+    c.write(&Message::FileChunk(FileChunk {
+        transfer_id: meta.transfer_id.clone(),
+        offset: 0,
+        data: bytes.to_vec(),
+    }))
+    .await?;
+    assert!(matches!(
+        end(&mut c, meta.transfer_id).await?,
+        Message::Ack(_)
+    ));
+    h.actions
+        .denied
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        !c.send_text(phone.text("new".into(), ClipboardOrigin::Clipboard)?)
+            .await?
+            .deduplicated
+    );
+    assert_eq!(&*h.actions.text.lock().unwrap(), &["new"]);
+    drop(c);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn received_image_descriptor_survives_swap_while_copy_is_blocked() -> Result<()> {
+    use std::sync::atomic::Ordering;
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    h.actions.block_image.store(true, Ordering::SeqCst);
+    let bytes = b"\x89PNG\r\n\x1a\noriginal image";
+    let source = h.dir.path().join("source.png");
+    std::fs::write(&source, bytes)?;
+    c.send_file(metadata(Id::new(pneud::random_hex(16))?, bytes), &source)
+        .await?;
+    tokio::time::timeout(Duration::from_secs(2), h.actions.image_entered.notified()).await?;
+    let saved = h.saved()?.pop().unwrap();
+    std::fs::remove_file(&saved)?;
+    let secret = h.dir.path().join("secret");
+    std::fs::write(&secret, b"secret text")?;
+    std::os::unix::fs::symlink(&secret, &saved)?;
+    h.actions.image_release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while h.actions.image_bytes.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(&*h.actions.image_bytes.lock().unwrap(), &[bytes.to_vec()]);
+    drop(c);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn text_claim_rejects_interleaved_file_before_placement() -> Result<()> {
+    use std::sync::atomic::Ordering;
+    let h = Harness::new().await?;
+    let phone = h.phone("phone")?;
+    let mut c = h.pair(&phone).await?;
+    h.actions.block_text.store(true, Ordering::SeqCst);
+    let text = phone.text("claimed text".into(), ClipboardOrigin::Clipboard)?;
+    let bytes = b"conflicting file";
+    let meta = metadata(text.transfer_id.clone(), bytes);
+    let mut events = h.core.subscribe();
+    begin_chunks(&mut c, &meta, bytes).await?;
+    event_matching(&mut events, |e| matches!(e, pneud::Event::TransferProgress {transfer_id,received,..} if *transfer_id == meta.transfer_id && *received == bytes.len() as u64)).await?;
+    // The file has a live stage but no receipt yet. Text claims its ID while
+    // blocked inside clipboard integration; FILE_END must conflict at commit.
+    c.write(&Message::Clipboard(text.clone())).await?;
+    tokio::time::timeout(Duration::from_secs(2), h.actions.text_entered.notified()).await?;
+    assert!(matches!(
+        end(&mut c, meta.transfer_id).await?,
+        Message::Nack(Nack {
+            code: NackCode::IdConflict,
+            ..
+        })
+    ));
+    assert!(h.actions.text.lock().unwrap().is_empty());
+    h.actions.text_release.notify_one();
+    assert!(matches!(
+        c.read(Duration::from_secs(3)).await?,
+        Message::Ack(Ack {
+            deduplicated: false,
+            ..
+        })
+    ));
+    assert_eq!(&*h.actions.text.lock().unwrap(), &["claimed text"]);
+    assert!(h.saved().unwrap_or_default().is_empty());
+    drop(c);
+    h.stop().await
+}

@@ -1,0 +1,747 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pneu Mockups</title>
+<style>
+:root{
+  --page:#E4E6EA; --page-ink:#1E2227; --page-sub:#5A616B; --page-line:#C9CDD3; --page-card:#F4F5F7;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){ --page:#141619; --page-ink:#E6E8EB; --page-sub:#9AA1AA; --page-line:#2C3036; --page-card:#1C1F23; }
+}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]) .phone, :root:not([data-theme="light"]) .shade, :root:not([data-theme="light"]) .qs{box-shadow:0 0 0 1px rgba(255,255,255,.14)} }
+:root[data-theme="dark"] .phone,:root[data-theme="dark"] .shade,:root[data-theme="dark"] .qs{box-shadow:0 0 0 1px rgba(255,255,255,.14)}
+:root[data-theme="dark"]{ --page:#141619; --page-ink:#E6E8EB; --page-sub:#9AA1AA; --page-line:#2C3036; --page-card:#1C1F23; }
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--page);color:var(--page-ink);font-family:"Noto Sans",system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+.page{max-width:1760px;margin:0 auto;padding:24px 16px 80px}
+.pagehead{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:8px}
+.pagehead h1{font-size:24px;font-weight:600;margin:0}
+.toc{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0 0}
+.toc a{color:var(--page-ink);text-decoration:none;font-size:13px;padding:6px 10px;border-radius:6px;background:var(--page-card);border:1px solid var(--page-line)}
+h2.sec{font-size:20px;font-weight:600;margin:48px 0 4px;padding-top:12px;border-top:1px solid var(--page-line)}
+.mocks{display:flex;flex-wrap:wrap;gap:0 32px;align-items:flex-start}
+.mock{margin:28px 0;flex:none;max-width:100%}
+.mock h3{font-size:15px;font-weight:600;margin:0 0 4px}
+.mock p.note{font-size:13px;color:var(--page-sub);margin:0 0 12px;max-width:848px;line-height:1.45}
+.mock h3{max-width:848px}
+.pair{display:flex;gap:20px;flex-wrap:wrap;align-items:flex-start}
+.grid{display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start}
+.cap{font-size:12px;color:var(--page-sub);margin:6px 0 0}
+svg{display:block}
+
+/* ---------------- Material 3 (phone) ---------------- */
+.m3{
+  --primary:#415F91;--on-primary:#FFFFFF;--primary-container:#D6E3FF;--on-primary-container:#284777;
+  --secondary-container:#DAE2F9;--on-secondary-container:#3E4759;
+  --tertiary-container:#FAD8FD;--on-tertiary-container:#573E5C;
+  --error:#BA1A1A;--error-container:#FFDAD6;--on-error-container:#93000A;
+  --surface:#F9F9FF;--sc-lowest:#FFFFFF;--sc-low:#F3F3FA;--sc:#EDEDF4;--sc-high:#E7E8EE;--sc-highest:#E2E2E9;
+  --on-surface:#191C20;--on-surface-variant:#44474E;--outline:#74777F;--outline-variant:#C4C6D0;
+  --inverse-surface:#2E3036;--inverse-on-surface:#F0F0F7;--inverse-primary:#AAC7FF;
+  --screen:var(--sc);--group:var(--sc-lowest);--scrim:rgba(0,0,0,.32);
+  --shade:#DCE0E8;--shade-card:rgba(255,255,255,.92);
+}
+.m3.dark{
+  --primary:#AAC7FF;--on-primary:#0A305F;--primary-container:#284777;--on-primary-container:#D6E3FF;
+  --secondary-container:#3E4759;--on-secondary-container:#DAE2F9;
+  --tertiary-container:#573E5C;--on-tertiary-container:#FAD8FD;
+  --error:#FFB4AB;--error-container:#93000A;--on-error-container:#FFDAD6;
+  --surface:#111318;--sc-lowest:#0C0E13;--sc-low:#191C20;--sc:#1D2024;--sc-high:#282A2F;--sc-highest:#33353A;
+  --on-surface:#E2E2E9;--on-surface-variant:#C4C6D0;--outline:#8E9099;--outline-variant:#44474E;
+  --inverse-surface:#E2E2E9;--inverse-on-surface:#2E3036;--inverse-primary:#415F91;
+  --screen:var(--surface);--group:var(--sc-high);--scrim:rgba(0,0,0,.5);
+  --shade:#0B0C0E;--shade-card:#202226;
+}
+.m3{font-family:Roboto,"Noto Sans",system-ui,sans-serif;color:var(--on-surface);letter-spacing:.1px}
+.phone{width:412px;height:892px;border-radius:38px;overflow:hidden;position:relative;background:var(--screen);display:flex;flex-direction:column;box-shadow:0 0 0 1px rgba(0,0,0,.18),0 10px 30px rgba(0,0,0,.14);flex:none}
+.phone.tall{height:auto}
+.sb{height:36px;display:flex;align-items:center;justify-content:space-between;padding:6px 26px 0;font-size:14px;font-weight:500;flex:none;color:var(--on-surface)}
+.sb .r{display:flex;gap:5px;align-items:center}
+.navbar{height:26px;flex:none;display:flex;justify-content:center;align-items:center}
+.navbar::after{content:"";width:110px;height:4px;border-radius:2px;background:var(--on-surface);opacity:.45}
+.body{flex:1;position:relative;overflow:hidden;display:flex;flex-direction:column}
+.scroll{flex:1;overflow:hidden;padding:0 16px}
+.tab{height:64px;display:flex;align-items:center;padding:0 4px 0 16px;flex:none}
+.tab .t{font-size:22px;line-height:28px;flex:1}
+.tab.nav{padding-left:4px}
+.tab.nav .t{margin-left:4px}
+.ltab{flex:none;height:152px;display:flex;flex-direction:column;padding:0 4px}
+.ltab .top{height:64px;display:flex;align-items:center}
+.ltab .t{font-size:28px;line-height:36px;margin:auto 0 24px 12px}
+.ltab.nonav .t{margin-left:12px}
+.ib{width:48px;height:48px;display:grid;place-items:center;border-radius:50%;color:var(--on-surface-variant);flex:none}
+.ib.on-surface{color:var(--on-surface)}
+.card{background:var(--group);border-radius:24px;overflow:hidden}
+.gh{font-size:14px;font-weight:500;color:var(--primary);padding:24px 16px 8px;display:flex;align-items:center;justify-content:space-between;line-height:20px}
+.gh.first{padding-top:8px}
+.gh .tb{color:var(--primary);font-size:14px;font-weight:500;padding:6px 12px;margin:-6px -12px -6px 0;border-radius:18px}
+.li{display:flex;align-items:center;gap:16px;min-height:56px;padding:8px 16px}
+.li.two{min-height:72px}
+.li .lead{flex:none;color:var(--on-surface-variant);display:grid;place-items:center}
+.li .txt{flex:1;min-width:0}
+.li .h{font-size:16px;line-height:24px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.li .s{font-size:14px;line-height:20px;color:var(--on-surface-variant);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.li .s.err,.li .h.err{color:var(--error)}
+.li.disabled .txt,.li.disabled .switch{opacity:.38}
+.li .trail{flex:none;display:flex;align-items:center;gap:0;margin-right:-8px}
+.switch{width:52px;height:32px;border-radius:16px;position:relative;flex:none;border:2px solid var(--outline);background:var(--sc-highest)}
+.switch::after{content:"";position:absolute;width:16px;height:16px;border-radius:50%;background:var(--outline);left:6px;top:6px}
+.switch.on{background:var(--primary);border-color:var(--primary)}
+.switch.on::after{width:24px;height:24px;left:22px;top:2px;background:var(--on-primary)}
+.switch.on .chk{position:absolute;left:26px;top:6px;color:var(--on-primary-container);z-index:1}
+.btn{height:40px;border-radius:20px;padding:0 24px;display:inline-flex;align-items:center;justify-content:center;gap:8px;font-size:14px;font-weight:500;letter-spacing:.1px;white-space:nowrap;flex:none}
+.btn.sm{height:36px;padding:0 16px;border-radius:18px}
+.btn.lg{height:48px;border-radius:24px}
+.btn.xl{height:56px;border-radius:28px;font-size:16px}
+.btn.filled{background:var(--primary);color:var(--on-primary)}
+.btn.tonal{background:var(--secondary-container);color:var(--on-secondary-container)}
+.btn.outlined{border:1px solid var(--outline);color:var(--on-surface-variant)}
+.btn.outlined.prim{color:var(--primary)}
+.btn.text{color:var(--primary);padding:0 12px}
+.btn.disabled{background:rgba(127,127,127,.12)!important;color:var(--on-surface)!important;opacity:.38;border-color:transparent}
+.btn.outlined.disabled{background:transparent!important;border:1px solid var(--on-surface)}
+.btn.wide{flex:1 1 0;min-width:0}
+.btn svg{flex:none}
+.hero{background:var(--group);border-radius:28px;padding:24px 20px 20px;display:flex;flex-direction:column;align-items:center;text-align:center}
+.disc{width:72px;height:72px;border-radius:50%;display:grid;place-items:center;position:relative}
+.disc.ok{background:var(--primary-container);color:var(--on-primary-container)}
+.disc.neutral{background:var(--sc-highest);color:var(--on-surface-variant)}
+.disc.paused{background:var(--tertiary-container);color:var(--on-tertiary-container)}
+.disc.err{background:var(--error-container);color:var(--on-error-container)}
+.disc .ring{position:absolute;inset:-4px;border-radius:50%;border:3px solid var(--primary);border-right-color:transparent;border-bottom-color:transparent;transform:rotate(25deg)}
+.hero .ht{font-size:24px;line-height:32px;margin-top:16px}
+.hero .hd{font-size:14px;line-height:20px;color:var(--on-surface-variant);margin-top:4px;max-width:100%;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.hero .hb{display:flex;gap:8px;width:100%;margin-top:20px}
+.banner{background:var(--error-container);color:var(--on-error-container);border-radius:16px;display:flex;align-items:center;gap:12px;padding:4px 4px 4px 16px;min-height:56px;margin-bottom:16px}
+.banner .bt{flex:1;font-size:14px;line-height:20px}
+.banner .btn.text{color:var(--on-error-container)}
+.thumb{width:48px;height:48px;border-radius:12px;overflow:hidden;position:relative;flex:none;background:#888}
+.thumb svg{width:100%;height:100%}
+.thumb .play{position:absolute;left:3px;bottom:3px;width:16px;height:16px;border-radius:50%;background:rgba(0,0,0,.55);color:#fff;display:grid;place-items:center}
+.tile48{width:48px;height:48px;border-radius:12px;background:var(--secondary-container);color:var(--on-secondary-container);display:grid;place-items:center;flex:none}
+.prog{position:relative;width:48px;height:48px;display:grid;place-items:center;color:var(--on-surface-variant)}
+.prog svg.ringp{position:absolute;inset:6px}
+.empty{height:120px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:var(--on-surface-variant);font-size:14px}
+.chk-done{color:var(--primary)}
+.fixed-bottom{padding:12px 16px 12px;flex:none}
+.scrimfull{position:absolute;inset:0;background:var(--scrim)}
+.dialog{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:312px;background:var(--sc-high);border-radius:28px;padding:24px 24px 20px;box-shadow:0 8px 24px rgba(0,0,0,.2)}
+.m3.dark .dialog{background:var(--sc-high)}
+.dialog .dt{font-size:24px;line-height:32px;margin-bottom:16px}
+.dialog .dx{font-size:14px;line-height:20px;color:var(--on-surface-variant)}
+.dialog .da{display:flex;justify-content:flex-end;gap:8px;margin-top:24px}
+.snack{position:absolute;left:16px;right:16px;bottom:16px;background:var(--inverse-surface);color:var(--inverse-on-surface);border-radius:4px;min-height:48px;display:flex;align-items:center;padding:14px 16px;font-size:14px;line-height:20px;box-shadow:0 3px 8px rgba(0,0,0,.25)}
+/* camera */
+.cam{position:absolute;inset:0;background:radial-gradient(120% 80% at 50% 40%,#5b6068 0%,#2d3035 55%,#141518 100%)}
+.cam .monitor{position:absolute;left:40px;right:40px;top:150px;height:380px;border-radius:14px;background:linear-gradient(#cfd3d8,#aeb3ba);box-shadow:0 0 0 10px #1a1c1f,0 20px 60px rgba(0,0,0,.6);transform:perspective(900px) rotateX(6deg) rotateY(-8deg)}
+.cam .monitor .win{position:absolute;left:58px;top:40px;width:220px;height:280px;background:#eff0f1;border-radius:6px;display:grid;place-items:center}
+.cam .monitor .qr{width:150px;height:150px;background:#fff;padding:8px;border-radius:4px}
+.camwrap{position:absolute;inset:0;color:#fff}
+.camwrap .tab{color:#fff;position:relative;z-index:2}
+.camwrap .tab .ib{color:#fff}
+.hole{position:absolute;left:78px;top:188px;width:256px;height:256px;border-radius:24px;box-shadow:0 0 0 2000px rgba(0,0,0,.55);border:2px solid #fff}
+.hole.busy{border:4px solid #AAC7FF}
+.hole .center{position:absolute;inset:0;display:grid;place-items:center}
+.caminstr{position:absolute;left:24px;right:24px;top:468px;text-align:center;font-size:16px;line-height:24px;color:#fff}
+.spinner{border-radius:50%;border:4px solid currentColor;border-right-color:transparent;border-bottom-color:transparent;transform:rotate(30deg)}
+.camblank{position:absolute;inset:0;background:#000;color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px}
+.camblank .msg{font-size:16px;color:#fff}
+.camblank .btn.filled{background:#AAC7FF;color:#0A305F}
+/* status bar icons */
+.sbi{display:inline-block}
+/* notification shade */
+.shade{width:412px;border-radius:28px;background:var(--shade);padding:16px 12px 20px;flex:none;box-shadow:0 0 0 1px rgba(0,0,0,.18),0 10px 30px rgba(0,0,0,.14)}
+.nlabel{font-size:12px;color:var(--on-surface-variant);margin:14px 8px 6px}
+.nlabel:first-child{margin-top:0}
+.ncard{background:var(--shade-card);border-radius:24px;padding:14px 16px 12px;display:flex;gap:12px}
+.nicon{width:32px;height:32px;border-radius:50%;background:#0F6E68;color:#fff;display:grid;place-items:center;flex:none;margin-top:2px}
+.nmain{flex:1;min-width:0}
+.nhead{font-size:12px;color:var(--on-surface-variant);display:flex;gap:6px;align-items:center;line-height:16px}
+.ntitle{font-size:15px;line-height:20px;font-weight:500;margin-top:2px}
+.ntext{font-size:14px;line-height:20px;color:var(--on-surface-variant)}
+.nbar{height:4px;border-radius:2px;background:var(--sc-highest);margin:10px 0 2px;overflow:hidden}
+.nbar>i{display:block;height:100%;background:#0F6E68;border-radius:2px}
+.m3.dark .nbar>i{background:#5FC7BD}
+.nact{display:flex;gap:4px;margin:8px 0 0 -12px}
+.nact span{font-size:14px;font-weight:500;color:#0F6E68;padding:8px 12px;border-radius:16px}
+.m3.dark .nact span{color:#7FD6CC}
+/* QS tiles */
+.qs{width:412px;border-radius:28px;background:var(--shade);padding:16px;display:grid;grid-template-columns:1fr 1fr;gap:10px;flex:none;box-shadow:0 0 0 1px rgba(0,0,0,.18),0 10px 30px rgba(0,0,0,.14)}
+.qt{height:68px;border-radius:22px;display:flex;align-items:center;gap:10px;padding:0 12px;background:var(--sc-highest);color:var(--on-surface)}
+.m3.dark .qt{background:#2A2C31}
+.qt .qi{width:40px;height:40px;border-radius:50%;display:grid;place-items:center;flex:none;background:rgba(127,127,127,.18)}
+.qt .ql{font-size:14px;line-height:18px;font-weight:500;white-space:nowrap}
+.qt .qs2{font-size:12px;line-height:16px;opacity:.75;white-space:nowrap}
+.qt.on{background:var(--primary);color:var(--on-primary)}
+.m3.dark .qt.on{background:var(--primary);color:var(--on-primary)}
+.qt.on .qi{background:rgba(255,255,255,.18)}
+.qt.na{opacity:.45}
+.qcap{grid-column:span 2;font-size:12px;color:var(--on-surface-variant);margin:6px 2px -2px}
+/* share sheet */
+.sheet{position:absolute;left:0;right:0;bottom:0;background:var(--sc-low);border-radius:28px 28px 0 0;padding:10px 0 8px}
+.m3.dark .sheet{background:var(--sc)}
+.handle{width:32px;height:4px;border-radius:2px;background:var(--on-surface-variant);opacity:.4;margin:4px auto 14px}
+.shprev{display:flex;gap:14px;align-items:center;padding:0 24px 16px}
+.dsrow,.approw{display:grid;grid-template-columns:repeat(4,1fr);padding:8px 12px;row-gap:14px}
+.target{display:flex;flex-direction:column;align-items:center;gap:6px;font-size:12px;line-height:16px;text-align:center;color:var(--on-surface)}
+.target .av{width:56px;height:56px;border-radius:50%;display:grid;place-items:center;color:#fff;font-size:20px;font-weight:500;position:relative}
+.target .av.app{border-radius:18px}
+.target .badge{position:absolute;right:-2px;bottom:-2px;width:22px;height:22px;border-radius:50%;border:2px solid var(--sc-low);overflow:hidden}
+.target .lbl{max-width:84px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.shdiv{height:1px;background:var(--outline-variant);margin:8px 24px}
+.toast{display:inline-flex;align-items:center;gap:10px;padding:10px 18px 10px 10px;border-radius:24px;background:var(--sc-highest);color:var(--on-surface);font-size:14px;box-shadow:0 2px 8px rgba(0,0,0,.18)}
+.m3.dark .toast{background:#3A3C41}
+.toast .ti{width:24px;height:24px;border-radius:50%;overflow:hidden}
+
+/* ---------------- Breeze (PC) ---------------- */
+.bz{
+  --win:#EFF0F1;--view:#FFFFFF;--text:#232629;--inactive:#707D8A;--border:#BDC1C5;--accent:#3DAEE9;
+  --title:#DEE0E2;--btn:#FCFCFC;--btn-border:#B4B8BC;--panel:rgba(235,237,239,.97);--menu:#FFFFFF;--hover:rgba(61,174,233,.18);
+  --neg:#DA4453;--pos:#27AE60;--neu:#F67400;--shadow:0 6px 20px rgba(0,0,0,.22);--notif:#FFFFFF;--thumbbg:#E3E5E7;
+  font-family:"Noto Sans",system-ui,sans-serif;font-size:13.3px;color:var(--text)
+}
+.bz.dark{
+  --win:#202326;--view:#141618;--text:#FCFCFC;--inactive:#A1A9B1;--border:#3F4549;--accent:#3DAEE9;
+  --title:#2A2E32;--btn:#292C30;--btn-border:#4E555B;--panel:rgba(32,35,38,.97);--menu:#1E2124;--hover:rgba(61,174,233,.25);
+  --shadow:0 6px 20px rgba(0,0,0,.5);--notif:#25282B;--thumbbg:#16181A;
+}
+.desk{border-radius:12px;padding:18px;width:620px;flex:none;position:relative;overflow:hidden}
+.desk.light{background:linear-gradient(135deg,#9fb6d6,#c8d5e6 55%,#b8c7d9)}
+.desk.dark{background:linear-gradient(135deg,#1c2a3c,#2b3a50 55%,#16202c)}
+.panelbar{height:44px;border-radius:10px;background:var(--panel);display:flex;align-items:center;justify-content:flex-end;gap:2px;padding:0 10px;color:var(--text);box-shadow:0 1px 4px rgba(0,0,0,.2)}
+.trayi{width:30px;height:30px;display:grid;place-items:center;border-radius:5px;color:var(--text)}
+.trayi.sel{background:var(--hover);box-shadow:inset 0 0 0 1px rgba(61,174,233,.6)}
+.clock{display:flex;flex-direction:column;align-items:center;font-size:12px;line-height:14px;margin-left:8px;padding:0 4px}
+.menu{background:var(--menu);border:1px solid var(--border);border-radius:6px;box-shadow:var(--shadow);padding:4px 0;width:270px;color:var(--text)}
+.mi{height:28px;display:flex;align-items:center;gap:8px;padding:0 12px 0 8px;margin:0 4px;border-radius:4px;white-space:nowrap}
+.mi .mk{width:16px;height:16px;flex:none;display:grid;place-items:center}
+.mi.dis{color:var(--inactive)}
+.mi.hov{background:var(--hover);box-shadow:inset 0 0 0 1px rgba(61,174,233,.55)}
+.mi .cb{width:16px;height:16px;border-radius:3px;border:1px solid var(--inactive);display:grid;place-items:center}
+.mi .cb.on{border-color:var(--accent);background:rgba(61,174,233,.18);color:var(--text)}
+.mi.dis .cb{opacity:.5}
+.msep{height:1px;background:var(--border);margin:4px 8px;opacity:.8}
+.tooltip{background:var(--menu);border:1px solid var(--border);border-radius:6px;box-shadow:var(--shadow);padding:10px 12px;display:flex;gap:10px;align-items:center;width:max-content;max-width:300px}
+.tooltip b{display:block;font-weight:600}
+.tooltip span{color:var(--inactive)}
+.kwin{width:400px;background:var(--win);border-radius:8px;overflow:hidden;box-shadow:var(--shadow),0 0 0 1px rgba(0,0,0,.25);flex:none;color:var(--text)}
+.kwin .tb{height:32px;background:var(--title);display:flex;align-items:center;padding:0 6px 0 8px;gap:8px}
+.kwin .tb .tt{flex:1;text-align:center;font-weight:400}
+.kwin .tb .wb{width:22px;height:22px;display:grid;place-items:center;border-radius:50%;color:var(--text)}
+.kwin .ct{padding:18px}
+.bbtn{height:30px;padding:0 14px;border-radius:4px;background:var(--btn);border:1px solid var(--btn-border);display:inline-flex;align-items:center;gap:6px;color:var(--text);white-space:nowrap}
+.bbtn.def{border-color:var(--accent)}
+.hsep{height:1px;background:var(--border);margin:14px 0;opacity:.9}
+.qrcard{width:232px;height:232px;background:#fff;border-radius:6px;margin:6px auto 0}
+.center{text-align:center}
+.frow{display:flex;align-items:center;gap:6px}
+.frow .lab{color:var(--text);margin-right:6px}
+.frow .path{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:none}
+.kmsg{border-radius:4px;background:color-mix(in srgb,var(--neg) 15%,var(--win));border:1px solid color-mix(in srgb,var(--neg) 50%,transparent);display:flex;align-items:center;gap:8px;padding:6px 8px 6px 10px;margin-bottom:14px}
+.kmsg .kt{flex:1}
+.dlg{position:absolute;left:50%;top:56%;transform:translate(-50%,-50%);width:300px;background:var(--win);border-radius:8px;box-shadow:var(--shadow),0 0 0 1px rgba(0,0,0,.3);overflow:hidden}
+.dim{position:absolute;inset:32px 0 0 0;background:rgba(0,0,0,.25)}
+.notif{width:370px;background:var(--notif);border-radius:10px;box-shadow:var(--shadow),0 0 0 1px rgba(0,0,0,.12);padding:10px 12px 12px;flex:none;color:var(--text)}
+.notif .nh{display:flex;align-items:center;gap:6px;color:var(--inactive);font-size:12px;height:22px}
+.notif .nh .sp{flex:1}
+.notif .ns{font-weight:600;margin-top:6px}
+.notif .nb{margin-top:2px;line-height:1.4}
+.notif .nthumb{margin-top:10px;height:150px;border-radius:5px;background:var(--thumbbg);display:flex;justify-content:center;align-items:center;gap:8px;position:relative;overflow:hidden}
+.notif .nthumb .more{position:absolute;right:6px;top:6px;width:24px;height:24px;border-radius:4px;background:var(--btn);border:1px solid var(--btn-border);display:grid;place-items:center}
+.notif .nacts{display:flex;gap:6px;margin-top:10px;justify-content:flex-end}
+.notif .nacts .bbtn{flex:1;justify-content:center}
+.ncol{display:flex;flex-direction:column;gap:14px}
+.iconsheet{display:flex;gap:28px;flex-wrap:wrap;align-items:flex-end}
+.iconsheet .it{display:flex;flex-direction:column;align-items:center;gap:8px;font-size:12px;color:var(--page-sub)}
+.traygrid{display:grid;grid-template-columns:auto repeat(3,auto);gap:10px 18px;align-items:center;padding:14px 18px;border-radius:10px}
+.traygrid .h{font-size:12px;opacity:.7}
+@media (max-width:700px){ .desk{zoom:.5} .pcwide{zoom:.8} }
+@media (max-width:460px){ .m3,.kwin,.notif{zoom:.8} .iconsheet{gap:16px} }
+</style>
+</head>
+<body>
+<div class="page" id="app"></div>
+<script>
+const ASSETS = {"ic_launcher_background.svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 108 108\" width=\"108\" height=\"108\">\n  <path fill=\"#0F6E68\" d=\"M0 0L108 0L108 108L0 108Z\"/>\n  <path fill=\"#FFFFFF\" fill-opacity=\"0.12\" d=\"M-23.07 109.86L109.86 -23.07L131.07 -1.86L-1.86 131.07Z\"/>\n</svg>\n", "ic_launcher_foreground.svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 108 108\" width=\"108\" height=\"108\">\n  <path fill=\"#F4B13E\" fill-opacity=\"0.85\" d=\"M24.3 81.44L36.18 69.56A1.6 1.6 0 0 1 38.44 69.56L38.44 69.56A1.6 1.6 0 0 1 38.44 71.82L26.56 83.7A1.6 1.6 0 0 1 24.3 83.7L24.3 83.7A1.6 1.6 0 0 1 24.3 81.44ZM23.74 72.38L31.37 64.75A1.6 1.6 0 0 1 33.64 64.75L33.64 64.75A1.6 1.6 0 0 1 33.64 67.01L26 74.65A1.6 1.6 0 0 1 23.74 74.65L23.74 74.65A1.6 1.6 0 0 1 23.74 72.38ZM33.35 82L40.99 74.36A1.6 1.6 0 0 1 43.25 74.36L43.25 74.36A1.6 1.6 0 0 1 43.25 76.63L35.62 84.26A1.6 1.6 0 0 1 33.35 84.26L33.35 84.26A1.6 1.6 0 0 1 33.35 82Z\"/>\n  <path fill=\"#EAF6F3\" d=\"M41.27 52.59L59.66 34.2L73.8 48.34L55.41 66.73Z\"/>\n  <path fill=\"#FFFFFF\" d=\"M47.99 50.54L57.61 40.92A1.2 1.2 0 0 1 59.3 40.92L59.3 40.92A1.2 1.2 0 0 1 59.3 42.62L49.69 52.23A1.2 1.2 0 0 1 47.99 52.23L47.99 52.23A1.2 1.2 0 0 1 47.99 50.54Z\"/>\n  <path fill=\"#F4B13E\" d=\"M41.27 52.59L55.41 66.73A10 10 0 0 1 41.27 52.59ZM59.66 34.2A10 10 0 0 1 73.8 48.34Z\"/>\n  <path fill=\"#083F3B\" d=\"M39.65 51.38L40.78 50.25A1.2 1.2 0 0 1 42.47 50.25L57.75 65.53A1.2 1.2 0 0 1 57.75 67.22L56.62 68.35A1.2 1.2 0 0 1 54.92 68.35L39.65 53.08A1.2 1.2 0 0 1 39.65 51.38ZM57.32 33.71L58.45 32.57A1.2 1.2 0 0 1 60.15 32.57L75.43 47.85A1.2 1.2 0 0 1 75.43 49.55L74.29 50.68A1.2 1.2 0 0 1 72.6 50.68L57.32 35.4A1.2 1.2 0 0 1 57.32 33.71Z\"/>\n</svg>\n", "ic_launcher_monochrome.svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 108 108\" width=\"108\" height=\"108\">\n  <path fill=\"#000000\" d=\"M41.27 52.59L55.41 66.73A10 10 0 0 1 41.27 52.59ZM43.04 50.82L57.89 35.97L72.03 50.11L57.18 64.96ZM59.66 34.2A10 10 0 0 1 73.8 48.34ZM24.3 81.44L36.18 69.56A1.6 1.6 0 0 1 38.44 69.56L38.44 69.56A1.6 1.6 0 0 1 38.44 71.82L26.56 83.7A1.6 1.6 0 0 1 24.3 83.7L24.3 83.7A1.6 1.6 0 0 1 24.3 81.44ZM23.74 72.38L31.37 64.75A1.6 1.6 0 0 1 33.64 64.75L33.64 64.75A1.6 1.6 0 0 1 33.64 67.01L26 74.65A1.6 1.6 0 0 1 23.74 74.65L23.74 74.65A1.6 1.6 0 0 1 23.74 72.38ZM33.35 82L40.99 74.36A1.6 1.6 0 0 1 43.25 74.36L43.25 74.36A1.6 1.6 0 0 1 43.25 76.63L35.62 84.26A1.6 1.6 0 0 1 33.35 84.26L33.35 84.26A1.6 1.6 0 0 1 33.35 82Z\"/>\n</svg>\n", "ic_launcher_preview.svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"18 18 72 72\" width=\"192\" height=\"192\">\n  <path fill=\"#0F6E68\" d=\"M0 0L108 0L108 108L0 108Z\"/>\n  <path fill=\"#FFFFFF\" fill-opacity=\"0.12\" d=\"M-23.07 109.86L109.86 -23.07L131.07 -1.86L-1.86 131.07Z\"/>\n  <path fill=\"#F4B13E\" fill-opacity=\"0.85\" d=\"M24.3 81.44L36.18 69.56A1.6 1.6 0 0 1 38.44 69.56L38.44 69.56A1.6 1.6 0 0 1 38.44 71.82L26.56 83.7A1.6 1.6 0 0 1 24.3 83.7L24.3 83.7A1.6 1.6 0 0 1 24.3 81.44ZM23.74 72.38L31.37 64.75A1.6 1.6 0 0 1 33.64 64.75L33.64 64.75A1.6 1.6 0 0 1 33.64 67.01L26 74.65A1.6 1.6 0 0 1 23.74 74.65L23.74 74.65A1.6 1.6 0 0 1 23.74 72.38ZM33.35 82L40.99 74.36A1.6 1.6 0 0 1 43.25 74.36L43.25 74.36A1.6 1.6 0 0 1 43.25 76.63L35.62 84.26A1.6 1.6 0 0 1 33.35 84.26L33.35 84.26A1.6 1.6 0 0 1 33.35 82Z\"/>\n  <path fill=\"#EAF6F3\" d=\"M41.27 52.59L59.66 34.2L73.8 48.34L55.41 66.73Z\"/>\n  <path fill=\"#FFFFFF\" d=\"M47.99 50.54L57.61 40.92A1.2 1.2 0 0 1 59.3 40.92L59.3 40.92A1.2 1.2 0 0 1 59.3 42.62L49.69 52.23A1.2 1.2 0 0 1 47.99 52.23L47.99 52.23A1.2 1.2 0 0 1 47.99 50.54Z\"/>\n  <path fill=\"#F4B13E\" d=\"M41.27 52.59L55.41 66.73A10 10 0 0 1 41.27 52.59ZM59.66 34.2A10 10 0 0 1 73.8 48.34Z\"/>\n  <path fill=\"#083F3B\" d=\"M39.65 51.38L40.78 50.25A1.2 1.2 0 0 1 42.47 50.25L57.75 65.53A1.2 1.2 0 0 1 57.75 67.22L56.62 68.35A1.2 1.2 0 0 1 54.92 68.35L39.65 53.08A1.2 1.2 0 0 1 39.65 51.38ZM57.32 33.71L58.45 32.57A1.2 1.2 0 0 1 60.15 32.57L75.43 47.85A1.2 1.2 0 0 1 75.43 49.55L74.29 50.68A1.2 1.2 0 0 1 72.6 50.68L57.32 35.4A1.2 1.2 0 0 1 57.32 33.71Z\"/>\n</svg>\n", "ic_stat_pneu.svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" width=\"24\" height=\"24\">\n  <path fill=\"#FFFFFF\" d=\"M5.28 13.06L10.94 18.72L10.59 19.07A4 4 0 0 1 4.93 13.41ZM6.2 12.14L12.14 6.2L17.8 11.86L11.86 17.8ZM13.06 5.28L13.41 4.93A4 4 0 0 1 19.07 10.59L18.72 10.94Z\"/>\n</svg>\n", "pneu-tray-connected.svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 22 22\" width=\"22\" height=\"22\">\n  <style type=\"text/css\" id=\"current-color-scheme\">.ColorScheme-Text{color:#232629;}.ColorScheme-NegativeText{color:#da4453;}</style>\n  <path class=\"ColorScheme-Text\" style=\"fill:currentColor;\" d=\"M4.28 12.06L9.94 17.72L9.59 18.07A4 4 0 0 1 3.93 12.41ZM5.2 11.14L11.14 5.2L16.8 10.86L10.86 16.8ZM12.06 4.28L12.41 3.93A4 4 0 0 1 18.07 9.59L17.72 9.94Z\"/>\n</svg>\n", "pneu-tray-disconnected.svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 22 22\" width=\"22\" height=\"22\">\n  <style type=\"text/css\" id=\"current-color-scheme\">.ColorScheme-Text{color:#232629;}.ColorScheme-NegativeText{color:#da4453;}</style>\n  <path class=\"ColorScheme-Text\" style=\"fill:currentColor;fill-rule:evenodd;\" d=\"M4.28 12.06L9.94 17.72L9.59 18.07A4 4 0 0 1 3.93 12.41ZM5.2 11.14L11.14 5.2L16.8 10.86L10.86 16.8ZM7.32 11.14L11.14 7.32L14.68 10.86L10.86 14.68ZM12.06 4.28L12.41 3.93A4 4 0 0 1 18.07 9.59L17.72 9.94Z\"/>\n</svg>\n", "pneu-tray-error.svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 22 22\" width=\"22\" height=\"22\">\n  <style type=\"text/css\" id=\"current-color-scheme\">.ColorScheme-Text{color:#232629;}.ColorScheme-NegativeText{color:#da4453;}</style>\n  <path class=\"ColorScheme-Text\" style=\"fill:currentColor;fill-rule:evenodd;\" d=\"M4.28 12.06L9.94 17.72L9.59 18.07A4 4 0 0 1 3.93 12.41ZM5.2 11.14L11.14 5.2L16.8 10.86L10.86 16.8ZM7.32 11.14L11.14 7.32L14.68 10.86L10.86 14.68ZM12.06 4.28L12.41 3.93A4 4 0 0 1 18.07 9.59L17.72 9.94Z\"/>\n  <path class=\"ColorScheme-NegativeText\" style=\"fill:currentColor;fill-rule:evenodd;\" d=\"M14 18A4 4 0 0 1 22 18A4 4 0 0 1 14 18ZM17.85 15.3L18.15 15.3A0.6 0.6 0 0 1 18.75 15.9L18.75 18.2A0.6 0.6 0 0 1 18.15 18.8L17.85 18.8A0.6 0.6 0 0 1 17.25 18.2L17.25 15.9A0.6 0.6 0 0 1 17.85 15.3ZM17.15 20.35A0.85 0.85 0 0 1 18.85 20.35A0.85 0.85 0 0 1 17.15 20.35Z\"/>\n</svg>\n", "pneu-tray-paused.svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 22 22\" width=\"22\" height=\"22\">\n  <style type=\"text/css\" id=\"current-color-scheme\">.ColorScheme-Text{color:#232629;}.ColorScheme-NegativeText{color:#da4453;}</style>\n  <path class=\"ColorScheme-Text\" style=\"fill:currentColor;\" d=\"M4.28 12.06L9.94 17.72L9.59 18.07A4 4 0 0 1 3.93 12.41ZM5.2 11.14L11.14 5.2L16.8 10.86L10.86 16.8ZM12.06 4.28L12.41 3.93A4 4 0 0 1 18.07 9.59L17.72 9.94Z\"/>\n  <path class=\"ColorScheme-Text\" style=\"fill:currentColor;\" d=\"M15.5 14.5L16.5 14.5A0.5 0.5 0 0 1 17 15L17 21A0.5 0.5 0 0 1 16.5 21.5L15.5 21.5A0.5 0.5 0 0 1 15 21L15 15A0.5 0.5 0 0 1 15.5 14.5ZM19.5 14.5L20.5 14.5A0.5 0.5 0 0 1 21 15L21 21A0.5 0.5 0 0 1 20.5 21.5L19.5 21.5A0.5 0.5 0 0 1 19 21L19 15A0.5 0.5 0 0 1 19.5 14.5Z\"/>\n</svg>\n", "pneu-tray-receiving.svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 22 22\" width=\"22\" height=\"22\">\n  <style type=\"text/css\" id=\"current-color-scheme\">.ColorScheme-Text{color:#232629;}.ColorScheme-NegativeText{color:#da4453;}</style>\n  <path class=\"ColorScheme-Text\" style=\"fill:currentColor;\" d=\"M6.05 10.29L11.71 15.95L11.35 16.3A4 4 0 0 1 5.7 10.65ZM6.97 9.37L12.91 3.43L18.57 9.09L12.63 15.03ZM13.83 2.51L14.18 2.16A4 4 0 0 1 19.84 7.82L19.49 8.17ZM1.03 17.58L3.43 15.17A0.8 0.8 0 0 1 4.57 15.17L4.57 15.17A0.8 0.8 0 0 1 4.57 16.3L2.16 18.71A0.8 0.8 0 0 1 1.03 18.71L1.03 18.71A0.8 0.8 0 0 1 1.03 17.58ZM4.35 18.78L5.7 17.43A0.8 0.8 0 0 1 6.83 17.43L6.83 17.43A0.8 0.8 0 0 1 6.83 18.57L5.48 19.91A0.8 0.8 0 0 1 4.35 19.91L4.35 19.91A0.8 0.8 0 0 1 4.35 18.78Z\"/>\n</svg>\n", "pneu.svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"18 18 72 72\" width=\"128\" height=\"128\">\n  <path fill=\"#0F6E68\" d=\"M18 54A36 36 0 0 1 90 54A36 36 0 0 1 18 54Z\"/>\n  <path fill=\"#FFFFFF\" fill-opacity=\"0.12\" d=\"M20.25 66.53L66.53 20.25A36 36 0 0 1 87.75 41.47L41.47 87.75A36 36 0 0 1 20.25 66.53Z\"/>\n  <path fill=\"#F4B13E\" fill-opacity=\"0.85\" d=\"M24.3 81.44L36.18 69.56A1.6 1.6 0 0 1 38.44 69.56L38.44 69.56A1.6 1.6 0 0 1 38.44 71.82L26.56 83.7A1.6 1.6 0 0 1 24.3 83.7L24.3 83.7A1.6 1.6 0 0 1 24.3 81.44ZM23.74 72.38L31.37 64.75A1.6 1.6 0 0 1 33.64 64.75L33.64 64.75A1.6 1.6 0 0 1 33.64 67.01L26 74.65A1.6 1.6 0 0 1 23.74 74.65L23.74 74.65A1.6 1.6 0 0 1 23.74 72.38ZM33.35 82L40.99 74.36A1.6 1.6 0 0 1 43.25 74.36L43.25 74.36A1.6 1.6 0 0 1 43.25 76.63L35.62 84.26A1.6 1.6 0 0 1 33.35 84.26L33.35 84.26A1.6 1.6 0 0 1 33.35 82Z\"/>\n  <path fill=\"#EAF6F3\" d=\"M41.27 52.59L59.66 34.2L73.8 48.34L55.41 66.73Z\"/>\n  <path fill=\"#FFFFFF\" d=\"M47.99 50.54L57.61 40.92A1.2 1.2 0 0 1 59.3 40.92L59.3 40.92A1.2 1.2 0 0 1 59.3 42.62L49.69 52.23A1.2 1.2 0 0 1 47.99 52.23L47.99 52.23A1.2 1.2 0 0 1 47.99 50.54Z\"/>\n  <path fill=\"#F4B13E\" d=\"M41.27 52.59L55.41 66.73A10 10 0 0 1 41.27 52.59ZM59.66 34.2A10 10 0 0 1 73.8 48.34Z\"/>\n  <path fill=\"#083F3B\" d=\"M39.65 51.38L40.78 50.25A1.2 1.2 0 0 1 42.47 50.25L57.75 65.53A1.2 1.2 0 0 1 57.75 67.22L56.62 68.35A1.2 1.2 0 0 1 54.92 68.35L39.65 53.08A1.2 1.2 0 0 1 39.65 51.38ZM57.32 33.71L58.45 32.57A1.2 1.2 0 0 1 60.15 32.57L75.43 47.85A1.2 1.2 0 0 1 75.43 49.55L74.29 50.68A1.2 1.2 0 0 1 72.6 50.68L57.32 35.4A1.2 1.2 0 0 1 57.32 33.71Z\"/>\n</svg>\n"};
+
+/* ---------- icons (24 grid, Material Symbols Rounded stand-ins) ---------- */
+function gearPath(){
+  const cx=12,cy=12,ro=9.6,ri=7.3,n=8; let d='';
+  for(let i=0;i<n;i++){
+    const b=i*360/n, pts=[[b-14,ri],[b-8.5,ro],[b+8.5,ro],[b+14,ri]];
+    pts.forEach(([a,r],k)=>{const t=a*Math.PI/180;d+=(i==0&&k==0?'M':'L')+(cx+r*Math.cos(t)).toFixed(2)+' '+(cy+r*Math.sin(t)).toFixed(2)});
+  }
+  return d+'Z';
+}
+const I = {
+  settings:`<path d="${gearPath()}"/><circle cx="12" cy="12" r="3"/>`,
+  back:`<path d="M19 12H5M11 6l-6 6 6 6"/>`,
+  paste_go:`<path d="M9 4H7a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h4"/><path d="M15 4h2a2 2 0 0 1 2 2v4"/><rect x="9" y="2.5" width="6" height="3.5" rx="1"/><path d="M14 17h7M18 14l3 3-3 3"/>`,
+  paste:`<path d="M9 4H7a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2h-2"/><rect x="9" y="2.5" width="6" height="3.5" rx="1"/>`,
+  pause:`<rect x="6.5" y="5" width="3.5" height="14" rx="1" fill="currentColor" stroke="none"/><rect x="14" y="5" width="3.5" height="14" rx="1" fill="currentColor" stroke="none"/>`,
+  play:`<path d="M8 5.8v12.4a1 1 0 0 0 1.5.86l10-6.2a1 1 0 0 0 0-1.72l-10-6.2A1 1 0 0 0 8 5.8z" fill="currentColor" stroke="none"/>`,
+  wifi:`<path d="M2.5 9a14 14 0 0 1 19 0M5.5 12.3a9.5 9.5 0 0 1 13 0M8.6 15.6a5 5 0 0 1 6.8 0"/><circle cx="12" cy="19" r="1.3" fill="currentColor" stroke="none"/>`,
+  wifi_off:`<path d="M2.5 9a14 14 0 0 1 5-3M11 4.6A14 14 0 0 1 21.5 9M5.5 12.3a9.5 9.5 0 0 1 3.4-2.1M14.8 10.6a9.5 9.5 0 0 1 3.7 1.7M8.6 15.6a5 5 0 0 1 6.8 0"/><circle cx="12" cy="19" r="1.3" fill="currentColor" stroke="none"/><path d="M3 3l18 18"/>`,
+  globe:`<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.6 2.5 3.8 5.5 3.8 9s-1.2 6.5-3.8 9c-2.6-2.5-3.8-5.5-3.8-9S9.4 5.5 12 3z"/>`,
+  cloud_off:`<path d="M7.5 18.5h9.8M19.9 16.6A3.8 3.8 0 0 0 17.5 10.6 6 6 0 0 0 9.8 6.3M6.6 8.4A4.6 4.6 0 0 0 7.5 18.5"/><path d="M3 3l18 18"/>`,
+  warning:`<path d="M10.3 4.2 2.6 17.6A2 2 0 0 0 4.3 20.6h15.4a2 2 0 0 0 1.7-3L13.7 4.2a2 2 0 0 0-3.4 0z"/><path d="M12 9.5v4.5"/><circle cx="12" cy="17.2" r="1.1" fill="currentColor" stroke="none"/>`,
+  error:`<circle cx="12" cy="12" r="9"/><path d="M12 7.5v5.5"/><circle cx="12" cy="16.4" r="1.1" fill="currentColor" stroke="none"/>`,
+  check:`<path d="M5 12.5l4.5 4.5L19 7.5"/>`,
+  check_circle:`<circle cx="12" cy="12" r="10" fill="currentColor" stroke="none"/><path d="M7.5 12.3l3 3 6-6" style="stroke:var(--on-primary,#fff)"/>`,
+  close:`<path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/>`,
+  refresh:`<path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3"/><path d="M19.5 4.5v4h-4"/>`,
+  bell:`<path d="M6 17V11a6 6 0 0 1 12 0v6l1.5 1.5h-15z"/><path d="M10 21h4"/>`,
+  photo_library:`<rect x="7" y="3" width="14" height="14" rx="2.5"/><path d="M3 7v11.5A2.5 2.5 0 0 0 5.5 21H17"/><path d="M7 14l3.5-3.5 3 3 2-2L21 16"/>`,
+  image:`<rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="8.5" cy="9.5" r="1.6"/><path d="M3.5 17.5l5-5 4 4 3-3 5 5"/>`,
+  battery:`<rect x="7" y="4" width="10" height="17.5" rx="2"/><path d="M10 2.5h4"/><rect x="9.3" y="6.5" width="5.4" height="12.6" rx=".8" fill="currentColor" stroke="none"/>`,
+  bedtime_off:`<path d="M19.5 15.2A8 8 0 0 1 8.8 4.5M6.2 6.3a8 8 0 0 0 11.5 11.4"/><path d="M3 3l18 18"/>`,
+  camera:`<path d="M4 8.5A1.5 1.5 0 0 1 5.5 7h2.3l1.7-2.3h5l1.7 2.3h2.3A1.5 1.5 0 0 1 20 8.5v9A1.5 1.5 0 0 1 18.5 19h-13A1.5 1.5 0 0 1 4 17.5z"/><circle cx="12" cy="13" r="3.4"/>`,
+  qr:`<rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><path d="M14 14h2v2M20 14v.01M18 18h2v2M14 20h.01M17 20.01"/>`,
+  computer:`<rect x="3" y="4" width="18" height="12.5" rx="2"/><path d="M8.5 20.5h7M12 16.5v4"/>`,
+  link_off:`<path d="M9 14.5a3.5 3.5 0 0 1 0-5l1.8-1.8M14.6 7.4a3.5 3.5 0 0 1 4.6 5.2l-1.6 1.6M15 9.5a3.5 3.5 0 0 1 0 5l-2 2a3.5 3.5 0 0 1-5-5l1.3-1.3"/><path d="M3.5 3.5l17 17"/>`,
+  file:`<path d="M6.5 3h7.5l4.5 4.5V19a2 2 0 0 1-2 2h-10a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M13.5 3v5h5M8.5 13h7M8.5 16.5h7"/>`,
+  link:`<path d="M10.5 13.5a3.5 3.5 0 0 0 5 0l3-3a3.5 3.5 0 0 0-5-5l-1 1"/><path d="M13.5 10.5a3.5 3.5 0 0 0-5 0l-3 3a3.5 3.5 0 0 0 5 5l1-1"/>`,
+  open_new:`<path d="M14 4h6v6M20 4l-8.5 8.5"/><path d="M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4"/>`,
+  folder:`<path d="M3.5 7.5A2 2 0 0 1 5.5 5.5h4l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/>`,
+  phone:`<rect x="6.5" y="2.5" width="11" height="19" rx="2.5"/><path d="M10.5 18.5h3"/>`,
+  more:`<circle cx="12" cy="5.5" r="1.5" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none"/><circle cx="12" cy="18.5" r="1.5" fill="currentColor" stroke="none"/>`,
+  exit:`<path d="M10 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h4M15 8l4 4-4 4M19 12H9"/>`,
+  min:`<path d="M7 10l5 5 5-5"/>`,
+  volume:`<path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/>`,
+  net:`<path d="M2.5 9a14 14 0 0 1 19 0M5.5 12.3a9.5 9.5 0 0 1 13 0M8.6 15.6a5 5 0 0 1 6.8 0"/><circle cx="12" cy="19" r="1.3" fill="currentColor" stroke="none"/>`,
+  clipb:`<path d="M9 4H7a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2h-2"/><rect x="9" y="2.5" width="6" height="3.5" rx="1"/><path d="M9 12h6M9 16h4"/>`,
+  up:`<path d="M7 14l5-5 5 5"/>`,
+  drop:`<path d="M7 10l5 5 5-5z" fill="currentColor" stroke="none"/>`,
+  bt:`<path d="M7 7l10 10-5 4V3l5 4L7 17"/>`,
+  configure:`<path d="${gearPath()}"/><circle cx="12" cy="12" r="3"/>`,
+  sig:`<path d="M4 20h2v-3H4zM9 20h2v-6H9zM14 20h2v-9h-2zM19 20h2V5h-2z" fill="currentColor" stroke="none"/>`,
+  bat:`<rect x="3" y="7.5" width="16" height="9" rx="2"/><path d="M21 10.5v3"/><rect x="5" y="9.5" width="10" height="5" rx=".8" fill="currentColor" stroke="none"/>`,
+  netdis:`<path d="M2.5 9a14 14 0 0 1 19 0M5.5 12.3a9.5 9.5 0 0 1 13 0M8.6 15.6a5 5 0 0 1 6.8 0"/><path d="M3 3l18 18"/>`,
+  dlgerr:`<circle cx="12" cy="12" r="10" fill="#DA4453" stroke="none"/><path d="M12 7v6" stroke="#fff"/><circle cx="12" cy="16.6" r="1.2" fill="#fff" stroke="none"/>`,
+};
+function ic(n,s=24,sw=2,extra=''){return `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" ${extra}>${I[n]}</svg>`}
+function asset(name,size){ // inline SVG asset, resized
+  let s=ASSETS[name]; if(!s) return '';
+  s=s.replace(/<style[\s\S]*?<\/style>/,'');
+  s=s.replace(/ width="[\d.]+" height="[\d.]+"/,` width="${size}" height="${size}"`);
+  return s;
+}
+function glyph(size){return asset('ic_stat_pneu.svg',size).replace(/fill="#FFFFFF"/g,'fill="currentColor"')}
+function appIcon(size,shape='circle'){
+  const r= shape=='circle'?'50%':(shape=='squircle'?'30%':'0');
+  return `<div style="width:${size}px;height:${size}px;border-radius:${r};overflow:hidden;flex:none">${asset('ic_launcher_preview.svg',size)}</div>`;
+}
+
+/* ---------- fake content ---------- */
+function shotChat(dark){
+  const bg=dark?'#121212':'#ffffff', bar=dark?'#1f2a2e':'#e8f0ee', b1=dark?'#2b2f33':'#eceff1', b2='#2f7d6d';
+  return `<svg viewBox="0 0 90 190" preserveAspectRatio="xMidYMid slice"><rect width="90" height="190" fill="${bg}"/><rect width="90" height="26" fill="${bar}"/><circle cx="12" cy="15" r="6" fill="#9cc7bd"/><rect x="22" y="11" width="34" height="5" rx="2.5" fill="${dark?'#556':'#9aa'}"/>
+  <rect x="8" y="36" width="52" height="16" rx="7" fill="${b1}"/><rect x="30" y="58" width="52" height="22" rx="7" fill="${b2}"/><rect x="8" y="86" width="40" height="14" rx="7" fill="${b1}"/><rect x="8" y="106" width="60" height="26" rx="7" fill="${b1}"/><rect x="38" y="138" width="44" height="14" rx="7" fill="${b2}"/><rect x="6" y="170" width="78" height="14" rx="7" fill="${dark?'#2b2f33':'#eceff1'}"/></svg>`;
+}
+function shotMap(){
+  return `<svg viewBox="0 0 90 190" preserveAspectRatio="xMidYMid slice"><rect width="90" height="190" fill="#e9e4d8"/><path d="M0 60 L90 40 M20 0 L40 190 M0 140 L90 120 M70 0 L60 190" stroke="#fff" stroke-width="7"/><path d="M0 100 Q45 80 90 110" stroke="#f7d27a" stroke-width="6" fill="none"/><rect x="50" y="130" width="30" height="40" fill="#cfe5c4"/><circle cx="46" cy="92" r="7" fill="#d9534f"/><circle cx="46" cy="92" r="2.5" fill="#fff"/></svg>`;
+}
+function photo(){
+  return `<svg viewBox="0 0 120 90" preserveAspectRatio="xMidYMid slice"><defs><linearGradient id="sk" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f6b26b"/><stop offset="1" stop-color="#f3d9a4"/></linearGradient></defs><rect width="120" height="90" fill="url(#sk)"/><circle cx="84" cy="34" r="10" fill="#fff4d6"/><path d="M0 70 L30 38 L52 60 L74 30 L120 72 L120 90 L0 90Z" fill="#5d6f86"/><path d="M0 80 L40 58 L70 76 L100 62 L120 74 L120 90 L0 90Z" fill="#33465c"/></svg>`;
+}
+function videoThumb(){
+  return `<svg viewBox="0 0 90 190" preserveAspectRatio="xMidYMid slice"><rect width="90" height="190" fill="#1d2b3a"/><rect x="8" y="20" width="74" height="40" rx="6" fill="#2f4a66"/><rect x="8" y="70" width="74" height="10" rx="5" fill="#3d5878"/><rect x="8" y="88" width="50" height="10" rx="5" fill="#3d5878"/><rect x="8" y="110" width="74" height="60" rx="6" fill="#26405a"/></svg>`;
+}
+let seed=7; function rnd(){seed=(seed*16807)%2147483647;return seed/2147483647}
+function fakeQR(){
+  seed=11; const n=29; let r='';
+  const finder=(x,y)=>`<rect x="${x}" y="${y}" width="7" height="7" fill="#000"/><rect x="${x+1}" y="${y+1}" width="5" height="5" fill="#fff"/><rect x="${x+2}" y="${y+2}" width="3" height="3" fill="#000"/>`;
+  for(let y=0;y<n;y++)for(let x=0;x<n;x++){
+    const inF=(x<8&&y<8)||(x>n-9&&y<8)||(x<8&&y>n-9);
+    if(inF) continue;
+    let on = (y==6&&x%2==0)||(x==6&&y%2==0) ? true : rnd()>.52;
+    if(x>=20&&x<=24&&y>=20&&y<=24){on=(x==20||x==24||y==20||y==24||(x==22&&y==22));}
+    if(on) r+=`<rect x="${x}" y="${y}" width="1.02" height="1.02" fill="#000"/>`;
+  }
+  return `<svg viewBox="-4 -4 37 37" width="100%" height="100%" shape-rendering="crispEdges"><rect x="-4" y="-4" width="37" height="37" fill="#fff"/>${finder(0,0)}${finder(n-7,0)}${finder(0,n-7)}${r}</svg>`;
+}
+const QR = fakeQR();
+const PC='MJStanton-Desktop', PH='Galaxy S25+';
+
+/* ---------- phone chrome ---------- */
+function phone(theme,inner,{tall=false,dark=false,sbLight=false}={}){
+  const col = sbLight?'style="color:#fff"':'';
+  return `<div class="m3 ${theme}"><div class="phone ${tall?'tall':''}" ${sbLight?'style="background:#000"':''}>
+  <div class="sb" ${col}><span>14:03</span><span class="r">${ic('wifi',16,2.2)}${ic('sig',16)}${ic('bat',18,1.6)}</span></div>
+  <div class="body">${inner}</div><div class="navbar" ${col}></div></div></div>`;
+}
+function both(fn,opts={}){return `<div class="pair">${phone('',fn(false),opts)}${phone('dark',fn(true),opts)}</div>`}
+function darkOnly(fn,opts={}){return `<div class="pair">${phone('dark',fn(true),opts)}</div>`}
+function sw(on){return `<div class="switch ${on?'on':''}">${on?`<span class="chk">${ic('check',16,2.4)}</span>`:''}</div>`}
+function li({lead='',h,s='',trail='',two=false,cls='',hcls='',scls=''}){
+  return `<div class="li ${s||two?'two':''} ${cls}">${lead?`<div class="lead">${lead}</div>`:''}<div class="txt"><div class="h ${hcls}">${h}</div>${s?`<div class="s ${scls}">${s}</div>`:''}</div>${trail?`<div class="trail">${trail}</div>`:''}</div>`;
+}
+function topbar(){return `<div class="tab"><div class="t">Pneu</div><div class="ib">${ic('settings',24,1.8)}</div></div>`}
+
+/* ---------- Setup / permissions ---------- */
+function setupRows(v){
+  const done=`<span class="chk-done">${ic('check_circle',24,2)}</span>`;
+  const b=(t)=>`<span class="btn tonal sm">${t}</span>`;
+  const rows={
+    initial:[
+      ['bell','Notifications','',b('Allow')],
+      ['photo_library','Photos and videos','',b('Allow')],
+      ['battery','Unrestricted battery use','',b('Allow')],
+      ['bedtime_off','Never sleeping apps','Add Pneu to the list',b('Open')],
+    ],
+    partial:[
+      ['bell','Notifications','',done],
+      ['photo_library','Photos and videos','Limited access',b('Allow all')],
+      ['battery','Unrestricted battery use','',done],
+      ['bedtime_off','Never sleeping apps','Add Pneu to the list',b('Open')],
+    ],
+    later:[
+      ['bell','Notifications','Turned off in settings',b('Settings')],
+      ['photo_library','Photos and videos','',done],
+      ['battery','Unrestricted battery use','',b('Allow')],
+      ['bedtime_off','Never sleeping apps','',done],
+    ],
+  }[v];
+  return `<div class="card">${rows.map(([i,h,s,t])=>li({lead:ic(i,24,1.8),h,s,trail:t,two:!!s})).join('')}</div>`;
+}
+function scrSetup(v){return ()=>`
+  <div class="ltab nonav"><div class="top"></div><div class="t">Set up Pneu</div></div>
+  <div class="scroll">${setupRows(v)}</div>
+  <div class="fixed-bottom"><div class="btn filled xl" style="width:100%">Continue</div></div>`}
+function scrPermissions(){return `
+  <div class="ltab"><div class="top"><div class="ib on-surface">${ic('back')}</div></div><div class="t">Permissions and battery</div></div>
+  <div class="scroll">${setupRows('later')}</div>`}
+
+/* ---------- Pair ---------- */
+function camBg(){return `<div class="cam"><div class="monitor"><div class="win"><div class="qr">${QR}</div></div></div></div>`}
+function pairTop(){return `<div class="tab nav"><div class="ib" style="color:#fff">${ic('back')}</div><div class="t" style="color:#fff">Pair with PC</div></div>`}
+function scrPair(v){return (dark)=>{
+  if(v=='camera') return `<div class="camblank">${ic('camera',48,1.6,'style="opacity:.7"')}<div class="btn filled lg">Allow camera</div></div><div class="camwrap" style="pointer-events:none;bottom:auto">${pairTop()}</div>`;
+  if(v=='denied') return `<div class="camblank">${ic('camera',48,1.6,'style="opacity:.7"')}<div class="msg">Camera access is off</div><div class="btn filled lg">Open settings</div></div><div class="camwrap" style="bottom:auto">${pairTop()}</div>`;
+  let center='',instr='Scan the QR code on your PC',hole='hole',extra='';
+  if(v=='pairing'){hole='hole busy';center=`<div class="center" style="background:rgba(0,0,0,.72);border-radius:20px"><div class="spinner" style="width:48px;height:48px;border-width:5px;color:#AAC7FF"></div></div>`;instr='Pairing…'}
+  if(v=='paired'){hole='hole busy';center=`<div class="center" style="background:rgba(0,0,0,.45);border-radius:20px"><div style="width:64px;height:64px;border-radius:50%;background:#AAC7FF;color:#0A305F;display:grid;place-items:center">${ic('check',36,3)}</div></div>`;instr='Paired with '+PC}
+  if(v=='notpneu') extra=`<div class="snack" style="z-index:3">That isn't a Pneu code</div>`;
+  if(v=='expired') extra=`<div class="snack" style="z-index:3">This code expired. Scan the new one.</div>`;
+  if(v=='unreachable') extra=`<div class="scrimfull" style="z-index:3"></div><div class="dialog" style="z-index:4"><div class="dt">Can't reach your PC</div><div class="dx">Make sure both are on the same Wi-Fi, or that Tailscale is connected.</div><div class="da"><span class="btn text">Cancel</span><span class="btn text">Try again</span></div></div>`;
+  return `${camBg()}<div class="camwrap">${pairTop()}<div class="${hole}">${center}</div><div class="caminstr">${instr}</div></div>${extra}`;
+}}
+
+/* ---------- Home ---------- */
+function hero({disc,icon,title,detail,left,right,spin=false,single=null}){
+  const ico = icon=='pneu'?glyph(36):ic(icon,32,2);
+  const btns = single?`<div class="hb">${single}</div>`:`<div class="hb">${left}${right}</div>`;
+  return `<div class="hero"><div class="disc ${disc}">${spin?'<div class="ring"></div>':''}${ico}</div><div class="ht">${title}</div><div class="hd">${detail}</div>${btns}</div>`;
+}
+const B = {
+  send:(dis)=>`<span class="btn tonal lg wide ${dis?'disabled':''}">${ic('paste_go',18,2)}Send clipboard</span>`,
+  pause:`<span class="btn outlined lg wide">${ic('pause',18)}Pause</span>`,
+  resume:`<span class="btn filled lg wide">${ic('play',18)}Resume</span>`,
+  tail:`<span class="btn tonal lg wide">${ic('open_new',18,2)}Open Tailscale</span>`,
+  pairAgain:`<span class="btn filled lg wide">${ic('qr',18,2)}Pair again</span>`,
+};
+function row(kind,dark,{h,s,trail='',scls='',hcls=''}){
+  let lead='';
+  if(kind=='chat') lead=`<div class="thumb">${shotChat(dark)}</div>`;
+  if(kind=='map') lead=`<div class="thumb">${shotMap()}</div>`;
+  if(kind=='photo') lead=`<div class="thumb">${photo()}</div>`;
+  if(kind=='video') lead=`<div class="thumb">${videoThumb()}<div class="play">${ic('play',10)}</div></div>`;
+  if(kind=='file') lead=`<div class="tile48">${ic('file',24,1.8)}</div>`;
+  if(kind=='link') lead=`<div class="tile48">${ic('link',24,1.8)}</div>`;
+  if(kind=='text') lead=`<div class="tile48">${ic('paste',24,1.8)}</div>`;
+  return li({lead,h,s,trail,scls,hcls,two:true});
+}
+const T = {
+  x:(lbl)=>`<span class="ib" title="${lbl}">${ic('close',22,2)}</span>`,
+  retry:`<span class="ib" title="Retry">${ic('refresh',22,2)}</span>`,
+  ring:(p)=>`<span class="prog" title="Cancel"><svg class="ringp" viewBox="0 0 36 36"><circle cx="18" cy="18" r="16" fill="none" style="stroke:var(--sc-highest)" stroke-width="3"/><circle cx="18" cy="18" r="16" fill="none" style="stroke:var(--primary)" stroke-width="3" stroke-dasharray="${(p*100.5).toFixed(1)} 200" transform="rotate(-90 18 18)" stroke-linecap="round"/></svg>${ic('close',18,2)}</span>`,
+};
+function recentSent(dark){return [
+  row('chat',dark,{h:'Screenshot',s:'14:02'}),
+  row('text',dark,{h:'Meet at the north entrance at 7, I\'ll bring the tickets',s:'Clipboard · 13:58'}),
+  row('map',dark,{h:'Screenshot',s:'13:41'}),
+  row('file',dark,{h:'invoice_octob…_signed.pdf',s:'13:20'}),
+  row('link',dark,{h:'github.com/mjstanton/pneu/pull/12',s:'12:05'}),
+  row('photo',dark,{h:'Photo',s:'Yesterday'}),
+]}
+function recent(dark,{rows,waiting=0,empty=false}){
+  const head=`<div class="gh">Recent${waiting?`<span class="tb" style="display:inline-flex;align-items:center;gap:2px">${waiting} waiting${ic('drop',18,0)}</span>`:''}</div>`;
+  if(empty) return head+`<div class="card"><div class="empty">${ic('image',32,1.6)}Nothing sent yet</div></div>`;
+  return head+`<div class="card">${rows.join('')}</div>`;
+}
+function homeShell(content){return `${topbar()}<div class="scroll" style="padding-bottom:16px">${content}</div>`}
+function scrHome(state){return (dark)=>{
+  const sent=recentSent(dark);
+  switch(state){
+  case 'wifi': return homeShell(hero({disc:'ok',icon:'pneu',title:'Connected',detail:`${PC} · Wi-Fi`,left:B.send(),right:B.pause})+
+     recent(dark,{rows:[row('video',dark,{h:'Screen recording',s:'Sending · 31 of 48 MB',trail:T.ring(.65)}),...sent.slice(0,5)]}));
+  case 'tsEmpty': return homeShell(hero({disc:'ok',icon:'pneu',title:'Connected',detail:`${PC} · Tailscale`,left:B.send(),right:B.pause})+recent(dark,{empty:true}));
+  case 'connecting': return homeShell(hero({disc:'neutral',icon:'pneu',spin:true,title:'Connecting…',detail:PC,left:B.send(true),right:B.pause})+recent(dark,{rows:sent.slice(0,5)}));
+  case 'unreachable': return homeShell(hero({disc:'neutral',icon:'cloud_off',title:'PC unreachable',detail:'Last connected 13:58',left:B.send(true),right:B.pause})+
+     recent(dark,{waiting:3,rows:[row('chat',dark,{h:'Screenshot',s:'Waiting',trail:T.x("Don't send")}),row('map',dark,{h:'Screenshot',s:'Waiting',trail:T.x("Don't send")}),row('photo',dark,{h:'Photo',s:'Waiting',trail:T.x("Don't send")}),...sent.slice(1,4)]}));
+  case 'tsOff': return homeShell(hero({disc:'neutral',icon:'cloud_off',title:'PC unreachable',detail:'Tailscale isn\'t connected',left:B.tail,right:B.pause})+
+     recent(dark,{waiting:1,rows:[row('chat',dark,{h:'Screenshot',s:'Waiting',trail:T.x("Don't send")}),...sent.slice(1,5)]}));
+  case 'wifiwait': return homeShell(hero({disc:'neutral',icon:'wifi_off',title:'Waiting for Wi-Fi',detail:'Mobile data is off in settings',left:B.send(true),right:B.pause})+
+     recent(dark,{waiting:2,rows:[row('video',dark,{h:'Screen recording',s:'Waiting',trail:T.x("Don't send")}),row('chat',dark,{h:'Screenshot',s:'Waiting',trail:T.x("Don't send")}),...sent.slice(1,4)]}));
+  case 'paused': return homeShell(hero({disc:'paused',icon:'pause',title:'Paused',detail:'Automatic sending is off',left:B.send(),right:B.resume})+recent(dark,{rows:sent.slice(0,5)}));
+  case 'lost': return homeShell(hero({disc:'err',icon:'error',title:'Pairing lost',detail:`${PC} doesn't recognize this phone`,single:B.pairAgain})+recent(dark,{rows:sent.slice(0,5)}));
+  case 'banner': return homeShell(`<div class="banner">${ic('warning',24,1.8)}<div class="bt">Battery optimization can stop Pneu</div><span class="btn text">Fix</span></div>`+
+     hero({disc:'ok',icon:'pneu',title:'Connected',detail:`${PC} · Wi-Fi`,left:B.send(),right:B.pause})+
+     recent(dark,{rows:[row('chat',dark,{h:'Screenshot',s:'Failed · PC disk is full',scls:'err',trail:T.retry+T.x('Remove')}),...sent.slice(1,4)]}));
+  }
+}}
+
+/* ---------- Settings ---------- */
+function settingsBody(v){
+  const a = v=='alt';
+  return `
+  <div class="gh first">Send automatically</div>
+  <div class="card">${li({h:'Screenshots',trail:sw(true)})}${li({h:'Camera photos',trail:sw(false)})}${li({h:'Screen recordings',trail:sw(false)})}</div>
+  <div class="gh">Connection</div>
+  <div class="card">
+   ${li({h:'Direct on home Wi-Fi',trail:sw(!a)})}
+   ${li({h:'Tailscale when away',s:a?'Tailscale app isn\'t installed':'',scls:'err',trail:sw(true)})}
+   ${li({h:'Use mobile data',trail:sw(!a)})}
+   ${li({h:'Send originals on mobile data',trail:sw(false),cls:a?'disabled':''})}
+   ${li({h:'Queue while PC is unreachable',trail:sw(true)})}
+  </div>
+  <div class="gh">Clipboard</div>
+  <div class="card">${li({h:'Send button in notification',trail:sw(true)})}</div>
+  <div class="gh">Paired PC</div>
+  <div class="card">${li({h:PC,s:'192.168.1.20 · 100.67.144.28'})}${li({h:'Unpair',hcls:'err'})}</div>
+  <div class="gh">This phone</div>
+  <div class="card">${li({h:'Permissions and battery',s:a?'1 needs attention':'All set',scls:a?'err':''})}</div>
+  <div style="text-align:center;font-size:12px;color:var(--on-surface-variant);padding:24px 0 16px">Version 1.0.0</div>`;
+}
+function scrSettings(v){return ()=>`
+  <div class="ltab"><div class="top"><div class="ib on-surface">${ic('back')}</div></div><div class="t">Settings</div></div>
+  <div class="scroll">${settingsBody(v)}</div>${v=='alt'?'<div class="snack" style="bottom:16px">Pneu needs Wi-Fi or Tailscale</div>':''}`}
+function scrUnpair(){return `
+  <div class="ltab"><div class="top"><div class="ib on-surface">${ic('back')}</div></div><div class="t">Settings</div></div>
+  <div class="scroll">${settingsBody('')}</div>
+  <div class="scrimfull"></div>
+  <div class="dialog"><div class="dt">Unpair from ${PC}?</div><div class="dx">3 waiting items won't be sent.</div><div class="da"><span class="btn text">Cancel</span><span class="btn text">Unpair</span></div></div>`}
+
+/* ---------- notifications / tiles / share ---------- */
+function ncard({title,text,acts=[],prog=null,app='Pneu'}){
+  return `<div class="ncard"><div class="nicon">${glyph(18)}</div><div class="nmain"><div class="nhead"><span>${app}</span></div><div class="ntitle">${title}</div><div class="ntext">${text}</div>${prog!=null?`<div class="nbar"><i style="width:${prog*100}%"></i></div>`:''}${acts.length?`<div class="nact">${acts.map(a=>`<span>${a}</span>`).join('')}</div>`:''}</div></div>`;
+}
+function shade(dark){
+  const L=(t)=>`<div class="nlabel">${t}</div>`;
+  return `<div class="m3 ${dark?'dark':''}"><div class="shade">
+   ${L('Connected')}${ncard({title:'Connected',text:`${PC} · Wi-Fi`,acts:['Send clipboard','Pause']})}
+   ${L('Sending')}${ncard({title:'Sending screen recording',text:'31 of 48 MB',prog:.65,acts:['Send clipboard','Pause']})}
+   ${L('Connecting')}${ncard({title:'Connecting…',text:PC,acts:['Send clipboard','Pause']})}
+   ${L('PC unreachable')}${ncard({title:'PC unreachable',text:'3 waiting',acts:['Send clipboard','Pause']})}
+   ${L('Waiting for Wi-Fi')}${ncard({title:'Waiting for Wi-Fi',text:'2 waiting',acts:['Send clipboard','Pause']})}
+   ${L('Paused')}${ncard({title:'Paused',text:'Automatic sending is off',acts:['Send clipboard','Resume']})}
+   ${L('Alerts channel')}${ncard({title:'Pneu may stop in the background',text:'Battery use is set to Optimized',acts:['Fix']})}
+   <div style="height:8px"></div>${ncard({title:'Pneu was stopped in the background',text:'Add Pneu to Never sleeping apps',acts:['Fix']})}
+   <div style="height:8px"></div>${ncard({title:'Pneu can\'t see new screenshots',text:'Photo access was turned off',acts:['Fix']})}
+   <div style="height:8px"></div>${ncard({title:'Pairing lost',text:`${PC} doesn't recognize this phone`,acts:['Pair again']})}
+  </div></div>`;
+}
+function qtile({on=false,na=false,icon,label,sub}){
+  return `<div class="qt ${on?'on':''} ${na?'na':''}"><div class="qi">${icon}</div><div><div class="ql">${label}</div>${sub?`<div class="qs2">${sub}</div>`:''}</div></div>`;
+}
+function tiles(dark){
+  const g=glyph(22), c=ic('paste_go',22,1.9);
+  return `<div class="m3 ${dark?'dark':''}"><div class="qs">
+   <div class="qcap" style="margin-top:0">Pneu tile: tap pauses or resumes, long-press opens Pneu</div>
+   ${qtile({on:true,icon:g,label:'Pneu',sub:'Wi-Fi'})}${qtile({on:true,icon:g,label:'Pneu',sub:'Tailscale'})}
+   ${qtile({on:true,icon:g,label:'Pneu',sub:'Connecting…'})}${qtile({on:true,icon:g,label:'Pneu',sub:'Offline'})}
+   ${qtile({icon:g,label:'Pneu',sub:'Paused'})}${qtile({icon:g,label:'Pneu',sub:'Pairing lost'})}
+   ${qtile({na:true,icon:g,label:'Pneu',sub:'Not paired'})}<div></div>
+   <div class="qcap">Send clipboard tile</div>
+   ${qtile({icon:c,label:'Send clipboard',sub:''})}${qtile({icon:c,label:'Send clipboard',sub:'Offline'})}
+   ${qtile({na:true,icon:c,label:'Send clipboard',sub:'Not paired'})}
+  </div></div>`;
+}
+function scrShare(dark){
+  const app=(bg,l,lbl)=>`<div class="target"><div class="av app" style="background:${bg}">${l}</div><div class="lbl">${lbl}</div></div>`;
+  return `<div style="position:absolute;inset:0;background:${dark?'#000':'#f2f2f2'};padding:70px 16px">
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:4px;opacity:.9">${[shotChat(dark),shotMap(),photo(),videoThumb(),shotChat(dark),photo()].map(s=>`<div style="height:170px;overflow:hidden">${s.replace('<svg','<svg width="100%" height="100%"')}</div>`).join('')}</div></div>
+   <div class="scrimfull"></div>
+   <div class="sheet">
+    <div class="handle"></div>
+    <div class="shprev"><div class="thumb" style="width:56px;height:56px">${shotChat(dark)}</div><div><div style="font-size:16px">Screenshot_20261011_140233.jpg</div><div style="font-size:14px;color:var(--on-surface-variant)">1 image</div></div></div>
+    <div class="dsrow">
+      <div class="target"><div class="av" style="background:#0F6E68">${ic('computer',28,1.8)}<div class="badge">${appIcon(18)}</div></div><div class="lbl">${PC}</div></div>
+      <div class="target"><div class="av" style="background:#7b61ff">S</div><div class="lbl">Sam</div></div>
+      <div class="target"><div class="av" style="background:#e8710a">R</div><div class="lbl">Rosa</div></div>
+      <div class="target"><div class="av" style="background:#1e8e3e">J</div><div class="lbl">Jo</div></div>
+    </div>
+    <div class="shdiv"></div>
+    <div class="approw">
+      ${app('#5b6ee1','<span style="font-size:13px">QS</span>','Quick Share')}${app('#2f9e6b','M','Messages')}${app('#d14b3f','E','Email')}
+      <div class="target">${appIcon(56,'squircle')}<div class="lbl">Send to PC</div></div>
+      ${app('#3b82c4','N','Notes')}${app('#7a7f87','⧉','Copy')}${app('#c58b1c','F','Files')}${app('#6d4bc4','D','Drive')}
+    </div>
+   </div>`;
+}
+function toasts(dark){
+  const t=(x)=>`<div class="toast"><div class="ti">${appIcon(24)}</div>${x}</div>`;
+  return `<div class="m3 ${dark?'dark':''}"><div style="width:412px;border-radius:28px;background:${dark?'#000':'#f2f2f2'};padding:20px;display:flex;flex-direction:column;gap:12px;align-items:center;box-shadow:0 0 0 1px rgba(0,0,0,.18)">
+   <div class="nlabel" style="align-self:flex-start;margin:0">Share → Send to PC</div>
+   ${t('Sending to PC')}${t('Sending 3 items to PC')}${t('PC unreachable. Queued.')}${t('Waiting for Wi-Fi. Queued.')}${t('Couldn\'t read this item')}
+   <div class="nlabel" style="align-self:flex-start;margin:6px 0 0">Send clipboard (tile, notification, Home)</div>
+   ${t('Clipboard sent')}${t('Clipboard is empty')}${t('PC unreachable. Not sent.')}
+  </div></div>`;
+}
+
+/* ---------- PC ---------- */
+function tray(name,size){return asset(`pneu-tray-${name}.svg`,size).replace(/<path class="ColorScheme-NegativeText" style="fill:currentColor;/,'<path class="ColorScheme-NegativeText" style="fill:#da4453;')}
+function panel(state,sel=false){
+  return `<div class="panelbar">
+   <div class="trayi">${ic('clipb',20,1.6)}</div><div class="trayi">${ic('bt',20,1.6)}</div><div class="trayi">${ic('volume',20,1.6)}</div><div class="trayi">${ic('net',20,1.6)}</div>
+   <div class="trayi ${sel?'sel':''}" style="color:var(--text)">${tray(state,22)}</div><div class="trayi">${ic('up',18,1.6)}</div>
+   <div class="clock"><span>14:03</span><span style="opacity:.75">11/10/2026</span></div></div>`;
+}
+function mi(t,{dis=false,cb=null,icon=null,hov=false}={}){
+  const mark = cb!==null?`<span class="cb ${cb?'on':''}">${cb?ic('check',12,2.6):''}</span>`:(icon?ic(icon,16,1.6):'');
+  return `<div class="mi ${dis?'dis':''} ${hov?'hov':''}"><span class="mk">${mark}</span>${t}</div>`;
+}
+const SEP='<div class="msep"></div>';
+function trayMenu(status,{paired=true,clip=true}={}){
+  return `<div class="menu">${mi(status,{dis:true})}${SEP}${mi('Open Folder',{icon:'folder'})}${SEP}
+   ${mi('Save to Folder',{cb:true})}${mi('Show Notifications',{cb:true,hov:true})}${mi('Copy Images to Clipboard',{cb:true})}${mi('Open in Image Viewer',{cb:false})}${SEP}
+   ${mi('Send Clipboard to Phone',{cb:clip})}${mi('Include Images',{cb:false,dis:!clip})}${SEP}
+   ${paired?mi('Configure Pneu…',{icon:'configure'}):mi('Pair Phone…',{icon:'phone'})}${mi('Quit',{icon:'exit'})}</div>`;
+}
+function desk(dark,inner,h=null){return `<div class="bz ${dark?'dark':''}"><div class="desk ${dark?'dark':'light'}" ${h?`style="height:${h}px"`:''}>${inner}</div></div>`}
+function bothPC(fn){return `<div class="pair">${fn(false)}${fn(true)}</div>`}
+function kwin(dark,content,{overlay=''}={}){
+  return `<div class="bz ${dark?'dark':''}"><div class="kwin" style="position:relative"><div class="tb">${asset('pneu.svg',16)}<div class="tt">Pneu</div><div class="wb">${ic('min',16,1.6)}</div><div class="wb">${ic('close',16,1.6)}</div></div><div class="ct">${content}</div>${overlay}</div></div>`;
+}
+const folderRow=`<div class="frow"><span class="lab">Save to:</span><span class="path">~/Pictures/Pneu</span><span class="bbtn">Change…</span></div>`;
+function winUnpaired(v){return (dark)=>{
+  let top;
+  if(v=='qr') top=`<div class="qrcard" style="padding:0">${QR}</div><div class="center" style="margin-top:12px">Scan with Pneu on your phone</div>`;
+  if(v=='pairing') top=`<div style="height:232px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px"><div class="spinner" style="width:32px;height:32px;border-width:3px;color:var(--accent)"></div><div>Pairing with ${PH}…</div></div>`;
+  if(v=='nonet') top=`<div style="height:232px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;color:var(--inactive)">${ic('netdis',48,1.4)}<div style="color:var(--text)">Connect this PC to a network to pair</div></div>`;
+  return kwin(dark,`${top}<div class="hsep"></div>${folderRow}<div style="display:flex;justify-content:flex-end;margin-top:14px"><span class="bbtn def">Close</span></div>`);
+}}
+function winPaired(v){return (dark)=>{
+  const st={wifi:['var(--pos)','Connected over Wi-Fi'],ts:['var(--pos)','Connected over Tailscale'],off:['var(--inactive)','Not connected · last seen 13:58'],paused:['var(--neu)','Paused on phone']}[v=='err'?'wifi':(v=='unpair'?'wifi':v)];
+  const banner = v=='err'?`<div class="kmsg">${ic('dlgerr',16,2)}<span class="kt">Can't write to ~/Pictures/Pneu.</span></div>`:'';
+  const content=`${banner}<div style="display:flex;gap:14px;align-items:center"><div style="color:var(--text)">${ic('phone',48,1.3)}</div><div><div style="font-size:16px;font-weight:600">${PH}</div><div style="display:flex;align-items:center;gap:6px;margin-top:3px;opacity:.85"><span class="dot" style="background:${st[0]}"></span>${st[1]}</div></div></div>
+   <div class="hsep"></div>${folderRow}<div class="hsep"></div><div style="display:flex;justify-content:space-between"><span class="bbtn">Unpair…</span><span class="bbtn def">Close</span></div>`;
+  const overlay = v=='unpair'?`<div class="dim"></div><div class="dlg"><div style="padding:18px">Unpair ${PH}?<div style="display:flex;justify-content:flex-end;gap:8px;margin-top:18px"><span class="bbtn def">Cancel</span><span class="bbtn">Unpair</span></div></div></div>`:'';
+  return kwin(dark,content,{overlay});
+}}
+function notif(dark,{summary,body='',thumbs=null,acts=[],transient=false,side=null}){
+  const th = thumbs?`<div class="nthumb">${thumbs}<span class="more">${ic('more',14)}</span></div>`:'';
+  return `<div class="bz ${dark?'dark':''}"><div class="notif"><div class="nh">${asset('pneu.svg',16)}<span>Pneu</span><span>·</span><span>Just now</span><span class="sp"></span>${ic('configure',14,1.6)}<span style="width:4px"></span>${ic('close',14,1.8)}</div>
+   ${side?`<div style="display:flex;gap:10px;align-items:flex-start"><div style="flex:1"><div class="ns">${summary}</div>${body?`<div class="nb">${body}</div>`:''}</div><div style="width:64px;height:48px;border-radius:4px;overflow:hidden;margin-top:6px;flex:none">${side}</div></div>`:`<div class="ns">${summary}</div>${body?`<div class="nb">${body}</div>`:''}`}${th}${acts.length?`<div class="nacts">${acts.map(a=>`<span class="bbtn">${a}</span>`).join('')}</div>`:''}</div></div>`;
+}
+const shotBox=(dark)=>`<div style="height:136px;width:66px;border-radius:3px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.3)">${shotChat(dark).replace('<svg','<svg width="100%" height="100%"')}</div>`;
+const mapBox=`<div style="height:136px;width:66px;border-radius:3px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.3)">${shotMap().replace('<svg','<svg width="100%" height="100%"')}</div>`;
+const fileBox=(dark)=>`<div style="height:120px;width:92px;border-radius:3px;background:${dark?'#2c3034':'#fff'};box-shadow:0 1px 3px rgba(0,0,0,.3);display:grid;place-items:center;color:#DA4453">${ic('file',40,1.4)}</div>`;
+function notifs(dark){
+  return `<div class="grid">
+  <div class="ncol">
+   <div class="cap">Screenshot received (Save, Notification and Copy on)</div>
+   ${notif(dark,{summary:'Screenshot',body:'Copied to clipboard',thumbs:shotBox(dark),acts:['Open','Show in Folder']})}
+   <div class="cap">Burst: replaces the notification above. Plasma previews the first URL, so the latest goes first.</div>
+   ${notif(dark,{summary:'3 screenshots',body:'Latest copied to clipboard',thumbs:mapBox,acts:['Show in Folder']})}
+   <div class="cap">Shared file</div>
+   ${notif(dark,{summary:'invoice_october_2026_final_signed.pdf',thumbs:fileBox(dark),acts:['Open','Show in Folder']})}
+  </div>
+  <div class="ncol">
+   <div class="cap">Text from phone (transient, low urgency)</div>
+   ${notif(dark,{summary:'Copied from phone',body:'Meet at the north entrance at 7, I\'ll bring the tickets'})}
+   ${notif(dark,{summary:'Copied from phone',body:'https://github.com/mjstanton/pneu/pull/12',acts:['Open Link']})}
+   <div class="cap">Image clipboard from phone</div>
+   ${notif(dark,{summary:'Image copied from phone',side:photo().replace('<svg','<svg width="100%" height="100%"')})}
+  </div>
+  <div class="ncol">
+   <div class="cap">Errors</div>
+   ${notif(dark,{summary:'Screenshot',body:'Not saved: can\'t write to ~/Pictures/Pneu',thumbs:shotBox(dark),acts:['Open','Choose Folder…']})}
+   ${notif(dark,{summary:'Screenshot',body:'Not saved: the disk is full',acts:['Open']})}
+   ${notif(dark,{summary:'Blocked an unpaired phone',body:'192.168.1.44 tried to connect',acts:['Pair Phone…']})}
+   ${notif(dark,{summary:`${PH} unpaired this PC`,acts:['Pair Phone…']})}
+   ${notif(dark,{summary:'Pneu can\'t receive',body:'Port 47811 is in use by another program'})}
+  </div></div>`;
+}
+
+/* ---------- page ---------- */
+function mock(id,title,note,html){return `<section class="mock" id="${id}"><h3>${title}</h3>${note?`<p class="note">${note}</p>`:''}${html}</section>`}
+function brand(){
+  const it=(html,cap)=>`<div class="it">${html}<span>${cap}</span></div>`;
+  const layer=(n,s)=>`<div style="width:${s}px;height:${s}px;background:repeating-conic-gradient(#ccc 0 25%,#eee 0 50%) 0 0/16px 16px;border-radius:6px;overflow:hidden">${asset(n,s)}</div>`;
+  const mono=(bg,fg)=>`<div style="width:96px;height:96px;border-radius:50%;background:${bg};color:${fg};overflow:hidden;display:grid;place-items:center"><div style="width:133.3%;height:133.3%;flex:none">${asset('ic_launcher_monochrome.svg',128).replace(/fill="#000000"/g,'fill="currentColor"')}</div></div>`;
+  let trayRows='';
+  for(const [cls,bg,fg] of [['light','#E9EBED','#232629'],['dark','#202326','#FCFCFC']]){
+    trayRows+=`<div class="traygrid" style="background:${bg};color:${fg}"><span class="h">${cls} panel</span><span class="h">16 px</span><span class="h">22 px</span><span class="h">44 px (2×)</span>`;
+    for(const s of ['connected','receiving','disconnected','paused','error']){
+      trayRows+=`<span style="font-size:12px">${s}</span>${[16,22,44].map(z=>`<span>${tray(s,z)}</span>`).join('')}`;
+    }
+    trayRows+='</div>';
+  }
+  return `<h2 class="sec" id="brand">Brand and icons</h2>
+  ${mock('launcher','App icon','Adaptive icon (background and foreground layers), shown under One UI squircle and round masks, plus the themed monochrome icon and the PC app icon.',
+    `<div class="iconsheet">${it(appIcon(160,'squircle'),'One UI mask')}${it(appIcon(160,'circle'),'Round mask')}${it(appIcon(64,'squircle'),'64 px')}${it(appIcon(48,'squircle'),'48 px')}
+     ${it(layer('ic_launcher_background.svg',108),'background layer')}${it(layer('ic_launcher_foreground.svg',108),'foreground layer')}
+     ${it(mono('#C9EDE7','#0A3B38'),'themed (light)')}${it(mono('#284777','#D6E3FF'),'themed (dark)')}
+     ${it(asset('pneu.svg',96),'PC app icon')}${it(`<div style="display:flex;gap:10px;align-items:center;background:#0F6E68;color:#fff;padding:10px;border-radius:8px">${glyph(24)}${glyph(18)}</div>`,'status bar / tile glyph')}</div>`)}
+  ${mock('trayicons','Tray icons','Monochrome, recoloured by Plasma (ColorScheme-Text); the error badge uses ColorScheme-NegativeText. No phone paired and pairing use the disconnected icon.',`<div class="grid">${trayRows}</div>`)}`;
+}
+function build(){
+  let h=`<div class="pagehead"><h1>Pneu</h1></div>
+  <div class="toc"><a href="#brand">Brand</a><a href="#setup">Setup</a><a href="#pair">Pair</a><a href="#home">Home</a><a href="#settings">Settings</a><a href="#notifications">Notifications</a><a href="#tiles">Quick Settings</a><a href="#share">Share</a><a href="#tray">Tray</a><a href="#window">Window</a><a href="#pcnotifs">PC notifications</a></div>`;
+  h+=brand();
+  h+=`<h2 class="sec">Phone</h2><div class="mocks">`;
+  h+=mock('setup','Setup (first run)','Continue is always enabled; anything skipped returns as a Home banner. Never sleeping apps shows on Samsung only.',both(scrSetup('initial')));
+  h+=mock('setup2','Setup, partly done','Limited photo access shows as not done with Allow all.',both(scrSetup('partial')));
+  h+=mock('perms','Permissions and battery (from Settings or a banner)','A permission denied twice opens system settings instead.',both(()=>scrPermissions()));
+  h+=mock('pair','Pair: camera permission','The Pair screen always uses the dark colour scheme, in both themes.',darkOnly(scrPair('camera'),{sbLight:true}));
+  h+=mock('pair1b','Pair: camera permanently denied','',darkOnly(scrPair('denied'),{sbLight:true}));
+  h+=mock('pair2','Pair: scanning, wrong code','Snackbar for 3 s; scanning continues.',darkOnly(scrPair('notpneu'),{sbLight:true}));
+  h+=mock('pair2b','Pair: expired code','',darkOnly(scrPair('expired'),{sbLight:true}));
+  h+=mock('pair3','Pair: pairing','Back is disabled for up to 15 s.',darkOnly(scrPair('pairing'),{sbLight:true}));
+  h+=mock('pair4','Pair: can\'t reach the PC','Cancel resumes scanning; Try again retries the same code.',darkOnly(scrPair('unreachable'),{sbLight:true}));
+  h+=mock('pair5','Pair: paired','Shown for 800 ms, then Home.',darkOnly(scrPair('paired'),{sbLight:true}));
+  h+=mock('home','Home: connected over Wi-Fi','A large transfer shows progress around its cancel button. Small screenshots flip straight to their time.',both(scrHome('wifi')));
+  h+=mock('home2','Home: just paired, connected over Tailscale','',both(scrHome('tsEmpty')));
+  h+=mock('home3','Home: connecting','',both(scrHome('connecting')));
+  h+=mock('home4','Home: PC unreachable with a queue','“3 waiting” opens a menu: Send now, Don\'t send any.',both(scrHome('unreachable')));
+  h+=mock('home5','Home: away from home, Tailscale off','',both(scrHome('tsOff')));
+  h+=mock('home6','Home: waiting for Wi-Fi (mobile data off)','',both(scrHome('wifiwait')));
+  h+=mock('home7','Home: paused','Screenshots taken while paused are skipped, not queued. Send clipboard and Share still work.',both(scrHome('paused')));
+  h+=mock('home8','Home: pairing lost','',both(scrHome('lost')));
+  h+=mock('home9','Home: setup issue and a failed item','One banner at a time; several issues read “{n} settings need attention”.',both(scrHome('banner')));
+  h+=mock('settings','Settings','',both(scrSettings(''),{tall:true}));
+  h+=mock('settings2','Settings: Tailscale missing, mobile data off, last connection method blocked','',both(scrSettings('alt'),{tall:true}));
+  h+=mock('unpair','Unpair dialog','The second line appears only when items are waiting.',both(()=>scrUnpair()));
+  h+=mock('notifications','Status notification and alerts','One ongoing notification whose content follows the state; alerts are a separate channel. When pairing is lost the service stops and only the alert remains.',`<div class="pair">${shade(false)}${shade(true)}</div>`);
+  h+=mock('tiles','Quick Settings tiles','',`<div class="pair">${tiles(false)}${tiles(true)}</div>`);
+  h+=mock('share','Share sheet','“Send to PC” in the app row, and the PC as a Direct Share target. No confirmation screen.',both((d)=>scrShare(d)));
+  h+=mock('toasts','Toasts','',`<div class="pair">${toasts(false)}${toasts(true)}</div>`);
+  h+=`</div><h2 class="sec">PC</h2><div class="mocks">`;
+  h+=mock('tray','Tray: connected, menu open','Left click opens the window; right click opens this menu.',bothPC(d=>desk(d,`<div style="display:flex;justify-content:flex-end;margin-bottom:10px">${trayMenu(`${PH} connected over Wi-Fi`)}</div>${panel('connected',true)}`)));
+  h+=mock('tray2','Tray: no phone paired, tooltip','',bothPC(d=>desk(d,`<div style="display:flex;justify-content:flex-end;gap:14px;align-items:flex-end;margin-bottom:10px"><div class="tooltip">${asset('pneu.svg',32)}<div><b>Pneu</b><span>No phone paired</span></div></div>${trayMenu('No phone paired',{paired:false})}</div>${panel('disconnected',true)}`)));
+  h+=mock('tray3','Tray tooltips by state','',bothPC(d=>desk(d,`<div style="display:flex;flex-direction:column;gap:10px;align-items:flex-end;margin-bottom:10px">
+     <div class="tooltip">${asset('pneu.svg',32)}<div><b>Pneu</b><span>${PH} isn't connected<br>Last seen 13:58</span></div></div>
+     <div class="tooltip">${asset('pneu.svg',32)}<div><b>Pneu</b><span>Receiving from ${PH}…</span></div></div>
+     <div class="tooltip">${asset('pneu.svg',32)}<div><b>Pneu</b><span>${PH} paused sending</span></div></div>
+     <div class="tooltip">${asset('pneu.svg',32)}<div><b>Pneu</b><span>Can't save to ~/Pictures/Pneu</span></div></div></div>
+     <div style="display:flex;flex-direction:column;gap:8px">${panel('disconnected')}${panel('receiving')}${panel('paused')}${panel('error')}</div>`)));
+  h+=mock('window','Window: unpaired','Opens on its own when the daemon starts unpaired. The QR refreshes every 5 minutes.',bothPC(winUnpaired('qr')));
+  h+=mock('window2','Window: phone connecting with the code','',bothPC(winUnpaired('pairing')));
+  h+=mock('window3','Window: no network','',bothPC(winUnpaired('nonet')));
+  h+=mock('window4','Window: paired and connected','',bothPC(winPaired('wifi')));
+  h+=mock('window5','Window: paired, phone not connected','',bothPC(winPaired('off')));
+  h+=mock('window6','Window: paired, phone paused','',bothPC(winPaired('paused')));
+  h+=mock('window7','Window: save folder error','',bothPC(winPaired('err')));
+  h+=mock('window8','Window: unpair confirmation','',bothPC(winPaired('unpair')));
+  h+=`<section class="mock" id="pcnotifs"><h3>Notifications, light</h3>${notifs(false)}</section><section class="mock"><h3>Notifications, dark</h3>${notifs(true)}</section></div>`;
+  document.getElementById('app').innerHTML=h;
+}
+build();
+</script>
+</body>
+</html>
