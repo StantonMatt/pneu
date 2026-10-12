@@ -1,0 +1,8 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <activity android:name="io.github.stantonmatt.pneu.FixtureViewerActivity" android:exported="true" android:process=":viewer"/>
+        <activity android:name="io.github.stantonmatt.pneu.FixtureCallerActivity" android:exported="true" android:process=":caller"/>
+        <provider android:name="io.github.stantonmatt.pneu.FixtureShareProvider" android:authorities="io.github.stantonmatt.pneu.test.sources" android:exported="false" android:grantUriPermissions="true" android:process=":caller"/>
+        <provider android:name="io.github.stantonmatt.pneu.ReviewProvider" android:authorities="io.github.stantonmatt.pneu.test.review" android:exported="true" android:grantUriPermissions="true" android:process=":review"/>
+    </application>
+</manifest>

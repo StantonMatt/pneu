@@ -19,8 +19,8 @@ These rules decide what the UI says, so they are fixed here. Items marked **prot
 |---|---|
 | Pairing | One phone and one PC. Pairing again on either side replaces the old pairing. The phone keeps its old pairing until a new one succeeds, so backing out of the scanner changes nothing. |
 | Unpair | Unpairing on either side tells the other side if connected (**protocol**: `unpair` message) and both forget each other. If not connected, the other side finds out on the next connection attempt (pin mismatch → "Pairing lost" on the phone, "Blocked an unpaired phone" on the PC). |
-| Pause (phone) | The connection stays up. Screenshots, photos and recordings taken while paused are **skipped, not queued**. Items already waiting stay queued and send after Resume. PC clipboard arriving while paused is ignored. Manual sends (Share → Send to PC, Send clipboard) still work. The phone tells the PC it is paused (**protocol**: `paused` flag in hello and a status message) so the tray can show it. |
-| Queue | With "Queue while PC is unreachable" on, automatic items found while the PC is unreachable wait and send in order when it comes back. With it off they are skipped and never listed. Shared items always queue (the user asked for them explicitly). Clipboard is never queued. An item whose source file is deleted before it is sent is dropped silently. |
+| Pause (phone) | The connection stays up. Automatic media already inserted in MediaStore at Resume, including still-pending items, is **skipped, not queued**. Resume re-baselines observation; it requires full media access. Items already waiting stay queued and send after Resume. PC clipboard arriving while paused is ignored. Manual sends (Share → Send to PC, Send clipboard) still work. The phone tells the PC it is paused (**protocol**: `paused` flag in hello and a status message) so the tray can show it. |
+| Queue | With "Queue while PC is unreachable" on, automatic items found while the PC is unreachable wait and send in order when it comes back. With it off they are skipped and never listed. Shared items always queue (the user asked for them explicitly). Clipboard is never queued. Queued files are private snapshots: deleting the original does not cancel sending. Use **Don't send** to cancel. |
 | Mobile data | "Use mobile data" off → on mobile data the state is "Waiting for Wi-Fi" and automatic items queue. "Send originals on mobile data" off → images are re-encoded (JPEG, quality 85, long edge ≤ 2560 px) and screen recordings wait for Wi-Fi; shared files are always sent as-is. |
 | Dedupe | Automatic items are keyed by MediaStore ID; nothing is sent twice after a reconnect. |
 | Clipboard loop | Neither side sends back clipboard content that Pneu itself just placed on that clipboard (compare a hash of the last content Pneu set). Without this, a received screenshot copied on the PC would bounce back to the phone. |
@@ -230,7 +230,7 @@ Row anatomy: leading 48 dp thumbnail (images and videos centre-cropped, corner 1
 | Sending (shown only for transfers over 1 s) | **Sending · {sent} of {total}** (sizes like `12 MB`) | `close` button with a determinate progress ring around it, description **Cancel** |
 | Failed | **Failed · PC disk is full**, **Failed · PC can't save files** (in `error`) | `refresh` (**Retry**) and `close` (**Remove**) |
 
-Tapping a sent image, video or file opens it with `ACTION_VIEW`; a sent link opens in the browser; other rows do nothing.
+Completed rows keep metadata and a small thumbnail, not the full file. Tapping a sent automatic image or video opens its original MediaStore item with `ACTION_VIEW` if it still exists; a sent link opens in the browser; other completed rows do nothing. Pending previews use staged bytes.
 
 Empty Recent (just paired): the card holds a 120 dp area with an `image` icon (32 dp, `onSurfaceVariant`) and **Nothing sent yet**.
 
@@ -342,7 +342,7 @@ Toasts (plain text toasts, which work from any context):
 | Clipboard empty | **Clipboard is empty** |
 | Not connected (clipboard is never queued) | **PC unreachable. Not sent.** |
 
-**Share target.** Activity label **Send to PC**, Pneu icon, `ACTION_SEND` and `ACTION_SEND_MULTIPLE` for `*/*` and `text/plain`. Translucent, no UI: it takes persistable read access to the URIs (or copies them to app storage if that fails), queues them, toasts and finishes. Also publish one dynamic sharing shortcut (Direct Share, `ShortcutManagerCompat.pushDynamicShortcut` with a share target category) labelled `{pc}`, so the PC shows in the share sheet's top row. Its icon is an adaptive icon: Material Symbol `computer` in white on Teal `#0F6E68`; Android adds the Pneu badge itself. Remove it on unpair.
+**Share target.** Activity label **Send to PC**, Pneu icon, `ACTION_SEND` and `ACTION_SEND_MULTIPLE` for `*/*` and `text/plain`. Translucent, no UI: it captures the paired PC once, copies granted content URIs to private storage, queues them, toasts and finishes. No persistable URI grants or Direct Share shortcuts are published; cached shortcut launches are rejected.
 
 | Situation | Toast |
 |---|---|
