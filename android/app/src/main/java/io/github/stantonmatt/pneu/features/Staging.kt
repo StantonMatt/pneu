@@ -64,7 +64,9 @@ class Staging(private val app: AppGraph, private val deleteCommittedSource:(File
                 // timeout it is closed/unlinked here; a late provider cannot recreate it.
                 val (count,hash)=FileOutputStream(temp).use {fileOutput->val output=writer(fileOutput,row);ProviderReads.copy(sourceTimeout) {signal,progress->
                     progress()
-                    val asset=app.context.contentResolver.openAssetFileDescriptor(Uri.parse(row.uri),"r",signal) ?: throw java.io.FileNotFoundException()
+                    val asset=try {app.context.contentResolver.openAssetFileDescriptor(Uri.parse(row.uri),"r",signal) ?: throw java.io.FileNotFoundException()}
+                    catch(e:CancellationException) {throw e}
+                    catch(e:Exception) {if(!row.automatic)throw ShareFailure("open_failed",e) else throw e}
                     sources.add(asset)
                     try {asset.use {source->
                     progress()

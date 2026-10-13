@@ -70,7 +70,7 @@ class FullReviewDeviceTest {
         catch(_:java.io.IOException) {}
         assertFalse(app.enqueue(Outgoing().apply {mediaId=randomId();transferId=randomId()},old))
         try {ManualEntries.text(app,"Old clipboard or shared text","clipboard",old);fail("Retargeted old text")}
-        catch(_:IllegalStateException) {}
+        catch(e:ShareFailure) {assertEquals("binding_mismatch",e.reason)}
     }
     @Test(timeout=30000) fun defaultFileAdmissionPrecedesEvenMimeLookupAndSamePcRepairRevokesIt()=runBlocking<Unit> {
         val old=app.preferences.flow.first()

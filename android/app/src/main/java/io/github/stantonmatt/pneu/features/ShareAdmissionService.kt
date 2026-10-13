@@ -60,7 +60,7 @@ class ShareAdmissionService:Service() {
             catch(e:Exception) {pending.remove(id);throw e}
             operation.share(request)
             // A failure to start the ongoing connection must not discard admission.
-            runCatching {PneuService.start(activity)}
+            runCatching {PneuService.start(activity)}.onFailure {android.util.Log.w("Pneu","share_warning: connection_start_failed")}
         }
     }
 }

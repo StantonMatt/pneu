@@ -3,6 +3,7 @@ package io.github.stantonmatt.pneu.features
 import android.app.Application
 import android.content.*
 import android.net.Uri
+import android.util.Log
 import android.widget.Toast
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -12,7 +13,7 @@ import io.github.stantonmatt.pneu.protocol.sha256
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
-internal data class ShareRequest(val binding:Deferred<DeliveryBinding?>,val items:List<Uri>,val texts:List<String>,val grants:Boolean)
+internal data class ShareRequest(val binding:Deferred<DeliveryBinding?>,val items:List<Uri>,val texts:List<String>)
 internal data class EntryResult(val message:String?=null,val pair:Boolean=false)
 
 /** Retains one admission across rotation. Shares run in the process scope with
@@ -32,27 +33,30 @@ internal class ManualEntryViewModel(application:Application):AndroidViewModel(ap
         started=true;startedSignal.complete(Unit)
         (if(processOwned)app.scope else viewModelScope).launch(Dispatchers.Main.immediate) {
             terminal.value=try {body()}
-            catch(e:CancellationException) {throw e}
-            catch(_:Exception) {EntryResult("Couldn't read this item")}
+            catch(e:CancellationException) {warn(processOwned,"cancelled");throw e}
+            catch(e:Exception) {warn(processOwned,(e as? ShareFailure)?.reason ?: "read_failed");EntryResult("Couldn't read this item")}
         }
     }
-    fun interrupted(message:String) {if(!started) {started=true;startedSignal.complete(Unit);terminal.value=EntryResult(message)}}
-    fun failure(message:String) {if(!started) {started=true;startedSignal.complete(Unit);terminal.value=EntryResult(message)}}
+    private fun warn(share:Boolean,reason:String) {if(share)ShareAdmission.warn(reason) else Log.w("Pneu","manual_entry_rejected: $reason")}
+    fun interrupted(message:String) {if(!started) {Log.w("Pneu","manual_entry_rejected: interrupted");started=true;startedSignal.complete(Unit);terminal.value=EntryResult(message)}}
+    fun failure(message:String,reason:String="read_failed") {if(!started) {Log.w("Pneu","manual_entry_rejected: $reason");started=true;startedSignal.complete(Unit);terminal.value=EntryResult(message)}}
     fun share(request:ShareRequest)=launch(processOwned=true) {
         val binding:DeliveryBinding?
         val p=try {binding=request.binding.await();app.preferences.read()}catch(e:Exception) {
             if(e is CancellationException)throw e
+            ShareAdmission.warn("settings")
             return@launch EntryResult("Couldn't load Pneu settings. Open Pneu and try again.")
         }
-        if(p.peer==null || p.pairingLost)return@launch EntryResult(pair=true)
-        if(!p.shareSheet || binding==null || !binding.matches(p))return@launch EntryResult()
-        if(!request.grants)return@launch EntryResult("Couldn't read this item")
+        if(p.peer==null || p.pairingLost) {ShareAdmission.warn("not_paired");return@launch EntryResult(pair=true)}
+        if(!p.shareSheet) {ShareAdmission.warn("disabled");return@launch EntryResult()}
+        if(binding==null || !binding.matches(p)) {ShareAdmission.warn("binding_mismatch");return@launch EntryResult()}
         var count=0;var failed=request.items.isEmpty() && request.texts.isEmpty()
+        if(failed)ShareAdmission.warn("empty")
         withContext(Dispatchers.IO) {
             suspend fun admit(body:suspend ()->Outgoing) {
                 try {val row=body();completed.add(row.mediaId);count++}
                 catch(e:CancellationException) {throw e}
-                catch(_:Exception) {completed.add(null);failed=true}
+                catch(e:Exception) {ShareAdmission.warn((e as? ShareFailure)?.reason ?: "read_failed");completed.add(null);failed=true}
             }
             if(request.items.isNotEmpty())for(uri in request.items)admit {ManualEntries.file(app,uri,"file",binding)}
             else for(text in request.texts)admit {ManualEntries.text(app,text,"share",binding)}
@@ -74,24 +78,30 @@ internal class ManualEntryViewModel(application:Application):AndroidViewModel(ap
     fun clipboard(clip:ClipData?)=launch {
         val binding=try {requireNotNull(clipboardBinding).await()}catch(e:Exception) {
             if(e is CancellationException)throw e
+            Log.w("Pneu","manual_entry_rejected: settings")
             return@launch EntryResult("Couldn't load Pneu settings. Open Pneu and try again.")
         }
         when {
-            !app.connection.connected || binding==null || !binding.matches(app.preferences.read())->EntryResult("PC unreachable. Not sent.")
-            clip==null || clip.itemCount==0->EntryResult("Clipboard is empty")
-            clip.description.extras?.getBoolean(ClipDescription.EXTRA_IS_SENSITIVE)==true->EntryResult("Sensitive clipboard. Not sent.")
+            !app.connection.connected || binding==null || !binding.matches(shareStep("settings") {app.preferences.read()})-> {
+                Log.w("Pneu","manual_entry_rejected: unavailable_binding");EntryResult("PC unreachable. Not sent.")
+            }
+            clip==null || clip.itemCount==0-> {Log.w("Pneu","manual_entry_rejected: empty");EntryResult("Clipboard is empty")}
+            clip.description.extras?.getBoolean(ClipDescription.EXTRA_IS_SENSITIVE)==true-> {Log.w("Pneu","manual_entry_rejected: sensitive");EntryResult("Sensitive clipboard. Not sent.")}
             else->try {
                 val row=withContext(Dispatchers.IO) {
                     val item=clip.getItemAt(0)
-                    val type=if(item.uri!=null)ProviderReads.call {app.context.contentResolver.getType(item.uri)} else null
+                    val type=if(item.uri!=null)shareStep("metadata_failed") {ProviderReads.call {app.context.contentResolver.getType(item.uri)}} else null
                     if(item.uri!=null && type?.startsWith("image/")==true) {
-                        check(app.connection.supports("clipboard_image"));ManualEntries.file(app,item.uri,"clipboard_image",binding,type)
+                        if(!app.connection.supports("clipboard_image"))throw ShareFailure("unsupported_kind")
+                        ManualEntries.file(app,item.uri,"clipboard_image",binding,type)
                     }else {
                         val text=item.text?.toString().orEmpty()
-                        if(text.isEmpty())return@withContext null
-                        check(app.connection.supports("clipboard_text"))
+                        if(text.isEmpty()) {Log.w("Pneu","manual_entry_rejected: empty");return@withContext null}
+                        if(!app.connection.supports("clipboard_text"))throw ShareFailure("unsupported_kind")
                         val hash=sha256(text.toByteArray())
-                        if(DeliveryPolicy.ownedEcho(clip.description.extras?.getBoolean(ClipboardDelivery.OWN_CLIP)==true,hash,clip.description.extras?.getString(ClipboardDelivery.OWN_HASH) ?: app.awaitPrefs().lastReceivedHash))return@withContext null
+                        if(DeliveryPolicy.ownedEcho(clip.description.extras?.getBoolean(ClipboardDelivery.OWN_CLIP)==true,hash,clip.description.extras?.getString(ClipboardDelivery.OWN_HASH) ?: shareStep("settings") {app.awaitPrefs()}.lastReceivedHash)) {
+                            Log.w("Pneu","manual_entry_rejected: owned_echo");return@withContext null
+                        }
                         ManualEntries.text(app,text,"clipboard",binding)
                     }
                 }
@@ -104,7 +114,7 @@ internal class ManualEntryViewModel(application:Application):AndroidViewModel(ap
                     }}
                     EntryResult()
                 }
-            }catch(e:CancellationException) {throw e}catch(_:Exception) {EntryResult("PC unreachable. Not sent.")}
+            }catch(e:CancellationException) {throw e}catch(e:Exception) {Log.w("Pneu","manual_entry_rejected: ${(e as? ShareFailure)?.reason ?: "read_failed"}");EntryResult("PC unreachable. Not sent.")}
         }
     }
 }

@@ -237,7 +237,10 @@ def permission_denials(test):
     try:
         instrument('permission-denials', test, seconds=240)
     finally:
-        restore()
+        try:
+            screenshots('files/fourth-review-screens', 'permission-denial-screens')
+        finally:
+            restore()
 
 
 def snapshot_rows():

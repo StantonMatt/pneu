@@ -108,7 +108,11 @@ $ANDROID_HOME/platform-tools/adb -s emulator-5554 install -r app/build/outputs/a
   non-text shares use normative `file`. Manual sends work while paused. Clipboard
   admission requires a live connection and negotiated capability; admitted work
   remains durable through ACK loss. Sensitive Android clips are rejected.
-  URI shares require an OS-recorded sender read grant (API 35+); API 34 URI shares fail closed because ordinary activity launches expose no equivalent caller proof. Text shares work on API 34. All admissions carry the same phone/PC binding from entry through metadata, staging
+  URI shares accept external `content://` providers and prove access with the
+  existing bounded provider open/read, including chooser-relayed grants and
+  Pneu's own media permission. No initial-caller proof or API 34 rejection applies.
+  Own providers and private/path-traversal URIs remain rejected. All admissions
+  carry the same phone/PC binding from entry through metadata, staging
   and enqueue; multi-item shares never acquire a new recipient between items.
   URI shares are copied immediately. No Direct Share publication or FileProvider
   exists. Startup removes legacy dynamic/long-lived shortcuts and full-file Recent
@@ -162,6 +166,12 @@ $ANDROID_HOME/platform-tools/adb -s emulator-5554 install -r app/build/outputs/a
   remain installed but unavailable when disabled.
   Lifecycle/settings writes share a failure boundary; saved state remains visible,
   navigation follows durable success, and errors offer retry when available.
+  Setup keeps Samsung's **Never sleeping apps** row checked while Android reports
+  Pneu exempt from battery optimisation (**Unrestricted** on One UI); One UI hides
+  exempt apps from that picker. Resume and service health checks use the current
+  exemption, so revoking it restores guidance unless a separately acknowledged
+  sleeping-list visit still passes its bucket/kill rechecks. Background-kill
+  evidence remains visible and can be dismissed even while the row is checked.
   Pair/replacement retries require confirmation again. Camera and deep-link
   confirmations retain their last attempted invitation across activity recreation;
   Try again after rejection re-presents it before issuing another pairing request.
@@ -233,10 +243,19 @@ No suite arguments runs all suites. Select one or more by name, for example:
 | `connection` | Deep-link rejection/confirmation retry plus complete pass 4/5/6 real mTLS classes: DNS fallback, staged snapshots, partial-file NACK, receipt/storage faults, interrupted/latest text and binding-reset recovery. |
 | `faults` | All 24 ConnectionFault scenarios with their required peer flags: completion/fallback storage recovery, ineligible-selection backoff, both 200 MiB transfers, capabilities, stalled writes, absolute deadlines, source revocation, unauthorized and generic TLS failures. |
 | `tls` | Keystore mutual TLS, wrong-pin/plaintext address fallback, TLS 1.2 rejection and exact pinned leaf with invalid TLS 1.3 CertificateVerify. |
-| `features` | Complete Features class: pairing recovery after expiry, silent TLS candidates, share/clipboard, SystemUI tiles, pause/observation boundaries, mid-copy policy invalidation/rescan delivery and latest-text delivery. |
+| `features` | Complete Features class: pairing recovery after expiry, silent TLS candidates, share/clipboard (including chooser-granted bytes verified at the authenticated peer), SystemUI tiles, pause/observation boundaries, mid-copy policy invalidation/rescan delivery and latest-text delivery. |
 | `policy` | Complete Policy class: actual metered route, mobile encoding, optimized recovery, recordings, mid-copy policy invalidation/rescan delivery, multiple shares, clipboard sensitivity/echo/receipts and staging capacity. |
 | `upload` | Hash-verified 160 MiB upload lasting over 180 seconds with no PC traffic before ACK. |
 | `daemon` | Builds this worktree's real `pneud`, pairs with private XDG state, unpairs while phone is offline, and verifies exactly three unauthorized frames followed by Pairing lost. |
+
+Features waits report their step names in instrumentation output and timeout
+assertions. Chooser sharing follows its activity operation to the exact Room row,
+ACK and peer FILE bytes/hash. Its sender stays alive for the real system chooser's
+result, and the package-filtered single target auto-launches through that chooser,
+without driving its animated sheet. Diagnostics include fixture launch status,
+provider-open counts and fixed Pneu rejection codes without source URIs or content.
+The permission-denial case saves failure screenshots and UI hierarchy under
+`permission-denial-screens/`, including when its instrumentation assertions fail.
 
 The outer scheduler admits Python before any fixture, invitation, listener or
 control-socket deadline starts. There are no nested `heavy` calls. APKs are
@@ -279,8 +298,9 @@ are consolidated, retaining every distinct fixture configuration and phased test
 
 ## Physical acceptance and interpretation
 
-- Validate Samsung sleep/Doze/reboot, Never sleeping guidance and permissions on
-  the S25+; real screenshot latency, HEIF decoding, recording paths, URI grants
+- Validate Samsung sleep/Doze/reboot, Unrestricted exemption/revocation,
+  Never sleeping guidance and permissions on the S25+; real screenshot latency,
+  HEIF decoding, recording paths, URI grants
   from real share providers, clipboard focus from notification/tile, real
   Wi-Fi/cellular/Tailscale transitions and battery use need physical acceptance.
 - The emulator has Wi-Fi enabled but its active default network is metered;
@@ -340,6 +360,12 @@ alert can describe a cryptographic fault and is not a revocation signal.
 - Shares received by the activity survive immediate Home and removal of its task.
   Force-stop/process death can interrupt items still being admitted; queued
   snapshots remain durable, and restored intents never replay admitted items.
+- Pneu reads shared items with whatever access it has, including its own photo
+  permission. Another app on the phone can ask Pneu to send a readable media item,
+  only ever to the user's own paired PC captured when sharing starts. External
+  callers cannot choose the recipient. Android 14+ and system-chooser shares use
+  the same bounded open/read path. Share failures log fixed reason codes under
+  the `Pneu` tag, without URIs, filenames, content or provider exception messages.
 - A pairing change during sharing or sending can drop an item; it never retargets
   admitted work to a replacement PC. Share activities begin recipient capture in `onCreate`: loaded snapshots
   are captured synchronously before suspension; cold entries wait up to five
@@ -361,8 +387,11 @@ alert can describe a cryptographic fault and is not a revocation signal.
 - Boot/update can briefly show the service notification on an unpaired phone before
   it stops. Persistent preference failure shows storage failure or requires opening
   Pneu; it never invents default trust settings.
-- Samsung **Never sleeping** state is inferred from guidance/rechecks, not read
-  from a system API. OEM restrictions may require user intervention.
+- Samsung **Never sleeping** is satisfied by the live battery-optimisation
+  exemption. Confirmed on the S25+ with One UI on Android 16: **Unrestricted** apps
+  are hidden from the Never sleeping picker. Without an exemption, state is
+  inferred from guidance/rechecks, since no API exposes the sleeping list.
+  OEM restrictions and background-kill evidence still require attention.
 
 Pass 8 adds `EighthReviewDeviceTest` for resume floors and late captures, shared
 JPEG/capture quotas, synchronous boot requests, unpaired-service stop, stale shortcut

@@ -95,7 +95,7 @@ class PneuService : Service() {
         val nm=getSystemService(NotificationManager::class.java)
         val alerts=listOf(
             Triple(!h.photos,"Pneu can't see new screenshots","Photo access was turned off"),
-            Triple(h.killed,"Pneu was stopped in the background",if(android.os.Build.MANUFACTURER.equals("samsung",true))"Add Pneu to Never sleeping apps" else "Check permissions and battery settings"),
+            Triple(h.killed,"Pneu was stopped in the background",if(android.os.Build.MANUFACTURER.equals("samsung",true) && !h.sleeping)"Add Pneu to Never sleeping apps" else "Check permissions and battery settings"),
             Triple(!h.battery,"Pneu may stop in the background","Battery use is set to Optimized"),
             Triple(!h.localNetwork,"Pneu can't connect to your PC","Local network access is off")
         )

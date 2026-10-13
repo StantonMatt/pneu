@@ -1,5 +1,7 @@
 package io.github.stantonmatt.pneu.features
 
+internal class BindingChangedException:IllegalStateException("Binding changed")
+
 /** Owns unpublished capture bytes. Automatic publication rejection is ordinary
  * policy invalidation; manual rejection still reports a changed recipient.
  * Cleanup precedes the rescan so observers never see abandoned staging bytes. */
@@ -8,7 +10,7 @@ internal object StagedAdmission {
         var admitted=false
         try {admitted=body()} finally {if(!admitted)discard()}
         if(!admitted) {
-            check(automatic) {"Binding changed"}
+            if(!automatic)throw BindingChangedException()
             rescan()
         }
         return admitted

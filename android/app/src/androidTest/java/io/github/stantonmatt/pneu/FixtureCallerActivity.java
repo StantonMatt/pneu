@@ -7,6 +7,19 @@ import android.os.Bundle;
 
 /** Standalone test APK UID; Java avoids target APK dependencies in its separate process. */
 public class FixtureCallerActivity extends Activity {
+    private static final int CHOOSER=1;
+    private void chooserState(String state) {
+        getContentResolver().call(Uri.parse("content://io.github.stantonmatt.pneu.test.sources"),"chooser-state",state,null);
+    }
+    private void launchFailed(String reason,boolean chooser) {
+        android.util.Log.w("Pneu","share_fixture_failed: "+reason);
+        if(chooser)chooserState(reason);
+        finish();
+    }
+    @Override protected void onActivityResult(int requestCode,int resultCode,Intent data) {
+        super.onActivityResult(requestCode,resultCode,data);
+        if(requestCode==CHOOSER)finish();
+    }
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         if(state!=null)return; // The test caller must not replay SEND on rotation.
@@ -36,7 +49,29 @@ public class FixtureCallerActivity extends Activity {
         if(getIntent().getBooleanExtra("grant",true))target.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
         if(getIntent().getBooleanExtra("persistable",false))target.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
         if(target.getClipData()==null && text==null)target.setClipData(ClipData.newRawUri("fixture",uri));
-        try {startActivity(target);} catch(Exception ignored) {}
+        if(getIntent().getBooleanExtra("clipOnly",false))target.removeExtra(Intent.EXTRA_STREAM);
+        Intent launch=target;
+        boolean chooser=getIntent().getBooleanExtra("chooser",false);
+        if(chooser) {
+            target.setComponent(null).setPackage("io.github.stantonmatt.pneu");
+            // There is exactly one target. Let the real system chooser select it
+            // deterministically, preserving its startActivityAsCaller attribution
+            // and temporary ClipData grant without an accessibility tap race.
+            launch=Intent.createChooser(target,"Share fixture")
+                .putExtra(Intent.EXTRA_AUTO_LAUNCH_SINGLE_CHOICE,true);
+        }
+        try {
+            if(chooser) {
+                // Keep the sender's Activity/token alive until the chooser returns.
+                startActivityForResult(launch,CHOOSER);
+                chooserState("started");
+                return;
+            }
+            startActivity(launch);
+        } catch(ActivityNotFoundException ignored) {launchFailed("launch_not_found",chooser);return;}
+        catch(SecurityException ignored) {launchFailed("launch_security",chooser);return;}
+        catch(IllegalArgumentException ignored) {launchFailed("launch_invalid",chooser);return;}
+        catch(Exception ignored) {launchFailed("launch_failed",chooser);return;}
         if(!getIntent().getBooleanExtra("keepAlive",false))finish();
     }
 }

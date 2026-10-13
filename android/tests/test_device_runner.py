@@ -187,6 +187,19 @@ class DeviceRunnerTest(unittest.TestCase):
         data = json.loads((self.scratch / 'results.json').read_text())
         self.assertTrue(all(s['status'] == 'failed' for s in data['suites']))
 
+    def test_permission_denial_failure_archives_ui_and_restores_permissions(self):
+        for archive_error in (None, RuntimeError('archive unavailable')):
+            with self.subTest(archive_error=archive_error), \
+                 patch.object(runner, 'install'), patch.object(runner, 'run'), \
+                 patch.object(runner, 'instrument', side_effect=AssertionError('UI failed')), \
+                 patch.object(runner, 'screenshots', side_effect=archive_error) as archive, \
+                 patch.object(runner, 'restore') as restore:
+                expected = 'archive unavailable' if archive_error else 'UI failed'
+                with self.assertRaisesRegex((AssertionError, RuntimeError), expected):
+                    runner.permission_denials('FourthReviewUiDeviceTest')
+                archive.assert_called_once_with('files/fourth-review-screens', 'permission-denial-screens')
+                restore.assert_called_once()
+
     def test_cleanup_error_does_not_leave_a_child_or_private_key(self):
         runner.scratch = self.scratch
         runner.adb = ['adb']

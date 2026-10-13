@@ -29,10 +29,11 @@ fun Context.health(p:io.github.stantonmatt.pneu.data.Prefs=graph.prefs.value): H
     val nm=getSystemService(NotificationManager::class.java)
     val notifications=NotificationManagerCompat.from(this).areNotificationsEnabled() && nm.getNotificationChannel("status")?.importance != NotificationManager.IMPORTANCE_NONE
     val am=getSystemService(ActivityManager::class.java)
-    val battery=getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName) && !am.isBackgroundRestricted
+    val batteryExempt=getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
+    val battery=batteryExempt && !am.isBackgroundRestricted
     val bucket=getSystemService(UsageStatsManager::class.java).appStandbyBucket
     val killed=p.peer!=null && ServiceEvidence.killed(this)
     if(killed && p.neverSleeping)graph.invalidateSleeping()
-    val sleeping=!Build.MANUFACTURER.equals("samsung",true) || PermissionPolicy.sleeping(p.neverSleeping,bucket<UsageStatsManager.STANDBY_BUCKET_RARE,killed)
+    val sleeping=!Build.MANUFACTURER.equals("samsung",true) || PermissionPolicy.sleeping(p.neverSleeping,bucket<UsageStatsManager.STANDBY_BUCKET_RARE,killed,batteryExempt)
     return Health(photos,notifications,battery,sleeping,killed,nm.getNotificationChannel("status")?.importance==NotificationManager.IMPORTANCE_NONE,am.isBackgroundRestricted,Build.VERSION.SDK_INT<37 || granted(Manifest.permission.ACCESS_LOCAL_NETWORK))
 }

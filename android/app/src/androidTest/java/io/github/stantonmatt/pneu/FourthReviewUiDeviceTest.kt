@@ -24,12 +24,28 @@ class FourthReviewUiDeviceTest {
     }
 
     private val i=InstrumentationRegistry.getInstrumentation();private val c=i.targetContext;private val app=c.graph;private val device=UiDevice.getInstance(i)
-    private fun launch(extra:String) {c.startActivity(Intent(c,MainActivity::class.java).putExtra(extra,true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK));Thread.sleep(500)}
-    private fun visible(text:String)=device.findObject(UiSelector().text(text)).waitForExists(4000)
+    private fun launch(extra:String) {
+        c.startActivity(Intent(c,MainActivity::class.java).putExtra(extra,true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
+        val title=when(extra) {"home"->"Pneu";"pair"->"Pair with PC";else->"Permissions and battery"}
+        assertTrue("Pneu $extra screen must appear",device.wait(Until.hasObject(By.pkg(c.packageName).text(title)),5000))
+        device.waitForIdle(1000)
+    }
+    private fun visible(text:String)=device.findObject(UiSelector().packageName(c.packageName).text(text)).waitForExists(4000)
+    private fun clickPneu(selector:BySelector,label:String) {
+        var target=requireNotNull(device.wait(Until.findObject(selector.pkg(c.packageName)),5000)) {"Pneu $label must appear"}
+        // Compose may expose the icon/text separately from its clickable parent.
+        while(!target.isClickable)target=requireNotNull(target.parent) {"Pneu $label must have a clickable control"}
+        device.waitForIdle(1000);target.click()
+    }
+    private fun settingsRow(title:String) {
+        val scroll=UiScrollable(UiSelector().packageName(c.packageName).scrollable(true))
+        assertTrue("Settings row '$title' must be reachable",scroll.scrollTextIntoView(title))
+        assertTrue("Settings row '$title' must be visible",visible(title))
+    }
     private fun rowSettings(title:String) {
-        val target=device.findObject(UiSelector().text(title));assertTrue(target.waitForExists(4000))
+        val target=device.findObject(UiSelector().packageName(c.packageName).text(title));assertTrue("Permission row '$title' must be visible",target.waitForExists(4000))
         val y=target.bounds.centerY()
-        device.findObjects(By.text("Settings")).minBy {kotlin.math.abs(it.visibleBounds.centerY()-y)}.click()
+        device.findObjects(By.pkg(c.packageName).text("Settings")).minBy {kotlin.math.abs(it.visibleBounds.centerY()-y)}.click()
     }
     private fun grant(permission:String)=i.uiAutomation.grantRuntimePermission(c.packageName,permission)
     @Test(timeout=90000) fun permanentDenialsRetainConfirmedPairingAndGenericKillCanBeAcknowledged()=runBlocking<Unit> {
@@ -56,15 +72,16 @@ class FourthReviewUiDeviceTest {
             assertTrue(visible("Camera access is off"));assertTrue(visible("Open settings"))
             device.findObject(UiSelector().text("Open settings")).click();assertTrue(device.wait(Until.hasObject(By.pkg("com.android.settings")),4000));device.pressBack()
             // Photos request only images, and a grant from Settings completes the intended toggle.
-            launch("home");device.findObject(UiSelector().description("Settings")).click();assertTrue(visible("Camera photos"))
-            device.findObject(UiSelector().text("Camera photos")).click()
+            launch("home");clickPneu(By.desc("Settings"),"Home Settings action")
+            assertTrue("Pneu Settings screen must open",device.wait(Until.hasObject(By.pkg(c.packageName).text("Settings")),5000))
+            settingsRow("Camera photos");clickPneu(By.text("Camera photos"),"Camera photos row")
             assertTrue(device.wait(Until.hasObject(By.pkg("com.android.settings")),4000));grant(Manifest.permission.READ_MEDIA_IMAGES);device.pressBack()
             assertTrue("Images grant",c.granted(Manifest.permission.READ_MEDIA_IMAGES));withTimeoutOrNull(5000) {app.prefs.first {it.photos}} ?: fail("Photos toggle did not resume after settings")
             assertFalse(c.granted(Manifest.permission.READ_MEDIA_VIDEO))
             val resumeGeneration=android.provider.MediaStore.getGeneration(c,"external_primary")
             app.preferences.toggle("paused",false);assertFalse(app.preferences.read().paused)
             assertTrue(app.preferences.read().imageFloor>resumeGeneration)
-            device.findObject(UiSelector().text("Screen recordings")).click()
+            settingsRow("Screen recordings");clickPneu(By.text("Screen recordings"),"Screen recordings row")
             assertTrue(device.wait(Until.hasObject(By.pkg("com.android.settings")),4000));grant(Manifest.permission.READ_MEDIA_VIDEO);device.pressBack()
             assertTrue("Video grant",c.granted(Manifest.permission.READ_MEDIA_VIDEO));withTimeoutOrNull(5000) {app.prefs.first {it.recordings}} ?: fail("Recording toggle did not resume after settings")
             launch("permissions");rowSettings("Notifications")
@@ -73,8 +90,8 @@ class FourthReviewUiDeviceTest {
             c.getSharedPreferences("service_evidence",Context.MODE_PRIVATE).edit().putBoolean("running",false).putLong("kill",System.currentTimeMillis()+1000).putLong("acknowledged",0).commit()
             assertTrue(ServiceEvidence.killed(c));launch("permissions")
             assertTrue(visible("Local network"));assertFalse(device.findObject(UiSelector().text("Camera")).exists());assertTrue(visible("Notifications"))
-            val scroll=device.findObject(UiSelector().scrollable(true));if(scroll.exists())UiScrollable(UiSelector().scrollable(true)).scrollTextIntoView("Dismiss")
-            assertTrue(visible("Pneu was stopped in the background"));assertTrue(visible("Dismiss"));device.findObject(UiSelector().text("Dismiss")).click()
+            val scroll=device.findObject(UiSelector().packageName(c.packageName).scrollable(true));if(scroll.exists())UiScrollable(UiSelector().packageName(c.packageName).scrollable(true)).scrollTextIntoView("Dismiss")
+            assertTrue("Kill evidence must remain visible",visible("Pneu was stopped in the background"));assertTrue("Kill evidence must be dismissible",visible("Dismiss"));clickPneu(By.text("Dismiss"),"kill evidence Dismiss")
             withTimeout(4000) {while(ServiceEvidence.killed(c))delay(30)}
             assertFalse(c.health().killed)
             device.pressBack();launch("home");assertFalse(visible("Pneu was stopped in the background"))

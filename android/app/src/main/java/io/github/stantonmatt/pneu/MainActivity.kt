@@ -245,7 +245,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
                     if(PermissionPolicy.batterySettings(checked.backgroundRestricted))details()
                     else runCatching {context.startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,Uri.parse("package:${context.packageName}")))}.onFailure {details()}
                 }
-                if(checked.killed && !Build.MANUFACTURER.equals("samsung",true))PermissionRow("Pneu was stopped in the background",R.drawable.ic_bedtime_off,false,"Dismiss") {
+                if(checked.killed && (checked.sleeping || !Build.MANUFACTURER.equals("samsung",true)))PermissionRow("Pneu was stopped in the background",R.drawable.ic_bedtime_off,false,"Dismiss") {
                     scope.launch {if(actions.run("Couldn't acknowledge background stop") {withContext(Dispatchers.IO) {ServiceEvidence.acknowledge(context)}}) {recheck++;repair()}}
                 }
                 if(Build.MANUFACTURER.equals("samsung",true)) PermissionRow("Never sleeping apps",R.drawable.ic_bedtime_off,checked.sleeping,"Open",if(checked.sleeping) null else "Add Pneu to the list") {

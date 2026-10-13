@@ -78,7 +78,7 @@ class NinthReviewDeviceTest {
         (c.applicationContext as Application).registerActivityLifecycleCallbacks(callbacks);control("reset")
     }
     @After fun cleanup()=runBlocking<Unit> {
-        app.preferences.beforeRead={};app.preferences.beforeReadStart={};control("release");device.setOrientationNatural();device.unfreezeRotation();device.pressHome()
+        app.preferences.beforeRead={};app.preferences.beforeReadStart={};control("release");control("delete-media");device.setOrientationNatural();device.unfreezeRotation();device.pressHome()
         (c.applicationContext as Application).unregisterActivityLifecycleCallbacks(callbacks)
         i.runOnMainSync {current.get()?.finish()}
         c.stopService(Intent(c,PneuService::class.java));app.connection.stop();app.forgetBinding();sources.forEach {c.contentResolver.delete(it,null,null)};app.staging.cleanup()
@@ -91,6 +91,55 @@ class NinthReviewDeviceTest {
         val result=withTimeout(4000) {operation.result.filterNotNull().first()}
         assertEquals("PC unreachable. Not sent.",result.message)
         assertNotNull(operation.clipboardBinding);assertTrue(app.queue.pending().isEmpty())
+    }
+    @Test(timeout=30000) fun chooserRelaysTemporaryGrantToBoundedShareRead()=runBlocking<Unit> {
+        val since=System.currentTimeMillis();val source=ChooserShareFixture.source("slow-image")
+        val expected=ChooserShareFixture.expectedBytes(c)
+        assertEquals(PackageManager.PERMISSION_DENIED,c.checkUriPermission(source,Process.myPid(),Process.myUid(),Intent.FLAG_GRANT_READ_URI_PERMISSION))
+        try {
+            ChooserShareFixture.launch(c,"slow-image");entered()
+            val activity=currentShare();val operation=startedOperation(activity)
+            assertTrue(activity.isTaskRoot)
+            i.runOnMainSync {activity.finishAndRemoveTask()}
+            withTimeout(3000) {while(!activity.isDestroyed)delay(10)}
+            // The read has not happened yet; only the service now owns the grant.
+            assertEquals(0,control("stats").getInt("opens"))
+            assertEquals(PackageManager.PERMISSION_GRANTED,c.checkUriPermission(source,Process.myPid(),Process.myUid(),Intent.FLAG_GRANT_READ_URI_PERMISSION))
+            control("release")
+            val result=withTimeout(5000) {operation.result.filterNotNull().first()}
+            assertEquals(result.message,1,operation.completed.filterNotNull().size)
+            queued(1)
+            val row=app.queue.pending().single {it.kind=="file"}
+            assertEquals("",row.uri);assertEquals(expected.size.toLong(),row.size)
+            assertEquals(sha256(expected),row.hash);assertArrayEquals(expected,java.io.File(row.path).readBytes())
+            withTimeout(3000) {while(c.checkUriPermission(source,Process.myPid(),Process.myUid(),Intent.FLAG_GRANT_READ_URI_PERMISSION)!=PackageManager.PERMISSION_DENIED)delay(10)}
+        }finally {control("release");ChooserShareFixture.report("chooser-admission",since)}
+    }
+    @Test(timeout=15000) fun broadPhotoPermissionReadsExternalClipDataWithoutUriGrant()=runBlocking<Unit> {
+        // Inserted by the test provider's separate UID, not owned by Pneu.
+        val source=Uri.parse(control("create-media").getString("uri"))
+        assertEquals(PackageManager.PERMISSION_DENIED,c.checkUriPermission(source,Process.myPid(),Process.myUid(),Intent.FLAG_GRANT_READ_URI_PERMISSION))
+        c.startActivity(Intent().setComponent(ComponentName(c.packageName+".test",FixtureCallerActivity::class.java.name))
+            .putExtra("uri",source.toString()).putExtra("grant",false).putExtra("clipOnly",true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
+        val operation=startedOperation(currentShare())
+        withTimeout(5000) {operation.result.filterNotNull().first()}
+        queued(1);assertEquals(1,operation.completed.filterNotNull().size)
+        withTimeout(3000) {while(c.checkUriPermission(source,Process.myPid(),Process.myUid(),Intent.FLAG_GRANT_READ_URI_PERMISSION)!=PackageManager.PERMISSION_DENIED)delay(10)}
+        assertEquals(PackageManager.PERMISSION_DENIED,c.checkUriPermission(source,Process.myPid(),Process.myUid(),Intent.FLAG_GRANT_READ_URI_PERMISSION))
+    }
+    @Test(timeout=15000) fun deniedOpenFailsWithoutAdmittingSnapshot()=runBlocking<Unit> {
+        caller("denied")
+        val operation=startedOperation(currentShare())
+        assertEquals("Couldn't read this item",withTimeout(5000) {operation.result.filterNotNull().first()}.message)
+        assertEquals(listOf<String?>(null),operation.completed);assertTrue(app.queue.pending().isEmpty())
+        assertEquals(1,control("stats").getInt("opens"))
+    }
+    @Test(timeout=15000) fun producerReadFailureDoesNotAdmitPartialSnapshot()=runBlocking<Unit> {
+        caller("read-error")
+        val operation=startedOperation(currentShare())
+        assertEquals("Couldn't read this item",withTimeout(5000) {operation.result.filterNotNull().first()}.message)
+        assertEquals(listOf<String?>(null),operation.completed);assertTrue(app.queue.pending().isEmpty())
+        assertEquals(1,control("stats").getInt("opens"))
     }
     @Test(timeout=15000) fun serviceRecoversInitialReadFailureWithoutAnotherStart()=runBlocking<Unit> {
         val failed=AtomicBoolean(true);val reads=AtomicInteger();val epoch=app.preferences.read().policyEpoch

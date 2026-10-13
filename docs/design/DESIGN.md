@@ -153,7 +153,9 @@ One card with these rows (leading icon 24 dp in `onSurfaceVariant`; trailing con
 | Notifications | `NotificationManagerCompat.areNotificationsEnabled()` and the Status channel isn't blocked |
 | Photos and videos | `READ_MEDIA_IMAGES` granted (and `READ_MEDIA_VIDEO` if Screen recordings is on). Only `READ_MEDIA_VISUAL_USER_SELECTED` granted = limited. |
 | Unrestricted battery use | `PowerManager.isIgnoringBatteryOptimizations(packageName)` and not `ActivityManager.isBackgroundRestricted()` |
-| Never sleeping apps | Can't be read directly. Marked done when the user comes back from that screen; reset to not done if Pneu's app standby bucket is `RARE` or `RESTRICTED`, or `getHistoricalProcessExitReasons()` shows the service was killed by the system while it should have been running. |
+| Never sleeping apps | Done while `PowerManager.isIgnoringBatteryOptimizations(packageName)` is true: Samsung treats Unrestricted apps as never sleeping and hides them from the picker. Otherwise, marked done when the user comes back from that screen; reset to not done if Pneu's app standby bucket is `RARE` or `RESTRICTED`, or `getHistoricalProcessExitReasons()` shows the service was killed by the system while it should have been running. |
+
+The Samsung row keeps its checkmark while the battery exemption is active, without asking the user to visit the picker. Revoking the exemption restores the guidance unless the separate sleeping-list acknowledgement still passes its rechecks. Background-kill evidence still shows the Home banner and alert even with an exemption; Permissions and battery offers **Dismiss** for that evidence when Never sleeping apps is already satisfied.
 
 Samsung intent for the list: try the Device care "Never sleeping apps" activity first, fall back to Device care's battery screen, then to `ACTION_APPLICATION_DETAILS_SETTINGS`. **Verify the exact component on the S25+ in the spike.**
 
@@ -479,7 +481,7 @@ Sentence case. Use plurals resources for every `{n}`.
 | `alert_battery_title` | Pneu may stop in the background |
 | `alert_battery_text` | Battery use is set to Optimized |
 | `alert_killed_title` | Pneu was stopped in the background |
-| `alert_killed_text` | Add Pneu to Never sleeping apps |
+| `alert_killed_text` | Check permissions and battery settings (Samsung when Never sleeping apps is not satisfied: Add Pneu to Never sleeping apps) |
 | `alert_photos_title` | Pneu can't see new screenshots |
 | `alert_photos_text` | Photo access was turned off |
 | `tile_pneu` | Pneu |
@@ -686,7 +688,7 @@ Notifications:
 ## 5. For the spike and the implementers
 
 1. **Plasma tray recolouring** from an app-supplied `IconThemePath` (section 2). Fallback is described there.
-2. **Samsung "Never sleeping apps" intent** and whether "Unrestricted" battery already adds Pneu to that list on One UI 8. If it does, drop the separate row.
+2. **Samsung "Never sleeping apps" intent:** verify the fallback component on the S25+ when battery optimisation is active. Resolved on the Galaxy S25+, One UI on Android 16: **Unrestricted** exempts Pneu from battery optimisation, satisfies the never-sleeping requirement and hides Pneu from the picker. Keep the row checked while exempt, and re-check on resume; background-kill evidence remains independent.
 3. **`x-kde-urls` rendering** in Plasma 6.6 notifications from a non-KNotification client (the thumbnail and drag-out). If it doesn't render, use `image-path` with the file URL instead and keep the same actions.
 4. **Status notification importance.** `IMPORTANCE_LOW` keeps the **Send clipboard** button one swipe away. If its status-bar icon is unwanted, the user can set the channel to minimised in One UI; don't use `IMPORTANCE_MIN` by default.
 5. **Clipboard read from the translucent activity** on One UI: confirm `onWindowFocusChanged` gets focus when launched from the tile with the shade collapsing.

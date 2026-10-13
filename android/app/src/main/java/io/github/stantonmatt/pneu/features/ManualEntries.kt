@@ -34,22 +34,25 @@ object ManualEntries {
     fun clipboardIntent(context:Context,p:Prefs)=bind(Intent(context,SendClipboardActivity::class.java),p)
     suspend fun text(app:AppGraph,text:String,origin:String):Outgoing=text(app,text,origin,DeliveryBinding.from(app.awaitPrefs()))
     suspend fun text(app: AppGraph,text: String,origin: String,binding:DeliveryBinding?): Outgoing {
-        check(binding!=null) {"Not paired"}
-        val timestamp=app.newTextTimestamp()
+        if(binding==null)throw ShareFailure("binding_mismatch")
+        val timestamp=shareStep("settings") {app.newTextTimestamp()}
         val row=Outgoing().apply {mediaId="manual:${randomId()}";transferId=randomId();kind="text";automatic=false;this.text=text;this.origin=origin;createdAt=timestamp;mime="text/plain"}
-        Protocol.validate(Type.CLIPBOARD,json("transfer_id" to row.transferId,"text" to text,"created_at" to row.createdAt,"origin" to origin))
-        Protocol.write(java.io.ByteArrayOutputStream(),Frame.Control(Type.CLIPBOARD,json("transfer_id" to row.transferId,"text" to text,"created_at" to row.createdAt,"origin" to origin)))
-        check(app.enqueue(row,binding));app.connection.kick();return row
+        shareStep("invalid_text") {
+            Protocol.validate(Type.CLIPBOARD,json("transfer_id" to row.transferId,"text" to text,"created_at" to row.createdAt,"origin" to origin))
+            Protocol.write(java.io.ByteArrayOutputStream(),Frame.Control(Type.CLIPBOARD,json("transfer_id" to row.transferId,"text" to text,"created_at" to row.createdAt,"origin" to origin)))
+        }
+        if(!shareStep("storage_failed") {app.enqueue(row,binding)})throw ShareFailure("binding_mismatch")
+        app.connection.kick();return row
     }
     suspend fun file(app:AppGraph,uri:Uri,kind:String):Outgoing=file(app,uri,kind,DeliveryBinding.from(app.awaitPrefs()))
     suspend fun file(app: AppGraph,uri: Uri,kind: String,binding:DeliveryBinding?,resolvedMime:String?=null): Outgoing {
-        check(binding!=null && binding.matches(app.preferences.read())) {"Binding changed"}
-        require(ShareAdmission.publicContent(uri,app.context.packageName))
-        val type=resolvedMime ?: ProviderReads.call {app.context.contentResolver.getType(uri)}
+        if(binding==null || !binding.matches(shareStep("settings") {app.preferences.read()}))throw ShareFailure("binding_mismatch")
+        shareStep("metadata_failed") {ShareAdmission.rejection(app.context,uri)}?.let {throw ShareFailure(it)}
+        val type=resolvedMime ?: shareStep("metadata_failed") {ProviderReads.call {app.context.contentResolver.getType(uri)}}
         val row=Outgoing().apply {mediaId="manual:${randomId()}";transferId=randomId();this.uri=uri.toString();this.kind=kind;automatic=false;createdAt=System.currentTimeMillis();mime=type ?: "application/octet-stream";fileName="Shared item"}
-        row.fileName=ProviderReads.call {signal->app.context.contentResolver.query(uri,arrayOf(OpenableColumns.DISPLAY_NAME),null,null,null,signal)?.use {if(it.moveToFirst())it.getString(0) else null}} ?: row.fileName
+        row.fileName=shareStep("metadata_failed") {ProviderReads.call {signal->app.context.contentResolver.query(uri,arrayOf(OpenableColumns.DISPLAY_NAME),null,null,null,signal)?.use {if(it.moveToFirst())it.getString(0) else null}}} ?: row.fileName
         row.fileName=safeFilename(row.fileName)
-        app.staging.capture(row,binding);app.connection.kick();return row
+        shareStep("read_failed") {app.staging.capture(row,binding)};app.connection.kick();return row
     }
     fun configureShareTarget(context:Context,enabled:Boolean) {
         context.packageManager.setComponentEnabledSetting(ComponentName(context,ShareActivity::class.java),if(enabled)android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_ENABLED else android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED,android.content.pm.PackageManager.DONT_KILL_APP)
@@ -118,19 +121,25 @@ class ShareActivity : ManualEntryActivity() {
         super.onCreate(state)
         val operation=requireNotNull(operation)
         if(operation.started)return
-        if(intent.hasExtra(Intent.EXTRA_SHORTCUT_ID) || !ShareAdmission.supported(intent.action)) {finish();return}
+        if(intent.hasExtra(Intent.EXTRA_SHORTCUT_ID)) {ShareAdmission.warn("shortcut");finish();return}
+        if(!ShareAdmission.supported(intent.action)) {ShareAdmission.warn("unsupported_action");finish();return}
+        var failureReason="invalid_intent"
         try {
             val streams=if(intent.action==Intent.ACTION_SEND_MULTIPLE)intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM,Uri::class.java).orEmpty()
                 else listOfNotNull(intent.getParcelableExtra(Intent.EXTRA_STREAM,Uri::class.java))
             val items=if(streams.isNotEmpty())streams.toList() else (0 until (intent.clipData?.itemCount ?: 0)).mapNotNull {intent.clipData?.getItemAt(it)?.uri}
             val texts=if(intent.action==Intent.ACTION_SEND_MULTIPLE)intent.getCharSequenceArrayListExtra(Intent.EXTRA_TEXT)?.map {it.toString()}.orEmpty()
                 else listOfNotNull(intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString())
-            // Capture caller proof before handing temporary grants to the
-            // process-owned admission. Neither rotation nor task removal replays it.
-            val grants=items.all {ShareAdmission.granted(this,intent,it)}
-            val request=ShareRequest(binding,items,texts,grants)
-            if(grants)ShareAdmissionService.start(this,operation,request) else operation.share(request)
-        }catch(_:Exception) {operation.failure("Couldn't read this item")}
+            failureReason="metadata_failed"
+            items.firstNotNullOfOrNull {ShareAdmission.rejection(this,it)}?.let {
+                ShareAdmission.warn(it);operation.failure("Couldn't read this item",it);return
+            }
+            // The bounded provider open/read proves access, including chooser
+            // grants or our media permission. Keep temporary grants service-owned.
+            val request=ShareRequest(binding,items,texts)
+            failureReason="service_start"
+            ShareAdmissionService.start(this,operation,request)
+        }catch(_:Exception) {ShareAdmission.warn(failureReason);operation.failure("Couldn't read this item",failureReason)}
     }
 }
 

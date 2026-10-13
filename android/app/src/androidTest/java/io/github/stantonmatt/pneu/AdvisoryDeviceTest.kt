@@ -83,15 +83,16 @@ class AdvisoryDeviceTest {
         assertNotNull(app.queue.find(row.mediaId));assertTrue(app.preferences.flow.first().deliveryReset)
         app.reconcileDelivery();assertNull(app.queue.find(row.mediaId));assertFalse(app.preferences.flow.first().deliveryReset)
     }
-    @Test(timeout=45000) fun separateCallerCannotUseAmbientPermissionsOrPrivateUris()=runBlocking {
+    @Test(timeout=45000) fun separateCallerUsesReadableMediaButCannotUsePrivateUris()=runBlocking {
         seed();val source=image("Pictures/Pneu advisory/");val before=app.queue.nextOrder()
         for(uri in listOf("file://${context.filesDir}/datastore/pneu.preferences_pb","content://${context.packageName}.files/shared/private","content://io.github.stantonmatt.pneu.test.sources/data/user/0/private"))caller(uri)
-        caller(source.toString(),false) // SEND auto-migrates EXTRA_STREAM to a grant; the caller still lacks this MediaStore permission.
         caller("content://io.github.stantonmatt.pneu.test.sources/image",true,"unsupported.action")
         assertEquals(before,app.queue.nextOrder())
+        caller(source.toString(),false) // Pneu can read this media without caller proof.
+        withTimeout(5000) {while(app.queue.nextOrder()<before+1)delay(50)}
         caller("content://io.github.stantonmatt.pneu.test.sources/image")
-        withTimeout(5000) {while(app.queue.pending().isEmpty())delay(50)}
-        assertEquals("file",app.queue.pending().single().kind)
+        withTimeout(5000) {while(app.queue.pending().size<2)delay(50)}
+        assertTrue(app.queue.pending().all {it.kind=="file"})
     }
     @Test(timeout=45000) fun multipleSharedTextsKeepLatestUnsentItem()=runBlocking<Unit> {
         seed();app.preferences.toggle("wifi",false)

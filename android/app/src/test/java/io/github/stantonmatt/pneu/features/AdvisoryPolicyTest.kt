@@ -46,7 +46,7 @@ class AdvisoryPolicyTest {
     }
     @Test fun permissionCopyMatchesRepairAndLimitedGrantsRemainRequestable() {
         assertTrue(PermissionPolicy.batterySettings(true));assertFalse(PermissionPolicy.batterySettings(false))
-        assertFalse(PermissionPolicy.sleeping(true,true,true));assertTrue(PermissionPolicy.sleeping(true,true,false))
+        assertFalse(PermissionPolicy.sleeping(true,true,true,false));assertTrue(PermissionPolicy.sleeping(true,true,false,false))
         assertEquals("Allow all",PermissionPolicy.photoAction(true,true,false))
         assertEquals("Allow",PermissionPolicy.photoAction(false,true,true))
         assertEquals("Settings",PermissionPolicy.photoAction(false,true,false))

@@ -78,7 +78,7 @@ class ThirteenthReviewDeviceTest {
         try {
             val snapshots=PreferenceSnapshots(flow {awaitCancellation()},owner)
             val operation=ManualEntryViewModel(c.applicationContext as Application)
-            val request=ShareRequest(snapshots.captureBinding(),emptyList(),listOf("Never admitted"),true)
+            val request=ShareRequest(snapshots.captureBinding(),emptyList(),listOf("Never admitted"))
             val start=android.os.SystemClock.elapsedRealtime()
             i.runOnMainSync {operation.share(request)}
             val result=withTimeout(7000) {operation.result.filterNotNull().first()}
