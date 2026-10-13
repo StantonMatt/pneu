@@ -602,6 +602,26 @@ impl Store {
         verified: VerifiedFile,
         stage: Stage,
     ) -> Result<bool> {
+        self.commit_file_checked(device, verified, stage, None)
+            .await
+    }
+    pub(crate) async fn commit_saved_file(
+        &self,
+        device: Id,
+        verified: VerifiedFile,
+        stage: Stage,
+        cache: PathBuf,
+    ) -> Result<bool> {
+        self.commit_file_checked(device, verified, stage, Some(cache))
+            .await
+    }
+    async fn commit_file_checked(
+        &self,
+        device: Id,
+        verified: VerifiedFile,
+        stage: Stage,
+        cache: Option<PathBuf>,
+    ) -> Result<bool> {
         let epoch = self.peer_epoch(&device);
         self.blocking(move |store| {
             let begin = verified.metadata();
@@ -623,6 +643,14 @@ impl Store {
                 }
                 validate_failed_file(tx, &device, &begin)?;
                 capacity(&store.folder, store.reserve.load(Ordering::SeqCst))?;
+                if let Some(cache) = &cache {
+                    // Use the retained directory's current path, so a folder
+                    // moved into the cache during a transfer cannot become a save.
+                    ensure!(
+                        !crate::config::save_folder_overlaps_cache(&stage.0.folder.path()?, cache),
+                        rustix::io::Errno::ACCESS
+                    );
+                }
                 stage.place()?;
                 tx.execute(
                     "INSERT INTO receipts(device,id,meta,destination) VALUES (?,?,?,?)",
@@ -1642,11 +1670,7 @@ mod tests {
             let (dir, store, device) = fixture().await?;
             let cache = dir.path().join("cache");
             let staged = store
-                .create_stage(
-                    cache.clone(),
-                    format!("received-{}", crate::random_hex(16)),
-                    5,
-                )
+                .create_stage(cache.clone(), crate::storage::cache_basename("file.bin"), 5)
                 .await?;
             (&staged.0.file).write_all(b"owned")?;
             let path = staged.destination_path()?;

@@ -20,6 +20,7 @@ fn reinstall_reenables_graphical_session_unit_and_restarts_only_in_session() -> 
                 "-c",
                 r#"
 function /home/mjstanton/.local/bin/heavy() { printf 'build\n' >> "$PNEU_INSTALL_TRACE"; }
+heavy() { printf 'build\n' >> "$PNEU_INSTALL_TRACE"; }
 install() { printf 'install\n' >> "$PNEU_INSTALL_TRACE"; }
 systemctl() {
     printf '%s\n' "$*" >> "$PNEU_INSTALL_TRACE"

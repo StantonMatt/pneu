@@ -785,7 +785,7 @@ async fn cache_mode_and_restart_required_port_change() -> Result<()> {
         files[0]
             .file_name()
             .to_string_lossy()
-            .starts_with("received-")
+            .starts_with(".pneu-cache-")
     );
     assert_eq!(std::fs::read(files[0].path())?, bytes);
     // Other settings and ordinary connection replacement still work on the
@@ -2137,10 +2137,11 @@ async fn long_image_names_preserve_extension_and_bursts_open_only_latest() -> Re
     let images = h.actions.images.lock().unwrap().clone();
     let opens = h.actions.opens.lock().unwrap().clone();
     let newest = h
-        .saved()?
-        .into_iter()
-        .find(|p| p.file_name().unwrap().to_string_lossy().contains("-2-"))
-        .unwrap();
+        .core
+        .config()
+        .save_path
+        .join(format!("2-{}.png", "é".repeat(122)));
+    assert!(h.saved()?.contains(&newest));
     assert_eq!(opens, vec![newest.clone()]);
     assert_eq!(images.last(), Some(&newest));
     assert!(
@@ -2835,6 +2836,74 @@ async fn offers_policy_changes_and_stale_discard_cannot_send_prepared_clipboard(
     drop(newer);
     h.stop().await
 }
+#[tokio::test]
+async fn save_folder_ipc_and_startup_reject_cache_aliases_and_children() -> Result<()> {
+    let h = Harness::new().await?;
+    let alias = h.dir.path().join("cache-alias");
+    std::os::unix::fs::symlink(&h.core.paths.cache, &alias)?;
+    let original = h.core.config();
+    original.save(&h.core.paths.config)?;
+    let persisted = std::fs::read(&h.core.paths.config)?;
+    let (listener, _owner) = pneud::ipc::bind(&h.core.paths.socket)?;
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let ipc = tokio::spawn(pneud::ipc::serve(h.core.clone(), listener, rx));
+    let outcome: Result<()> = async {
+        for folder in [
+            h.core.paths.cache.clone(),
+            h.core.paths.cache.join("new/nested"),
+            alias.clone(),
+            alias.join("new/nested"),
+        ] {
+            let mut config = original.clone();
+            config.save_path = folder.clone();
+            let error = h.core.update_config(config.clone()).await.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("save folder must not be the daemon cache directory")
+            );
+            let error = Core::new(h.core.paths.clone(), config, h.actions.clone())
+                .await
+                .err()
+                .expect("startup rejects cache save folder");
+            assert!(
+                error
+                    .to_string()
+                    .contains("save folder must not be the daemon cache directory")
+            );
+            // The GUI folder chooser issues this same IPC command.
+            let error = pneud::ipc::request(
+                &h.core.paths.socket,
+                pneud::ipc::Command::SaveFolder { folder },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("save folder must not be the daemon cache directory")
+            );
+            assert_eq!(h.core.config().save_path, original.save_path);
+            assert_eq!(std::fs::read(&h.core.paths.config)?, persisted);
+        }
+        let allowed = h.dir.path().join("cache-sibling/new");
+        pneud::ipc::request(
+            &h.core.paths.socket,
+            pneud::ipc::Command::SaveFolder {
+                folder: allowed.clone(),
+            },
+        )
+        .await?;
+        assert_eq!(h.core.config().save_path, allowed);
+        Ok(())
+    }
+    .await;
+    stop.send_replace(true);
+    ipc.await??;
+    h.stop().await?;
+    outcome
+}
+
 #[tokio::test]
 async fn field_specific_settings_preserve_concurrent_folder_and_toggle_changes() -> Result<()> {
     let h = Harness::new().await?;

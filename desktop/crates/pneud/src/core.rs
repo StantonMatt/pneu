@@ -2,7 +2,7 @@ use crate::{
     Config, Paths,
     actions::{PcActions, ReceivedFile},
     identity::Identity,
-    storage::{Stage, VerifiedFile},
+    storage::{Stage, VerifiedFile, cache_basename, safe_basename},
     store::{Metadata, Store},
     tls::{Admission, ClientVerifier, Invitation},
 };
@@ -583,7 +583,7 @@ impl Core {
         config: Config,
         actions: Arc<dyn PcActions>,
     ) -> Result<Arc<Self>> {
-        config.validate()?;
+        config.validate_with_cache(&paths.cache)?;
         paths.prepare()?;
         let store = Store::open(&paths.data.join("state.sqlite3"))?;
         let identity = Identity::load_or_create(&paths.data)?;
@@ -1110,7 +1110,7 @@ impl Core {
         config: Config,
         guard: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<()> {
-        config.validate()?;
+        config.validate_with_cache(&self.paths.cache)?;
         ensure!(
             config.port == self.config().port,
             "changing the port takes effect after restarting pneud"
@@ -2281,6 +2281,17 @@ impl Core {
                                         state.stage.clone().context("missing cache stage")?,
                                     )
                                     .await
+                            } else if state.config.save_to_folder
+                                && state.begin.kind != FileKind::ClipboardImage
+                            {
+                                store
+                                    .commit_saved_file(
+                                        device.clone(),
+                                        verified,
+                                        state.stage.clone().context("missing staging handle")?,
+                                        self.paths.cache.clone(),
+                                    )
+                                    .await
                             } else {
                                 store
                                     .commit_file(
@@ -2576,11 +2587,7 @@ impl Core {
         let stage = store
             .create_stage(
                 self.paths.cache.clone(),
-                format!(
-                    "received-{}-{}",
-                    crate::random_hex(16),
-                    safe_basename(&state.begin.file_name, 200)
-                ),
+                cache_basename(&state.begin.file_name),
                 state.begin.size,
             )
             .await?;
@@ -2628,19 +2635,24 @@ impl Core {
                     .blocking(move |_| crate::config::private_dir(&cache))
                     .await?;
             }
-            let prefix =
+            let destination =
                 if state.begin.kind == FileKind::ClipboardImage || !state.config.save_to_folder {
-                    "received-"
+                    cache_basename(&state.begin.file_name)
                 } else {
-                    ""
+                    safe_basename(&state.begin.file_name, 255)
                 };
-            let destination = format!(
-                "{prefix}{}-{}",
-                crate::random_hex(16),
-                safe_basename(&state.begin.file_name, 200)
-            );
             let size = state.begin.size;
-            let stage = match store.create_stage(folder, destination, size).await {
+            let stage = match async {
+                if state.config.save_to_folder && state.begin.kind != FileKind::ClipboardImage {
+                    ensure!(
+                        !crate::config::save_folder_overlaps_cache(&folder, &self.paths.cache),
+                        rustix::io::Errno::ACCESS
+                    );
+                }
+                store.create_stage(folder, destination, size).await
+            }
+            .await
+            {
                 Ok(stage) => stage,
                 Err(error)
                     if state.config.save_to_folder
@@ -2659,11 +2671,7 @@ impl Core {
                     store
                         .create_stage(
                             self.paths.cache.clone(),
-                            format!(
-                                "received-{}-{}",
-                                crate::random_hex(16),
-                                safe_basename(&state.begin.file_name, 200)
-                            ),
+                            cache_basename(&state.begin.file_name),
                             size,
                         )
                         .await?
@@ -3184,21 +3192,6 @@ async fn close_transport<W: tokio::io::AsyncWrite + Unpin>(
         _ => vec![reason.message()],
     };
     crate::transport::close(writer, &messages).await
-}
-
-fn safe_basename(name: &str, max: usize) -> String {
-    let split = name
-        .rsplit_once('.')
-        .filter(|(stem, ext)| !stem.is_empty() && ext.len() < 32);
-    let (stem, suffix) = split
-        .map(|(stem, ext)| (stem, format!(".{ext}")))
-        .unwrap_or((name, String::new()));
-    let budget = max.saturating_sub(suffix.len());
-    let mut end = stem.len().min(budget);
-    while !stem.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}{suffix}", &stem[..end])
 }
 
 async fn read_handshake(tls: &mut TlsStream<TcpStream>) -> Result<Message> {
@@ -4787,6 +4780,241 @@ mod tests {
             Ok(())
         }
     }
+    struct PathActions(mpsc::UnboundedSender<(&'static str, PathBuf)>);
+    #[async_trait::async_trait]
+    impl PcActions for PathActions {
+        async fn clipboard_text(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn clipboard_image(&self, _: &std::path::Path, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn notify(&self, path: &std::path::Path, _: &str) -> Result<()> {
+            self.0.send(("notify", path.into()))?;
+            Ok(())
+        }
+        async fn open(&self, path: &std::path::Path) -> Result<()> {
+            self.0.send(("open", path.into()))?;
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn readable_save_names_propagate_to_receipts_events_and_actions_on_replay() -> Result<()>
+    {
+        let (actions, mut observed) = mpsc::unbounded_channel();
+        let (_dir, core, device) = fixture(Arc::new(PathActions(actions))).await?;
+        let mut events = core.subscribe();
+        let mut config = core.config();
+        config.open_in_viewer = true;
+        config.copy_image_to_clipboard = false;
+        config.notification_preview = true;
+        core.update_config(config).await?;
+        let bytes = b"\x89PNG\r\n\x1a\nreceived";
+        let mut begin = test_begin(bytes);
+        begin.file_name = "写真.png".into();
+        begin.mime = "image/png".into();
+        let folder = core.config().save_path;
+        let (tx, mut rx) = mpsc::channel(2);
+        // First transfer keeps its name; a different ID collides; its replay
+        // uses the durable receipt and does not place or act on another file.
+        for (index, expected) in ["写真.png", "写真 (2).png", "写真 (2).png"]
+            .into_iter()
+            .enumerate()
+        {
+            if index == 1 {
+                begin.transfer_id = Id::new(crate::random_hex(16))?;
+            }
+            let mut incoming = None;
+            for message in [
+                Message::FileBegin(begin.clone()),
+                Message::FileChunk(FileChunk {
+                    transfer_id: begin.transfer_id.clone(),
+                    offset: 0,
+                    data: bytes.to_vec(),
+                }),
+                Message::FileEnd(FileEnd {
+                    transfer_id: begin.transfer_id.clone(),
+                }),
+            ] {
+                core.receive_test(&core.store, &device, message, &mut incoming, &tx)
+                    .await?;
+            }
+            assert!(
+                matches!(rx.recv().await, Some(Message::Ack(Ack { deduplicated, .. })) if deduplicated == (index == 2))
+            );
+            let expected_path = folder.join(expected);
+            let id = begin.transfer_id.clone();
+            let peer = device.clone();
+            let receipt_path: String = core
+                .store
+                .call(move |c| {
+                    Ok(c.query_row(
+                        "SELECT destination FROM receipts WHERE device=? AND id=?",
+                        rusqlite::params![peer.as_str(), id.as_str()],
+                        |r| r.get(0),
+                    )?)
+                })
+                .await?;
+            assert_eq!(PathBuf::from(receipt_path), expected_path);
+            let mut finished = false;
+            while let Ok(event) = events.try_recv() {
+                if let Event::TransferFinished {
+                    path, deduplicated, ..
+                } = event
+                {
+                    finished = true;
+                    assert_eq!(deduplicated, index == 2);
+                    assert_eq!(path, (index != 2).then_some(expected_path.clone()));
+                }
+            }
+            assert!(finished, "missing transfer completion event");
+            if index != 2 {
+                let mut effects = Vec::new();
+                for _ in 0..2 {
+                    let (effect, path) =
+                        tokio::time::timeout(Duration::from_secs(5), observed.recv())
+                            .await?
+                            .context("desktop action")?;
+                    assert_eq!(path, expected_path);
+                    effects.push(effect);
+                }
+                effects.sort_unstable();
+                assert_eq!(effects, ["notify", "open"]);
+            }
+            assert_eq!(std::fs::read(expected_path)?, bytes);
+        }
+        core.shutdown_actions().await?;
+        assert!(observed.try_recv().is_err());
+        assert_eq!(
+            std::fs::read_dir(folder)?
+                .filter(|entry| entry.as_ref().is_ok_and(|entry| entry.path().is_file()))
+                .count(),
+            2
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn unavailable_folders_load_and_late_cache_overlap_falls_back_without_save_receipt()
+    -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        for moved_after_begin in [false, true] {
+            // Root bypasses mode bits; the mid-transfer move still runs there.
+            if !moved_after_begin && rustix::process::geteuid().as_raw() == 0 {
+                continue;
+            }
+            let dir = tempfile::tempdir()?;
+            let blocked = dir.path().join("blocked");
+            let cache = if moved_after_begin {
+                dir.path().join("cache")
+            } else {
+                blocked.join("cache")
+            };
+            std::fs::create_dir_all(&cache)?;
+            let config = Config {
+                save_path: if moved_after_begin {
+                    dir.path().join("saved")
+                } else {
+                    cache.clone()
+                },
+                ..Config::default()
+            };
+            let config_path = dir.path().join("config.toml");
+            if !moved_after_begin {
+                std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000))?;
+                assert_eq!(
+                    std::fs::symlink_metadata(&cache).unwrap_err().kind(),
+                    std::io::ErrorKind::PermissionDenied
+                );
+            }
+            let startup: Result<_> = async {
+                config.save(&config_path)?;
+                let loaded = Config::load(&config_path)?;
+                assert_eq!(loaded.save_path, config.save_path);
+                let core = Core::new(
+                    Paths {
+                        data: dir.path().join("data"),
+                        cache: cache.clone(),
+                        config: config_path.clone(),
+                        socket: dir.path().join("socket"),
+                    },
+                    loaded,
+                    Arc::new(NoActions),
+                )
+                .await?;
+                let mut settings = core.config();
+                settings.notification_preview = false;
+                core.update_config(settings).await?;
+                assert!(!core.config().notification_preview);
+                assert!(!Config::load(&config_path)?.notification_preview);
+                Ok(core)
+            }
+            .await;
+            // Restore access even when an assertion-independent startup error occurs.
+            if !moved_after_begin {
+                std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700))?;
+            }
+            let core = startup?;
+            let device = Id::new(crate::random_hex(16))?;
+            core.store
+                .pair(device.clone(), Hash::new(crate::random_hex(32))?)
+                .await?;
+            let bytes = b"received bytes";
+            let mut begin = test_begin(bytes);
+            begin.file_name = "received-photo.jpg".into();
+            let (tx, mut rx) = mpsc::channel(2);
+            let mut incoming = None;
+            for message in [
+                Message::FileBegin(begin.clone()),
+                Message::FileChunk(FileChunk {
+                    transfer_id: begin.transfer_id.clone(),
+                    offset: 0,
+                    data: bytes.to_vec(),
+                }),
+                Message::FileEnd(FileEnd {
+                    transfer_id: begin.transfer_id.clone(),
+                }),
+            ] {
+                if moved_after_begin && matches!(message, Message::FileEnd(_)) {
+                    std::fs::rename(core.config().save_path, cache.join("moved-save"))?;
+                }
+                core.receive_test(&core.store, &device, message, &mut incoming, &tx)
+                    .await?;
+            }
+            assert!(matches!(
+                rx.recv().await,
+                Some(Message::Nack(Nack {
+                    code: NackCode::NotWritable,
+                    retryable: true,
+                    ..
+                }))
+            ));
+            assert!(
+                core.store
+                    .receipt(device, begin.transfer_id)
+                    .await?
+                    .is_none()
+            );
+            assert!(!cache.join("received-photo.jpg").exists());
+            assert!(!cache.join("moved-save/received-photo.jpg").exists());
+            let cached = std::fs::read_dir(&cache)?
+                .collect::<std::io::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|entry| entry.path().is_file())
+                .collect::<Vec<_>>();
+            assert_eq!(cached.len(), 1);
+            assert!(
+                cached[0]
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(crate::storage::CACHE_PREFIX)
+            );
+            assert_eq!(std::fs::read(cached[0].path())?, bytes);
+            core.shutdown_actions().await?;
+            core.store.drain().await;
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn file_end_commits_using_streamed_verification_without_reading_stage() -> Result<()> {
         let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;

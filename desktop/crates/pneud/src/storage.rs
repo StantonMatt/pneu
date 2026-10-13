@@ -76,6 +76,49 @@ impl Folder {
     }
 }
 pub(crate) const STAGING_DIR: &str = ".pneu-staging";
+pub(crate) const CACHE_PREFIX: &str = ".pneu-cache-";
+const NAME_MAX: usize = 255;
+const NAME_ATTEMPTS: usize = 10_000;
+
+fn name_parts(name: &str) -> (&str, &str) {
+    name.rsplit_once('.')
+        .filter(|(stem, ext)| !stem.is_empty() && ext.len() < 32)
+        .map(|(stem, _)| (stem, &name[stem.len()..]))
+        .unwrap_or((name, ""))
+}
+
+fn truncate_utf8(text: &str, max: usize) -> &str {
+    let mut end = text.len().min(max);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+pub(crate) fn safe_basename(name: &str, max: usize) -> String {
+    let (stem, extension) = name_parts(name);
+    format!(
+        "{}{extension}",
+        truncate_utf8(stem, max.saturating_sub(extension.len()))
+    )
+}
+
+pub(crate) fn cache_basename(name: &str) -> String {
+    format!(
+        "{CACHE_PREFIX}{}-{}",
+        crate::random_hex(16),
+        safe_basename(name, 200)
+    )
+}
+
+fn numbered_name(name: &str, number: usize) -> String {
+    let (stem, extension) = name_parts(name);
+    let suffix = format!(" ({number})");
+    format!(
+        "{}{suffix}{extension}",
+        truncate_utf8(stem, NAME_MAX - suffix.len() - extension.len())
+    )
+}
 /// Startup-only sweep. Never called while a transfer owns a live stage.
 pub(crate) fn clean_staging(folder: &Folder) -> Result<()> {
     clean_legacy_staging(folder)?;
@@ -208,6 +251,7 @@ pub(crate) struct StageInner {
     pub file: File,
     pub name: String,
     pub destination: String,
+    placed_name: Mutex<Option<String>>,
     pub cleanup: Mutex<Option<Cleanup>>,
 }
 impl Stage {
@@ -234,18 +278,30 @@ impl Stage {
             file,
             name,
             destination,
+            placed_name: Mutex::new(None),
             cleanup: Mutex::new(None),
         })))
     }
     pub fn record_placed(&self) -> Result<OwnedFile> {
         Ok(OwnedFile {
             folder: self.0.folder.clone(),
-            name: self.0.destination.clone(),
+            name: self
+                .0
+                .placed_name
+                .lock()
+                .expect("placed name")
+                .clone()
+                .context("file has not been placed")?,
             identity: FileIdentity::read(&self.0.file)?,
         })
     }
     pub fn destination_path(&self) -> Result<PathBuf> {
-        Ok(self.0.folder.path()?.join(&self.0.destination))
+        let placed = self.0.placed_name.lock().expect("placed name");
+        Ok(self
+            .0
+            .folder
+            .path()?
+            .join(placed.as_ref().unwrap_or(&self.0.destination)))
     }
     #[cfg(test)]
     pub fn path(&self) -> Result<PathBuf> {
@@ -258,6 +314,8 @@ impl Stage {
         Ok(())
     }
     pub fn place(&self) -> Result<()> {
+        let mut placed_name = self.0.placed_name.lock().expect("placed name");
+        ensure!(placed_name.is_none(), "file has already been placed");
         let before = rustix::fs::fstat(&self.0.file)?;
         let named = rustix::fs::statat(
             &*self.0.directory.file,
@@ -268,18 +326,47 @@ impl Stage {
             (before.st_dev, before.st_ino) == (named.st_dev, named.st_ino),
             "staging file was replaced"
         );
-        rustix::fs::renameat_with(
-            &*self.0.directory.file,
-            &self.0.name,
-            &*self.0.folder.file,
-            &self.0.destination,
-            rustix::fs::RenameFlags::NOREPLACE,
-        )?;
-        let placed = rustix::fs::statat(
-            &*self.0.folder.file,
-            &self.0.destination,
-            AtFlags::SYMLINK_NOFOLLOW,
-        )?;
+        // Only the no-replace rename decides whether a name is free. Every
+        // contender is relative to the retained folder FD, including fallback.
+        for attempt in 1..=NAME_ATTEMPTS + 16 {
+            let candidate = if attempt == 1 {
+                safe_basename(&self.0.destination, NAME_MAX)
+            } else if attempt <= NAME_ATTEMPTS {
+                numbered_name(&self.0.destination, attempt)
+            } else {
+                // Cache fallback names must remain in the disposable namespace.
+                let (namespace, basename) = self
+                    .0
+                    .destination
+                    .strip_prefix(CACHE_PREFIX)
+                    .map(|basename| (CACHE_PREFIX, basename))
+                    .unwrap_or(("", self.0.destination.as_str()));
+                let prefix = format!("{}-", crate::random_hex(16));
+                format!(
+                    "{namespace}{prefix}{}",
+                    safe_basename(basename, NAME_MAX - namespace.len() - prefix.len())
+                )
+            };
+            match rustix::fs::renameat_with(
+                &*self.0.directory.file,
+                &self.0.name,
+                &*self.0.folder.file,
+                &candidate,
+                rustix::fs::RenameFlags::NOREPLACE,
+            ) {
+                Ok(()) => {
+                    *placed_name = Some(candidate);
+                    break;
+                }
+                Err(rustix::io::Errno::EXIST) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let destination = placed_name
+            .as_ref()
+            .context("no available destination name")?;
+        let placed =
+            rustix::fs::statat(&*self.0.folder.file, destination, AtFlags::SYMLINK_NOFOLLOW)?;
         ensure!(
             (before.st_dev, before.st_ino) == (placed.st_dev, placed.st_ino),
             "placed file was replaced"
@@ -415,13 +502,15 @@ impl OwnedFile {
         Ok(())
     }
 }
+/// The private cache namespace identifies disposable entries. Legacy received-*
+/// names are ambiguous and must never authorize deletion of a saved file.
 /// Retention policy selects old regular cache files, then anchors its checks and
 /// deletion to opened descriptors. This is also the restart orphan sweep.
 pub(crate) fn prune_cache(folder: &Folder, cutoff: std::time::SystemTime) -> Result<()> {
     for entry in rustix::fs::Dir::read_from(&*folder.file)? {
         let entry = entry?;
         let name = entry.file_name();
-        if !name.to_bytes().starts_with(b"received-") {
+        if !name.to_bytes().starts_with(CACHE_PREFIX.as_bytes()) {
             continue;
         }
         let file = match rustix::fs::openat(
@@ -501,37 +590,221 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::os::unix::fs::PermissionsExt;
+    fn named_stage(folder: &Folder, name: &str, bytes: &[u8]) -> Result<Stage> {
+        use std::io::Write;
+        let stage = Stage::create(
+            folder.clone(),
+            staging_directory(folder)?,
+            name.into(),
+            bytes.len() as u64,
+        )?;
+        (&stage.0.file).write_all(bytes)?;
+        Ok(stage)
+    }
     #[test]
-    fn cache_pruning_is_anchored_and_selects_only_old_regular_received_files() -> Result<()> {
+    fn placement_keeps_names_and_numbers_collisions_without_overwriting() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let folder = Folder::open(dir.path(), false)?;
+        for (name, second, third) in [
+            ("photo.jpg", "photo (2).jpg", "photo (3).jpg"),
+            ("README", "README (2)", "README (3)"),
+            ("archive.tar.gz", "archive.tar (2).gz", "archive.tar (3).gz"),
+            (".hidden", ".hidden (2)", ".hidden (3)"),
+            ("café-写真.png", "café-写真 (2).png", "café-写真 (3).png"),
+        ] {
+            // Stages predate all placements: naming must be decided at rename.
+            let stages = [
+                named_stage(&folder, name, b"first")?,
+                named_stage(&folder, name, b"second")?,
+                named_stage(&folder, name, b"third")?,
+            ];
+            for ((stage, expected), contents) in stages.iter().zip([name, second, third]).zip([
+                b"first".as_slice(),
+                b"second",
+                b"third",
+            ]) {
+                stage.place()?;
+                assert_eq!(stage.destination_path()?, dir.path().join(expected));
+                assert_eq!(std::fs::read(stage.destination_path()?)?, contents);
+                assert!(!stage.path()?.exists());
+            }
+            // Ownership evidence must also follow the actual collision name.
+            stages[1].record_placed()?.remove()?;
+            assert!(!dir.path().join(second).exists());
+            assert_eq!(std::fs::read(dir.path().join(name))?, b"first");
+            assert_eq!(std::fs::read(dir.path().join(third))?, b"third");
+        }
+        Ok(())
+    }
+    #[test]
+    fn placement_bounds_long_ascii_and_unicode_collision_names() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let folder = Folder::open(dir.path(), false)?;
+        for name in [
+            format!("{}.jpg", "a".repeat(251)),
+            "b".repeat(255),
+            format!("{}xx.png", "界".repeat(83)),
+        ] {
+            assert_eq!(name.len(), NAME_MAX);
+            for number in 1..=3 {
+                let stage = named_stage(&folder, &name, &[number])?;
+                stage.place()?;
+                let path = stage.destination_path()?;
+                let actual = path.file_name().unwrap().to_str().unwrap();
+                assert!(actual.len() <= NAME_MAX);
+                let (stem, extension) = name_parts(actual);
+                assert_eq!(extension, name_parts(&name).1);
+                if number == 1 {
+                    assert_eq!(actual, name);
+                } else {
+                    assert!(stem.ends_with(&format!(" ({number})")));
+                }
+                assert_eq!(std::fs::read(path)?, [number]);
+            }
+        }
+        // Larger counters reserve their entire suffix before UTF-8 truncation.
+        let numbered = numbered_name(&format!("{}.png", "界".repeat(83)), NAME_ATTEMPTS);
+        assert!(numbered.len() <= NAME_MAX);
+        assert!(numbered.ends_with(" (10000).png"));
+        Ok(())
+    }
+    #[test]
+    fn simultaneous_placements_atomically_select_distinct_names() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let folder = Folder::open(dir.path(), false)?;
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let stages = (0..16)
+            .map(|n| named_stage(&folder, "shared.txt", &[n]))
+            .collect::<Result<Vec<_>>>()?;
+        let paths = std::thread::scope(|scope| {
+            let jobs = stages
+                .iter()
+                .map(|stage| {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        stage.place()?;
+                        stage.destination_path()
+                    })
+                })
+                .collect::<Vec<_>>();
+            jobs.into_iter()
+                .map(|job| job.join().expect("placement thread"))
+                .collect::<Result<Vec<_>>>()
+        })?;
+        assert_eq!(
+            paths.iter().collect::<std::collections::HashSet<_>>().len(),
+            16
+        );
+        for (n, path) in paths.iter().enumerate() {
+            assert_eq!(std::fs::read(path)?, [n as u8]);
+        }
+        assert!(dir.path().join("shared.txt").exists());
+        for n in 2..=16 {
+            assert!(dir.path().join(format!("shared ({n}).txt")).exists());
+        }
+        Ok(())
+    }
+    #[test]
+    fn placement_retries_late_collisions_against_the_opened_directory() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let save = dir.path().join("save");
+        let moved = dir.path().join("moved");
+        let folder = Folder::open(&save, true)?;
+        let stage = named_stage(&folder, "photo.jpg", b"received")?;
+        std::fs::rename(&save, &moved)?;
+        std::fs::create_dir(&save)?;
+        std::fs::write(save.join("photo.jpg"), b"replacement")?;
+        // A directory and symlink count as occupied names too.
+        std::fs::create_dir(moved.join("photo.jpg"))?;
+        std::os::unix::fs::symlink(save.join("photo.jpg"), moved.join("photo (2).jpg"))?;
+        stage.place()?;
+        assert_eq!(stage.destination_path()?, moved.join("photo (3).jpg"));
+        assert_eq!(std::fs::read(stage.destination_path()?)?, b"received");
+        assert_eq!(std::fs::read(save.join("photo.jpg"))?, b"replacement");
+        assert!(moved.join("photo.jpg").is_dir());
+        assert!(moved.join("photo (2).jpg").is_symlink());
+        Ok(())
+    }
+    #[test]
+    fn exhausted_numbered_names_use_a_bounded_random_prefix() -> Result<()> {
+        for namespace in ["", CACHE_PREFIX] {
+            let dir = tempfile::tempdir()?;
+            let folder = Folder::open(dir.path(), false)?;
+            let name = format!("{namespace}{}.jpg", "a".repeat(251 - namespace.len()));
+            let stage = named_stage(&folder, &name, b"received")?;
+            let occupied = dir.path().join("occupied");
+            std::fs::write(&occupied, b"keep")?;
+            // Hard links occupy all candidates without allocating 10,000 files.
+            for number in 1..=NAME_ATTEMPTS {
+                let candidate = if number == 1 {
+                    name.clone()
+                } else {
+                    numbered_name(&name, number)
+                };
+                std::fs::hard_link(&occupied, dir.path().join(candidate))?;
+            }
+            stage.place()?;
+            let path = stage.destination_path()?;
+            let actual = path.file_name().unwrap().to_str().unwrap();
+            assert_eq!(actual.len(), NAME_MAX);
+            let actual = actual
+                .strip_prefix(namespace)
+                .expect("cache namespace retained");
+            assert!(actual[..32].bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert_eq!(&actual[32..33], "-");
+            assert!(actual.ends_with(".jpg"));
+            assert_eq!(std::fs::read(path)?, b"received");
+            assert_eq!(std::fs::read(dir.path().join(name))?, b"keep");
+            assert_eq!(
+                std::fs::read(
+                    dir.path()
+                        .join(numbered_name(&stage.0.destination, NAME_ATTEMPTS))
+                )?,
+                b"keep"
+            );
+        }
+        Ok(())
+    }
+    #[test]
+    fn cache_pruning_only_removes_old_private_cache_entries_and_is_anchored() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let cache = dir.path().join("cache");
         std::fs::create_dir(&cache)?;
         let folder = Folder::open(&cache, false)?;
-        std::fs::write(cache.join("received-old"), b"old")?;
-        File::open(cache.join("received-old"))?
+        let old = cache_basename("old.jpg");
+        let new = cache_basename("new.jpg");
+        let link = cache_basename("link.jpg");
+        let directory = cache_basename("directory");
+        std::fs::write(cache.join(&old), b"old")?;
+        File::open(cache.join(&old))?
             .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))?;
-        std::fs::write(cache.join("received-new"), b"new")?;
+        std::fs::write(cache.join(&new), b"new")?;
+        std::fs::write(cache.join("received-photo.jpg"), b"saved")?;
+        File::open(cache.join("received-photo.jpg"))?
+            .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))?;
         std::fs::write(cache.join("unrelated"), b"keep")?;
-        std::os::unix::fs::symlink(cache.join("unrelated"), cache.join("received-link"))?;
-        std::fs::create_dir(cache.join("received-directory"))?;
+        std::os::unix::fs::symlink(cache.join("unrelated"), cache.join(&link))?;
+        std::fs::create_dir(cache.join(&directory))?;
         let moved = dir.path().join("moved");
         std::fs::rename(&cache, &moved)?;
         std::fs::create_dir(&cache)?;
-        std::fs::write(cache.join("received-old"), b"foreign")?;
+        std::fs::write(cache.join(&old), b"foreign")?;
         prune_cache(
             &folder,
             std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
         )?;
-        assert!(!moved.join("received-old").exists());
-        assert_eq!(std::fs::read(moved.join("received-new"))?, b"new");
+        assert!(!moved.join(&old).exists());
+        assert_eq!(std::fs::read(moved.join(&new))?, b"new");
+        assert_eq!(std::fs::read(moved.join("received-photo.jpg"))?, b"saved");
         assert_eq!(std::fs::read(moved.join("unrelated"))?, b"keep");
         assert!(
-            std::fs::symlink_metadata(moved.join("received-link"))?
+            std::fs::symlink_metadata(moved.join(&link))?
                 .file_type()
                 .is_symlink()
         );
-        assert!(moved.join("received-directory").is_dir());
-        assert_eq!(std::fs::read(cache.join("received-old"))?, b"foreign");
+        assert!(moved.join(&directory).is_dir());
+        assert_eq!(std::fs::read(cache.join(&old))?, b"foreign");
         Ok(())
     }
     #[test]

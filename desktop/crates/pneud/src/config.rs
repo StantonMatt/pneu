@@ -4,7 +4,7 @@ use std::{
     env, fs,
     io::Write,
     os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 #[derive(Clone, Debug)]
@@ -26,7 +26,7 @@ impl Paths {
             PathBuf::from(env::var_os("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is unset")?);
         Ok(Self {
             data: base("XDG_DATA_HOME", ".local/share").join("pneu"),
-            cache: base("XDG_CACHE_HOME", ".cache").join("pneu"),
+            cache: cache_dir_from_env()?,
             config: base("XDG_CONFIG_HOME", ".config").join("pneu/config.toml"),
             socket: runtime.join("pneud.sock"),
         })
@@ -78,11 +78,19 @@ impl Default for Config {
 }
 impl Config {
     pub fn validate(&self) -> Result<()> {
+        self.validate_with_cache(&cache_dir_from_env()?)
+    }
+    pub(crate) fn validate_with_cache(&self, cache: &Path) -> Result<()> {
         ensure!(
             !self.name.is_empty() && self.name.len() <= 128 && !self.name.contains('\0'),
             "invalid PC name"
         );
         ensure!(self.save_path.is_absolute(), "save_path must be absolute");
+        ensure!(cache.is_absolute(), "cache directory must be absolute");
+        ensure!(
+            !save_folder_overlaps_cache(&self.save_path, cache),
+            "save folder must not be the daemon cache directory or a folder inside it"
+        );
         ensure!(self.port != 0, "port must be nonzero");
         ensure!(
             self.max_file_bytes <= pneu_proto::MAX_FILE_SIZE,
@@ -119,6 +127,57 @@ impl Config {
         self.validate()?;
         atomic_private(path, toml::to_string_pretty(self)?.as_bytes())
     }
+}
+// Unavailable storage remains recoverable through per-transfer errors/fallback.
+// Only successful resolution of both paths can prove an unsafe destination.
+pub(crate) fn save_folder_overlaps_cache(save: &Path, cache: &Path) -> bool {
+    match (resolve_folder(save, &mut 0), resolve_folder(cache, &mut 0)) {
+        (Ok(save), Ok(cache)) => save.starts_with(cache),
+        _ => false,
+    }
+}
+fn cache_dir_from_env() -> Result<PathBuf> {
+    Ok(env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or(PathBuf::from(env::var_os("HOME").context("HOME is unset")?).join(".cache"))
+        .join("pneu"))
+}
+
+// Resolve existing symlinks while retaining missing components: choosing a
+// folder that has not been created yet must enforce the same cache boundary.
+fn resolve_folder(path: &Path, links: &mut usize) -> Result<PathBuf> {
+    let mut resolved = PathBuf::new();
+    let mut components = path.components();
+    while let Some(component) = components.next() {
+        match component {
+            Component::RootDir => resolved.push("/"),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(name) => {
+                resolved.push(name);
+                match fs::symlink_metadata(&resolved) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        ensure!(*links < 40, "too many folder symlinks");
+                        *links += 1;
+                        let target = fs::read_link(&resolved)?;
+                        let redirected = resolved
+                            .parent()
+                            .context("symlink parent")?
+                            .join(target)
+                            .join(components.as_path());
+                        return resolve_folder(&redirected, links);
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Component::Prefix(_) => anyhow::bail!("unsupported folder prefix"),
+        }
+    }
+    Ok(resolved)
 }
 fn machine_hostname() -> String {
     rustix::system::uname()
@@ -179,6 +238,85 @@ pub fn sync_parent(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unresolvable_folder_errors_do_not_reject_settings() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("file");
+        fs::write(&file, b"not a directory")?;
+        Config {
+            save_path: file.join("cache/save"),
+            ..Config::default()
+        }
+        .validate_with_cache(&file.join("cache"))?;
+        let looping = dir.path().join("loop");
+        std::os::unix::fs::symlink("loop", &looping)?;
+        Config {
+            save_path: looping.join("save"),
+            ..Config::default()
+        }
+        .validate_with_cache(&looping)?;
+        Ok(())
+    }
+    #[test]
+    fn save_folder_validation_rejects_cache_and_resolved_descendants() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cache = dir.path().join("cache");
+        fs::create_dir(&cache)?;
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink("cache", &alias)?;
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink("cache/new", &dangling)?;
+        let cache_alias = dir.path().join("cache-alias");
+        std::os::unix::fs::symlink(&cache, &cache_alias)?;
+        for folder in [
+            cache.clone(),
+            cache.join("new/nested"),
+            alias.clone(),
+            alias.join("new/nested"),
+            dangling.join("child"),
+            dir.path().join("missing/../cache/new"),
+        ] {
+            for configured_cache in [&cache, &cache_alias] {
+                let config = Config {
+                    save_path: folder.clone(),
+                    ..Config::default()
+                };
+                assert!(
+                    config
+                        .validate_with_cache(configured_cache)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("save folder must not be the daemon cache directory")
+                );
+            }
+        }
+        for folder in [
+            dir.path().join("cache-sibling/new"),
+            dir.path().to_owned(),
+            alias.join("../saved"),
+        ] {
+            Config {
+                save_path: folder,
+                ..Config::default()
+            }
+            .validate_with_cache(&cache)?;
+        }
+        // Enforce the same boundary even before the cache root exists.
+        Config {
+            save_path: cache.join("../future/nested"),
+            ..Config::default()
+        }
+        .validate_with_cache(&dir.path().join("future"))
+        .expect_err("uncreated cache subtree must be rejected");
+        // The public config validation uses the actual environment cache root.
+        Config {
+            save_path: cache_dir_from_env()?.join("new"),
+            ..Config::default()
+        }
+        .validate()
+        .expect_err("environment cache subtree must be rejected");
+        Ok(())
+    }
     #[test]
     fn default_name_is_the_machine_hostname() -> Result<()> {
         let hostname = machine_hostname();
