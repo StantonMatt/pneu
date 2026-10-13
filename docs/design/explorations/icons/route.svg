@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108" width="108" height="108">
+<defs>
+<linearGradient id="bg" gradientUnits="userSpaceOnUse" x1="30" y1="0" x2="78" y2="108">
+<stop offset="0" stop-color="#FFE46E"/>
+<stop offset="0.55" stop-color="#FFC824"/>
+<stop offset="1" stop-color="#F2A300"/>
+</linearGradient>
+<radialGradient id="bgL" gradientUnits="userSpaceOnUse" cx="54" cy="-8" r="84">
+<stop offset="0" stop-color="#FFFFFF" stop-opacity="0.32"/>
+<stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+</radialGradient>
+<linearGradient id="cap" gradientUnits="userSpaceOnUse" x1="0" y1="-4.6" x2="0" y2="4.6">
+<stop offset="0" stop-color="#8C93FF"/>
+<stop offset="0.5" stop-color="#4F5BFF"/>
+<stop offset="1" stop-color="#343CD6"/>
+</linearGradient>
+</defs>
+<path fill="url(#bg)" d="M0 0H108V108H0Z"/>
+<path fill="url(#bgL)" d="M0 0H108V108H0Z"/>
+<g transform="translate(54 54) scale(0.86) translate(-54 -54)">
+<path d="M8 49L20 49Q25 49 28.54 45.46L40.46 33.54Q44 30 49 30L100 30" fill="none" stroke="#FFFFFF" stroke-opacity=".45" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M35 75L42 75Q47 75 50.54 71.46L64.46 57.54Q68 54 68 49L68 36" fill="none" stroke="#16173A" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="29.5" y="66.5" width="11" height="17" rx="3.6" fill="#FFFFFF" stroke="#16173A" stroke-width="3.6"/>
+<rect x="57" y="27" width="22" height="15" rx="3.6" fill="#FFFFFF" stroke="#16173A" stroke-width="3.6"/>
+<g transform="translate(57.5 64.5) rotate(-45)">
+<rect x="-10" y="-5.6" width="20" height="11.2" rx="5.6" fill="url(#cap)" stroke="#FFC824" stroke-width="2.6"/>
+<rect x="-4" y="-3.3" width="9" height="1.6" rx=".8" fill="#FFFFFF" opacity=".85"/>
+</g>
+</g>
+</svg>

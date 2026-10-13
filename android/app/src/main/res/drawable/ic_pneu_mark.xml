@@ -1,23 +1,31 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Generated from docs/design/v2/assets/pneu-mark.svg; SHA-256 6f341e9f9e5d38b96393d3b0472cf915aeb424aa2fce6184a294fe9401344f6d. -->
+<!-- Generated from docs/design/v2/assets/pneu-mark.svg; SHA-256 b9753cff454048f542bc842a1c03c062d6d64c5f1cfada7d91c52120b843f614. -->
 <vector xmlns:aapt="http://schemas.android.com/aapt" xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
     <path android:pathData="M7 0H17C21.34 0 24 2.66 24 7V17C24 21.34 21.34 24 17 24H7C2.66 24 0 21.34 0 17V7C0 2.66 2.66 0 7 0Z" android:strokeColor="#00000000">
         <aapt:attr name="android:fillColor">
-            <gradient android:type="linear" android:startX="7.2" android:startY="0" android:endX="16.8" android:endY="24">
-                <item android:offset="0" android:color="#6B74FF" />
-                <item android:offset=".55" android:color="#4846E8" />
-                <item android:offset="1" android:color="#2620AE" />
+            <gradient android:type="linear" android:startX="12" android:startY="12" android:endX="24" android:endY="24">
+                <item android:offset="0" android:color="#232570" />
+                <item android:offset="1" android:color="#0C0D2E" />
             </gradient>
         </aapt:attr>
     </path>
-    <path android:pathData="M7 0H17C21.34 0 24 2.66 24 7V17C24 21.34 21.34 24 17 24H7C2.66 24 0 21.34 0 17V7C0 2.66 2.66 0 7 0Z" android:strokeColor="#00000000">
+    <path android:pathData="M22.13 1.87C20.92 0.67 19.17 0 17 0H7C2.66 0 0 2.66 0 7V17C0 19.17 0.67 20.92 1.87 22.13Z" android:strokeColor="#00000000">
         <aapt:attr name="android:fillColor">
-            <gradient android:type="radial" android:centerX="12" android:centerY="-1.92" android:gradientRadius="18.72">
-                <item android:offset="0" android:color="#52FFFFFF" />
+            <gradient android:type="linear" android:startX="0" android:startY="0" android:endX="12" android:endY="12">
+                <item android:offset="0" android:color="#8A91FF" />
+                <item android:offset="1" android:color="#4F5BFF" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <path android:pathData="M22.13 1.87C20.92 0.67 19.17 0 17 0H7C2.66 0 0 2.66 0 7V17C0 19.17 0.67 20.92 1.87 22.13Z" android:strokeColor="#00000000">
+        <aapt:attr name="android:fillColor">
+            <gradient android:type="radial" android:centerX="4" android:centerY="-0.67" android:gradientRadius="19.33">
+                <item android:offset="0" android:color="#3DFFFFFF" />
                 <item android:offset="1" android:color="#00FFFFFF" />
             </gradient>
         </aapt:attr>
     </path>
-    <path android:pathData="M8.65 13.86V8.36A2.86 2.86 0 0 1 11.51 5.5H12.61A3.41 3.41 0 0 1 12.61 12.32H11.9" android:fillColor="#00000000" android:strokeColor="#FFFFFF" android:strokeWidth="2.86" android:strokeLineCap="round" android:strokeLineJoin="round" />
-    <path android:pathData="M7.92 17.72L8.86 19.49A1.14 1.14 0 0 0 10.41 19.96L10.41 19.96A1.14 1.14 0 0 0 10.88 18.42L9.94 16.65A1.14 1.14 0 0 0 8.4 16.18L8.4 16.18A1.14 1.14 0 0 0 7.92 17.72Z" android:fillColor="#FFB547" android:strokeColor="#00000000" />
+    <path android:pathData="M14 9.29L9.29 14A0.33 0.33 0 0 1 8.82 14L5.75 10.94A3.67 3.67 0 0 1 5.75 5.75A3.67 3.67 0 0 1 10.94 5.75L14 8.82A0.33 0.33 0 0 1 14 9.29Z" android:fillColor="#FFFFFF" android:strokeColor="#00000000" android:fillAlpha="0.11" />
+    <path android:pathData="M9.05 13.53L7.6 12.08M6.19 10.66L6.11 10.59A3.17 3.17 0 0 1 5.23 8.89M5.51 6.94A3.17 3.17 0 0 1 6.94 5.51M8.89 5.23A3.17 3.17 0 0 1 10.59 6.11L10.66 6.19M12.08 7.6L13.53 9.05" android:fillColor="#00000000" android:strokeColor="#FFFFFF" android:strokeWidth="1" android:strokeLineCap="round" android:strokeLineJoin="round" android:strokeAlpha="0.92" />
+    <path android:pathData="M14.71 10L10 14.71A0.33 0.33 0 0 0 10 15.18L13.06 18.25A3.67 3.67 0 0 0 18.25 18.25A3.67 3.67 0 0 0 18.25 13.06L15.18 10A0.33 0.33 0 0 0 14.71 10Z" android:fillColor="#FFB547" android:strokeColor="#00000000" />
 </vector>

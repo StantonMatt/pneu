@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Generated from docs/design/v2/assets/ic_stat_pneu.svg; SHA-256 46aac113d32af3948aa074c8680eca0ac85a5b38e5295be01b05ec363bacab5b. -->
+<!-- Generated from docs/design/v2/assets/ic_stat_pneu.svg; SHA-256 e36fbc889df59bf918ff5fbe10be9aa8b3bed4da51b62966d01b9d800f3ba997. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
-    <path android:pathData="M7.14 19.68V8.09A3.77 3.77 0 0 1 10.91 4.32H12.36A4.5 4.5 0 0 1 12.36 13.3H11.49" android:fillColor="#00000000" android:strokeColor="#FFFFFF" android:strokeWidth="3.4" android:strokeLineCap="round" android:strokeLineJoin="round" />
+    <path android:pathData="M7.72 13.66L5.58 11.52M2.95 8.49A4.2 4.2 0 0 1 2.79 5.53M5.53 2.79A4.2 4.2 0 0 1 8.49 2.95M11.52 5.58L13.66 7.72" android:fillColor="#00000000" android:strokeColor="#FFFFFF" android:strokeWidth="1.85" android:strokeLineCap="round" android:strokeLineJoin="round" />
+    <path android:pathData="M15.9 9.42L9.42 15.9A0.55 0.55 0 0 0 9.42 16.67L13.58 20.83A5.13 5.13 0 0 0 20.83 20.83A5.13 5.13 0 0 0 20.83 13.58L16.67 9.42A0.55 0.55 0 0 0 15.9 9.42Z" android:fillColor="#FFFFFF" android:strokeColor="#00000000" />
 </vector>

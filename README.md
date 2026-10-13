@@ -1,4 +1,4 @@
-# <img src="docs/design/assets/pneu.svg" width="64" height="64" alt="Pneu icon"> Pneu
+# <img src="docs/design/v2/assets/pneu.svg" width="64" height="64" alt="Pneu icon"> Pneu
 
 Send phone screenshots and files to your Linux PC, and sync clipboard text both ways.
 

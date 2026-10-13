@@ -577,9 +577,9 @@ After an approved icon revision, re-import the vector paths without rasterizing:
 PYTHONDONTWRITEBYTECODE=1 python3 tools/import_v2_icons.py
 ```
 
-Each generated vector records the source SVG hash. Launcher foreground and
-monochrome retain the 108-unit canvas and the source's 66 dp safe zone. The device
-runner's `local` suite runs the complete `TenthReviewUiDeviceTest`, including the
+Each generated Crossing vector records the source SVG hash. Launcher foreground
+and monochrome retain the 108-unit canvas and the source's 66 dp safe zone. The
+device runner's `local` suite runs the complete `TenthReviewUiDeviceTest`, including the
 v2 pane-title and custom-switch semantics checks. Run the complete device runner
 before installation acceptance, then visually check light/dark, font scales 1.0
 and 1.3 (and above 1.3 for stacked buttons), and animations on/off on the phone.

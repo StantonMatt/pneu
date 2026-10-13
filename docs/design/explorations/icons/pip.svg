@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108" width="108" height="108">
+<defs>
+<linearGradient id="bg" gradientUnits="userSpaceOnUse" x1="30" y1="0" x2="78" y2="108">
+<stop offset="0" stop-color="#FFA052"/>
+<stop offset="0.55" stop-color="#FF6B2B"/>
+<stop offset="1" stop-color="#E9461A"/>
+</linearGradient>
+<radialGradient id="bgL" gradientUnits="userSpaceOnUse" cx="54" cy="-8" r="84">
+<stop offset="0" stop-color="#FFFFFF" stop-opacity="0.3"/>
+<stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+</radialGradient>
+<linearGradient id="pb" gradientUnits="userSpaceOnUse" x1="0" y1="-13" x2="0" y2="13">
+<stop offset="0" stop-color="#FFFFFF"/>
+<stop offset="0.62" stop-color="#FFF5EE"/>
+<stop offset="1" stop-color="#FFD6C0"/>
+</linearGradient>
+<linearGradient id="pc" gradientUnits="userSpaceOnUse" x1="0" y1="-13" x2="0" y2="13">
+<stop offset="0" stop-color="#7C84FF"/>
+<stop offset="0.5" stop-color="#4F5BFF"/>
+<stop offset="1" stop-color="#3036C9"/>
+</linearGradient>
+<clipPath id="pcl">
+<rect x="-25" y="-13" width="50" height="26" rx="13"/>
+</clipPath>
+</defs>
+<path fill="url(#bg)" d="M0 0H108V108H0Z"/>
+<path fill="url(#bgL)" d="M0 0H108V108H0Z"/>
+<g transform="translate(54 54) scale(0.86) translate(-54 -54)">
+<g transform="translate(57 51) rotate(-33)" stroke="#FFFFFF" stroke-linecap="round" fill="none">
+<path d="M-30 -6.5H-40" stroke-width="3.2" opacity=".9"/>
+<path d="M-31 1.5H-45" stroke-width="3.2" opacity=".75"/>
+<path d="M-30 9H-37" stroke-width="3.2" opacity=".6"/>
+</g>
+<g transform="translate(58.6 55.4) rotate(-33)">
+<rect x="-25" y="-13" width="50" height="26" rx="13" fill="#9C2A08" opacity=".22"/>
+</g>
+<g transform="translate(57 51) rotate(-33)">
+<rect x="-25" y="-13" width="50" height="26" rx="13" fill="url(#pb)"/>
+<g clip-path="url(#pcl)">
+<rect x="-26" y="-14" width="13.5" height="28" fill="url(#pc)"/>
+<rect x="-12.5" y="-14" width="1.4" height="28" fill="#FFFFFF" opacity=".9"/>
+<rect x="-11.1" y="-14" width="2.2" height="28" fill="#4F5BFF"/>
+</g>
+<path d="M0.7 -2.6A2.5 3.5 0 1 0 5.7 -2.6A2.5 3.5 0 1 0 0.7 -2.6Z" fill="#1B1D4A"/>
+<path d="M3.1 -3.8A0.9 0.9 0 1 0 4.9 -3.8A0.9 0.9 0 1 0 3.1 -3.8Z" fill="#FFFFFF"/>
+<path d="M10.7 -2.6A2.5 3.5 0 1 0 15.7 -2.6A2.5 3.5 0 1 0 10.7 -2.6Z" fill="#1B1D4A"/>
+<path d="M13.1 -3.8A0.9 0.9 0 1 0 14.9 -3.8A0.9 0.9 0 1 0 13.1 -3.8Z" fill="#FFFFFF"/>
+<path d="M5.6 2.7Q8.2 5.7 10.8 2.7" fill="none" stroke="#1B1D4A" stroke-width="1.7" stroke-linecap="round"/>
+<path d="M-2.8 2.6A2.4 1.5 0 1 0 2 2.6A2.4 1.5 0 1 0 -2.8 2.6Z" fill="#FF7B66" opacity=".5"/>
+<path d="M14.4 2.6A2.4 1.5 0 1 0 19.2 2.6A2.4 1.5 0 1 0 14.4 2.6Z" fill="#FF7B66" opacity=".5"/>
+</g>
+</g>
+</svg>

@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108" width="108" height="108">
+<defs>
+<linearGradient id="bg" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="108" y2="108">
+<stop offset="0" stop-color="#1D1E57"/>
+<stop offset="1" stop-color="#0C0D2C"/>
+</linearGradient>
+<linearGradient id="ph" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="60" y2="60">
+<stop offset="0" stop-color="#7A82FF"/>
+<stop offset="1" stop-color="#4F5BFF"/>
+</linearGradient>
+<radialGradient id="bgL" gradientUnits="userSpaceOnUse" cx="30" cy="10" r="70">
+<stop offset="0" stop-color="#FFFFFF" stop-opacity="0.22"/>
+<stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+</radialGradient>
+<linearGradient id="am" gradientUnits="userSpaceOnUse" x1="0" y1="-10" x2="0" y2="10">
+<stop offset="0" stop-color="#FFE6A8"/>
+<stop offset="0.5" stop-color="#FFB547"/>
+<stop offset="1" stop-color="#EE861A"/>
+</linearGradient>
+</defs>
+<path fill="url(#bg)" d="M0 0H108V108H0Z"/>
+<path fill="url(#ph)" d="M0 0H108L0 108Z"/>
+<path fill="url(#bgL)" d="M0 0H108L0 108Z"/>
+<g transform="translate(54 54) rotate(45)">
+<path d="M-1.4 10H-14A10 10 0 0 1 -14 -10H-1.4Z" fill="#FFFFFF" fill-opacity=".16" stroke="#FFFFFF" stroke-opacity=".85" stroke-width="1.5" stroke-dasharray="3 2.6" stroke-linejoin="round"/>
+<path d="M1.4 -10H14A10 10 0 0 1 14 10H1.4Z" fill="url(#am)"/>
+<rect x="3" y="-7.4" width="11" height="2" rx="1" fill="#FFFFFF" opacity=".8"/>
+</g>
+</svg>

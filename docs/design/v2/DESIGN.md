@@ -1,6 +1,6 @@
 # Pneu v2: design spec
 
-Status: approved (v2), with the refined launcher icon (v2.1, section 3). Visual reference: `index.html` in this folder (open it in a browser; it is self-contained and works offline). Every phone screen and state is drawn there in light and dark, and every PC surface in Plasma light and dark. Icons: `assets/`.
+Status: approved (v2), with the Crossing icon (v2.2, section 3). Visual reference: `index.html` in this folder (open it in a browser; it is self-contained and works offline). Every phone screen and state is drawn there in light and dark, and every PC surface in Plasma light and dark. Icons: `assets/`.
 
 v2 is a visual and UX redesign of v1 (`../DESIGN.md`). It keeps every feature, setting, default, flow and behaviour rule from v1 and from the shipped app (including additions made during implementation, such as Local network, Receive clipboard from PC, Show in share sheet, Quick Settings tiles, the pairing confirmation and the local-queue banner). Where this document is silent, v1 and the code win.
 
@@ -24,7 +24,7 @@ Pneu should feel like a small, finished product: calm, exact and quick to read. 
 | Area | v1 | v2 |
 |---|---|---|
 | Colour | Material 3 dynamic colour from the wallpaper | Fixed Pneu palette (section 4.1). Semantic status colours. |
-| Icon | Teal carrier with brass caps | Monogram (section 3): a lit tube P with an amber carrier at large sizes, one flat P at small sizes. |
+| Icon | Teal carrier with brass caps | Crossing (section 3): a carrier crossing from the phone's field to the PC's, a dashed ghost on one side and solid amber where it has landed. |
 | Home hero | Status disc, title, detail, buttons | The Link, title, detail, buttons. Same states, copy and buttons. |
 | Button emphasis | Left tonal, right outlined | Send clipboard / Open Tailscale tonal; Pause neutral; Resume and Pair again filled (the only filled buttons on Home). |
 | Banner | Red container, one line | Neutral card with an amber icon tile, up to two lines, action on the right. Local-queue banner keeps red. |
@@ -37,7 +37,7 @@ Pneu should feel like a small, finished product: calm, exact and quick to read. 
 | Pair scanner | Full outline square, visible title "Pair with PC" | Corner brackets; title kept only as the TalkBack pane title; success fills the frame. |
 | Dialogs | Centred M3 AlertDialog | Bottom-anchored floating dialog (One UI placement), two equal-width buttons, red destructive confirm. Same titles, text and buttons. |
 | PC window | Native Breeze widgets, Close button, phone icon + status dot | Pneu components following Plasma light/dark; the Link on top; Save to and Unpair… in one card; **no Close button** (title-bar ✕ and Esc remain). |
-| Tray | Carrier glyph | New glyph; disconnected = glyph at 50 % opacity; receiving = indigo glyph; paused/error badges in Plasma's neutral/negative colours. |
+| Tray | Carrier glyph | New glyph; disconnected = glyph at 50 % opacity; receiving = indigo glyph; paused/error badges (top-right) in Plasma's neutral/negative colours. |
 
 **Behaviour and navigation.** No functional change. Navigation graph, launch routing, back behaviour, all toggles and their defaults, queue/pause/clipboard rules, notifications, tiles and share target behave exactly as today. The changes that touch interaction are placement only: the Paired PC group moves to the top of Settings, the PC window loses its Close button (closing behaviour is unchanged: it hides), and Unpair… moves from the window footer into the settings card.
 
@@ -47,62 +47,62 @@ Pneu should feel like a small, finished product: calm, exact and quick to read. 
 
 ## 3. Icon
 
-### 3.1 Concepts
+### 3.1 Concept: Crossing
 
-| | File | Idea | Strengths | Weaknesses |
-|---|---|---|---|---|
-| **A · Monogram (chosen, refined)** | `concept-a-monogram.svg`, `concept-a-monogram-glyph.svg` | The P is one bent tube. At launcher size it is drawn lit, with an amber carrier tumbling out of the stem's open end. | Unmistakably Pneu at launcher size (tube, carrier, arrival). Small sizes keep the same P as one flat path. | The carrier shrinks to an amber speck below 24 px (kept; it still reads as a P). |
-| B · Transit | `concept-b-transit.svg`, `concept-b-transit-glyph.svg` | A carrier mid-flight inside a glass tube, amber nose first. | Tells the pneumatic-tube story literally. | At 16–24 px the walls thin to hairlines and it reads as a slashed circle; the capsule alone reads as a pill. |
-| C · Trail | `concept-c-trail.svg`, `concept-c-trail-glyph.svg` | Three discs accelerating up and to the right. | Very simple, scales cleanly. | Abstract; no link to tubes or the name. |
+Phone and PC are two fields split on the diagonal, and the carrier crosses the line between them. On the phone side it is still a ghost (a dashed outline over a faint fill); on the PC side it has landed (solid amber). The mark shows what Pneu promises, instant arrival, rather than how the tube works, and it keeps the v2 indigo and amber, so the palette and every screen stay as they are.
 
-B and C are unchanged from the first round and kept for reference only.
+Crossing was chosen in the second icon round, which compared nine concepts with the shipped tube P (v2.1 · Monogram): `../explorations/icons/index.html`. It replaces the tube P everywhere: launcher, themed icon, notification glyph, both tiles, in-app mark, PC app icon and tray. The first-round concept files (A · Monogram, B · Transit, C · Trail) are no longer kept in `assets/`; they remain in git history.
 
-**Why the carrier leaves the stem, not the bowl.** The P's bowl ends pointing back at the stem, so anything leaving it would hit the stem (tested: it reads as a stick across the letter). The stem's bottom is the tube's other open end, and it points into the empty space under the letter. Real tube stations deliver the same way: the carrier drops out of the bottom of the tube. Tilting the carrier 28° keeps it from reading as the dot of an exclamation mark.
+Refinements over the exploration:
 
-### 3.2 Mark: two masters
+- The ghost's outline is open at the cut (no dashes along the boundary), so the two halves read as one carrier passing through rather than two halves of a pill.
+- Dashes are drawn as whole round-capped segments laid out on the outline, not with a dash array: equal gaps, both end dashes touching the cut, and an odd count so one dash sits on the far end.
+- The landed half uses v2's carrier amber with no gloss streak; the streak made it read as a medicine capsule.
+- The mark is about 10 % larger (61 % of the visible tile), and both fields run as gradients towards the boundary.
 
-Launchers show only the central 72 dp of the 108 dp layers; all sizes below refer to that visible area. Previews in `index.html` are cropped to it.
+### 3.2 Mark
 
-**Large master** (launcher, PC app icon, in-app mark; 28 dp and up). Coordinates in the 108 dp canvas:
+Launchers show only the central 72 dp of the 108 dp layers; sizes below refer to that visible area. Previews in `index.html` are cropped to it.
 
-| Layer | Spec |
+**Construction.** One capsule on the 45° axis through the centre, top-left to bottom-right, cut in two across that axis. The cut sits on the field boundary (the anti-diagonal, which runs corner to corner of the visible square). Coordinates and lengths in the 108 dp canvas:
+
+| Part | Spec |
 |---|---|
-| Background | Linear gradient `x1 32.4, y1 0 → x2 75.6, y2 108`: `#6B74FF` 0, `#4846E8` 0.55, `#2620AE` 1. Plus a radial top light: centre (54, −8.64), radius 84.24, `#FFFFFF` at 32 % → 0 %. |
-| Tube centreline | `M43.95 59.59 V43.09 A8.58 8.58 0 0 1 52.52 34.51 H55.83 A10.23 10.23 0 0 1 55.83 54.97 H53.69`; stroke 8.58, round caps and joins. The stem is shortened by about a quarter of the letter height to make room for the carrier. |
-| Tube colour | Linear gradient from (35.37, 25.93) `#FFFFFF` to (66.06, 68.17) `#D9DDFF`: white at the lit top-left, a cool lavender at the bottom-right. |
-| Soft shadow | Three copies of the tube and carrier in `#100A6B`, offset down 0.85 / 2.03 / 3.38 dp, widened by 1.0 / 2.6 / 4.4 dp, at 10 / 7 / 5 % opacity. Lives in the foreground layer so it moves with the mark on parallax. |
-| Specular streak | The centreline offset by (−1.63, −1.63), from 62 % up the stem, over the bend and top bar, round the bowl to −15°; stroke 1.2, round caps; vertical gradient `#FFFFFF` 0 % at y 52.99 → 95 % at y 43.09 so it fades towards the open end. |
-| Carrier | Stadium, 12.87 × 6.86 dp, axis 62° from horizontal (tilted 28° off vertical, falling to the right), its upper end 2.24 dp below the stem's cap. Fill: linear gradient `#FFD98C` → `#FF9426` (top-left to bottom-right). Highlight: a 4.6 × 1.4 stadium on its upper-left side, white at 70 %. |
-| Extents | Farthest painted point 26.2 dp from the centre (safe zone 33). Bounding box x 39.7–70.3, y 30.2–78.6 (shadow excluded): the mark is about two thirds of the visible height. |
+| Capsule | Width 22 (radius 11). Each half: 14 straight plus a radius-11 round end. Gap 3 between the halves, centred on the boundary. The landed half's two cut corners are rounded to radius 1 (the ghost fill's too). Tip 26.5 from the centre (safe zone 33); bounding box 32.0–76.0 on both axes, 44 of the visible 72 (61 %). |
+| Ghost (top-left, phone side) | Fill: the half-capsule in `#FFFFFF` at 11 %. Outline: 7 round-capped dashes, stroke 2.4, `#FFFFFF` at 92 %, on a centreline 1.2 inside the silhouette (so their outer edge is the silhouette), from the cut on one side round the end to the cut on the other. Visible dashes 6.34, visible gaps 2.4; one dash is centred on the far end; the end dashes stop 1.5 from the boundary, mirroring the landed half. No dashes along the cut. |
+| Landed half (bottom-right, PC side) | Linear gradient from (64.25, 48.7) to (57.18, 72.74): `#FFD98C` 0, `#FFB547` 0.45, `#FF9426` 1 (light on the cut's upper corner, deep round the end). No highlight, no shadow. |
+| Fields | Navy square: linear gradient (54, 54) → (90, 90), `#232570` → `#0C0D2E`. Indigo triangle (0, 0)–(108, 0)–(0, 108) on top: linear gradient (18, 18) → (54, 54), `#8A91FF` → `#4F5BFF`, plus a radial light on the same triangle, centre (30, 16), radius 58, `#FFFFFF` at 24 % → 0 %. |
 
-**Small master** (status bar, notifications, both tiles, tray, themed icon; flat, one path, no carrier):
+**Sizes.** Three variants of the same construction. The ghost is never dropped: without it the landed half alone reads as a drop or a map pin.
 
-```
-M40.6 75.2 V43.2 A10.4 10.4 0 0 1 51 32.8 H55 A12.4 12.4 0 0 1 55 57.6 H52.6     (108 canvas, stroke 10.4)
-```
+| Variant | Used for | Differences from the construction |
+|---|---|---|
+| Full | Launcher, themed icon, PC app icon | None. The themed icon keeps the 7 dashes and the landed half, both flat black, without the ghost fill or the fields. |
+| Mark | In-app mark (28 dp) | 5 dashes with stroke and visible gaps of 3 (1 of the 24 grid), so they stay clear at 28 dp; flat `#FFB547` landed half. |
+| Small | Status bar, Quick Settings tiles, tray (16–24 px) | Drawn on a 22-unit grid: radius 4.7, straight 5.9, gap 1.7, cut corners 0.5. Ghost: 4 dashes, stroke 1.7, visible gaps 2.0 (1.45 px at 16 px), no fill; the even count puts a gap on the far end, which keeps every dash long enough to read at 16 px. One colour. `ic_stat_pneu` scales it ×24/22 about (12, 12) (stroke 1.85). |
 
-Round caps and joins, no fill. It is the same P with the stem at full length (the carrier's place). Stroke = 0.197 × letter height; heavier relative strokes at small grids: 3.4 of 24 (`ic_stat_pneu`), 3.1 of 22 (tray). The monochrome (themed) layer uses this path at 0.72 scale (stroke 9.36), centred, so it has the launcher mark's visual weight.
+The PC icon is one scalable file for 16–256 px. Below about 32 px its dashes merge into a faint lighter shape, and the two fields and the amber half carry the icon; that is accepted rather than adding size-specific files.
 
 ### 3.3 Asset set
 
-All files are plain SVG with baked coordinates: no transforms, masks, clip paths, filters or raster. Strokes, linear and radial gradients and per-stop opacity are used deliberately; Android VectorDrawable (via `aapt:attr` gradients), QtSvg and resvg all support them.
+All files are plain SVG with baked coordinates: top-level paths plus gradients in `<defs>`; no transforms, groups, masks, clip paths, filters, dash arrays or raster. Strokes, linear and radial gradients and per-stop opacity are used deliberately; Android VectorDrawable (via `aapt:attr` gradients), QtSvg and resvg all support them. The dashes are subpaths of one stroked path with `fill="none"`, so `android/tools/import_v2_icons.py` converts every Android file as is.
 
 | File | Canvas | Use |
 |---|---|---|
-| `ic_launcher_background.svg` | 108 | Adaptive background: indigo gradient + radial top light (two paths). |
-| `ic_launcher_foreground.svg` | 108 | Adaptive foreground: shadow, lit tube, streak, carrier (10 paths). |
-| `ic_launcher_monochrome.svg` | 108 | Themed icon (`<monochrome>`): flat small-master P. Alpha only. |
+| `ic_launcher_background.svg` | 108 | Adaptive background: navy square, indigo triangle, top light (three paths). |
+| `ic_launcher_foreground.svg` | 108 | Adaptive foreground: ghost fill, ghost dashes, landed half (three paths). The carrier moves against the fields on parallax. |
+| `ic_launcher_monochrome.svg` | 108 | Themed icon (`<monochrome>`): ghost dashes and landed half in black, alpha only, at the colour mark's size. |
 | `ic_launcher_preview.svg` | 108 | Both layers flattened, for docs and mocks (crop to `18 18 72 72` to see what a launcher shows). |
-| `ic_stat_pneu.svg` | 24 | Notification small icon (status, alerts, share admission) and both Quick Settings tiles. Flat small master, white, alpha only. |
-| `pneu.svg` | 128 | PC app icon: `.desktop` `Icon=`, window icon, notification `app_icon`, tooltip. Rounded square (radius 30 of 112, 8 px margin) with the launcher background, a 1.5 px inner top-edge light (white 38 % → 0), and the large master scaled to the square. Install to `~/.local/share/icons/hicolor/scalable/apps/pneu.svg` and replace `desktop/assets/pneu.svg`. One file serves 16–256 px; at 16–22 px the carrier is an amber speck and the P still reads. |
-| `pneu-mark.svg` | 24 | In-app mark (Home top bar, 28 dp): launcher background in a rounded square, flat white tube and flat `#FFB547` carrier (no shadow or streak). |
-| `pneu-tray-connected.svg` | 22 | Small master in `ColorScheme-Text`. |
-| `pneu-tray-disconnected.svg` | 22 | Same at `stroke-opacity: 0.5`. Used for no phone paired, pairing in progress, phone not connected. |
-| `pneu-tray-receiving.svg` | 22 | Small master in fixed `#6370FF` (≥ 3.5 : 1 on Breeze light and dark panels). Shown at least 1.5 s. |
-| `pneu-tray-paused.svg` | 22 | Small master + `ColorScheme-NeutralText` badge (disc r 4.5 at 17.3, 17.3 with two knocked-out bars). |
-| `pneu-tray-error.svg` | 22 | Small master + `ColorScheme-NegativeText` badge with a knocked-out "!". |
+| `ic_stat_pneu.svg` | 24 | Notification small icon (status, alerts, share admission) and both Quick Settings tiles. Small variant, white, alpha only. |
+| `pneu.svg` | 128 | PC app icon: `.desktop` `Icon=`, window icon, notification `app_icon`, tooltip. v2's rounded square (112 at an 8 px margin, one-cubic corners) showing the launcher's visible 72 dp: navy tile, the indigo part above the diagonal (which meets the two corner curves at their midpoints, (111.98, 16.03) and (16.03, 111.98)), the top light, a 1.5 px inner edge light (white 12 % all round, which keeps the navy corner visible on dark panels, plus white 38 % → 0 by y 58.4 along the top) and the full mark scaled ×112/72 about (64, 64). Install to `~/.local/share/icons/hicolor/scalable/apps/pneu.svg` and replace `desktop/assets/pneu.svg`. |
+| `pneu-mark.svg` | 24 | In-app mark (Home top bar, 28 dp): full-bleed tile (radius 7, v2's corners) with both fields and the top light, and the mark variant scaled ×1/3 about (12, 12). |
+| `pneu-tray-connected.svg` | 22 | Small variant in `ColorScheme-Text`. |
+| `pneu-tray-disconnected.svg` | 22 | Same at `stroke-opacity` and `fill-opacity` 0.5. Dashes and landed half never overlap, so no pixel exceeds 50 %. Used for no phone paired, pairing in progress, phone not connected. |
+| `pneu-tray-receiving.svg` | 22 | Small variant in fixed `#6370FF` (≥ 3.5 : 1 on Breeze light and dark panels). Shown at least 1.5 s. |
+| `pneu-tray-paused.svg` | 22 | Small variant + `ColorScheme-NeutralText` badge: disc r 4.5 at (17.4, 4.6) with two knocked-out bars, 1.4 × 4.6, 1.4 apart. |
+| `pneu-tray-error.svg` | 22 | Small variant + `ColorScheme-NegativeText` badge with a knocked-out "!" (bar 1.5 × 3.3, dot r 0.8). |
 
-The tray glyph sits slightly left of centre so badges occupy the empty lower-right corner without overlapping the bowl; no knockout ring is needed. Tray files keep v1's `current-color-scheme` stylesheet, so both the named-icon path and the ARGB fallback (resvg with `currentColor` replaced by the panel text colour) work unchanged.
+The tray glyph is centred at (10.15, 11.85), slightly down and left, so badges own the empty top-right corner beside the cut and stay at least 1.1 px clear of the glyph; no knockout ring is needed. (v2.1 put badges bottom-right; the landed half now fills that corner.) Tray files keep v1's `current-color-scheme` stylesheet with the tokens `#232629`, `#f67400` and `#da4453`, so both the named-icon path and the ARGB fallback (resvg after the one-pass palette substitution) work unchanged.
 
 ---
 
@@ -595,11 +595,11 @@ PC strings: unchanged from v1 4.6, minus the window's **Close** button label.
 | Predictive back | Keep the current screen state machine; wrap screen changes in `AnimatedContent` and handle back with `PredictiveBackHandler` (progress → scale 1 → 0.94 and 0 → 24 dp corner radius on the leaving screen). |
 
 **Icons and resources**
-- Launcher: `mipmap-anydpi-v26/ic_launcher.xml` keeps background/foreground/monochrome. Import each layer SVG with Vector Asset Studio (it converts the gradients); or write them by hand:
-  - Background: two `<path android:pathData="M0,0h108v108h-108z">` elements. The first has a linear `aapt:attr` gradient (`startX 32.4 startY 0 endX 75.6 endY 108`, `<item android:offset="0" android:color="#FF6B74FF"/>`, `0.55 #FF4846E8`, `1 #FF2620AE`). The second has a radial gradient (`centerX 54 centerY -8.64 gradientRadius 84.24`, `0 #52FFFFFF`, `1 #00FFFFFF`).
-  - Foreground: one `<path>` per SVG path, in order. Stroked paths use `android:strokeColor` (or an `aapt:attr name="android:strokeColor"` gradient), `strokeWidth`, `strokeAlpha`, `strokeLineCap="round"`, `strokeLineJoin="round"`, `fillColor="#00000000"`. Filled paths use `fillColor`/`fillAlpha` or a gradient. Per-stop opacity becomes the alpha byte of the stop colour (95 % white = `#F2FFFFFF`).
-  - Monochrome: the small-master path, `strokeWidth="9.36"`, black.
-- `ic_stat_pneu`: the small master from `ic_stat_pneu.svg` (`strokeWidth="3.4"`, white).
+- Launcher: `mipmap-anydpi-v26/ic_launcher.xml` keeps background/foreground/monochrome. Import every Android SVG with `android/tools/import_v2_icons.py` (paths, strokes and gradients convert one to one); by hand it is:
+  - Background: three paths. `M0,0h108v108h-108z` with a linear `aapt:attr` gradient (`startX 54 startY 54 endX 90 endY 90`, `<item android:offset="0" android:color="#FF232570"/>`, `1 #FF0C0D2E`); then `M0,0H108L0,108Z` twice, first with a linear gradient (`18 18 → 54 54`, `0 #FF8A91FF`, `1 #FF4F5BFF`), then with a radial gradient (`centerX 30 centerY 16 gradientRadius 58`, `0 #3DFFFFFF`, `1 #00FFFFFF`).
+  - Foreground: one `<path>` per SVG path, in order: ghost fill (`fillColor #FFFFFF`, `fillAlpha 0.11`), dashes (`strokeColor #FFFFFF`, `strokeAlpha 0.92`, `strokeWidth 2.4`, `strokeLineCap="round"`, `strokeLineJoin="round"`, `fillColor="#00000000"`), landed half (three-stop linear gradient). Per-stop opacity becomes the alpha byte of the stop colour (24 % white = `#3DFFFFFF`).
+  - Monochrome: the dash path and the landed half, black.
+- `ic_stat_pneu`: the small variant from `ic_stat_pneu.svg` (dash path `strokeWidth="1.85"` and the landed half, white).
 - Home top bar mark: import `pneu-mark.svg` as `ic_pneu_mark`.
 - Notification colour: `setColor(0xFF4F5BFF.toInt())` (was teal).
 
@@ -613,7 +613,8 @@ PC strings: unchanged from v1 4.6, minus the window's **Close** button label.
 
 ### 9.3 Tray and notifications
 
-- Replace the five files in `desktop/assets/` with the v2 tray SVGs (same names). The renderer already substitutes `currentColor`; the receiving file's fixed `#6370FF` and the badge classes need no code change. Confirm resvg honours `stroke-opacity` for the disconnected state (it does in current resvg).
+- Replace the five files in `desktop/assets/` with the v2 tray SVGs (same names). The renderer already substitutes `currentColor`; the receiving file's fixed `#6370FF` and the badge classes need no code change. Confirm resvg honours `stroke-opacity` and `fill-opacity` for the disconnected state (it does in current resvg).
+- The pixel tests in `ui/tray.rs` sample the old P's stem at (11, 30) and the bottom-right badge at (34, 28) in the 44 px pixmap. Sample the landed half at (25, 28) and the top-right badge at (35, 16) instead (clear of the bars and the "!"); every other assertion holds as written.
 - Replace `pneu.svg` (app icon) in `desktop/assets/` and the installer's hicolor target.
 - Notifications: no code change beyond the icon.
 
@@ -626,7 +627,7 @@ PC strings: unchanged from v1 4.6, minus the window's **Close** button label.
 
 ## 10. Decisions (resolved)
 
-1. **Icon**: A · Monogram, refined as in section 3 (lit tube P, carrier dropping out of the stem; flat P at small sizes).
+1. **Icon**: Crossing (section 3), chosen in the second icon round; it replaces A · Monogram (the tube P).
 2. **Palette**: fixed Pneu palette, no dynamic colour.
 3. **PC window**: Pneu components, following Plasma light/dark.
 4. **Close button**: removed; title-bar ✕ and Esc close the window.

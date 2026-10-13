@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108" width="108" height="108">
+<defs>
+<linearGradient id="bg" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="108">
+<stop offset="0" stop-color="#1E1F27"/>
+<stop offset="1" stop-color="#0C0D11"/>
+</linearGradient>
+<radialGradient id="bgL" gradientUnits="userSpaceOnUse" cx="54" cy="-6" r="80">
+<stop offset="0" stop-color="#FFFFFF" stop-opacity="0.1"/>
+<stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+</radialGradient>
+</defs>
+<path fill="url(#bg)" d="M0 0H108V108H0Z"/>
+<path fill="url(#bgL)" d="M0 0H108V108H0Z"/>
+<g transform="translate(54 54) scale(0.93) translate(-54 -54)">
+<path d="M33 67.5H48" fill="none" stroke="#FFB547" stroke-width="3.3" stroke-linecap="round"/>
+<path d="M33.5 48V33H42.85A4.65 4.65 0 0 1 42.85 42.3H33.5M60 33V48M60 40.5A7.5 7.5 0 0 1 75 40.5V48M48 67.5A7.5 7.5 0 1 0 46.07 72.52M60 60V67.5A7.5 7.5 0 0 0 75 67.5V60M75 60V75" fill="none" stroke="#FFFFFF" stroke-width="6.4" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+</svg>

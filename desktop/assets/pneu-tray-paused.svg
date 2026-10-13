@@ -1,5 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" width="22" height="22">
   <style type="text/css" id="current-color-scheme">.ColorScheme-Text{color:#232629;}.ColorScheme-NeutralText{color:#f67400;}.ColorScheme-NegativeText{color:#da4453;}</style>
-  <path class="ColorScheme-Text" style="fill:none;stroke:currentColor;stroke-width:3.1;stroke-linecap:round;stroke-linejoin:round" d="M5.61 17.94V7.46A3.41 3.41 0 0 1 9.02 4.06H10.33A4.06 4.06 0 0 1 10.33 12.18H9.54"/>
-  <path class="ColorScheme-NeutralText" style="fill:currentColor;fill-rule:evenodd" d="M12.8 17.3A4.5 4.5 0 1 1 21.8 17.3A4.5 4.5 0 1 1 12.8 17.3ZM15.2 15H16.6V19.6H15.2ZM18 15H19.4V19.6H18Z"/>
+  <path class="ColorScheme-Text" style="fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round" d="M6.23 13.37L4.26 11.41M1.85 8.63A3.85 3.85 0 0 1 1.7 5.92M4.22 3.4A3.85 3.85 0 0 1 6.93 3.55M9.71 5.96L11.67 7.93"/>
+  <path class="ColorScheme-Text" style="fill:currentColor" d="M13.72 9.48L7.78 15.42A0.5 0.5 0 0 0 7.78 16.13L11.6 19.95A4.7 4.7 0 0 0 18.25 19.95A4.7 4.7 0 0 0 18.25 13.3L14.43 9.48A0.5 0.5 0 0 0 13.72 9.48Z"/>
+  <path class="ColorScheme-NeutralText" style="fill:currentColor;fill-rule:evenodd" d="M12.9 4.6A4.5 4.5 0 1 1 21.9 4.6A4.5 4.5 0 1 1 12.9 4.6ZM15.3 2.3H16.7V6.9H15.3ZM18.1 2.3H19.5V6.9H18.1Z"/>
 </svg>

@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 64" width="192" height="64">
+<defs>
+<linearGradient id="m-bg" gradientUnits="userSpaceOnUse" x1="18" y1="12" x2="90" y2="98">
+<stop offset="0" stop-color="#86A2FF"/>
+<stop offset="0.5" stop-color="#7464F2"/>
+<stop offset="1" stop-color="#B35BE0"/>
+</linearGradient>
+<radialGradient id="m-bgL" gradientUnits="userSpaceOnUse" cx="30" cy="18" r="62">
+<stop offset="0" stop-color="#FFFFFF" stop-opacity="0.38"/>
+<stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+</radialGradient>
+<radialGradient id="m-bgP" gradientUnits="userSpaceOnUse" cx="92" cy="96" r="50">
+<stop offset="0" stop-color="#FF8FC8" stop-opacity="0.45"/>
+<stop offset="1" stop-color="#FF8FC8" stop-opacity="0"/>
+</radialGradient>
+<linearGradient id="m-gl" gradientUnits="userSpaceOnUse" x1="0" y1="-13.5" x2="0" y2="13.5">
+<stop offset="0" stop-color="#FFFFFF" stop-opacity="0.7"/>
+<stop offset="0.16" stop-color="#FFFFFF" stop-opacity="0.24"/>
+<stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0.07"/>
+<stop offset="0.84" stop-color="#FFFFFF" stop-opacity="0.2"/>
+<stop offset="1" stop-color="#FFFFFF" stop-opacity="0.55"/>
+</linearGradient>
+<linearGradient id="m-sky" gradientUnits="userSpaceOnUse" x1="0" y1="-8.5" x2="0" y2="8.5">
+<stop offset="0" stop-color="#A9E2FF"/>
+<stop offset="1" stop-color="#4E8CFF"/>
+</linearGradient>
+<linearGradient id="m-cf" gradientUnits="userSpaceOnUse" x1="0" y1="-13.5" x2="0" y2="13.5">
+<stop offset="0" stop-color="#FFF0C4"/>
+<stop offset="0.4" stop-color="#FFB547"/>
+<stop offset="0.78" stop-color="#D47E18"/>
+<stop offset="1" stop-color="#FFCB6B"/>
+</linearGradient>
+<linearGradient id="m-cr" gradientUnits="userSpaceOnUse" x1="0" y1="-13.5" x2="0" y2="13.5">
+<stop offset="0" stop-color="#FFFFFF"/>
+<stop offset="0.4" stop-color="#DCDFF2"/>
+<stop offset="0.78" stop-color="#9EA2C8"/>
+<stop offset="1" stop-color="#E7E9FA"/>
+</linearGradient>
+<clipPath id="m-gc">
+<rect x="-31.0" y="-13.5" width="62" height="27" rx="13.5"/>
+</clipPath>
+<clipPath id="m-pc">
+<rect x="-15" y="-8.5" width="29" height="17" rx="2"/>
+</clipPath>
+<radialGradient id="m-gsh">
+<stop offset="0" stop-color="#2A1066" stop-opacity=".42"/>
+<stop offset=".6" stop-color="#2A1066" stop-opacity=".14"/>
+<stop offset="1" stop-color="#2A1066" stop-opacity="0"/>
+</radialGradient>
+<clipPath id="tile">
+<path d="M64 32L63.99 38.48L63.96 41L63.92 42.92L63.85 44.51L63.77 45.9L63.67 47.15L63.54 48.28L63.4 49.32L63.24 50.29L63.07 51.2L62.87 52.05L62.65 52.85L62.41 53.61L62.16 54.32L61.88 55L61.58 55.65L61.27 56.26L60.93 56.85L60.57 57.4L60.19 57.93L59.78 58.43L59.35 58.9L58.9 59.35L58.43 59.78L57.93 60.19L57.4 60.57L56.85 60.93L56.26 61.27L55.65 61.58L55 61.88L54.32 62.16L53.61 62.41L52.85 62.65L52.05 62.87L51.2 63.07L50.29 63.24L49.32 63.4L48.28 63.54L47.15 63.67L45.9 63.77L44.51 63.85L42.92 63.92L41 63.96L38.48 63.99L32 64L25.52 63.99L23 63.96L21.08 63.92L19.49 63.85L18.1 63.77L16.85 63.67L15.72 63.54L14.68 63.4L13.71 63.24L12.8 63.07L11.95 62.87L11.15 62.65L10.39 62.41L9.68 62.16L9 61.88L8.35 61.58L7.74 61.27L7.15 60.93L6.6 60.57L6.07 60.19L5.57 59.78L5.1 59.35L4.65 58.9L4.22 58.43L3.81 57.93L3.43 57.4L3.07 56.85L2.73 56.26L2.42 55.65L2.12 55L1.84 54.32L1.59 53.61L1.35 52.85L1.13 52.05L0.93 51.2L0.76 50.29L0.6 49.32L0.46 48.28L0.33 47.15L0.23 45.9L0.15 44.51L0.08 42.92L0.04 41L0.01 38.48L0 32L0.01 25.52L0.04 23L0.08 21.08L0.15 19.49L0.23 18.1L0.33 16.85L0.46 15.72L0.6 14.68L0.76 13.71L0.93 12.8L1.13 11.95L1.35 11.15L1.59 10.39L1.84 9.68L2.12 9L2.42 8.35L2.73 7.74L3.07 7.15L3.43 6.6L3.81 6.07L4.22 5.57L4.65 5.1L5.1 4.65L5.57 4.22L6.07 3.81L6.6 3.43L7.15 3.07L7.74 2.73L8.35 2.42L9 2.12L9.68 1.84L10.39 1.59L11.15 1.35L11.95 1.13L12.8 0.93L13.71 0.76L14.68 0.6L15.72 0.46L16.85 0.33L18.1 0.23L19.49 0.15L21.08 0.08L23 0.04L25.52 0.01L32 0L38.48 0.01L41 0.04L42.92 0.08L44.51 0.15L45.9 0.23L47.15 0.33L48.28 0.46L49.32 0.6L50.29 0.76L51.2 0.93L52.05 1.13L52.85 1.35L53.61 1.59L54.32 1.84L55 2.12L55.65 2.42L56.26 2.73L56.85 3.07L57.4 3.43L57.93 3.81L58.43 4.22L58.9 4.65L59.35 5.1L59.78 5.57L60.19 6.07L60.57 6.6L60.93 7.15L61.27 7.74L61.58 8.35L61.88 9L62.16 9.68L62.41 10.39L62.65 11.15L62.87 11.95L63.07 12.8L63.24 13.71L63.4 14.68L63.54 15.72L63.67 16.85L63.77 18.1L63.85 19.49L63.92 21.08L63.96 23L63.99 25.52Z"/>
+</clipPath>
+</defs>
+<g clip-path="url(#tile)">
+<g transform="scale(0.89) translate(-18 -18)">
+<path fill="url(#m-bg)" d="M0 0H108V108H0Z"/>
+<path fill="url(#m-bgP)" d="M0 0H108V108H0Z"/>
+<path fill="url(#m-bgL)" d="M0 0H108V108H0Z"/>
+<g transform="translate(54 54) scale(0.84) translate(-54 -54)">
+<g transform="translate(57 66) rotate(-38) scale(1 .42)">
+<circle r="38" fill="url(#m-gsh)"/>
+</g>
+<g transform="translate(54 55) rotate(-38)">
+<g clip-path="url(#m-gc)">
+<rect x="-31.0" y="-13.5" width="62" height="27" fill="#E9ECFF" opacity=".16"/>
+<g transform="translate(-1 0)">
+<g clip-path="url(#m-pc)">
+<rect x="-15" y="-8.5" width="29" height="17" fill="url(#m-sky)"/>
+<path d="M4.7 -3.2A2.8 2.8 0 1 0 10.3 -3.2A2.8 2.8 0 1 0 4.7 -3.2Z" fill="#FFD27A"/>
+<path d="M-15 8.5L-6.5 -1.5L3.5 8.5Z" fill="#2D5BB0"/>
+<path d="M-1 8.5L6.5 1.8L14 8.5Z" fill="#3F7AD6"/>
+</g>
+<rect x="-15" y="-8.5" width="29" height="17" rx="2" fill="none" stroke="#FFFFFF" stroke-width="1.6"/>
+</g>
+<rect x="-31.0" y="-13.5" width="62" height="27" fill="url(#m-gl)"/>
+<rect x="21.5" y="-14.5" width="10" height="29" fill="url(#m-cf)"/>
+<rect x="-31.5" y="-14.5" width="10" height="29" fill="url(#m-cr)"/>
+<rect x="20.8" y="-14.5" width="1" height="29" fill="#FFFFFF" opacity=".75"/>
+<rect x="-21.8" y="-14.5" width="1" height="29" fill="#FFFFFF" opacity=".8"/>
+</g>
+<rect x="-18" y="-10.9" width="34" height="2.4" rx="1.2" fill="#FFFFFF" opacity=".9"/>
+<rect x="-13" y="9.5" width="22" height="1.3" rx=".65" fill="#FFFFFF" opacity=".4"/>
+<rect x="23.5" y="-10.1" width="4.5" height="1.6" rx=".8" fill="#FFFFFF" opacity=".85"/>
+<rect x="-30.6" y="-13.1" width="61.2" height="26.2" rx="13.1" fill="none" stroke="#FFFFFF" stroke-opacity=".55" stroke-width=".8"/>
+</g>
+</g>
+</g>
+</g>
+<g transform="translate(85.4 47)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+<path d="M0 0V-30H9.6A8.4 8.4 0 0 1 9.6 -13.2H0M24.4 -22V0M24.4 -11A11 11 0 0 1 46.4 -11V0M52.8 -11H74.8A11 11 0 1 0 71.97 -3.64M81.2 -22V-11A11 11 0 0 0 103.2 -11M103.2 -22V0" stroke="#FFFFFF" stroke-width="2.8"/>
+</g>
+</svg>

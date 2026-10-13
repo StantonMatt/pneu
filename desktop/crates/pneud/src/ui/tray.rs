@@ -319,20 +319,20 @@ mod tests {
                         background: "#ffffff".into(),
                     })?;
                     for (name, icon) in icons {
-                        // Interior pixels of the stem and badge, away from their
-                        // antialiased edges and from the badge's knocked-out bars.
+                        // Interior pixels of the landed half and top-right badge,
+                        // away from antialiased edges and knocked-out bars.
                         let pixel = |x: usize, y: usize| &icon.data[(y * 44 + x) * 4..][..4];
-                        let stem = pixel(11, 30);
+                        let glyph = pixel(25, 28);
                         let receiving = name == "pneu-tray-receiving";
                         let disconnected = name == "pneu-tray-disconnected";
-                        assert_eq!(stem[0], if disconnected { 128 } else { 255 }, "{name}");
+                        assert_eq!(glyph[0], if disconnected { 128 } else { 255 }, "{name}");
                         let expected = if receiving {
                             [99, 112, 255]
                         } else {
                             rgb(foreground)
                         };
                         assert!(
-                            stem[1..].iter().zip(expected).all(|(actual, expected)| {
+                            glyph[1..].iter().zip(expected).all(|(actual, expected)| {
                                 actual.abs_diff(expected) <= if disconnected { 2 } else { 0 }
                             }),
                             "{name}: foreground={foreground}, negative={negative}, neutral={neutral}"
@@ -343,7 +343,7 @@ mod tests {
                             _ => None,
                         };
                         if let Some(color) = badge {
-                            let actual = pixel(34, 28);
+                            let actual = pixel(35, 16);
                             assert_eq!(actual[0], 255, "{name}");
                             assert_eq!(
                                 &actual[1..],

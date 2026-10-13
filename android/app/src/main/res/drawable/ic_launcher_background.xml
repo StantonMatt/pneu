@@ -1,19 +1,26 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Generated from docs/design/v2/assets/ic_launcher_background.svg; SHA-256 7a3852ae7c32dc774b1e939aff253aeb34d9ea9e380b68f3c6c562f1c5b91b1f. -->
+<!-- Generated from docs/design/v2/assets/ic_launcher_background.svg; SHA-256 dc0ee2c6a09767310413b44fa38924053fd083e48ea3779cc1164a8c48300cc9. -->
 <vector xmlns:aapt="http://schemas.android.com/aapt" xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
     <path android:pathData="M0 0H108V108H0Z" android:strokeColor="#00000000">
         <aapt:attr name="android:fillColor">
-            <gradient android:type="linear" android:startX="32.4" android:startY="0" android:endX="75.6" android:endY="108">
-                <item android:offset="0" android:color="#6B74FF" />
-                <item android:offset=".55" android:color="#4846E8" />
-                <item android:offset="1" android:color="#2620AE" />
+            <gradient android:type="linear" android:startX="54" android:startY="54" android:endX="90" android:endY="90">
+                <item android:offset="0" android:color="#232570" />
+                <item android:offset="1" android:color="#0C0D2E" />
             </gradient>
         </aapt:attr>
     </path>
-    <path android:pathData="M0 0H108V108H0Z" android:strokeColor="#00000000">
+    <path android:pathData="M0 0H108L0 108Z" android:strokeColor="#00000000">
         <aapt:attr name="android:fillColor">
-            <gradient android:type="radial" android:centerX="54" android:centerY="-8.64" android:gradientRadius="84.24">
-                <item android:offset="0" android:color="#52FFFFFF" />
+            <gradient android:type="linear" android:startX="18" android:startY="18" android:endX="54" android:endY="54">
+                <item android:offset="0" android:color="#8A91FF" />
+                <item android:offset="1" android:color="#4F5BFF" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <path android:pathData="M0 0H108L0 108Z" android:strokeColor="#00000000">
+        <aapt:attr name="android:fillColor">
+            <gradient android:type="radial" android:centerX="30" android:centerY="16" android:gradientRadius="58">
+                <item android:offset="0" android:color="#3DFFFFFF" />
                 <item android:offset="1" android:color="#00FFFFFF" />
             </gradient>
         </aapt:attr>
