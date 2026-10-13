@@ -43,8 +43,6 @@ cd desktop
 
 The installer builds `pneud`, installs it into `~/.local/bin`, installs icons and a desktop entry, and enables a systemd user service tied to the graphical session. It starts or restarts the daemon immediately if that session is active.
 
-**Installer note:** [desktop/install.sh](desktop/install.sh) currently hard-codes `/home/mjstanton/.local/bin/heavy` for the release build. Other users need to provide that wrapper or adapt the build invocation before using the installer.
-
 On the phone side, from the repo root, with the Android SDK configured and `adb` on your PATH:
 
 ```sh
@@ -120,4 +118,4 @@ Android 14 supports text shares, but URI/file shares require Android 15+ for sen
 
 ## License
 
-No license file yet. The [Material Symbols license](android/MATERIAL_SYMBOLS_LICENSE) covers those bundled assets.
+[MIT](LICENSE). The bundled Material Symbols assets are covered by their own [license](android/MATERIAL_SYMBOLS_LICENSE).

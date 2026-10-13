@@ -59,7 +59,7 @@ originate idle PINGs, and validate PONGs; clipboard diagnostics include IDs only
 share` marks shared text, and `send-file PATH file MIME` sends an ordinary file.
 It checks the PC's advertised clipboard-image capability before sending that kind.
 
-`install.sh` builds the release daemon through `heavy`, installs it into
+`install.sh` builds the release daemon (through `heavy` when available), installs it into
 `~/.local/bin`, installs the app/tray icons and desktop entry, writes the systemd user unit, and reenables it for `graphical-session.target`.
 An active graphical session starts/restarts the daemon immediately, including
 reinstalls; otherwise it starts with the next graphical session. Run it only
