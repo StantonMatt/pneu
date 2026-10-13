@@ -372,8 +372,8 @@ impl DesktopActions {
                 "org.freedesktop.Notifications",
             )
             .await?;
-            let mut signals = proxy.receive_signal("ActionInvoked").await?;
-            let mut closed = proxy.receive_signal("NotificationClosed").await?;
+            // One stream preserves ActivationToken -> ActionInvoked -> Closed ordering.
+            let mut signals = proxy.receive_all_signals().await?;
             let paths = Arc::new(Mutex::new(HashMap::<u32, ReceivedFile>::new()));
             let action_paths = paths.clone();
             let targets = Arc::new(Mutex::new(HashMap::<u32, Target>::new()));
@@ -382,29 +382,48 @@ impl DesktopActions {
             let (stop, mut stopped) = tokio::sync::watch::channel(false);
             let task = tokio::spawn(Box::pin(async move {
                 let mut interactions = crate::ui::portal::Interactions::new();
+                let mut tokens = crate::ui::activation::NotificationTokens::default();
                 loop {
                     tokio::select! { biased;
                         _=stopped.changed()=>break,
-                        signal=closed.next()=>{
-                            let Some(signal)=signal else {break;};
-                            if let Ok((id,_reason))=signal.body().deserialize::<(u32,u32)>() {action_paths.lock().await.remove(&id);action_targets.lock().await.remove(&id);}
-                        },
                         signal=signals.next()=>{
                             let Some(signal)=signal else {break;};
+                            match signal.header().member().map(|m| m.as_str()) {
+                                Some("ActivationToken") => {
+                                    if let Ok((id, token)) = signal.body().deserialize::<(u32, String)>() {
+                                        // Check the live mappings, not an independently evictable ID cache.
+                                        let eligible = action_targets.lock().await.contains_key(&id)
+                                            || action_paths.lock().await.contains_key(&id);
+                                        if eligible { tokens.receive(id, token, std::time::Instant::now()); }
+                                    }
+                                    continue;
+                                }
+                                Some("NotificationClosed") => {
+                                    if let Ok((id, _)) = signal.body().deserialize::<(u32, u32)>() {
+                                        action_paths.lock().await.remove(&id);
+                                        action_targets.lock().await.remove(&id);
+                                        tokens.remove(id);
+                                    }
+                                    continue;
+                                }
+                                Some("ActionInvoked") => {},
+                                _ => continue,
+                            }
                             if let Ok((id,action))=signal.body().deserialize::<(u32,String)>() {
                                 let target=action_targets.lock().await.get(&id).cloned();
+                                let path=action_paths.lock().await.get(&id).cloned();
+                                let token=tokens.take(id, std::time::Instant::now());
                                 if let Some(target)=target {
                                     match action.as_str() {
-                                        "default"|"open" => { if interactions.available() && let Some(file)=target.files.first() && let Ok(wait)=begin_open_received_file(file,&action_connection).await { interactions.push(async move { let _=wait.await; }); } },
-                                        "show" => { let _=show_files(&target.urls,&action_connection).await; },
-                                        "link" => { if interactions.available() && let Some(link)=target.link { let wait=begin_open_uri(&link,&action_connection).await; interactions.push(async move { let _=wait.await; }); } },
-                                        "folder"|"pair" => { if let Some(commands)=commands.lock().expect("UI commands").clone() { let _=commands.try_send(if action=="folder" { crate::ui::Command::ChooseFolder } else { crate::ui::Command::Window }); } },
+                                        "default"|"open" => { if interactions.available() && let Some(file)=target.files.first() && let Ok(wait)=begin_open_received_file(file,&action_connection,token.as_deref()).await { interactions.push(async move { let _=wait.await; }); } },
+                                        "show" => { let _=show_files(&target.urls,&action_connection,token.as_deref()).await; },
+                                        "link" => { if interactions.available() && let Some(link)=target.link { let wait=begin_open_uri(&link,&action_connection,token.as_deref()).await; interactions.push(async move { let _=wait.await; }); } },
+                                        "folder"|"pair" => { if let Some(commands)=commands.lock().expect("UI commands").clone() { let _=commands.try_send(if action=="folder" { crate::ui::Command::ChooseFolder } else { crate::ui::Command::Window { activation_token: token } }); } },
                                         _=>{},
                                     }
                                     continue;
                                 }
-                                let path=action_paths.lock().await.get(&id).cloned();
-                                if let Some(path)=path {match action.as_str() {"default"|"open"=>{if interactions.available() && let Ok(wait)=begin_open_received_file(&path, &action_connection).await { interactions.push(async move { let _=wait.await; }); }},"show"=>{let _=show_path(path.path()).await;},_=>{}}}
+                                if let Some(path)=path {match action.as_str() {"default"|"open"=>{if interactions.available() && let Ok(wait)=begin_open_received_file(&path, &action_connection,token.as_deref()).await { interactions.push(async move { let _=wait.await; }); }},"show"=>{if let Ok(uri)=file_uri(path.path()) { let _=show_files(&[uri], &action_connection,token.as_deref()).await; }},_=>{}}}
                             }
                         }
                     }
@@ -785,7 +804,7 @@ impl PcActions for DesktopActions {
         &self,
         file: &ReceivedFile,
     ) -> Result<crate::ui::portal::Interaction> {
-        begin_open_received_file(file, &self.bus_connection().await?).await
+        begin_open_received_file(file, &self.bus_connection().await?, None).await
     }
     async fn shutdown(&self) -> Result<()> {
         let _guard = self.clipboard_gate.lock().await;
@@ -810,11 +829,14 @@ fn file_uri(path: &Path) -> Result<String> {
 /// asynchronous viewer launch. There is deliberately no pathname fallback.
 #[cfg(test)]
 async fn open_received_file(file: &ReceivedFile, connection: &zbus::Connection) -> Result<()> {
-    begin_open_received_file(file, connection).await?.await
+    begin_open_received_file(file, connection, None)
+        .await?
+        .await
 }
 async fn begin_open_received_file(
     file: &ReceivedFile,
     connection: &zbus::Connection,
+    activation_token: Option<&str>,
 ) -> Result<crate::ui::portal::Interaction> {
     let request = crate::ui::portal::Request::new(connection).await?;
     let proxy = request
@@ -827,10 +849,7 @@ async fn begin_open_received_file(
         &(
             "",
             fd,
-            HashMap::from([(
-                "handle_token",
-                zbus::zvariant::Value::from(request.token.as_str()),
-            )]),
+            crate::ui::activation::open_uri_options(&request.token, activation_token),
         ),
     ))
     .await?;
@@ -841,21 +860,11 @@ async fn begin_open_received_file(
         Ok(())
     }))
 }
-async fn show_path(path: &Path) -> Result<()> {
-    let connection = zbus::Connection::session().await?;
-    let proxy = zbus::Proxy::new(
-        &connection,
-        "org.freedesktop.FileManager1",
-        "/org/freedesktop/FileManager1",
-        "org.freedesktop.FileManager1",
-    )
-    .await?;
-    let _: () = proxy
-        .call("ShowItems", &(vec![file_uri(path)?], ""))
-        .await?;
-    Ok(())
-}
-async fn show_files(urls: &[String], connection: &zbus::Connection) -> Result<()> {
+async fn show_files(
+    urls: &[String],
+    connection: &zbus::Connection,
+    activation_token: Option<&str>,
+) -> Result<()> {
     let proxy = zbus::Proxy::new(
         connection,
         "org.freedesktop.FileManager1",
@@ -863,21 +872,25 @@ async fn show_files(urls: &[String], connection: &zbus::Connection) -> Result<()
         "org.freedesktop.FileManager1",
     )
     .await?;
-    let _: () = proxy.call("ShowItems", &(urls, "")).await?;
+    let _: () = proxy
+        .call("ShowItems", &(urls, activation_token.unwrap_or_default()))
+        .await?;
     Ok(())
 }
 pub async fn open_uri(uri: &str, connection: &zbus::Connection) -> Result<()> {
-    begin_open_uri(uri, connection).await.await
+    begin_open_uri(uri, connection, None).await.await
 }
 async fn begin_open_uri(
     uri: &str,
     connection: &zbus::Connection,
+    activation_token: Option<&str>,
 ) -> crate::ui::portal::Interaction {
-    let portal = begin_open_uri_portal(uri, connection).await;
+    let portal = begin_open_uri_portal(uri, connection, activation_token).await;
     let uri = uri.to_owned();
+    let activation_token = activation_token.map(str::to_owned);
     Box::pin(async move {
         crate::ui::portal::with_fallback(async { portal?.await }, || async {
-            let status = tokio::process::Command::new("xdg-open")
+            let status = crate::ui::activation::command("xdg-open", activation_token.as_deref())
                 .arg(&uri)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -891,12 +904,19 @@ async fn begin_open_uri(
         .await
     })
 }
-pub(crate) async fn open_uri_portal(uri: &str, connection: &zbus::Connection) -> Result<()> {
-    begin_open_uri_portal(uri, connection).await?.await
+pub(crate) async fn open_uri_portal(
+    uri: &str,
+    connection: &zbus::Connection,
+    activation_token: Option<&str>,
+) -> Result<()> {
+    begin_open_uri_portal(uri, connection, activation_token)
+        .await?
+        .await
 }
 async fn begin_open_uri_portal(
     uri: &str,
     connection: &zbus::Connection,
+    activation_token: Option<&str>,
 ) -> Result<crate::ui::portal::Interaction> {
     let request = crate::ui::portal::Request::new(connection).await?;
     let proxy = request
@@ -907,10 +927,7 @@ async fn begin_open_uri_portal(
         &(
             "",
             uri,
-            HashMap::from([(
-                "handle_token",
-                zbus::zvariant::Value::from(request.token.as_str()),
-            )]),
+            crate::ui::activation::open_uri_options(&request.token, activation_token),
         ),
     ))
     .await?;
@@ -1190,6 +1207,7 @@ exec sleep 60
         Arc<std::sync::Mutex<Option<String>>>,
         Arc<std::sync::atomic::AtomicU32>,
         Arc<std::sync::atomic::AtomicU32>,
+        Arc<std::sync::Mutex<Option<String>>>,
     );
     struct PortalRequest(Arc<std::sync::atomic::AtomicU32>);
     #[zbus::interface(name = "org.freedesktop.portal.Request")]
@@ -1198,10 +1216,14 @@ exec sleep 60
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
-    struct FileManagerServer(Arc<std::sync::atomic::AtomicU32>);
+    struct FileManagerServer(
+        Arc<std::sync::atomic::AtomicU32>,
+        Arc<std::sync::Mutex<String>>,
+    );
     #[zbus::interface(name = "org.freedesktop.FileManager1")]
     impl FileManagerServer {
-        fn show_items(&self, _urls: Vec<String>, _startup: &str) {
+        fn show_items(&self, _urls: Vec<String>, startup: &str) {
+            *self.1.lock().unwrap() = startup.to_owned();
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
@@ -1212,6 +1234,15 @@ exec sleep 60
             header: zbus::message::Header<'_>,
             connection: &zbus::Connection,
         ) -> zbus::zvariant::OwnedObjectPath {
+            assert!(
+                options
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "handle_token" | "activation_token")),
+                "unsupported OpenURI option"
+            );
+            *self.5.lock().unwrap() = options
+                .get("activation_token")
+                .map(|value| String::try_from(value.try_clone().unwrap()).unwrap());
             let token: String = options
                 .get("handle_token")
                 .unwrap()
@@ -1344,13 +1375,15 @@ exec sleep 60
         let issued = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let closed = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let shown = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let startup_id = Arc::new(std::sync::Mutex::new(String::new()));
+        let portal_activation = Arc::new(std::sync::Mutex::new(None::<String>));
         let server = zbus::connection::Builder::address(address)?
             .name("org.freedesktop.Notifications")?
             .name("org.freedesktop.portal.Desktop")?
             .name("org.freedesktop.FileManager1")?
             .serve_at(
                 "/org/freedesktop/FileManager1",
-                FileManagerServer(shown.clone()),
+                FileManagerServer(shown.clone(), startup_id.clone()),
             )?
             .serve_at(
                 "/org/freedesktop/portal/desktop",
@@ -1360,6 +1393,7 @@ exec sleep 60
                     deferred_response.clone(),
                     issued.clone(),
                     closed.clone(),
+                    portal_activation.clone(),
                 ),
             )?
             .serve_at(
@@ -1467,6 +1501,166 @@ exec sleep 60
         let final_path = dir.path().join("final.png");
         std::fs::write(&final_path, &image_bytes)?;
         let final_file = ReceivedFile::open(&final_path)?;
+        // Target churn must not prevent activation of a file still retained in paths.
+        for _ in 0..600 {
+            actions
+                .notice(
+                    crate::ui::notifications::Notice::new("churn"),
+                    Vec::new(),
+                    None,
+                    0,
+                    None,
+                )
+                .await?;
+        }
+        {
+            let current = actions.notifications().await?;
+            let n = current.as_ref().unwrap();
+            assert!(n.paths.lock().await.contains_key(&2));
+            let targets = n.targets.lock().await;
+            assert_eq!(targets.len(), NOTIFICATION_ACTION_LIMIT);
+            assert!(!targets.contains_key(&2));
+        }
+        // Repeated clicks on the retained file each use a fresh one-shot token.
+        for token in [Some("retained-first"), Some("retained-second"), None] {
+            let before = shown.load(std::sync::atomic::Ordering::SeqCst);
+            if let Some(token) = token {
+                server
+                    .emit_signal(
+                        None::<&str>,
+                        "/org/freedesktop/Notifications",
+                        "org.freedesktop.Notifications",
+                        "ActivationToken",
+                        &(2u32, token),
+                    )
+                    .await?;
+            }
+            server
+                .emit_signal(
+                    None::<&str>,
+                    "/org/freedesktop/Notifications",
+                    "org.freedesktop.Notifications",
+                    "ActionInvoked",
+                    &(2u32, "show"),
+                )
+                .await?;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while shown.load(std::sync::atomic::Ordering::SeqCst) == before {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            assert_eq!(&*startup_id.lock().unwrap(), token.unwrap_or_default());
+        }
+        // Real D-Bus signal ordering and all notification launch destinations.
+        for action in ["default", "open", "show", "link", "folder", "pair"] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+            actions.set_commands(tx);
+            let id = actions
+                .notice(
+                    crate::ui::notifications::Notice::blocked("phone"),
+                    vec![final_file.clone()],
+                    Some("https://example.com".into()),
+                    0,
+                    None,
+                )
+                .await?;
+            let before = if action == "show" {
+                shown.load(std::sync::atomic::Ordering::SeqCst)
+            } else {
+                issued.load(std::sync::atomic::Ordering::SeqCst)
+            };
+            for (member, payload) in [
+                ("ActivationToken", "notification-token"),
+                ("ActionInvoked", action),
+            ] {
+                server
+                    .emit_signal(
+                        None::<&str>,
+                        "/org/freedesktop/Notifications",
+                        "org.freedesktop.Notifications",
+                        member,
+                        &(id, payload),
+                    )
+                    .await?;
+            }
+            if matches!(action, "folder" | "pair") {
+                let command = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await?
+                    .unwrap();
+                match command {
+                    crate::ui::Command::Window { activation_token } if action == "pair" => {
+                        assert_eq!(activation_token.as_deref(), Some("notification-token"));
+                    }
+                    crate::ui::Command::ChooseFolder if action == "folder" => {}
+                    _ => panic!("wrong notification command"),
+                }
+            } else {
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    loop {
+                        let count = if action == "show" {
+                            shown.load(std::sync::atomic::Ordering::SeqCst)
+                        } else {
+                            issued.load(std::sync::atomic::Ordering::SeqCst)
+                        };
+                        if count > before {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await?;
+                if action == "show" {
+                    assert_eq!(&*startup_id.lock().unwrap(), "notification-token");
+                } else {
+                    assert_eq!(
+                        portal_activation.lock().unwrap().as_deref(),
+                        Some("notification-token")
+                    );
+                }
+            }
+        }
+        // Retained notice targets accept fresh tokens after prior actions too;
+        // a missing token cannot reuse the previous click's credential.
+        let id = actions
+            .notice(
+                crate::ui::notifications::Notice::new("repeat actions"),
+                vec![final_file.clone()],
+                None,
+                0,
+                None,
+            )
+            .await?;
+        for token in [None, Some("first-click"), None, Some("second-click"), None] {
+            let before = shown.load(std::sync::atomic::Ordering::SeqCst);
+            if let Some(token) = token {
+                server
+                    .emit_signal(
+                        None::<&str>,
+                        "/org/freedesktop/Notifications",
+                        "org.freedesktop.Notifications",
+                        "ActivationToken",
+                        &(id, token),
+                    )
+                    .await?;
+            }
+            server
+                .emit_signal(
+                    None::<&str>,
+                    "/org/freedesktop/Notifications",
+                    "org.freedesktop.Notifications",
+                    "ActionInvoked",
+                    &(id, "show"),
+                )
+                .await?;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while shown.load(std::sync::atomic::Ordering::SeqCst) == before {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            assert_eq!(&*startup_id.lock().unwrap(), token.unwrap_or_default());
+        }
         let metadata = pneu_proto::FileBegin {
             transfer_id: pneu_proto::Id::from_bytes([7; 16]),
             file_name: "final.png".into(),
@@ -1598,7 +1792,7 @@ exec sleep 60
             portal_code.store(code, std::sync::atomic::Ordering::SeqCst);
             let fallback = std::sync::atomic::AtomicBool::new(false);
             crate::ui::portal::with_fallback(
-                open_uri_portal("https://example.com", &connection),
+                open_uri_portal("https://example.com", &connection, None),
                 || async {
                     fallback.store(true, std::sync::atomic::Ordering::SeqCst);
                     Ok(())
@@ -1695,7 +1889,12 @@ exec sleep 60
                 .context("notification command")?;
             assert!(matches!(
                 (action, command),
-                ("pair", crate::ui::Command::Window) | ("folder", crate::ui::Command::ChooseFolder)
+                (
+                    "pair",
+                    crate::ui::Command::Window {
+                        activation_token: None
+                    }
+                ) | ("folder", crate::ui::Command::ChooseFolder)
             ));
         }
         assert_eq!(
@@ -1758,9 +1957,9 @@ exec sleep 60
         let failed = Arc::new(std::sync::atomic::AtomicU32::new(0));
         for index in 0..crate::ui::portal::Interactions::LIMIT {
             let wait = if index % 2 == 0 {
-                begin_open_received_file(&final_file, &connection).await?
+                begin_open_received_file(&final_file, &connection, None).await?
             } else {
-                begin_open_uri_portal("https://example.com", &connection).await?
+                begin_open_uri_portal("https://example.com", &connection, None).await?
             };
             let failed = failed.clone();
             waiting.push(async move {
@@ -1794,12 +1993,13 @@ exec sleep 60
                     deferred_response,
                     issued,
                     closed,
+                    portal_activation.clone(),
                 ),
             )?
             .build()
             .await?;
         open_received_file(&final_file, &connection).await?;
-        open_uri_portal("https://example.com", &connection).await?;
+        open_uri_portal("https://example.com", &connection, None).await?;
         waiting.shutdown().await;
         drop(replacement);
         drop(server);

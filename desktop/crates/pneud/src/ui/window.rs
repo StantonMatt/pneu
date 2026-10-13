@@ -324,7 +324,26 @@ enum Action {
 }
 pub fn run(paths: Paths) -> Result<()> {
     // Prefer Qt/native; selecting winit is an explicit fallback for Qt-less builds.
-    slint::BackendSelector::new().select()?;
+    use slint::winit_030::winit::{
+        platform::startup_notify::WindowAttributesExtStartupNotify, window::ActivationToken,
+    };
+    // Slint applies this hook at adapter creation, not during later hide/show.
+    // Notification activation therefore starts a fresh supervised window process.
+    let startup_activation = std::cell::RefCell::new(std::env::var("XDG_ACTIVATION_TOKEN").ok());
+    let startup_request = std::env::var("PNEU_WINDOW_REQUEST")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|request| request & 1 == 0)
+        .unwrap_or(0);
+    slint::BackendSelector::new()
+        .with_winit_window_attributes_hook(move |attributes| {
+            if let Some(token) = startup_activation.borrow_mut().take() {
+                attributes.with_activation_token(ActivationToken::from_raw(token))
+            } else {
+                attributes
+            }
+        })
+        .select()?;
     slint::set_xdg_app_id("pneu")?;
     let window = PneuWindow::new()?;
     let visible = Arc::new(AtomicBool::new(true));
@@ -359,7 +378,7 @@ pub fn run(paths: Paths) -> Result<()> {
             let mut pairing_token: Option<pneu_proto::Hash> = None;
             let mut invitation_revision = 0;
             let mut invitation_job: Option<futures_util::future::BoxFuture<'static, Result<serde_json::Value>>> = None;
-            let mut request = 0;
+            let mut request = startup_request;
             let mut was_paired = false;
             let mut last_pair_attempt = 0;
             let mut failed = 0;
@@ -642,12 +661,23 @@ mod tests {
     impl Chooser {
         async fn open_file(
             &self,
-            _parent: &str,
+            parent: &str,
             _title: &str,
             options: std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
             #[zbus(connection)] connection: &zbus::Connection,
             #[zbus(header)] header: zbus::message::Header<'_>,
         ) -> zbus::fdo::Result<zbus::zvariant::OwnedObjectPath> {
+            assert!(parent.is_empty());
+            assert_eq!(options.len(), 4);
+            for key in options.keys() {
+                assert!(
+                    matches!(
+                        key.as_str(),
+                        "handle_token" | "directory" | "multiple" | "current_folder"
+                    ),
+                    "unsupported FileChooser option: {key}"
+                );
+            }
             let token = String::try_from(options["handle_token"].try_clone().unwrap()).unwrap();
             let sender = header
                 .sender()

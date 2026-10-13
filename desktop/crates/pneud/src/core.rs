@@ -573,7 +573,7 @@ pub struct Core {
     action_stop: watch::Sender<bool>,
     shutdown: watch::Sender<bool>,
     port: AtomicU16,
-    window_request: AtomicU64,
+    window_request: Mutex<(u64, Option<String>)>,
     #[cfg(test)]
     file_write_delay: Mutex<Duration>,
 }
@@ -654,7 +654,7 @@ impl Core {
             action_stop,
             shutdown,
             port: AtomicU16::new(port),
-            window_request: AtomicU64::new(0),
+            window_request: Mutex::new((0, None)),
             #[cfg(test)]
             file_write_delay: Mutex::new(Duration::ZERO),
         });
@@ -768,14 +768,22 @@ impl Core {
         self.port.load(Ordering::SeqCst)
     }
     pub fn request_window(&self, choose_folder: bool) {
-        let previous = self.window_request.load(Ordering::SeqCst);
-        self.window_request.store(
-            ((previous >> 1) + 1) * 2 + u64::from(choose_folder),
-            Ordering::SeqCst,
-        );
+        self.request_window_with_activation(choose_folder, None);
+    }
+    pub(crate) fn request_window_with_activation(
+        &self,
+        choose_folder: bool,
+        token: Option<String>,
+    ) {
+        let mut request = self.window_request.lock().expect("window request");
+        request.0 = ((request.0 >> 1) + 1) * 2 + u64::from(choose_folder);
+        request.1 = token;
     }
     pub fn window_request(&self) -> u64 {
-        self.window_request.load(Ordering::SeqCst)
+        self.window_request.lock().expect("window request").0
+    }
+    pub(crate) fn window_request_with_activation(&self) -> (u64, Option<String>) {
+        self.window_request.lock().expect("window request").clone()
     }
     pub async fn close_pairing_if(&self, token: Hash) {
         let _guard = self.pairing_gate.lock().await;

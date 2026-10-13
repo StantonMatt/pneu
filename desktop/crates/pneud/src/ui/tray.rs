@@ -90,7 +90,9 @@ impl ksni::Tray for Tray {
         }
     }
     fn activate(&mut self, _: i32, _: i32) {
-        self.send(Command::Window);
+        self.send(Command::Window {
+            activation_token: None,
+        });
     }
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         let mut items = vec![
@@ -140,7 +142,11 @@ impl ksni::Tray for Tray {
                     "smartphone"
                 }
                 .into(),
-                activate: Box::new(|s: &mut Self| s.send(Command::Window)),
+                activate: Box::new(|s: &mut Self| {
+                    s.send(Command::Window {
+                        activation_token: None,
+                    })
+                }),
                 ..Default::default()
             }
             .into(),

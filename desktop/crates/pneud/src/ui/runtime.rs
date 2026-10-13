@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    process::{Child, Command as Process},
+    process::Child,
     sync::{mpsc, watch},
 };
 
@@ -102,7 +102,7 @@ pub async fn run(
                 Err(_)=>update_tray=false,
             },
             command=rx.recv()=>match command {
-                Some(Command::Window)=>core.request_window(false),
+                Some(Command::Window { activation_token })=>core.request_window_with_activation(false, activation_token),
                 Some(Command::ChooseFolder)=>core.request_window(true),
                 Some(Command::Quit)=>core.request_shutdown(),
                 Some(Command::Toggle(toggle))=>{
@@ -120,15 +120,18 @@ pub async fn run(
         {
             window = None;
         }
-        let request = core.window_request();
+        let (request, activation_token) = core.window_request_with_activation();
         if request != last_request {
             last_request = request;
+            let startup_token = window_startup_token(request, activation_token.as_deref());
+            replace_window_for_activation(&mut window, startup_token).await?;
             if window.is_none()
                 && (std::env::var_os("WAYLAND_DISPLAY").is_some()
                     || std::env::var_os("DISPLAY").is_some())
             {
-                match Process::new(std::env::current_exe()?)
+                match super::activation::command(std::env::current_exe()?, startup_token)
                     .arg("ui-window")
+                    .env("PNEU_WINDOW_REQUEST", request.to_string())
                     .kill_on_drop(true)
                     .spawn()
                 {
@@ -174,6 +177,25 @@ pub async fn run(
         }).await
 }
 
+// A supplied credential must exist before Slint creates the adapter. There is
+// no API in Slint 1.15.1 to set it on an existing Qt or winit Wayland window.
+fn window_startup_token(request: u64, token: Option<&str>) -> Option<&str> {
+    token.filter(|token| request & 1 == 0 && !token.is_empty())
+}
+async fn replace_window_for_activation(
+    window: &mut Option<Child>,
+    token: Option<&str>,
+) -> Result<()> {
+    if token.is_some()
+        && let Some(child) = window.as_mut()
+    {
+        child.kill().await?;
+        child.wait().await?;
+        *window = None;
+    }
+    Ok(())
+}
+
 struct ThemeRefresh {
     next: Instant,
 }
@@ -211,10 +233,10 @@ async fn open_folder(folder: &std::path::Path) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("folder is not absolute"))?;
     let portal = async {
         let bus = zbus::Connection::session().await?;
-        crate::actions::open_uri_portal(uri.as_str(), &bus).await
+        crate::actions::open_uri_portal(uri.as_str(), &bus, None).await
     };
     open_folder_fallback(portal, || async {
-        let status = Process::new("xdg-open")
+        let status = super::activation::command("xdg-open", None)
             .arg(folder)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -262,6 +284,43 @@ pub(crate) fn clipboard_policy_event(core: &Core, event: &Event) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn activation_reaps_pair_window_and_ignores_chooser_token() -> Result<()> {
+        let mut window = Some(
+            tokio::process::Command::new("sleep")
+                .arg("60")
+                .kill_on_drop(true)
+                .spawn()?,
+        );
+        let pid = window.as_ref().unwrap().id().unwrap();
+        for token in [None, Some("")] {
+            replace_window_for_activation(&mut window, window_startup_token(2, token)).await?;
+            assert_eq!(window.as_ref().unwrap().id(), Some(pid));
+        }
+        let chooser_token = window_startup_token(3, Some("chooser"));
+        assert!(chooser_token.is_none());
+        replace_window_for_activation(&mut window, chooser_token).await?;
+        assert_eq!(window.as_ref().unwrap().id(), Some(pid));
+        replace_window_for_activation(&mut window, window_startup_token(4, Some("pair"))).await?;
+        assert!(window.is_none());
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "old child must be reaped before relaunch"
+        );
+        // Cold launches need no previous child; their token is still passed on.
+        let token = window_startup_token(6, Some("startup"));
+        replace_window_for_activation(&mut window, token).await?;
+        let output = super::super::activation::command("sh", token)
+            .args([
+                "-c",
+                "printf '%s/%s' \"$XDG_ACTIVATION_TOKEN\" \"$DESKTOP_STARTUP_ID\"",
+            ])
+            .output()
+            .await?;
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"startup/startup");
+        Ok(())
+    }
     #[test]
     fn progress_bursts_do_not_render_or_advance_theme_schedule() -> Result<()> {
         let start = Instant::now();

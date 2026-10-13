@@ -364,3 +364,33 @@ completion, never while queued or streaming image chunks. Frame write/flush
 progress remains bounded separately. The store explicitly releases its flock
 when the final Store owner ends: a concurrent child between fork and exec cannot
 prolong ownership merely by inheriting a CLOEXEC descriptor.
+
+Notification activation on Wayland uses the notification server's
+`ActivationToken(id, token)` signal immediately preceding `ActionInvoked`.
+One ordered signal stream associates the credential with that notification;
+pending credentials expire after thirty seconds and are consumed once. Their
+bounded cache is independent of notification target lifetimes. Each fresh token
+is accepted for a live action mapping, including repeated clicks on a retained
+notification. Missing, closed and already-used tokens are never inherited by a
+later action. Open and Open Link pass `activation_token` to portal requests;
+Show in Folder passes the token as FileManager1's startup ID.
+The URI fallback passes both `XDG_ACTIVATION_TOKEN` and `DESKTOP_STARTUP_ID` in
+the child environment, clearing inherited startup credentials when absent.
+Pair Phone uses a fresh supervised UI child when a token is present. The daemon
+kills and reaps its old UI child, then supplies the startup environment and
+request revision to the new child. Transient dialogs reset; settings and pairing
+state remain in the daemon. Winit reads `XDG_ACTIVATION_TOKEN` before
+`PneuWindow::new()` and applies it once through Slint's creation hook; Qt consumes
+the fresh process's startup token. The child recognizes its initial window
+revision without hiding/remapping the window.
+
+Choose Folder uses plain FileChooser and may open behind other windows.
+
+Tray Open Folder has no notification credential. ksni 0.3.6 exposes neither an
+activation token nor a Wayland seat/input serial in its menu callback (only the
+tray state). This headless daemon owns no Wayland input surface, so requesting
+an `xdg_activation_v1` token on a separate connection cannot establish the user
+interaction needed to bypass KWin's focus prevention. Tray launches remain
+best-effort portal/xdg-open launches without a token until the tray host/library
+supports forwarding one; opening a previously open Dolphin window from the tray
+is therefore not guaranteed to raise it.

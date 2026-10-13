@@ -173,7 +173,7 @@ async fn handle(core: Arc<Core>, stream: UnixStream) -> Result<()> {
         Command::Config {config} => { core.update_config(config).await?; serde_json::Value::Null },
         Command::Clipboard {device,text} => serde_json::to_value(core.send_clipboard(device,text).await?)?,
         Command::DiscardClipboard {device} => { core.discard_clipboard(device).await?; serde_json::Value::Null },
-        Command::UiStatus => { let (revision, invitation) = core.pairing_status(); let snapshot = core.ui_snapshot(); serde_json::json!({"device":snapshot.device, "snapshot":snapshot, "config": core.config(), "window_request":core.window_request(),"invitation_revision":revision,"invitation":invitation}) },
+        Command::UiStatus => { let (revision, invitation) = core.pairing_status(); let snapshot = core.ui_snapshot(); let (window_request, activation_token) = core.window_request_with_activation(); serde_json::json!({"device":snapshot.device, "snapshot":snapshot, "config": core.config(), "window_request":window_request,"activation_token":activation_token,"invitation_revision":revision,"invitation":invitation}) },
         Command::ShowWindow { choose_folder } => { core.request_window(choose_folder); serde_json::Value::Null },
         Command::Status => {
             let snapshot = core.ui_snapshot();

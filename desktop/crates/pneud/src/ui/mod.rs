@@ -1,4 +1,5 @@
 //! Desktop presentation state. The protocol core remains usable without a tray host.
+pub(crate) mod activation;
 pub mod clipboard;
 pub mod notifications;
 pub mod palette;
@@ -317,7 +318,7 @@ impl Toggle {
 }
 #[derive(Clone, Debug)]
 pub enum Command {
-    Window,
+    Window { activation_token: Option<String> },
     ChooseFolder,
     OpenFolder,
     Toggle(Toggle),
