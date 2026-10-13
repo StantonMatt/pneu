@@ -201,11 +201,11 @@ def authenticated(rows, digest):
 
 
 LOCAL_TESTS = (
-    'DeviceFixtureDeviceTest', 'MainActivityTest', 'CoreDeviceTest',
+    'DeviceFixtureDeviceTest', 'MainActivityTest', 'CoreDeviceTest', 'V2ScreensDeviceTest',
     'FullReviewDeviceTest', 'SecondReviewDeviceTest', 'AdvisoryDeviceTest',
     'FourthReviewStorageDeviceTest', 'FifthReviewStorageDeviceTest',
     'FifthReviewUiDeviceTest', 'SixthReviewStorageDeviceTest', 'SeventhReviewStorageDeviceTest',
-    'RoundTwoAdvisoryDeviceTest', 'TenthReviewDeviceTest', 'TenthReviewUiDeviceTest',
+    'RoundTwoAdvisoryDeviceTest', 'TenthReviewDeviceTest', 'TenthReviewUiDeviceTest', 'ForegroundServiceDeviceTest',
     'TwelfthReviewDeviceTest', 'NinthReviewDeviceTest', 'EighthReviewDeviceTest',
     'ThirteenthReviewDeviceTest#failedInitialCaptureShowsSettingsFailureWithoutAdmitting',
     'FourteenthReviewDeviceTest', 'FifteenthReviewDeviceTest',
@@ -220,6 +220,8 @@ def local_case(test):
         instrument(test, test, seconds=600)
     finally:
         screenshots('files/fifth-review-screens', 'screens')
+        if test == 'V2ScreensDeviceTest':
+            screenshots('files/v2-screens', 'screens')
         if test == 'SixteenthRecentDeviceTest':
             hierarchy = subprocess.run([*adb, 'exec-out', 'run-as', package, 'cat', 'cache/sixteenth-recent.xml'],
                                        capture_output=True, timeout=15)

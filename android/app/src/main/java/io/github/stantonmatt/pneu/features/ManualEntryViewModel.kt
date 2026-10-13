@@ -14,7 +14,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
 internal data class ShareRequest(val binding:Deferred<DeliveryBinding?>,val items:List<Uri>,val texts:List<String>)
-internal data class EntryResult(val message:String?=null,val pair:Boolean=false)
+internal data class EntryResult(val message:String?=null,val pair:Boolean=false,val id:String=java.util.UUID.randomUUID().toString())
 
 /** Retains one admission across rotation. Shares run in the process scope with
  * service-owned grants, so clearing the entry task cannot cancel them. */
@@ -34,7 +34,7 @@ internal class ManualEntryViewModel(application:Application):AndroidViewModel(ap
         (if(processOwned)app.scope else viewModelScope).launch(Dispatchers.Main.immediate) {
             terminal.value=try {body()}
             catch(e:CancellationException) {warn(processOwned,"cancelled");throw e}
-            catch(e:Exception) {warn(processOwned,(e as? ShareFailure)?.reason ?: "read_failed");EntryResult("Couldn't read this item")}
+            catch(e:Exception) {warn(processOwned,(e as? ShareFailure)?.reason ?: "read_failed");EntryResult(app.context.getString(R.string.toast_cant_read))}
         }
     }
     private fun warn(share:Boolean,reason:String) {if(share)ShareAdmission.warn(reason) else Log.w("Pneu","manual_entry_rejected: $reason")}
@@ -45,7 +45,7 @@ internal class ManualEntryViewModel(application:Application):AndroidViewModel(ap
         val p=try {binding=request.binding.await();app.preferences.read()}catch(e:Exception) {
             if(e is CancellationException)throw e
             ShareAdmission.warn("settings")
-            return@launch EntryResult("Couldn't load Pneu settings. Open Pneu and try again.")
+            return@launch EntryResult(app.context.getString(R.string.toast_settings))
         }
         if(p.peer==null || p.pairingLost) {ShareAdmission.warn("not_paired");return@launch EntryResult(pair=true)}
         if(!p.shareSheet) {ShareAdmission.warn("disabled");return@launch EntryResult()}
@@ -62,10 +62,10 @@ internal class ManualEntryViewModel(application:Application):AndroidViewModel(ap
             else for(text in request.texts)admit {ManualEntries.text(app,text,"share",binding)}
         }
         return@launch EntryResult(when {
-            failed->"Couldn't read this item"
-            app.connection.state.value.status=="Waiting for Wi-Fi"->"Waiting for Wi-Fi. Queued."
-            app.connection.connected->if(count>1)"Sending $count items to PC" else "Sending to PC"
-            else->"PC unreachable. Queued."
+            failed->app.context.getString(R.string.toast_cant_read)
+            app.connection.state.value.status=="Waiting for Wi-Fi"->app.context.getString(R.string.toast_queued_wifi)
+            app.connection.connected->if(count>1)app.context.resources.getQuantityString(R.plurals.toast_sending_many,count,count) else app.context.getString(R.string.toast_sending)
+            else->app.context.getString(R.string.toast_queued)
         })
     }
     private var clipboardBindingCaptured=false
@@ -79,14 +79,14 @@ internal class ManualEntryViewModel(application:Application):AndroidViewModel(ap
         val binding=try {requireNotNull(clipboardBinding).await()}catch(e:Exception) {
             if(e is CancellationException)throw e
             Log.w("Pneu","manual_entry_rejected: settings")
-            return@launch EntryResult("Couldn't load Pneu settings. Open Pneu and try again.")
+            return@launch EntryResult(app.context.getString(R.string.toast_settings))
         }
         when {
             !app.connection.connected || binding==null || !binding.matches(shareStep("settings") {app.preferences.read()})-> {
-                Log.w("Pneu","manual_entry_rejected: unavailable_binding");EntryResult("PC unreachable. Not sent.")
+                Log.w("Pneu","manual_entry_rejected: unavailable_binding");EntryResult(app.context.getString(R.string.toast_not_sent))
             }
-            clip==null || clip.itemCount==0-> {Log.w("Pneu","manual_entry_rejected: empty");EntryResult("Clipboard is empty")}
-            clip.description.extras?.getBoolean(ClipDescription.EXTRA_IS_SENSITIVE)==true-> {Log.w("Pneu","manual_entry_rejected: sensitive");EntryResult("Sensitive clipboard. Not sent.")}
+            clip==null || clip.itemCount==0-> {Log.w("Pneu","manual_entry_rejected: empty");EntryResult(app.context.getString(R.string.toast_clipboard_empty))}
+            clip.description.extras?.getBoolean(ClipDescription.EXTRA_IS_SENSITIVE)==true-> {Log.w("Pneu","manual_entry_rejected: sensitive");EntryResult(app.context.getString(R.string.toast_sensitive))}
             else->try {
                 val row=withContext(Dispatchers.IO) {
                     val item=clip.getItemAt(0)
@@ -105,16 +105,16 @@ internal class ManualEntryViewModel(application:Application):AndroidViewModel(ap
                         ManualEntries.text(app,text,"clipboard",binding)
                     }
                 }
-                if(row==null)EntryResult("Clipboard is empty")else {
+                if(row==null)EntryResult(app.context.getString(R.string.toast_clipboard_empty))else {
                     completed.add(row.mediaId)
                     app.scope.launch {PostCommit.maintainSuspending {
                         withTimeoutOrNull(120000) {app.queue.work().recoverReads().first {rows->rows.none {it.mediaId==row.mediaId}}}
-                        val feedback=ClipboardFeedback.result(app.queue.find(row.mediaId))
+                        val feedback=app.context.getString(ClipboardFeedback.result(app.queue.find(row.mediaId)))
                         withContext(Dispatchers.Main) {Toast.makeText(app.context,feedback,Toast.LENGTH_SHORT).show()}
                     }}
                     EntryResult()
                 }
-            }catch(e:CancellationException) {throw e}catch(e:Exception) {Log.w("Pneu","manual_entry_rejected: ${(e as? ShareFailure)?.reason ?: "read_failed"}");EntryResult("PC unreachable. Not sent.")}
+            }catch(e:CancellationException) {throw e}catch(e:Exception) {Log.w("Pneu","manual_entry_rejected: ${(e as? ShareFailure)?.reason ?: "read_failed"}");EntryResult(app.context.getString(R.string.toast_not_sent))}
         }
     }
 }

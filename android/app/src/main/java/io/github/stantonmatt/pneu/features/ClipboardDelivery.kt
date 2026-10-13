@@ -3,6 +3,7 @@ package io.github.stantonmatt.pneu.features
 import android.content.ClipData
 import android.content.ClipboardManager
 import io.github.stantonmatt.pneu.AppGraph
+import io.github.stantonmatt.pneu.R
 import io.github.stantonmatt.pneu.data.Receipt
 import io.github.stantonmatt.pneu.data.DeliveryBinding
 import io.github.stantonmatt.pneu.protocol.*
@@ -13,7 +14,7 @@ import kotlinx.coroutines.sync.withLock
 
 /** Last writer wins. Durable ID receipts and the last-applied timestamp; no inbound barriers. */
 class ClipboardDelivery(private val app: AppGraph, private val applyText:suspend (String,String)->Unit={text,hash->
-    withContext(Dispatchers.Main) {app.context.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("Pneu",text).apply {description.extras=android.os.PersistableBundle().apply {putBoolean(OWN_CLIP,true);putString(OWN_HASH,hash)}})}
+    withContext(Dispatchers.Main) {app.context.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText(app.context.getString(R.string.app_name),text).apply {description.extras=android.os.PersistableBundle().apply {putBoolean(OWN_CLIP,true);putString(OWN_HASH,hash)}})}
 }) {
     companion object {const val OWN_CLIP="io.github.stantonmatt.pneu.clipboard";const val OWN_HASH="io.github.stantonmatt.pneu.clipboard.hash"}
     private val incoming=Mutex()

@@ -20,12 +20,20 @@ class ShareAdmissionService:Service() {
     private var latestStart=0
     override fun onCreate() {
         super.onCreate()
-        getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel("status","Status",NotificationManager.IMPORTANCE_LOW))
+        getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel("status",getString(R.string.channel_status),NotificationManager.IMPORTANCE_LOW))
+        enterForeground()
+    }
+    private fun enterForeground() {
         startForeground(4,NotificationCompat.Builder(this,"status").setSmallIcon(R.drawable.ic_stat_pneu)
-            .setContentTitle("Preparing share").setOngoing(true).setSilent(true).setShowWhen(false).build(),ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+            .setContentTitle(getString(R.string.notif_preparing_share)).setOngoing(true).setSilent(true).setShowWhen(false)
+            .setOnlyAlertOnce(true).setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE).build(),ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
     }
     override fun onStartCommand(intent:Intent?,flags:Int,startId:Int):Int {
+        enterForeground()
+        runCatching {onForegroundCommand(this,startId)}
         latestStart=startId
+        if(intent?.action==STOP) {stopSelfResult(startId);return START_NOT_STICKY}
         val operation=intent?.getStringExtra(OWNER)?.let {pending.remove(it)}
         if(operation!=null) {
             active++
@@ -44,12 +52,15 @@ class ShareAdmissionService:Service() {
     override fun onDestroy() {scope.cancel();super.onDestroy()}
     companion object {
         private const val OWNER="pneu.share.owner"
+        private const val STOP="pneu.share.stop"
+        @Volatile internal var onForegroundCommand:(ShareAdmissionService,Int)->Unit={_,_->}
+        internal fun stop(context:Context) {context.startService(Intent(context,ShareAdmissionService::class.java).setAction(STOP))}
         private val pending=ConcurrentHashMap<String,ManualEntryViewModel>()
         internal fun start(activity:Activity,operation:ManualEntryViewModel,request:ShareRequest) {
             val id=randomId();pending[id]=operation
             val owner=Intent(activity,ShareAdmissionService::class.java).putExtra(OWNER,id)
             if(request.items.isNotEmpty()) {
-                owner.clipData=ClipData.newRawUri("Shared items",request.items.first()).apply {
+                owner.clipData=ClipData.newRawUri(activity.getString(R.string.shared_items),request.items.first()).apply {
                     request.items.drop(1).forEach {addItem(ClipData.Item(it))}
                 }
                 owner.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)

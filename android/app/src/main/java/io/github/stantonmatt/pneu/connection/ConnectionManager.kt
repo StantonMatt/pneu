@@ -21,7 +21,11 @@ import java.net.Socket
 import javax.net.ssl.SSLSocket
 import kotlin.random.Random
 
-data class LinkState(val status: String = "PC unreachable", val route: String = "", val pairing: String = "", val sent: Long = 0, val total: Long = 0, val transferMediaId: String = "", val cellular: Boolean = false, val pairingPin: String = "", val transferKind: String = "", val transferFileName: String = "") {
+data class LinkState(val status: String = "PC unreachable", val route: String = "", val pairing: String = "", val sent: Long = 0, val total: Long = 0, val transferMediaId: String = "", val cellular: Boolean = false, val pairingPin: String = "", val transferKind: String = "", val transferFileName: String = "",
+    val pairingFeedback:UiFeedback?=pairing.takeIf(String::isNotEmpty)?.let {UiFeedback(it)}) {
+    /** Emit a new pairing result even when its copy matches the preceding one.
+     * Ordinary route/progress copies preserve the existing event identity. */
+    fun withPairing(message:String)=copy(pairing=message,pairingFeedback=message.takeIf(String::isNotEmpty)?.let {UiFeedback(it)})
     fun sendingTitle():String? = if(transferMediaId.isEmpty())null else when(transferKind) {
         "photo" -> "Sending photo"
         "recording" -> "Sending screen recording"
@@ -192,8 +196,10 @@ class ConnectionManager(private val app: AppGraph) {
                             if(invitation == null && epoch==dialEpoch.get() && prefs.peer!=null && rejections.record("${prefs.peer.pin}:${prefs.peer.deviceId}",rejected)) lost(prefs.peer,prefs.deviceId)
                         } finally {
                             val status=if(app.awaitPrefs().pairingLost)"Pairing lost" else "PC unreachable"
-                            state.update { it.copy(status=status,route="",cellular=false,sent=0,total=0,transferMediaId="",transferKind="",transferFileName="",
-                                pairing=it.pairing.takeUnless {message->message.startsWith("Paired with ")}.orEmpty(),pairingPin="") }
+                            state.update {
+                                val disconnected=it.copy(status=status,route="",cellular=false,sent=0,total=0,transferMediaId="",transferKind="",transferFileName="",pairingPin="")
+                                if(disconnected.pairing.startsWith("Paired with "))disconnected.withPairing("") else disconnected
+                            }
                         }
                     }
                     if (succeeded) break

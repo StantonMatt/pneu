@@ -198,7 +198,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
     suspend fun retryConnection(expected:ConfirmedBinding,pending:io.github.stantonmatt.pneu.protocol.Invitation?,feedback:Boolean=false):Boolean=bindingMutex.withLock {
         val current=preferences.read()
         if(!expected.matches(current) || current.pending!=pending)return@withLock false
-        if(feedback)connection.state.update {it.copy(pairing="Pairing…")}
+        if(feedback)connection.state.update {it.withPairing("Pairing…")}
         connection.retry();true
     }
     suspend fun installBinding(invitation: io.github.stantonmatt.pneu.protocol.Invitation,pcId: String): Boolean = bindingMutex.withLock {

@@ -160,7 +160,7 @@ $ANDROID_HOME/platform-tools/adb -s emulator-5554 install -r app/build/outputs/a
   They decode bounded private staging/cache bytes; no third-party URI
   thumbnail or stream reads run from the UI. ACK completion and preview cleanup
   share the queue lock, so unpair cannot leave a late preview behind.
-- Compose UI retains the approved dynamic-colour/light/dark shell; all toggles
+- Compose UI uses the v2 fixed indigo palette, true-black dark mode and the Link; all toggles
   now affect behaviour. Share-sheet visibility removes its ordinary target;
   Quick Settings preference gates both installed tiles. Existing Android tiles
   remain installed but unavailable when disabled.
@@ -563,3 +563,31 @@ baselines before creating media. Source-specific write and drop latches hold the
 copy across the saved policy mutation and verify cleanup without a dedupe tombstone
 before releasing the rescan. The local policy regression deliberately stalls
 startup and proves the same fresh media is then recaptured under the new policy.
+
+## v2 presentation
+
+`ui/` supplies the fixed palette, type, shapes, motion, Link, custom switches,
+buttons, scanner frame and floating dialogs. The system animator scale disables
+continuous Link motion. Pair keeps its accessibility pane title without drawing
+it. Settings starts with the paired PC and orders Clipboard before Connection.
+
+After an approved icon revision, re-import the vector paths without rasterizing:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 tools/import_v2_icons.py
+```
+
+Each generated vector records the source SVG hash. Launcher foreground and
+monochrome retain the 108-unit canvas and the source's 66 dp safe zone. The device
+runner's `local` suite runs the complete `TenthReviewUiDeviceTest`, including the
+v2 pane-title and custom-switch semantics checks. Run the complete device runner
+before installation acceptance, then visually check light/dark, font scales 1.0
+and 1.3 (and above 1.3 for stacked buttons), and animations on/off on the phone.
+
+`local` also runs `V2ScreensDeviceTest`, a controlled presentation fixture using
+the production Home, scanner, permission and dialog components. Its `v2-*.png`
+files are exported into the runner's `local/screens/`: dark connected Home,
+sending (capsule and progress), connecting, failed/recording rows, waiting menu,
+unpair/pair confirmations, permissions/battery, plus light first-run setup. Real
+pairing and transfer behavior is validated separately by the existing peer suites.
+The fixture also checks that the Recent header stays put when waiting appears.

@@ -1,5 +1,6 @@
 package io.github.stantonmatt.pneu.features
 
+import io.github.stantonmatt.pneu.R
 import io.github.stantonmatt.pneu.protocol.Endpoint
 import org.junit.Assert.*
 import org.junit.Test
@@ -7,15 +8,15 @@ import org.junit.Test
 class UiPresentationTest {
     @Test fun failedItemsUseOnlyTheApprovedCopy() {
         val copy=mapOf(
-            "disk_full" to "Failed · PC disk is full",
-            "not_writable" to "Failed · PC can't save files",
-            "unsupported_kind" to "Failed · PC can't receive this",
-            "image_decode" to "Failed · Couldn't read image",
-            "local_file_missing" to "Failed · File is gone"
+            "disk_full" to R.string.item_failed_disk,
+            "not_writable" to R.string.item_failed_write,
+            "unsupported_kind" to R.string.item_failed_unsupported,
+            "image_decode" to R.string.item_failed_image,
+            "local_file_missing" to R.string.item_failed_gone
         )
         copy.forEach {(error,text)->assertEquals(text,UiPresentation.failedItem(error))}
         for(error in listOf("local_capacity","storage_failed","id_conflict","","private /file/path"))
-            assertEquals("Failed",UiPresentation.failedItem(error))
+            assertEquals(R.string.item_failed,UiPresentation.failedItem(error))
     }
 
     @Test fun pairedPcShowsAtMostOneIpv4AddressPerRoute() {

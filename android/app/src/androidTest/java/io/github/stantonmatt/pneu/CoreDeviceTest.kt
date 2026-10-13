@@ -85,11 +85,11 @@ class CoreDeviceTest {
         // UI callers run on Main: unpair must dispatch blocking Room/file cleanup to IO.
         launch();clickSettings()
         val device=androidx.test.uiautomator.UiDevice.getInstance(instrumentation)
-        device.swipe(540,2170,540,680,15);Thread.sleep(400)
+        assertTrue(device.findObject(androidx.test.uiautomator.UiSelector().text("Unpair")).waitForExists(4000))
         click("Unpair");click("Unpair")
         withTimeout(3000) { while(context.graph.prefs.value.peer != null) delay(50) }
         delay(1200)
-        assertTrue(device.findObject(androidx.test.uiautomator.UiSelector().text("Pair with PC")).exists())
+        assertTrue(device.findObject(androidx.test.uiautomator.UiSelector().text("Scan the QR code on your PC")).exists())
         assertTrue(context.graph.queue.pending().isEmpty())
         assertNull(context.graph.queue.find(id))
         assertFalse(File(row.path).exists())

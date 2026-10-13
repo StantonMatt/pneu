@@ -4,6 +4,7 @@ use std::path::PathBuf;
 pub struct Colors {
     pub foreground: String,
     pub negative: String,
+    pub neutral: String,
     pub background: String,
 }
 pub fn config_root() -> PathBuf {
@@ -47,6 +48,7 @@ pub fn colors(ini: &str) -> Colors {
     Colors {
         foreground: color(ini, "ForegroundNormal").unwrap_or_else(|| "#232629".into()),
         negative: color(ini, "ForegroundNegative").unwrap_or_else(|| "#da4453".into()),
+        neutral: color(ini, "ForegroundNeutral").unwrap_or_else(|| "#f67400".into()),
         background: color(ini, "BackgroundNormal").unwrap_or_else(|| "#eff0f1".into()),
     }
 }

@@ -1,5 +1,6 @@
 package io.github.stantonmatt.pneu.features
 
+import io.github.stantonmatt.pneu.R
 import io.github.stantonmatt.pneu.protocol.*
 import io.github.stantonmatt.pneu.connection.ProgressOutput
 import io.github.stantonmatt.pneu.connection.Connectivity.*
@@ -47,42 +48,42 @@ class AdvisoryPolicyTest {
     @Test fun permissionCopyMatchesRepairAndLimitedGrantsRemainRequestable() {
         assertTrue(PermissionPolicy.batterySettings(true));assertFalse(PermissionPolicy.batterySettings(false))
         assertFalse(PermissionPolicy.sleeping(true,true,true,false));assertTrue(PermissionPolicy.sleeping(true,true,false,false))
-        assertEquals("Allow all",PermissionPolicy.photoAction(true,true,false))
-        assertEquals("Allow",PermissionPolicy.photoAction(false,true,true))
-        assertEquals("Settings",PermissionPolicy.photoAction(false,true,false))
-        assertEquals("Allow camera",PermissionPolicy.cameraAction(true,true))
-        assertEquals("Open settings",PermissionPolicy.cameraAction(true,false))
+        assertEquals(R.string.action_allow_all,PermissionPolicy.photoAction(true,true,false))
+        assertEquals(R.string.action_allow,PermissionPolicy.photoAction(false,true,true))
+        assertEquals(R.string.action_settings,PermissionPolicy.photoAction(false,true,false))
+        assertEquals(R.string.pair_allow_camera,PermissionPolicy.cameraAction(true,true))
+        assertEquals(R.string.action_open_settings,PermissionPolicy.cameraAction(true,false))
     }
     @Test fun systemExitEvidenceExcludesDeliberateStops() {
         assertTrue(PermissionPolicy.systemExit(2));assertTrue(PermissionPolicy.systemExit(12))
         assertTrue(PermissionPolicy.systemExit(9));assertFalse(PermissionPolicy.systemExit(10))
     }
     @Test fun receiptTimeoutNeverClaimsNonDelivery() {
-        for(state in listOf("waiting","sending","failed"))assertEquals("Still sending clipboard",ClipboardFeedback.result(Outgoing().apply {this.state=state}))
-        assertEquals("Clipboard sent",ClipboardFeedback.result(Outgoing().apply {state="sent";nextAttempt=Long.MAX_VALUE}))
-        assertEquals("Replaced by newer clipboard",ClipboardFeedback.result(Outgoing().apply {state="superseded";nextAttempt=Long.MAX_VALUE}))
-        for(state in listOf("discarded","skipped"))assertEquals("Clipboard send cancelled",ClipboardFeedback.result(Outgoing().apply {this.state=state}))
-        assertEquals("Clipboard send cancelled",ClipboardFeedback.result(null))
+        for(state in listOf("waiting","sending","failed"))assertEquals(R.string.toast_clipboard_sending,ClipboardFeedback.result(Outgoing().apply {this.state=state}))
+        assertEquals(R.string.toast_clipboard_sent,ClipboardFeedback.result(Outgoing().apply {state="sent";nextAttempt=Long.MAX_VALUE}))
+        assertEquals(R.string.toast_clipboard_replaced,ClipboardFeedback.result(Outgoing().apply {state="superseded";nextAttempt=Long.MAX_VALUE}))
+        for(state in listOf("discarded","skipped"))assertEquals(R.string.toast_clipboard_cancelled,ClipboardFeedback.result(Outgoing().apply {this.state=state}))
+        assertEquals(R.string.toast_clipboard_cancelled,ClipboardFeedback.result(null))
     }
     @Test fun blockedClipboardFeedbackMatchesTheSendersRetryMarker() {
         for(code in listOf("id_conflict","unsupported_kind","hash_mismatch","size_mismatch")) {
             val row=Outgoing().apply {state="failed";error=code;nextAttempt=RetryPolicy.nack(code,3,1.0).waitMillis}
             assertEquals(Long.MAX_VALUE,row.nextAttempt)
             assertNull(QueueSchedule.choose(listOf(row),0,{it.nextAttempt}).row)
-            assertEquals("Couldn't send clipboard",ClipboardFeedback.result(row))
+            assertEquals(R.string.toast_clipboard_failed,ClipboardFeedback.result(row))
             row.nextAttempt=0 // Explicit Retry or renewed capability eligibility.
             assertSame(row,QueueSchedule.choose(listOf(row),0,{it.nextAttempt}).row)
-            assertEquals("Still sending clipboard",ClipboardFeedback.result(row))
+            assertEquals(R.string.toast_clipboard_sending,ClipboardFeedback.result(row))
         }
         // The deadline, not an error-code allowlist, is authoritative.
-        assertEquals("Couldn't send clipboard",ClipboardFeedback.result(Outgoing().apply {state="waiting";nextAttempt=Long.MAX_VALUE}))
-        assertEquals("Couldn't send clipboard",ClipboardFeedback.result(Outgoing().apply {state="failed";error="invalid_payload";nextAttempt=Long.MAX_VALUE}))
+        assertEquals(R.string.toast_clipboard_failed,ClipboardFeedback.result(Outgoing().apply {state="waiting";nextAttempt=Long.MAX_VALUE}))
+        assertEquals(R.string.toast_clipboard_failed,ClipboardFeedback.result(Outgoing().apply {state="failed";error="invalid_payload";nextAttempt=Long.MAX_VALUE}))
     }
     @Test fun retryableClipboardFailuresKeepPendingFeedbackDuringCooldown() {
         for(code in listOf("storage_failed","disk_full","not_writable","clipboard_unavailable","hash_mismatch")) {
             val row=Outgoing().apply {state="failed";error=code;nextAttempt=RetryPolicy.nack(code,0,1.0).waitMillis}
             assertTrue(row.nextAttempt in 1 until Long.MAX_VALUE)
-            assertEquals("Still sending clipboard",ClipboardFeedback.result(row))
+            assertEquals(R.string.toast_clipboard_sending,ClipboardFeedback.result(row))
         }
     }
 }

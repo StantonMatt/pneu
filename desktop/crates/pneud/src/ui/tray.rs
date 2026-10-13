@@ -194,14 +194,10 @@ pub fn pixmaps() -> Result<Vec<(String, ksni::Icon)>> {
     pixmaps_for(super::palette::panel_colors())
 }
 fn pixmaps_for(palette: super::palette::Colors) -> Result<Vec<(String, ksni::Icon)>> {
-    let foreground = palette.foreground;
-    let negative = palette.negative;
     ICONS
         .into_iter()
         .map(|(name, svg)| {
-            let svg = svg
-                .replace("#232629", &foreground)
-                .replace("#da4453", &negative);
+            let svg = recolor_svg(svg, &palette);
             let rgba = render_svg(svg.as_bytes(), 44)?;
             let mut argb = Vec::with_capacity(rgba.len());
             for pixel in rgba.chunks_exact(4) {
@@ -217,6 +213,34 @@ fn pixmaps_for(palette: super::palette::Colors) -> Result<Vec<(String, ksni::Ico
             ))
         })
         .collect()
+}
+// Scan only the original SVG: a palette color may itself equal another source
+// token, and must never be substituted a second time. Fixed receiving indigo
+// and all other SVG content pass through unchanged.
+fn recolor_svg(svg: &str, palette: &super::palette::Colors) -> String {
+    let replacements = [
+        ("#232629", palette.foreground.as_str()),
+        ("#da4453", palette.negative.as_str()),
+        ("#f67400", palette.neutral.as_str()),
+    ];
+    let mut output = String::with_capacity(svg.len());
+    let mut remaining = svg;
+    while let Some(index) = remaining.find('#') {
+        output.push_str(&remaining[..index]);
+        remaining = &remaining[index..];
+        if let Some((color, suffix)) = replacements
+            .iter()
+            .find_map(|(token, color)| remaining.strip_prefix(token).map(|suffix| (*color, suffix)))
+        {
+            output.push_str(color);
+            remaining = suffix;
+        } else {
+            output.push('#');
+            remaining = &remaining[1..];
+        }
+    }
+    output.push_str(remaining);
+    output
 }
 pub fn render_svg(svg: &[u8], size: u32) -> Result<Vec<u8>> {
     let tree = resvg::usvg::Tree::from_data(svg, &resvg::usvg::Options::default())?;
@@ -279,20 +303,102 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn coincident_palette_colors_keep_glyph_badge_and_receiving_colors() -> Result<()> {
+        // All source-token colors plus an unrelated custom color. The Cartesian
+        // product covers cascades and palettes whose semantic colors coincide.
+        let colors = ["#232629", "#da4453", "#f67400", "#1d2e3f"];
+        let rgb =
+            |color: &str| -> [u8; 3] { hex::decode(&color[1..]).unwrap().try_into().unwrap() };
+        for foreground in colors {
+            for negative in colors {
+                for neutral in colors {
+                    let icons = pixmaps_for(super::super::palette::Colors {
+                        foreground: foreground.into(),
+                        negative: negative.into(),
+                        neutral: neutral.into(),
+                        background: "#ffffff".into(),
+                    })?;
+                    for (name, icon) in icons {
+                        // Interior pixels of the stem and badge, away from their
+                        // antialiased edges and from the badge's knocked-out bars.
+                        let pixel = |x: usize, y: usize| &icon.data[(y * 44 + x) * 4..][..4];
+                        let stem = pixel(11, 30);
+                        let receiving = name == "pneu-tray-receiving";
+                        let disconnected = name == "pneu-tray-disconnected";
+                        assert_eq!(stem[0], if disconnected { 128 } else { 255 }, "{name}");
+                        let expected = if receiving {
+                            [99, 112, 255]
+                        } else {
+                            rgb(foreground)
+                        };
+                        assert!(
+                            stem[1..].iter().zip(expected).all(|(actual, expected)| {
+                                actual.abs_diff(expected) <= if disconnected { 2 } else { 0 }
+                            }),
+                            "{name}: foreground={foreground}, negative={negative}, neutral={neutral}"
+                        );
+                        let badge = match name.as_str() {
+                            "pneu-tray-error" => Some(negative),
+                            "pneu-tray-paused" => Some(neutral),
+                            _ => None,
+                        };
+                        if let Some(color) = badge {
+                            let actual = pixel(34, 28);
+                            assert_eq!(actual[0], 255, "{name}");
+                            assert_eq!(
+                                &actual[1..],
+                                &rgb(color),
+                                "{name}: foreground={foreground}, negative={negative}, neutral={neutral}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    #[test]
     fn every_tray_state_renders_in_light_and_custom_dark_foreground() -> Result<()> {
         for (foreground, rgb) in [("#232629", [35, 38, 41]), ("#eff0f1", [239, 240, 241])] {
             let icons = pixmaps_for(super::super::palette::Colors {
                 foreground: foreground.into(),
                 negative: "#da4453".into(),
+                neutral: "#9a7b3c".into(),
                 background: "#ffffff".into(),
             })?;
             assert_eq!(icons.len(), 5);
-            for (_, icon) in icons {
+            for (name, icon) in icons {
+                let expected = if name == "pneu-tray-receiving" {
+                    [99, 112, 255]
+                } else {
+                    rgb
+                };
+                let alpha = if name == "pneu-tray-disconnected" {
+                    120
+                } else {
+                    240
+                };
                 assert!(
-                    icon.data
-                        .chunks_exact(4)
-                        .any(|p| p[0] > 240 && p[1..] == rgb)
+                    icon.data.chunks_exact(4).any(|p| p[0] > alpha
+                        && p[1..].iter().zip(expected).all(|(actual, expected)| actual
+                            .abs_diff(expected)
+                            <= if name == "pneu-tray-disconnected" {
+                                2
+                            } else {
+                                0
+                            })),
+                    "{name}"
                 );
+                if name == "pneu-tray-disconnected" {
+                    assert!(icon.data.chunks_exact(4).all(|p| p[0] <= 128));
+                }
+                if name == "pneu-tray-paused" {
+                    assert!(
+                        icon.data
+                            .chunks_exact(4)
+                            .any(|p| p[0] > 240 && p[1..] == [154, 123, 60])
+                    );
+                }
             }
         }
         Ok(())

@@ -1,6 +1,7 @@
 package io.github.stantonmatt.pneu
 
 import android.content.Intent
+import android.app.ActivityManager
 import android.net.Uri
 import android.content.ContentUris
 import android.provider.MediaStore
@@ -28,6 +29,18 @@ import java.util.concurrent.atomic.AtomicBoolean
  * than erase the state whose creation is the subject of the test. Permissions are
  * managed by each fixture/host (the permanent-denial class must retain its denials). */
 internal object DeviceFixture {
+    /** Deliver stop behind a queued foreground start; raw stopService can
+     * remove that start before the service has acknowledged its deadline. */
+    suspend fun stopPneuService() {
+        val i=InstrumentationRegistry.getInstrumentation();val c=i.targetContext
+        PneuService.stop(c)
+        i.waitForIdleSync()
+        withTimeout(10000) {
+            while(c.getSystemService(ActivityManager::class.java).getRunningServices(Int.MAX_VALUE)
+                .any {it.service.className==PneuService::class.java.name})delay(20)
+        }
+        i.waitForIdleSync()
+    }
     suspend fun reset(preserveIdentity:Boolean=InstrumentationRegistry.getArguments().getString("identityPrepared")=="true")=withContext(Dispatchers.IO) {
         val c=InstrumentationRegistry.getInstrumentation().targetContext
         val app=c.graph
@@ -47,8 +60,8 @@ internal object DeviceFixture {
         app.staging.afterAutomaticCaptureDrop={}
         app.onMediaObserverReady={}
         withTimeout(10000) {app.initialized.await()}
-        c.stopService(Intent(c,PneuService::class.java))
-        c.stopService(Intent(c,ShareAdmissionService::class.java))
+        stopPneuService()
+        ShareAdmissionService.stop(c)
         // Flush service destruction before joining its cancelled connection/senders.
         InstrumentationRegistry.getInstrumentation().waitForIdleSync()
         app.connection.stop()

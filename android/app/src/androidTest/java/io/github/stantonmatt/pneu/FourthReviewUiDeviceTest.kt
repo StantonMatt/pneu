@@ -26,7 +26,8 @@ class FourthReviewUiDeviceTest {
     private val i=InstrumentationRegistry.getInstrumentation();private val c=i.targetContext;private val app=c.graph;private val device=UiDevice.getInstance(i)
     private fun launch(extra:String) {
         c.startActivity(Intent(c,MainActivity::class.java).putExtra(extra,true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
-        val title=when(extra) {"home"->"Pneu";"pair"->"Pair with PC";else->"Permissions and battery"}
+        if(extra=="pair") {assertTrue("Pneu scanner must appear",device.wait(Until.hasObject(By.pkg(c.packageName).desc("Back")),5000));device.waitForIdle(1000);return}
+        val title=when(extra) {"home"->"Pneu";else->"Permissions and battery"}
         assertTrue("Pneu $extra screen must appear",device.wait(Until.hasObject(By.pkg(c.packageName).text(title)),5000))
         device.waitForIdle(1000)
     }

@@ -13,13 +13,13 @@ import androidx.core.content.ContextCompat
 
 /** These checks also run after returning from OEM settings. Samsung does not expose its sleeping list. */
 data class Health(val photos: Boolean, val notifications: Boolean, val battery: Boolean, val sleeping: Boolean, val killed: Boolean = false, val channelBlocked:Boolean=false,val backgroundRestricted:Boolean=false,val localNetwork:Boolean=true) {
-    val issues: List<String> get() = buildList {
-        if(!localNetwork) add("Pneu can't connect to your PC")
-        if(!photos) add("Pneu can't see new screenshots")
-        if(killed) add("Pneu was stopped in the background")
-        if(!battery) add("Battery optimization can stop Pneu")
-        if(!sleeping) add("Pneu isn't in Never sleeping apps")
-        if(!notifications) add("Notifications are off")
+    val issues: List<Int> get() = buildList {
+        if(!localNetwork) add(R.string.banner_local_network)
+        if(!photos) add(R.string.banner_photos)
+        if(killed) add(R.string.banner_killed)
+        if(!battery) add(R.string.banner_battery)
+        if(!sleeping) add(R.string.banner_never_sleeping)
+        if(!notifications) add(R.string.banner_notifications)
     }
 }
 fun Context.granted(permission: String) = ContextCompat.checkSelfPermission(this,permission) == PackageManager.PERMISSION_GRANTED

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Generated from docs/design/v2/assets/pneu-mark.svg; SHA-256 6f341e9f9e5d38b96393d3b0472cf915aeb424aa2fce6184a294fe9401344f6d. -->
+<vector xmlns:aapt="http://schemas.android.com/aapt" xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+    <path android:pathData="M7 0H17C21.34 0 24 2.66 24 7V17C24 21.34 21.34 24 17 24H7C2.66 24 0 21.34 0 17V7C0 2.66 2.66 0 7 0Z" android:strokeColor="#00000000">
+        <aapt:attr name="android:fillColor">
+            <gradient android:type="linear" android:startX="7.2" android:startY="0" android:endX="16.8" android:endY="24">
+                <item android:offset="0" android:color="#6B74FF" />
+                <item android:offset=".55" android:color="#4846E8" />
+                <item android:offset="1" android:color="#2620AE" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <path android:pathData="M7 0H17C21.34 0 24 2.66 24 7V17C24 21.34 21.34 24 17 24H7C2.66 24 0 21.34 0 17V7C0 2.66 2.66 0 7 0Z" android:strokeColor="#00000000">
+        <aapt:attr name="android:fillColor">
+            <gradient android:type="radial" android:centerX="12" android:centerY="-1.92" android:gradientRadius="18.72">
+                <item android:offset="0" android:color="#52FFFFFF" />
+                <item android:offset="1" android:color="#00FFFFFF" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <path android:pathData="M8.65 13.86V8.36A2.86 2.86 0 0 1 11.51 5.5H12.61A3.41 3.41 0 0 1 12.61 12.32H11.9" android:fillColor="#00000000" android:strokeColor="#FFFFFF" android:strokeWidth="2.86" android:strokeLineCap="round" android:strokeLineJoin="round" />
+    <path android:pathData="M7.92 17.72L8.86 19.49A1.14 1.14 0 0 0 10.41 19.96L10.41 19.96A1.14 1.14 0 0 0 10.88 18.42L9.94 16.65A1.14 1.14 0 0 0 8.4 16.18L8.4 16.18A1.14 1.14 0 0 0 7.92 17.72Z" android:fillColor="#FFB547" android:strokeColor="#00000000" />
+</vector>

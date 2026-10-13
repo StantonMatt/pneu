@@ -13,11 +13,167 @@ use std::{
 };
 
 slint::slint! {
-    import { Button, Spinner, Palette } from "std-widgets.slint";
+    import { Palette } from "std-widgets.slint";
+    global Pneu {
+        out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+        out property <color> card: dark ? #2A2E32 : #FFFFFF;
+        out property <color> card-border: dark ? #373B41 : #DCDEE1;
+        out property <color> text: Palette.foreground;
+        out property <color> text2: dark ? #A4A9B0 : #5E6369;
+        out property <color> accent: #4F5BFF;
+        out property <color> accent-soft: dark ? #2B305E : #E8EAFF;
+        out property <color> on-accent-soft: dark ? #C7CCFF : #2F38C8;
+        out property <color> button: dark ? #33373C : #F2F3F5;
+        out property <color> button-border: dark ? #4A4F56 : #C8CBD0;
+        out property <color> danger: dark ? #FF7A7A : #C9302F;
+        out property <color> danger-fill: #D93D42;
+        out property <color> danger-soft: dark ? #3A1F22 : #FBE9EA;
+        out property <color> banner-border: #DA445359;
+        out property <color> warn: dark ? #FFB547 : #B45309;
+        out property <color> warn-soft: dark ? #3A2C14 : #FFF1DC;
+        out property <color> dim: dark ? #00000073 : #14161A52;
+    }
+    enum ButtonKind { neutral, danger, row }
+    component PneuButton inherits Rectangle {
+        in property <string> text;
+        in property <ButtonKind> kind: neutral;
+        in property <bool> enabled: true;
+        private property <bool> kb-focus;
+        changed enabled => { if !root.enabled { root.kb-focus = false; } }
+        callback clicked();
+        min-width: label.preferred-width + 28px;
+        max-width: kind == ButtonKind.row ? 10000px : self.min-width;
+        horizontal-stretch: kind == ButtonKind.row ? 1 : 0;
+        min-height: kind == ButtonKind.row ? 44px : 30px;
+        max-height: self.min-height;
+        border-radius: kind == ButtonKind.row ? 0px : 8px;
+        background: kind == ButtonKind.row ? (touch.pressed ? Pneu.button : transparent)
+            : (kind == ButtonKind.danger ? Pneu.danger-fill : Pneu.button);
+        border-width: kind == ButtonKind.row ? 0px : 1px;
+        border-color: fs.has-focus && root.kb-focus ? Pneu.accent : (kind == ButtonKind.danger ? Pneu.danger-fill : Pneu.button-border);
+        accessible-role: button;
+        accessible-enabled: root.enabled;
+        accessible-label: text;
+        accessible-action-default => { root.clicked(); }
+        forward-focus: fs;
+        // In-window dialogs do not get Slint's native popup focus event.
+        public function focus-popup() {
+            fs.focus();
+            fs.focus-gained(FocusReason.popup-activation);
+        }
+        if fs.has-focus && root.kb-focus: Rectangle {
+            x: -2px; y: -2px; width: parent.width + 4px; height: parent.height + 4px;
+            border-radius: root.kind == ButtonKind.row ? 2px : 10px;
+            border-width: 2px; border-color: #4F5BFF59;
+        }
+        Rectangle {
+            border-radius: parent.border-radius;
+            background: touch.pressed ? (Pneu.dark ? #FFFFFF14 : #00000014)
+                : touch.has-hover ? (Pneu.dark ? #FFFFFF0A : #0000000A) : transparent;
+        }
+        label := Text {
+            x: 14px; width: parent.width - 28px; height: parent.height;
+            text: root.text; vertical-alignment: center;
+            horizontal-alignment: root.kind == ButtonKind.row ? left : center;
+            color: root.kind == ButtonKind.danger ? white : root.kind == ButtonKind.row ? Pneu.danger : Pneu.text;
+            font-weight: root.kind == ButtonKind.row ? 600 : 400;
+        }
+        fs := FocusScope {
+            enabled: root.enabled;
+            focus-gained(reason) => { root.kb-focus = reason == FocusReason.tab-navigation || reason == FocusReason.popup-activation; }
+            focus-lost(reason) => { root.kb-focus = false; }
+            key-pressed(event) => {
+                if event.text == Key.Return || event.text == " " { root.clicked(); return accept; }
+                return reject;
+            }
+        }
+        touch := TouchArea { enabled: root.enabled; clicked => { root.kb-focus = false; fs.focus(); root.clicked(); } }
+    }
+    component Card inherits Rectangle {
+        background: Pneu.card; border-radius: 14px;
+        border-width: 1px; border-color: Pneu.card-border;
+    }
+    component Row inherits HorizontalLayout {
+        padding-top: 12px; padding-bottom: 12px; padding-left: 14px; padding-right: 14px;
+        spacing: 12px;
+    }
+    component Capsule inherits Rectangle {
+        in-out property <float> travel: 0.5;
+        width: 20px; height: 9px; border-radius: 4.5px;
+        background: Pneu.accent;
+        in property <length> tube-width;
+        x: (tube-width - self.width) * travel;
+        y: (3px - self.height) / 2;
+        opacity: min(1, min(travel * 8, (1 - travel) * 8));
+        Rectangle { x: parent.width - 6px; width: 6px; height: parent.height; border-radius: 4.5px; background: #FFB547; }
+    }
+    component AnimatedCapsule inherits Capsule {
+        travel: 0;
+        init => { root.travel = 1; }
+        animate travel { duration: 1400ms; easing: cubic-bezier(0.45, 0, 0.2, 1); iteration-count: -1; }
+    }
+    component PneuSpinner inherits Rectangle {
+        in property <bool> motion;
+        width: 30px; height: 30px; border-radius: 15px;
+        border-width: 3px; border-color: Pneu.accent-soft;
+        accessible-role: progress-indicator;
+        Rectangle {
+            transform-rotation: root.motion ? mod(animation-tick() / 800ms, 1) * 1turn : 0deg;
+            Path {
+                width: 30px; height: 30px; viewbox-width: 30; viewbox-height: 30;
+                stroke: Pneu.accent; stroke-width: 3px; stroke-line-cap: round;
+                commands: "M15 1.5 A13.5 13.5 0 0 1 28.5 15";
+            }
+        }
+    }
+    component Link inherits Rectangle {
+        in property <bool> connected;
+        in property <bool> receiving;
+        in property <bool> paused;
+        in property <bool> motion;
+        height: 40px;
+        Rectangle {
+            x: 0px; y: 0px; width: 40px; height: 40px; border-radius: 12px;
+            background: root.paused ? Pneu.warn-soft : root.connected ? Pneu.accent-soft : Pneu.button;
+            Image { x: 9px; y: 9px; width: 22px; height: 22px;
+                source: @image-url("../../../../assets/smartphone.svg");
+                colorize: root.paused ? Pneu.warn : root.connected ? Pneu.on-accent-soft : Pneu.text2;
+            }
+        }
+        tube := Rectangle {
+            x: 52px; y: (parent.height - self.height) / 2; width: parent.width - 104px; height: 3px; border-radius: 1.5px;
+            background: root.connected && !root.paused && !root.receiving
+                ? @linear-gradient(90deg, #7381FF 0%, #4F5BFF 100%)
+                : root.connected ? Pneu.card-border : transparent;
+            if !root.connected: Rectangle {
+                clip: true;
+                for i in ceil(tube.width / 11px): Rectangle { x: i * 11px; y: 0px; width: 5px; height: 3px; background: Pneu.card-border; }
+            }
+            if root.receiving && !root.paused && root.motion: AnimatedCapsule { tube-width: tube.width; }
+            if root.receiving && !root.paused && !root.motion: Capsule { tube-width: tube.width; }
+            if root.paused: Rectangle {
+                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                width: 28px; height: 28px; border-radius: 14px;
+                border-width: 3px; border-color: Pneu.card; background: Pneu.warn-soft;
+                Image { x: 7px; y: 7px; width: 14px; height: 14px; source: @image-url("../../../../assets/pause.svg"); colorize: Pneu.warn; }
+            }
+        }
+        Rectangle {
+            x: parent.width - self.width; y: 0px; width: 40px; height: 40px; border-radius: 12px;
+            background: root.connected && !root.paused ? Pneu.accent-soft : Pneu.button;
+            Image { x: 9px; y: 9px; width: 22px; height: 22px; source: @image-url("../../../../assets/computer.svg");
+                colorize: root.connected && !root.paused ? Pneu.on-accent-soft : Pneu.text2;
+            }
+        }
+    }
     export component PneuWindow inherits Window {
         title: "Pneu";
         icon: @image-url("../../../../assets/pneu.svg");
-        private property <length> window-width: root.paired ? 400px : max(400px, root.qr.width * 1px + 36px);
+        // Keep the last real QR size across invitation/pairing transitions.
+        private property <int> last-qr-size: 292;
+        private property <length> qr-card-height: last-qr-size * 1px + 28px;
+        private property <length> pairing-height: qr-card-height + 12px + qr-caption.preferred-height;
+        private property <length> window-width: max(400px, last-qr-size * 1px + 60px);
         min-width: window-width; max-width: window-width;
         min-height: layout.preferred-height; max-height: layout.preferred-height;
         background: Palette.background;
@@ -27,14 +183,14 @@ slint::slint! {
         private property <string> confirmation-device;
         private property <string> confirmation-phone;
         in property <string> status;
-        in property <color> dot;
-        in property <bool> dot-muted;
+        in property <bool> connected;
+        in property <bool> receiving;
+        in property <bool> paused;
+        in property <bool> motion: true;
         in property <string> folder;
         in property <string> error;
         in property <image> qr;
-        in property <image> phone-icon;
-        in property <image> network-icon;
-        in property <image> error-icon;
+        changed qr => { if root.qr.width > 0 { root.last-qr-size = root.qr.width; } }
         in property <string> pairing;
         in property <bool> network;
         in-out property <bool> confirming;
@@ -47,99 +203,116 @@ slint::slint! {
             root.confirming = true;
         }
         public function submit-unpair() { root.unpair(root.confirmation-device); }
+        qr-caption := Text { text: "Scan with Pneu on your phone"; font-size: 14px; visible: false; }
+        name-line := Text { text: "Ag"; font-size: 15px; font-weight: 700; visible: false; }
+        status-line := Text { text: "Ag"; visible: false; }
         forward-focus: keys;
         keys := FocusScope {
-            forward-focus: close-button;
+            focus-on-tab-navigation: false;
+            forward-focus: change-button;
             key-pressed(event) => {
                 if event.text == Key.Escape {
-                    if root.confirming { confirm.close(); root.confirming = false; } else { root.close(); }
+                    if root.confirming { root.confirming = false; change-button.focus(); } else { root.close(); }
                     return accept;
                 }
-                if event.text == Key.Return && !root.confirming { root.close(); return accept; }
                 return reject;
             }
-        layout := VerticalLayout {
-            padding: 18px; spacing: 12px;
-            if root.error != "": Rectangle {
-                border-radius: 4px; background: #da445326; border-color: #da445380; border-width: 1px;
-                HorizontalLayout {
-                    padding: 8px; spacing: 8px;
-                    Image { source: root.error-icon; width: 16px; height: 16px; }
-                    Text { text: root.error; color: Palette.foreground; wrap: word-wrap; }
-                }
-            }
-            if !root.paired: VerticalLayout {
-                spacing: 12px;
-                if root.network && root.pairing == "": HorizontalLayout {
-                    Rectangle { horizontal-stretch: 1; }
-                    Rectangle { width: root.qr.width * 1px; height: root.qr.height * 1px; border-radius: 6px; background: white; clip: true;
-                        Image { source: root.qr; width: parent.width; height: parent.height; image-rendering: pixelated; }
-                    }
-                    Rectangle { horizontal-stretch: 1; }
-                }
-                if root.pairing != "": VerticalLayout {
-                    height: max(280px, root.qr.height * 1px); alignment: center; spacing: 12px;
-                    HorizontalLayout { alignment: center; Spinner { width: 32px; height: 32px; } }
-                    Text { text: "Pairing with " + root.pairing + "…"; color: Palette.foreground; horizontal-alignment: center; }
-                }
-                if !root.network && root.pairing == "": VerticalLayout {
-                    height: 280px; alignment: center; spacing: 12px;
-                    HorizontalLayout { alignment: center; Image { source: root.network-icon; width: 48px; height: 48px; } }
-                    Text { text: "Connect this PC to a network to pair"; color: Palette.foreground; horizontal-alignment: center; }
-                }
-                if root.network && root.pairing == "": Text { text: "Scan with Pneu on your phone"; color: Palette.foreground; horizontal-alignment: center; }
-            }
-            if root.paired: HorizontalLayout {
-                spacing: 14px;
-                Image { source: root.phone-icon; width: 48px; height: 48px; }
-                VerticalLayout {
-                    spacing: 6px;
-                    Text { text: root.phone; font-size: root.default-font-size * 1.2; font-weight: 600; color: Palette.foreground; overflow: elide; }
-                    HorizontalLayout { spacing: 6px;
-                        Rectangle { width: 8px; height: 8px; border-radius: 4px; background: root.dot-muted ? Palette.foreground : root.dot; opacity: root.dot-muted ? 0.7 : 1; }
-                        Text { text: root.status; color: Palette.foreground; opacity: 0.7; overflow: elide; }
-                    }
-                }
-            }
-            Rectangle { height: 1px; background: Palette.border; }
-            HorizontalLayout {
-                spacing: 6px;
-                Text { text: "Save to:"; color: Palette.foreground; vertical-alignment: center; }
-                Text { text: root.folder; color: Palette.foreground; horizontal-stretch: 1; overflow: elide; vertical-alignment: center; }
-                Button { text: "Change…"; clicked => { root.choose-folder(); } }
-            }
-            if root.paired: Rectangle { height: 1px; background: Palette.border; }
-            HorizontalLayout {
-                if root.paired: Button { text: "Unpair…"; clicked => { root.prepare-unpair(); confirm.show(); } }
-                Rectangle { horizontal-stretch: 1; }
-                close-button := Button { text: "Close"; primary: true; clicked => { root.close(); } }
-            }
-        }
-        if root.confirming: Rectangle { background: #00000055; TouchArea {} }
-        confirm := PopupWindow {
-            x: (root.width - self.width) / 2; y: (root.height - self.height) / 2;
-            width: 330px; height: 114px; close-policy: no-auto-close;
-            forward-focus: popup-keys;
-            popup-keys := FocusScope {
-                forward-focus: cancel;
-                key-pressed(event) => {
-                    if event.text == Key.Escape || event.text == Key.Return { confirm.close(); root.confirming = false; close-button.focus(); return accept; }
-                    return reject;
-                }
-            Rectangle {
-                background: Palette.background; border-radius: 4px; border-width: 1px; border-color: Palette.border;
-                VerticalLayout {
-                    padding: 18px; spacing: 18px;
-                    Text { text: "Unpair " + root.confirmation-phone + "?"; color: Palette.foreground; overflow: elide; }
+            layout := VerticalLayout {
+                padding: 16px; spacing: 12px;
+                if root.error != "": Rectangle {
+                    border-radius: 10px; background: Pneu.danger-soft; border-color: Pneu.banner-border; border-width: 1px;
                     HorizontalLayout {
-                        Rectangle { horizontal-stretch: 1; }
-                        cancel := Button { text: "Cancel"; primary: true; clicked => { confirm.close(); root.confirming = false; close-button.focus(); } }
-                        Button { text: "Unpair"; clicked => { confirm.close(); root.confirming = false; root.submit-unpair(); } }
+                        padding-top: 10px; padding-bottom: 10px; padding-left: 12px; padding-right: 12px; spacing: 8px;
+                        Image { source: @image-url("../../../../assets/error.svg"); colorize: #DA4453; width: 16px; height: 16px; }
+                        Text { text: root.error; color: Pneu.text; wrap: word-wrap; }
+                    }
+                }
+                if !root.paired: VerticalLayout {
+                    spacing: 12px;
+                    if root.network && root.pairing == "": HorizontalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: root.qr.width * 1px + 28px; height: root.qr.height * 1px + 28px;
+                            border-radius: 16px; background: white;
+                            border-width: Pneu.dark ? 1px : 0px; border-color: #FFFFFF0F;
+                            drop-shadow-blur: Pneu.dark ? 0px : 12px; drop-shadow-offset-y: 3px; drop-shadow-color: #14161A0D;
+                            Image { x: 14px; y: 14px; source: root.qr; width: root.qr.width * 1px; height: root.qr.height * 1px; image-rendering: pixelated; }
+                        }
+                    }
+                    if root.pairing != "": VerticalLayout {
+                        height: root.pairing-height; alignment: center; spacing: 16px;
+                        HorizontalLayout { alignment: center; PneuSpinner { motion: root.motion; } }
+                        Text { text: "Pairing with " + root.pairing + "…"; color: Pneu.text; horizontal-alignment: center; overflow: elide; max-height: status-line.preferred-height; }
+                    }
+                    if !root.network && root.pairing == "": VerticalLayout {
+                        height: root.pairing-height; alignment: center; spacing: 16px;
+                        HorizontalLayout { alignment: center; Image { source: @image-url("../../../../assets/monitor-off.svg"); colorize: Pneu.text2; width: 44px; height: 44px; } }
+                        Text { text: "Connect this PC to a network to pair"; color: Pneu.text; horizontal-alignment: center; wrap: word-wrap; }
+                    }
+                    if root.network && root.pairing == "": Text { text: qr-caption.text; font-size: qr-caption.font-size; color: Pneu.text; horizontal-alignment: center; }
+                }
+                if root.paired: Card {
+                    VerticalLayout {
+                        padding-top: 16px; padding-bottom: 14px; padding-left: 14px; padding-right: 14px; spacing: 0px;
+                        Link { connected: root.connected; receiving: root.receiving; paused: root.paused; motion: root.motion; }
+                        Rectangle { height: 12px; }
+                        Text { text: root.phone; font-size: 15px; font-weight: 700; color: Pneu.text; overflow: elide; max-height: name-line.preferred-height; horizontal-alignment: center; }
+                        Text { text: root.status; color: Pneu.text2; overflow: elide; max-height: status-line.preferred-height; horizontal-alignment: center; }
+                    }
+                }
+                Card {
+                    VerticalLayout {
+                        spacing: 0px;
+                        Row {
+                            VerticalLayout {
+                                horizontal-stretch: 1; spacing: 2px;
+                                Text { text: "Save to"; font-size: 12.5px; color: Pneu.text2; }
+                                Text { text: root.folder; color: Pneu.text; horizontal-stretch: 1; overflow: elide; }
+                            }
+                            change-button := PneuButton { text: "Change…"; enabled: !root.confirming; clicked => { root.choose-folder(); } }
+                        }
+                        if root.paired: Rectangle { height: 1px; Rectangle { x: 14px; width: parent.width - 28px; height: 1px; background: Pneu.card-border; } }
+                        if root.paired: PneuButton { text: "Unpair…"; kind: row; enabled: !root.confirming; clicked => { root.prepare-unpair(); } }
                     }
                 }
             }
-        }
-        }
+            if root.confirming: Rectangle {
+                background: Pneu.dim;
+                TouchArea {}
+                popup-keys := FocusScope {
+                    forward-focus: cancel;
+                    focus-on-tab-navigation: false;
+                    init => { cancel.focus-popup(); }
+                    key-pressed(event) => {
+                        if event.text == Key.Escape { root.confirming = false; change-button.focus(); return accept; }
+                        return reject;
+                    }
+                    Card {
+                        x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                        width: 320px; height: max(0px, min(popup-layout.preferred-height, root.height - 32px));
+                        drop-shadow-blur: 28px; drop-shadow-offset-y: 8px; drop-shadow-color: Pneu.dark ? #000000B3 : #14161A33;
+                        popup-layout := VerticalLayout {
+                            padding: 20px; spacing: 20px;
+                            Text {
+                                text: "Unpair " + root.confirmation-phone + "?";
+                                font-size: 15px; font-weight: 700; color: Pneu.text;
+                                overflow: elide;
+                                // One elided line stays within the two-line limit. Slint's Qt
+                                // renderer clips vertical wrap overflow without an ellipsis.
+                                // Reserve padding, spacing and the action row even in a small window.
+                                min-height: 0px;
+                                max-height: max(0px, min(name-line.preferred-height, root.height - 122px));
+                            }
+                            HorizontalLayout {
+                                min-height: 30px; max-height: 30px; spacing: 8px;
+                                Rectangle { horizontal-stretch: 1; }
+                                cancel := PneuButton { text: "Cancel"; clicked => { root.confirming = false; change-button.focus(); } }
+                                PneuButton { text: "Unpair"; kind: danger; clicked => { root.confirming = false; change-button.focus(); root.submit-unpair(); } }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -191,7 +364,6 @@ pub fn run(paths: Paths) -> Result<()> {
             let mut last_pair_attempt = 0;
             let mut failed = 0;
             let mut action_error = String::new();
-            let mut icon_theme = None;
             let mut folder_job: Option<futures_util::future::BoxFuture<'_, Result<()>>> = None;
             loop {
                 if invitation_job.is_none() { let socket=paths.socket.clone(); let revision=invitation_revision; invitation_job=Some(Box::pin(async move {ipc::request(&socket, ipc::Command::WaitPairingChange {revision}).await})); }
@@ -256,27 +428,15 @@ pub fn run(paths: Paths) -> Result<()> {
                 was_paired = snapshot.paired;
                 let folder = middle_elide(&super::display_path(&config.save_path),30);
                 let error = snapshot.error.as_ref().map(|e| e.banner()).unwrap_or_else(|| action_error.clone());
-                let dot = if snapshot.error.is_some() { slint::Color::from_rgb_u8(218,68,83) }
-                    else if snapshot.paused { slint::Color::from_rgb_u8(246,116,0) }
-                    else if snapshot.connected { slint::Color::from_rgb_u8(39,174,96) }
-                    else { slint::Color::from_rgb_u8(127,127,127) };
-                let status = snapshot.window_status();
-                let ini = super::palette::globals();
-                let icons = if icon_theme.as_ref() != Some(&ini) {
-                    let icons = (theme_icon(&ini,"smartphone",48),theme_icon(&ini,"network-disconnect",48),theme_icon(&ini,"dialog-error",16));
-                    icon_theme = Some(ini);
-                    Some(icons)
-                } else { None };
+                let status = display_peer_text(&snapshot.window_status());
+                let phone = display_peer_text(&snapshot.phone.name);
+                let pairing = display_peer_text(snapshot.pairing.as_deref().unwrap_or_default());
+                let motion = animations_enabled(&super::palette::globals());
                 let device = snapshot.device.as_ref().map(|d| d.as_str()).unwrap_or_default().to_owned();
                 let _ = weak.upgrade_in_event_loop(move |w| {
                     w.set_device(device.into());
-                    w.set_paired(snapshot.paired); w.set_phone(snapshot.phone.name.into()); w.set_status(status.into()); w.set_dot(dot); w.set_dot_muted(!snapshot.connected && snapshot.error.is_none());
-                    w.set_folder(folder.into()); w.set_error(error.into()); w.set_pairing(snapshot.pairing.unwrap_or_default().into());
-                    if let Some((phone_icon, network_icon, error_icon)) = icons {
-                    if let Some((bytes,size)) = phone_icon { w.set_phone_icon(slint::Image::from_rgba8(slint::SharedPixelBuffer::clone_from_slice(&bytes,size,size))); }
-                    if let Some((bytes,size)) = network_icon { w.set_network_icon(slint::Image::from_rgba8(slint::SharedPixelBuffer::clone_from_slice(&bytes,size,size))); }
-                    if let Some((bytes,size)) = error_icon { w.set_error_icon(slint::Image::from_rgba8(slint::SharedPixelBuffer::clone_from_slice(&bytes,size,size))); }
-                    }
+                    w.set_paired(snapshot.paired); w.set_phone(phone.into()); w.set_status(status.into()); w.set_connected(snapshot.connected); w.set_receiving(snapshot.receiving && snapshot.connected); w.set_paused(snapshot.paused && snapshot.connected); w.set_motion(motion);
+                    w.set_folder(folder.into()); w.set_error(error.into()); w.set_pairing(pairing.into());
                 });
             }
             drop(invitation_job);
@@ -290,6 +450,13 @@ pub fn run(paths: Paths) -> Result<()> {
     drop(window);
     let _ = worker.join();
     Ok(())
+}
+// Peer names are labels, not paragraphs. Keep their bytes on the wire and in
+// storage unchanged while rendering all line separators as spaces in the window.
+fn display_peer_text(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect()
 }
 fn middle_elide(text: &str, max: usize) -> String {
     let chars: Vec<_> = text.chars().collect();
@@ -305,34 +472,12 @@ fn middle_elide(text: &str, max: usize) -> String {
         )
     }
 }
-fn theme_icon(ini: &str, name: &str, size: u32) -> Option<(Vec<u8>, u32)> {
-    let active = super::palette::value(ini, "Icons", "Theme").unwrap_or("breeze");
-    let palette = super::palette::colors(ini);
-    for theme in [active, "breeze", "breeze-dark"] {
-        if theme.contains('/') || theme.contains("..") {
-            continue;
-        }
-        for category in ["devices", "status", "actions"] {
-            for source_size in [64, 48, 32, 22, 24, 16] {
-                let path = PathBuf::from(format!(
-                    "/usr/share/icons/{theme}/{category}/{source_size}/{name}.svg"
-                ));
-                if let Ok(svg) = std::fs::read_to_string(path)
-                    && let Ok(bytes) = render_theme_svg(&svg, &palette, size)
-                {
-                    return Some((bytes, size));
-                }
-            }
-        }
-    }
-    None
-}
-fn render_theme_svg(svg: &str, palette: &super::palette::Colors, size: u32) -> Result<Vec<u8>> {
-    let svg = svg
-        .replace("#232629", &palette.foreground)
-        .replace("#eff0f1", &palette.foreground)
-        .replace("#da4453", &palette.negative);
-    super::tray::render_svg(svg.as_bytes(), size)
+// Plasma's global animation slider applies to the Link as well. Re-read with
+// each status update so changing the system preference needs no daemon restart.
+fn animations_enabled(ini: &str) -> bool {
+    super::palette::value(ini, "KDE", "AnimationDurationFactor")
+        .and_then(|value| value.parse::<f64>().ok())
+        .is_none_or(|factor| factor > 0.0)
 }
 pub fn qr_pixels(uri: &str) -> Result<slint::SharedPixelBuffer<slint::Rgba8Pixel>> {
     let code = qrcode::QrCode::with_error_correction_level(uri.as_bytes(), qrcode::EcLevel::M)?;
@@ -411,7 +556,7 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn confirmation_keeps_displayed_device_when_status_changes() -> Result<()> {
-        // Native Breeze widgets initialise Qt even with a software window.
+        // The native palette initialises Qt even with a software window.
         // Isolate Qt's offscreen setting from the user's desktop and parallel tests.
         if std::env::var_os("PNEU_CONFIRMATION_TEST_CHILD").is_none() {
             let status = tokio::time::timeout(Duration::from_secs(15),
@@ -463,19 +608,23 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn window_icons_follow_actual_palette_for_custom_dark_scheme() -> Result<()> {
-        let svg = include_str!("../../../../assets/pneu-tray-disconnected.svg");
-        for (ini, rgb) in [
-            ("[Colors:Window]\nForegroundNormal=35,38,41\n", [35, 38, 41]),
-            (
-                "[General]\nColorScheme=CustomMidnight\n[Colors:Window]\nForegroundNormal=240,241,242\n",
-                [240, 241, 242],
-            ),
-        ] {
-            let bytes = render_theme_svg(svg, &super::super::palette::colors(ini), 48)?;
-            assert!(bytes.chunks_exact(4).any(|p| p[3] > 240 && p[..3] == rgb));
-        }
-        Ok(())
+    fn peer_labels_normalize_a_protocol_limit_name_and_unicode_line_breaks() {
+        let name = format!("{}xy", "Phone\n".repeat(21));
+        assert_eq!(name.len(), 128);
+        assert_eq!(
+            display_peer_text(&name),
+            format!("{}xy", "Phone ".repeat(21))
+        );
+        assert_eq!(
+            display_peer_text("Galaxy\r\nS25\t+\u{2028}Phone\u{2029}"),
+            "Galaxy  S25 + Phone "
+        );
+    }
+    #[test]
+    fn link_respects_plasma_reduced_motion() {
+        assert!(animations_enabled(""));
+        assert!(animations_enabled("[KDE]\nAnimationDurationFactor=0.5\n"));
+        assert!(!animations_enabled("[KDE]\nAnimationDurationFactor=0\n"));
     }
     struct Chooser(
         Arc<tokio::sync::Notify>,
@@ -712,7 +861,7 @@ mod tests {
                     (260..=292).contains(&size),
                     "typical pairing QR is {size}px"
                 );
-                assert!(size + 36 <= 400, "QR must fit within the window padding");
+                assert!(size + 60 <= 400, "QR must fit within the window padding");
             }
         }
         Ok(())

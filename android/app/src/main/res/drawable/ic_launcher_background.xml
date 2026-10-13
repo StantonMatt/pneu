@@ -1,4 +1,21 @@
-<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
-<path android:fillColor="#0F6E68" android:fillAlpha="1" android:pathData="M0 0L108 0L108 108L0 108Z"/>
-<path android:fillColor="#FFFFFF" android:fillAlpha="0.12" android:pathData="M-23.07 109.86L109.86 -23.07L131.07 -1.86L-1.86 131.07Z"/>
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Generated from docs/design/v2/assets/ic_launcher_background.svg; SHA-256 7a3852ae7c32dc774b1e939aff253aeb34d9ea9e380b68f3c6c562f1c5b91b1f. -->
+<vector xmlns:aapt="http://schemas.android.com/aapt" xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <path android:pathData="M0 0H108V108H0Z" android:strokeColor="#00000000">
+        <aapt:attr name="android:fillColor">
+            <gradient android:type="linear" android:startX="32.4" android:startY="0" android:endX="75.6" android:endY="108">
+                <item android:offset="0" android:color="#6B74FF" />
+                <item android:offset=".55" android:color="#4846E8" />
+                <item android:offset="1" android:color="#2620AE" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <path android:pathData="M0 0H108V108H0Z" android:strokeColor="#00000000">
+        <aapt:attr name="android:fillColor">
+            <gradient android:type="radial" android:centerX="54" android:centerY="-8.64" android:gradientRadius="84.24">
+                <item android:offset="0" android:color="#52FFFFFF" />
+                <item android:offset="1" android:color="#00FFFFFF" />
+            </gradient>
+        </aapt:attr>
+    </path>
 </vector>

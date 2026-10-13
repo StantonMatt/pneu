@@ -49,7 +49,7 @@ object ManualEntries {
         if(binding==null || !binding.matches(shareStep("settings") {app.preferences.read()}))throw ShareFailure("binding_mismatch")
         shareStep("metadata_failed") {ShareAdmission.rejection(app.context,uri)}?.let {throw ShareFailure(it)}
         val type=resolvedMime ?: shareStep("metadata_failed") {ProviderReads.call {app.context.contentResolver.getType(uri)}}
-        val row=Outgoing().apply {mediaId="manual:${randomId()}";transferId=randomId();this.uri=uri.toString();this.kind=kind;automatic=false;createdAt=System.currentTimeMillis();mime=type ?: "application/octet-stream";fileName="Shared item"}
+        val row=Outgoing().apply {mediaId="manual:${randomId()}";transferId=randomId();this.uri=uri.toString();this.kind=kind;automatic=false;createdAt=System.currentTimeMillis();mime=type ?: "application/octet-stream";fileName=app.context.getString(R.string.shared_item)}
         row.fileName=shareStep("metadata_failed") {ProviderReads.call {signal->app.context.contentResolver.query(uri,arrayOf(OpenableColumns.DISPLAY_NAME),null,null,null,signal)?.use {if(it.moveToFirst())it.getString(0) else null}}} ?: row.fileName
         row.fileName=safeFilename(row.fileName)
         shareStep("read_failed") {app.staging.capture(row,binding)};app.connection.kick();return row
@@ -73,7 +73,7 @@ abstract class ManualEntryActivity : ComponentActivity() {
         this.operation=operation
         // A process-death restore has no retained operation. Fail closed rather
         // than replaying an intent whose earlier items may already be in Room.
-        if(state!=null && !operation.started)operation.interrupted(if(this is SendClipboardActivity)"Clipboard send interrupted. Send again." else "Sharing interrupted. Share again.")
+        if(state!=null && !operation.started)operation.interrupted(if(this is SendClipboardActivity)getString(R.string.toast_clipboard_interrupted) else getString(R.string.toast_share_interrupted))
         onBackPressedDispatcher.addCallback(this,object:OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {moveTaskToBack(true)}
         })
@@ -110,7 +110,7 @@ class SendClipboardActivity : ManualEntryActivity() {
         try {
             // Clipboard access still happens only in the focused Activity.
             operation.clipboard(getSystemService(ClipboardManager::class.java).primaryClip)
-        }catch(_:Exception) {operation.failure("PC unreachable. Not sent.")}
+        }catch(_:Exception) {operation.failure(getString(R.string.toast_not_sent))}
     }
 }
 class ShareActivity : ManualEntryActivity() {
@@ -132,14 +132,14 @@ class ShareActivity : ManualEntryActivity() {
                 else listOfNotNull(intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString())
             failureReason="metadata_failed"
             items.firstNotNullOfOrNull {ShareAdmission.rejection(this,it)}?.let {
-                ShareAdmission.warn(it);operation.failure("Couldn't read this item",it);return
+                ShareAdmission.warn(it);operation.failure(getString(R.string.toast_cant_read),it);return
             }
             // The bounded provider open/read proves access, including chooser
             // grants or our media permission. Keep temporary grants service-owned.
             val request=ShareRequest(binding,items,texts)
             failureReason="service_start"
             ShareAdmissionService.start(this,operation,request)
-        }catch(_:Exception) {ShareAdmission.warn(failureReason);operation.failure("Couldn't read this item",failureReason)}
+        }catch(_:Exception) {ShareAdmission.warn(failureReason);operation.failure(getString(R.string.toast_cant_read),failureReason)}
     }
 }
 
@@ -159,23 +159,23 @@ class PneuTile : PneuTileBase() {
     override fun render(p: Prefs,s: io.github.stantonmatt.pneu.connection.LinkState) {
         val presentation=TilePolicy.present(p,s.status,s.route)
         qsTile?.apply {
-            label="Pneu";icon=Icon.createWithResource(this@PneuTile,R.drawable.ic_stat_pneu)
+            label=this@PneuTile.getString(R.string.tile_pneu);icon=Icon.createWithResource(this@PneuTile,R.drawable.ic_stat_pneu)
             state=when {!presentation.available->Tile.STATE_UNAVAILABLE;presentation.active->Tile.STATE_ACTIVE;else->Tile.STATE_INACTIVE}
-            subtitle=presentation.subtitle;updateTile()
+            subtitle=presentation.subtitle?.let {getString(it)};updateTile()
         }
     }
-    override fun onClick() {super.onClick();scope.launch {UiActions.feedback(this@PneuTile).run("Couldn't load Pneu settings. Open Pneu and try again.") {
+    override fun onClick() {super.onClick();scope.launch {UiActions.feedback(this@PneuTile).run(getString(R.string.toast_settings)) {
         val p=graph.awaitPrefs()
         if(!p.quickSettings)return@run
-        if(p.pairingLost)open(MainActivity::class.java,p) else if(p.peer!=null)graph.preferences.toggle("paused",!p.paused).also {PneuService.start(this@PneuTile)}
+        if(p.pairingLost)open(MainActivity::class.java,p) else if(p.peer!=null)UiActions.feedback(this@PneuTile).run(getString(R.string.toast_pause)) {graph.preferences.toggle("paused",!p.paused);PneuService.start(this@PneuTile)}
     }}}
 }
 class ClipboardTile : PneuTileBase() {
     override fun render(p: Prefs,s: io.github.stantonmatt.pneu.connection.LinkState) {
         val presentation=TilePolicy.present(p,s.status,s.route,clipboard=true)
-        qsTile?.apply {label="Send clipboard";icon=Icon.createWithResource(this@ClipboardTile,R.drawable.ic_content_paste_go);state=if(presentation.available)Tile.STATE_INACTIVE else Tile.STATE_UNAVAILABLE;subtitle=presentation.subtitle;updateTile()}
+        qsTile?.apply {label=this@ClipboardTile.getString(R.string.tile_send_clipboard);icon=Icon.createWithResource(this@ClipboardTile,R.drawable.ic_content_paste_go);state=if(presentation.available)Tile.STATE_INACTIVE else Tile.STATE_UNAVAILABLE;subtitle=presentation.subtitle?.let {getString(it)};updateTile()}
     }
-    override fun onClick() {super.onClick();scope.launch {UiActions.feedback(this@ClipboardTile).run("Couldn't load Pneu settings. Open Pneu and try again.") {
+    override fun onClick() {super.onClick();scope.launch {UiActions.feedback(this@ClipboardTile).run(getString(R.string.toast_settings)) {
         val p=graph.awaitPrefs();if(!p.quickSettings)return@run
         if(p.pairingLost)open(MainActivity::class.java,p) else if(p.peer!=null)open(SendClipboardActivity::class.java,p)
     }}}

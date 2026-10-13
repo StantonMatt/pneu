@@ -1,5 +1,6 @@
 package io.github.stantonmatt.pneu.features
 
+import io.github.stantonmatt.pneu.R
 import io.github.stantonmatt.pneu.Health
 import org.junit.Assert.*
 import org.junit.Test
@@ -23,7 +24,7 @@ class SamsungSleepingPolicyTest {
         assertTrue(health(exempt=true).sleeping)
         val revoked=health(exempt=false)
         assertFalse(revoked.sleeping)
-        assertEquals(listOf("Battery optimization can stop Pneu","Pneu isn't in Never sleeping apps"),revoked.issues)
+        assertEquals(listOf(R.string.banner_battery,R.string.banner_never_sleeping),revoked.issues)
         assertTrue(health(exempt=true).issues.isEmpty())
     }
 
@@ -38,7 +39,7 @@ class SamsungSleepingPolicyTest {
             val killed=health(exempt=true,acknowledged=acknowledged,bucketAllowed=false,killed=true)
             assertTrue(killed.sleeping)
             assertTrue(killed.killed)
-            assertEquals(listOf("Pneu was stopped in the background"),killed.issues)
+            assertEquals(listOf(R.string.banner_killed),killed.issues)
         }
     }
 }

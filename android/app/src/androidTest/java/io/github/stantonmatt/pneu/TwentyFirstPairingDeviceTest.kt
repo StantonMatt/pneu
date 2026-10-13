@@ -46,6 +46,7 @@ class TwentyFirstPairingDeviceTest {
             assertEquals(1,PeerFixture.evidence().count {it.asJsonObject["event"].asString=="PAIR_REJECTED"})
             assertEquals(0,PeerFixture.evidence().count {it.asJsonObject["event"].asString=="PAIR"})
             compose.onNodeWithText("Pair").performClick()
+            compose.waitUntil(5000) {app.prefs.value.pending==invitation || app.prefs.value.peer?.pin==invitation.fingerprint}
             withTimeout(20000) {while(app.preferences.read().peer?.pin!=invitation.fingerprint || !app.connection.connected)delay(50)}
             assertNull(app.preferences.read().pending)
             assertEquals(1,PeerFixture.evidence().count {it.asJsonObject["event"].asString=="PAIR"})
