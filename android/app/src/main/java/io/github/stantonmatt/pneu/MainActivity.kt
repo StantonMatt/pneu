@@ -302,7 +302,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
                 }
                 val notificationSettings=checked.channelBlocked || context.granted(Manifest.permission.POST_NOTIFICATIONS) || PermissionRequests.settings(activity,Manifest.permission.POST_NOTIFICATIONS)
                 PermissionRow(resources.getString(R.string.perm_notifications),R.drawable.ic_notifications,checked.notifications,if(notificationSettings)resources.getString(R.string.settings_title) else resources.getString(R.string.action_allow),if(notificationSettings && !checked.notifications)resources.getString(R.string.perm_denied) else null,divider=Build.VERSION.SDK_INT>=37) {
-                    if(notificationSettings)context.startActivity(Intent(if(checked.channelBlocked)Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS else Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE,context.packageName).putExtra(Settings.EXTRA_CHANNEL_ID,"status"))
+                    if(notificationSettings)context.startActivity(Intent(if(checked.channelBlocked)Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS else Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE,context.packageName).putExtra(Settings.EXTRA_CHANNEL_ID,StatusNotificationChannel.id(context)))
                     else request(Manifest.permission.POST_NOTIFICATIONS)
                 }
                 val limited=context.granted(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED) && !checked.photos

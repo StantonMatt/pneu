@@ -24,22 +24,27 @@ class PneuService : Service() {
     override fun onCreate() {
         super.onCreate()
         val nm=getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(NotificationChannel("status",getString(R.string.channel_status),NotificationManager.IMPORTANCE_LOW))
+        StatusNotificationChannel.create(this)
         nm.createNotificationChannel(NotificationChannel("alerts",getString(R.string.channel_alerts),NotificationManager.IMPORTANCE_DEFAULT))
         enterForeground()
     }
     // Never consult graph, preferences, identity or Room on the promotion path.
-    private fun startingNotification()=NotificationCompat.Builder(this,"status")
+    private fun startingNotification()=NotificationCompat.Builder(this,StatusNotificationChannel.id(this))
         .setSmallIcon(R.drawable.ic_stat_pneu).setColor(0xFF4F5BFF.toInt())
         .setContentTitle(getString(R.string.notif_starting)).setContentIntent(activityIntent(0,MainActivity::class.java))
         .setOngoing(true).setOnlyAlertOnce(true).setShowWhen(false).setSilent(true)
         .setCategory(NotificationCompat.CATEGORY_SERVICE)
         .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE).build()
-    private fun enterForeground() {
-        val ready=lastNotification ?: startingNotification()
+    private fun enterForeground():Boolean {
+        val channel=StatusNotificationChannel.ensure(this) ?: return false
+        // A recovered channel may differ from the last notification's channel.
+        // Promotion still uses the graph-free startup notification in that case.
+        val ready=lastNotification?.takeIf {it.channelId==channel} ?: startingNotification()
         startForeground(1,ready,ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+        return true
     }
     private fun updateNotification(nm:NotificationManager) {
+        if(StatusNotificationChannel.ensure(this)==null)return
         val ready=notification()
         lastNotification=ready
         nm.notify(1,ready)
@@ -92,7 +97,7 @@ class PneuService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // Every command can carry a fresh foreground deadline, including a
         // sticky null intent, notification action, retry, or queued stop.
-        enterForeground()
+        if(!enterForeground()) {stopSelfResult(startId);return START_NOT_STICKY}
         runCatching {onForegroundCommand(this,startId)}
         latestStart=startId
         if(intent?.action==ACTION_STOP) {
@@ -112,7 +117,7 @@ class PneuService : Service() {
     private fun activityIntent(code: Int, activity: Class<*>) = PendingIntent.getActivity(this,code,Intent(this,activity).apply { if(code==0)putExtra("home",true);if(code == 3) putExtra("pair",true); if(code >= 10) putExtra("permissions",true) },PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
     private fun notification(): Notification {
         val p=graph.prefs.value; val s=graph.connection.state.value
-        if(!p.loaded)return NotificationCompat.Builder(this,"status").setSmallIcon(R.drawable.ic_stat_pneu).setColor(0xFF4F5BFF.toInt())
+        if(!p.loaded)return NotificationCompat.Builder(this,StatusNotificationChannel.id(this)).setSmallIcon(R.drawable.ic_stat_pneu).setColor(0xFF4F5BFF.toInt())
             .setContentTitle(if(s.status=="Storage unavailable")getString(R.string.load_failed) else getString(R.string.load_pending))
             .setContentIntent(activityIntent(0,MainActivity::class.java)).setOngoing(true).setOnlyAlertOnce(true).setShowWhen(false).setSilent(true).build()
         val title=if(p.pairingLost) "Pairing lost" else if(p.paused) "Paused" else UiPresentation.sending(this,s) ?: s.status
@@ -128,7 +133,7 @@ class PneuService : Service() {
             else -> if(p.lastConnected>0) getString(R.string.detail_last_connected,lastConnectedLabel(this,p.lastConnected)) else null
         }
         val pause=PendingIntent.getService(this,2,Intent(this,PneuService::class.java).setAction(ACTION_PAUSE),PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        return NotificationCompat.Builder(this,"status").setSmallIcon(R.drawable.ic_stat_pneu).setColor(0xFF4F5BFF.toInt())
+        return NotificationCompat.Builder(this,StatusNotificationChannel.id(this)).setSmallIcon(R.drawable.ic_stat_pneu).setColor(0xFF4F5BFF.toInt())
             .setContentTitle(UiPresentation.status(this,title)).setContentText(detail).setContentIntent(activityIntent(0,MainActivity::class.java))
             .setOngoing(true).setOnlyAlertOnce(true).setShowWhen(false).setSilent(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE).setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)

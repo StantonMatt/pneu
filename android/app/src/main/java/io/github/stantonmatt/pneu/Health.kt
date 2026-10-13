@@ -27,7 +27,8 @@ fun Context.health(p:io.github.stantonmatt.pneu.data.Prefs=graph.prefs.value): H
     check(p.loaded) {"Settings not loaded"}
     val photos=granted(Manifest.permission.READ_MEDIA_IMAGES) && (!p.recordings || granted(Manifest.permission.READ_MEDIA_VIDEO))
     val nm=getSystemService(NotificationManager::class.java)
-    val notifications=NotificationManagerCompat.from(this).areNotificationsEnabled() && nm.getNotificationChannel("status")?.importance != NotificationManager.IMPORTANCE_NONE
+    val channelBlocked=nm.getNotificationChannel(StatusNotificationChannel.id(this))?.importance==NotificationManager.IMPORTANCE_NONE
+    val notifications=NotificationManagerCompat.from(this).areNotificationsEnabled() && !channelBlocked
     val am=getSystemService(ActivityManager::class.java)
     val batteryExempt=getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
     val battery=batteryExempt && !am.isBackgroundRestricted
@@ -35,5 +36,5 @@ fun Context.health(p:io.github.stantonmatt.pneu.data.Prefs=graph.prefs.value): H
     val killed=p.peer!=null && ServiceEvidence.killed(this)
     if(killed && p.neverSleeping)graph.invalidateSleeping()
     val sleeping=!Build.MANUFACTURER.equals("samsung",true) || PermissionPolicy.sleeping(p.neverSleeping,bucket<UsageStatsManager.STANDBY_BUCKET_RARE,killed,batteryExempt)
-    return Health(photos,notifications,battery,sleeping,killed,nm.getNotificationChannel("status")?.importance==NotificationManager.IMPORTANCE_NONE,am.isBackgroundRestricted,Build.VERSION.SDK_INT<37 || granted(Manifest.permission.ACCESS_LOCAL_NETWORK))
+    return Health(photos,notifications,battery,sleeping,killed,channelBlocked,am.isBackgroundRestricted,Build.VERSION.SDK_INT<37 || granted(Manifest.permission.ACCESS_LOCAL_NETWORK))
 }

@@ -1,13 +1,14 @@
 package io.github.stantonmatt.pneu
 
 import android.Manifest
-import android.app.NotificationChannel
+import android.app.Instrumentation
 import android.app.NotificationManager
 import android.content.*
 import android.content.pm.ShortcutManager
 import android.graphics.Bitmap
 import android.net.Uri
 import android.provider.MediaStore
+import android.provider.Settings
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.uiautomator.*
@@ -196,10 +197,74 @@ class AdvisoryDeviceTest {
         val retained=app.queue.find(failed.mediaId)!!
         assertEquals("failed",retained.state);assertEquals("id_conflict",retained.error);assertEquals(Long.MAX_VALUE,retained.nextAttempt)
     }
-    @Test(timeout=45000) fun blockedStatusChannelOpensChannelSettingsImmediately()=runBlocking {
-        val nm=context.getSystemService(NotificationManager::class.java);nm.deleteNotificationChannel("status");nm.createNotificationChannel(NotificationChannel("status","Status",NotificationManager.IMPORTANCE_NONE))
-        try {launch("permissions");device.findObject(UiSelector().text("Settings")).click();assertTrue(device.wait(Until.hasObject(By.pkg("com.android.settings")),3000))}
-        finally {device.pressHome();nm.deleteNotificationChannel("status");nm.createNotificationChannel(NotificationChannel("status","Status",NotificationManager.IMPORTANCE_LOW))}
+    @Test(timeout=45000) fun blockedStatusChannelOpensChannelSettingsImmediately()=runBlocking {assertBlockedStatusChannelSettings()}
+    @Test(timeout=60000) fun changedLegacyChannelsOpenTheirOwnSettingsWhenBlocked()=runBlocking {
+        val nm=context.getSystemService(NotificationManager::class.java)
+        val changes=listOf<(android.app.NotificationChannel)->Unit>(
+            {it.importance=NotificationManager.IMPORTANCE_NONE},
+            {it.importance=NotificationManager.IMPORTANCE_MIN},
+            {it.lockscreenVisibility=android.app.Notification.VISIBILITY_PRIVATE},
+            {it.lockscreenVisibility=android.app.Notification.VISIBILITY_SECRET},
+            {it.setBypassDnd(true)},
+            {it.setSound(Uri.parse("content://io.github.stantonmatt.pneu.test.sources/denied"),it.audioAttributes)}
+        )
+        for((index,change) in changes.withIndex()) {
+            val legacyId="badge-settings-fixture-legacy-$index";val candidateId="badge-settings-fixture-v2-$index"
+            nm.createNotificationChannel(android.app.NotificationChannel(legacyId,"Status",NotificationManager.IMPORTANCE_LOW))
+            val legacy=nm.getNotificationChannel(legacyId).apply(change)
+            try {
+                assertEquals(legacyId,StatusNotificationChannel.selectForTest(context,legacyId,candidateId,loadLegacy={legacy}))
+                assertBlockedStatusChannelSettings()
+                assertNotNull(nm.getNotificationChannel(legacyId))
+                assertNull(nm.getNotificationChannel(candidateId))
+            } finally {
+                DeviceFixture.stopPneuService();DeviceFixture.stopShareAdmissionService()
+                app.connection.stop();withTimeout(10000) {app.connection.awaitStopped()}
+                // Service channels stay registered for deferred AMS validation.
+                StatusNotificationChannel.resetForTest();StatusNotificationChannel.create(context)
+            }
+        }
+    }
+    private suspend fun assertBlockedStatusChannelSettings() {
+        val channelId=StatusNotificationChannel.id(context)
+        try {
+            DeviceFixture.setChannelEnabled(channelId,false)
+            val health=context.health()
+            assertTrue("The current status channel must be reported blocked",health.channelBlocked)
+            assertFalse(health.notifications)
+            launch("permissions")
+            val opened=CompletableDeferred<Intent>()
+            val monitor=object:Instrumentation.ActivityMonitor() {
+                override fun onStartActivity(intent:Intent):Instrumentation.ActivityResult? {
+                    if(intent.action?.startsWith("android.settings.")==true)opened.complete(Intent(intent))
+                    return null // Observe the real launch without intercepting it.
+                }
+            }
+            instrumentation.addMonitor(monitor)
+            try {
+                val title=device.wait(Until.findObject(By.pkg(context.packageName).text(context.getString(R.string.perm_notifications))),5000)
+                assertNotNull("Notifications row must appear",title)
+                // Other permission rows can also have a Settings action. Choose
+                // the action beside Notifications instead of the first label.
+                val action=device.findObjects(By.pkg(context.packageName).text("Settings"))
+                    .minByOrNull {kotlin.math.abs(it.visibleBounds.centerY()-title!!.visibleBounds.centerY())}
+                assertNotNull("Notifications row must expose its Settings action",action)
+                action!!.click()
+                val actual=withTimeoutOrNull(5000) {opened.await()}
+                    ?: throw AssertionError("Notifications Settings action did not launch for $channelId")
+                assertEquals("Blocked notifications must open channel settings",Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS,actual.action)
+                assertEquals(context.packageName,actual.getStringExtra(Settings.EXTRA_APP_PACKAGE))
+                assertEquals(channelId,actual.getStringExtra(Settings.EXTRA_CHANNEL_ID))
+                assertTrue(device.wait(Until.hasObject(By.pkg("com.android.settings")),3000))
+            } finally {instrumentation.removeMonitor(monitor)}
+        }
+        finally {
+            // Deleting/recreating a channel retains its blocked importance.
+            // Restore it through Settings, which can change that user setting.
+            try {
+                DeviceFixture.setChannelEnabled(channelId,true)
+            } finally {device.pressHome()}
+        }
     }
     @Test(timeout=45000) fun killEvidenceSurvivesReconnectAndRepairAcknowledgesIt()=runBlocking {
         seed();val evidence=context.getSharedPreferences("service_evidence",Context.MODE_PRIVATE)

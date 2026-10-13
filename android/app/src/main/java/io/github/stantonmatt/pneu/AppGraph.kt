@@ -13,7 +13,7 @@ import io.github.stantonmatt.pneu.features.*
 
 class PneuApp : Application() {
     lateinit var graph: AppGraph
-    override fun onCreate() { super.onCreate(); graph = AppGraph(this) }
+    override fun onCreate() { super.onCreate(); StatusNotificationChannel.create(this); graph = AppGraph(this) }
 }
 val Context.graph get() = (applicationContext as PneuApp).graph
 class AppGraph(val context: Context,val preferences: Preferences=Preferences(context)) {

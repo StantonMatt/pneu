@@ -104,6 +104,9 @@ class SixteenthRecentDeviceTest {
         val marker=LinkState(status="Connected",transferMediaId="outside-recent",transferKind="file",transferFileName=active.fileName,total=active.size,sent=2048)
         app.connection.state.value=marker
         withTimeout(3000) {while(c.getSystemService(NotificationManager::class.java).activeNotifications.none {it.id==1 && it.notification.extras.getString(Notification.EXTRA_TITLE)=="Sending Active-report.pdf"})delay(50)}
+        val nm=c.getSystemService(NotificationManager::class.java)
+        assertEquals(StatusNotificationChannel.id(c),nm.activeNotifications.first {it.id==1}.notification.channelId)
+        assertFalse(nm.getNotificationChannel(StatusNotificationChannel.id(c)).canShowBadge())
         assertFalse(app.recent.value.any {it.mediaId==marker.transferMediaId})
         app.connection.state.value=marker.copy(transferMediaId=active.mediaId)
         c.startActivity(Intent(c,MainActivity::class.java).putExtra("home",true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))

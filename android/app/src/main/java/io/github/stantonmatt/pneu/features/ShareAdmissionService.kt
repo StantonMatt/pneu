@@ -20,17 +20,22 @@ class ShareAdmissionService:Service() {
     private var latestStart=0
     override fun onCreate() {
         super.onCreate()
-        getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel("status",getString(R.string.channel_status),NotificationManager.IMPORTANCE_LOW))
+        StatusNotificationChannel.create(this)
         enterForeground()
     }
-    private fun enterForeground() {
-        startForeground(4,NotificationCompat.Builder(this,"status").setSmallIcon(R.drawable.ic_stat_pneu)
+    private fun enterForeground():Boolean {
+        val channel=StatusNotificationChannel.ensure(this) ?: return false
+        startForeground(4,NotificationCompat.Builder(this,channel).setSmallIcon(R.drawable.ic_stat_pneu)
             .setContentTitle(getString(R.string.notif_preparing_share)).setOngoing(true).setSilent(true).setShowWhen(false)
             .setOnlyAlertOnce(true).setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE).build(),ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+        return true
     }
     override fun onStartCommand(intent:Intent?,flags:Int,startId:Int):Int {
-        enterForeground()
+        if(!enterForeground()) {
+            intent?.getStringExtra(OWNER)?.let {pending.remove(it)}
+            stopSelfResult(startId);return START_NOT_STICKY
+        }
         runCatching {onForegroundCommand(this,startId)}
         latestStart=startId
         if(intent?.action==STOP) {stopSelfResult(startId);return START_NOT_STICKY}

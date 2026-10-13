@@ -2,9 +2,12 @@ package io.github.stantonmatt.pneu
 
 import android.content.Intent
 import android.app.ActivityManager
+import android.app.NotificationManager
 import android.net.Uri
 import android.content.ContentUris
 import android.provider.MediaStore
+import android.provider.Settings
+import androidx.test.uiautomator.*
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.test.platform.app.InstrumentationRegistry
@@ -18,6 +21,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Assert.*
 import java.io.File
 import java.util.concurrent.CountDownLatch
@@ -29,6 +33,30 @@ import java.util.concurrent.atomic.AtomicBoolean
  * than erase the state whose creation is the subject of the test. Permissions are
  * managed by each fixture/host (the permanent-denial class must retain its denials). */
 internal object DeviceFixture {
+    /** Start a new Settings task for each channel: reusing a channel-details
+     * Activity can leave its fragment displaying the previous channel. Target
+     * the main Show notifications control, never an unrelated checked switch. */
+    suspend fun setChannelEnabled(channelId:String,enabled:Boolean) {
+        val i=InstrumentationRegistry.getInstrumentation();val c=i.targetContext
+        val nm=c.getSystemService(NotificationManager::class.java);val device=UiDevice.getInstance(i)
+        if((nm.getNotificationChannel(channelId).importance!=NotificationManager.IMPORTANCE_NONE)==enabled)return
+        c.startActivity(Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+            .putExtra(Settings.EXTRA_APP_PACKAGE,c.packageName).putExtra(Settings.EXTRA_CHANNEL_ID,channelId)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
+        val control=device.findObject(UiSelector().packageName("com.android.settings").text("Show notifications"))
+        assertTrue("Show notifications control for $channelId must appear",control.waitForExists(5000))
+        control.click()
+        val changed=withTimeoutOrNull(5000) {
+            while((nm.getNotificationChannel(channelId).importance!=NotificationManager.IMPORTANCE_NONE)!=enabled)delay(50)
+            true
+        } ?: false
+        if(!changed) {
+            val evidence=File(c.filesDir,"badge-settings-failures").apply {mkdirs()}
+            device.dumpWindowHierarchy(File(evidence,"$channelId-$enabled.xml"))
+            device.takeScreenshot(File(evidence,"$channelId-$enabled.png"))
+        }
+        assertTrue("Settings must set $channelId enabled=$enabled; actual importance=${nm.getNotificationChannel(channelId).importance}",changed)
+    }
     /** Deliver stop behind a queued foreground start; raw stopService can
      * remove that start before the service has acknowledged its deadline. */
     suspend fun stopPneuService() {
@@ -38,6 +66,16 @@ internal object DeviceFixture {
         withTimeout(10000) {
             while(c.getSystemService(ActivityManager::class.java).getRunningServices(Int.MAX_VALUE)
                 .any {it.service.className==PneuService::class.java.name})delay(20)
+        }
+        i.waitForIdleSync()
+    }
+    suspend fun stopShareAdmissionService() {
+        val i=InstrumentationRegistry.getInstrumentation();val c=i.targetContext
+        ShareAdmissionService.stop(c)
+        i.waitForIdleSync()
+        withTimeout(10000) {
+            while(c.getSystemService(ActivityManager::class.java).getRunningServices(Int.MAX_VALUE)
+                .any {it.service.className==ShareAdmissionService::class.java.name})delay(20)
         }
         i.waitForIdleSync()
     }
@@ -61,7 +99,7 @@ internal object DeviceFixture {
         app.onMediaObserverReady={}
         withTimeout(10000) {app.initialized.await()}
         stopPneuService()
-        ShareAdmissionService.stop(c)
+        stopShareAdmissionService()
         // Flush service destruction before joining its cancelled connection/senders.
         InstrumentationRegistry.getInstrumentation().waitForIdleSync()
         app.connection.stop()
