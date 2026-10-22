@@ -14,9 +14,11 @@ use std::{net::IpAddr, path::Path, time::Instant};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Phone {
-    /// Metadata is usable only for this pairing identity, including after restart.
+    /// Metadata is usable only for this device and durable pairing generation.
     #[serde(default)]
     pub device: Option<pneu_proto::Id>,
+    #[serde(default)]
+    pub pairing_generation: Option<u64>,
     pub name: String,
     pub last_seen: u64,
     #[serde(default)]
@@ -24,6 +26,12 @@ pub struct Phone {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub paired_devices: Vec<pneu_proto::Id>,
+    #[serde(default)]
+    pub connected_devices: Vec<pneu_proto::Id>,
+    #[serde(default)]
+    pub paused_devices: Vec<pneu_proto::Id>,
     #[serde(default)]
     pub device: Option<pneu_proto::Id>,
     /// Connection generation which supplied the display metadata, if known.
@@ -119,15 +127,16 @@ impl Snapshot {
 #[derive(Default)]
 pub(crate) struct State {
     pub snapshot: Snapshot,
-    pub receiving_until: Option<Instant>,
+    pub receiving_until: std::collections::HashMap<(pneu_proto::Id, pneu_proto::Id), Instant>,
     pub phone_generation: Option<u64>,
-    pub active_transfers: std::collections::HashSet<pneu_proto::Id>,
+    pub phones: std::collections::HashMap<pneu_proto::Id, Phone>,
+    pub phone_generations: std::collections::HashMap<pneu_proto::Id, u64>,
+    pub active_transfers: std::collections::HashSet<(pneu_proto::Id, pneu_proto::Id)>,
 }
 impl State {
-    pub fn clear_transfers(&mut self) {
-        self.active_transfers.clear();
-        self.receiving_until = None;
-        self.snapshot.receiving = false;
+    pub fn clear_transfers(&mut self, device: &pneu_proto::Id) {
+        self.active_transfers.retain(|(id, _)| id != device);
+        self.receiving_until.retain(|(id, _), _| id != device);
     }
 }
 impl Snapshot {

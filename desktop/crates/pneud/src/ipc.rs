@@ -177,9 +177,9 @@ async fn handle(core: Arc<Core>, stream: UnixStream) -> Result<()> {
         Command::ShowWindow { choose_folder } => { core.request_window(choose_folder); serde_json::Value::Null },
         Command::Status => {
             let snapshot = core.ui_snapshot();
-            let paired: Vec<_> = snapshot.device.iter().cloned().collect();
-            let connected: Vec<_> = snapshot.device.iter().filter(|_| snapshot.connected).cloned().collect();
-            let paused: Vec<_> = snapshot.device.iter().filter(|_| snapshot.connected && snapshot.paused).cloned().collect();
+            let paired = snapshot.paired_devices;
+            let connected = snapshot.connected_devices;
+            let paused = snapshot.paused_devices;
             serde_json::json!({"device_id":core.identity.device_id,"fingerprint":core.identity.fingerprint,"port":core.bound_port(),"paired_devices":paired,"connected_devices":connected,"paused_devices":paused,"config":core.config()})
         },
     }) }.await;

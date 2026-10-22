@@ -664,7 +664,7 @@ async fn unpair_closes_session_and_removes_trust() -> Result<()> {
         "peers",
         "receipts",
         "outgoing",
-        "clipboard_clock",
+        "legacy_clipboard_clock",
         "clipboard_recent",
     ] {
         assert_eq!(device_rows(&h, &phone.identity.device_id, table)?, 0);
@@ -1226,7 +1226,7 @@ async fn incoming_unpair_clears_pairing_receipts_and_active_staging() -> Result<
         "peers",
         "receipts",
         "outgoing",
-        "clipboard_clock",
+        "legacy_clipboard_clock",
         "clipboard_recent",
     ] {
         assert_eq!(device_rows(&h, device, table)?, 0);
@@ -1779,7 +1779,7 @@ async fn image_copy_uses_content_and_only_viewer_launches_require_extensions() -
 }
 
 #[tokio::test]
-async fn new_pairing_replaces_old_and_cancels_its_running_and_queued_actions() -> Result<()> {
+async fn unpair_then_new_pairing_cancels_old_running_and_queued_actions() -> Result<()> {
     let h = Harness::new().await?;
     let old = h.phone("old")?;
     let next = h.phone("next")?;
@@ -1807,6 +1807,7 @@ async fn new_pairing_replaces_old_and_cancels_its_running_and_queued_actions() -
     event_matching(&mut transfer_events, |event|matches!(event,pneud::Event::TransferProgress {transfer_id,..} if *transfer_id==unfinished.transfer_id)).await?;
     assert!(h.core.ui_snapshot().receiving);
     tokio::time::sleep(Duration::from_secs(1)).await;
+    h.core.unpair_device(old.identity.device_id.clone()).await?;
     let mut replacement = h.pair(&next).await?;
     assert!(
         !h.core.ui_snapshot().receiving,
@@ -1824,7 +1825,7 @@ async fn new_pairing_replaces_old_and_cancels_its_running_and_queued_actions() -
     for table in [
         "peers",
         "receipts",
-        "clipboard_clock",
+        "legacy_clipboard_clock",
         "clipboard_recent",
         "outgoing",
     ] {
@@ -2848,6 +2849,7 @@ async fn offers_policy_changes_and_stale_discard_cannot_send_prepared_clipboard(
             .is_err()
     );
     let replacement = h.phone("replacement")?;
+    h.core.unpair_device(device.clone()).await?;
     drop(c);
     // A different unknown certificate must respect the one-second admission throttle.
     tokio::time::sleep(Duration::from_millis(1050)).await;
@@ -3053,6 +3055,357 @@ async fn disconnect_and_orderly_shutdown_keep_last_seen_after_restart() -> Resul
         restarted.shutdown_actions().await?;
         drop(restarted);
         drop(dir);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn two_phones_receive_automatic_clipboard_and_unpair_independently() -> Result<()> {
+    let h = Harness::new().await?;
+    let first = h.phone("first")?;
+    let second = h.phone("second")?;
+    let mut a = h.pair(&first).await?;
+    // Unknown certificates are intentionally admitted at most once per second.
+    tokio::time::sleep(Duration::from_millis(1050)).await;
+    let mut b = h.pair(&second).await?;
+    assert_eq!(h.core.paired_devices().len(), 2);
+    assert_eq!(h.core.connected_devices().len(), 2);
+    let offer = h.core.observe_clipboard_offer().unwrap();
+    let id = h
+        .core
+        .send_observed_clipboard(offer, "both phones".into())
+        .await?;
+    for connection in [&mut a, &mut b] {
+        assert!(
+            matches!(connection.read(Duration::from_secs(2)).await?, Message::Clipboard(c) if c.transfer_id == id && c.text == "both phones")
+        );
+    }
+    // One pending receipt cannot hold up the other recipient's next delivery.
+    b.write(&Message::Ack(Ack {
+        transfer_id: id.clone(),
+        deduplicated: false,
+    }))
+    .await?;
+    let offer = h.core.observe_clipboard_offer().unwrap();
+    let next = h
+        .core
+        .send_observed_clipboard(offer, "independent delivery".into())
+        .await?;
+    assert!(
+        matches!(b.read(Duration::from_secs(2)).await?,Message::Clipboard(c) if c.transfer_id == next)
+    );
+    b.write(&Message::Ack(Ack {
+        transfer_id: next,
+        deduplicated: false,
+    }))
+    .await?;
+    h.core
+        .unpair_device(first.identity.device_id.clone())
+        .await?;
+    assert!(matches!(
+        a.read(Duration::from_secs(2)).await?,
+        Message::Unpair(_)
+    ));
+    assert_eq!(
+        h.core.connected_devices(),
+        vec![second.identity.device_id.clone()]
+    );
+    assert!(
+        !b.send_text(Clipboard {
+            hlc: None,
+            source_device: None,
+            transfer_id: Id::new(pneud::random_hex(16))?,
+            text: "still authorized".into(),
+            created_at: 1,
+            origin: ClipboardOrigin::Clipboard
+        })
+        .await?
+        .deduplicated
+    );
+    assert_eq!(&*h.actions.text.lock().unwrap(), &["still authorized"]);
+    drop(a);
+    drop(b);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn frozen_recipients_and_same_device_replacement_preserve_other_session() -> Result<()> {
+    let h = Harness::new().await?;
+    let first = h.phone("first")?;
+    let second = h.phone("second")?;
+    let mut a = h.pair(&first).await?;
+    let frozen = h.core.observe_clipboard_offer().unwrap();
+    tokio::time::sleep(Duration::from_millis(1050)).await;
+    let mut b = h.pair(&second).await?;
+    let id = h
+        .core
+        .send_observed_clipboard(frozen, "before second connected".into())
+        .await?;
+    assert!(
+        matches!(a.read(Duration::from_secs(2)).await?,Message::Clipboard(c) if c.transfer_id == id)
+    );
+    a.write(&Message::Ack(Ack {
+        transfer_id: id,
+        deduplicated: false,
+    }))
+    .await?;
+    assert!(b.read(Duration::from_millis(100)).await.is_err());
+    let mut events = h.core.subscribe();
+    let mut replacement = first.reconnect().await?;
+    event_matching(&mut events, |e|matches!(e,pneud::Event::ConnectionChanged {device,connected:true} if *device == first.identity.device_id)).await?;
+    assert!(matches!(
+        a.read(Duration::from_secs(2)).await?,
+        Message::Error(ErrorMessage {
+            code: ErrorCode::ConnectionReplaced,
+            ..
+        })
+    ));
+    assert_eq!(h.core.connected_devices().len(), 2);
+    // A new certificate with this same ID exercises approved re-pairing.
+    let mut repaired = h.phone("repaired")?;
+    repaired.identity.device_id = first.identity.device_id.clone();
+    tokio::time::sleep(Duration::from_millis(1050)).await;
+    let mut current = h.pair(&repaired).await?;
+    assert!(matches!(
+        replacement.read(Duration::from_secs(2)).await?,
+        Message::Error(ErrorMessage {
+            code: ErrorCode::Unauthorized,
+            ..
+        })
+    ));
+    assert_eq!(h.core.paired_devices().len(), 2);
+    assert_eq!(h.core.connected_devices().len(), 2);
+    let offer = h.core.observe_clipboard_offer().unwrap();
+    h.core
+        .unpair_device(first.identity.device_id.clone())
+        .await?;
+    // Removing even the first frozen recipient cannot cancel the other's offer.
+    let id = h
+        .core
+        .send_observed_clipboard(offer, "remaining recipient".into())
+        .await?;
+    assert!(
+        matches!(b.read(Duration::from_secs(2)).await?,Message::Clipboard(c) if c.transfer_id == id)
+    );
+    b.write(&Message::Ack(Ack {
+        transfer_id: id,
+        deduplicated: false,
+    }))
+    .await?;
+    assert!(matches!(
+        current.read(Duration::from_secs(2)).await?,
+        Message::Unpair(_)
+    ));
+    assert!(
+        !b.send_text(second.text(
+            "authorized after re-pair".into(),
+            ClipboardOrigin::Clipboard
+        )?)
+        .await?
+        .deduplicated
+    );
+    drop((a, b, replacement, current));
+    h.stop().await
+}
+
+#[tokio::test]
+async fn sweep_ready_budget_refuses_extra_peer_and_allows_same_peer_replacement() -> Result<()> {
+    let h = Harness::new().await?;
+    let mut phones = Vec::new();
+    for index in 0..17 {
+        if index != 0 {
+            tokio::time::sleep(Duration::from_millis(1010)).await;
+        }
+        let phone = h.phone(&format!("peer-{index}"))?;
+        let mut connection = h.pair(&phone).await?;
+        let mut events = h.core.subscribe();
+        connection.close().await?;
+        event_matching(&mut events, |e|matches!(e,pneud::Event::ConnectionChanged {device,connected:false} if *device==phone.identity.device_id)).await?;
+        phones.push(phone);
+    }
+    let mut connected = Vec::new();
+    for phone in phones.iter().take(16) {
+        let mut events = h.core.subscribe();
+        connected.push(phone.reconnect().await?);
+        event_matching(&mut events, |e|matches!(e,pneud::Event::ConnectionChanged {device,connected:true} if *device==phone.identity.device_id)).await?;
+    }
+    assert_eq!(h.core.connected_devices().len(), 16);
+    let mut extra = phones[16].reconnect().await?;
+    let refused = extra.read(Duration::from_secs(2)).await;
+    let count = h.core.connected_devices().len();
+    let mut events = h.core.subscribe();
+    let mut replacement = phones[0].reconnect().await?;
+    event_matching(&mut events, |e|matches!(e,pneud::Event::ConnectionChanged {device,connected:true} if *device==phones[0].identity.device_id)).await?;
+    let replaced = connected[0].read(Duration::from_secs(2)).await?;
+    let ping = Ping {
+        nonce: Nonce::new("d".repeat(16))?,
+    };
+    replacement.write(&Message::Ping(ping.clone())).await?;
+    assert_eq!(
+        replacement.read(Duration::from_secs(2)).await?,
+        Message::Pong(ping)
+    );
+    let mut pending = Vec::new();
+    for _ in 0..16 {
+        pending.push(raw_connect(&h, &phones[0]).await?);
+    }
+    let overflow = raw_connect(&h, &phones[0]).await;
+    drop((connected, replacement, extra, pending));
+    h.stop().await?;
+    assert!(matches!(
+        refused,
+        Ok(Message::Error(ErrorMessage {
+            code: ErrorCode::Busy,
+            ..
+        }))
+    ));
+    assert_eq!(count, 16);
+    assert!(matches!(
+        replaced,
+        Message::Error(ErrorMessage {
+            code: ErrorCode::ConnectionReplaced,
+            ..
+        })
+    ));
+    assert!(overflow.is_err(), "pending transports must remain bounded");
+    Ok(())
+}
+
+#[test]
+fn sweep_superseded_connections_close_while_metadata_worker_is_blocked() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let h = Harness::new().await?;
+        let phone = h.phone("paired")?;
+        let mut initial = h.pair(&phone).await?;
+        let ping = Ping {
+            nonce: Nonce::new("d".repeat(16))?,
+        };
+        initial.write(&Message::Ping(ping.clone())).await?;
+        assert_eq!(
+            initial.read(Duration::from_secs(2)).await?,
+            Message::Pong(ping)
+        );
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+        entered_rx.await?;
+        let mut held = Vec::new();
+        for _ in 0..200 {
+            let mut events = h.core.subscribe();
+            held.push(phone.reconnect().await?);
+            event_matching(&mut events, |e| {
+                matches!(
+                    e,
+                    pneud::Event::ConnectionChanged {
+                        connected: true,
+                        ..
+                    }
+                )
+            })
+            .await?;
+        }
+        let mut closed = 0;
+        for connection in held.iter_mut().take(199) {
+            if matches!(
+                connection.read(Duration::from_millis(100)).await,
+                Ok(Message::Error(ErrorMessage {
+                    code: ErrorCode::ConnectionReplaced,
+                    ..
+                }))
+            ) && connection.read(Duration::from_millis(100)).await.is_err()
+            {
+                closed += 1;
+            }
+        }
+        release_tx.send(())?;
+        blocker.await?;
+        drop((initial, held));
+        h.stop().await?;
+        assert_eq!(
+            closed, 199,
+            "superseded sockets must close before metadata persistence resumes"
+        );
+        Ok(())
+    })
+}
+
+#[tokio::test]
+async fn sweep_repair_cancels_own_actions_and_other_pair_preserves_them() -> Result<()> {
+    for same_device in [true, false] {
+        let h = Harness::new().await?;
+        let old = h.phone("old")?;
+        let mut next = h.phone("next")?;
+        if same_device {
+            next.identity.device_id = old.identity.device_id.clone();
+        }
+        assert_ne!(old.identity.fingerprint, next.identity.fingerprint);
+        let mut c = h.pair(&old).await?;
+        let bytes = b"\x89PNG\r\n\x1a\nimage";
+        h.actions
+            .block_image
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        for (index, kind) in [FileKind::Screenshot, FileKind::ClipboardImage]
+            .into_iter()
+            .enumerate()
+        {
+            let mut meta = metadata(Id::new(pneud::random_hex(16))?, bytes);
+            meta.file_name = format!("old-{index}.png");
+            meta.kind = kind;
+            begin_chunks(&mut c, &meta, bytes).await?;
+            assert!(matches!(
+                end(&mut c, meta.transfer_id).await?,
+                Message::Ack(_)
+            ));
+            if index == 0 {
+                tokio::time::timeout(Duration::from_secs(2), h.actions.image_entered.notified())
+                    .await?;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(1010)).await;
+        let mut replacement = h.pair(&next).await?;
+        h.actions
+            .block_image
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        h.actions.image_release.notify_one();
+        if same_device {
+            assert!(matches!(
+                c.read(Duration::from_secs(2)).await?,
+                Message::Error(ErrorMessage {
+                    code: ErrorCode::Unauthorized,
+                    ..
+                })
+            ));
+            assert!(old.reconnect().await.is_err());
+            let new_bytes = b"\x89PNG\r\n\x1a\nnew image";
+            let mut meta = metadata(Id::new(pneud::random_hex(16))?, new_bytes);
+            meta.file_name = "new.png".into();
+            meta.kind = FileKind::ClipboardImage;
+            begin_chunks(&mut replacement, &meta, new_bytes).await?;
+            assert!(matches!(
+                end(&mut replacement, meta.transfer_id).await?,
+                Message::Ack(_)
+            ));
+            h.wait_images(1).await?;
+            assert_eq!(h.actions.images.lock().unwrap().len(), 1);
+            assert_eq!(
+                *h.actions.image_bytes.lock().unwrap(),
+                vec![new_bytes.to_vec()]
+            );
+        } else {
+            h.wait_images(2).await?;
+            assert_eq!(h.core.connected_devices().len(), 2);
+            assert_eq!(h.actions.images.lock().unwrap().len(), 2);
+        }
+        drop((c, replacement));
+        h.stop().await?;
     }
     Ok(())
 }

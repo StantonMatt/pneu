@@ -7,11 +7,15 @@ use crate::{
     tls::{Admission, ClientVerifier, Invitation},
 };
 use anyhow::{Context, Result, bail, ensure};
+use futures_util::{
+    FutureExt,
+    future::{BoxFuture, Shared},
+};
 use pneu_proto::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     path::PathBuf,
     sync::{
@@ -213,6 +217,11 @@ impl NotificationJob {
         }
     }
 }
+// Established peer slots plus bounded ingress headroom let a known peer
+// replace its session even when every established slot is occupied.
+const SESSION_LIMIT: usize = 16;
+const ADMISSION_LIMIT: usize = 16;
+const TRANSPORT_LIMIT: usize = SESSION_LIMIT + ADMISSION_LIMIT;
 const NOTIFICATION_LIMIT: usize = 16;
 const EXPLICIT_IMAGE_LIMIT: usize = 8;
 #[derive(Default)]
@@ -315,41 +324,149 @@ fn persist_phone_generation(
     path: &std::path::Path,
     generation: u64,
 ) -> Result<()> {
-    let ui = ui.lock().expect("UI state");
-    if ui.phone_generation == Some(generation) {
-        crate::config::atomic_private(path, &serde_json::to_vec(&ui.snapshot.phone)?)?;
+    let mut ui = ui.lock().expect("UI state");
+    // Metadata authority outlives the socket. A different live peer cannot
+    // revoke it; replacement/re-pair of this device can.
+    if !ui.phone_generations.values().any(|id| *id == generation) {
+        return Ok(());
     }
+    if ui.phone_generation == Some(generation)
+        && let Some(device) = ui.snapshot.phone.device.clone()
+    {
+        let phone = ui.snapshot.phone.clone();
+        ui.phones.insert(device, phone);
+    }
+    // The per-device cache preserves ended peers when phone.json moves to the
+    // next displayed device. Both files use private atomic publication.
+    crate::config::atomic_private(
+        &path.with_file_name("phones.json"),
+        &serde_json::to_vec(&ui.phones)?,
+    )?;
+    crate::config::atomic_private(path, &serde_json::to_vec(&ui.snapshot.phone)?)?;
     Ok(())
 }
+
+/// Called under sessions -> admission -> UI locks by snapshots and lifecycle
+/// writers alike, so identity, metadata, generation and status move together.
+fn select_display(state: &Connections, admission: &Admission, ui: &mut crate::ui::State) {
+    let mut paired: Vec<_> = admission.peers.values().cloned().collect();
+    paired.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    paired.dedup();
+    let mut connected: Vec<_> = state
+        .sessions
+        .values()
+        .filter(|s| {
+            paired.contains(&s.device) && !s.close.is_closed() && s.close.borrow().is_none()
+        })
+        .map(|s| s.device.clone())
+        .collect();
+    connected.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    let previous = ui.snapshot.phone.device.clone();
+    let device = previous
+        .as_ref()
+        .filter(|id| connected.contains(id))
+        .cloned()
+        .or_else(|| connected.first().cloned())
+        .or_else(|| previous.filter(|id| paired.contains(id)))
+        .or_else(|| paired.first().cloned());
+    let phone = device
+        .as_ref()
+        .and_then(|id| ui.phones.get(id))
+        .cloned()
+        .or_else(|| {
+            device
+                .as_ref()
+                .and_then(|id| state.sessions.get(id))
+                .filter(|s| s.phone.device == device)
+                .map(|s| s.phone.clone())
+        })
+        .unwrap_or_else(|| crate::ui::Phone {
+            device: device.clone(),
+            name: if device.is_some() {
+                "Phone".into()
+            } else {
+                String::new()
+            },
+            ..Default::default()
+        });
+    let session = device
+        .as_ref()
+        .filter(|id| connected.contains(id))
+        .and_then(|id| state.sessions.get(id));
+    ui.phone_generation = device
+        .as_ref()
+        .and_then(|id| ui.phone_generations.get(id))
+        .copied();
+    ui.receiving_until
+        .retain(|_, until| *until > std::time::Instant::now());
+    ui.snapshot.receiving = session.is_some()
+        && device.as_ref().is_some_and(|id| {
+            ui.active_transfers.iter().any(|(d, _)| d == id)
+                || ui.receiving_until.keys().any(|(d, _)| d == id)
+        });
+    ui.snapshot.phone = phone;
+    ui.snapshot.device = device;
+    ui.snapshot.generation = ui.phone_generation;
+    ui.snapshot.paired = ui.snapshot.device.is_some();
+    ui.snapshot.connected = session.is_some();
+    ui.snapshot.paused = session.is_some_and(|s| s.paused);
+    ui.snapshot.paused_devices = connected
+        .iter()
+        .filter(|id| state.sessions.get(*id).is_some_and(|s| s.paused))
+        .cloned()
+        .collect();
+    ui.snapshot.paired_devices = paired;
+    ui.snapshot.connected_devices = connected;
+}
+
 fn update_ui_state(ui: &Mutex<crate::ui::State>, event: &Event) {
-    {
-        let mut ui = ui.lock().expect("UI state");
-        match event {
-            Event::ConnectionChanged { connected, .. } => {
+    let mut ui = ui.lock().expect("UI state");
+    match event {
+        Event::ConnectionChanged { device, connected } => {
+            let now = crate::now_ms();
+            if let Some(phone) = ui.phones.get_mut(device) {
+                phone.last_seen = now;
+            }
+            if ui.snapshot.phone.device.as_ref() == Some(device) {
                 ui.snapshot.connected = *connected;
-                ui.snapshot.phone.last_seen = crate::now_ms();
-                ui.clear_transfers();
+                ui.snapshot.phone.last_seen = now;
             }
-            Event::PhonePaused { paused, .. } => ui.snapshot.paused = *paused,
-            Event::PairingProgress { name } => ui.snapshot.pairing = name.clone(),
-            Event::TransferStarted { metadata, .. } => {
-                ui.active_transfers.insert(metadata.transfer_id.clone());
-                ui.receiving_until = Some(std::time::Instant::now() + Duration::from_millis(1500));
-            }
-            Event::TransferFinished { transfer_id, .. } => {
-                ui.active_transfers.remove(transfer_id);
-            }
-            Event::Unpaired { .. } | Event::Paired { .. } => {
-                // Metadata from a prior pairing cannot label the next identity,
-                // even while its HELLO/publication is still pending.
+            ui.clear_transfers(device);
+        }
+        Event::PhonePaused { device, paused }
+            if ui.snapshot.phone.device.as_ref() == Some(device) =>
+        {
+            ui.snapshot.paused = *paused;
+        }
+        Event::PairingProgress { name } => ui.snapshot.pairing = name.clone(),
+        Event::TransferStarted { device, metadata } => {
+            let key = (device.clone(), metadata.transfer_id.clone());
+            ui.active_transfers.insert(key.clone());
+            ui.receiving_until
+                .retain(|_, until| *until > std::time::Instant::now());
+            ui.receiving_until
+                .insert(key, std::time::Instant::now() + Duration::from_millis(1500));
+        }
+        Event::TransferFinished {
+            device,
+            transfer_id,
+            ..
+        } => {
+            ui.active_transfers
+                .remove(&(device.clone(), transfer_id.clone()));
+        }
+        Event::Unpaired { device } | Event::Paired { device } => {
+            ui.phones.remove(device);
+            ui.phone_generations.remove(device);
+            ui.clear_transfers(device);
+            if ui.snapshot.phone.device.as_ref() == Some(device) {
                 ui.snapshot.phone = crate::ui::Phone::default();
                 ui.snapshot.connected = false;
                 ui.snapshot.paused = false;
                 ui.phone_generation = None;
-                ui.clear_transfers();
             }
-            _ => {}
         }
+        _ => {}
     }
 }
 
@@ -358,15 +475,16 @@ fn emit_event(ui: &Mutex<crate::ui::State>, events: &broadcast::Sender<Event>, e
     let _ = events.send(event);
 }
 
+#[derive(Clone)]
 enum OutgoingSelection {
     Text(Clipboard),
-    Image(Id, Vec<u8>),
+    Image(Id, Arc<Vec<u8>>, u64),
 }
 impl OutgoingSelection {
     fn id(&self) -> &Id {
         match self {
             Self::Text(text) => &text.transfer_id,
-            Self::Image(id, _) => id,
+            Self::Image(id, _, _) => id,
         }
     }
 }
@@ -399,11 +517,9 @@ impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for OfferWriter<'_,
         }
         let sessions = this.core.sessions.lock().expect("sessions");
         let automatic = this.core.automatic.lock().expect("automatic clipboard");
-        if this
+        if !this
             .core
-            .automatic_target_locked(&sessions, &automatic)
-            .as_ref()
-            != Some(&this.target)
+            .automatic_target_current_locked(&sessions, &automatic, &this.target)
         {
             this.canceled = true;
             return std::task::Poll::Ready(Err(std::io::Error::new(
@@ -472,7 +588,7 @@ async fn transmit_automatic<W: tokio::io::AsyncWrite + Unpin>(
     let result = async {
         match work.selection {
             OutgoingSelection::Text(text) => send(&mut writer, &Message::Clipboard(text)).await?,
-            OutgoingSelection::Image(id, bytes) => {
+            OutgoingSelection::Image(id, bytes, created_at) => {
                 let begin = FileBegin {
                     hlc: None,
                     source_device: None,
@@ -480,9 +596,9 @@ async fn transmit_automatic<W: tokio::io::AsyncWrite + Unpin>(
                     file_name: "clipboard.png".into(),
                     mime: "image/png".into(),
                     size: bytes.len() as u64,
-                    sha256: Hash::new(hex::encode(Sha256::digest(&bytes)))?,
+                    sha256: Hash::new(hex::encode(Sha256::digest(bytes.as_slice())))?,
                     kind: FileKind::ClipboardImage,
-                    created_at: crate::now_ms(),
+                    created_at,
                     source_media_id: None,
                 };
                 send(&mut writer, &Message::FileBegin(begin)).await?;
@@ -506,9 +622,7 @@ async fn transmit_automatic<W: tokio::io::AsyncWrite + Unpin>(
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    if !writer.started
-        && (writer.canceled || core.automatic_target().as_ref() != Some(&writer.target))
-    {
+    if !writer.started && (writer.canceled || !core.automatic_recipient_current(&writer.target)) {
         return Ok(false);
     }
     result?;
@@ -519,16 +633,88 @@ pub struct ClipboardTarget {
     pub device: Id,
     pub connection: u64,
     pub generation: u64,
+    pub peer_generation: u64,
+}
+/// Frozen recipients of a physical clipboard offer. Later connections are never
+/// added; a revoked recipient can be skipped without suppressing another one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipboardOffer {
+    generation: u64,
+    recipients: Vec<ClipboardRecipient>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClipboardRecipient {
+    target: ClipboardTarget,
+    text: bool,
+    image: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClipboardFormat {
+    Text,
+    Image,
+}
+impl ClipboardOffer {
+    pub(crate) fn supports_format(&self, format: ClipboardFormat) -> bool {
+        self.recipients.iter().any(|recipient| match format {
+            ClipboardFormat::Text => recipient.text,
+            ClipboardFormat::Image => recipient.image,
+        })
+    }
+    /// Plan only from observation-time recipients, capabilities and image policy.
+    /// Availability may narrow the payloads; send-time checks may remove targets.
+    pub(crate) fn payload_plans(
+        &self,
+        text: bool,
+        image: bool,
+    ) -> Vec<(ClipboardTarget, ClipboardFormat)> {
+        self.recipients
+            .iter()
+            .filter_map(|recipient| {
+                let format = if image && recipient.image {
+                    ClipboardFormat::Image
+                } else if text && recipient.text {
+                    ClipboardFormat::Text
+                } else {
+                    return None;
+                };
+                Some((recipient.target.clone(), format))
+            })
+            .collect()
+    }
+}
+#[cfg(test)]
+impl ClipboardOffer {
+    pub(crate) fn test_offer() -> Self {
+        Self {
+            generation: 1,
+            recipients: vec![ClipboardRecipient {
+                target: ClipboardTarget {
+                    device: Id::from_bytes([1; 16]),
+                    connection: 1,
+                    generation: 1,
+                    peer_generation: 0,
+                },
+                text: true,
+                image: true,
+            }],
+        }
+    }
 }
 #[derive(Default)]
 struct AutomaticClipboard {
     generation: u64,
-    selection: Option<(ClipboardTarget, OutgoingSelection)>,
+    selections: HashMap<Id, AutomaticWrite>,
+    peer_generations: HashMap<Id, u64>,
 }
 impl AutomaticClipboard {
     fn invalidate(&mut self) {
         self.generation = self.generation.wrapping_add(1);
-        self.selection = None;
+        self.selections.clear();
+    }
+    fn invalidate_peer(&mut self, device: &Id) {
+        let generation = self.peer_generations.entry(device.clone()).or_default();
+        *generation = generation.wrapping_add(1);
+        self.selections.remove(device);
     }
 }
 struct ReadyState {
@@ -542,11 +728,19 @@ struct Session {
     close: watch::Sender<Option<CloseReason>>,
     wake: Arc<Notify>,
     paused: bool,
+    capabilities: Vec<String>,
+    phone: crate::ui::Phone,
 }
 #[derive(Default)]
 struct Connections {
-    session: Option<Session>,
-    unpairing: bool,
+    sessions: HashMap<Id, Session>,
+    unpairing: HashSet<Id>,
+}
+type PhoneWrite = Shared<BoxFuture<'static, std::result::Result<(), Arc<String>>>>;
+#[derive(Default)]
+struct PhoneWrites {
+    pending: HashMap<Id, u64>,
+    completion: Option<PhoneWrite>,
 }
 /// Clone the Arc<Core> into a tray/window. Commands below are async; subscribe()
 /// returns a bounded broadcast stream (lagging UI consumers must resnapshot).
@@ -554,7 +748,7 @@ pub struct Core {
     pub identity: Identity,
     pub paths: Paths,
     ui: Arc<Mutex<crate::ui::State>>,
-    peer_capabilities: Mutex<Vec<String>>,
+    phone_writes: Arc<Mutex<PhoneWrites>>,
     automatic: Arc<Mutex<AutomaticClipboard>>,
     config: watch::Sender<Config>,
     events: broadcast::Sender<Event>,
@@ -570,7 +764,7 @@ pub struct Core {
     sessions: Arc<Mutex<Connections>>,
     actions: Arc<dyn PcActions>,
     action_queue: Arc<ActionQueue>,
-    action_scope: Arc<Mutex<Option<(Id, ActionScope)>>>,
+    action_scope: Arc<Mutex<HashMap<Id, ActionScope>>>,
     action_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
     action_stop: watch::Sender<bool>,
     shutdown: watch::Sender<bool>,
@@ -619,16 +813,45 @@ impl Core {
             .expect("admission")
             .peers
             .values()
-            .next()
-            .map(|id| (id.clone(), ActionScope::new()));
-        let phone = std::fs::read(paths.data.join("phone.json"))
+            .map(|id| (id.clone(), ActionScope::new()))
+            .collect();
+        let current_metadata = |device: &Id, phone: &crate::ui::Phone| {
+            phone.device.as_ref() == Some(device)
+                && phone.pairing_generation.is_some()
+                && phone.pairing_generation == store.pairing_generation(device)
+                && admission
+                    .lock()
+                    .expect("admission")
+                    .peers
+                    .values()
+                    .any(|id| id == device)
+        };
+        let phone: crate::ui::Phone = std::fs::read(paths.data.join("phone.json"))
             .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .and_then(|bytes| serde_json::from_slice::<crate::ui::Phone>(&bytes).ok())
+            .filter(|phone| {
+                phone
+                    .device
+                    .as_ref()
+                    .is_some_and(|id| current_metadata(id, phone))
+            })
             .unwrap_or_default();
+        let mut phones: HashMap<Id, crate::ui::Phone> =
+            std::fs::read(paths.data.join("phones.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
+        // Validate each file independently before merging: a stale per-device
+        // entry must not shadow a current phone.json entry for the same ID.
+        phones.retain(|device, phone| current_metadata(device, phone));
+        if let Some(device) = phone.device.clone() {
+            phones.entry(device).or_insert_with(|| phone.clone());
+        }
         let core = Arc::new(Self {
-            peer_capabilities: Mutex::new(Vec::new()),
+            phone_writes: Arc::new(Mutex::new(PhoneWrites::default())),
             automatic: Arc::new(Mutex::new(AutomaticClipboard::default())),
             ui: Arc::new(Mutex::new(crate::ui::State {
+                phones,
                 snapshot: crate::ui::Snapshot {
                     phone,
                     ..Default::default()
@@ -688,26 +911,26 @@ impl Core {
         self.sessions
             .lock()
             .expect("sessions")
-            .session
-            .as_ref()
+            .sessions
+            .values()
             .filter(|s| !s.close.is_closed() && s.close.borrow().is_none())
-            .map(|s| vec![s.device.clone()])
-            .unwrap_or_default()
+            .map(|s| s.device.clone())
+            .collect()
     }
     pub fn phone_paused(&self, device: &Id) -> Option<bool> {
         self.sessions
             .lock()
             .expect("sessions")
-            .session
-            .as_ref()
+            .sessions
+            .get(device)
             .filter(|s| &s.device == device && !s.close.is_closed() && s.close.borrow().is_none())
             .map(|s| s.paused)
     }
     fn set_phone_paused(&self, device: &Id, id: u64, paused: bool) {
         let mut state = self.sessions.lock().expect("sessions");
         if let Some(s) = state
-            .session
-            .as_mut()
+            .sessions
+            .get_mut(device)
             .filter(|s| s.id == id && &s.device == device)
         {
             let changed = s.paused != paused;
@@ -716,7 +939,7 @@ impl Core {
                 self.automatic
                     .lock()
                     .expect("automatic clipboard")
-                    .invalidate();
+                    .invalidate_peer(device);
             }
             self.event(Event::PhonePaused {
                 device: device.clone(),
@@ -728,8 +951,8 @@ impl Core {
         let state = self.sessions.lock().expect("sessions");
         if store.connection_id.is_none()
             || state
-                .session
-                .as_ref()
+                .sessions
+                .get(device)
                 .is_some_and(|s| &s.device == device && Some(s.id) == store.connection_id)
         {
             self.event(event);
@@ -738,19 +961,24 @@ impl Core {
     fn finish_connection(&self, device: &Id, id: u64) -> bool {
         let mut state = self.sessions.lock().expect("sessions");
         if state
-            .session
-            .as_ref()
+            .sessions
+            .get(device)
             .is_some_and(|s| s.id == id && &s.device == device)
         {
-            state.session = None;
+            state.sessions.remove(device);
             self.automatic
                 .lock()
                 .expect("automatic clipboard")
-                .invalidate();
+                .invalidate_peer(device);
             self.event(Event::ConnectionChanged {
                 device: device.clone(),
                 connected: false,
             });
+            select_display(
+                &state,
+                &self.admission.lock().expect("admission"),
+                &mut self.ui.lock().expect("UI state"),
+            );
             true
         } else {
             false
@@ -762,7 +990,7 @@ impl Core {
     fn connection_id_current(&self, connection_id: Option<u64>, device: &Id) -> bool {
         let state = self.sessions.lock().expect("sessions");
         connection_id.is_none()
-            || state.session.as_ref().is_some_and(|s| {
+            || state.sessions.get(device).is_some_and(|s| {
                 &s.device == device && Some(s.id) == connection_id && s.close.borrow().is_none()
             })
     }
@@ -824,39 +1052,9 @@ impl Core {
     pub fn ui_snapshot(&self) -> crate::ui::Snapshot {
         let sessions = self.sessions.lock().expect("sessions");
         let admission = self.admission.lock().expect("admission");
-        let ui = self.ui.lock().expect("UI state");
-        let mut snapshot = ui.snapshot.clone();
-        snapshot.device = admission.peers.values().next().cloned();
-        snapshot.paired = snapshot.device.is_some();
-        if !snapshot.paired || snapshot.phone.device != snapshot.device {
-            // Older caches without identity are untrusted presentation data.
-            // A generic label is safer than attributing the previous phone's name.
-            snapshot.phone = crate::ui::Phone {
-                device: snapshot.device.clone(),
-                name: if snapshot.paired {
-                    "Phone".into()
-                } else {
-                    String::new()
-                },
-                ..Default::default()
-            };
-            snapshot.generation = None;
-        } else {
-            snapshot.generation = ui.phone_generation;
-        }
-        let session = sessions.session.as_ref().filter(|s| {
-            snapshot.device.as_ref() == Some(&s.device)
-                && !s.close.is_closed()
-                && s.close.borrow().is_none()
-        });
-        snapshot.connected = session.is_some();
-        snapshot.paused = session.is_some_and(|s| s.paused);
-        snapshot.receiving = snapshot.connected
-            && (!ui.active_transfers.is_empty()
-                || ui
-                    .receiving_until
-                    .is_some_and(|t| t > std::time::Instant::now()));
-        snapshot
+        let mut ui = self.ui.lock().expect("UI state");
+        select_display(&sessions, &admission, &mut ui);
+        ui.snapshot.clone()
     }
     pub fn set_receive_error(&self, error: Option<crate::ui::ReceiveError>) {
         self.ui.lock().expect("UI state").snapshot.error = error;
@@ -876,8 +1074,8 @@ impl Core {
         let sessions = self.sessions.lock().expect("sessions");
         if store.connection_id.is_some()
             && sessions
-                .session
-                .as_ref()
+                .sessions
+                .get(device)
                 .is_none_or(|s| &s.device != device || Some(s.id) != store.connection_id)
         {
             return;
@@ -897,15 +1095,15 @@ impl Core {
         let sessions = self.sessions.lock().expect("sessions");
         if store.connection_id.is_none()
             || sessions
-                .session
-                .as_ref()
+                .sessions
+                .get(device)
                 .is_some_and(|s| &s.device == device && Some(s.id) == store.connection_id)
         {
             self.ui
                 .lock()
                 .expect("UI state")
                 .active_transfers
-                .remove(id);
+                .remove(&(device.clone(), id.clone()));
         }
     }
     fn clear_receive_error(&self, matches: impl FnOnce(&crate::ui::ReceiveError) -> bool) {
@@ -996,25 +1194,27 @@ impl Core {
         if !self.paired_devices().contains(&device) {
             return Ok(false);
         }
+        // Cancellation while waiting for capacity must leave trust and its
+        // action scope intact. From here through submission there is no await.
+        let reservation = self.store.reserve().await;
         {
             let mut state = self.sessions.lock().expect("sessions");
             if expected.is_some()
                 && state
-                    .session
-                    .as_ref()
+                    .sessions
+                    .get(&device)
                     .is_none_or(|s| Some(s.id) != expected || s.device != device)
             {
                 return Ok(false);
             }
-            state.unpairing = true;
+            state.unpairing.insert(device.clone());
         }
         let scope = self
             .action_scope
             .lock()
             .expect("actions")
-            .as_ref()
-            .filter(|(id, _)| *id == device)
-            .map(|(_, scope)| scope.clone());
+            .get(&device)
+            .cloned();
         if let Some(scope) = &scope {
             scope.cancelled.send_replace(true);
             self.action_queue.discard_invalid();
@@ -1027,13 +1227,11 @@ impl Core {
         let automatic = self.automatic.clone();
         let phone_path = self.paths.data.join("phone.json");
         self.store
-            .unpair_then(device.clone(), move |persisted| {
+            .unpair_reserved(reservation, device.clone(), move |persisted| {
                 let _guard = guard;
                 let mut scope = actions.lock().expect("actions");
                 if persisted {
-                    if scope.as_ref().is_some_and(|(id, _)| *id == device) {
-                        scope.take();
-                    }
+                    scope.remove(&device);
                     admission
                         .lock()
                         .expect("admission")
@@ -1042,11 +1240,11 @@ impl Core {
                 } else {
                     // Old work remains cancelled; restored trust gets a fresh
                     // action scope and can reconnect once storage recovers.
-                    *scope = Some((device.clone(), ActionScope::new()));
+                    scope.insert(device.clone(), ActionScope::new());
                 }
                 drop(scope);
                 let mut state = sessions.lock().expect("sessions");
-                let ended = state.session.take().filter(|s| s.device == device);
+                let ended = state.sessions.remove(&device);
                 if let Some(session) = &ended {
                     session.close.send_replace(Some(if persisted {
                         reason
@@ -1054,8 +1252,11 @@ impl Core {
                         CloseReason::Error(ErrorCode::Closing)
                     }));
                 }
-                state.unpairing = false;
-                automatic.lock().expect("automatic clipboard").invalidate();
+                state.unpairing.remove(&device);
+                automatic
+                    .lock()
+                    .expect("automatic clipboard")
+                    .invalidate_peer(&device);
                 let disconnected = Event::ConnectionChanged {
                     device: device.clone(),
                     connected: false,
@@ -1063,6 +1264,11 @@ impl Core {
                 // Capture/persist the ended timestamp before Unpaired invalidates
                 // metadata authority, while preserving public Unpaired -> disconnected order.
                 update_ui_state(&ui, &disconnected);
+                select_display(
+                    &state,
+                    &admission.lock().expect("admission"),
+                    &mut ui.lock().expect("UI state"),
+                );
                 if let Some(session) = ended
                     && let Err(error) = persist_phone_generation(&ui, &phone_path, session.id)
                 {
@@ -1088,6 +1294,11 @@ impl Core {
                         message: "unpair persistence failed; pairing retained".into(),
                     });
                 }
+                select_display(
+                    &state,
+                    &admission.lock().expect("admission"),
+                    &mut ui.lock().expect("UI state"),
+                );
                 let _ = events.send(disconnected);
             })
             .await?;
@@ -1182,102 +1393,143 @@ impl Core {
         Ok(text.transfer_id)
     }
     pub fn clipboard_target(&self) -> Option<(Id, u64)> {
-        if !self.config().clipboard_sync_to_phone {
-            return None;
-        }
-        self.sessions
-            .lock()
-            .expect("sessions")
-            .session
-            .as_ref()
-            .filter(|s| !s.paused && !s.close.is_closed() && s.close.borrow().is_none())
-            .map(|s| (s.device.clone(), s.id))
+        self.automatic_target()?
+            .recipients
+            .first()
+            .map(|r| (r.target.device.clone(), r.target.connection))
     }
-    pub fn clipboard_image_capable(&self) -> bool {
-        self.peer_capabilities
-            .lock()
-            .expect("capabilities")
-            .iter()
-            .any(|s| s == "clipboard_image")
+    fn automatic_target_current_locked(
+        &self,
+        sessions: &Connections,
+        automatic: &AutomaticClipboard,
+        target: &ClipboardTarget,
+    ) -> bool {
+        self.config().clipboard_sync_to_phone
+            && !sessions.unpairing.contains(&target.device)
+            && target.generation == automatic.generation
+            && target.peer_generation
+                == *automatic.peer_generations.get(&target.device).unwrap_or(&0)
+            && sessions.sessions.get(&target.device).is_some_and(|s| {
+                s.id == target.connection
+                    && !s.paused
+                    && !s.close.is_closed()
+                    && s.close.borrow().is_none()
+            })
+    }
+    fn automatic_recipient_current(&self, target: &ClipboardTarget) -> bool {
+        let sessions = self.sessions.lock().expect("sessions");
+        let automatic = self.automatic.lock().expect("automatic clipboard");
+        self.automatic_target_current_locked(&sessions, &automatic, target)
     }
     fn automatic_target_locked(
         &self,
         sessions: &Connections,
         automatic: &AutomaticClipboard,
-    ) -> Option<ClipboardTarget> {
-        if sessions.unpairing || !self.config().clipboard_sync_to_phone {
-            return None;
-        }
-        sessions
-            .session
-            .as_ref()
-            .filter(|s| !s.paused && !s.close.is_closed() && s.close.borrow().is_none())
-            .map(|s| ClipboardTarget {
-                device: s.device.clone(),
-                connection: s.id,
-                generation: automatic.generation,
+    ) -> Option<ClipboardOffer> {
+        let include_images = self.config().clipboard_include_images;
+        let mut recipients: Vec<_> = sessions
+            .sessions
+            .values()
+            .map(|s| ClipboardRecipient {
+                target: ClipboardTarget {
+                    device: s.device.clone(),
+                    connection: s.id,
+                    generation: automatic.generation,
+                    peer_generation: *automatic.peer_generations.get(&s.device).unwrap_or(&0),
+                },
+                text: s.capabilities.iter().any(|c| c == "clipboard_text"),
+                image: include_images && s.capabilities.iter().any(|c| c == "clipboard_image"),
             })
+            .filter(|r| {
+                (r.text || r.image)
+                    && self.automatic_target_current_locked(sessions, automatic, &r.target)
+            })
+            .collect();
+        recipients.sort_by(|a, b| a.target.device.as_str().cmp(b.target.device.as_str()));
+        (!recipients.is_empty()).then_some(ClipboardOffer {
+            generation: automatic.generation,
+            recipients,
+        })
     }
-    pub fn automatic_target(&self) -> Option<ClipboardTarget> {
+    pub fn automatic_target(&self) -> Option<ClipboardOffer> {
         let sessions = self.sessions.lock().expect("sessions");
         let automatic = self.automatic.lock().expect("automatic clipboard");
         self.automatic_target_locked(&sessions, &automatic)
     }
+    pub fn automatic_offer_current(&self, offer: &ClipboardOffer) -> bool {
+        let sessions = self.sessions.lock().expect("sessions");
+        let automatic = self.automatic.lock().expect("automatic clipboard");
+        offer
+            .recipients
+            .iter()
+            .any(|r| self.automatic_target_current_locked(&sessions, &automatic, &r.target))
+    }
+    /// Freeze recipients before asynchronous clipboard reading/debouncing.
     /// Every offer, including clear/secret/unsupported, invalidates prepared work.
-    pub fn observe_clipboard_offer(&self) -> Option<ClipboardTarget> {
+    pub fn observe_clipboard_offer(&self) -> Option<ClipboardOffer> {
         let sessions = self.sessions.lock().expect("sessions");
         let mut automatic = self.automatic.lock().expect("automatic clipboard");
         automatic.invalidate();
         self.automatic_target_locked(&sessions, &automatic)
     }
     pub fn cancel_automatic_clipboard(&self, device: &Id) {
-        let sessions = self.sessions.lock().expect("sessions");
-        if sessions
-            .session
-            .as_ref()
-            .is_some_and(|s| &s.device == device)
-        {
-            self.automatic
-                .lock()
-                .expect("automatic clipboard")
-                .invalidate();
-        }
+        self.automatic
+            .lock()
+            .expect("automatic clipboard")
+            .invalidate_peer(device);
     }
     fn take_automatic(&self, device: &Id, connection: u64) -> Option<AutomaticWrite> {
         let sessions = self.sessions.lock().expect("sessions");
         let mut automatic = self.automatic.lock().expect("automatic clipboard");
-        let current = self.automatic_target_locked(&sessions, &automatic)?;
-        if &current.device != device || current.connection != connection {
-            return None;
-        }
-        if automatic
-            .selection
-            .as_ref()
-            .is_none_or(|(target, _)| target != &current)
+        let work = automatic.selections.get(device)?;
+        if work.target.connection != connection
+            || !self.automatic_target_current_locked(&sessions, &automatic, &work.target)
         {
             return None;
         }
-        automatic
-            .selection
-            .take()
-            .map(|(target, selection)| AutomaticWrite { target, selection })
+        automatic.selections.remove(device)
     }
     fn publish_automatic(
         &self,
-        target: ClipboardTarget,
-        selection: OutgoingSelection,
+        offer: ClipboardOffer,
+        text: Option<OutgoingSelection>,
+        image: Option<OutgoingSelection>,
     ) -> Result<()> {
+        let plans = offer.payload_plans(text.is_some(), image.is_some());
         let sessions = self.sessions.lock().expect("sessions");
         let mut automatic = self.automatic.lock().expect("automatic clipboard");
-        ensure!(
-            self.automatic_target_locked(&sessions, &automatic).as_ref() == Some(&target),
-            "clipboard offer or policy changed"
-        );
-        automatic.selection = Some((target.clone(), selection));
+        let mut recipients = Vec::new();
+        for (target, format) in plans {
+            if self.automatic_target_current_locked(&sessions, &automatic, &target) {
+                let selection = match format {
+                    ClipboardFormat::Text => text.as_ref(),
+                    ClipboardFormat::Image => image.as_ref(),
+                }
+                .expect("planned clipboard format")
+                .clone();
+                recipients.push(target.device.clone());
+                automatic
+                    .selections
+                    .insert(target.device.clone(), AutomaticWrite { target, selection });
+            }
+        }
+        ensure!(!recipients.is_empty(), "clipboard offer or policy changed");
         drop(automatic);
         drop(sessions);
-        self.wake(&target.device);
+        for device in recipients {
+            self.wake(&device);
+        }
         Ok(())
+    }
+    fn automatic_offer_for(&self, device: Id, connection: Option<u64>) -> Result<ClipboardOffer> {
+        let mut offer = self
+            .automatic_target()
+            .context("phone is disconnected or paused")?;
+        offer.recipients.retain(|r| {
+            r.target.device == device && connection.is_none_or(|c| r.target.connection == c)
+        });
+        ensure!(!offer.recipients.is_empty(), "connection changed");
+        Ok(offer)
     }
     pub async fn send_automatic_clipboard(
         &self,
@@ -1285,33 +1537,11 @@ impl Core {
         connection: u64,
         text: String,
     ) -> Result<Id> {
-        let target = self
-            .automatic_target()
-            .context("phone is disconnected or paused")?;
-        ensure!(
-            target.device == device && target.connection == connection,
-            "connection changed"
-        );
-        self.send_observed_clipboard(target, text).await
+        self.send_observed_clipboard(self.automatic_offer_for(device, Some(connection))?, text)
+            .await
     }
-    pub async fn send_observed_clipboard(
-        &self,
-        target: ClipboardTarget,
-        text: String,
-    ) -> Result<Id> {
-        let _clipboard = self.outgoing_gate.lock().await;
-        ensure!(
-            self.automatic_target().as_ref() == Some(&target),
-            "clipboard offer or policy changed"
-        );
-        let text = self
-            .store
-            .with_current_pairing()
-            .ephemeral_clipboard(target.device.clone(), text)
-            .await?;
-        let id = text.transfer_id.clone();
-        self.publish_automatic(target, OutgoingSelection::Text(text))?;
-        Ok(id)
+    pub async fn send_observed_clipboard(&self, offer: ClipboardOffer, text: String) -> Result<Id> {
+        self.send_observed_formats(offer, Some(text), None).await
     }
     pub async fn send_automatic_image(
         &self,
@@ -1319,35 +1549,65 @@ impl Core {
         connection: u64,
         bytes: Vec<u8>,
     ) -> Result<Id> {
-        let target = self
-            .automatic_target()
-            .context("phone is disconnected or paused")?;
-        ensure!(
-            target.device == device && target.connection == connection,
-            "connection changed"
-        );
-        self.send_observed_image(target, bytes).await
+        self.send_observed_image(self.automatic_offer_for(device, Some(connection))?, bytes)
+            .await
     }
     pub async fn send_clipboard_image(&self, device: Id, bytes: Vec<u8>) -> Result<Id> {
-        let target = self
-            .automatic_target()
-            .context("phone is disconnected or paused")?;
-        ensure!(target.device == device, "device is not connected");
-        self.send_observed_image(target, bytes).await
+        self.send_observed_image(self.automatic_offer_for(device, None)?, bytes)
+            .await
     }
-    pub async fn send_observed_image(&self, target: ClipboardTarget, bytes: Vec<u8>) -> Result<Id> {
+    pub async fn send_observed_image(&self, offer: ClipboardOffer, bytes: Vec<u8>) -> Result<Id> {
+        self.send_observed_formats(offer, None, Some(bytes)).await
+    }
+    pub(crate) async fn send_observed_formats(
+        &self,
+        offer: ClipboardOffer,
+        text: Option<String>,
+        image: Option<Vec<u8>>,
+    ) -> Result<Id> {
         let _clipboard = self.outgoing_gate.lock().await;
-        ensure!(
-            self.config().clipboard_include_images && self.clipboard_image_capable(),
-            "clipboard images are disabled or unsupported"
-        );
-        ensure!(
+        // Validate before planning so a bad representation cannot select a
+        // preferred format and then prevent delivery of its usable alternative.
+        let text = text.filter(|text| text.len() <= MAX_CLIPBOARD_BYTES && !text.contains('\0'));
+        let image = image.filter(|bytes| {
             bytes.len() <= crate::ui::clipboard::MAX_IMAGE
-                && bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-            "invalid clipboard PNG"
+                && bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        });
+        let plans = offer.payload_plans(text.is_some(), image.is_some());
+        ensure!(
+            !plans.is_empty() && self.automatic_offer_current(&offer),
+            "clipboard offer or policy changed"
         );
-        let id = Id::new(crate::random_hex(16))?;
-        self.publish_automatic(target, OutgoingSelection::Image(id.clone(), bytes))?;
+        let text = if plans
+            .iter()
+            .any(|(_, format)| *format == ClipboardFormat::Text)
+        {
+            Some(
+                self.store
+                    .ephemeral_clipboard(text.expect("planned text"))
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let id = match &text {
+            Some(text) => text.transfer_id.clone(),
+            None => Id::new(crate::random_hex(16))?,
+        };
+        let image = if plans
+            .iter()
+            .any(|(_, format)| *format == ClipboardFormat::Image)
+        {
+            let bytes = image.expect("planned image");
+            Some(OutgoingSelection::Image(
+                id.clone(),
+                Arc::new(bytes),
+                crate::now_ms(),
+            ))
+        } else {
+            None
+        };
+        self.publish_automatic(offer, text.map(OutgoingSelection::Text), image)?;
         Ok(id)
     }
     /// Explicit IPC discard is authorized against the current pairing first.
@@ -1367,14 +1627,7 @@ impl Core {
         Ok(())
     }
     fn wake(&self, device: &Id) {
-        if let Some(s) = self
-            .sessions
-            .lock()
-            .expect("sessions")
-            .session
-            .as_ref()
-            .filter(|s| &s.device == device)
-        {
+        if let Some(s) = self.sessions.lock().expect("sessions").sessions.get(device) {
             s.wake.notify_one();
         }
     }
@@ -1407,7 +1660,8 @@ impl Core {
         } else {
             None
         };
-        let semaphore = Arc::new(Semaphore::new(16));
+        let semaphore = Arc::new(Semaphore::new(ADMISSION_LIMIT));
+        let transports = Arc::new(Semaphore::new(TRANSPORT_LIMIT));
         let mut tasks = JoinSet::new();
         let mut shutdown = self.shutdown.subscribe();
         let mut prune = tokio::time::interval(Duration::from_secs(3600));
@@ -1432,9 +1686,9 @@ impl Core {
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
                 accepted = listener.accept() => {
                     let (stream,_) = accepted?;
-                    if let Ok(permit) = semaphore.clone().try_acquire_owned() {
+                    if let (Ok(permit), Ok(transport)) = (semaphore.clone().try_acquire_owned(), transports.clone().try_acquire_owned()) {
                         let core = self.clone();
-                        tasks.spawn(Box::pin(async move { let _permit = permit; let mut stop = core.shutdown.subscribe(); if *stop.borrow() { return; } let outcome = tokio::select! { biased; _ = stop.changed() => Ok(()), outcome = Box::pin(core.clone().connection(stream)) => outcome }; if let Err(e) = outcome { let reason = if let Some(protocol) = e.downcast_ref::<ProtocolError>() { format!("protocol {:?}",decode_code(protocol)) } else if let Some(io) = e.downcast_ref::<std::io::Error>() { format!("transport {:?}",io.kind()) } else { "transport or local state failure".into() }; core.error(None,format!("connection closed: {reason}")); } }));
+                        tasks.spawn(Box::pin(async move { let _transport = transport; let mut stop = core.shutdown.subscribe(); if *stop.borrow() { return; } let outcome = tokio::select! { biased; _ = stop.changed() => Ok(()), outcome = Box::pin(core.clone().connection(stream, permit)) => outcome }; if let Err(e) = outcome { let reason = if let Some(protocol) = e.downcast_ref::<ProtocolError>() { format!("protocol {:?}",decode_code(protocol)) } else if let Some(io) = e.downcast_ref::<std::io::Error>() { format!("transport {:?}",io.kind()) } else { "transport or local state failure".into() }; core.error(None,format!("connection closed: {reason}")); } }));
                     }
                 }
             }
@@ -1442,17 +1696,21 @@ impl Core {
         drop(mdns);
         let ended = {
             let state = self.sessions.lock().expect("sessions");
-            state.session.as_ref().map(|session| {
-                session
-                    .close
-                    .send_replace(Some(CloseReason::Error(ErrorCode::Closing)));
-                (session.device.clone(), session.id)
-            })
+            state
+                .sessions
+                .values()
+                .map(|session| {
+                    session
+                        .close
+                        .send_replace(Some(CloseReason::Error(ErrorCode::Closing)));
+                    (session.device.clone(), session.id)
+                })
+                .collect::<Vec<_>>()
         };
-        if let Some((device, id)) = ended
-            && self.finish_connection(&device, id)
-        {
-            self.optional(self.persist_phone(id).await, "shutdown last-seen metadata");
+        for (device, id) in ended {
+            if self.finish_connection(&device, id) {
+                self.optional(self.persist_phone(id).await, "shutdown last-seen metadata");
+            }
         }
         while tasks.join_next().await.is_some() {}
         self.store.drain().await;
@@ -1483,7 +1741,11 @@ impl Core {
             })
             .await
     }
-    async fn connection(self: Arc<Self>, stream: TcpStream) -> Result<()> {
+    async fn connection(
+        self: Arc<Self>,
+        stream: TcpStream,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<()> {
         Box::pin(async move {
             stream.set_nodelay(true)?;
             let verifier = Arc::new(ClientVerifier::new(
@@ -1599,15 +1861,21 @@ impl Core {
                 return Ok(());
             }
             verifier.release_provisional();
-            let (close_tx, close_rx) = watch::channel(None);
+            let (close_tx, mut close_rx) = watch::channel(None);
             let wake = Arc::new(Notify::new());
             // Fail fast while unpair persistence is pending, then serialize the
             // binding recheck and generation capture with pair/unpair callbacks.
-            if self.sessions.lock().expect("sessions").unpairing {
+            if self
+                .sessions
+                .lock()
+                .expect("sessions")
+                .unpairing
+                .contains(&hello.device_id)
+            {
                 send_error(&mut tls, ErrorCode::Unauthorized).await?;
                 return Ok(());
             }
-            let (registered, mut store, action_scope, connection_id) = {
+            let (registration_error, mut store, action_scope, connection_id) = {
                 let _guard = self.pairing_gate.lock().await;
                 // Registration and generation-scoped events share this mutex.
                 let mut state = self.sessions.lock().expect("sessions");
@@ -1617,14 +1885,17 @@ impl Core {
                     .action_scope
                     .lock()
                     .expect("actions")
-                    .as_ref()
-                    .filter(|(device, _)| *device == hello.device_id)
-                    .map(|(_, scope)| scope.clone());
-                let registered = if state.unpairing
+                    .get(&hello.device_id)
+                    .cloned();
+                let registration_error = if state.unpairing.contains(&hello.device_id)
                     || self.admission.lock().expect("admission").peers.get(&fp)
                         != Some(&hello.device_id)
                 {
-                    false
+                    Some(ErrorCode::Unauthorized)
+                } else if state.sessions.len() >= SESSION_LIMIT
+                    && !state.sessions.contains_key(&hello.device_id)
+                {
+                    Some(ErrorCode::Busy)
                 } else {
                     if let Some(scope) = &scope {
                         scope
@@ -1632,22 +1903,33 @@ impl Core {
                             .store(connection_id, Ordering::SeqCst);
                         self.action_queue.discard_invalid();
                     }
-                    if let Some(previous) = state.session.take() {
+                    if let Some(previous) = state.sessions.remove(&hello.device_id) {
                         previous
                             .close
                             .send_replace(Some(CloseReason::Error(ErrorCode::ConnectionReplaced)));
                     }
-                    state.session = Some(Session {
-                        device: hello.device_id.clone(),
-                        id: connection_id,
-                        close: close_tx.clone(),
-                        wake: wake.clone(),
-                        paused: hello.paused.unwrap_or(false),
-                    });
+                    state.sessions.insert(
+                        hello.device_id.clone(),
+                        Session {
+                            device: hello.device_id.clone(),
+                            id: connection_id,
+                            close: close_tx.clone(),
+                            wake: wake.clone(),
+                            paused: hello.paused.unwrap_or(false),
+                            capabilities: hello.capabilities.clone(),
+                            phone: crate::ui::Phone {
+                                device: Some(hello.device_id.clone()),
+                                pairing_generation: self.store.pairing_generation(&hello.device_id),
+                                name: hello.name.clone(),
+                                route: crate::ui::route(peer_address.ip()).into(),
+                                last_seen: crate::now_ms(),
+                            },
+                        },
+                    );
                     self.automatic
                         .lock()
                         .expect("automatic clipboard")
-                        .invalidate();
+                        .invalidate_peer(&hello.device_id);
                     self.publish_phone(&state, connection_id, &hello, peer_address.ip());
                     self.event(Event::PhonePaused {
                         device: hello.device_id.clone(),
@@ -1657,36 +1939,63 @@ impl Core {
                         device: hello.device_id.clone(),
                         connected: true,
                     });
-                    true
+                    None
                 };
                 (
-                    registered,
+                    registration_error,
                     self.store.with_current_pairing(),
                     scope,
                     connection_id,
                 )
             };
-            if !registered {
-                send_error(&mut tls, ErrorCode::Unauthorized).await?;
+            if let Some(code) = registration_error {
+                send_error(&mut tls, code).await?;
                 return Ok(());
             }
-            self.optional(self.persist_phone(connection_id).await, "phone metadata");
+            // Retain ingress and total transport permits through publication.
+            // A replaced socket must not wait for the blocking pool or disk.
+            let phone_persistence = self.persist_phone(connection_id);
+            let persisted = tokio::select! { biased;
+                _ = close_rx.changed() => false,
+                result = async {
+                    if let Some(scope) = &action_scope {
+                        store.remember_peer_hello(
+                            hello.clone(),
+                            scope.connection_generation.clone(),
+                            connection_id,
+                        ).await;
+                    }
+                    phone_persistence.await
+                } => {
+                    self.optional(result, "phone metadata");
+                    true
+                }
+            };
             store.connection_id = Some(connection_id);
-            let result = self
-                .clone()
-                .ready(
-                    tls,
-                    &hello,
-                    wake,
-                    ReadyState {
-                        store,
-                        allow_recovery,
-                        action_scope,
-                    },
-                    close_tx,
-                    close_rx,
-                )
-                .await;
+            let result = if persisted {
+                // The task's total transport permit remains held through READY
+                // and teardown. Only the bounded ingress reserve is released.
+                drop(permit);
+                self.clone()
+                    .ready(
+                        tls,
+                        &hello,
+                        wake,
+                        ReadyState {
+                            store,
+                            allow_recovery,
+                            action_scope,
+                        },
+                        close_tx,
+                        close_rx,
+                    )
+                    .await
+            } else {
+                let reason = close_rx
+                    .borrow()
+                    .unwrap_or(CloseReason::Error(ErrorCode::Closing));
+                close_transport(&mut tls, reason).await
+            };
             let current = self.finish_connection(&hello.device_id, connection_id);
             if current {
                 self.optional(
@@ -1706,37 +2015,90 @@ impl Core {
         hello: &Hello,
         address: std::net::IpAddr,
     ) -> bool {
-        if !state
-            .session
-            .as_ref()
-            .is_some_and(|s| s.id == connection && s.device == hello.device_id)
+        if state
+            .sessions
+            .get(&hello.device_id)
+            .is_none_or(|s| s.id != connection)
         {
             return false;
         }
+        let admission = self.admission.lock().expect("admission");
         let mut ui = self.ui.lock().expect("UI state");
-        ui.phone_generation = Some(connection);
-        ui.snapshot.phone = crate::ui::Phone {
-            device: Some(hello.device_id.clone()),
-            name: hello.name.clone(),
-            route: crate::ui::route(address).into(),
-            last_seen: crate::now_ms(),
-        };
-        *self.peer_capabilities.lock().expect("capabilities") = hello.capabilities.clone();
+        ui.phone_generations
+            .insert(hello.device_id.clone(), connection);
+        ui.phones.insert(
+            hello.device_id.clone(),
+            crate::ui::Phone {
+                device: Some(hello.device_id.clone()),
+                pairing_generation: self.store.pairing_generation(&hello.device_id),
+                name: hello.name.clone(),
+                route: crate::ui::route(address).into(),
+                last_seen: crate::now_ms(),
+            },
+        );
+        select_display(state, &admission, &mut ui);
         true
     }
-    async fn persist_phone(&self, connection: u64) -> Result<()> {
-        let sessions = self.sessions.clone();
-        let ui = self.ui.clone();
-        let path = self.paths.data.join("phone.json");
-        self.store
-            .blocking(move |_| {
-                let state = sessions.lock().expect("sessions");
-                if state.session.as_ref().is_none_or(|s| s.id == connection) {
-                    persist_phone_generation(&ui, &path, connection)?;
+    fn persist_phone(
+        &self,
+        connection: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        // Lifecycle publication already happened. Schedule its follow-up before
+        // returning a future, and coalesce storms instead of queuing one job per
+        // canceled connection. The writer still rechecks generation at the disk
+        // boundary; each device retains only its latest pending generation.
+        let device = self
+            .ui
+            .lock()
+            .expect("UI state")
+            .phone_generations
+            .iter()
+            .find_map(|(device, id)| (*id == connection).then(|| device.clone()));
+        let completion = device.map(|device| {
+            let mut writes = self.phone_writes.lock().expect("phone writes");
+            writes.pending.insert(device, connection);
+            if let Some(completion) = &writes.completion {
+                return completion.clone();
+            }
+            let pending = self.phone_writes.clone();
+            let ui = self.ui.clone();
+            let path = self.paths.data.join("phone.json");
+            let job = self.store.start_completion(move |_| {
+                let mut outcome = Ok(());
+                loop {
+                    let batch = {
+                        let mut writes = pending.lock().expect("phone writes");
+                        if writes.pending.is_empty() {
+                            writes.completion.take();
+                            return outcome;
+                        }
+                        std::mem::take(&mut writes.pending)
+                    };
+                    for generation in batch.into_values() {
+                        if let Err(error) = persist_phone_generation(&ui, &path, generation) {
+                            outcome = Err(error);
+                        }
+                    }
                 }
-                Ok(())
-            })
-            .await
+            });
+            let completion = async move {
+                job.await
+                    .map_err(|error| Arc::new(error.to_string()))?
+                    .map_err(|error| Arc::new(error.to_string()))
+            }
+            .boxed()
+            .shared();
+            writes.completion = Some(completion.clone());
+            completion
+        });
+        async move {
+            if let Some(completion) = completion {
+                return completion
+                    .await
+                    .map_err(|error| anyhow::Error::msg((*error).clone()));
+            }
+            Ok(())
+        }
     }
     async fn finish_pairing(
         &self,
@@ -1775,34 +2137,32 @@ impl Core {
             .pair_then(device.clone(), fp.clone(), move || {
                 let _guard = guard;
                 let mut connections = sessions.lock().expect("sessions");
-                connections.unpairing = false;
-                automatic.lock().expect("automatic clipboard").invalidate();
-                if let Some(old) = connections.session.take() {
+                connections.unpairing.remove(&device);
+                automatic
+                    .lock()
+                    .expect("automatic clipboard")
+                    .invalidate_peer(&device);
+                if let Some(old) = connections.sessions.remove(&device) {
                     old.close
                         .send_replace(Some(CloseReason::Error(ErrorCode::Unauthorized)));
                 }
                 let mut scopes = actions.lock().expect("actions");
-                if let Some((_, old)) = scopes.take() {
+                if let Some(old) = scopes.insert(device.clone(), ActionScope::new()) {
                     old.cancelled.send_replace(true);
                 }
                 pending.discard_invalid();
-                *scopes = Some((device.clone(), ActionScope::new()));
                 let mut state = admission.lock().expect("admission");
-                for old in state.peers.values() {
-                    emit_event(
-                        &ui,
-                        &events,
-                        Event::Unpaired {
-                            device: old.clone(),
-                        },
-                    );
-                }
-                state.peers.clear();
+                state.peers.retain(|_, id| *id != device);
                 state.peers.insert(fp, device.clone());
                 state.invitation = None;
                 invitation_changes.send_modify(|r| *r = r.wrapping_add(1));
                 drop(state);
                 emit_event(&ui, &events, Event::Paired { device });
+                select_display(
+                    &connections,
+                    &admission.lock().expect("admission"),
+                    &mut ui.lock().expect("UI state"),
+                );
             })
             .await
             .map_err(|_| PairCode::StorageFailed)
@@ -1932,7 +2292,6 @@ impl Core {
             text: text_task,
         };
         let mut writer_finished = false;
-        let mut applications_finished = false;
         let mut pending: Option<PendingOutgoing> = None;
         let mut retry_at: Option<Instant> = None;
         let mut query_outgoing = true;
@@ -1946,7 +2305,7 @@ impl Core {
                     let id = work.selection.id().clone();
                     let supported = match &work.selection {
                         OutgoingSelection::Text(_) => hello.capabilities.iter().any(|c|c=="clipboard_text"),
-                        OutgoingSelection::Image(_, _) => self.config().clipboard_include_images && hello.capabilities.iter().any(|c|c=="clipboard_image"),
+                        OutgoingSelection::Image(_, _, _) => self.config().clipboard_include_images && hello.capabilities.iter().any(|c|c=="clipboard_image"),
                     };
                     if supported {
                         let deadline = Instant::now()+Duration::from_secs(60);
@@ -2005,10 +2364,9 @@ impl Core {
                             Message::Error(_)=>break,
                             Message::Status(status)=>{self.set_phone_paused(&hello.device_id,store.connection_id.expect("connection id"),status.paused);query_outgoing=true;},
                             Message::Unpair(_)=>{
-                                workers.file.abort(); workers.text.abort();
-                                let _ = (&mut workers.file).await;
-                                let _ = (&mut workers.text).await;
-                                applications_finished = true;
+                                // Admission precedes worker teardown too. The
+                                // pairing epoch fences any in-flight commit;
+                                // common teardown below joins both workers.
                                 self.forget_pairing(hello.device_id.clone(), CloseReason::Error(ErrorCode::Closing), store.connection_id, Some(hello.name.clone())).await?;
                                 break;
                             },
@@ -2047,10 +2405,8 @@ impl Core {
         workers.file.abort();
         workers.text.abort();
         let _ = (&mut workers.reader).await;
-        if !applications_finished {
-            let _ = (&mut workers.file).await;
-            let _ = (&mut workers.text).await;
-        }
+        let _ = (&mut workers.file).await;
+        let _ = (&mut workers.text).await;
         drop(file_tx);
         drop(text_tx);
         drop(write_tx);
@@ -2537,10 +2893,8 @@ impl Core {
                             .await?;
                         return Ok(());
                     }
-                    if !scope.allows(&origin) {
-                        claim.discard().await?;
-                        return Ok(());
-                    }
+                    // Once the OS reports success, retain history even if a
+                    // replacement invalidated the action's connection meanwhile.
                     if let Err(error) = claim.finalize(clipboard_application).await {
                         tx.send(nack(
                             text.transfer_id,
@@ -2791,6 +3145,7 @@ impl Core {
             return;
         }
         let copied = if image && (explicit || job.config.copy_image_to_clipboard) {
+            let _clipboard = self.clipboard_gate.lock().await;
             match job
                 .scope
                 .effect(&job.origin, || {
@@ -3407,12 +3762,7 @@ mod tests {
             incoming: &mut Option<Incoming>,
             tx: &mpsc::Sender<Message>,
         ) -> Result<()> {
-            let scope = self
-                .action_scope
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|(_, scope)| scope.clone());
+            let scope = self.action_scope.lock().unwrap().get(device).cloned();
             self.receive(store, scope.as_ref(), device, message, incoming, tx)
                 .await
         }
@@ -3424,12 +3774,7 @@ mod tests {
             writer: mpsc::Sender<Message>,
             close: watch::Sender<Option<CloseReason>>,
         ) -> Result<()> {
-            let scope = self
-                .action_scope
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|(_, scope)| scope.clone());
+            let scope = self.action_scope.lock().unwrap().get(&device).cloned();
             self.file_loop(store, scope, device, messages, writer, close)
                 .await
         }
@@ -3444,15 +3789,25 @@ mod tests {
             .lock()
             .unwrap()
             .peers
+            .retain(|_, id| id != device);
+        core.admission
+            .lock()
+            .unwrap()
+            .peers
             .insert(Hash::new(crate::random_hex(32))?, device.clone());
         let mut state = core.sessions.lock().unwrap();
-        state.session = Some(Session {
-            device: device.clone(),
-            id,
-            close,
-            wake: Arc::new(Notify::new()),
-            paused: false,
-        });
+        state.sessions.insert(
+            device.clone(),
+            Session {
+                device: device.clone(),
+                id,
+                close,
+                wake: Arc::new(Notify::new()),
+                paused: false,
+                capabilities: vec!["clipboard_text".into(), "clipboard_image".into()],
+                phone: crate::ui::Phone::default(),
+            },
+        );
         core.publish_phone(
             &state,
             id,
@@ -3576,9 +3931,8 @@ mod tests {
             .action_scope
             .lock()
             .unwrap()
-            .as_ref()
+            .get(&device)
             .unwrap()
-            .1
             .clone();
         let job = ActionJob {
             file: ReceivedFile::from_file(dir.path().join("file"), tempfile::tempfile()?)?,
@@ -3664,9 +4018,8 @@ mod tests {
             .action_scope
             .lock()
             .unwrap()
-            .as_ref()
+            .get(&device)
             .unwrap()
-            .1
             .clone();
         let path = dir.path().join("image.png");
         std::fs::write(&path, b"\x89PNG\r\n\x1a\n")?;
@@ -4020,7 +4373,7 @@ mod tests {
         assert!(core.ui_snapshot().receiving);
         assert!(core.finish_connection(&device, 2));
         assert!(!core.ui_snapshot().receiving);
-        assert!(core.ui.lock().unwrap().receiving_until.is_none());
+        assert!(core.ui.lock().unwrap().receiving_until.is_empty());
         core.shutdown_actions().await?;
         Ok(())
     }
@@ -4150,6 +4503,7 @@ mod tests {
             let old = core.ui_snapshot();
             assert_eq!(old.phone.device, old.device);
             assert_eq!(old.generation, Some(generation - 1));
+            core.unpair_device(old.device.clone().unwrap()).await?;
             let invitation = core
                 .start_pairing_with_addresses(vec!["127.0.0.1:47821".into()])
                 .await?;
@@ -4207,40 +4561,168 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
-    async fn cached_phone_metadata_is_bound_to_identity_after_restart() -> Result<()> {
-        for cache in ["matching", "different", "legacy"] {
+    async fn cached_phone_metadata_is_bound_to_identity_and_pairing_after_restart() -> Result<()> {
+        for filename in ["phone.json", "phones.json"] {
+            for cache in ["matching", "different", "legacy", "unversioned", "revoked"] {
+                let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
+                let _connection = admit_ui_test_phone(&core, &device, 1)?;
+                core.persist_phone(1).await?;
+                let paths = core.paths.clone();
+                let config = core.config();
+                core.shutdown_actions().await?;
+                drop(core);
+                let other = if filename == "phone.json" {
+                    "phones.json"
+                } else {
+                    "phone.json"
+                };
+                std::fs::remove_file(paths.data.join(other))?;
+                let file = paths.data.join(filename);
+                let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&file)?)?;
+                let phone = if filename == "phones.json" {
+                    &mut value[device.as_str()]
+                } else {
+                    &mut value
+                };
+                if cache == "legacy" {
+                    phone.as_object_mut().unwrap().remove("device");
+                }
+                if cache == "different" {
+                    phone["device"] = serde_json::to_value(Id::from_bytes([9; 16]))?;
+                }
+                if cache == "unversioned" {
+                    phone.as_object_mut().unwrap().remove("pairing_generation");
+                }
+                if cache == "revoked" {
+                    phone["pairing_generation"] = serde_json::json!(0);
+                }
+                crate::config::atomic_private(&file, &serde_json::to_vec(&value)?)?;
+                let restarted = Core::new(paths, config, Arc::new(NoActions)).await?;
+                let snapshot = restarted.ui_snapshot();
+                restarted.shutdown_actions().await?;
+                assert_eq!(snapshot.device, Some(device));
+                assert_eq!(snapshot.phone.device, snapshot.device);
+                assert_eq!(
+                    snapshot.phone.name,
+                    if cache == "matching" {
+                        "Phone 1"
+                    } else {
+                        "Phone"
+                    },
+                    "{filename}: {cache}"
+                );
+                assert_eq!(snapshot.phone.last_seen != 0, cache == "matching");
+                assert_eq!(snapshot.phone.route.is_empty(), cache != "matching");
+                assert!(snapshot.generation.is_none());
+                assert!(snapshot.paired && !snapshot.connected && !snapshot.paused);
+            }
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn current_phone_cache_survives_a_revoked_entry_in_the_other_file() -> Result<()> {
+        for stale_file in ["phone.json", "phones.json"] {
             let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
-            let _connection = admit_ui_test_phone(&core, &device, 1)?;
+            let _old = admit_ui_test_phone(&core, &device, 1)?;
+            core.persist_phone(1).await?;
+            let path = core.paths.data.join(stale_file);
+            let stale = std::fs::read(&path)?;
+            let invitation = core
+                .start_pairing_with_addresses(vec!["127.0.0.1:47821".into()])
+                .await?;
+            core.finish_pairing(
+                &device,
+                &Hash::new(crate::random_hex(32))?,
+                &invitation.token,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            let _current = admit_ui_test_phone(&core, &device, 2)?;
+            core.persist_phone(2).await?;
+            let paths = core.paths.clone();
+            let config = core.config();
+            core.store.drain().await;
+            core.shutdown_actions().await?;
+            drop(core);
+            crate::config::atomic_private(&path, &stale)?;
+            let restarted = Core::new(paths, config, Arc::new(NoActions)).await?;
+            let snapshot = restarted.ui_snapshot();
+            restarted.shutdown_actions().await?;
+            assert_eq!(snapshot.phone.name, "Phone 2", "stale {stale_file}");
+            assert!(snapshot.phone.last_seen > 0);
+            assert!(!snapshot.phone.route.is_empty());
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn repaired_pairing_does_not_restore_revoked_metadata_after_restart() -> Result<()> {
+        revoked_metadata_restart(false, true).await
+    }
+    #[tokio::test]
+    async fn unpaired_device_does_not_restore_metadata_after_restart() -> Result<()> {
+        revoked_metadata_restart(true, false).await
+    }
+    #[tokio::test]
+    async fn unpair_then_pair_does_not_restore_revoked_metadata_after_restart() -> Result<()> {
+        revoked_metadata_restart(true, true).await
+    }
+    async fn revoked_metadata_restart(unpair: bool, repair: bool) -> Result<()> {
+        for cache in ["phone.json", "phones.json", "both"] {
+            let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
+            let connection = admit_ui_test_phone(&core, &device, 1)?;
+            core.persist_phone(1).await?;
+            assert!(core.finish_connection(&device, 1));
             core.persist_phone(1).await?;
             let paths = core.paths.clone();
             let config = core.config();
+            // Keep the old bytes, modelling a crash after the trust transaction
+            // commits but before any cache invalidation/write can finish.
+            let old_phone = std::fs::read(paths.data.join("phone.json"))?;
+            let old_phones = std::fs::read(paths.data.join("phones.json"))?;
+            if unpair {
+                core.unpair_device(device.clone()).await?;
+            }
+            if repair {
+                let invitation = core
+                    .start_pairing_with_addresses(vec!["127.0.0.1:47821".into()])
+                    .await?;
+                core.finish_pairing(
+                    &device,
+                    &Hash::new(crate::random_hex(32))?,
+                    &invitation.token,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                assert_eq!(core.ui_snapshot().phone.name, "Phone");
+            }
+            core.store.drain().await;
             core.shutdown_actions().await?;
+            drop(connection);
             drop(core);
-            let file = paths.data.join("phone.json");
-            let mut phone: serde_json::Value = serde_json::from_slice(&std::fs::read(&file)?)?;
-            if cache == "legacy" {
-                phone.as_object_mut().unwrap().remove("device");
+            for (file, bytes) in [("phone.json", old_phone), ("phones.json", old_phones)] {
+                if cache == "both" || cache == file {
+                    crate::config::atomic_private(&paths.data.join(file), &bytes)?;
+                } else {
+                    std::fs::remove_file(paths.data.join(file))?;
+                }
             }
-            if cache == "different" {
-                phone["device"] = serde_json::to_value(Id::from_bytes([9; 16]))?;
-            }
-            crate::config::atomic_private(&file, &serde_json::to_vec(&phone)?)?;
             let restarted = Core::new(paths, config, Arc::new(NoActions)).await?;
             let snapshot = restarted.ui_snapshot();
-            assert_eq!(snapshot.device, Some(device));
-            assert_eq!(snapshot.phone.device, snapshot.device);
+            let caches_empty = restarted.ui.lock().unwrap().phones.is_empty();
+            restarted.shutdown_actions().await?;
+            assert!(
+                caches_empty,
+                "revoked entry loaded from {cache}, unpair={unpair}"
+            );
             assert_eq!(
                 snapshot.phone.name,
-                if cache == "matching" {
-                    "Phone 1"
-                } else {
-                    "Phone"
-                }
+                if repair { "Phone" } else { "" },
+                "cache={cache}"
             );
-            assert_eq!(snapshot.phone.last_seen != 0, cache == "matching");
-            assert!(snapshot.generation.is_none());
-            assert!(snapshot.paired && !snapshot.connected && !snapshot.paused);
-            restarted.shutdown_actions().await?;
+            assert_eq!(snapshot.phone.last_seen, 0);
+            assert!(snapshot.phone.route.is_empty());
+            assert_eq!(snapshot.device, repair.then_some(device));
+            assert!(!snapshot.connected);
         }
         Ok(())
     }
@@ -4400,6 +4882,143 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    async fn sweep_activity_is_per_device_and_disconnect_reconnect_scoped() -> Result<()> {
+        let (_dir, core, a) = fixture(Arc::new(NoActions)).await?;
+        let b = Id::from_bytes([2; 16]);
+        let _a = admit_ui_test_phone(&core, &a, 1)?;
+        let _b = admit_ui_test_phone(&core, &b, 2)?;
+        let transfer = test_begin(b"same ID, different senders");
+        core.event(Event::TransferStarted {
+            device: b.clone(),
+            metadata: transfer.clone(),
+        });
+        assert!(
+            !core.ui_snapshot().receiving,
+            "B must not show Receiving from A"
+        );
+        core.event(Event::TransferStarted {
+            device: a.clone(),
+            metadata: transfer.clone(),
+        });
+        assert_eq!(core.ui.lock().unwrap().active_transfers.len(), 2);
+        core.event(Event::TransferFinished {
+            device: a.clone(),
+            transfer_id: transfer.transfer_id.clone(),
+            path: None,
+            deduplicated: false,
+        });
+        tokio::time::sleep(Duration::from_millis(1550)).await;
+        assert!(
+            !core.ui_snapshot().receiving,
+            "B's equal ID must remain independent"
+        );
+        let _replacement = admit_ui_test_phone(&core, &a, 3)?;
+        assert_eq!(
+            core.ui.lock().unwrap().active_transfers.len(),
+            1,
+            "A reconnect must preserve B activity"
+        );
+        assert!(core.finish_connection(&b, 2));
+        assert!(
+            core.ui.lock().unwrap().active_transfers.is_empty(),
+            "secondary disconnect must remove its own unfinished receive"
+        );
+        assert!(!core.ui_snapshot().receiving);
+        let _b_reconnected = admit_ui_test_phone(&core, &b, 4)?;
+        core.event(Event::TransferStarted {
+            device: b.clone(),
+            metadata: transfer,
+        });
+        assert!(core.finish_connection(&a, 3));
+        let snapshot = core.ui_snapshot();
+        assert_eq!(snapshot.device, Some(b.clone()));
+        assert_eq!(snapshot.phone.name, "Phone 4");
+        assert!(snapshot.receiving);
+        assert_eq!(snapshot.status(), "Receiving from Phone 4…");
+        assert!(core.finish_connection(&b, 4));
+        assert!(core.ui.lock().unwrap().active_transfers.is_empty());
+        assert!(!core.ui_snapshot().receiving);
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn sweep_display_prefers_lowest_connected_peer_and_keeps_it() -> Result<()> {
+        let (_dir, core, a) = fixture(Arc::new(NoActions)).await?;
+        let b = Id::from_bytes([2; 16]);
+        let c = Id::from_bytes([3; 16]);
+        let _a = admit_ui_test_phone(&core, &a, 1)?;
+        let _c = admit_ui_test_phone(&core, &c, 2)?;
+        let _b = admit_ui_test_phone(&core, &b, 3)?;
+        assert_eq!(core.ui_snapshot().device, Some(a.clone()));
+        assert!(core.finish_connection(&a, 1));
+        assert_eq!(core.ui_snapshot().device, Some(b.clone()));
+        let _a_again = admit_ui_test_phone(&core, &a, 4)?;
+        assert_eq!(
+            core.ui_snapshot().device,
+            Some(b.clone()),
+            "a live displayed peer stays selected"
+        );
+        core.set_phone_paused(&b, 3, true);
+        let snapshot = core.ui_snapshot();
+        assert_eq!(snapshot.phone.name, "Phone 3");
+        assert_eq!(snapshot.generation, Some(3));
+        assert!(snapshot.connected && snapshot.paused);
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn sweep_display_switch_persists_ended_peer_metadata_across_restart() -> Result<()> {
+        for shutdown in [false, true] {
+            let (_dir, core, a) = fixture(Arc::new(NoActions)).await?;
+            let b = Id::from_bytes([2; 16]);
+            core.store
+                .pair(b.clone(), Hash::new(crate::random_hex(32))?)
+                .await?;
+            let _a = admit_ui_test_phone(&core, &a, 1)?;
+            let _b = admit_ui_test_phone(&core, &b, 2)?;
+            core.ui.lock().unwrap().snapshot.phone.last_seen = 1;
+            core.persist_phone(1).await?;
+            assert_eq!(core.ui_snapshot().device, Some(a.clone()));
+            if shutdown {
+                // Use the production serve shutdown path with both sessions live.
+                core.request_shutdown();
+                core.clone()
+                    .serve(TcpListener::bind("127.0.0.1:0").await?, false)
+                    .await?;
+            } else {
+                assert!(core.finish_connection(&a, 1));
+                core.persist_phone(1).await?;
+                let snapshot = core.ui_snapshot();
+                assert_eq!(snapshot.device, Some(b.clone()));
+                assert_eq!(snapshot.phone.device, snapshot.device);
+                assert_eq!(snapshot.phone.name, "Phone 2");
+                assert!(snapshot.connected);
+                let disk: crate::ui::Phone =
+                    serde_json::from_slice(&std::fs::read(core.paths.data.join("phone.json"))?)?;
+                assert_eq!(disk.device, snapshot.device);
+                assert_eq!(disk.name, snapshot.phone.name);
+                assert!(core.finish_connection(&b, 2));
+                core.persist_phone(2).await?;
+            }
+            let paths = core.paths.clone();
+            let config = core.config();
+            core.store.drain().await;
+            core.shutdown_actions().await?;
+            drop(core);
+            let core = Core::new(paths, config, Arc::new(NoActions)).await?;
+            core.unpair_device(b).await?;
+            let snapshot = core.ui_snapshot();
+            assert_eq!(snapshot.device, Some(a));
+            assert_eq!(snapshot.phone.name, "Phone 1");
+            assert!(
+                snapshot.phone.last_seen > 1,
+                "A final last seen must survive B staying connected and restart"
+            );
+            core.shutdown_actions().await?;
+        }
+        Ok(())
+    }
+    #[tokio::test]
     async fn final_phone_metadata_persists_only_for_latest_generation() -> Result<()> {
         let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
         let _old = admit_ui_test_phone(&core, &device, 1)?;
@@ -4420,10 +5039,17 @@ mod tests {
         assert_eq!(std::fs::read(&path)?, before);
         core.unpair_device(device).await?;
         assert!(core.ui.lock().unwrap().phone_generation.is_none());
+        let unpaired = std::fs::read(&path)?;
         core.persist_phone(2).await?;
         assert_eq!(
-            serde_json::from_slice::<crate::ui::Phone>(&std::fs::read(path)?)?.name,
-            "Phone 2"
+            std::fs::read(&path)?,
+            unpaired,
+            "revoked metadata cannot overwrite the unpaired snapshot"
+        );
+        assert!(
+            serde_json::from_slice::<crate::ui::Phone>(&unpaired)?
+                .device
+                .is_none()
         );
         core.shutdown_actions().await?;
         Ok(())
@@ -4433,13 +5059,18 @@ mod tests {
         let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
         core.admission.lock().unwrap().peers = core.store.peers().await?;
         let (close, _rx) = watch::channel(None);
-        core.sessions.lock().unwrap().session = Some(Session {
-            device: device.clone(),
-            id: 2,
-            close,
-            wake: Arc::new(Notify::new()),
-            paused: false,
-        });
+        core.sessions.lock().unwrap().sessions.insert(
+            device.clone(),
+            Session {
+                device: device.clone(),
+                id: 2,
+                close,
+                wake: Arc::new(Notify::new()),
+                paused: false,
+                capabilities: vec!["clipboard_text".into(), "clipboard_image".into()],
+                phone: crate::ui::Phone::default(),
+            },
+        );
         let current = Hello {
             role: None,
             addresses: None,
@@ -4465,7 +5096,395 @@ mod tests {
         assert_eq!(before, std::fs::read(core.paths.data.join("phone.json"))?);
         assert_eq!(core.ui_snapshot().phone.name, "Current phone");
         assert_eq!(core.ui_snapshot().phone.route, "Tailscale");
-        assert!(core.clipboard_image_capable());
+        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+            .await?;
+        assert!(
+            !core
+                .automatic_target()
+                .unwrap()
+                .payload_plans(false, true)
+                .is_empty()
+        );
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    async fn automatic_wire(core: &Core, work: AutomaticWrite) -> Result<Vec<Message>> {
+        let (_priority_tx, mut priority) = mpsc::channel(1);
+        let (_normal_tx, mut normal) = mpsc::channel(1);
+        let mut bytes = Vec::new();
+        assert!(
+            transmit_automatic(core, &mut bytes, work, &mut priority, &mut normal, None).await?
+        );
+        let mut wire = bytes.as_slice();
+        let mut messages = Vec::new();
+        while let Some(message) = read_frame(&mut wire).await? {
+            messages.push(message);
+        }
+        Ok(messages)
+    }
+    #[tokio::test]
+    async fn automatic_formats_ignore_paused_image_peer() -> Result<()> {
+        let (_dir, core, text_peer) = fixture(Arc::new(NoActions)).await?;
+        let image_peer = Id::from_bytes([2; 16]);
+        let _text = admit_ui_test_phone(&core, &text_peer, 1)?;
+        let _image = admit_ui_test_phone(&core, &image_peer, 2)?;
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&text_peer)
+            .unwrap()
+            .capabilities = vec!["clipboard_text".into()];
+        core.set_phone_paused(&image_peer, 2, true);
+        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+            .await?;
+        crate::ui::clipboard::tests::deliver_offer(
+            &core,
+            &[
+                ("image/png", b"\x89PNG\r\n\x1a\nimage"),
+                ("text/plain", b"fallback"),
+            ],
+        )
+        .await?;
+        let work = core
+            .take_automatic(&text_peer, 1)
+            .expect("text peer must receive fallback");
+        assert!(
+            matches!(automatic_wire(&core, work).await?.as_slice(), [Message::Clipboard(c)] if c.text == "fallback")
+        );
+        assert!(core.take_automatic(&image_peer, 2).is_none());
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn automatic_formats_deliver_best_format_to_each_peer() -> Result<()> {
+        let (_dir, core, image_peer) = fixture(Arc::new(NoActions)).await?;
+        let text_peer = Id::from_bytes([2; 16]);
+        let _image = admit_ui_test_phone(&core, &image_peer, 1)?;
+        let _text = admit_ui_test_phone(&core, &text_peer, 2)?;
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&text_peer)
+            .unwrap()
+            .capabilities = vec!["clipboard_text".into()];
+        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+            .await?;
+        let requested = crate::ui::clipboard::tests::deliver_offer(
+            &core,
+            &[
+                ("image/png", b"\x89PNG\r\n\x1a\nimage"),
+                ("text/plain", b"fallback"),
+            ],
+        )
+        .await?;
+        let image = core
+            .take_automatic(&image_peer, 1)
+            .expect("image recipient");
+        let image_wire = automatic_wire(&core, image).await?;
+        assert!(
+            matches!(image_wire.as_slice(), [Message::FileBegin(begin), Message::FileChunk(chunk), Message::FileEnd(end)]
+            if begin.mime == "image/png" && begin.kind == FileKind::ClipboardImage
+                && begin.transfer_id == end.transfer_id && chunk.data == b"\x89PNG\r\n\x1a\nimage")
+        );
+        let text = core.take_automatic(&text_peer, 2).expect("text recipient");
+        assert!(
+            matches!(automatic_wire(&core, text).await?.as_slice(), [Message::Clipboard(c)] if c.text == "fallback")
+        );
+        assert!(requested.iter().any(|m| m == "image/png"));
+        assert!(requested.iter().any(|m| m == "text/plain"));
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn automatic_formats_validate_independently_before_recipient_preference() -> Result<()> {
+        let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
+        let _connection = admit_ui_test_phone(&core, &device, 1)?;
+        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+            .await?;
+        let png = b"\x89PNG\r\n\x1a\nvalid image".to_vec();
+        for bytes in [
+            b"invalid PNG".to_vec(),
+            vec![1; crate::ui::clipboard::MAX_IMAGE + 1],
+        ] {
+            core.send_observed_formats(
+                core.observe_clipboard_offer().unwrap(),
+                Some("fallback".into()),
+                Some(bytes),
+            )
+            .await?;
+            let work = core.take_automatic(&device, 1).expect("text fallback");
+            assert!(
+                matches!(automatic_wire(&core, work).await?.as_slice(), [Message::Clipboard(c)] if c.text == "fallback")
+            );
+        }
+        // An unusable text representation must not block the image for one
+        // peer merely because a different frozen recipient needs text.
+        let text_peer = Id::from_bytes([2; 16]);
+        let _text = admit_ui_test_phone(&core, &text_peer, 2)?;
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&text_peer)
+            .unwrap()
+            .capabilities = vec!["clipboard_text".into()];
+        for text in ["bad\0text".to_owned(), "t".repeat(MAX_CLIPBOARD_BYTES + 1)] {
+            core.send_observed_formats(
+                core.observe_clipboard_offer().unwrap(),
+                Some(text),
+                Some(png.clone()),
+            )
+            .await?;
+            let work = core
+                .take_automatic(&device, 1)
+                .expect("valid image survives invalid text");
+            assert!(matches!(
+                automatic_wire(&core, work).await?.as_slice(),
+                [
+                    Message::FileBegin(_),
+                    Message::FileChunk(_),
+                    Message::FileEnd(_)
+                ]
+            ));
+            assert!(core.take_automatic(&text_peer, 2).is_none());
+        }
+        core.set_phone_paused(&text_peer, 2, true);
+        let requested = crate::ui::clipboard::tests::deliver_offer(
+            &core,
+            &[("text/plain", b"fallback"), ("image/png", b"invalid PNG")],
+        )
+        .await?;
+        assert_eq!(requested, ["text/plain", "image/png"]);
+        let work = core
+            .take_automatic(&device, 1)
+            .expect("image-capable recipient falls back");
+        assert!(
+            matches!(automatic_wire(&core, work).await?.as_slice(), [Message::Clipboard(c)] if c.text == "fallback")
+        );
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn automatic_formats_image_only_text_recipients_are_silent() -> Result<()> {
+        let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
+        let _connection = admit_ui_test_phone(&core, &device, 1)?;
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&device)
+            .unwrap()
+            .capabilities = vec!["clipboard_text".into()];
+        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+            .await?;
+        let mut events = core.subscribe();
+        let requested = crate::ui::clipboard::tests::deliver_offer(
+            &core,
+            &[("image/png", b"\x89PNG\r\n\x1a\nimage")],
+        )
+        .await?;
+        assert!(
+            requested.is_empty(),
+            "unsupported images must not even be read"
+        );
+        assert!(core.take_automatic(&device, 1).is_none());
+        assert!(
+            core.send_observed_image(
+                core.observe_clipboard_offer().unwrap(),
+                b"\x89PNG\r\n\x1a\nimage".to_vec()
+            )
+            .await
+            .is_err()
+        );
+        assert!(core.take_automatic(&device, 1).is_none());
+        assert!(core.automatic.lock().unwrap().selections.is_empty());
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, Event::ClipboardSent { .. }),
+                "unsupported offer reported as sent"
+            );
+        }
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn automatic_formats_sensitive_policy_gates_every_representation() -> Result<()> {
+        let (_dir, core, image_peer) = fixture(Arc::new(NoActions)).await?;
+        let text_peer = Id::from_bytes([2; 16]);
+        let _image = admit_ui_test_phone(&core, &image_peer, 1)?;
+        let _text = admit_ui_test_phone(&core, &text_peer, 2)?;
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&text_peer)
+            .unwrap()
+            .capabilities = vec!["clipboard_text".into()];
+        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+            .await?;
+        for marker in [
+            "application/x-keepassxc-secret",
+            crate::ui::clipboard::ORIGIN_MIME,
+            "x-kde-passwordManagerHint",
+        ] {
+            let requested = crate::ui::clipboard::tests::deliver_offer(
+                &core,
+                &[
+                    ("image/png", b"\x89PNG\r\n\x1a\nimage"),
+                    ("text/plain", b"secret text"),
+                    (marker, b" secret\0 "),
+                ],
+            )
+            .await?;
+            if marker == "x-kde-passwordManagerHint" {
+                assert_eq!(
+                    requested.len(),
+                    3,
+                    "marker and both formats should be requested"
+                );
+            } else {
+                assert!(requested.is_empty(), "sensitive MIME gates every read");
+            }
+            assert!(core.take_automatic(&image_peer, 1).is_none());
+            assert!(core.take_automatic(&text_peer, 2).is_none());
+        }
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn automatic_formats_image_policy_and_text_aliases_follow_frozen_offer() -> Result<()> {
+        let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
+        let _connection = admit_ui_test_phone(&core, &device, 1)?;
+        // Images default off: a dual-capability recipient still gets offered text.
+        for mime in ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"] {
+            let requested = crate::ui::clipboard::tests::deliver_offer(
+                &core,
+                &[("image/png", b"\x89PNG\r\n\x1a\nimage"), (mime, b"text")],
+            )
+            .await?;
+            assert_eq!(requested, vec![mime]);
+            let work = core
+                .take_automatic(&device, 1)
+                .expect("text with images disabled");
+            assert!(matches!(work.selection, OutgoingSelection::Text(c) if c.text == "text"));
+        }
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&device)
+            .unwrap()
+            .capabilities = vec!["files".into(), "future_feature".into()];
+        assert!(
+            core.observe_clipboard_offer().is_none(),
+            "general file support cannot receive clipboard payloads"
+        );
+        assert!(
+            crate::ui::clipboard::tests::deliver_offer(&core, &[("text/plain", b"text")])
+                .await?
+                .is_empty()
+        );
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn automatic_formats_resuming_or_connecting_cannot_expand_frozen_recipients() -> Result<()>
+    {
+        let (_dir, core, text_peer) = fixture(Arc::new(NoActions)).await?;
+        let image_peer = Id::from_bytes([2; 16]);
+        let late_peer = Id::from_bytes([3; 16]);
+        let _text = admit_ui_test_phone(&core, &text_peer, 1)?;
+        let _image = admit_ui_test_phone(&core, &image_peer, 2)?;
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&text_peer)
+            .unwrap()
+            .capabilities = vec!["clipboard_text".into()];
+        core.set_phone_paused(&image_peer, 2, true);
+        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+            .await?;
+        let mut late_connection = None;
+        let requested = crate::ui::clipboard::tests::deliver_offer_after_observation(
+            &core,
+            &[
+                ("image/png", b"\x89PNG\r\n\x1a\nimage"),
+                ("text/plain", b"frozen text"),
+            ],
+            || {
+                core.set_phone_paused(&image_peer, 2, false);
+                late_connection = Some(admit_ui_test_phone(&core, &late_peer, 3).unwrap());
+                // Even a capability gained on the original session cannot expand its plan.
+                core.sessions
+                    .lock()
+                    .unwrap()
+                    .sessions
+                    .get_mut(&text_peer)
+                    .unwrap()
+                    .capabilities
+                    .push("clipboard_image".into());
+            },
+        )
+        .await?;
+        assert_eq!(requested, vec!["text/plain"]);
+        let work = core
+            .take_automatic(&text_peer, 1)
+            .expect("original text recipient");
+        assert!(matches!(work.selection, OutgoingSelection::Text(c) if c.text == "frozen text"));
+        assert!(core.take_automatic(&image_peer, 2).is_none());
+        assert!(core.take_automatic(&late_peer, 3).is_none());
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn automatic_formats_send_rechecks_only_remove_frozen_recipients() -> Result<()> {
+        let (_dir, core, image_peer) = fixture(Arc::new(NoActions)).await?;
+        let text_peer = Id::from_bytes([2; 16]);
+        let _image = admit_ui_test_phone(&core, &image_peer, 1)?;
+        let _text = admit_ui_test_phone(&core, &text_peer, 2)?;
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&text_peer)
+            .unwrap()
+            .capabilities = vec!["clipboard_text".into()];
+        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+            .await?;
+        let offer = core.observe_clipboard_offer().unwrap();
+        core.set_phone_paused(&image_peer, 1, true);
+        core.send_observed_formats(
+            offer,
+            Some("remaining text".into()),
+            Some(b"\x89PNG\r\n\x1a\nimage".to_vec()),
+        )
+        .await?;
+        assert!(core.take_automatic(&image_peer, 1).is_none());
+        let work = core
+            .take_automatic(&text_peer, 2)
+            .expect("still eligible text recipient");
+        assert!(
+            matches!(automatic_wire(&core, work).await?.as_slice(), [Message::Clipboard(c)] if c.text == "remaining text")
+        );
+        // Re-enabling a policy cannot authorize an offer observed before it changed.
+        let stale = core.observe_clipboard_offer().unwrap();
+        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+            .await?;
+        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+            .await?;
+        assert!(
+            core.send_observed_formats(
+                stale,
+                Some("stale text".into()),
+                Some(b"\x89PNG\r\n\x1a\nimage".to_vec())
+            )
+            .await
+            .is_err()
+        );
+        assert!(core.take_automatic(&text_peer, 2).is_none());
         core.shutdown_actions().await?;
         Ok(())
     }
@@ -4479,13 +5498,18 @@ mod tests {
             .peers
             .insert(fp, device.clone());
         let (close, _receiver) = watch::channel(None);
-        core.sessions.lock().unwrap().session = Some(Session {
-            device: device.clone(),
-            id: 7,
-            close,
-            wake: Arc::new(Notify::new()),
-            paused: false,
-        });
+        core.sessions.lock().unwrap().sessions.insert(
+            device.clone(),
+            Session {
+                device: device.clone(),
+                id: 7,
+                close,
+                wake: Arc::new(Notify::new()),
+                paused: false,
+                capabilities: vec!["clipboard_text".into(), "clipboard_image".into()],
+                phone: crate::ui::Phone::default(),
+            },
+        );
         let explicit = core
             .send_clipboard(device.clone(), "explicit".into())
             .await?;
@@ -4527,13 +5551,18 @@ mod tests {
     async fn clipboard_observation_ignores_paused_offers_during_slow_reads() -> Result<()> {
         let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
         let (close, _receiver) = watch::channel(None);
-        core.sessions.lock().unwrap().session = Some(Session {
-            device: device.clone(),
-            id: 7,
-            close,
-            wake: Arc::new(Notify::new()),
-            paused: false,
-        });
+        core.sessions.lock().unwrap().sessions.insert(
+            device.clone(),
+            Session {
+                device: device.clone(),
+                id: 7,
+                close,
+                wake: Arc::new(Notify::new()),
+                paused: false,
+                capabilities: vec!["clipboard_text".into(), "clipboard_image".into()],
+                phone: crate::ui::Phone::default(),
+            },
+        );
         crate::ui::clipboard::tests::delayed_source_pause_resume(&core, |paused| {
             core.set_phone_paused(&device, 7, paused)
         })
@@ -4757,6 +5786,189 @@ mod tests {
         Ok(())
     }
     struct NoActions;
+    // Drop releases every submitted closure, including on an assertion failure.
+    async fn occupy_store(store: &Store) -> Vec<std::sync::mpsc::Sender<()>> {
+        let mut releases = Vec::new();
+        for _ in 0..crate::work::BLOCKING_LIMIT {
+            let (release, blocked) = std::sync::mpsc::channel();
+            let mut job = Box::pin(store.blocking(move |_| {
+                let _ = blocked.recv();
+                Ok(())
+            }));
+            assert!(futures_util::poll!(job.as_mut()).is_pending());
+            drop(job);
+            releases.push(release);
+        }
+        releases
+    }
+    #[tokio::test]
+    async fn canceled_metadata_wait_after_connection_change_preserves_latest_snapshot() -> Result<()>
+    {
+        let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
+        let _first = admit_ui_test_phone(&core, &device, 1)?;
+        core.persist_phone(1).await?;
+        let releases = occupy_store(&core.store).await;
+        let _replacement = admit_ui_test_phone(&core, &device, 2)?;
+        let mut persistence = Box::pin(core.persist_phone(2));
+        let _ = futures_util::poll!(persistence.as_mut());
+        drop(persistence);
+        drop(releases);
+        core.store.drain().await;
+        let saved: crate::ui::Phone =
+            serde_json::from_slice(&std::fs::read(core.paths.data.join("phone.json"))?)?;
+        core.shutdown_actions().await?;
+        assert_eq!(
+            saved.name, "Phone 2",
+            "connection mutation lost its metadata follow-up"
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn canceled_unpair_waiting_for_capacity_keeps_pairing_usable() -> Result<()> {
+        for remote in [false, true] {
+            let (dir, core, _) = fixture(Arc::new(NoActions)).await?;
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?.to_string();
+            let server = tokio::spawn(core.clone().serve(listener, false));
+            let phone = crate::client::Phone::new(dir.path().join("phone"))?;
+            let invitation = core.start_pairing_with_addresses(vec![address]).await?;
+            let mut original = phone.pair(&invitation).await?;
+            let ping = Message::Ping(Ping {
+                nonce: Nonce::new("f".repeat(16))?,
+            });
+            original.write(&ping).await?;
+            original.read(Duration::from_secs(2)).await?;
+            let device = phone.identity.device_id.clone();
+            let scope = core.action_scope.lock().unwrap()[&device].clone();
+            let connection = core.sessions.lock().unwrap().sessions[&device].id;
+            let releases = occupy_store(&core.store).await;
+            let mut unpair = Box::pin(core.forget_pairing(
+                device.clone(),
+                CloseReason::Unpair,
+                remote.then_some(connection),
+                remote.then(|| "Phone".into()),
+            ));
+            assert!(futures_util::poll!(unpair.as_mut()).is_pending());
+            drop(unpair);
+            drop(releases);
+            core.store.drain().await;
+            let consistent = !core.sessions.lock().unwrap().unpairing.contains(&device)
+                && !*scope.cancelled.borrow();
+            let binding = core
+                .store
+                .peers()
+                .await?
+                .get(&phone.identity.fingerprint)
+                .cloned();
+            let reconnect = if consistent {
+                Some(phone.reconnect().await)
+            } else {
+                None
+            };
+            core.request_shutdown();
+            tokio::time::timeout(Duration::from_secs(3), server).await???;
+            assert!(consistent, "cancelled admission stranded lifecycle state");
+            assert_eq!(binding, Some(device));
+            reconnect.context("reconnect skipped")??;
+        }
+        Ok(())
+    }
+    struct SaturatingText {
+        store: Mutex<Option<Store>>,
+        releases: Mutex<Vec<std::sync::mpsc::Sender<()>>>,
+        value: Mutex<String>,
+        writes: AtomicU64,
+    }
+    #[async_trait::async_trait]
+    impl PcActions for SaturatingText {
+        async fn clipboard_text(&self, text: &str) -> Result<()> {
+            *self.value.lock().unwrap() = text.into();
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            let store = self.store.lock().unwrap().take();
+            if let Some(store) = store {
+                *self.releases.lock().unwrap() = occupy_store(&store).await;
+            }
+            Ok(())
+        }
+        async fn clipboard_image(&self, _: &std::path::Path, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn notify(&self, _: &std::path::Path, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn open(&self, _: &std::path::Path) -> Result<()> {
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn disconnect_after_text_apply_with_saturated_capacity_records_and_deduplicates()
+    -> Result<()> {
+        let actions = Arc::new(SaturatingText {
+            store: Mutex::new(None),
+            releases: Mutex::new(Vec::new()),
+            value: Mutex::new(String::new()),
+            writes: AtomicU64::new(0),
+        });
+        let (dir, core, _) = fixture(actions.clone()).await?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?.to_string();
+        let server = tokio::spawn(core.clone().serve(listener, false));
+        let phone = crate::client::Phone::new(dir.path().join("phone"))?;
+        let invitation = core.start_pairing_with_addresses(vec![address]).await?;
+        let mut original = phone.pair(&invitation).await?;
+        original
+            .write(&Message::Ping(Ping {
+                nonce: Nonce::new("f".repeat(16))?,
+            }))
+            .await?;
+        original.read(Duration::from_secs(2)).await?;
+        let device = phone.identity.device_id.clone();
+        let scope = core.action_scope.lock().unwrap()[&device].clone();
+        let connection = core.sessions.lock().unwrap().sessions[&device].id;
+        let mut store = core.store.with_current_pairing();
+        store.connection_id = Some(connection);
+        let text = phone.text("already applied".into(), ClipboardOrigin::Clipboard)?;
+        *actions.store.lock().unwrap() = Some(core.store.clone());
+        let (tx, _rx) = mpsc::channel(4);
+        let mut incoming = None;
+        let mut receive = Box::pin(core.receive(
+            &store,
+            Some(&scope),
+            &device,
+            Message::Clipboard(text.clone()),
+            &mut incoming,
+            &tx,
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let _ = futures_util::poll!(receive.as_mut());
+                if actions.writes.load(Ordering::SeqCst) != 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        // Model the READY worker abort immediately after the successful OS write.
+        drop(receive);
+        core.finish_connection(&device, connection);
+        actions.releases.lock().unwrap().clear();
+        core.store.drain().await;
+        let recorded = core.store.receipt(device, text.transfer_id.clone()).await?;
+        *actions.value.lock().unwrap() = "newer local clipboard".into();
+        let mut replacement = phone.reconnect().await?;
+        let replay = replacement.send_text(text).await?;
+        core.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(3), server).await???;
+        assert!(
+            recorded.is_some_and(|(_, complete)| complete),
+            "applied text lost its durable history"
+        );
+        assert!(replay.deduplicated);
+        assert_eq!(actions.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(*actions.value.lock().unwrap(), "newer local clipboard");
+        Ok(())
+    }
     struct CountingActions(AtomicU64);
     #[async_trait::async_trait]
     impl PcActions for CountingActions {
@@ -5373,7 +6585,10 @@ mod tests {
         core.store
             .pair(device.clone(), Hash::new(crate::random_hex(32))?)
             .await?;
-        *core.action_scope.lock().unwrap() = Some((device.clone(), ActionScope::new()));
+        core.action_scope
+            .lock()
+            .unwrap()
+            .insert(device.clone(), ActionScope::new());
         Ok((dir, core, device))
     }
     fn test_begin(bytes: &[u8]) -> FileBegin {
@@ -5610,19 +6825,23 @@ mod tests {
             .action_scope
             .lock()
             .unwrap()
-            .as_ref()
+            .get(&device)
             .unwrap()
-            .1
             .clone();
         scope.connection_generation.store(1, Ordering::SeqCst);
         let (close, _closed) = watch::channel(None);
-        core.sessions.lock().unwrap().session = Some(Session {
-            device: device.clone(),
-            id: 1,
-            close,
-            wake: Arc::new(Notify::new()),
-            paused: false,
-        });
+        core.sessions.lock().unwrap().sessions.insert(
+            device.clone(),
+            Session {
+                device: device.clone(),
+                id: 1,
+                close,
+                wake: Arc::new(Notify::new()),
+                paused: false,
+                capabilities: vec!["clipboard_text".into(), "clipboard_image".into()],
+                phone: crate::ui::Phone::default(),
+            },
+        );
         let mut store = core.store.with_current_pairing();
         store.connection_id = Some(1);
         let text = Clipboard {
@@ -5711,12 +6930,19 @@ mod tests {
             .action_scope
             .lock()
             .unwrap()
-            .as_ref()
+            .get(&device)
             .unwrap()
-            .1
             .clone();
         let mut old_store = core.store.with_current_pairing();
-        old_store.connection_id = Some(core.sessions.lock().unwrap().session.as_ref().unwrap().id);
+        old_store.connection_id = Some(
+            core.sessions
+                .lock()
+                .unwrap()
+                .sessions
+                .get(&device)
+                .unwrap()
+                .id,
+        );
         let text = phone.text("replayed operation".into(), ClipboardOrigin::Clipboard)?;
         let (entered, wait) = tokio::sync::oneshot::channel();
         let (release, blocked) = std::sync::mpsc::channel();
@@ -5805,24 +7031,28 @@ mod tests {
             .action_scope
             .lock()
             .unwrap()
-            .as_ref()
+            .get(&device)
             .unwrap()
-            .1
             .clone();
         let (close, _closed) = watch::channel(None);
-        core.sessions.lock().unwrap().session = Some(Session {
-            device: device.clone(),
-            id: 1,
-            close,
-            wake: Arc::new(Notify::new()),
-            paused: false,
-        });
+        core.sessions.lock().unwrap().sessions.insert(
+            device.clone(),
+            Session {
+                device: device.clone(),
+                id: 1,
+                close,
+                wake: Arc::new(Notify::new()),
+                paused: false,
+                capabilities: vec!["clipboard_text".into(), "clipboard_image".into()],
+                phone: crate::ui::Phone::default(),
+            },
+        );
         scope.connection_generation.store(1, Ordering::SeqCst);
         let job = ActionJob {
             file: ReceivedFile::from_file(dir.path().join("image.png"), tempfile::tempfile()?)?,
             scope: scope.clone(),
             origin: ActionOrigin {
-                device,
+                device: device.clone(),
                 connection_id: Some(1),
             },
             path: dir.path().join("image.png"),
@@ -5847,7 +7077,13 @@ mod tests {
                 .await
         });
         tokio::task::yield_now().await;
-        core.sessions.lock().unwrap().session.as_mut().unwrap().id = 2;
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&device)
+            .unwrap()
+            .id = 2;
         scope.connection_generation.store(2, Ordering::SeqCst);
         drop(active);
         worker.await?;
@@ -5891,9 +7127,8 @@ mod tests {
             .action_scope
             .lock()
             .unwrap()
-            .as_ref()
+            .get(&device)
             .unwrap()
-            .1
             .clone();
         let (entered, wait) = tokio::sync::oneshot::channel();
         let (release, blocked) = std::sync::mpsc::channel();
@@ -6072,7 +7307,8 @@ mod tests {
     async fn unpair_confirmation_for_replaced_phone_cannot_remove_current_binding() -> Result<()> {
         let (_dir, core, displayed) = fixture(Arc::new(NoActions)).await?;
         core.admission.lock().unwrap().peers = core.store.peers().await?;
-        // The window captured displayed before the CLI paired another device.
+        // The window captured displayed before it was unpaired elsewhere.
+        core.unpair_device(displayed.clone()).await?;
         let invitation = core
             .start_pairing_with_addresses(vec!["127.0.0.1:47821".into()])
             .await?;
@@ -6085,18 +7321,24 @@ mod tests {
             .action_scope
             .lock()
             .unwrap()
-            .as_ref()
+            .get(&replacement)
             .unwrap()
-            .1
             .clone();
         let mut events = core.subscribe();
         core.unpair_device(displayed).await?;
-        assert_eq!(core.paired_devices(), vec![replacement]);
+        assert_eq!(core.paired_devices(), vec![replacement.clone()]);
         assert_eq!(
             core.store.peers().await?,
             core.admission.lock().unwrap().peers
         );
-        assert!(!core.sessions.lock().unwrap().unpairing);
+        assert!(
+            !core
+                .sessions
+                .lock()
+                .unwrap()
+                .unpairing
+                .contains(&replacement)
+        );
         assert!(!*scope.cancelled.borrow());
         assert!(events.try_recv().is_err());
         core.shutdown_actions().await?;
@@ -6108,7 +7350,10 @@ mod tests {
         let peers = core.store.peers().await?;
         core.admission.lock().unwrap().peers = peers;
         let admitted = ActionScope::new();
-        *core.action_scope.lock().unwrap() = Some((device.clone(), admitted.clone()));
+        core.action_scope
+            .lock()
+            .unwrap()
+            .insert(device.clone(), admitted.clone());
         let invitation = core
             .start_pairing_with_addresses(vec!["127.0.0.1:47821".into()])
             .await?;
@@ -6124,9 +7369,8 @@ mod tests {
             .action_scope
             .lock()
             .unwrap()
-            .as_ref()
+            .get(&device)
             .unwrap()
-            .1
             .clone();
         assert!(!*replacement.cancelled.borrow());
         for kind in [FileKind::Screenshot, FileKind::ClipboardImage] {
@@ -6159,13 +7403,18 @@ mod tests {
         let peers = core.store.peers().await?;
         core.admission.lock().unwrap().peers = peers;
         let (close, _closed) = watch::channel(None);
-        core.sessions.lock().unwrap().session = Some(Session {
-            device: device.clone(),
-            id: 1,
-            close,
-            wake: Arc::new(Notify::new()),
-            paused: false,
-        });
+        core.sessions.lock().unwrap().sessions.insert(
+            device.clone(),
+            Session {
+                device: device.clone(),
+                id: 1,
+                close,
+                wake: Arc::new(Notify::new()),
+                paused: false,
+                capabilities: vec!["clipboard_text".into(), "clipboard_image".into()],
+                phone: crate::ui::Phone::default(),
+            },
+        );
         core.store.call(|c| {
             c.execute_batch("CREATE TEMP TABLE enqueues(id TEXT,created_at INTEGER);
                 CREATE TEMP TRIGGER record_enqueue AFTER INSERT ON outgoing BEGIN
@@ -6230,9 +7479,8 @@ mod tests {
                 .action_scope
                 .lock()
                 .unwrap()
-                .as_ref()
+                .get(&device)
                 .unwrap()
-                .1
                 .clone();
             let epoch = core.store.with_current_pairing();
             core.store
@@ -6261,7 +7509,9 @@ mod tests {
             let unpair_core = core.clone();
             let peer = device.clone();
             let task = tokio::spawn(async move { unpair_core.unpair_device(peer).await });
-            while !core.sessions.lock().unwrap().unpairing || core.store.active_jobs() < 2 {
+            while !core.sessions.lock().unwrap().unpairing.contains(&device)
+                || core.store.active_jobs() < 2
+            {
                 tokio::task::yield_now().await;
             }
             if cancel {
@@ -6276,7 +7526,7 @@ mod tests {
             }
             core.store.drain().await;
             assert!(!core.ui_snapshot().receiving);
-            assert!(core.ui.lock().unwrap().receiving_until.is_none());
+            assert!(core.ui.lock().unwrap().receiving_until.is_empty());
             let phone_metadata: crate::ui::Phone =
                 serde_json::from_slice(&std::fs::read(core.paths.data.join("phone.json"))?)?;
             assert_eq!(phone_metadata.last_seen, core.ui_snapshot().phone.last_seen);
@@ -6295,8 +7545,8 @@ mod tests {
                 phone.directory.join("binding.json").exists(),
                 "failed unpair told phone to forget trust"
             );
-            assert!(!core.sessions.lock().unwrap().unpairing);
-            assert!(core.sessions.lock().unwrap().session.is_none());
+            assert!(!core.sessions.lock().unwrap().unpairing.contains(&device));
+            assert!(core.sessions.lock().unwrap().sessions.is_empty());
             assert_eq!(core.paired_devices(), vec![device.clone()]);
             assert_eq!(
                 core.store.peers().await?.get(&phone.identity.fingerprint),
@@ -6311,9 +7561,8 @@ mod tests {
                 .action_scope
                 .lock()
                 .unwrap()
-                .as_ref()
+                .get(&device)
                 .unwrap()
-                .1
                 .clone();
             assert!(!*fresh.cancelled.borrow());
             assert!(!Arc::ptr_eq(&old.active, &fresh.active));
@@ -6357,15 +7606,23 @@ mod tests {
             let bindings = core.store.peers().await?;
             core.admission.lock().unwrap().peers = bindings.clone();
             let scope = ActionScope::new();
-            *core.action_scope.lock().unwrap() = Some((device.clone(), scope.clone()));
+            core.action_scope
+                .lock()
+                .unwrap()
+                .insert(device.clone(), scope.clone());
             let (close, closed) = watch::channel(None);
-            core.sessions.lock().unwrap().session = Some(Session {
-                device: device.clone(),
-                id: 1,
-                close,
-                wake: Arc::new(Notify::new()),
-                paused: false,
-            });
+            core.sessions.lock().unwrap().sessions.insert(
+                device.clone(),
+                Session {
+                    device: device.clone(),
+                    id: 1,
+                    close,
+                    wake: Arc::new(Notify::new()),
+                    paused: false,
+                    capabilities: vec!["clipboard_text".into(), "clipboard_image".into()],
+                    phone: crate::ui::Phone::default(),
+                },
+            );
             let invitation = core
                 .start_pairing_with_addresses(vec!["127.0.0.1:47821".into()])
                 .await?;
@@ -6426,16 +7683,28 @@ mod tests {
                     .token,
                 invitation.token
             );
-            assert!(!core.sessions.lock().unwrap().unpairing);
+            assert!(!core.sessions.lock().unwrap().unpairing.contains(&device));
             assert_eq!(
-                core.sessions.lock().unwrap().session.as_ref().unwrap().id,
+                core.sessions
+                    .lock()
+                    .unwrap()
+                    .sessions
+                    .get(&device)
+                    .unwrap()
+                    .id,
                 1
             );
             assert!(closed.borrow().is_none());
             assert!(!*scope.cancelled.borrow());
             assert!(Arc::ptr_eq(
                 &scope.active,
-                &core.action_scope.lock().unwrap().as_ref().unwrap().1.active
+                &core
+                    .action_scope
+                    .lock()
+                    .unwrap()
+                    .get(&device)
+                    .unwrap()
+                    .active
             ));
             assert!(epoch.first_outgoing(device.clone()).await.is_ok());
             core.store
@@ -6560,6 +7829,179 @@ mod tests {
         assert_eq!(core.paired_devices(), vec![device]);
         Ok(())
     }
+    #[test]
+    fn canceled_phone_cache_writes_keep_their_blocking_capacity() -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
+            let (entered, wait) = tokio::sync::oneshot::channel();
+            let (release, blocking) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = entered.send(());
+                let _ = blocking.recv();
+            });
+            wait.await?;
+            let mut maximum = 0;
+            for id in 1..=200 {
+                let _connection = admit_ui_test_phone(&core, &device, id)?;
+                // Poll once, then cancel exactly as a replaced connection does.
+                let mut write = Box::pin(core.persist_phone(id));
+                assert!(futures_util::poll!(write.as_mut()).is_pending());
+                drop(write);
+                maximum = maximum.max(core.store.active_jobs());
+            }
+            release.send(())?;
+            blocker.await?;
+            core.persist_phone(200).await?;
+            core.store.drain().await;
+            let phones: HashMap<Id, crate::ui::Phone> =
+                serde_json::from_slice(&std::fs::read(core.paths.data.join("phones.json"))?)?;
+            core.shutdown_actions().await?;
+            assert!(maximum <= crate::work::BLOCKING_LIMIT);
+            assert_eq!(phones[&device].name, "Phone 200");
+            Ok(())
+        })
+    }
+    #[test]
+    fn reconnect_storm_bounds_store_jobs_and_preserves_other_device_progress() -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let (dir, core, other) = fixture(Arc::new(NoActions)).await?;
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            let server = tokio::spawn(core.clone().serve(listener, false));
+            let phone = crate::client::Phone::new(dir.path().join("phone"))?;
+            let invitation = core.start_pairing_with_addresses(vec![address.to_string()]).await?;
+            let mut initial = phone.pair(&invitation).await?;
+            let ping = Ping { nonce: Nonce::new("d".repeat(16))? };
+            initial.write(&Message::Ping(ping.clone())).await?;
+            assert_eq!(initial.read(Duration::from_secs(2)).await?, Message::Pong(ping));
+            core.store.drain().await;
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(crate::tls::client_config(
+                &phone.identity, core.identity.fingerprint.clone(),
+            )?));
+            let (entered, wait) = tokio::sync::oneshot::channel();
+            let (release, blocking) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = entered.send(());
+                let _ = blocking.recv();
+            });
+            wait.await?;
+            let mut release = Some(release);
+            let mut operation = None;
+            let mut progress = None;
+            let mut latest = None;
+            let mut maximum = 0;
+            let mut maximum_admitted = 0;
+            let outcome: Result<()> = async {
+                for index in 0..240 {
+                    if index == 100 {
+                        let store = core.store.clone();
+                        let device = other.clone();
+                        operation = Some(tokio::spawn(async move {
+                            store.enqueue_clipboard(device, "another device".into()).await
+                        }));
+                    }
+                    if index == 200 {
+                        // Keep the producer running after release while an
+                        // independent timer checks the other device's progress.
+                        release.take().unwrap().send(())?;
+                        let mut operation = operation.take().unwrap();
+                        progress = Some(tokio::spawn(async move {
+                            let result = tokio::time::timeout(Duration::from_secs(2), &mut operation).await;
+                            if result.is_err() {
+                                operation.abort();
+                                let _ = operation.await;
+                            }
+                            result
+                        }));
+                    }
+                    let mut events = core.subscribe();
+                    let stream = TcpStream::connect(address).await?;
+                    let mut tls = connector.connect(
+                        rustls::pki_types::ServerName::try_from("pneu.local")?, stream,
+                    ).await?;
+                    write_frame(&mut tls, &Message::Hello(Hello {
+                        role: Some(DeviceRole::Computer),
+                        addresses: Some(vec![format!("127.0.0.1:{}", 10000 + index)]),
+                        version: 1,
+                        device_id: phone.identity.device_id.clone(),
+                        name: format!("Reconnect {index}"),
+                        capabilities: vec!["clipboard_text".into()],
+                        paused: Some(false),
+                    })).await?;
+                    ensure!(matches!(read_frame(&mut tls).await?, Some(Message::Hello(_))), "HELLO");
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while !matches!(events.recv().await?, Event::ConnectionChanged { device, connected: true } if device == phone.identity.device_id) {}
+                        Ok::<_, anyhow::Error>(())
+                    }).await??;
+                    // Let the connection submit its metadata before sampling.
+                    tokio::task::yield_now().await;
+                    if index < 200 {
+                        maximum = maximum.max(core.store.active_jobs());
+                        maximum_admitted = maximum_admitted.max(core.store.admitted_jobs());
+                        assert!(core.phone_writes.lock().unwrap().pending.len() <= 1,
+                            "reconnect metadata did not coalesce per peer");
+                    }
+                    latest = Some(tls);
+                }
+                Ok(())
+            }.await;
+            if let Some(release) = release {
+                let _ = release.send(());
+            }
+            blocker.await?;
+            if let Some(operation) = operation {
+                operation.await??;
+            }
+            let progress = match progress {
+                Some(progress) => Some(progress.await?),
+                None => None,
+            };
+            let ready = tokio::time::timeout(Duration::from_secs(2), async {
+                let latest = latest.as_mut().context("latest connection")?;
+                let ping = Ping { nonce: Nonce::new("e".repeat(16))? };
+                write_frame(latest, &Message::Ping(ping.clone())).await?;
+                ensure!(read_frame(latest).await? == Some(Message::Pong(ping)), "latest READY");
+                Ok(())
+            }).await;
+            core.store.drain().await;
+            let saved: Result<(String, String)> = core.store.call(move |c| {
+                Ok(c.query_row("SELECT name,addresses FROM peers WHERE id=?", [phone.identity.device_id.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))?)
+            }).await;
+            let cache: Result<crate::ui::Phone> = (|| {
+                Ok(serde_json::from_slice(&std::fs::read(core.paths.data.join("phone.json"))?)?)
+            })();
+            core.request_shutdown();
+            let stopped = tokio::time::timeout(Duration::from_secs(5), server).await;
+            drop((initial, latest));
+            outcome?;
+            let progress = progress.context("other device progress")?;
+            let operation = progress.context("other device stalled")?;
+            operation??;
+            ready??;
+            stopped???;
+            assert!(maximum_admitted <= crate::work::BLOCKING_LIMIT,
+                "reconnects retained {maximum_admitted} normal admissions");
+            // One coalesced, uncancelable metadata continuation can coexist
+            // with the 16 normal admissions while the blocking pool is stalled.
+            assert!(maximum <= crate::work::BLOCKING_LIMIT + 1,
+                "reconnects queued {maximum} blocking jobs");
+            assert_eq!(saved?, ("Reconnect 239".into(), "[\"127.0.0.1:10239\"]".into()));
+            assert_eq!(cache?.name, "Reconnect 239");
+            let final_cache: crate::ui::Phone = serde_json::from_slice(&std::fs::read(core.paths.data.join("phone.json"))?)?;
+            assert_eq!(final_cache.last_seen, core.ui_snapshot().phone.last_seen);
+            Ok(())
+        })
+    }
     #[tokio::test]
     async fn status_traffic_reuses_one_blocked_outgoing_query() -> Result<()> {
         let (dir, core, _) = fixture(Arc::new(NoActions)).await?;
@@ -6645,8 +8087,9 @@ mod tests {
         wait.await?;
         let unpair_core = core.clone();
         let device = phone.identity.device_id.clone();
-        let unpair = tokio::spawn(async move { unpair_core.unpair_device(device).await });
-        while !core.sessions.lock().unwrap().unpairing {
+        let unpair_device = device.clone();
+        let unpair = tokio::spawn(async move { unpair_core.unpair_device(unpair_device).await });
+        while !core.sessions.lock().unwrap().unpairing.contains(&device) {
             tokio::task::yield_now().await;
         }
         let still_connected = core.phone_paused(&phone.identity.device_id) == Some(false);
@@ -6728,13 +8171,19 @@ mod tests {
                 .await
         });
         tokio::task::yield_now().await;
-        core.sessions.lock().unwrap().session.as_mut().unwrap().id = 2;
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&device)
+            .unwrap()
+            .id = 2;
         drop(guard);
         assert!(!task.await??);
         assert!(events.try_recv().is_err());
         assert_eq!(core.phone_paused(&device), Some(false));
         assert!(!core.store.peers().await?.is_empty());
-        assert!(!core.sessions.lock().unwrap().unpairing);
+        assert!(!core.sessions.lock().unwrap().unpairing.contains(&device));
         assert!(
             !core
                 .forget_pairing(
@@ -6786,7 +8235,9 @@ mod tests {
                     )
                     .await
             });
-            while !core.sessions.lock().unwrap().unpairing || core.store.active_jobs() < 2 {
+            while !core.sessions.lock().unwrap().unpairing.contains(&device)
+                || core.store.active_jobs() < 2
+            {
                 tokio::task::yield_now().await;
             }
             if mode == "cancelled" {
@@ -6836,17 +8287,27 @@ mod tests {
             .lock()
             .unwrap()
             .peers
+            .retain(|_, id| *id != device);
+        core.admission
+            .lock()
+            .unwrap()
+            .peers
             .insert(Hash::new(crate::random_hex(32))?, device.clone());
-        core.sessions.lock().unwrap().session = Some(Session {
-            device: device.clone(),
-            id: 2,
-            close,
-            wake: Arc::new(Notify::new()),
-            paused: false,
-        });
+        core.sessions.lock().unwrap().sessions.insert(
+            device.clone(),
+            Session {
+                device: device.clone(),
+                id: 2,
+                close,
+                wake: Arc::new(Notify::new()),
+                paused: false,
+                capabilities: vec!["clipboard_text".into(), "clipboard_image".into()],
+                phone: crate::ui::Phone::default(),
+            },
+        );
         let mut events = core.subscribe();
         core.unpair_device(Id::new(crate::random_hex(16))?).await?;
-        assert!(!core.sessions.lock().unwrap().unpairing);
+        assert!(!core.sessions.lock().unwrap().unpairing.contains(&device));
         let mut old = core.store.clone();
         old.connection_id = Some(1);
         core.connection_event(
@@ -6913,7 +8374,10 @@ mod tests {
         let actions = Arc::new(TimeoutImageActions::default());
         let (dir, core, device) = fixture(actions.clone()).await?;
         let scope = ActionScope::new();
-        *core.action_scope.lock().unwrap() = Some((device.clone(), scope.clone()));
+        core.action_scope
+            .lock()
+            .unwrap()
+            .insert(device.clone(), scope.clone());
         let mut config = core.config();
         config.open_in_viewer = true;
         config.copy_image_to_clipboard = true;
@@ -6943,6 +8407,71 @@ mod tests {
             &*actions.opened.lock().unwrap(),
             &[dir.path().join("latest.png")]
         );
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn legacy_incoming_clock_and_ids_are_independent_between_peers() -> Result<()> {
+        let actions = Arc::new(CountingActions(AtomicU64::new(0)));
+        let (_dir, core, a) = fixture(actions.clone()).await?;
+        let b = Id::from_bytes([2; 16]);
+        core.store
+            .pair(b.clone(), Hash::new(crate::random_hex(32))?)
+            .await?;
+        core.action_scope
+            .lock()
+            .unwrap()
+            .insert(b.clone(), ActionScope::new());
+        let shared = Id::from_bytes([3; 16]);
+        let (tx, mut rx) = mpsc::channel(8);
+        for (device, timestamp, value) in [(&a, 100, "from A"), (&b, 1, "from B")] {
+            core.receive_test(
+                &core.store,
+                device,
+                Message::Clipboard(Clipboard {
+                    hlc: None,
+                    source_device: None,
+                    transfer_id: shared.clone(),
+                    text: value.into(),
+                    created_at: timestamp,
+                    origin: ClipboardOrigin::Clipboard,
+                }),
+                &mut None,
+                &tx,
+            )
+            .await?;
+            assert!(matches!(
+                rx.recv().await,
+                Some(Message::Ack(Ack {
+                    deduplicated: false,
+                    ..
+                }))
+            ));
+        }
+        assert_eq!(actions.0.load(Ordering::SeqCst), 2);
+        core.receive_test(
+            &core.store,
+            &a,
+            Message::Clipboard(Clipboard {
+                hlc: None,
+                source_device: None,
+                transfer_id: Id::from_bytes([4; 16]),
+                text: "stale A".into(),
+                created_at: 99,
+                origin: ClipboardOrigin::Clipboard,
+            }),
+            &mut None,
+            &tx,
+        )
+        .await?;
+        assert!(matches!(
+            rx.recv().await,
+            Some(Message::Ack(Ack {
+                deduplicated: true,
+                ..
+            }))
+        ));
+        assert_eq!(actions.0.load(Ordering::SeqCst), 2);
         core.shutdown_actions().await?;
         Ok(())
     }

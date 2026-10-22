@@ -275,7 +275,7 @@ impl DesktopActions {
         let bytes = if let Some(file) = file {
             let file = file.clone();
             Some(
-                crate::work::start_blocking(vec![self.jobs.clone()], move || {
+                crate::work::blocking(self.jobs.clone(), move || {
                     file.read_bounded(16 * 1024 * 1024)
                 })
                 .await??,
@@ -343,7 +343,7 @@ impl DesktopActions {
         file: &ReceivedFile,
     ) -> Result<(i32, i32, i32, bool, i32, i32, Vec<u8>)> {
         let file = file.clone();
-        crate::work::start_blocking(vec![self.jobs.clone()], move || {
+        crate::work::blocking(self.jobs.clone(), move || {
             let image = decode_image(&file.read_bounded(16 * 1024 * 1024)?)?
                 .thumbnail(256, 256)
                 .to_rgba8();

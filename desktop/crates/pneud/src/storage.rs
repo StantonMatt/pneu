@@ -394,7 +394,7 @@ impl Drop for StageInner {
                 // Register cleanup before releasing the stage's work token:
                 // even unobserved blocking-task results cannot escape drain().
                 let token = cleanup._work;
-                drop(cleanup.store.start_blocking(move |_| {
+                drop(cleanup.store.start_cleanup(move |_| {
                     let _lifecycle = token;
                     clean()
                 }));
