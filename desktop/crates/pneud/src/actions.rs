@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use std::{
@@ -96,6 +96,146 @@ impl ReceivedFile {
     }
 }
 
+/// Private, anonymous backing for normalized clipboard bytes. Keep a fallback
+/// for cache filesystems that do not implement O_TMPFILE.
+fn clipboard_file(cache: &Path) -> Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+    let directory = rustix::fs::open(
+        cache,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    match rustix::fs::openat(
+        &directory,
+        ".",
+        OFlags::TMPFILE | OFlags::RDWR | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    ) {
+        Ok(file) => Ok(file.into()),
+        Err(rustix::io::Errno::OPNOTSUPP | rustix::io::Errno::ISDIR | rustix::io::Errno::NOENT) => {
+            unlinked_clipboard_file(&directory)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+fn unlinked_clipboard_file(directory: &impl std::os::fd::AsFd) -> Result<std::fs::File> {
+    use rustix::fs::{AtFlags, Mode, OFlags};
+    for _ in 0..128 {
+        let name = format!(".pneu-clipboard-{}", crate::random_hex(16));
+        match rustix::fs::openat(
+            directory,
+            &name,
+            OFlags::CREATE | OFlags::EXCL | OFlags::RDWR | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        ) {
+            Ok(file) => {
+                rustix::fs::unlinkat(directory, &name, AtFlags::empty())?;
+                return Ok(file.into());
+            }
+            Err(rustix::io::Errno::EXIST) => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    anyhow::bail!("could not allocate anonymous clipboard file")
+}
+
+/// Data-bearing inputs stay anchored while preparation runs outside the actor.
+#[derive(Clone, Debug)]
+pub enum ClipboardInput {
+    Text(String),
+    Image(ReceivedFile, String),
+    Bytes {
+        bytes: Vec<u8>,
+        mime: String,
+        cache: PathBuf,
+    },
+    Formats {
+        text: String,
+        png: Vec<u8>,
+        cache: PathBuf,
+    },
+}
+/// A prepared helper is inert until the actor authorizes its ticket. Only the
+/// driver owns this value; dropping it kills and schedules reaping of the child.
+pub struct PreparedClipboard {
+    pub hashes: Vec<[u8; 32]>,
+    pub marker_confirmation: bool,
+    input: ClipboardInput,
+    helper: Option<ClipboardCandidate>,
+    #[cfg(test)]
+    pub(crate) test_exited: bool,
+}
+impl PreparedClipboard {
+    pub fn immediate(input: ClipboardInput) -> Result<Self> {
+        use sha2::{Digest, Sha256};
+        use std::io::Write;
+        let (input, hashes) = match input {
+            ClipboardInput::Text(text) => {
+                let hashes = vec![Sha256::digest(text.as_bytes()).into()];
+                (ClipboardInput::Text(text), hashes)
+            }
+            ClipboardInput::Image(file, mime) => {
+                let hashes = vec![Sha256::digest(file.read_bounded(16 * 1024 * 1024)?).into()];
+                (ClipboardInput::Image(file, mime), hashes)
+            }
+            ClipboardInput::Bytes { bytes, mime, cache } => {
+                let hashes = vec![Sha256::digest(&bytes).into()];
+                let mut file = clipboard_file(&cache)?;
+                file.write_all(&bytes)?;
+                (
+                    ClipboardInput::Image(
+                        ReceivedFile::from_file(cache.join("clipboard.png"), file)?,
+                        mime,
+                    ),
+                    hashes,
+                )
+            }
+            ClipboardInput::Formats { text, png, cache } => {
+                let hashes = vec![
+                    Sha256::digest(text.as_bytes()).into(),
+                    Sha256::digest(&png).into(),
+                ];
+                let mut file = clipboard_file(&cache)?;
+                file.write_all(&png)?;
+                (
+                    ClipboardInput::Image(
+                        ReceivedFile::from_file(cache.join("clipboard.png"), file)?,
+                        "image/png".into(),
+                    ),
+                    hashes,
+                )
+            }
+        };
+        Ok(Self {
+            hashes,
+            marker_confirmation: false,
+            input,
+            helper: None,
+            #[cfg(test)]
+            test_exited: false,
+        })
+    }
+    pub fn input(&self) -> &ClipboardInput {
+        &self.input
+    }
+    pub(crate) async fn wait_exit(&mut self) {
+        #[cfg(test)]
+        if self.test_exited {
+            return;
+        }
+        if let Some(child) = self.helper.as_mut().and_then(|h| h.child.as_mut()) {
+            let _ = child.wait().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    }
+    pub(crate) async fn stop(&mut self) {
+        if let Some(helper) = &mut self.helper {
+            helper.stop().await;
+        }
+        self.helper.take();
+    }
+}
 #[async_trait]
 pub trait PcActions: Send + Sync {
     async fn clipboard_text(&self, text: &str) -> Result<()>;
@@ -110,6 +250,24 @@ pub trait PcActions: Send + Sync {
     async fn clipboard_received(&self, file: &ReceivedFile, mime: &str) -> Result<()> {
         self.clipboard_image(file.path(), mime).await
     }
+    /// Preparation never changes the OS selection. Lightweight/mock backends
+    /// use an immediate candidate; the real helper reports its offered hashes.
+    async fn prepare_clipboard(
+        &self,
+        input: ClipboardInput,
+        _ticket: u128,
+    ) -> Result<PreparedClipboard> {
+        tokio::task::spawn_blocking(move || PreparedClipboard::immediate(input)).await?
+    }
+    async fn install_clipboard(&self, prepared: &mut PreparedClipboard) -> Result<()> {
+        match &prepared.input {
+            ClipboardInput::Text(text) => self.clipboard_text(text).await,
+            ClipboardInput::Image(file, mime) => self.clipboard_received(file, mime).await,
+            _ => anyhow::bail!("unnormalized clipboard candidate"),
+        }
+    }
+    /// Presentation bookkeeping after the actor confirms the OS selection.
+    async fn record_clipboard_copy(&self, _file: &ReceivedFile) {}
     async fn notify_received(&self, file: &ReceivedFile, mime: &str) -> Result<()> {
         self.notify(file.path(), mime).await
     }
@@ -178,6 +336,7 @@ pub trait PcActions: Send + Sync {
     async fn notify_text(&self, _text: &str) -> Result<()> {
         Ok(())
     }
+    async fn drain_clipboard(&self) {}
     async fn shutdown(&self) -> Result<()> {
         Ok(())
     }
@@ -187,19 +346,45 @@ pub trait PcActions: Send + Sync {
 /// its unavoidable buffers. The helper then serves the
 /// data-control selection without a fork from a multithreaded Tokio process.
 pub struct DesktopActions {
-    clipboard: Mutex<Option<Child>>,
-    clipboard_gate: Mutex<()>,
     cache: PathBuf,
     notifications: Mutex<Option<Notifications>>,
     jobs: Arc<crate::work::Work>,
-    pub echo: Arc<crate::ui::clipboard::EchoGuard>,
     commands: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<crate::ui::Command>>>>,
     copy_results: Mutex<HashMap<PathBuf, bool>>,
     burst: Mutex<Option<Burst>>,
     #[cfg(test)]
     bus: Option<zbus::Connection>,
     #[cfg(test)]
-    helper: Option<PathBuf>,
+    helper: Option<(PathBuf, Vec<String>)>,
+    #[cfg(test)]
+    helper_timeout: std::time::Duration,
+}
+
+struct ClipboardCandidate {
+    child: Option<Child>,
+    input: Option<tokio::process::ChildStdin>,
+    jobs: Arc<crate::work::Work>,
+}
+impl ClipboardCandidate {
+    async fn stop(&mut self) {
+        self.input.take();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+    }
+}
+impl Drop for ClipboardCandidate {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+            let owned = crate::work::track(vec![self.jobs.clone()]);
+            tokio::spawn(async move {
+                let _owned = owned;
+                let _ = child.wait().await;
+            });
+        }
+    }
 }
 #[derive(Clone)]
 struct Target {
@@ -247,12 +432,9 @@ fn remember_notification(paths: &mut HashMap<u32, ReceivedFile>, id: u32, path: 
 impl DesktopActions {
     pub fn new(cache: PathBuf) -> Self {
         Self {
-            clipboard: Mutex::new(None),
-            clipboard_gate: Mutex::new(()),
             cache,
             notifications: Mutex::new(None),
             jobs: Arc::new(crate::work::Work::default()),
-            echo: Arc::new(crate::ui::clipboard::EchoGuard::default()),
             commands: Arc::new(std::sync::Mutex::new(None)),
             copy_results: Mutex::new(HashMap::new()),
             burst: Mutex::new(None),
@@ -260,83 +442,98 @@ impl DesktopActions {
             bus: None,
             #[cfg(test)]
             helper: None,
+            #[cfg(test)]
+            helper_timeout: std::time::Duration::from_secs(10),
         }
     }
     pub fn set_commands(&self, commands: tokio::sync::mpsc::Sender<crate::ui::Command>) {
         *self.commands.lock().expect("UI commands") = Some(commands);
     }
-    async fn copy(
-        &self,
-        file: Option<&ReceivedFile>,
-        text: Option<&str>,
-        mime: &str,
-    ) -> Result<()> {
-        let _guard = self.clipboard_gate.lock().await;
-        let bytes = if let Some(file) = file {
-            let file = file.clone();
-            Some(
-                crate::work::blocking(self.jobs.clone(), move || {
+    async fn prepare_copy(&self, input: ClipboardInput, ticket: u128) -> Result<PreparedClipboard> {
+        let (mime, bytes) = match &input {
+            ClipboardInput::Text(text) => (
+                "text/plain;charset=utf-8".to_owned(),
+                text.as_bytes().to_vec(),
+            ),
+            ClipboardInput::Image(file, mime) => {
+                let file = file.clone();
+                let bytes = crate::work::blocking(self.jobs.clone(), move || {
                     file.read_bounded(16 * 1024 * 1024)
                 })
-                .await??,
-            )
-        } else {
-            None
+                .await??;
+                (mime.clone(), bytes)
+            }
+            ClipboardInput::Bytes { bytes, mime, .. } => (mime.clone(), bytes.clone()),
+            ClipboardInput::Formats { text, png, .. } => {
+                let mut bytes = (text.len() as u64).to_be_bytes().to_vec();
+                bytes.extend_from_slice(text.as_bytes());
+                bytes.extend_from_slice(png);
+                ("application/x-pneu-formats".into(), bytes)
+            }
         };
-        use sha2::{Digest, Sha256};
-        // Prepare the candidate hashes without altering the successful selection.
-        let mut hashes = Vec::new();
-        if let Some(bytes) = &bytes {
-            hashes.push(Sha256::digest(bytes).into());
-        }
-        if let Some(text) = text {
-            hashes.push(Sha256::digest(text.as_bytes()).into());
-        }
-        let executable = std::env::current_exe()?;
+        let mut command = Command::new(std::env::current_exe()?);
         #[cfg(test)]
-        let executable = self.helper.clone().unwrap_or(executable);
-        let mut command = Command::new(executable);
+        if let Some((executable, args)) = &self.helper {
+            command = Command::new(executable);
+            command.args(args);
+        }
         command
             .arg("clipboard-helper")
             .arg(mime)
+            .arg(ticket.to_string())
             .env("TMPDIR", &self.cache)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null())
             .kill_on_drop(true);
         let mut child = command.spawn()?;
-        let mut input = child.stdin.take().context("helper stdin")?;
-        if let Some(bytes) = bytes {
-            input.write_all(&bytes).await?;
-        }
-        if let Some(text) = text {
-            input.write_all(text.as_bytes()).await?;
-        }
-        drop(input);
-        let mut output = BufReader::new(child.stdout.take().context("helper stdout")?.take(256));
-        let mut line = String::new();
-        let ready = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            output.read_line(&mut line),
-        )
-        .await;
-        if !matches!(ready, Ok(Ok(n)) if n > 0) || line.split_whitespace().next() != Some("READY") {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            bail!("Wayland data-control clipboard unavailable");
-        }
-        for hash in line.split_whitespace().skip(1) {
-            let mut digest = [0; 32];
-            if hex::decode_to_slice(hash, &mut digest).is_ok() {
+        let input_pipe = child.stdin.take().context("helper stdin")?;
+        let mut output = BufReader::new(child.stdout.take().context("helper stdout")?.take(1024));
+        let mut candidate = ClipboardCandidate {
+            child: Some(child),
+            input: Some(input_pipe),
+            jobs: self.jobs.clone(),
+        };
+        #[cfg(not(test))]
+        let timeout = std::time::Duration::from_secs(10);
+        #[cfg(test)]
+        let timeout = self.helper_timeout;
+        let result = tokio::time::timeout(timeout, async {
+            let pipe = candidate.input.as_mut().context("helper stdin")?;
+            pipe.write_all(&(bytes.len() as u64).to_be_bytes()).await?;
+            pipe.write_all(&bytes).await?;
+            let mut line = String::new();
+            let n = output.read_line(&mut line).await?;
+            anyhow::ensure!(n > 0 && line.ends_with('\n'), "missing clipboard READY");
+            let mut fields = line.split_whitespace();
+            anyhow::ensure!(fields.next() == Some("READY"), "invalid clipboard READY");
+            let mut hashes = Vec::new();
+            for hash in fields {
+                anyhow::ensure!(hashes.len() < 8, "too many clipboard hashes");
+                let mut digest = [0; 32];
+                hex::decode_to_slice(hash, &mut digest).context("invalid clipboard hash")?;
                 hashes.push(digest);
             }
+            anyhow::ensure!(!hashes.is_empty(), "missing clipboard fingerprints");
+            Ok::<_, anyhow::Error>(hashes)
+        })
+        .await
+        .context("clipboard preparation timed out")
+        .and_then(|r| r);
+        match result {
+            Ok(hashes) => Ok(PreparedClipboard {
+                hashes,
+                marker_confirmation: true,
+                input,
+                helper: Some(candidate),
+                #[cfg(test)]
+                test_exited: false,
+            }),
+            Err(error) => {
+                candidate.stop().await;
+                Err(error.context("Wayland data-control clipboard unavailable"))
+            }
         }
-        self.echo.replace_hashes(hashes);
-        if let Some(mut previous) = self.clipboard.lock().await.replace(child) {
-            let _ = previous.kill().await;
-            let _ = previous.wait().await;
-        }
-        Ok(())
     }
     async fn preview(
         &self,
@@ -509,22 +706,40 @@ impl DesktopActions {
 }
 #[async_trait]
 impl PcActions for DesktopActions {
-    async fn clipboard_text(&self, text: &str) -> Result<()> {
-        self.copy(None, Some(text), "text/plain;charset=utf-8")
-            .await
+    async fn clipboard_text(&self, _text: &str) -> Result<()> {
+        anyhow::bail!("clipboard writes require the clipboard actor")
     }
-    async fn clipboard_image(&self, path: &Path, mime: &str) -> Result<()> {
-        self.clipboard_received(&ReceivedFile::open(path)?, mime)
-            .await
+    async fn clipboard_image(&self, _path: &Path, _mime: &str) -> Result<()> {
+        anyhow::bail!("clipboard writes require the clipboard actor")
     }
-    async fn clipboard_received(&self, file: &ReceivedFile, mime: &str) -> Result<()> {
-        let result = self.copy(Some(file), None, mime).await;
+    async fn drain_clipboard(&self) {
+        self.jobs.drain().await;
+    }
+    async fn prepare_clipboard(
+        &self,
+        input: ClipboardInput,
+        ticket: u128,
+    ) -> Result<PreparedClipboard> {
+        self.prepare_copy(input, ticket).await
+    }
+    async fn install_clipboard(&self, prepared: &mut PreparedClipboard) -> Result<()> {
+        prepared
+            .helper
+            .as_mut()
+            .context("clipboard helper")?
+            .input
+            .take()
+            .context("clipboard authorization already consumed")?
+            .write_all(b"G")
+            .await?;
+        Ok(())
+    }
+    async fn record_clipboard_copy(&self, file: &ReceivedFile) {
         let mut copies = self.copy_results.lock().await;
         if copies.len() >= 256 {
             copies.clear();
         }
-        copies.insert(file.path().to_owned(), result.is_ok());
-        result
+        copies.insert(file.path().to_owned(), true);
     }
     async fn notify(&self, path: &Path, mime: &str) -> Result<()> {
         self.notify_received(&ReceivedFile::open(path)?, mime).await
@@ -807,11 +1022,6 @@ impl PcActions for DesktopActions {
         begin_open_received_file(file, &self.bus_connection().await?, None).await
     }
     async fn shutdown(&self) -> Result<()> {
-        let _guard = self.clipboard_gate.lock().await;
-        if let Some(mut child) = self.clipboard.lock().await.take() {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-        }
         self.jobs.drain().await;
         if let Some(n) = self.notifications.lock().await.take() {
             n.stop.send_replace(true);
@@ -950,6 +1160,21 @@ fn clipboard_sources(
     bytes: Vec<u8>,
 ) -> Result<Vec<wl_clipboard_rs::copy::MimeSource>> {
     use wl_clipboard_rs::copy::{MimeSource, MimeType, Source};
+    if mime == "application/x-pneu-formats" {
+        anyhow::ensure!(bytes.len() >= 8, "invalid clipboard formats header");
+        let length = u64::from_be_bytes(bytes[..8].try_into()?) as usize;
+        anyhow::ensure!(
+            length <= pneu_proto::MAX_CLIPBOARD_BYTES && bytes.len() >= 8 + length,
+            "invalid clipboard formats length"
+        );
+        let text = std::str::from_utf8(&bytes[8..8 + length])?;
+        let mut sources = clipboard_sources("image/png".into(), bytes[8 + length..].to_vec())?;
+        sources.push(MimeSource {
+            source: Source::Bytes(text.as_bytes().to_vec().into()),
+            mime_type: MimeType::Specific("text/plain;charset=utf-8".into()),
+        });
+        return Ok(sources);
+    }
     let mut sources = Vec::new();
     if mime.starts_with("image/") && mime != "image/png" {
         let mut png = std::io::Cursor::new(Vec::new());
@@ -973,12 +1198,19 @@ fn clipboard_sources(
     });
     Ok(sources)
 }
-pub fn clipboard_helper(mime: String) -> Result<()> {
+pub fn clipboard_helper(mime: String, ticket: u128) -> Result<()> {
     use std::io::{Read, Write};
     let mut bytes = Vec::new();
-    std::io::stdin()
-        .take(16 * 1024 * 1024 + 1)
-        .read_to_end(&mut bytes)?;
+    let mut input = std::io::stdin().lock();
+    let mut length = [0; 8];
+    input.read_exact(&mut length)?;
+    let length = u64::from_be_bytes(length);
+    anyhow::ensure!(
+        length <= 16 * 1024 * 1024,
+        "clipboard helper input too large"
+    );
+    input.by_ref().take(length).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() as u64 == length, "truncated helper input");
     anyhow::ensure!(
         bytes.len() <= 16 * 1024 * 1024,
         "clipboard helper input too large"
@@ -986,7 +1218,7 @@ pub fn clipboard_helper(mime: String) -> Result<()> {
     let mut options = wl_clipboard_rs::copy::Options::new();
     options.foreground(true);
     use sha2::{Digest, Sha256};
-    let sources = clipboard_sources(mime, bytes)?;
+    let mut sources = clipboard_sources(mime, bytes)?;
     let hashes = sources
         .iter()
         .filter_map(|source| {
@@ -1005,15 +1237,84 @@ pub fn clipboard_helper(mime: String) -> Result<()> {
         })
         .collect::<Vec<_>>()
         .join(" ");
+    // The daemon's ordered watcher is the sole installation witness.
+    let marker = crate::ui::clipboard::install_marker(ticket);
+    sources.push(wl_clipboard_rs::copy::MimeSource {
+        source: wl_clipboard_rs::copy::Source::Bytes(Vec::new().into()),
+        mime_type: wl_clipboard_rs::copy::MimeType::Specific(marker),
+    });
     let selection = options.prepare_copy_multi(sources)?;
     println!("READY {hashes}");
     std::io::stdout().flush()?;
+    let mut commit = [0];
+    input.read_exact(&mut commit)?;
+    anyhow::ensure!(commit == *b"G", "clipboard helper canceled");
     selection.serve()?;
     Ok(())
 }
 #[cfg(test)]
+#[path = "actions_clipboard_tests.rs"]
+mod clipboard_tests;
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn anonymous_clipboard_backing_is_private_unlinked_and_descriptor_bound() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let dir = crate::test_support::scratch()?;
+        let directory = std::fs::File::open(dir.path())?;
+        for file in [
+            clipboard_file(dir.path())?,
+            unlinked_clipboard_file(&directory)?,
+        ] {
+            let metadata = file.metadata()?;
+            assert!(metadata.is_file());
+            assert_eq!(metadata.mode() & 0o777, 0o600);
+            assert_eq!(metadata.nlink(), 0);
+            assert_eq!(std::fs::read_dir(dir.path())?.count(), 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn immediate_clipboard_bytes_and_formats_retain_payload_and_hashes() -> Result<()> {
+        use sha2::{Digest, Sha256};
+        let dir = crate::test_support::scratch()?;
+        let png = b"clipboard image bytes".to_vec();
+        let text = "clipboard text".to_owned();
+        let image_hash: [u8; 32] = Sha256::digest(&png).into();
+        let text_hash: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+        for (input, hashes) in [
+            (
+                ClipboardInput::Bytes {
+                    bytes: png.clone(),
+                    mime: "image/png".into(),
+                    cache: dir.path().to_owned(),
+                },
+                vec![image_hash],
+            ),
+            (
+                ClipboardInput::Formats {
+                    text,
+                    png: png.clone(),
+                    cache: dir.path().to_owned(),
+                },
+                vec![text_hash, image_hash],
+            ),
+        ] {
+            let prepared = PreparedClipboard::immediate(input)?;
+            assert_eq!(prepared.hashes, hashes);
+            let ClipboardInput::Image(file, mime) = prepared.input() else {
+                panic!("expected normalized image");
+            };
+            assert_eq!(mime, "image/png");
+            assert_eq!(file.read_bounded(png.len())?, png);
+            assert!(!file.path().exists());
+            assert_eq!(std::fs::read_dir(dir.path())?.count(), 0);
+        }
+        Ok(())
+    }
+
     #[test]
     fn burst_membership_uses_arrival_gaps_span_order_and_count() {
         use std::time::{Duration, Instant};
@@ -1050,60 +1351,7 @@ mod tests {
         assert_eq!(decode_image(bytes)?.width(), 2);
         Ok(())
     }
-    #[tokio::test]
-    async fn echo_guard_commits_successful_selection_and_keeps_it_on_every_failure() -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir()?;
-        let mut actions = DesktopActions::new(dir.path().to_owned());
-        let helper = dir.path().join("helper");
-        use sha2::{Digest, Sha256};
-        let converted = hex::encode(Sha256::digest(b"converted image"));
-        std::fs::write(
-            &helper,
-            format!(
-                "#!/bin/sh
-cat >/dev/null
-printf 'READY {converted}\n'
-exec sleep 60
-"
-            ),
-        )?;
-        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))?;
-        actions.helper = Some(helper);
-        actions.echo.remember(b"previous");
-        actions
-            .copy(None, Some("new successful text"), "text/plain")
-            .await?;
-        assert!(!actions.echo.contains(b"previous"));
-        assert!(actions.echo.contains(b"new successful text"));
-        assert!(actions.echo.contains(b"converted image"));
-        for helper in [
-            PathBuf::from("/no/such/helper"),
-            PathBuf::from("/bin/false"),
-        ] {
-            actions.helper = Some(helper);
-            assert!(
-                actions
-                    .copy(None, Some("failed local text"), "text/plain")
-                    .await
-                    .is_err()
-            );
-            let path = dir.path().join("image");
-            std::fs::write(&path, b"failed image")?;
-            assert!(
-                actions
-                    .copy(Some(&ReceivedFile::open(&path)?), None, "image/png")
-                    .await
-                    .is_err()
-            );
-            assert!(!actions.echo.contains(b"failed local text"));
-            assert!(!actions.echo.contains(b"failed image"));
-            assert!(actions.echo.contains(b"new successful text"));
-            assert!(actions.echo.contains(b"converted image"));
-        }
-        actions.shutdown().await?;
-        Ok(())
-    }
+
     #[tokio::test]
     async fn clipboard_preview_rejects_large_sparse_input_before_decoding() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -1812,20 +2060,15 @@ exec sleep 60
         }
         // Acceptance is immediate, but an application chooser may take time.
         portal_code.store(3, std::sync::atomic::Ordering::SeqCst);
-        let file = final_file.clone();
-        let viewer_bus = connection.clone();
-        let viewer = tokio::spawn(async move { open_received_file(&file, &viewer_bus).await });
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while deferred_response.lock().unwrap().is_none() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await?;
-        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
-        assert!(
-            !viewer.is_finished(),
-            "interactive chooser was prematurely canceled"
-        );
+        // Finish the real D-Bus acceptance phase before advancing time. Only
+        // the interactive wait is virtual; kernel I/O stays on the real clock.
+        let mut viewer = begin_open_received_file(&final_file, &connection, None).await?;
+        assert!(futures_util::poll!(viewer.as_mut()).is_pending());
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        let waiting = futures_util::poll!(viewer.as_mut()).is_pending();
+        tokio::time::resume();
+        assert!(waiting, "interactive chooser was prematurely canceled");
         let path = deferred_response.lock().unwrap().take().unwrap();
         server
             .emit_signal(
@@ -1836,7 +2079,7 @@ exec sleep 60
                 &(0u32, HashMap::<String, zbus::zvariant::OwnedValue>::new()),
             )
             .await?;
-        tokio::time::timeout(std::time::Duration::from_secs(2), viewer).await???;
+        tokio::time::timeout(std::time::Duration::from_secs(10), viewer).await??;
         // Leave all three interactive entry points pending: legacy Open,
         // structured Open, and Open Link. Signals and cleanup must still run.
         portal_code.store(3, std::sync::atomic::Ordering::SeqCst);

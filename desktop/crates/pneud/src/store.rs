@@ -1,4 +1,10 @@
 //! Paired peers, completed file receipts, bounded clipboard history, latest outgoing text.
+#[path = "store_clipboard.rs"]
+mod clipboard;
+#[path = "store_settings.rs"]
+mod settings;
+pub(crate) use settings::{SettingsMalformed, SettingsUnexpected};
+
 use crate::storage::{Folder, Stage, VerifiedFile, clean_staging, staging_directory};
 use crate::work::{Reservation, Work, start_blocking};
 use anyhow::{Context, Result, ensure};
@@ -17,8 +23,25 @@ use std::{
     },
 };
 
+// Legacy HELLO extensions are not negotiated hints. Direction supplies the
+// known role; only an outbound invitation/route can identify a legacy computer.
+pub(crate) fn normalize_legacy_hello(hello: &mut pneu_proto::Hello, outbound: bool) {
+    if !hello.capabilities.iter().any(|c| c == "mesh") {
+        hello.role = Some(if outbound {
+            pneu_proto::DeviceRole::Computer
+        } else {
+            pneu_proto::DeviceRole::Phone
+        });
+        hello.addresses = None;
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextReceipt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hlc: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_device: Option<Id>,
     pub transfer_id: Id,
     pub sha256: Hash,
     pub created_at: u64,
@@ -28,6 +51,8 @@ pub struct TextReceipt {
 impl From<&Clipboard> for TextReceipt {
     fn from(text: &Clipboard) -> Self {
         Self {
+            hlc: text.hlc,
+            source_device: text.source_device.clone(),
             transfer_id: text.transfer_id.clone(),
             sha256: Hash::new(hex::encode(Sha256::digest(text.text.as_bytes()))).expect("SHA-256"),
             created_at: text.created_at,
@@ -35,10 +60,23 @@ impl From<&Clipboard> for TextReceipt {
         }
     }
 }
+fn keyed_text_receipt(
+    key: &crate::clipboard_fingerprint::FingerprintKey,
+    text: &Clipboard,
+) -> TextReceipt {
+    let mut receipt = TextReceipt::from(text);
+    let raw: [u8; 32] = hex::decode(receipt.sha256.as_str())
+        .expect("SHA-256")
+        .try_into()
+        .expect("SHA-256");
+    receipt.sha256 = Hash::new(hex::encode(key.digest(&raw))).expect("HMAC-SHA256");
+    receipt
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation")]
 pub enum Metadata {
     File(FileBegin),
+    Settings(pneu_proto::PeerSettings),
     Text(TextReceipt),
 }
 
@@ -48,14 +86,40 @@ struct CacheOwner {
     path: PathBuf,
     file: crate::storage::OwnedFile,
 }
+#[derive(Clone, Debug)]
+pub(crate) struct PeerInfo {
+    pub id: Id,
+    pub fingerprint: Hash,
+    pub generation: u64,
+    pub role: String,
+    pub name: String,
+    pub addresses: Vec<String>,
+}
+#[derive(Clone)]
+struct AbandonedClaim {
+    epoch: PeerEpoch,
+    token: String,
+}
 #[derive(Clone)]
 pub struct Store {
     connection: Arc<Mutex<Connection>>,
+    clipboard_history_revision: Arc<AtomicU64>,
+    clipboard_clock_slots: Arc<tokio::sync::Semaphore>,
+    pub(crate) clipboard_fingerprint_key: crate::clipboard_fingerprint::FingerprintKey,
+    abandoned_claims: Arc<Mutex<HashMap<(Id, Id), AbandonedClaim>>>,
+    #[cfg(test)]
+    faults: Arc<Mutex<HashMap<&'static str, usize>>>,
+    pub(crate) pair_settings: Arc<Mutex<HashMap<Id, Vec<pneu_proto::PeerSetting>>>>,
+    pub(crate) settings_changed: tokio::sync::watch::Sender<u64>,
+    pub(crate) settings_generations: Arc<Mutex<HashMap<Id, u64>>>,
     _ownership: Arc<StoreOwnership>,
     folder: Folder,
     reserve: Arc<AtomicU64>,
     work: Arc<Work>,
     pub(crate) connection_id: Option<u64>,
+    pub(crate) action_connection_id: Option<u64>,
+    pub(crate) mesh: bool,
+    pub(crate) local_device: Option<Id>,
     generations: Arc<Mutex<HashMap<Id, u64>>>,
     peer_generations: Option<HashMap<Id, u64>>,
     staging_ready: Arc<Mutex<HashSet<(u64, u64)>>>,
@@ -112,6 +176,15 @@ impl std::fmt::Display for PairingRevoked {
 }
 impl std::error::Error for PairingRevoked {}
 #[derive(Debug)]
+pub(crate) struct ClipboardStorageFailure;
+impl std::fmt::Display for ClipboardStorageFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("clipboard clock/policy storage failed")
+    }
+}
+impl std::error::Error for ClipboardStorageFailure {}
+
+#[derive(Debug)]
 struct ReceiptConflict;
 impl std::fmt::Display for ReceiptConflict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -121,7 +194,7 @@ impl std::fmt::Display for ReceiptConflict {
 impl std::error::Error for ReceiptConflict {}
 /// A short-lived shared-ID reservation, not a replay queue. The claim owns its
 /// cleanup even if the caller disappears while a blocking insert is finishing.
-pub(crate) struct TextClaim {
+pub(crate) struct ClipboardReservation {
     // Bridge completion of the blocking insert to observation/drop of its
     // result, so shutdown cannot miss cleanup of an abandoned returned claim.
     reservation: Option<Reservation>,
@@ -131,7 +204,12 @@ pub(crate) struct TextClaim {
     text: Clipboard,
     token: Option<String>,
 }
-impl TextClaim {
+impl ClipboardReservation {
+    #[cfg(test)]
+    fn finalize(self) -> impl std::future::Future<Output = Result<()>> + Send {
+        self.complete(None, true)
+    }
+
     pub(crate) async fn discard(mut self) -> Result<()> {
         let store = self.store.clone();
         store
@@ -154,9 +232,10 @@ impl TextClaim {
         }
         Ok(())
     }
-    pub(crate) fn finalize(
+    pub(crate) fn complete(
         mut self,
-        application: tokio::sync::OwnedMutexGuard<()>,
+        application_hlc: Option<u64>,
+        applied: bool,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
         let store = self.store.clone();
         let epoch = self.epoch.clone();
@@ -165,7 +244,8 @@ impl TextClaim {
         // admission before it was handed to the clipboard caller.
         let reservation = self.reservation.take().expect("text finalization capacity");
         let job = store.submit(reservation, move |store| {
-            let _application = application;
+            #[cfg(test)]
+            store.fault("finalize_text")?;
             store.peer_write(epoch, |tx| {
                 let token = self.token.as_ref().context("missing text claim")?;
                 let removed = tx.execute(
@@ -173,7 +253,14 @@ impl TextClaim {
                     params![self.device.as_str(), self.text.transfer_id.as_str(), token],
                 )?;
                 ensure!(removed == 1, "text claim lost");
-                record_text(tx, &self.device, &self.text)?;
+                record_text(
+                    tx,
+                    &self.device,
+                    &self.text,
+                    application_hlc,
+                    applied,
+                    &store.clipboard_fingerprint_key,
+                )?;
                 Ok(())
             })?;
             self.token.take();
@@ -183,16 +270,27 @@ impl TextClaim {
         async move { job.await? }
     }
 }
-impl Drop for TextClaim {
+impl Drop for ClipboardReservation {
     fn drop(&mut self) {
         if let Some(token) = self.token.take() {
             // Only plain data enters the cleanup task. If runtime shutdown drops
-            // the queued closure, it must not drop another TextClaim and recursively
+            // the queued closure, it must not drop another ClipboardReservation and recursively
             // enqueue cleanup. Startup removes any abandoned reservation.
             let reservation = self.reservation.take();
             let epoch = self.epoch.clone();
             let device = self.device.clone();
             let id = self.text.transfer_id.clone();
+            self.store
+                .abandoned_claims
+                .lock()
+                .expect("abandoned text claims")
+                .insert(
+                    (device.clone(), id.clone()),
+                    AbandonedClaim {
+                        epoch: epoch.clone(),
+                        token: token.clone(),
+                    },
+                );
             self.store.start_cleanup(move |store| {
                 let _reservation = reservation;
                 let result = release_text_claim(store, epoch, &device, &id, &token);
@@ -211,6 +309,8 @@ fn release_text_claim(
     id: &Id,
     token: &str,
 ) -> Result<()> {
+    #[cfg(test)]
+    store.fault("release_text_claim")?;
     let result = store.peer_write(epoch, |tx| {
         tx.execute(
             "DELETE FROM receipts WHERE device=? AND id=? AND destination=?",
@@ -225,25 +325,134 @@ fn release_text_claim(
             return Err(error);
         }
     }
+    let mut abandoned = store
+        .abandoned_claims
+        .lock()
+        .expect("abandoned text claims");
+    let key = (device.clone(), id.clone());
+    if abandoned
+        .get(&key)
+        .is_some_and(|claim| claim.token == token)
+    {
+        abandoned.remove(&key);
+    }
     Ok(())
 }
-fn record_text(tx: &Transaction<'_>, device: &Id, text: &Clipboard) -> Result<()> {
-    tx.execute("INSERT INTO legacy_clipboard_clock VALUES (?,?) ON CONFLICT(device) DO UPDATE SET created_at=max(created_at,excluded.created_at)", params![device.as_str(), text.created_at as i64])?;
-    // Legacy ordering remains per sender. The applied value itself belongs to
-    // the physical clipboard and survives removal of any individual pairing.
-    tx.execute("INSERT INTO clipboard_clock(singleton,created_at,source_device) VALUES(1,?,?) ON CONFLICT(singleton) DO UPDATE SET created_at=excluded.created_at,source_device=excluded.source_device", params![text.created_at as i64,device.as_str()])?;
+/// Overflow-safe rejection happens before *any* clock/register/history mutation.
+pub(crate) fn validate_stamp(hlc: u64, now: u64) -> Result<()> {
+    ensure!(
+        hlc.saturating_sub(now) <= 60_000,
+        "clipboard clock disagreement"
+    );
+    Ok(())
+}
+fn observe_hlc(tx: &Transaction<'_>, hlc: u64) -> Result<()> {
+    let previous: String = tx.query_row(
+        "SELECT last_seen FROM mesh_clock WHERE singleton=1",
+        [],
+        |r| r.get(0),
+    )?;
+    if hlc > previous.parse::<u64>()? {
+        tx.execute(
+            "UPDATE mesh_clock SET last_seen=? WHERE singleton=1",
+            [hlc.to_string()],
+        )?;
+    }
+    Ok(())
+}
+fn allocate_stamp(tx: &Transaction<'_>) -> Result<(u64, u64)> {
+    let previous: String = tx.query_row(
+        "SELECT last_seen FROM mesh_clock WHERE singleton=1",
+        [],
+        |r| r.get(0),
+    )?;
+    let hlc = crate::now_ms().max(
+        previous
+            .parse::<u64>()?
+            .checked_add(1)
+            .context("clipboard clock exhausted")?,
+    );
+    let legacy: i64 = tx.query_row(
+        "SELECT last_outgoing_at FROM local_clock WHERE singleton=1",
+        [],
+        |r| r.get(0),
+    )?;
+    let created_at = crate::now_ms().max(
+        (legacy as u64)
+            .checked_add(1)
+            .context("clipboard timestamp exhausted")?,
+    );
+    ensure!(
+        created_at <= i64::MAX as u64,
+        "clipboard timestamp exhausted"
+    );
+    tx.execute(
+        "UPDATE mesh_clock SET last_seen=? WHERE singleton=1",
+        [hlc.to_string()],
+    )?;
+    tx.execute(
+        "UPDATE local_clock SET last_outgoing_at=? WHERE singleton=1",
+        [created_at as i64],
+    )?;
+    Ok((created_at, hlc))
+}
+fn stamp_eligible(c: &Connection, hlc: u64, source: &Id) -> Result<bool> {
+    let applied: Option<(Option<String>, String)> = c
+        .query_row(
+            "SELECT hlc,source_device FROM clipboard_clock WHERE singleton=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match applied {
+        Some((Some(previous), device)) => {
+            Ok((hlc, source.as_str()) > (previous.parse::<u64>()?, device.as_str()))
+        }
+        _ => Ok(true),
+    }
+}
+fn apply_stamp(tx: &Transaction<'_>, hlc: u64, source: &Id, created_at: u64) -> Result<()> {
+    observe_hlc(tx, hlc)?;
+    if stamp_eligible(tx, hlc, source)? {
+        tx.execute("INSERT INTO clipboard_clock(singleton,created_at,source_device,hlc) VALUES(1,?,?,?) ON CONFLICT(singleton) DO UPDATE SET created_at=excluded.created_at,source_device=excluded.source_device,hlc=excluded.hlc", params![created_at as i64,source.as_str(),hlc.to_string()])?;
+    }
+    Ok(())
+}
+fn record_text(
+    tx: &Transaction<'_>,
+    device: &Id,
+    text: &Clipboard,
+    application_hlc: Option<u64>,
+    applied: bool,
+    key: &crate::clipboard_fingerprint::FingerprintKey,
+) -> Result<()> {
+    if applied {
+        if text.hlc.is_none() {
+            tx.execute("INSERT INTO legacy_clipboard_clock VALUES (?,?) ON CONFLICT(device) DO UPDATE SET created_at=max(created_at,excluded.created_at)", params![device.as_str(), text.created_at as i64])?;
+            // Legacy peers keep their per-sender gate; their successful OS effect
+            // fences every queued mesh operation with a local observation stamp.
+        }
+        let hlc = match application_hlc.or(text.hlc) {
+            Some(hlc) => hlc,
+            None => allocate_stamp(tx)?.1,
+        };
+        apply_stamp(tx, hlc, device, text.created_at)?;
+    }
     tx.execute(
         "INSERT INTO clipboard_recent VALUES (?,?,?)",
         params![
             device.as_str(),
             text.transfer_id.as_str(),
-            serde_json::to_string(&Metadata::Text(text.into()))?
+            serde_json::to_string(&Metadata::Text(keyed_text_receipt(key, text)))?
         ],
     )?;
     tx.execute("DELETE FROM clipboard_recent WHERE device=? AND rowid NOT IN (SELECT rowid FROM clipboard_recent WHERE device=? ORDER BY rowid DESC LIMIT ?)", params![device.as_str(), device.as_str(), RECENT_TEXT_LIMIT as i64])?;
     Ok(())
 }
 impl Store {
+    pub(crate) fn text_receipt(&self, text: &Clipboard) -> TextReceipt {
+        keyed_text_receipt(&self.clipboard_fingerprint_key, text)
+    }
     pub fn open(path: &Path) -> Result<Self> {
         ensure!(
             !path.exists() || !fs::symlink_metadata(path)?.file_type().is_symlink(),
@@ -263,7 +472,7 @@ impl Store {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;")?;
         let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        ensure!(version <= 1, "unsupported store schema version {version}");
+        ensure!(version <= 2, "unsupported store schema version {version}");
         // All schema changes and legacy cleanup are one transaction. A failed
         // migration leaves the existing pairing, receipts and outbox intact.
         let tx = conn.transaction()?;
@@ -273,7 +482,8 @@ impl Store {
           CREATE TABLE IF NOT EXISTS outgoing(seq INTEGER PRIMARY KEY AUTOINCREMENT,device TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,payload TEXT NOT NULL,retry_at INTEGER NOT NULL DEFAULT 0);
           CREATE TABLE IF NOT EXISTS clipboard_recent(device TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,id TEXT NOT NULL,meta TEXT NOT NULL,PRIMARY KEY(device,id));
           CREATE TABLE IF NOT EXISTS failed_cache(device TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,id TEXT NOT NULL,meta TEXT NOT NULL,destination TEXT NOT NULL,PRIMARY KEY(device,id));
-          CREATE TABLE IF NOT EXISTS staging_folders(path TEXT PRIMARY KEY);")?;
+          CREATE TABLE IF NOT EXISTS staging_folders(path TEXT PRIMARY KEY);
+          CREATE TABLE IF NOT EXISTS clipboard_fingerprints(seq INTEGER PRIMARY KEY,meta TEXT NOT NULL);")?;
         // Keep earlier folder hints before retiring receipt recovery columns.
         // They authorize disposable-root sweeping, never deletion of final files.
         let old_locations: bool = tx.query_row(
@@ -292,12 +502,18 @@ impl Store {
         if legacy_complete {
             tx.execute("DELETE FROM receipts WHERE complete=0", [])?;
         }
+        // Preserve the timestamp floor before retiring legacy queued text.
+        let legacy_outgoing_floor: i64 = tx.query_row(
+            "SELECT coalesce(max(json_extract(payload,'$.created_at')),0) FROM outgoing",
+            [],
+            |r| r.get(0),
+        )?;
         // Retire earlier pending/rollback receipts without touching user files.
         // Preserve completed file dedupe, but clipboard history has a bounded horizon.
         tx.execute_batch(
             "DROP TABLE IF EXISTS stages;
             DELETE FROM receipts WHERE json_extract(meta,'$.operation')='Text';
-            DELETE FROM outgoing WHERE seq NOT IN (SELECT max(seq) FROM outgoing GROUP BY device);",
+            DELETE FROM outgoing;",
         )?;
         for column in ["staging", "location", "rolling_back", "complete"] {
             let exists: bool = tx.query_row(
@@ -340,6 +556,12 @@ impl Store {
                 DROP TABLE pairing_epoch;
                 PRAGMA user_version=1;")?;
         }
+        if version < 2 {
+            // Evidence belongs to this exact row/generation. Never infer READY
+            // from a HELLO or migrate unconfirmed pairings as established.
+            tx.execute_batch("ALTER TABLE peers ADD COLUMN established INTEGER NOT NULL DEFAULT 0 CHECK(established IN (0,1));
+                PRAGMA user_version=2;")?;
+        }
         // Repair an unfenced v1 database that a released binary has opened.
         // Its initial schema batch may have recreated the global epoch table.
         // Retain its outgoing clock and never lower any surviving peer's epoch.
@@ -351,14 +573,38 @@ impl Store {
             tx.execute_batch("UPDATE local_clock SET last_outgoing_at=max(last_outgoing_at,coalesce((SELECT last_outgoing_at FROM pairing_epoch WHERE singleton=1),0));
                 DROP TABLE pairing_epoch;")?;
         }
-        tx.execute_batch("UPDATE peers SET generation=max(generation,coalesce((SELECT generation FROM peer_generations WHERE device=peers.id),0));
+        tx.execute_batch("UPDATE peers SET established=0 WHERE generation<coalesce((SELECT generation FROM peer_generations WHERE device=peers.id),0);
+            UPDATE peers SET generation=max(generation,coalesce((SELECT generation FROM peer_generations WHERE device=peers.id),0));
             INSERT INTO peer_generations SELECT id,generation FROM peers WHERE true ON CONFLICT(device) DO UPDATE SET generation=max(peer_generations.generation,excluded.generation);")?;
         // Released 2.0.2 unconditionally INSERTs into pairing_epoch in its first
         // startup batch, BEFORE pruning peers/receipts. A read-only view makes
         // that INSERT fail, even though released code ignores user_version.
         // Keep this fence on every open, including recovery of an unfenced v1 DB.
         tx.execute_batch("CREATE VIEW IF NOT EXISTS pairing_epoch AS SELECT singleton,0 AS generation,last_outgoing_at FROM local_clock;")?;
-        tx.execute_batch("UPDATE local_clock SET last_outgoing_at=max(last_outgoing_at,coalesce((SELECT max(json_extract(payload,'$.created_at')) FROM outgoing),0)) WHERE singleton=1;")?;
+        tx.execute(
+            "UPDATE local_clock SET last_outgoing_at=max(last_outgoing_at,?) WHERE singleton=1",
+            [legacy_outgoing_floor],
+        )?;
+        // Decimal TEXT preserves the full unsigned wire HLC range in SQLite.
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS mesh_clock(singleton INTEGER PRIMARY KEY CHECK(singleton=1),last_seen TEXT NOT NULL);
+            INSERT OR IGNORE INTO mesh_clock VALUES(1,'0');")?;
+        let legacy_floor: i64 = tx.query_row(
+            "SELECT last_outgoing_at FROM local_clock WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?;
+        observe_hlc(&tx, legacy_floor as u64)?;
+        let applied: Option<String> = tx
+            .query_row(
+                "SELECT hlc FROM clipboard_clock WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        if let Some(applied) = applied {
+            observe_hlc(&tx, applied.parse()?)?;
+        }
         let generations = {
             let mut q = tx.prepare("SELECT device,generation FROM peer_generations")?;
             q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
@@ -368,23 +614,103 @@ impl Store {
                 })
                 .collect::<Result<HashMap<_, _>>>()?
         };
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS settings_support(device TEXT PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,supported INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS settings_receipts(device TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,id TEXT NOT NULL,meta TEXT NOT NULL,PRIMARY KEY(device,id));
+            CREATE INDEX IF NOT EXISTS settings_receipts_sequence ON settings_receipts(device);
+            CREATE TABLE IF NOT EXISTS settings_outgoing(device TEXT PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS settings_replay(device TEXT PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS settings_confirmed(device TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,key TEXT NOT NULL,enabled INTEGER NOT NULL,hlc TEXT NOT NULL,writer_device TEXT NOT NULL,PRIMARY KEY(device,key));")?;
+        // Policy is authoritative before Core can expose any clipboard offers.
+        let pair_settings = {
+            let mut q = tx.prepare("SELECT id FROM peers")?;
+            let ids = q
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ids.into_iter()
+                .map(|id| {
+                    let id = Id::new(id)?;
+                    let fields = settings::fields(&tx, &id)?;
+                    Ok((id, fields))
+                })
+                .collect::<Result<HashMap<_, _>>>()?
+        };
+        crate::clipboard_fingerprint::FingerprintKey::cleanup_temporary(
+            &path.with_file_name("clipboard-fingerprint.key"),
+        )?;
+        let clipboard_fingerprint_key =
+            crate::clipboard_fingerprint::FingerprintKey::load_or_create(
+                &path.with_file_name("clipboard-fingerprint.key"),
+            )?;
+        clipboard::migrate_fingerprints(&tx, &clipboard_fingerprint_key)?;
         tx.commit()?;
+        // Remove obsolete raw hashes from the migration WAL as well.
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         let folder = Folder::open(path.parent().context("database parent")?, false)?;
         folder.file.sync_all()?;
         Ok(Self {
             connection: Arc::new(Mutex::new(conn)),
+            pair_settings: Arc::new(Mutex::new(pair_settings)),
+            settings_changed: tokio::sync::watch::channel(0).0,
+            settings_generations: Arc::new(Mutex::new(HashMap::new())),
             _ownership: Arc::new(StoreOwnership(lock)),
             folder,
             reserve: Arc::new(AtomicU64::new(16 * 1024 * 1024)),
             work: Arc::new(Work::default()),
             connection_id: None,
+            action_connection_id: None,
+            mesh: false,
+            local_device: None,
             generations: Arc::new(Mutex::new(generations)),
             peer_generations: None,
             staging_ready: Arc::new(Mutex::new(HashSet::new())),
             cache_owners: Arc::new(Mutex::new(HashMap::new())),
+            clipboard_history_revision: Arc::new(AtomicU64::new(0)),
+            clipboard_clock_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+            clipboard_fingerprint_key,
+            abandoned_claims: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             peer_write_barrier: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            faults: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+    fn retry_abandoned_claims(&self) -> Result<()> {
+        let pending: Vec<_> = self
+            .abandoned_claims
+            .lock()
+            .expect("abandoned text claims")
+            .iter()
+            .map(|((peer, id), claim)| (peer.clone(), id.clone(), claim.clone()))
+            .collect();
+        for (peer, id, claim) in pending {
+            release_text_claim(self, claim.epoch, &peer, &id, &claim.token)?;
+        }
+        Ok(())
+    }
+    /// Per-store, per-operation faults are shared by captured session handles.
+    /// They simulate local I/O failure without changing a real database or disk.
+    #[cfg(test)]
+    pub(crate) fn fail_next(&self, site: &'static str, count: usize) {
+        self.faults.lock().unwrap().insert(site, count);
+    }
+    #[cfg(test)]
+    pub(crate) fn faults_remaining(&self, site: &'static str) -> usize {
+        *self.faults.lock().unwrap().get(site).unwrap_or(&0)
+    }
+    #[cfg(test)]
+    pub(crate) fn fault(&self, site: &'static str) -> Result<()> {
+        let mut faults = self.faults.lock().unwrap();
+        if let Some(left) = faults.get_mut(site)
+            && *left > 0
+        {
+            *left -= 1;
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                Some(format!("injected storage failure: {site}")),
+            )
+            .into());
+        }
+        Ok(())
     }
     fn locked<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
         f(&mut *self
@@ -398,6 +724,20 @@ impl Store {
         let mut store = self.clone();
         store.peer_generations = Some(self.generations.lock().expect("peer generations").clone());
         store
+    }
+    pub(crate) fn for_next_pairing(&self, device: &Id) -> Self {
+        let mut captured = self.with_current_pairing();
+        let generation = captured
+            .pairing_generation(device)
+            .unwrap_or(0)
+            .checked_add(1)
+            .expect("pairing generation exhausted");
+        captured
+            .peer_generations
+            .as_mut()
+            .expect("captured generations")
+            .insert(device.clone(), generation);
+        captured
     }
     /// Durable epoch, including revocation tombstones. Callers must also verify
     /// that the device is still paired before accepting cached presentation data.
@@ -510,8 +850,12 @@ impl Store {
         self.blocking(move |store| store.locked(f)).await
     }
     pub async fn admission(&self) -> Result<()> {
-        self.blocking(|store| capacity(&store.folder, store.reserve.load(Ordering::SeqCst)))
-            .await
+        self.blocking(|store| {
+            #[cfg(test)]
+            store.fault("admission")?;
+            capacity(&store.folder, store.reserve.load(Ordering::SeqCst))
+        })
+        .await
     }
     pub async fn peers(&self) -> Result<HashMap<Hash, Id>> {
         self.call(|c| {
@@ -525,31 +869,156 @@ impl Store {
         })
         .await
     }
+    pub(crate) async fn peer_info(&self) -> Result<Vec<PeerInfo>> {
+        #[cfg(test)]
+        self.fault("peer_info")?;
+        self.call(|c| {
+            let mut q =
+                c.prepare("SELECT id,fp,generation,role,name,addresses FROM peers ORDER BY id")?;
+            q.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
+            })?
+            .map(|row| {
+                let (id, fp, generation, role, name, addresses) = row?;
+                let addresses: Vec<String> = serde_json::from_str(&addresses)?;
+                ensure!(
+                    addresses.len() <= 16
+                        && addresses
+                            .iter()
+                            .all(|a| pneu_proto::validate_address(a).is_ok()),
+                    "invalid saved addresses"
+                );
+                Ok(PeerInfo {
+                    id: Id::new(id)?,
+                    fingerprint: Hash::new(fp)?,
+                    generation: generation as u64,
+                    role,
+                    name,
+                    addresses,
+                })
+            })
+            .collect()
+        })
+        .await
+    }
+    pub(crate) async fn mark_peer_established(&self, device: Id) -> Result<()> {
+        let epoch = self.peer_epoch(&device);
+        self.blocking(move |store| {
+            #[cfg(test)]
+            store.fault("mark_peer_established")?;
+            store.peer_write(epoch, |tx| {
+                tx.execute(
+                    "UPDATE peers SET established=1 WHERE id=?",
+                    [device.as_str()],
+                )?;
+                Ok(())
+            })
+        })
+        .await
+    }
+    pub(crate) async fn peer_established(&self, device: Id) -> Result<bool> {
+        let epoch = self.peer_epoch(&device);
+        self.blocking(move |store| {
+            #[cfg(test)]
+            store.fault("peer_established")?;
+            store.peer_write(epoch, |tx| {
+                Ok(tx.query_row(
+                    "SELECT established FROM peers WHERE id=?",
+                    [device.as_str()],
+                    |row| row.get(0),
+                )?)
+            })
+        })
+        .await
+    }
+    pub(crate) async fn remember_route(&self, device: Id, address: String) -> Result<()> {
+        pneu_proto::validate_address(&address)?;
+        let epoch = self.peer_epoch(&device);
+        self.blocking(move |store| {
+            #[cfg(test)]
+            store.fault("remember_route")?;
+            store.peer_write(epoch, |tx| {
+                let previous: String = tx.query_row(
+                    "SELECT addresses FROM peers WHERE id=?",
+                    [device.as_str()],
+                    |r| r.get(0),
+                )?;
+                let mut addresses: Vec<String> = serde_json::from_str(&previous)?;
+                addresses.retain(|a| a != &address);
+                addresses.insert(0, address);
+                addresses.truncate(16);
+                tx.execute(
+                    "UPDATE peers SET addresses=? WHERE id=?",
+                    params![serde_json::to_string(&addresses)?, device.as_str()],
+                )?;
+                Ok(())
+            })
+        })
+        .await
+    }
     /// Presentation/address hints never replace captured trust. Await bounded
     /// submission so replacing a connection cancels its unscheduled hints.
     pub(crate) async fn remember_peer_hello(
         &self,
-        hello: pneu_proto::Hello,
+        mut hello: pneu_proto::Hello,
         current: Arc<AtomicU64>,
         connection: u64,
-    ) {
+        outbound: bool,
+    ) -> Result<()> {
+        normalize_legacy_hello(&mut hello, outbound);
         let epoch = self.peer_epoch(&hello.device_id);
         let result = self
             .blocking(move |store| {
+                #[cfg(test)]
+                store.fault("remember_peer_hello")?;
                 store.peer_write(epoch, |tx| {
                     if current.load(Ordering::SeqCst) != connection {
                         return Ok(());
                     }
+                    tx.execute("INSERT INTO settings_support VALUES(?,?) ON CONFLICT(device) DO UPDATE SET supported=excluded.supported",params![hello.device_id.as_str(),hello.capabilities.iter().any(|c|c=="mesh")])?;
                     let role = match hello.role {
                         Some(pneu_proto::DeviceRole::Computer) => "computer",
                         _ => "phone",
                     };
+                    let previous: String = tx.query_row(
+                        "SELECT addresses FROM peers WHERE id=?",
+                        [hello.device_id.as_str()],
+                        |r| r.get(0),
+                    )?;
+                    let cached: Vec<String> = if !outbound && !hello.capabilities.iter().any(|c| c == "mesh") {
+                        // A legacy inbound peer is a phone, so historical
+                        // unnegotiated route hints have no routing authority.
+                        Vec::new()
+                    } else {
+                        serde_json::from_str(&previous)?
+                    };
+                    let mut addresses: Vec<String> = cached.first().cloned().into_iter().collect();
+                    for address in hello
+                        .addresses
+                        .unwrap_or_default()
+                        .into_iter()
+                        .chain(cached.into_iter().skip(1))
+                    {
+                        if pneu_proto::validate_address(&address).is_ok()
+                            && !addresses.contains(&address)
+                            && addresses.len() < 16
+                        {
+                            addresses.push(address);
+                        }
+                    }
                     tx.execute(
                         "UPDATE peers SET name=?,role=?,addresses=? WHERE id=?",
                         params![
                             hello.name,
                             role,
-                            serde_json::to_string(&hello.addresses.unwrap_or_default())?,
+                            serde_json::to_string(&addresses)?,
                             hello.device_id.as_str()
                         ],
                     )?;
@@ -562,19 +1031,32 @@ impl Store {
         {
             eprintln!("peer metadata unavailable: {error}");
         }
+        result
     }
     #[cfg(test)]
     pub async fn pair(&self, device: Id, fp: Hash) -> Result<()> {
         self.pair_then(device, fp, || {}).await
     }
+    #[cfg(test)]
     pub(crate) async fn pair_then(
         &self,
         device: Id,
         fp: Hash,
         finish: impl FnOnce() + Send + 'static,
     ) -> Result<()> {
+        self.pair_then_hello(device, fp, None, finish).await
+    }
+    pub(crate) async fn pair_then_hello(
+        &self,
+        device: Id,
+        fp: Hash,
+        hello: Option<pneu_proto::Hello>,
+        finish: impl FnOnce() + Send + 'static,
+    ) -> Result<()> {
         self.blocking(move |store| {
-            store.locked(|c| {
+            #[cfg(test)]
+                store.fault("pair_then_hello")?;
+                store.locked(|c| {
                 capacity(&store.folder, store.reserve.load(Ordering::SeqCst))?;
                 let tx = c.transaction()?;
                 let previous: i64 = tx.query_row("SELECT coalesce((SELECT generation FROM peer_generations WHERE device=?),0)", [device.as_str()], |r| r.get(0))?;
@@ -586,7 +1068,10 @@ impl Store {
                     q.query_map([device.as_str()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?.collect::<rusqlite::Result<_>>()?
                 };
                 tx.execute("DELETE FROM peers WHERE id=?", [device.as_str()])?;
-                tx.execute("INSERT INTO peers(id,fp,generation) VALUES(?,?,?)",params![device.as_str(),fp.as_str(),generation])?;
+                let role = if hello.as_ref().is_some_and(|h| h.role == Some(pneu_proto::DeviceRole::Computer)) { "computer" } else { "phone" };
+                let addresses = hello.as_ref().and_then(|h| h.addresses.clone()).unwrap_or_default();
+                ensure!(addresses.len() <= 16 && addresses.iter().all(|a| pneu_proto::validate_address(a).is_ok()), "invalid initial routes");
+                tx.execute("INSERT INTO peers(id,fp,generation,role,name,addresses) VALUES(?,?,?,?,?,?)",params![device.as_str(),fp.as_str(),generation,role,hello.as_ref().map(|h| h.name.as_str()).unwrap_or_default(),serde_json::to_string(&addresses)?])?;
                 for (key,enabled,hlc,writer) in settings {
                     tx.execute("INSERT INTO peer_settings VALUES(?,?,?,?,?)",params![device.as_str(),key,enabled,hlc,writer])?;
                 }
@@ -618,6 +1103,8 @@ impl Store {
         let epoch = self.peer_epoch(&device);
         let job = self.submit(reservation, move |store| {
             let result = store.locked(|c| {
+                #[cfg(test)]
+                store.fault("unpair_reserved")?;
                 let tx = c.transaction()?;
                 epoch.check(&tx)?;
                 ensure!(
@@ -635,6 +1122,16 @@ impl Store {
                 )?;
                 tx.commit()?;
                 store
+                    .pair_settings
+                    .lock()
+                    .expect("pair settings")
+                    .remove(&device);
+                store
+                    .settings_generations
+                    .lock()
+                    .expect("settings generations")
+                    .remove(&device);
+                store
                     .generations
                     .lock()
                     .expect("peer generations")
@@ -649,10 +1146,15 @@ impl Store {
         async move { job.await? }
     }
     pub async fn receipt(&self, device: Id, id: Id) -> Result<Option<(Metadata, bool)>> {
+        #[cfg(test)]
+        self.fault("receipt")?;
         let epoch = self.peer_epoch(&device);
-        self.call(move |c| {
-            epoch.check(c)?;
-            receipt_row(c, device.as_str(), id.as_str())
+        self.blocking(move |store| {
+            store.retry_abandoned_claims()?;
+            store.locked(|c| {
+                epoch.check(c)?;
+                receipt_row(c, device.as_str(), id.as_str())
+            })
         })
         .await
     }
@@ -665,6 +1167,8 @@ impl Store {
         size: u64,
     ) -> Result<Stage> {
         self.blocking(move |store| {
+            #[cfg(test)]
+            store.fault("create_stage")?;
             store.locked(|c| {
                 capacity(&store.folder, store.reserve.load(Ordering::SeqCst))?;
                 c.execute(
@@ -735,7 +1239,14 @@ impl Store {
         .await
     }
     pub async fn discard_stage(&self, stage: Stage) -> Result<()> {
-        self.blocking(move |_| stage.cleanup()).await
+        self.blocking(move |store| {
+            #[cfg(not(test))]
+            let _ = store;
+            #[cfg(test)]
+            store.fault("discard_stage")?;
+            stage.cleanup()
+        })
+        .await
     }
     pub async fn commit_file(
         &self,
@@ -765,6 +1276,8 @@ impl Store {
     ) -> Result<bool> {
         let epoch = self.peer_epoch(&device);
         self.blocking(move |store| {
+            #[cfg(test)]
+            store.fault("commit_file_checked")?;
             let begin = verified.metadata();
             ensure!(
                 stage.0.file.metadata()?.len() == begin.size,
@@ -792,6 +1305,7 @@ impl Store {
                         rustix::io::Errno::ACCESS
                     );
                 }
+                store.check_file_setting(tx, &device, begin.kind)?;
                 stage.place()?;
                 tx.execute(
                     "INSERT INTO receipts(device,id,meta,destination) VALUES (?,?,?,?)",
@@ -840,6 +1354,8 @@ impl Store {
     ) -> Result<bool> {
         let epoch = self.peer_epoch(&device);
         self.blocking(move |store| {
+            #[cfg(test)]
+            store.fault("commit_cache")?;
             let begin = verified.metadata();
             ensure!(
                 stage.0.file.metadata()?.len() == begin.size,
@@ -860,6 +1376,7 @@ impl Store {
                     return Ok(false);
                 }
                 capacity(&store.folder, store.reserve.load(Ordering::SeqCst))?;
+                store.check_file_setting(tx,&device,begin.kind)?;
                 stage.place()?;
                 tx.execute("INSERT INTO failed_cache(device,id,meta,destination) VALUES (?,?,?,?) ON CONFLICT(device,id) DO UPDATE SET destination=excluded.destination",
                     params![device.as_str(),begin.transfer_id.as_str(),serde_json::to_string(&Metadata::File(begin.clone()))?,stage.destination_path()?.to_str()])?;
@@ -885,14 +1402,27 @@ impl Store {
         &self,
         device: Id,
         text: Clipboard,
-    ) -> Result<Option<TextClaim>> {
+    ) -> Result<Option<ClipboardReservation>> {
         let epoch = self.peer_epoch(&device);
         let reservation = self.reserve().await;
         let store = self.clone();
         reservation
             .submit_with(move |reservation| {
+                #[cfg(test)]
+                store.fault("claim_text")?;
+                store.retry_abandoned_claims()?;
+                ensure!(
+                    store
+                        .abandoned_claims
+                        .lock()
+                        .expect("abandoned text claims")
+                        .len()
+                        < RECENT_TEXT_LIMIT,
+                    "text cleanup capacity exhausted"
+                );
                 store.peer_write(epoch.clone(), |tx| {
-                    let expected = Metadata::Text((&text).into());
+                    let expected =
+                        Metadata::Text(keyed_text_receipt(&store.clipboard_fingerprint_key, &text));
                     let cached: bool = tx.query_row(
                         "SELECT EXISTS(SELECT 1 FROM failed_cache WHERE device=? AND id=?)",
                         params![device.as_str(), text.transfer_id.as_str()],
@@ -906,16 +1436,6 @@ impl Store {
                         ensure!(complete, "clipboard operation still pending");
                         return Ok(None);
                     }
-                    let timestamp: Option<i64> = tx
-                        .query_row(
-                            "SELECT created_at FROM legacy_clipboard_clock WHERE device=?",
-                            [device.as_str()],
-                            |r| r.get(0),
-                        )
-                        .optional()?;
-                    if timestamp.is_some_and(|t| text.created_at <= t as u64) {
-                        return Ok(None);
-                    }
                     capacity(&store.folder, store.reserve.load(Ordering::SeqCst))?;
                     let token = crate::random_hex(16);
                     tx.execute(
@@ -927,7 +1447,7 @@ impl Store {
                             token
                         ],
                     )?;
-                    Ok(Some(TextClaim {
+                    Ok(Some(ClipboardReservation {
                         reservation: Some(reservation),
                         epoch,
                         store: store.clone(),
@@ -942,9 +1462,9 @@ impl Store {
     #[cfg(test)]
     pub async fn text_is_stale(&self, device: Id, text: Clipboard) -> Result<bool> {
         let epoch = self.peer_epoch(&device);
+        let expected = Metadata::Text(keyed_text_receipt(&self.clipboard_fingerprint_key, &text));
         self.call(move |c| {
             epoch.check(c)?;
-            let expected = Metadata::Text((&text).into());
             if let Some((previous, complete)) =
                 receipt_row(c, device.as_str(), text.transfer_id.as_str())?
             {
@@ -964,20 +1484,13 @@ impl Store {
         .await
     }
     #[cfg(test)]
-    async fn applied_text(
-        &self,
-        device: Id,
-        text: Clipboard,
-        application: Option<tokio::sync::OwnedMutexGuard<()>>,
-    ) -> Result<()> {
+    async fn applied_text(&self, device: Id, text: Clipboard) -> Result<()> {
         let epoch = self.peer_epoch(&device);
-        // Async cancellation must not release application ordering before this
-        // uncancelable history write finishes. This is a short global clipboard
-        // critical section, not a socket/device delivery lease or durable barrier.
+        // Receipt commits are uncancelable; the actor owns clipboard ordering.
         self.start_completion(move |store| {
-            let _application = application;
             store.peer_write(epoch, |tx| {
-                let expected = Metadata::Text((&text).into());
+                let expected =
+                    Metadata::Text(keyed_text_receipt(&store.clipboard_fingerprint_key, &text));
                 if let Some((previous, _)) =
                     receipt_row(tx, device.as_str(), text.transfer_id.as_str())?
                 {
@@ -985,42 +1498,50 @@ impl Store {
                     return Ok(());
                 }
                 capacity(&store.folder, store.reserve.load(Ordering::SeqCst))?;
-                record_text(tx, &device, &text)?;
+                record_text(
+                    tx,
+                    &device,
+                    &text,
+                    None,
+                    true,
+                    &store.clipboard_fingerprint_key,
+                )?;
                 Ok(())
             })
         })
         .await?
     }
-    /// Local timestamp assignment and enqueue share one peer write transaction.
-    pub async fn enqueue_clipboard(&self, device: Id, text: String) -> Result<Clipboard> {
-        self.prepare_clipboard(device, text).await
-    }
-    pub async fn ephemeral_clipboard(&self, text: String) -> Result<Clipboard> {
+    /// Clock/register fixture for Store migration and exhaustion tests.
+    #[cfg(test)]
+    pub(crate) async fn local_clipboard(&self, source: Id) -> Result<(u64, u64)> {
         self.call(move |c| {
             let tx = c.transaction()?;
-            let previous: i64 = tx.query_row(
-                "SELECT last_outgoing_at FROM local_clock WHERE singleton=1",
-                [],
-                |r| r.get(0),
-            )?;
-            let text = Clipboard {
-                hlc: None,
-                source_device: None,
-                transfer_id: Id::new(crate::random_hex(16))?,
-                text,
-                created_at: crate::now_ms().max((previous as u64).saturating_add(1)),
-                origin: ClipboardOrigin::Clipboard,
-            };
-            pneu_proto::encode_frame(&pneu_proto::Message::Clipboard(text.clone()))?;
-            tx.execute(
-                "UPDATE local_clock SET last_outgoing_at=? WHERE singleton=1",
-                [text.created_at as i64],
-            )?;
+            let (created_at, hlc) = allocate_stamp(&tx)?;
+            apply_stamp(&tx, hlc, &source, created_at)?;
             tx.commit()?;
-            Ok(text)
+            Ok((created_at, hlc))
         })
         .await
     }
+    pub(crate) async fn observe_hlc(&self, device: Id, hlc: u64) -> Result<()> {
+        let epoch = self.peer_epoch(&device);
+        self.blocking(move |store| {
+            #[cfg(test)]
+            store.fault("observe_hlc")?;
+            store.peer_write(epoch, |tx| observe_hlc(tx, hlc))
+        })
+        .await
+    }
+    #[cfg(test)]
+    pub(crate) async fn stamp_eligible(&self, hlc: u64, source: Id) -> Result<bool> {
+        self.call(move |c| stamp_eligible(c, hlc, &source)).await
+    }
+    /// Local timestamp assignment and enqueue share one peer write transaction.
+    #[cfg(test)]
+    pub async fn enqueue_clipboard(&self, device: Id, text: String) -> Result<Clipboard> {
+        self.prepare_clipboard(device, text).await
+    }
+    #[cfg(test)]
     async fn prepare_clipboard(&self, device: Id, text: String) -> Result<Clipboard> {
         let epoch = self.peer_epoch(&device);
         self.blocking(move |store| {
@@ -1052,6 +1573,7 @@ impl Store {
         })
         .await
     }
+    #[cfg(test)]
     pub async fn first_outgoing(&self, device: Id) -> Result<Option<(i64, Clipboard, i64)>> {
         let epoch = self.peer_epoch(&device);
         self.call(move |c| {
@@ -1068,51 +1590,8 @@ impl Store {
         })
         .await
     }
-    /// READY has already received a delivery result. Holding a normal permit
-    /// across the network wait could starve incoming work on all peers. Submit
-    /// this finite continuation synchronously instead: each bounded connection
-    /// has at most one pending delivery, and its next query needs normal admission.
-    pub fn outgoing_receipt(
-        &self,
-        device: Id,
-        seq: i64,
-        blocked: bool,
-        ack: bool,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
-        let epoch = self.peer_epoch(&device);
-        let job = self.start_completion(move |store| {
-            store.peer_write(epoch, |tx| {
-                if ack || blocked {
-                    tx.execute(
-                        "DELETE FROM outgoing WHERE device=? AND seq=?",
-                        params![device.as_str(), seq],
-                    )?;
-                } else {
-                    tx.execute(
-                        "UPDATE outgoing SET retry_at=? WHERE device=? AND seq=?",
-                        params![
-                            (crate::now_ms() + 48_000 + rand::random::<u64>() % 24_001) as i64,
-                            device.as_str(),
-                            seq
-                        ],
-                    )?;
-                }
-                Ok(())
-            })
-        });
-        async move { job.await? }
-    }
-    pub async fn discard_outgoing(&self, device: Id) -> Result<()> {
-        let epoch = self.peer_epoch(&device);
-        self.blocking(move |store| {
-            store.peer_write(epoch, |tx| {
-                tx.execute("DELETE FROM outgoing WHERE device=?", [device.as_str()])?;
-                Ok(())
-            })
-        })
-        .await
-    }
 }
+#[cfg(test)]
 fn replace_outgoing(
     store: &Store,
     tx: &Transaction<'_>,
@@ -1120,7 +1599,12 @@ fn replace_outgoing(
     text: &Clipboard,
 ) -> Result<()> {
     // Validate encoded size before modifying timestamps or the existing value.
-    pneu_proto::encode_frame(&pneu_proto::Message::Clipboard(text.clone()))?;
+    let mut wire = text.clone();
+    if !store.mesh {
+        wire.hlc = None;
+        wire.source_device = None;
+    }
+    pneu_proto::encode_frame(&pneu_proto::Message::Clipboard(wire))?;
     let previous: Option<i64> = tx
         .query_row(
             "SELECT json_extract(payload,'$.created_at') FROM outgoing WHERE device=?",
@@ -1172,13 +1656,16 @@ fn validate_failed_file(c: &Connection, device: &Id, begin: &FileBegin) -> Resul
     Ok(())
 }
 fn receipt_row(c: &Connection, device: &str, id: &str) -> Result<Option<(Metadata, bool)>> {
-    let row: Option<(String, bool)> = c.query_row("SELECT meta,json_extract(meta,'$.operation')!='Text' FROM receipts WHERE device=? AND id=? UNION ALL SELECT meta,1 FROM clipboard_recent WHERE device=? AND id=?", params![device,id,device,id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let row: Option<(String, bool)> = c.query_row("SELECT meta,json_extract(meta,'$.operation')!='Text' FROM receipts WHERE device=? AND id=? UNION ALL SELECT meta,1 FROM clipboard_recent WHERE device=? AND id=? UNION ALL SELECT meta,1 FROM settings_receipts WHERE device=? AND id=?", params![device,id,device,id,device,id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
     row.map(|(m, complete)| Ok((serde_json::from_str(&m)?, complete)))
         .transpose()
 }
 /// Preserve OS causes through anyhow contexts, including rustix filesystem errors.
 pub(crate) fn save_failure_code(error: &anyhow::Error) -> NackCode {
     for cause in error.chain() {
+        if cause.downcast_ref::<settings::SettingDisabled>().is_some() {
+            return NackCode::UnsupportedKind;
+        }
         if cause.downcast_ref::<ReceiptConflict>().is_some() {
             return NackCode::IdConflict;
         }
@@ -1239,6 +1726,50 @@ mod tests {
         drop(store);
         Ok(())
     }
+    // The verbatim released startup can fail before wrapping its raw flock in
+    // StoreOwnership. A concurrent test's fork may then inherit that lock until
+    // exec. Run this historical code alone so process exit releases every FD.
+    async fn released_startup(path: &Path, expected: &str) -> Result<()> {
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "store::tests::released_startup_fixture",
+                    "--nocapture",
+                ])
+                .env("PNEU_TEST_RELEASED_STORE", path)
+                .env("PNEU_TEST_RELEASED_EXPECTED", expected)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await??;
+        ensure!(
+            output.status.success(),
+            "released startup fixture failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+    #[test]
+    fn released_startup_fixture() -> Result<()> {
+        let Some(path) = std::env::var_os("PNEU_TEST_RELEASED_STORE") else {
+            return Ok(());
+        };
+        let expected = std::env::var("PNEU_TEST_RELEASED_EXPECTED")?;
+        let result = released_store::Store::open(Path::new(&path));
+        if expected == "success" {
+            drop(result?);
+        } else {
+            let error = result
+                .err()
+                .expect("released startup must refuse migrated storage");
+            assert!(error.to_string().contains(&expected), "{error:#}");
+        }
+        Ok(())
+    }
+
     async fn fixture() -> Result<(tempfile::TempDir, Store, Id)> {
         let dir = tempfile::tempdir()?;
         let store = Store::open(&dir.path().join("state.sqlite3"))?;
@@ -1248,6 +1779,7 @@ mod tests {
             .await?;
         Ok((dir, store, device))
     }
+
     fn text(created_at: u64) -> Clipboard {
         Clipboard {
             hlc: None,
@@ -1309,10 +1841,7 @@ mod tests {
         }
         let store = Store::open(&path)?;
         assert_eq!(store.peers().await?.get(&fp), Some(&first));
-        assert_eq!(
-            store.first_outgoing(first.clone()).await?.unwrap().1,
-            pending
-        );
+        assert!(store.first_outgoing(first.clone()).await?.is_none());
         assert_eq!(
             store
                 .receipt(first.clone(), file.transfer_id.clone())
@@ -1333,7 +1862,7 @@ mod tests {
         assert_eq!(peers.len(), 2);
         assert_eq!(peers.get(&fp), Some(&first));
         assert!(peers.values().any(|id| id == &second));
-        assert_eq!(store.first_outgoing(first).await?.unwrap().1, pending);
+        assert!(store.first_outgoing(first).await?.is_none());
         Ok(())
     }
     #[tokio::test]
@@ -1342,7 +1871,7 @@ mod tests {
         let path = dir.path().join("state.sqlite3");
         // Create the original schema with the real released startup, then
         // migrate an existing pairing before adding the second device.
-        drop(released_store::Store::open(&path)?);
+        released_startup(&path, "success").await?;
         let first = Id::from_bytes([1; 16]);
         let c = Connection::open(&path)?;
         c.execute(
@@ -1356,7 +1885,7 @@ mod tests {
             .pair(second.clone(), Hash::new(crate::random_hex(32))?)
             .await?;
         for device in [&first, &second] {
-            store.applied_text(device.clone(), text(123), None).await?;
+            store.applied_text(device.clone(), text(123)).await?;
             store.enqueue(device.clone(), text(456)).await?;
             let file = begin(b"completed");
             store.locked(|c| {
@@ -1424,10 +1953,7 @@ mod tests {
             Ok(rows)
         };
         let before = snapshot()?;
-        let error = released_store::Store::open(&path)
-            .err()
-            .expect("released startup must refuse migrated storage");
-        assert!(error.to_string().contains("view"), "{error:#}");
+        released_startup(&path, "view").await?;
         assert_eq!(
             snapshot()?,
             before,
@@ -1438,7 +1964,10 @@ mod tests {
         close_for_restart(store).await?;
         assert_eq!(
             snapshot()?,
-            before,
+            before
+                .into_iter()
+                .filter(|row| !row.starts_with("outgoing:"))
+                .collect::<Vec<_>>(),
             "new startup after old attempt lost data"
         );
         Ok(())
@@ -1467,7 +1996,7 @@ mod tests {
                 .await?
                 .is_some()
         );
-        assert_eq!(store.first_outgoing(device).await?.unwrap().1, pending);
+        assert!(store.first_outgoing(device).await?.is_none());
         store.locked(|c| {
             assert_eq!(
                 c.query_row("SELECT last_outgoing_at FROM local_clock", [], |r| r
@@ -1485,11 +2014,108 @@ mod tests {
             Ok(())
         })?;
         close_for_restart(store).await?;
-        assert!(released_store::Store::open(&path).is_err());
+        released_startup(&path, "view").await?;
         let store = Store::open(&path)?;
         assert_eq!(store.peers().await?.len(), 1);
         Ok(())
     }
+    #[tokio::test]
+    async fn established_evidence_migrates_conservatively_and_is_generation_scoped() -> Result<()> {
+        let (dir, store, device) = fixture().await?;
+        let path = dir.path().join("state.sqlite3");
+        let generation = store.pairing_generation(&device);
+        store
+            .call(|c| {
+                c.execute_batch(
+                    "ALTER TABLE peers DROP COLUMN established; PRAGMA user_version=1;",
+                )?;
+                Ok(())
+            })
+            .await?;
+        close_for_restart(store).await?;
+        let store = Store::open(&path)?;
+        assert_eq!(store.pairing_generation(&device), generation);
+        assert!(!store.peer_established(device.clone()).await?);
+        store.mark_peer_established(device.clone()).await?;
+        close_for_restart(store).await?;
+        let store = Store::open(&path)?;
+        assert!(store.peer_established(device.clone()).await?);
+        let old = store.with_current_pairing();
+        store
+            .pair(device.clone(), Hash::new(crate::random_hex(32))?)
+            .await?;
+        assert!(!store.peer_established(device.clone()).await?);
+        assert!(old.mark_peer_established(device.clone()).await.is_err());
+        assert!(!store.peer_established(device.clone()).await?);
+        drop(old);
+        // Startup generation repair must not transfer READY evidence either.
+        store.mark_peer_established(device.clone()).await?;
+        store
+            .call(|c| {
+                c.execute("UPDATE peer_generations SET generation=generation+1", [])?;
+                Ok(())
+            })
+            .await?;
+        close_for_restart(store).await?;
+        let store = Store::open(&path)?;
+        assert!(!store.peer_established(device).await?);
+        close_for_restart(store).await
+    }
+    #[tokio::test]
+    async fn v1_migration_adds_only_established_and_preserves_downgrade_fence() -> Result<()> {
+        let (dir, store, device) = fixture().await?;
+        let path = dir.path().join("state.sqlite3");
+        let pending = text(456);
+        store.enqueue(device.clone(), pending.clone()).await?;
+        let generation = store.pairing_generation(&device);
+        let peers = store.peers().await?;
+        // Model the committed v1 schema with an existing binding.
+        store
+            .call(|c| {
+                c.execute_batch(
+                    "ALTER TABLE peers DROP COLUMN established; PRAGMA user_version=1;",
+                )?;
+                Ok(())
+            })
+            .await?;
+        close_for_restart(store).await?;
+        let store = Store::open(&path)?;
+        store
+            .call(|c| {
+                assert_eq!(
+                    c.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))?,
+                    2
+                );
+                assert_eq!(
+                    c.query_row(
+                        "SELECT count(*) FROM sqlite_schema WHERE name='join_installations'",
+                        [],
+                        |r| r.get::<_, u32>(0)
+                    )?,
+                    0
+                );
+                assert_eq!(
+                    c.query_row(
+                        "SELECT type FROM sqlite_schema WHERE name='pairing_epoch'",
+                        [],
+                        |r| r.get::<_, String>(0)
+                    )?,
+                    "view"
+                );
+                Ok(())
+            })
+            .await?;
+        assert_eq!(store.peers().await?, peers);
+        assert_eq!(store.pairing_generation(&device), generation);
+        assert!(store.first_outgoing(device.clone()).await?.is_none());
+        close_for_restart(store).await?;
+        released_startup(&path, "view").await?;
+        let store = Store::open(&path)?;
+        assert_eq!(store.peers().await?, peers);
+        assert!(store.first_outgoing(device).await?.is_none());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn failed_migration_rolls_back_schema_and_preserves_pairing() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -1529,13 +2155,13 @@ mod tests {
     async fn device_clipboard_register_survives_unpair_and_legacy_gates_stay_independent()
     -> Result<()> {
         let (dir, store, first) = fixture().await?;
-        store.applied_text(first.clone(), text(100), None).await?;
+        store.applied_text(first.clone(), text(100)).await?;
         let second = Id::new(crate::random_hex(16))?;
         store
             .pair(second.clone(), Hash::new(crate::random_hex(32))?)
             .await?;
         assert!(!store.text_is_stale(second.clone(), text(1)).await?);
-        store.applied_text(second.clone(), text(1), None).await?;
+        store.applied_text(second.clone(), text(1)).await?;
         store.unpair_then(second.clone(), |_| {}).await?;
         close_for_restart(store).await?;
         let store = Store::open(&dir.path().join("state.sqlite3"))?;
@@ -1587,12 +2213,12 @@ mod tests {
                 name: "Revoked computer".into(),
                 role: Some(pneu_proto::DeviceRole::Computer),
                 addresses: Some(vec!["192.0.2.1:47821".into()]),
-                capabilities: vec!["clipboard_text".into()],
+                capabilities: vec!["clipboard_text".into(), "mesh".into()],
                 paused: Some(false),
             };
             captured
-                .remember_peer_hello(hello.clone(), current.clone(), 1)
-                .await;
+                .remember_peer_hello(hello.clone(), current.clone(), 1, false)
+                .await?;
             let old: (String, String, String) = store
                 .call(|c| {
                     Ok(
@@ -1618,7 +2244,12 @@ mod tests {
                     .await?;
             }
             // Revoked HELLO work cannot restore hints into the replacement row.
-            captured.remember_peer_hello(hello, current, 1).await;
+            assert!(
+                captured
+                    .remember_peer_hello(hello, current, 1, false)
+                    .await
+                    .is_err()
+            );
             drop(captured);
             close_for_restart(store).await?;
             let restarted = Store::open(&dir.path().join("state.sqlite3"))?;
@@ -1646,12 +2277,11 @@ mod tests {
         // Both same-ID replacement and unpair/re-pair must revoke every write
         // class, including no-op receipts and jobs that outlive their caller.
         for unpair_first in [false, true] {
-            for operation in 0..10 {
+            for operation in [0, 1, 2, 3, 8, 9, 10] {
                 let (dir, store, device) = fixture().await?;
                 let old_scope = store.with_current_pairing();
                 let pending = text(1);
                 store.enqueue(device.clone(), pending).await?;
-                let seq = store.first_outgoing(device.clone()).await?.unwrap().0;
                 let staged = stage(&store, dir.path().join("save"), b"old file").await?;
                 let placed = staged.destination_path()?;
                 let temporary = staged.path()?;
@@ -1673,23 +2303,15 @@ mod tests {
                             .commit_file(peer, VerifiedFile::fixture(meta), staged)
                             .await
                             .map(|_| ()),
-                        1 => writer.applied_text(peer, text(99), None).await,
+                        1 => writer.applied_text(peer, text(99)).await,
                         2 => writer.enqueue(peer, text(99)).await,
                         3 => writer
                             .enqueue_clipboard(peer, "revoked".into())
                             .await
                             .map(|_| ()),
-                        4 => writer.outgoing_receipt(peer, seq, false, true).await,
-                        5 => writer.outgoing_receipt(peer, seq, true, false).await,
-                        6 => writer.outgoing_receipt(peer, seq, false, false).await,
-                        7 => writer.discard_outgoing(peer).await,
                         8 => writer.claim_text(peer, text(99)).await.map(|_| ()),
-                        _ => {
-                            claim
-                                .unwrap()
-                                .finalize(Arc::new(tokio::sync::Mutex::new(())).lock_owned().await)
-                                .await
-                        }
+                        10 => writer.mark_peer_established(peer).await,
+                        _ => claim.unwrap().finalize().await,
                     }
                 });
                 entered.await?;
@@ -1702,9 +2324,7 @@ mod tests {
                 let newest = text(2);
                 store.enqueue(device.clone(), newest.clone()).await?;
                 let applied = text(3);
-                store
-                    .applied_text(device.clone(), applied.clone(), None)
-                    .await?;
+                store.applied_text(device.clone(), applied.clone()).await?;
                 release.send(())?;
                 let result = job.await?;
                 store.drain().await;
@@ -1738,7 +2358,6 @@ mod tests {
                         .is_err()
                 );
                 assert!(old_scope.first_outgoing(device.clone()).await.is_err());
-                assert!(old_scope.discard_outgoing(device).await.is_err());
             }
         }
         Ok(())
@@ -1858,7 +2477,7 @@ mod tests {
     #[tokio::test]
     async fn wal_full_and_pairing_preserves_other_peer_state() -> Result<()> {
         let (_dir, store, device) = fixture().await?;
-        store.applied_text(device.clone(), text(10), None).await?;
+        store.applied_text(device.clone(), text(10)).await?;
         store.enqueue(device.clone(), text(11)).await?;
         let newer = Id::new(crate::random_hex(16))?;
         store
@@ -1881,9 +2500,7 @@ mod tests {
         let (dir, store, device) = fixture().await?;
         let first = text(1);
         assert!(!store.text_is_stale(device.clone(), first.clone()).await?);
-        store
-            .applied_text(device.clone(), first.clone(), None)
-            .await?;
+        store.applied_text(device.clone(), first.clone()).await?;
         let mut conflict = first.clone();
         conflict.text = "different".into();
         assert_eq!(
@@ -1896,9 +2513,7 @@ mod tests {
             NackCode::IdConflict
         );
         for timestamp in 2..=100 {
-            store
-                .applied_text(device.clone(), text(timestamp), None)
-                .await?;
+            store.applied_text(device.clone(), text(timestamp)).await?;
         }
         assert!(store.text_is_stale(device.clone(), first.clone()).await?);
         assert!(store.text_is_stale(device.clone(), text(100)).await?);
@@ -1921,50 +2536,7 @@ mod tests {
         assert!(!store.text_is_stale(device, text(101)).await?);
         Ok(())
     }
-    #[tokio::test]
-    async fn received_ack_and_nack_finish_even_if_unpolled_at_full_admission() -> Result<()> {
-        for (blocked, ack) in [(false, true), (true, false), (false, false)] {
-            let (_dir, store, device) = fixture().await?;
-            store.enqueue(device.clone(), text(1)).await?;
-            let seq = store.first_outgoing(device.clone()).await?.unwrap().0;
-            let (entered, wait) = tokio::sync::oneshot::channel();
-            let (release, held) = std::sync::mpsc::channel::<()>();
-            let mut holder = Box::pin(store.call(move |_| {
-                let _ = entered.send(());
-                let _ = held.recv();
-                Ok(())
-            }));
-            assert!(futures_util::poll!(holder.as_mut()).is_pending());
-            wait.await?;
-            let mut releases = vec![release];
-            for _ in 1..crate::work::BLOCKING_LIMIT {
-                let (release, held) = std::sync::mpsc::channel::<()>();
-                let mut job = Box::pin(store.blocking(move |_| {
-                    let _ = held.recv();
-                    Ok(())
-                }));
-                assert!(futures_util::poll!(job.as_mut()).is_pending());
-                drop(job);
-                releases.push(release);
-            }
-            // A READY deadline may expire without polling the returned future.
-            // Receipt submission itself must already have transferred ownership.
-            drop(store.outgoing_receipt(device.clone(), seq, blocked, ack));
-            drop(releases);
-            holder.await?;
-            store.drain().await;
-            let outgoing = store.first_outgoing(device).await?;
-            if ack || blocked {
-                assert!(outgoing.is_none(), "received result lost its deletion");
-            } else {
-                assert!(
-                    outgoing.unwrap().2 > crate::now_ms() as i64,
-                    "received retryable NACK lost its backoff"
-                );
-            }
-        }
-        Ok(())
-    }
+
     #[tokio::test]
     async fn unpolled_finalization_still_records_applied_text() -> Result<()> {
         let (_dir, store, device) = fixture().await?;
@@ -1973,10 +2545,8 @@ mod tests {
             .claim_text(device.clone(), applied.clone())
             .await?
             .context("claim")?;
-        let application = Arc::new(tokio::sync::Mutex::new(()));
-        drop(claim.finalize(application.clone().lock_owned().await));
+        drop(claim.finalize());
         store.drain().await;
-        assert!(application.try_lock().is_ok());
         assert!(store.receipt(device, applied.transfer_id).await?.unwrap().1);
         Ok(())
     }
@@ -2010,23 +2580,7 @@ mod tests {
         }
         Ok(())
     }
-    #[tokio::test]
-    async fn latest_outgoing_replaces_unsent_and_old_ack_or_nack_cannot_delete_it() -> Result<()> {
-        let (_dir, store, device) = fixture().await?;
-        store.enqueue(device.clone(), text(1)).await?;
-        let (old, _, _) = store.first_outgoing(device.clone()).await?.unwrap();
-        let latest = text(3);
-        store.enqueue(device.clone(), text(2)).await?;
-        store.enqueue(device.clone(), latest.clone()).await?;
-        store
-            .outgoing_receipt(device.clone(), old, false, true)
-            .await?;
-        store
-            .outgoing_receipt(device.clone(), old, true, false)
-            .await?;
-        assert_eq!(store.first_outgoing(device).await?.unwrap().1, latest);
-        Ok(())
-    }
+
     #[tokio::test]
     async fn startup_sweeps_every_used_folder_even_without_receipts_or_current_config() -> Result<()>
     {
@@ -2464,7 +3018,7 @@ mod tests {
         let mut meta = begin(b"file");
         meta.transfer_id = clipboard.transfer_id.clone();
         store
-            .applied_text(device.clone(), clipboard.clone(), None)
+            .applied_text(device.clone(), clipboard.clone())
             .await?;
         let staged = stage(&store, dir.path().join("save"), b"file").await?;
         let temporary = staged.path()?;
@@ -2476,7 +3030,13 @@ mod tests {
         assert!(!temporary.exists());
         assert_eq!(
             store.receipt(device, clipboard.transfer_id.clone()).await?,
-            Some((Metadata::Text((&clipboard).into()), true))
+            Some((
+                Metadata::Text(keyed_text_receipt(
+                    &store.clipboard_fingerprint_key,
+                    &clipboard
+                )),
+                true
+            ))
         );
         Ok(())
     }
@@ -2485,15 +3045,10 @@ mod tests {
         let (dir, store, device) = fixture().await?;
         let clipboard = text(1);
         store
-            .applied_text(device.clone(), clipboard.clone(), None)
+            .applied_text(device.clone(), clipboard.clone())
             .await?;
         store.reserve.store(u64::MAX, Ordering::SeqCst);
-        assert!(
-            store
-                .applied_text(device.clone(), text(2), None)
-                .await
-                .is_err()
-        );
+        assert!(store.applied_text(device.clone(), text(2)).await.is_err());
         assert!(store.enqueue(device.clone(), text(3)).await.is_err());
         assert!(
             store
@@ -2559,12 +3114,7 @@ mod tests {
         let mut conflicting = text(1);
         conflicting.transfer_id = meta.transfer_id;
         assert_eq!(
-            save_failure_code(
-                &store
-                    .applied_text(device, conflicting, None)
-                    .await
-                    .unwrap_err()
-            ),
+            save_failure_code(&store.applied_text(device, conflicting).await.unwrap_err()),
             NackCode::IdConflict
         );
         let count: i64 = store
@@ -2576,42 +3126,7 @@ mod tests {
         );
         Ok(())
     }
-    #[tokio::test]
-    async fn canceled_history_commit_keeps_clipboard_application_order_until_blocking_work_finishes()
-    -> Result<()> {
-        let (_dir, store, device) = fixture().await?;
-        let application = Arc::new(tokio::sync::Mutex::new(()));
-        let owned = application.clone().lock_owned().await;
-        let (entered, wait) = tokio::sync::oneshot::channel();
-        let (release, blocking) = std::sync::mpsc::channel();
-        let held = store.clone();
-        let holder = tokio::spawn(async move {
-            held.call(move |_| {
-                let _ = entered.send(());
-                blocking.recv()?;
-                Ok(())
-            })
-            .await
-        });
-        wait.await?;
-        let recording = store.clone();
-        let peer = device.clone();
-        let record =
-            tokio::spawn(async move { recording.applied_text(peer, text(2), Some(owned)).await });
-        while store.active_jobs() < 2 {
-            tokio::task::yield_now().await;
-        }
-        record.abort();
-        let _ = record.await;
-        let retained = application.try_lock().is_err();
-        release.send(())?;
-        holder.await??;
-        store.drain().await;
-        assert!(retained);
-        assert!(application.try_lock().is_ok());
-        assert!(store.text_is_stale(device, text(1)).await?);
-        Ok(())
-    }
+
     #[tokio::test]
     async fn pending_text_claim_blocks_file_and_is_removed_on_discard_and_cancellation()
     -> Result<()> {
@@ -2739,9 +3254,7 @@ mod tests {
                 .await?
                 .is_some()
         );
-        newest
-            .finalize(Arc::new(tokio::sync::Mutex::new(())).lock_owned().await)
-            .await?;
+        newest.finalize().await?;
         store.drain().await;
         assert!(store.text_is_stale(device, text).await?);
         Ok(())
@@ -2755,9 +3268,7 @@ mod tests {
             .claim_text(device.clone(), applied.clone())
             .await?
             .unwrap();
-        claim
-            .finalize(Arc::new(tokio::sync::Mutex::new(())).lock_owned().await)
-            .await?;
+        claim.finalize().await?;
         let pending = text(2);
         let mut abandoned = store
             .claim_text(device.clone(), pending.clone())
@@ -2825,8 +3336,95 @@ mod tests {
             std::io::Error::from_raw_os_error(code)
         }
     }
+    #[tokio::test]
+    async fn legacy_claim_does_not_allocate_effect_stamp() -> Result<()> {
+        let (_dir, store, device) = fixture().await?;
+        let before: String = store
+            .call(|c| Ok(c.query_row("SELECT last_seen FROM mesh_clock", [], |r| r.get(0))?))
+            .await?;
+        let claim = store.claim_text(device, text(1)).await?.unwrap();
+        let after: String = store
+            .call(|c| Ok(c.query_row("SELECT last_seen FROM mesh_clock", [], |r| r.get(0))?))
+            .await?;
+        claim.discard().await?;
+        assert_eq!(
+            before, after,
+            "admission allocated a stamp before the OS effect boundary"
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn mesh_clock_tie_break_history_skew_exhaustion_and_restart() -> Result<()> {
+        let (dir, store, first) = fixture().await?;
+        let low = Id::from_bytes([0; 16]);
+        let high = Id::from_bytes([255; 16]);
+        for peer in [&low, &high] {
+            store
+                .pair(peer.clone(), Hash::new(crate::random_hex(32))?)
+                .await?;
+        }
+        let mut operation = text(1);
+        let hlc = crate::now_ms() + 100;
+        operation.hlc = Some(hlc);
+        operation.source_device = Some(low.clone());
+        let claim = store
+            .claim_text(low.clone(), operation.clone())
+            .await?
+            .unwrap();
+        claim.finalize().await?;
+        assert!(!store.stamp_eligible(hlc, low.clone()).await?);
+        assert!(store.stamp_eligible(hlc, high.clone()).await?);
+        let mut conflict = operation.clone();
+        conflict.hlc = Some(hlc + 1);
+        assert!(
+            store.claim_text(low.clone(), conflict).await.is_err(),
+            "stamp is part of ID metadata equality"
+        );
+        assert!(validate_stamp(u64::MAX, crate::now_ms()).is_err());
+        assert!(validate_stamp(u64::MAX, u64::MAX - 60_000).is_ok());
+        assert!(validate_stamp(u64::MAX, u64::MAX - 60_001).is_err());
+        store.unpair_then(low, |_| {}).await?;
+        assert!(
+            !store.stamp_eligible(hlc - 1, high).await?,
+            "unpair preserves global register"
+        );
+        let (_, next) = store.local_clipboard(first.clone()).await?;
+        assert!(next > hlc);
+        close_for_restart(store).await?;
+        let store = Store::open(&dir.path().join("state.sqlite3"))?;
+        let (_, after) = store.local_clipboard(first.clone()).await?;
+        assert!(after > next);
+        store
+            .call(|c| {
+                c.execute("UPDATE mesh_clock SET last_seen=?", [u64::MAX.to_string()])?;
+                Ok(())
+            })
+            .await?;
+        let old = store
+            .call(|c| {
+                Ok(c.query_row("SELECT hlc FROM clipboard_clock", [], |r| {
+                    r.get::<_, String>(0)
+                })?)
+            })
+            .await?;
+        assert!(store.local_clipboard(first).await.is_err());
+        assert_eq!(
+            store
+                .call(
+                    |c| Ok(c.query_row("SELECT hlc FROM clipboard_clock", [], |r| r
+                        .get::<_, String>(0))?)
+                )
+                .await?,
+            old
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 #[path = "../tests/fixtures/released_store.rs"]
 mod released_store;
+
+#[cfg(test)]
+#[path = "store_settings_tests.rs"]
+mod settings_tests;

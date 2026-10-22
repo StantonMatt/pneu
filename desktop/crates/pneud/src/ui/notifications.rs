@@ -121,6 +121,17 @@ impl Notice {
         n.actions.push(("pair", "Pair Phone…"));
         n
     }
+    pub fn paired(name: &str) -> Self {
+        let name: String = name
+            .chars()
+            .map(|c| if c.is_whitespace() { ' ' } else { c })
+            .collect();
+        let mut n = Self::new(format!("Paired with {name}"));
+        n.transient = true;
+        n.urgency = 0;
+        n.expires = 4000;
+        n
+    }
     pub fn unpaired(phone: &str) -> Self {
         let mut n = Self::new(format!("{phone} unpaired this PC"));
         n.actions.push(("pair", "Pair Phone…"));

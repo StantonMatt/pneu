@@ -1,5 +1,6 @@
 pub mod actions;
 pub mod client;
+mod clipboard_fingerprint;
 pub mod config;
 pub mod core;
 mod discovery;
@@ -7,6 +8,8 @@ pub mod identity;
 pub mod ipc;
 mod storage;
 mod store;
+#[cfg(test)]
+mod test_support;
 pub mod tls;
 mod transport;
 pub mod ui;

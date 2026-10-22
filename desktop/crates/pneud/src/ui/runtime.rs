@@ -38,7 +38,7 @@ pub async fn run(
             None
         }
     };
-    let watcher = match super::clipboard::Watch::start(core.clone(), actions.echo.clone()) {
+    let watcher = match super::clipboard::Watch::start(core.clone()) {
         Ok(watcher) => Some(watcher),
         Err(error) => {
             eprintln!("pneud: clipboard watch unavailable: {error}");
@@ -95,6 +95,9 @@ pub async fn run(
                         last_blocked=Some(Instant::now());let _=actions.notice(Notice::blocked(&address),Vec::new(),None,0,None).await;
                     }
                 }
+                Ok(Event::ComputerPaired {name,..})=>{
+                    if !core.window_focused() {let _=actions.notice(Notice::paired(&name),Vec::new(),None,0,None).await;}
+                },
                 Ok(Event::RemoteUnpaired {name})=>{let _=actions.notice(Notice::unpaired(&name),Vec::new(),None,0,None).await;},
                 Ok(event @ (Event::ConnectionChanged {..}|Event::PhonePaused {..}|Event::ConfigChanged))=>clipboard_policy_event(&core,&event),
                 Err(tokio::sync::broadcast::error::RecvError::Closed)=>break,

@@ -45,22 +45,30 @@ as a revocation signal ("Pairing lost"), rather than a network failure.
 
 Each computer advertises mDNS service `_pneu._tcp.local.` (service type `_pneu._tcp`), SRV
 port and TXT keys `v=1`, `fp=<computer fingerprint>`. Instance name is for display only.
-For each peer, the dialer tries: (1) last-good LAN endpoint, (2) current mDNS endpoints matching the
-stored fingerprint/version, (3) paired Tailscale endpoints. QR LAN candidates
-bootstrap the LAN cache. Preserve candidate order within a category, trying each
-once before the next category. mDNS TXT is untrusted and cannot change a pin.
+Android phones discover computers through this advertisement using NsdManager;
+computers do not browse mDNS. For each computer peer, the dialer tries: (1) the
+last-good LAN endpoint, (2) HELLO address hints learned from that peer, (3)
+invitation addresses, (4) Tailscale addresses. The persisted route cache keeps
+last-good first, then HELLO hints before invitation fallbacks. Tailscale addresses
+always fall in the final category, even when last-good. Preserve candidate order
+within a category, trying each once before the next category. mDNS TXT is
+untrusted and cannot change a phone's stored pin.
 Tailscale `100.64.0.0/10` addresses, including the planned `100.67.144.28`, route
 through the phone's Tailscale app. LAN addresses can be IPv4, IPv6 or DNS names.
-PC selects QR and mDNS addresses from the same prioritized shortlist: Tailscale
-IPv4, interfaces carrying a default route, then other physical LAN interfaces.
+PC selects QR and mDNS advertisement addresses from the same prioritized
+shortlist: Tailscale IPv4, interfaces carrying a default route, then other
+physical LAN interfaces.
 Exclude Docker/bridge/veth/virbr, loopback, unspecified, multicast and link-local
 addresses before applying the eight-address limit. DNS A/AAAA records have no
-ordering guarantee; priority governs the selected shortlist. Discovery failure
-MUST NOT prevent the TCP daemon from running.
+ordering guarantee; priority governs the selected shortlist. Local interface
+discovery failure MUST NOT prevent the TCP daemon from running.
 
-Per endpoint, TCP connect timeout is 5 s and TLS handshake timeout is 10 s. After
-all candidates fail, retry after 2, 4, 8, 16, 32, then 60 s, with uniform ±20%
-jitter. Network changes and user-initiated sends MAY trigger an immediate retry.
+Per endpoint, TCP connect timeout is at most 5 s (1 s for secondary LAN
+hints and invitation fallbacks) and TLS handshake timeout is 10 s. A computer
+dial sweep has a fixed 30 s deadline including admission waits, DNS, TCP, TLS and
+HELLO; reaching it ends the sweep and releases the candidate's socket and permits. After all
+candidates fail or the sweep deadline expires, retry after 2, 4, 8, 16, 32, then
+60 s, with uniform ±20% jitter. Network changes and user-initiated sends MAY trigger an immediate retry.
 Never run parallel connection races to the same peer; independent peer dial loops
 may run concurrently. Mesh trust, queues, capabilities, sessions and binding
 generations are scoped by peer device ID. Pairing a new device MUST NOT remove or
@@ -122,7 +130,9 @@ literals; they are not treated as DNS names. No zones, paths, schemes, credentia
 or whitespace.
 Do not resolve DNS while parsing. Repeated identical `addr` values are invalid.
 Version/expiry parsing is syntactic; the application MUST reject unsupported
-versions and locally expired brand-new invitations before dialing. A persisted
+versions and locally expired brand-new invitations before dialing. A syntactically
+valid unsupported invitation shows **"Update required"**; malformed links remain
+invalid. A persisted
 pending pairing attempt is recovery, not a brand-new invitation, and MUST be
 retried even after its original `exp` has passed. PC's clock is decisive
 for token expiry; explain a clock disagreement to the user.
@@ -194,6 +204,11 @@ compression or base64 layer exists.
   CSPRNG entropy per logical operation, then persist until ACK. Reinstallation
   generates a new device ID and requires pairing. The TLS pin is bound to one
   device ID at pairing; a different HELLO ID for a known pin is unauthorized.
+  A remote HELLO claiming the receiver's own device ID is always unauthorized,
+  regardless of role, certificate or pairing token. Reject it before accepting
+  PAIR_REQUEST, installing trust, or changing peer/settings state. Invitation
+  previews reject the local certificate fingerprint; the remote device ID is
+  checked when HELLO arrives, before sending PAIR_REQUEST.
 * `Hash`: exactly 64 lowercase hex digits, SHA-256 of original file bytes.
 * `Timestamp`: integer Unix UTC milliseconds in `0..9007199254740991` (JSON's
   exactly representable integer range). Use a wall clock for metadata, a monotonic
@@ -519,13 +534,41 @@ Suppress clipboard watchers for received operations; never echo them with new ID
    network loss and triggers reconnect for pending work.
 
 Dialer cannot distinguish known/unknown admission from HELLO alone. Before its
-first PAIR_REQUEST, the dialer MUST durably save a pending pairing record with the
-acceptor fingerprint, ordered addresses and token (and the invitation metadata). If
-PAIR_RESULT is lost, it MUST keep that record and reconnect using that pin and
-send PAIR_REQUEST again, even after the invitation's `exp`. Only a brand-new
-invitation is subject to the local expiry check. A rejected result ends that
-attempt; accepted=true durably installs the acceptor binding and clears the pending
-record. The old binding remains until a new pairing succeeds.
+first PAIR_REQUEST, a phone dialer MUST durably save a pending pairing record with
+the acceptor fingerprint, ordered addresses and token (and invitation metadata).
+A computer joiner holds its attempt in memory only. Only one unresolved computer
+join is allowed, including a preview awaiting confirmation. A new join MUST fail
+with a pairing-in-progress error until the existing attempt completes, is
+definitively rejected, or is cancelled locally. Display errors, including TLS or
+fingerprint mismatch, MUST NOT replace the attempt.
+
+If PAIR_RESULT is lost, the dialer reconnects using the same token and pin and
+sends PAIR_REQUEST again, even after the invitation's `exp`. Only a brand-new
+invitation is subject to the local expiry check. A definitive rejected result ends
+the attempt; storage failures, missing rejection codes and generic admission denials
+remain retryable. A computer joiner restart abandons its in-memory attempt; the
+user pairs again with a fresh invitation.
+
+At the first PAIR_REQUEST, once HELLO is known, a computer joiner captures the
+acceptor's device ID, its local pairing tombstone generation, and the current
+admission entry for the invitation fingerprint. Retries MUST NOT refresh this
+per-peer install fence. At accepted=true, under the pairing gate, the joiner
+installs only if all three remain unchanged. Otherwise it finishes without
+installing: report paired if that fingerprint is now bound to that device ID,
+and cancelled otherwise. Other peers' pairing changes do not invalidate this fence.
+Cancellation is local and immediate; a computer join attempt NEVER sends UNPAIR.
+An unconfirmed inviter binding is harmless: the next pairing reuses it through the
+known-certificate recovery exception, and the user can remove it. It has no
+time-based expiry.
+
+A newly accepted computer binding MUST survive speculative reverse-dial admission
+failures while its joiner may still be persisting or recovering PAIR_RESULT.
+Destructive handling of reverse-dial unauthorized is deferred until there is proof
+that the joiner persisted its binding: joiner-initiated READY-loop PING traffic on
+a session after PAIR_RESULT, or a reverse dial accepted by the joiner's acceptor
+(which accepts only known certificates outside pairing). A PONG on the pairing
+connection is not evidence: the joiner may answer PING before persisting.
+Readiness evidence is durable and scoped to the pairing generation.
 
 For a certificate already bound to the same HELLO device ID, the acceptor MUST answer
 PAIR_REQUEST with PAIR_RESULT accepted=true, without rechecking the token, expiry
@@ -580,7 +623,9 @@ Compare keys lexicographically by unsigned HLC, then by the lowercase hex device
 ID; **greater wins**, including the greater device ID on equal HLC. An incoming
 clip is eligible only if its key is strictly greater than the applied register
 (or the register is empty). Retained-ID conflicts still NACK `id_conflict`.
-Stale/identical text ACKs `deduplicated=true` without an OS effect. New eligible
+Stale text ACKs `deduplicated=true` without an OS effect. An eligible copy identical
+to the known current content also ACKs `deduplicated=true` without an OS write,
+while advancing the register and recording its receipt. New eligible
 text retains the existing reserve/apply/finalize/ACK transaction and bounded
 recent-ID history, with `hlc`/`source_device` included in metadata equality.
 Failure NACKs `clipboard_unavailable`, does not advance the applied register and
@@ -609,8 +654,11 @@ effect boundary and assign a local observation stamp with the local HLC formula
 and authenticated legacy peer ID. Do the same at the effect boundary for legacy
 file-based image clipboard effects. It is not forwarded or restamped on the wire.
 This fences queued mesh actions behind a later legacy effect without claiming
-mesh convergence with a legacy endpoint. Local clipboard changes never queue for
-offline peers on mesh links; a reconnect does not replay an old local clipboard.
+mesh convergence with a legacy endpoint. Clipboard delivery is latest-only, in
+memory and connected-only for all peers, including legacy peers. A disconnect
+or restart drops unsent clipboard content; a reconnect does not replay it.
+Legacy wire messages strip the stamp and set `created_at` to the operation's HLC.
+Old durable legacy clipboard rows are discarded at migration/startup.
 
 ## PEER_SETTINGS (`21`, decimal 33)
 
@@ -669,7 +717,9 @@ before sending and the receiver before applying MUST check current settings;
 recheck at the OS boundary for deferred effects. Turning a switch off suppresses
 queued unsent content in that direction; it does not revoke saved files/receipts.
 Text arriving in a disabled clipboard direction NACKs `unsupported_kind` without
-applying. A disabled automatic-media direction drains file bytes and NACKs
+applying. A mesh text replay matching a retained receipt ACKs `deduplicated` before
+checking the disabled direction; conflicting retained metadata still NACKs `id_conflict`.
+A disabled automatic-media direction drains file bytes and NACKs
 `unsupported_kind` at END. A disabled clipboard direction still allows ordinary
 file saving, but suppresses every deferred image clipboard effect. Queued file
 deliveries blocked by settings remain paused until enabled or explicitly
@@ -685,17 +735,29 @@ Do not echo an unchanged state indefinitely. Allow one unacknowledged settings
 snapshot per direction; coalesce subsequent edits into the next full snapshot.
 
 Use a fresh `transfer_id` in the shared sender operation-ID namespace for each
-snapshot, distinct from file/text IDs. Persist the exact outgoing snapshot until
-ACK. Receiver persists the merged state and a receipt keyed by
+changed full stamped state, distinct from file/text IDs. Persist the exact
+outgoing snapshot until ACK and retain the acknowledged snapshot across restart.
+On reconnect, replay that same snapshot and ID if the full stamped state is
+unchanged; mint a new ID only when the state changes. Pending snapshots always
+replay before any newer coalesced state. Receiver persists the merged state and
+a receipt keyed by
 `(authenticated sender device_id, transfer_id)` including snapshot metadata,
 then sends ordinary ACK (`deduplicated=false` for a newly recorded snapshot,
-`true` for identical replay). Retain settings receipts for the binding lifetime,
-as with file receipts. A retained ID with different metadata NACKs `id_conflict`;
+`true` for identical retained replay). Settings receipts MAY use a bounded recent
+window (PC: latest 4,096 recorded snapshots per authenticated sender, ordered by
+local insertion sequence). Prune older receipts atomically with the merge and
+new receipt; this is a recoverable window, not a lifetime admission quota.
+A retained ID with different metadata NACKs `id_conflict`;
 persistence failure NACKs `storage_failed` without a partial merge. ACK/NACK must
 match that peer/connection's pending snapshot. The existing 120 s receipt timer
 and 60 s storage retry apply; on disconnect retry the exact pending snapshot
-before sending a fresh full state. Lost ACK is safe, and older replay never
-replaces newer fields. A settings failure holds content until synchronization
+before sending a changed full state. Replaying an evicted snapshot safely merges
+its fields again under LWW and records a new receipt (`deduplicated=false`);
+subsequent retained replay ACKs `deduplicated=true`. Its older tuples cannot
+replace newer fields, and equal tuples with conflicting values remain malformed.
+ID conflict detection for evicted settings receipts is limited to the retained
+window; file receipt retention is unchanged. Lost ACK is safe, and older replay
+never replaces newer fields. A settings failure holds content until synchronization
 succeeds; keepalive remains live.
 
 For a newly paired pair, both clipboard directions and the pair automatic-media
@@ -841,11 +903,11 @@ only this bounded horizon. Unpair clears both timestamp and recent IDs.
 
 A failed clipboard application NACKs `clipboard_unavailable` and retains nothing:
 no pending operation or inbound barrier. Sender MAY retry, drop, or supersede
-failed text. PC keeps only its latest pending outgoing text, replacing any older
-unsent value; an already-sent value may await its receipt. Concurrent local sends MUST preserve timestamp order: an older or equal
+failed text. PC keeps only its latest pending outgoing text in memory for each connected peer,
+replacing any older unsent value; an already-sent value may await its receipt. Concurrent local sends MUST preserve timestamp order: an older or equal
 `created_at` MUST NOT overwrite a newer pending value.
-Receiving an old receipt MUST NOT remove a newer pending value. Retrying preserves the original
-ID, text and timestamp. A crash between clipboard application and history commit
+Receiving an old receipt MUST NOT remove a newer pending value. A retained in-flight delivery across duplicate connection replacement preserves
+its original ID, text and timestamp. A crash between clipboard application and history commit
 can repeat that value; clipboard application is best effort. Files never block
 clipboard text except for bounded transport backpressure.
 
@@ -911,6 +973,14 @@ bytes, clipboard text, pairing secrets or keys to logs. Avoid acknowledging data
 before durable storage: this is what protects offline delivery after crashes.
 User content and pins remain encrypted on the wire, including over Tailscale.
 Protocol syntax validation does not provide certificate/authorization checks.
+
+Paired computers' address hints can trigger outbound TCP/TLS attempts to arbitrary
+host:port destinations, including loopback. The certificate pin prevents application
+data exchange with an untrusted endpoint, but does not prevent TCP connection or
+TLS ClientHello traffic. This residual routing risk is accepted; hints are bounded
+to sixteen persisted routes per peer and twenty-four dial candidates. Computer
+peers do not consume mDNS routing hints. The advertisement retains its eligible
+interface allowlist, eight-address shortlist and periodic refresh for phones.
 
 `docs/protocol-vectors/v1.json` is the interoperability fixture. `frames` contains
 exact full wire hex plus typed `decoded` meanings for every ID. Control encoders

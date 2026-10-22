@@ -8,7 +8,10 @@ use std::sync::Arc;
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|s| s == "clipboard-helper") {
-        return pneud::actions::clipboard_helper(args.get(1).context("MIME argument")?.clone());
+        return pneud::actions::clipboard_helper(
+            args.get(1).context("MIME argument")?.clone(),
+            args.get(2).context("install ticket")?.parse()?,
+        );
     }
     if args.first().is_some_and(|s| s == "ui-window") {
         return pneud::ui::window::run(Paths::from_env()?);
@@ -31,6 +34,32 @@ async fn async_main(args: Vec<String>) -> Result<()> {
                 },
             )
             .await?;
+            Ok(())
+        }
+        Some("join") => {
+            anyhow::ensure!(
+                args.len() == 1,
+                "join reads the invitation from stdin; no arguments allowed"
+            );
+            let mut uri = String::new();
+            use std::io::Read;
+            std::io::stdin().take(8194).read_to_string(&mut uri)?;
+            anyhow::ensure!(uri.len() <= 8193, "pairing input too large");
+            println!(
+                "{}",
+                ipc::request(&paths.socket, Command::Join { uri }).await?
+            );
+            Ok(())
+        }
+        Some("join-confirm" | "join-status" | "join-cancel") => {
+            anyhow::ensure!(args.len() == 2, "expected attempt ID");
+            let attempt = args[1].clone();
+            let command = match args[0].as_str() {
+                "join-confirm" => Command::JoinConfirm { attempt },
+                "join-status" => Command::JoinStatus { attempt },
+                _ => Command::JoinCancel { attempt },
+            };
+            println!("{}", ipc::request(&paths.socket, command).await?);
             Ok(())
         }
         Some("pair") => {
@@ -95,7 +124,7 @@ async fn async_main(args: Vec<String>) -> Result<()> {
         }
         Some("--help" | "help") => {
             println!(
-                "pneud [run|window|pair|close-pairing|status|reload|unpair DEVICE|clipboard DEVICE TEXT|discard-clipboard DEVICE]"
+                "pneud [run|window|pair|join (stdin)|join-confirm ATTEMPT|join-status ATTEMPT|join-cancel ATTEMPT|close-pairing|status|reload|unpair DEVICE|clipboard DEVICE TEXT|discard-clipboard DEVICE]"
             );
             Ok(())
         }

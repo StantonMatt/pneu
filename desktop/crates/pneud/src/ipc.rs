@@ -14,18 +14,59 @@ use tokio::{
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Command {
     Pair,
+    Join {
+        uri: String,
+    },
+    JoinConfirm {
+        attempt: String,
+    },
+    JoinStatus {
+        attempt: String,
+    },
+    JoinCancel {
+        attempt: String,
+    },
     EnsurePair,
-    WaitPairingChange { revision: u64 },
+    WaitPairingChange {
+        revision: u64,
+    },
     ClosePairing,
-    ClosePairingIf { token: Hash },
-    Unpair { device: Id },
-    Config { config: Config },
-    SaveFolder { folder: std::path::PathBuf },
-    Clipboard { device: Id, text: String },
-    DiscardClipboard { device: Id },
+    ClosePairingIf {
+        token: Hash,
+    },
+    Unpair {
+        device: Id,
+    },
+    Config {
+        config: Config,
+    },
+    SaveFolder {
+        folder: std::path::PathBuf,
+    },
+    Clipboard {
+        device: Id,
+        text: String,
+    },
+    DiscardClipboard {
+        device: Id,
+    },
+    PeerSettings {
+        device: Id,
+    },
+    SetPeerSetting {
+        device: Id,
+        key: String,
+        enabled: bool,
+    },
     Status,
     UiStatus,
-    ShowWindow { choose_folder: bool },
+    WindowFocus {
+        request: u64,
+        focused: bool,
+    },
+    ShowWindow {
+        choose_folder: bool,
+    },
 }
 #[derive(Serialize, Deserialize)]
 pub struct Reply {
@@ -163,7 +204,11 @@ async fn handle(core: Arc<Core>, stream: UnixStream) -> Result<()> {
         &tokio::time::timeout(Duration::from_secs(10), line(&mut stream)).await??,
     )?;
     let result: Result<serde_json::Value> = async { Ok(match request {
-        Command::Pair => { let uri = core.start_pairing().await?; serde_json::json!({"uri":uri.build()?,"expires_at":uri.expires_at}) },
+        Command::Join { uri } => core.join(&uri).await?,
+        Command::JoinConfirm { attempt } => core.confirm_join(&attempt).await?,
+        Command::JoinStatus { attempt } => core.join_status(&attempt)?,
+        Command::JoinCancel { attempt } => { core.cancel_join(&attempt).await?; serde_json::Value::Null },
+        Command::Pair => { let uri = core.start_pairing().await?; serde_json::json!({"uri":uri.build()?,"expires_at":uri.expires_at,"qr_data":uri.build()?}) },
         Command::EnsurePair => { let uri = core.ensure_pairing().await?; serde_json::to_value(uri)? },
         Command::WaitPairingChange {revision} => serde_json::json!({"revision":core.wait_pairing_change(revision).await}),
         Command::ClosePairingIf { token } => { core.close_pairing_if(token).await; serde_json::Value::Null },
@@ -172,7 +217,10 @@ async fn handle(core: Arc<Core>, stream: UnixStream) -> Result<()> {
         Command::SaveFolder {folder} => { core.change_save_folder(folder).await?; serde_json::Value::Null },
         Command::Config {config} => { core.update_config(config).await?; serde_json::Value::Null },
         Command::Clipboard {device,text} => serde_json::to_value(core.send_clipboard(device,text).await?)?,
+        Command::PeerSettings {device} => core.peer_settings(device).await?,
+        Command::SetPeerSetting {device,key,enabled} => core.set_peer_setting(device,key,enabled).await?,
         Command::DiscardClipboard {device} => { core.discard_clipboard(device).await?; serde_json::Value::Null },
+        Command::WindowFocus { request, focused } => { core.set_window_focus(request, focused); serde_json::Value::Null },
         Command::UiStatus => { let (revision, invitation) = core.pairing_status(); let snapshot = core.ui_snapshot(); let (window_request, activation_token) = core.window_request_with_activation(); serde_json::json!({"device":snapshot.device, "snapshot":snapshot, "config": core.config(), "window_request":window_request,"activation_token":activation_token,"invitation_revision":revision,"invitation":invitation}) },
         Command::ShowWindow { choose_folder } => { core.request_window(choose_folder); serde_json::Value::Null },
         Command::Status => {
@@ -180,7 +228,7 @@ async fn handle(core: Arc<Core>, stream: UnixStream) -> Result<()> {
             let paired = snapshot.paired_devices;
             let connected = snapshot.connected_devices;
             let paused = snapshot.paused_devices;
-            serde_json::json!({"device_id":core.identity.device_id,"fingerprint":core.identity.fingerprint,"port":core.bound_port(),"paired_devices":paired,"connected_devices":connected,"paused_devices":paused,"config":core.config()})
+            serde_json::json!({"device_id":core.identity.device_id,"fingerprint":core.identity.fingerprint,"port":core.bound_port(),"paired_devices":paired,"connected_devices":connected,"paused_devices":paused,"devices":snapshot.devices,"config":core.config()})
         },
     }) }.await;
     let reply = match result {

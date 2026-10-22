@@ -203,11 +203,40 @@ pub(crate) fn atomic_private_in(
     destination: &std::ffi::OsStr,
     bytes: &[u8],
 ) -> Result<()> {
+    publish_private_in(folder, destination, bytes, true, || Ok(())).map(|_| ())
+}
+/// First-writer-wins publication for durable secrets. A racing creator loads
+/// the winner instead of replacing a key another process may already use.
+pub(crate) fn atomic_private_new(path: &Path, bytes: &[u8]) -> Result<bool> {
+    let folder = crate::storage::Folder::open(path.parent().context("no parent")?, false)?;
+    publish_private_in(
+        &folder,
+        path.file_name().context("file name")?,
+        bytes,
+        false,
+        || Ok(()),
+    )
+}
+fn publish_private_in(
+    folder: &crate::storage::Folder,
+    destination: &std::ffi::OsStr,
+    bytes: &[u8],
+    replace: bool,
+    before_write: impl FnOnce() -> Result<()>,
+) -> Result<bool> {
     ensure!(
         Path::new(destination).file_name() == Some(destination),
         "invalid file name"
     );
-    let tmp = format!("pneu-{}-tmp", crate::random_hex(16));
+    let tmp = format!(
+        ".pneu-{}-{}-tmp",
+        destination
+            .to_string_lossy()
+            .chars()
+            .take(48)
+            .collect::<String>(),
+        crate::random_hex(16)
+    );
     let name = tmp.as_str();
     let mut file = fs::File::from(rustix::fs::openat(
         &*folder.file,
@@ -220,13 +249,28 @@ pub(crate) fn atomic_private_in(
         rustix::fs::Mode::from_raw_mode(0o600),
     )?);
     let result = (|| {
+        before_write()?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        rustix::fs::renameat(&*folder.file, name, &*folder.file, destination)?;
+        if replace {
+            rustix::fs::renameat(&*folder.file, name, &*folder.file, destination)?;
+        } else {
+            match rustix::fs::renameat_with(
+                &*folder.file,
+                name,
+                &*folder.file,
+                destination,
+                rustix::fs::RenameFlags::NOREPLACE,
+            ) {
+                Ok(()) => {}
+                Err(rustix::io::Errno::EXIST) => return Ok(false),
+                Err(error) => return Err(error.into()),
+            }
+        }
         folder.file.sync_all()?;
-        Ok(())
+        Ok(true)
     })();
-    if result.is_err() {
+    if !matches!(result, Ok(true)) {
         let _ = crate::storage::remove_file(&folder.file, name, &file);
     }
     result
@@ -372,6 +416,65 @@ mod tests {
         fs::write(destination.join("keep"), b"foreign")?;
         assert!(atomic_private(&destination, b"new config").is_err());
         assert_eq!(fs::read(destination.join("keep"))?, b"foreign");
+        assert_eq!(fs::read_dir(dir.path())?.count(), 1);
+        Ok(())
+    }
+    #[test]
+    fn fingerprint_write_failure_before_payload_and_interrupted_temp_recover_on_restart()
+    -> Result<()> {
+        let dir = crate::test_support::scratch()?;
+        let folder = crate::storage::Folder::open(dir.path(), false)?;
+        let key = dir.path().join("clipboard-fingerprint.key");
+        let result = publish_private_in(&folder, key.file_name().unwrap(), &[7; 32], false, || {
+            Err(std::io::Error::from_raw_os_error(rustix::io::Errno::NOSPC.raw_os_error()).into())
+        });
+        assert!(result.is_err());
+        assert!(!key.exists());
+        assert_eq!(fs::read_dir(dir.path())?.count(), 0);
+        // Simulate process death after creating the private staging file.
+        let orphan = dir.path().join(format!(
+            ".pneu-clipboard-fingerprint.key-{}-tmp",
+            "a".repeat(32)
+        ));
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&orphan)?;
+        let unrelated = dir.path().join("keep");
+        fs::write(&unrelated, b"keep")?;
+        let db = dir.path().join("state.sqlite3");
+        let store = crate::store::Store::open(&db)?;
+        assert!(!orphan.exists());
+        assert_eq!(fs::read(&unrelated)?, b"keep");
+        let bytes = fs::read(&key)?;
+        assert_eq!(bytes.len(), 32);
+        drop(store);
+        drop(crate::store::Store::open(&db)?);
+        assert_eq!(fs::read(&key)?, bytes);
+        Ok(())
+    }
+    #[test]
+    fn atomic_new_concurrent_creators_keep_one_complete_private_winner() -> Result<()> {
+        let dir = crate::test_support::scratch()?;
+        let path = dir.path().join("key");
+        let results = std::thread::scope(|scope| {
+            (1..=8u8)
+                .map(|n| {
+                    let path = &path;
+                    scope.spawn(move || atomic_private_new(path, &[n; 32]))
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .collect::<Result<Vec<_>>>()
+        })?;
+        assert_eq!(results.iter().filter(|r| **r).count(), 1);
+        let bytes = fs::read(&path)?;
+        assert_eq!(bytes.len(), 32);
+        assert!(bytes.iter().all(|b| *b == bytes[0]));
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
         assert_eq!(fs::read_dir(dir.path())?.count(), 1);
         Ok(())
     }

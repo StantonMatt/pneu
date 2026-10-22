@@ -13,6 +13,10 @@ use std::{
 };
 
 slint::slint! {
+    export global WindowFocus {
+        callback changed(bool);
+    }
+
     import { Palette } from "std-widgets.slint";
     global Pneu {
         out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
@@ -80,8 +84,8 @@ slint::slint! {
         }
         fs := FocusScope {
             enabled: root.enabled;
-            focus-gained(reason) => { root.kb-focus = reason == FocusReason.tab-navigation || reason == FocusReason.popup-activation; }
-            focus-lost(reason) => { root.kb-focus = false; }
+            focus-gained(reason) => { WindowFocus.changed(true); root.kb-focus = reason == FocusReason.tab-navigation || reason == FocusReason.popup-activation; }
+            focus-lost(reason) => { if reason == FocusReason.window-activation { WindowFocus.changed(false); } root.kb-focus = false; }
             key-pressed(event) => {
                 if event.text == Key.Return || event.text == " " { root.clicked(); return accept; }
                 return reject;
@@ -208,6 +212,8 @@ slint::slint! {
         status-line := Text { text: "Ag"; visible: false; }
         forward-focus: keys;
         keys := FocusScope {
+            focus-gained(reason) => { WindowFocus.changed(true); }
+            focus-lost(reason) => { if reason == FocusReason.window-activation { WindowFocus.changed(false); } }
             focus-on-tab-navigation: false;
             forward-focus: change-button;
             key-pressed(event) => {
@@ -347,6 +353,11 @@ pub fn run(paths: Paths) -> Result<()> {
     slint::set_xdg_app_id("pneu")?;
     let window = PneuWindow::new()?;
     let visible = Arc::new(AtomicBool::new(true));
+    let focused = Arc::new(AtomicBool::new(false));
+    let focus = focused.clone();
+    window.global::<WindowFocus>().on_changed(move |value| {
+        focus.store(value, Ordering::SeqCst);
+    });
     let (commands, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let c = commands.clone();
     window.on_close(move || {
@@ -411,6 +422,7 @@ pub fn run(paths: Paths) -> Result<()> {
                         }
                     }
                 }
+                let _ = ipc::request(&paths.socket,ipc::Command::WindowFocus { request, focused: visible.load(Ordering::SeqCst) && focused.load(Ordering::SeqCst) }).await;
                 let value = match ipc::request(&paths.socket,ipc::Command::UiStatus).await {
                     Ok(value) => { failed = 0; value },
                     Err(_) => { failed += 1; if failed >= 3 { break; } continue; }
@@ -458,6 +470,7 @@ pub fn run(paths: Paths) -> Result<()> {
                     w.set_folder(folder.into()); w.set_error(error.into()); w.set_pairing(pairing.into());
                 });
             }
+            let _ = ipc::request(&paths.socket,ipc::Command::WindowFocus { request, focused: false }).await;
             drop(invitation_job);
             if let Some(token)=pairing_token {let _ = ipc::request(&paths.socket,ipc::Command::ClosePairingIf { token }).await;}
             let _ = slint::quit_event_loop();
@@ -758,7 +771,10 @@ mod tests {
         tokio::select! {result=folder_result(&mut job)=>{result?;anyhow::bail!("missing response completed");}, _=entered.notified()=>{}}
         // Same select branch used by the live window: a missing modal response
         // must allow state/QR ticks and Close to cancel the outstanding request.
-        tokio::select! {result=folder_result(&mut job)=>{result?;anyhow::bail!("missing response completed");}, _=tokio::time::sleep(Duration::from_millis(10))=>{}}
+        assert!(
+            futures_util::poll!(Box::pin(folder_result(&mut job))).is_pending(),
+            "missing response must return control to the window"
+        );
         job.take();
         tokio::time::timeout(Duration::from_secs(2), closed.notified()).await?;
         for response in [0, 1, 2] {

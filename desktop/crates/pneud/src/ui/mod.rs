@@ -27,6 +27,8 @@ pub struct Phone {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
     #[serde(default)]
+    pub devices: Vec<crate::core::mesh::DeviceSnapshot>,
+    #[serde(default)]
     pub paired_devices: Vec<pneu_proto::Id>,
     #[serde(default)]
     pub connected_devices: Vec<pneu_proto::Id>,

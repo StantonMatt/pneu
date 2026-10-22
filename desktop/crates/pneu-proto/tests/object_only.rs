@@ -1,6 +1,31 @@
 use pneu_proto::*;
 use serde_json::{Value, json};
 
+#[test]
+fn peer_settings_self_direction_is_rejected_on_decode_and_encode() {
+    let device = Id::from_bytes([1; 16]);
+    for feature in ["clipboard", "automatic_media"] {
+        let snapshot = PeerSettings {
+            transfer_id: Id::from_bytes([2; 16]),
+            settings: vec![PeerSetting {
+                key: format!("{device}/{device}/{feature}"),
+                enabled: false,
+                hlc: 0,
+                writer_device: device.clone(),
+            }],
+        };
+        let message = Message::PeerSettings(snapshot.clone());
+        assert!(snapshot.settings[0].validate().is_err());
+        assert!(encode_frame(&message).is_err());
+        // Build raw bytes to exercise the receive codec independently of encode.
+        let payload = serde_json::to_vec(&snapshot).unwrap();
+        let mut wire = ((payload.len() + 1) as u32).to_be_bytes().to_vec();
+        wire.push(0x21);
+        wire.extend(payload);
+        assert!(decode_frame(&wire).is_err());
+    }
+}
+
 fn fixture(kind: &str) -> Value {
     let vectors: Value =
         serde_json::from_str(include_str!("../../../../docs/protocol-vectors/v1.json")).unwrap();
