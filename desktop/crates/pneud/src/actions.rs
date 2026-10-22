@@ -1662,6 +1662,8 @@ exec sleep 60
             assert_eq!(&*startup_id.lock().unwrap(), token.unwrap_or_default());
         }
         let metadata = pneu_proto::FileBegin {
+            hlc: None,
+            source_device: None,
             transfer_id: pneu_proto::Id::from_bytes([7; 16]),
             file_name: "final.png".into(),
             mime: "image/png".into(),

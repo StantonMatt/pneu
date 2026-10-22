@@ -2,6 +2,84 @@ use crate::{MAX_CLIPBOARD_BYTES, MAX_FILE_SIZE, MAX_TIMESTAMP, Result, require, 
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashSet;
 
+// Serde's derived struct visitor also accepts positional sequences. Route wire
+// objects through MapAccess, keeping field attributes/defaults in one place.
+macro_rules! object_struct {
+    (
+        $(#[$attr:meta])* pub struct $name:ident {
+            $($(#[$field_attr:meta])* pub $field:ident: $ty:ty),* $(,)?
+        }
+    ) => {
+        $(#[$attr])*
+        pub struct $name {
+            $($(#[$field_attr])* pub $field: $ty),*
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+                #[derive(Deserialize)]
+                struct Fields {
+                    $($(#[$field_attr])* $field: $ty),*
+                }
+                let Fields { $($field),* } = deserialize_object(deserializer)?;
+                Ok(Self { $($field),* })
+            }
+        }
+    };
+}
+
+fn deserialize_object<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct ObjectVisitor<T>(std::marker::PhantomData<T>);
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for ObjectVisitor<T> {
+        type Value = T;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a JSON object")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            map: A,
+        ) -> std::result::Result<T, A::Error> {
+            T::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+        }
+    }
+    deserializer.deserialize_map(ObjectVisitor(std::marker::PhantomData))
+}
+
+// Derived unit enums also accept externally tagged objects. Decode through
+// String so every wire enum has the same string-only JSON representation.
+macro_rules! string_enum {
+    (
+        $(#[$attr:meta])* pub enum $name:ident {
+            $($(#[$variant_attr:meta])* $variant:ident => $wire:literal),* $(,)?
+        }
+    ) => {
+        $(#[$attr])*
+        #[serde(try_from = "String")]
+        pub enum $name {
+            $($(#[$variant_attr])* #[serde(rename = $wire)] $variant),*
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = crate::ProtocolError;
+
+            fn try_from(value: String) -> Result<Self> {
+                match value.as_str() {
+                    $($wire => Ok(Self::$variant),)*
+                    _ => Err(crate::ProtocolError::InvalidValue(
+                        concat!("invalid ", stringify!($name)).into(),
+                    )),
+                }
+            }
+        }
+    };
+}
+
 macro_rules! hex_type {
     ($name:ident, $digits:expr) => {
         #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -64,90 +142,139 @@ where
     T::deserialize(deserializer).map(Some)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Hello {
-    pub version: u32,
-    pub device_id: Id,
-    pub name: String,
-    pub capabilities: Vec<String>,
-    #[serde(
-        default,
-        deserialize_with = "non_null",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub paused: Option<bool>,
+object_struct! {
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    pub struct Hello {
+        pub version: u32,
+        pub device_id: Id,
+        pub name: String,
+        pub capabilities: Vec<String>,
+        #[serde(
+            default,
+            deserialize_with = "non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub paused: Option<bool>,
+        #[serde(
+            default,
+            deserialize_with = "non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub role: Option<DeviceRole>,
+        #[serde(
+            default,
+            deserialize_with = "non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub addresses: Option<Vec<String>>,
+    }
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PairRequest {
-    pub token: Hash,
+string_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum DeviceRole {
+        Phone => "phone",
+        Computer => "computer",
+    }
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PairResult {
-    pub accepted: bool,
-    #[serde(
-        default,
-        deserialize_with = "non_null",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub code: Option<PairCode>,
-    #[serde(
-        default,
-        deserialize_with = "non_null",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub message: Option<String>,
+object_struct! {
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    pub struct PairRequest {
+        pub token: Hash,
+    }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PairCode {
-    InvalidToken,
-    ExpiredToken,
-    PairingClosed,
-    AlreadyPaired,
-    StorageFailed,
+object_struct! {
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    pub struct PairResult {
+        pub accepted: bool,
+        #[serde(
+            default,
+            deserialize_with = "non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub code: Option<PairCode>,
+        #[serde(
+            default,
+            deserialize_with = "non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub message: Option<String>,
+    }
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Ping {
-    pub nonce: Nonce,
+string_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum PairCode {
+        InvalidToken => "invalid_token",
+        ExpiredToken => "expired_token",
+        PairingClosed => "pairing_closed",
+        AlreadyPaired => "already_paired",
+        StorageFailed => "storage_failed",
+    }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Status {
-    pub paused: bool,
+object_struct! {
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    pub struct Ping {
+        pub nonce: Nonce,
+    }
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Unpair {}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FileKind {
-    Screenshot,
-    Photo,
-    Recording,
-    File,
-    ClipboardImage,
+object_struct! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+    pub struct Status {
+        pub paused: bool,
+    }
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FileBegin {
-    pub transfer_id: Id,
-    pub file_name: String,
-    pub mime: String,
-    pub size: u64,
-    pub sha256: Hash,
-    pub kind: FileKind,
-    pub created_at: u64,
-    #[serde(
-        default,
-        deserialize_with = "non_null",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub source_media_id: Option<String>,
+object_struct! {
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    pub struct Unpair {}
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FileChunk {
-    pub transfer_id: Id,
-    pub offset: u64,
-    /// In decoded JSON fixtures this is hex; on the wire these bytes are raw.
-    #[serde(with = "hex_bytes")]
-    pub data: Vec<u8>,
+string_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum FileKind {
+        Screenshot => "screenshot",
+        Photo => "photo",
+        Recording => "recording",
+        File => "file",
+        ClipboardImage => "clipboard_image",
+    }
+}
+object_struct! {
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    pub struct FileBegin {
+        pub transfer_id: Id,
+        pub file_name: String,
+        pub mime: String,
+        pub size: u64,
+        pub sha256: Hash,
+        pub kind: FileKind,
+        pub created_at: u64,
+        #[serde(
+            default,
+            deserialize_with = "non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub source_media_id: Option<String>,
+        #[serde(
+            default,
+            deserialize_with = "non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub hlc: Option<u64>,
+        #[serde(
+            default,
+            deserialize_with = "non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub source_device: Option<Id>,
+    }
+}
+object_struct! {
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    pub struct FileChunk {
+        pub transfer_id: Id,
+        pub offset: u64,
+        /// In decoded JSON fixtures this is hex; on the wire these bytes are raw.
+        #[serde(with = "hex_bytes")]
+        pub data: Vec<u8>,
+    }
 }
 mod hex_bytes {
     use serde::{Deserialize, Deserializer, Serializer};
@@ -159,88 +286,153 @@ mod hex_bytes {
         hex::decode(text).map_err(serde::de::Error::custom)
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FileEnd {
-    pub transfer_id: Id,
+object_struct! {
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    pub struct FileEnd {
+        pub transfer_id: Id,
+    }
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Ack {
-    pub transfer_id: Id,
-    pub deduplicated: bool,
+object_struct! {
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    pub struct Ack {
+        pub transfer_id: Id,
+        pub deduplicated: bool,
+    }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NackCode {
-    HashMismatch,
-    SizeMismatch,
-    StorageFailed,
-    DiskFull,
-    NotWritable,
-    UnsupportedKind,
-    IdConflict,
-    ClipboardUnavailable,
+string_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum NackCode {
+        HashMismatch => "hash_mismatch",
+        SizeMismatch => "size_mismatch",
+        StorageFailed => "storage_failed",
+        DiskFull => "disk_full",
+        NotWritable => "not_writable",
+        UnsupportedKind => "unsupported_kind",
+        IdConflict => "id_conflict",
+        ClipboardUnavailable => "clipboard_unavailable",
+    }
 }
 impl NackCode {
     pub fn retryable(self) -> bool {
         !matches!(self, Self::UnsupportedKind | Self::IdConflict)
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Nack {
-    pub transfer_id: Id,
-    pub code: NackCode,
-    pub retryable: bool,
-    #[serde(
-        default,
-        deserialize_with = "non_null",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub message: Option<String>,
+object_struct! {
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    pub struct Nack {
+        pub transfer_id: Id,
+        pub code: NackCode,
+        pub retryable: bool,
+        #[serde(
+            default,
+            deserialize_with = "non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub message: Option<String>,
+    }
 }
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ClipboardOrigin {
-    #[default]
-    Clipboard,
-    Share,
+string_enum! {
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum ClipboardOrigin {
+        #[default]
+        Clipboard => "clipboard",
+        Share => "share",
+    }
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Clipboard {
-    pub transfer_id: Id,
-    pub text: String,
-    pub created_at: u64,
-    #[serde(default)]
-    pub origin: ClipboardOrigin,
+object_struct! {
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    pub struct Clipboard {
+        pub transfer_id: Id,
+        pub text: String,
+        pub created_at: u64,
+        #[serde(default)]
+        pub origin: ClipboardOrigin,
+        #[serde(
+            default,
+            deserialize_with = "non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub hlc: Option<u64>,
+        #[serde(
+            default,
+            deserialize_with = "non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub source_device: Option<Id>,
+    }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ErrorCode {
-    VersionMismatch,
-    Unauthorized,
-    UnexpectedMessage,
-    MalformedMessage,
-    FrameTooLarge,
-    UnknownMessage,
-    Timeout,
-    Busy,
-    ConnectionReplaced,
-    Closing,
+
+object_struct! {
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    pub struct PeerSettings {
+        pub transfer_id: Id,
+        pub settings: Vec<PeerSetting>,
+    }
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ErrorMessage {
-    pub code: ErrorCode,
-    #[serde(
-        default,
-        deserialize_with = "non_null",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub message: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "non_null",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub supported_version: Option<u32>,
+
+object_struct! {
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    pub struct PeerSetting {
+        /// `<from-device-id>/<to-device-id>/clipboard|automatic_media`.
+        pub key: String,
+        pub enabled: bool,
+        pub hlc: u64,
+        pub writer_device: Id,
+    }
+}
+
+impl PeerSetting {
+    pub fn validate(&self) -> Result<()> {
+        let parts: Vec<_> = self.key.split('/').collect();
+        require(parts.len() == 3, "invalid settings key")?;
+        Id::new(parts[0])?;
+        Id::new(parts[1])?;
+        require(
+            parts[0] != parts[1],
+            "settings direction must join distinct devices",
+        )?;
+        require(
+            matches!(parts[2], "clipboard" | "automatic_media"),
+            "invalid settings feature",
+        )?;
+        require(
+            self.writer_device.as_str() == parts[0] || self.writer_device.as_str() == parts[1],
+            "settings writer must belong to pair",
+        )
+    }
+}
+string_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum ErrorCode {
+        VersionMismatch => "version_mismatch",
+        Unauthorized => "unauthorized",
+        UnexpectedMessage => "unexpected_message",
+        MalformedMessage => "malformed_message",
+        FrameTooLarge => "frame_too_large",
+        UnknownMessage => "unknown_message",
+        Timeout => "timeout",
+        Busy => "busy",
+        ConnectionReplaced => "connection_replaced",
+        Closing => "closing",
+    }
+}
+object_struct! {
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    pub struct ErrorMessage {
+        pub code: ErrorCode,
+        #[serde(
+            default,
+            deserialize_with = "non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub message: Option<String>,
+        #[serde(
+            default,
+            deserialize_with = "non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub supported_version: Option<u32>,
+    }
 }
 
 /// JSON representation is for fixtures/debugging only; use the frame codec on wire.
@@ -260,6 +452,7 @@ pub enum Message {
     Ack(Ack),
     Nack(Nack),
     Clipboard(Clipboard),
+    PeerSettings(PeerSettings),
     Error(ErrorMessage),
 }
 
@@ -279,6 +472,7 @@ impl Message {
             Self::Ack(_) => 0x13,
             Self::Nack(_) => 0x14,
             Self::Clipboard(_) => 0x20,
+            Self::PeerSettings(_) => 0x21,
             Self::Error(_) => 0x7f,
         }
     }
@@ -305,6 +499,17 @@ impl Message {
                     !seen.contains("clipboard_image") || seen.contains("files"),
                     "clipboard_image requires files",
                 )?;
+                if let Some(addresses) = &m.addresses {
+                    require(
+                        addresses.len() <= crate::MAX_CANDIDATE_ADDRESSES,
+                        "too many addresses",
+                    )?;
+                    let mut seen = HashSet::new();
+                    for address in addresses {
+                        crate::validate_address(address)?;
+                        require(seen.insert(address), "duplicate address")?;
+                    }
+                }
             }
             Self::PairResult(m) => {
                 require(
@@ -334,6 +539,14 @@ impl Message {
                 if let Some(id) = &m.source_media_id {
                     string_limit(id, 1, 256, "source_media_id")?;
                 }
+                require(
+                    m.hlc.is_some() == m.source_device.is_some(),
+                    "incomplete clipboard clock",
+                )?;
+                require(
+                    m.hlc.is_none() || (m.mime.starts_with("image/") && m.mime.len() > 6),
+                    "clipboard clock requires an image MIME",
+                )?;
             }
             Self::FileChunk(m) => {
                 require(
@@ -355,6 +568,21 @@ impl Message {
             Self::Clipboard(m) => {
                 string_limit(&m.text, 0, MAX_CLIPBOARD_BYTES, "clipboard text")?;
                 require(m.created_at <= MAX_TIMESTAMP, "invalid timestamp")?;
+                require(
+                    m.hlc.is_some() == m.source_device.is_some(),
+                    "incomplete clipboard clock",
+                )?;
+            }
+            Self::PeerSettings(m) => {
+                require(
+                    (1..=3).contains(&m.settings.len()),
+                    "expected 1..=3 settings",
+                )?;
+                let mut seen = HashSet::new();
+                for setting in &m.settings {
+                    setting.validate()?;
+                    require(seen.insert(&setting.key), "duplicate settings key")?;
+                }
             }
             Self::Error(m) => {
                 require(

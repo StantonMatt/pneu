@@ -474,6 +474,8 @@ async fn transmit_automatic<W: tokio::io::AsyncWrite + Unpin>(
             OutgoingSelection::Text(text) => send(&mut writer, &Message::Clipboard(text)).await?,
             OutgoingSelection::Image(id, bytes) => {
                 let begin = FileBegin {
+                    hlc: None,
+                    source_device: None,
                     transfer_id: id.clone(),
                     file_name: "clipboard.png".into(),
                     mime: "image/png".into(),
@@ -1533,6 +1535,8 @@ impl Core {
             crate::transport::send(
                 &mut tls,
                 &Message::Hello(Hello {
+                    role: None,
+                    addresses: None,
                     version: 1,
                     device_id: self.identity.device_id.clone(),
                     name: self.config().name,
@@ -3453,6 +3457,8 @@ mod tests {
             &state,
             id,
             &Hello {
+                role: None,
+                addresses: None,
                 version: 1,
                 device_id: device.clone(),
                 name: format!("Phone {id}"),
@@ -4435,6 +4441,8 @@ mod tests {
             paused: false,
         });
         let current = Hello {
+            role: None,
+            addresses: None,
             version: pneu_proto::PROTOCOL_VERSION,
             device_id: device.clone(),
             name: "Current phone".into(),
@@ -5227,6 +5235,8 @@ mod tests {
             .await?;
         let bytes = b"original bytes";
         let begin = FileBegin {
+            hlc: None,
+            source_device: None,
             transfer_id: Id::new(crate::random_hex(16))?,
             file_name: "file.bin".into(),
             mime: "application/octet-stream".into(),
@@ -5368,6 +5378,8 @@ mod tests {
     }
     fn test_begin(bytes: &[u8]) -> FileBegin {
         FileBegin {
+            hlc: None,
+            source_device: None,
             transfer_id: Id::new(crate::random_hex(16)).unwrap(),
             file_name: "file.bin".into(),
             mime: "application/octet-stream".into(),
@@ -5480,6 +5492,8 @@ mod tests {
                     &text_core.store,
                     &text_device,
                     Message::Clipboard(Clipboard {
+                        hlc: None,
+                        source_device: None,
                         transfer_id: Id::new(crate::random_hex(16))?,
                         text: "blocked".into(),
                         created_at: 0,
@@ -5533,6 +5547,8 @@ mod tests {
         let application = core.clipboard_gate.lock().await;
         let begin = test_begin(b"file");
         let text = Clipboard {
+            hlc: None,
+            source_device: None,
             transfer_id: begin.transfer_id.clone(),
             text: "must not apply".into(),
             created_at: 1,
@@ -5610,6 +5626,8 @@ mod tests {
         let mut store = core.store.with_current_pairing();
         store.connection_id = Some(1);
         let text = Clipboard {
+            hlc: None,
+            source_device: None,
             transfer_id: Id::new(crate::random_hex(16))?,
             text: "admitted text".into(),
             created_at: 1,
@@ -5899,6 +5917,8 @@ mod tests {
                     Some(&worker_scope),
                     &device,
                     Message::Clipboard(Clipboard {
+                        hlc: None,
+                        source_device: None,
                         transfer_id: Id::new(crate::random_hex(16))?,
                         text: "revoked".into(),
                         created_at: 1,

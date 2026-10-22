@@ -48,6 +48,8 @@ fn control_limit_counts_encoded_bytes() {
 
     // Text bytes are within the clipboard limit, but JSON escapes exceed 64 KiB.
     let message = Message::Clipboard(Clipboard {
+        hlc: None,
+        source_device: None,
         transfer_id: id(),
         text: "\u{0001}".repeat(MAX_CLIPBOARD_BYTES),
         created_at: 0,
@@ -56,6 +58,8 @@ fn control_limit_counts_encoded_bytes() {
     assert!(message.validate().is_ok());
     assert!(encode_frame(&message).is_err());
     let message = Message::Clipboard(Clipboard {
+        hlc: None,
+        source_device: None,
         transfer_id: id(),
         text: "é".repeat(MAX_CLIPBOARD_BYTES / 2 + 1),
         created_at: 0,

@@ -188,6 +188,8 @@ impl Phone {
                 let sent = crate::transport::send(
                     &mut tls,
                     &Message::Hello(Hello {
+                        role: None,
+                        addresses: None,
                         version: 1,
                         device_id: self.identity.device_id.clone(),
                         name: "Pneu simulator".into(),
@@ -266,6 +268,8 @@ impl Phone {
             hash.update(&buf[..n]);
         }
         let begin = FileBegin {
+            hlc: None,
+            source_device: None,
             transfer_id: Id::new(crate::random_hex(16))?,
             file_name: path
                 .file_name()
@@ -285,6 +289,8 @@ impl Phone {
     }
     pub fn text(&self, text: String, origin: ClipboardOrigin) -> Result<Clipboard> {
         let mut text = Clipboard {
+            hlc: None,
+            source_device: None,
             transfer_id: Id::new(crate::random_hex(16))?,
             text,
             created_at: crate::now_ms(),
@@ -649,6 +655,8 @@ mod tests {
             crate::transport::send(
                 &mut tls,
                 &Message::Hello(Hello {
+                    role: None,
+                    addresses: None,
                     version: 1,
                     device_id: pc.device_id,
                     name: "Mock PC".into(),
@@ -711,6 +719,8 @@ mod tests {
             if matches!(scenario, Scenario::ClipboardOrder) {
                 for (timestamp, deduplicated) in [(2, false), (1, true), (3, false), (3, true)] {
                     let text = Clipboard {
+                        hlc: None,
+                        source_device: None,
                         transfer_id: Id::new(crate::random_hex(16))?,
                         text: "private".into(),
                         created_at: timestamp,
@@ -732,6 +742,8 @@ mod tests {
             }
             if matches!(scenario, Scenario::PausedClipboard) {
                 let text = Clipboard {
+                    hlc: None,
+                    source_device: None,
                     transfer_id: id,
                     text: "private".into(),
                     created_at: 9,
@@ -825,6 +837,8 @@ mod tests {
             let id = Id::new(crate::random_hex(16))?;
             let (mut connection, pc) = mock_pc(directory.path(), scenario, id.clone()).await?;
             let text = Clipboard {
+                hlc: None,
+                source_device: None,
                 transfer_id: id.clone(),
                 text: "private text".into(),
                 created_at: 0,

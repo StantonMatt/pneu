@@ -236,6 +236,8 @@ fn assert_simulator_rejection(error: &anyhow::Error) {
 
 fn metadata(id: Id, bytes: &[u8]) -> FileBegin {
     FileBegin {
+        hlc: None,
+        source_device: None,
         transfer_id: id,
         file_name: "capture.png".into(),
         mime: "image/png".into(),
@@ -289,6 +291,8 @@ async fn pair_file_durable_ack_duplicate_and_clipboard() -> Result<()> {
     assert_eq!(h.actions.images.lock().unwrap().len(), 1);
     assert_eq!(h.actions.notices.lock().unwrap().len(), 1);
     let text = Clipboard {
+        hlc: None,
+        source_device: None,
         transfer_id: Id::new(pneud::random_hex(16))?,
         text: "hola ☃".into(),
         created_at: 0,
@@ -506,6 +510,8 @@ async fn unknown_clients_obey_provisional_and_total_connection_quotas() -> Resul
     write_frame(
         &mut provisional,
         &Message::Hello(Hello {
+            role: None,
+            addresses: None,
             version: 1,
             device_id: candidate.identity.device_id.clone(),
             name: "candidate".into(),
@@ -729,6 +735,8 @@ async fn missing_certificate_verify_private_key_is_rejected() -> Result<()> {
         Err(_) => true,
         Ok(mut stream) => {
             let hello = Message::Hello(Hello {
+                role: None,
+                addresses: None,
                 version: 1,
                 device_id: phone.identity.device_id.clone(),
                 name: "spoof".into(),
@@ -893,6 +901,8 @@ async fn paired_reconnect_survives_lost_pair_result_and_daemon_restart() -> Resu
         .connect(&invitation.addresses, invitation.fingerprint.clone(), None)
         .await?;
     let text = Clipboard {
+        hlc: None,
+        source_device: None,
         transfer_id: Id::new(pneud::random_hex(16))?,
         text: "recovered".into(),
         created_at: 0,
@@ -1023,6 +1033,8 @@ async fn hello_and_status_report_pause_without_receipts_and_keep_manual_sends() 
     assert!(matches!(c.read(Duration::from_secs(3)).await?, Message::Pong(p) if p.nonce == nonce));
     assert!(c.read(Duration::from_millis(100)).await.is_err());
     let manual = Clipboard {
+        hlc: None,
+        source_device: None,
         transfer_id: Id::new(pneud::random_hex(16))?,
         text: "manual share while paused".into(),
         created_at: 0,
@@ -1075,6 +1087,8 @@ async fn omitted_hello_paused_defaults_to_false() -> Result<()> {
     write_frame(
         &mut tls,
         &Message::Hello(Hello {
+            role: None,
+            addresses: None,
             version: 1,
             device_id: phone.identity.device_id.clone(),
             name: "Phone".into(),
@@ -1139,6 +1153,8 @@ async fn file_kind_and_clipboard_origin_survive_receipts_dedupe_and_events() -> 
     assert_eq!(h.actions.text.lock().unwrap().len(), 2);
     // Omission and explicit clipboard have the same semantic default for dedupe.
     let text = Clipboard {
+        hlc: None,
+        source_device: None,
         transfer_id: Id::new(pneud::random_hex(16))?,
         text: "default".into(),
         created_at: 3,
@@ -1159,6 +1175,8 @@ async fn incoming_unpair_clears_pairing_receipts_and_active_staging() -> Result<
     let mut c = h.pair(&phone).await?;
     let device = &phone.identity.device_id;
     let text = Clipboard {
+        hlc: None,
+        source_device: None,
         transfer_id: Id::new(pneud::random_hex(16))?,
         text: "received".into(),
         created_at: 0,
@@ -1224,6 +1242,8 @@ async fn incoming_unpair_clears_pairing_receipts_and_active_staging() -> Result<
     tokio::time::sleep(Duration::from_secs(1)).await;
     let mut c = h.pair(&phone).await?;
     let text = Clipboard {
+        hlc: None,
+        source_device: None,
         transfer_id: partial.transfer_id,
         text: "fresh".into(),
         created_at: 0,
@@ -1294,6 +1314,8 @@ async fn missing_uncreatable_save_folder_retains_cache_and_retries_without_recei
     ));
     assert_eq!(std::fs::read(&blocker)?, b"keep me");
     let conflicting_text = Clipboard {
+        hlc: None,
+        source_device: None,
         transfer_id: meta.transfer_id.clone(),
         text: "cannot replace failed file".into(),
         created_at: 1,
@@ -1652,6 +1674,8 @@ async fn shutdown_cancels_a_tls_connection_waiting_for_hello() -> Result<()> {
         .await?;
     h.core.request_shutdown();
     let hello = Message::Hello(Hello {
+        role: None,
+        addresses: None,
         version: 1,
         device_id: phone.identity.device_id.clone(),
         name: "late".into(),
@@ -1864,6 +1888,8 @@ async fn immediate_disconnect_after_receipt_preserves_text_link_and_failure_noti
                 .denied
                 .store(failed, std::sync::atomic::Ordering::SeqCst);
             c.write(&Message::Clipboard(Clipboard {
+                hlc: None,
+                source_device: None,
                 transfer_id: Id::new(pneud::random_hex(16))?,
                 text: text.into(),
                 created_at: 0,
@@ -2479,6 +2505,8 @@ async fn outgoing_clipboard_images_require_capability_and_keep_latest_while_rece
     write_frame(
         &mut tls,
         &Message::Hello(Hello {
+            role: None,
+            addresses: None,
             version: 1,
             device_id: phone.identity.device_id.clone(),
             name: "Image phone".into(),

@@ -869,6 +869,8 @@ impl Store {
                     |r| r.get(0),
                 )?;
                 let text = Clipboard {
+                    hlc: None,
+                    source_device: None,
                     transfer_id: Id::new(crate::random_hex(16))?,
                     text,
                     created_at: crate::now_ms().max((previous as u64).saturating_add(1)),
@@ -1053,6 +1055,8 @@ mod tests {
     use std::os::unix::fs::symlink;
     fn begin(bytes: &[u8]) -> FileBegin {
         FileBegin {
+            hlc: None,
+            source_device: None,
             transfer_id: Id::new(crate::random_hex(16)).unwrap(),
             file_name: "file.bin".into(),
             mime: "application/octet-stream".into(),
@@ -1088,6 +1092,8 @@ mod tests {
     }
     fn text(created_at: u64) -> Clipboard {
         Clipboard {
+            hlc: None,
+            source_device: None,
             transfer_id: Id::new(crate::random_hex(16)).unwrap(),
             text: "clipboard secret".into(),
             created_at,
