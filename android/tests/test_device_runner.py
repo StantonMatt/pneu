@@ -36,6 +36,63 @@ class DeviceRunnerTest(unittest.TestCase):
         runner.logs.clear()
         runner.keys.clear()
 
+    def test_cold_offline_text_waits_for_rejection_without_requiring_a_queue_row(self):
+        response = subprocess.CompletedProcess([], 0, stdout='')
+        marker = 'cold-text-test-marker'
+        def command(cmd, **kwargs):
+            if cmd[-1] == 'files/cold-share.json':
+                return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({'text': 'cold text'}))
+            if 'logcat' in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout=marker + '\nshare_rejected: no_recipient\n')
+            return response
+        with patch.object(runner, 'restore'), patch.object(runner, 'instrument') as instrument, \
+             patch.object(runner, 'run', side_effect=command), \
+             patch.object(runner.subprocess, 'run', return_value=response), \
+             patch.object(runner, 'snapshot_rows', return_value=[]), \
+             patch('uuid.uuid4', return_value=Mock(hex='test-marker')), \
+             patch.object(runner.time, 'sleep'), \
+             patch.object(runner.time, 'monotonic', side_effect=[0, 0, 13]):
+            runner.cold_share('text', 'prepare', 'verify')
+        self.assertEqual(instrument.call_count, 2)
+        evidence = json.loads((self.scratch / 'cold-text-evidence.json').read_text())
+        self.assertEqual(evidence['rejection'], 'no_recipient')
+        self.assertEqual(evidence['witnessed_rows_before_instrumentation'], [])
+
+    def test_empty_cold_text_queue_without_this_attempts_completion_is_not_success(self):
+        response = subprocess.CompletedProcess([], 0, stdout='')
+        def command(cmd, **kwargs):
+            if cmd[-1] == 'files/cold-share.json':
+                return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({'text': 'cold text'}))
+            if 'logcat' in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout='old-marker\nshare_rejected: no_recipient\n')
+            return response
+        with patch.object(runner, 'restore'), patch.object(runner, 'instrument') as instrument, \
+             patch.object(runner, 'run', side_effect=command), \
+             patch.object(runner.subprocess, 'run', return_value=response), \
+             patch.object(runner, 'snapshot_rows', return_value=[]), \
+             patch('uuid.uuid4', return_value=Mock(hex='test-marker')), \
+             patch.object(runner.time, 'sleep'), \
+             patch.object(runner.time, 'monotonic', side_effect=[0, 0, 13]):
+            with self.assertRaisesRegex(AssertionError, 'did not finish with no_recipient'):
+                runner.cold_share('text', 'prepare', 'verify')
+        instrument.assert_called_once_with('cold-text-prepare', 'prepare', ['-e', 'mode', 'text'])
+
+    def test_cold_file_witnesses_still_require_the_expected_delivery_count(self):
+        for mode, count in (('single', 1), ('multiple', 2)):
+            with self.subTest(mode=mode):
+                response = subprocess.CompletedProcess([], 0, stdout='')
+                data = json.dumps({'uri': 'content://fixture', 'text': 'unused'})
+                def command(cmd, **kwargs):
+                    return subprocess.CompletedProcess(cmd, 0, stdout=data if cmd[-1] == 'files/cold-share.json' else '')
+                with patch.object(runner, 'restore'), patch.object(runner, 'instrument') as instrument, \
+                     patch.object(runner, 'run', side_effect=command), \
+                     patch.object(runner.subprocess, 'run', return_value=response), \
+                     patch.object(runner, 'snapshot_rows', return_value=[['file', 'waiting', 1, 'hash']] * count):
+                    runner.cold_share(mode, 'prepare', 'verify')
+                self.assertEqual(instrument.call_count, 2)
+                evidence = json.loads((self.scratch / ('cold-' + mode + '-evidence.json')).read_text())
+                self.assertEqual(count, len(evidence['witnessed_rows_before_instrumentation']))
+
     def test_failure_continues_and_summary_preserves_successful_runs(self):
         order = []
         def failing():
@@ -228,7 +285,7 @@ class DeviceRunnerTest(unittest.TestCase):
         sdk = self.scratch / 'sdk'
         adb = sdk / 'platform-tools/adb'
         adb.parent.mkdir(parents=True)
-        adb.write_text('#!/bin/sh\nexit 1\n')
+        adb.write_text('#!/bin/sh\nif [ "$3" = emu ]; then echo pneu-test; exit 0; fi\nexit 1\n')
         adb.chmod(0o700)
         evidence = self.scratch / 'evidence'
         env = dict(os.environ, ANDROID_HOME=str(sdk), PYTHONDONTWRITEBYTECODE='1')
@@ -292,3 +349,58 @@ class DeviceCoverageTest(unittest.TestCase):
         methods['ConnectionFaultDeviceTest'].add('unselectedNewPeerScenario')
         with self.assertRaisesRegex(AssertionError, 'ConnectionFaultDeviceTest#unselectedNewPeerScenario'):
             self.assert_coverage(methods, runner.selected_device_tests())
+
+
+class EmulatorAuthorityTest(unittest.TestCase):
+    def test_every_adb_call_requires_the_verified_serial_and_environment(self):
+        serial = 'emulator-5580'
+        def suite(*_):
+            subprocess.run(['/sdk/adb', '-s', serial, 'shell', 'true'])
+            for command in (['/sdk/adb', 'shell', 'true'], ['/sdk/adb', '-s', 'real-phone', 'shell', 'true'], ['/sdk/adb', '-s', 'emulator-5554', 'shell', 'true']):
+                with self.assertRaisesRegex(RuntimeError, 'verified emulator'):
+                    subprocess.run(command)
+            os.environ['ANDROID_SERIAL'] = 'real-phone'
+            with self.assertRaisesRegex(RuntimeError, 'ANDROID_SERIAL changed'):
+                subprocess.run(['/sdk/adb', '-s', serial, 'shell', 'true'])
+            os.environ['ANDROID_SERIAL'] = serial
+            return True
+        with tempfile.TemporaryDirectory() as scratch, patch.dict(os.environ), \
+             patch.object(sys, 'argv', ['runner', 'local', '--serial', serial, '--scratch', scratch]), \
+             patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout='pneu-test\nOK\n')) as command, \
+             patch.object(runner, 'run_suites', side_effect=suite), patch.object(runner, 'cleanup'):
+            self.assertEqual(0, runner.main())
+            self.assertEqual(2, command.call_count)
+
+    def test_wrong_avd_is_rejected_before_install_or_cleanup(self):
+        with patch.dict(os.environ), patch.object(sys, 'argv', ['runner', '--serial', 'emulator-5580']), \
+             patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout='other-avd\nOK\n')) as command, \
+             patch.object(runner, 'run_suites') as suites, patch.object(runner, 'cleanup') as cleanup:
+            with self.assertRaises(SystemExit) as result:
+                runner.main()
+            self.assertEqual(2, result.exception.code)
+            self.assertEqual(1, command.call_count)
+            suites.assert_not_called();cleanup.assert_not_called()
+
+    def test_default_invocation_runs_all_suites_and_named_reruns_preserve_inventory(self):
+        original = {name: list(cases) for name, cases in runner.SUITES.items()}
+        for arguments in ([], ['local', '--cases', 'MultiComputerReviewDeviceTest']):
+            with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as scratch, \
+                 patch.dict(os.environ), patch.object(sys, 'argv', ['runner', '--serial', 'emulator-5580', '--scratch', scratch, *arguments]), \
+                 patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout='pneu-test\nOK\n')), \
+                 patch.object(runner, 'run_suites', return_value=True) as suites, patch.object(runner, 'cleanup'):
+                self.assertEqual(0, runner.main())
+                selected, _, cases = suites.call_args.args
+                if arguments:
+                    self.assertEqual(['local'], selected)
+                    self.assertEqual(['MultiComputerReviewDeviceTest'], [case.name for case in cases['local']])
+                else:
+                    self.assertEqual(list(original), selected)
+                    self.assertIsNone(cases)
+                self.assertEqual(original, runner.SUITES)
+
+    def test_real_phone_serial_is_rejected_before_any_command(self):
+        with patch.object(sys, 'argv', ['runner', 'local', '--serial', 'real-phone']), patch.object(subprocess, 'run') as command:
+            with self.assertRaises(SystemExit) as result:
+                runner.main()
+            self.assertEqual(2, result.exception.code)
+            command.assert_not_called()

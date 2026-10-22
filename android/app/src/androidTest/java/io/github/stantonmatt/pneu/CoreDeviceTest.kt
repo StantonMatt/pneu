@@ -30,8 +30,16 @@ class CoreDeviceTest {
         instrumentation.uiAutomation.takeScreenshot().let { bitmap -> File(dir,"$name.png").outputStream().use {bitmap.compress(Bitmap.CompressFormat.PNG,100,it)};bitmap.recycle() }
     }
     private fun launch() {context.startActivity(Intent(context,MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK));Thread.sleep(1200)}
+    private fun night(enabled:Boolean) {
+        instrumentation.uiAutomation.executeShellCommand("cmd uimode night ${if(enabled)"yes" else "no"}").use {
+            android.os.ParcelFileDescriptor.AutoCloseInputStream(it).readBytes()
+        }
+        androidx.test.uiautomator.UiDevice.getInstance(instrumentation).waitForIdle()
+        instrumentation.waitForIdleSync()
+    }
     private fun click(text: String) {
         val device=androidx.test.uiautomator.UiDevice.getInstance(instrumentation)
+        device.waitForIdle();instrumentation.waitForIdleSync()
         val objectToClick=device.findObject(androidx.test.uiautomator.UiSelector().text(text))
         assertTrue("Control $text",objectToClick.waitForExists(3000)); objectToClick.click();Thread.sleep(700)
     }
@@ -43,17 +51,18 @@ class CoreDeviceTest {
         context.graph.preferences.toggle("queue",true);context.graph.preferences.toggle("screenshots",true)
         context.graph.preferences.toggle("photos",false);context.graph.preferences.toggle("recordings",false)
         context.graph.preferences.toggle("mobile",true)
-        automation.executeShellCommand("cmd uimode night no").close()
-        launch();screenshot("setup-light");automation.executeShellCommand("cmd uimode night yes").close();Thread.sleep(900);screenshot("setup-dark");automation.executeShellCommand("cmd uimode night no").close();Thread.sleep(900);click("Continue");screenshot("pair-light")
-        automation.executeShellCommand("cmd uimode night yes").close();Thread.sleep(1000);screenshot("pair-dark")
+        night(false)
+        launch();screenshot("setup-light");night(true);Thread.sleep(900);screenshot("setup-dark");night(false);Thread.sleep(900);click("Continue");withTimeout(5000) {context.graph.prefs.first {it.setup}};screenshot("pair-light")
+        night(true);Thread.sleep(1000);screenshot("pair-dark")
         // Export a public leaf for the orchestrator's independent TLS harness.
         val cert=TlsIdentity(context.graph.preferences.flow.first().tlsAlias).certificate
         File(context.filesDir,"client.der").writeBytes(cert.encoded)
         val invitation=Invitation.parse("pneu://pair?v=1&name=Test%20PC&fp=${"a".repeat(64)}&addr=10.0.2.2%3A47826&token=${"b".repeat(64)}&exp=1800000300000")
         context.graph.preferences.paired(invitation,"c".repeat(32));context.graph.preferences.setLong("mediaSince",System.currentTimeMillis()/1000-2)
+        DeviceFixture.connectLocalPeer(context.graph)
         context.startActivity(Intent(context,MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK));Thread.sleep(1500)
         screenshot("home-dark");clickSettings();screenshot("settings-dark");androidx.test.uiautomator.UiDevice.getInstance(instrumentation).pressBack();Thread.sleep(400)
-        automation.executeShellCommand("cmd uimode night no").close();Thread.sleep(1200);screenshot("home-light");clickSettings();screenshot("settings-light")
+        night(false);Thread.sleep(1200);screenshot("home-light");clickSettings();screenshot("settings-light")
         // Close the UI first: observation must belong to the service, not the activity.
         androidx.test.uiautomator.UiDevice.getInstance(instrumentation).pressHome();Thread.sleep(500)
         instrumentation.runOnMainSync {
@@ -75,7 +84,18 @@ class CoreDeviceTest {
         val id="external_primary:${MediaStore.getVersion(context,"external_primary")}:images:${android.content.ContentUris.parseId(uri)}"
         assertNull(context.graph.queue.find(id))
         context.contentResolver.update(uri,ContentValues().apply {put(MediaStore.Images.Media.IS_PENDING,0)},null,null)
-        val row=withTimeout(8000) {while(context.graph.queue.find(id)==null) delay(100);context.graph.queue.find(id)!!}
+        // The shared image budget may queue pre-send preparation. Optimization
+        // may replace the transfer ID once; immutable bytes/ID start afterward.
+        val row=withTimeout(8000) {
+            while(true) {
+                val current=context.graph.queue.find(id)
+                if(current!=null && !io.github.stantonmatt.pneu.features.DeliveryPolicy.optimize(current.kind,current.mime,
+                    context.graph.connection.cellular(),context.graph.preferences.read().originals,
+                    current.attempted || current.payloadAttempted,current.optimized))break
+                delay(20)
+            }
+            context.graph.queue.find(id)!!
+        }
         assertEquals("waiting",row.state);assertTrue(File(row.path).exists());assertEquals(64,row.hash.length)
         delay(600);assertEquals(row.transferId,context.graph.queue.find(id)!!.transferId)
         withContext(Dispatchers.Main) {context.graph.retry(id)}

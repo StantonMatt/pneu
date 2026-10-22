@@ -57,7 +57,7 @@ class Staging(private val app: AppGraph, private val deleteCommittedSource:(File
             val admitted=StagedAdmission.publish(row.automatic,
                 discard={part?.let {it.delete();target.delete()}},
                 rescan={app.requestMediaScan();android.util.Log.d("PneuMedia","Dropped stale automatic capture; rescanning");afterAutomaticCaptureDrop(row)}) publication@{
-                if(binding==null || !binding.matches(app.preferences.read()))return@publication false
+                if(!app.hasRecipient(row,binding,app.preferences.read()))return@publication false
                 // Register before releasing the lock so cleanup cannot remove a live copy.
                 val temp=mutex.withLock {capacity(0);File.createTempFile("capture-",".part",dir).also {part=it;activeParts.add(it)}}
                 // Open private output before launching the abandonable worker. On a
@@ -94,7 +94,7 @@ class Staging(private val app: AppGraph, private val deleteCommittedSource:(File
                     }} finally {sources.remove(asset)}
                 }}
                 mutex.withLock {
-                    if(!binding.matches(app.preferences.read()))return@withLock false
+                    if(!app.hasRecipient(row,binding,app.preferences.read()))return@withLock false
                     capacity(0)
                     check(temp.renameTo(target));syncDir()
                     row.path=target.absolutePath;row.size=count;row.hash=hash;row.sourceHash=row.hash
@@ -111,7 +111,7 @@ class Staging(private val app: AppGraph, private val deleteCommittedSource:(File
         } catch(e:LocalCapacityException) {app.preferences.toggle("localCapacity",true);throw e}
         finally {part?.let {activeParts.remove(it)}}
     }
-    suspend fun optimize(row:Outgoing)=withContext(Dispatchers.IO) {
+    suspend fun optimize(row:Outgoing)=withContext(Dispatchers.IO) {ImageWorkBudget.run {
         // An interrupted pre-send preparation may already have published a JPEG.
         // Its ID, bytes and metadata are immutable on every subsequent selection.
         if(row.optimized)return@withContext row
@@ -145,15 +145,16 @@ class Staging(private val app: AppGraph, private val deleteCommittedSource:(File
             candidate.fileName=safeFilename(row.fileName,true);candidate.optimized=true
             Protocol.validate(Type.FILE_BEGIN,metadata(candidate))
             mutex.withLock {app.queueMutex.withLock {
-                val current=app.queue.find(row.mediaId)
-                if(current?.state !in setOf("waiting","failed") || current?.revision!=row.revision || current.transferId!=row.transferId || current.attempted || current.optimized || app.preferences.read().deliveryReset)throw java.io.IOException("Changed queue entry")
+                val current=app.queue.delivery(row.mediaId,row.peerId)
+                if(current?.state !in setOf("waiting","failed") || current?.revision!=row.revision || current.transferId!=row.transferId || app.queue.anyAttempted(row.mediaId)>0 || current.optimized || app.preferences.read().deliveryReset)throw java.io.IOException("Changed queue entry")
                 check(part.renameTo(target));syncDir()
-                app.queue.update(candidate);committed=true
+                app.queue.replacePayload(candidate);committed=true
                 PostCommit.maintain {deleteCommittedSource(old)}
             }}
             candidate
         } catch(e:Exception) {part.delete();if(!committed)target.delete();if(e is LocalCapacityException)app.preferences.toggle("localCapacity",true);throw e}
         finally {activeParts.remove(part);if(rendered!==bitmap)rendered?.recycle();bitmap?.recycle()}
+    }
     }
     /** Completed rows retain only metadata and a small private thumbnail. */
     suspend fun completeFile(row:Outgoing):Boolean=withContext(Dispatchers.IO) {
@@ -165,13 +166,17 @@ class Staging(private val app: AppGraph, private val deleteCommittedSource:(File
             val thumbnail=target?.let {MediaPreview.makeThumbnail(app.context,row,it,beforeThumbnailWrite)}
             if(thumbnail==null)target?.delete()
             mutex.withLock {app.queueMutex.withLock commit@{
-                val current=app.queue.find(row.mediaId)
-                if(current==null || current.state !in setOf("waiting","sending","failed") || current.revision!=row.revision || current.transferId!=row.transferId || app.preferences.read().deliveryReset) {thumbnail?.delete();return@commit false}
+                val current=app.queue.delivery(row.mediaId,row.peerId)
+                if(current==null || current.state !in setOf("waiting","sending","failed") || current.revision!=row.revision || current.transferId!=row.transferId || current.bindingGeneration!=row.bindingGeneration || app.preferences.read().deliveryReset) {thumbnail?.delete();return@commit false}
+                app.queue.update(row)
+                // ACK completes this recipient only. The last active recipient
+                // owns conversion of the shared payload into terminal history.
+                if(app.queue.hasPath(row.path)>0)return@commit true
                 val source=File(row.path)
                 val candidate=Outgoing().also {copy->Outgoing::class.java.fields.forEach {it.set(copy,it.get(row))}}
                 if(!row.automatic)candidate.uri=""
                 candidate.path=thumbnail?.path.orEmpty()
-                try {app.queue.update(candidate)}catch(e:Exception) {thumbnail?.delete();throw e}
+                try {app.queue.replacePayload(candidate)}catch(e:Exception) {thumbnail?.delete();throw e}
                 retained=true;row.path=candidate.path;row.uri=candidate.uri
                 PostCommit.maintain {deleteCommittedSource(source)};app.maintainTerminalLocked()
                 true

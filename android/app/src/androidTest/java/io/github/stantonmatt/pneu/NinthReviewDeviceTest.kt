@@ -89,7 +89,7 @@ class NinthReviewDeviceTest {
         val activity=withTimeout(4000) {clipboardCreated.await()}
         val operation=startedOperation(activity)
         val result=withTimeout(4000) {operation.result.filterNotNull().first()}
-        assertEquals("PC unreachable. Not sent.",result.message)
+        assertEquals("Computer unreachable. Not sent.",result.message)
         assertNotNull(operation.clipboardBinding);assertTrue(app.queue.pending().isEmpty())
     }
     @Test(timeout=30000) fun chooserRelaysTemporaryGrantToBoundedShareRead()=runBlocking<Unit> {
@@ -142,9 +142,11 @@ class NinthReviewDeviceTest {
         assertEquals(1,control("stats").getInt("opens"))
     }
     @Test(timeout=15000) fun serviceRecoversInitialReadFailureWithoutAnotherStart()=runBlocking<Unit> {
+        DeviceFixture.connectLocalPeer(app)
         val failed=AtomicBoolean(true);val reads=AtomicInteger();val epoch=app.preferences.read().policyEpoch
         app.preferences.beforeRead={if(failed.get()) {reads.incrementAndGet();throw IOException("Synthetic initial read")}}
-        PneuService.start(c);withTimeout(4000) {while(reads.get()<2)delay(20)}
+        // Read hooks run before the service's failure callback publishes status.
+        PneuService.start(c);withTimeout(4000) {while(reads.get()<2 || app.connection.state.value.status!="Storage unavailable")delay(20)}
         assertEquals("Storage unavailable",app.connection.state.value.status)
         failed.set(false)
         withTimeout(7000) {while(app.preferences.read().policyEpoch<epoch+2)delay(20)}
@@ -152,6 +154,7 @@ class NinthReviewDeviceTest {
         assertNotEquals("Storage unavailable",app.connection.state.value.status)
     }
     @Test(timeout=15000) fun serviceStartCommandRekicksBackoffAndStartsExactlyOneObserver()=runBlocking<Unit> {
+        DeviceFixture.connectLocalPeer(app)
         val failed=AtomicBoolean(true);val reads=AtomicInteger();val epoch=app.preferences.read().policyEpoch
         app.preferences.beforeRead={if(failed.get()) {reads.incrementAndGet();throw IOException("Synthetic initial read")}}
         PneuService.start(c);withTimeout(11000) {while(reads.get()<4)delay(20)}
@@ -163,16 +166,20 @@ class NinthReviewDeviceTest {
         val uri=image();withTimeout(4000) {while(app.queue.find(key(uri))==null)delay(20)}
         assertEquals(1,app.queue.all().count {it.mediaId==key(uri)})
     }
+    // Revoke the captured generation by repairing its peer; adding another PC
+    // deliberately leaves the original recipient valid in the mesh model.
     private suspend fun replace():Prefs {
         val old=app.preferences.read()
         val raw="pneu://pair?v=1&name=Replacement&fp=${randomId(32)}&addr=127.0.0.1%3A1&token=${randomId(32)}&exp=${System.currentTimeMillis()+300000}"
-        assertTrue(app.requestPairing(raw,old.peer!!.pin));assertTrue(app.installBinding(Invitation.parse(raw),randomId()))
+        assertTrue(app.requestPairing(raw,old.peer!!.pin));assertTrue(DeviceFixture.installApprovedBinding(app,Invitation.parse(raw),old.peer.deviceId))
         return app.preferences.read()
     }
     private suspend fun replacementBeforeShareRead(vararg paths:String,text:String?=null) {
         val original=DeliveryBinding.from(app.prefs.value)!!
         val entered=CompletableDeferred<Unit>();val release=CompletableDeferred<Unit>();val first=AtomicBoolean(true)
-        app.preferences.beforeReadStart={if(first.compareAndSet(true,false)) {entered.complete(Unit);release.await()}}
+        // Reserve-order work runs on IO before this read. Pause the share's
+        // main-thread settings read, not a concurrent service/connection read.
+        app.preferences.beforeReadStart={if(android.os.Looper.myLooper()==android.os.Looper.getMainLooper() && first.compareAndSet(true,false)) {entered.complete(Unit);release.await()}}
         try {
             if(text==null)caller(*paths,newTask=true)
             else c.startActivity(Intent().setComponent(ComponentName(c.packageName+".test",FixtureCallerActivity::class.java.name)).putExtra("text",text).putExtra("newTask",true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
@@ -261,6 +268,7 @@ class NinthReviewDeviceTest {
         assertEquals(3,operation.completed.filterNotNull().distinct().size)
     }
     @Test(timeout=15000) fun stalePermissionBaselineMustRetryRatherThanAdmitGapMedia()=runBlocking<Unit> {
+        DeviceFixture.connectLocalPeer(app)
         var readable=true;var intercept=false
         val entered=CompletableDeferred<Unit>();val release=CompletableDeferred<Unit>()
         val observer=ScreenshotObserver(app,latest={video->if(intercept && !video) {entered.complete(Unit);release.await();intercept=false};MediaCatalog.latest(c,video)},canRead={readable && !it})

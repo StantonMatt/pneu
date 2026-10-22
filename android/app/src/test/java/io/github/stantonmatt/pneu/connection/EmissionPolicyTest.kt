@@ -48,6 +48,21 @@ class EmissionPolicyTest {
         assertTrue(eligible(row("photo",true).apply {optimized=true},p=p,mobile=true))
         assertTrue(eligible(row(),p=p,mobile=true)) // unchanged shared file
     }
+    @Test fun meshFirstFrameWaitsForTheExactCurrentSettingsToSynchronizeEvenIfReadyFlagLags() {
+        val initial=PairSettings.initialize(prefs.peer!!,"phone")
+        val confirmed=initial.copy(confirmedSettings=PairSettings.signature(initial))
+        val changed=PairSettings.initialize(confirmed.copy(settings=confirmed.settings.mapValues {(_,field)->field.copy(hlc="2")}),"phone")
+        val caps=setOf("mesh","files","clipboard_text","clipboard_image")
+        for((kind,automatic) in listOf("text" to false,"file" to false,"photo" to true,"clipboard_image" to false)) {
+            val selected=row(kind,automatic)
+            assertTrue(eligible(selected,p=prefs.copy(peer=confirmed),caps=caps))
+            assertFalse("Unsynced $kind cannot emit",eligible(selected,p=prefs.copy(peer=changed),caps=caps))
+            val synced=changed.copy(confirmedSettings=PairSettings.signature(changed))
+            assertTrue(eligible(selected,p=prefs.copy(peer=synced),caps=caps))
+            assertTrue("Legacy has no settings handshake",eligible(selected,p=prefs.copy(peer=changed)))
+        }
+    }
+
     @Test fun cancellationBeforeEmissionPreventsBothLanesAndAfterEmissionKeepsTheReceipt() {
         for(kind in listOf("file","text")) {
             val queued=QueuedEmission(row(kind),binding)

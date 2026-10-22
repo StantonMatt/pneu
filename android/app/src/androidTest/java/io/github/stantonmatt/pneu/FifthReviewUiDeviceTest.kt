@@ -44,8 +44,13 @@ class FifthReviewUiDeviceTest {
             fun shell(command:String) {i.uiAutomation.executeShellCommand(command).use {android.os.ParcelFileDescriptor.AutoCloseInputStream(it).readBytes()}}
             shell("cmd statusbar add-tile io.github.stantonmatt.pneu/.features.PneuTile");device.openQuickSettings();delay(1000)
             shell("cmd statusbar click-tile io.github.stantonmatt.pneu/.features.PneuTile")
-            withTimeout(4000) {while(failedPauses.get()<2)delay(20)};assertFalse(app.preferences.flow.first().paused);device.pressBack()
-            app.preferences.beforeMutation={if(it=="forget")throw GeneralSecurityException("Synthetic Keystore preparation failure")}
+            withTimeout(4000) {while(failedPauses.get()<2)delay(20)};assertFalse(app.preferences.flow.first().paused)
+            // Tile actions may already collapse Quick Settings. A blind Back
+            // can then navigate Settings to Home; restore the intended screen.
+            shell("cmd statusbar collapse");device.waitForIdle()
+            val settings=device.findObject(UiSelector().description("Settings"))
+            if(settings.exists())settings.click()
+            app.preferences.beforeMutation={if(it=="forget")throw GeneralSecurityException("Synthetic trust removal failure")}
             UiScrollable(UiSelector().scrollable(true)).scrollTextIntoView("Unpair");click("Unpair");click("Unpair")
             assertTrue(visible("Couldn't unpair"));assertEquals(before.peer,app.preferences.flow.first().peer);assertEquals(before.deviceId,app.preferences.flow.first().deviceId);screen("unpair-write-failed")
             click("Close");assertTrue(visible("Trusted PC"))
@@ -53,26 +58,28 @@ class FifthReviewUiDeviceTest {
             UiScrollable(UiSelector().scrollable(true)).scrollTextIntoView("Show in share sheet");val original=app.preferences.flow.first().shareSheet
             click("Show in share sheet");assertTrue(visible("Couldn't save setting"));assertEquals(original,app.preferences.flow.first().shareSheet)
             app.preferences.beforeMutation={};click("Try again");withTimeout(5000) {app.prefs.first {it.shareSheet!=original}}
-            // Failed replacement retains the same approved URI and existing binding.
-            app.preferences.beforeMutation={if(it=="pending")throw IOException("Synthetic pairing write failure")}
+            // Starting/cancelling a scan is local even when durable mutations fail.
+            app.preferences.beforeMutation={throw IOException("Synthetic storage write failure")}
             val replacement=raw.replace("Trusted%20PC","New%20PC").replace("a".repeat(64),"c".repeat(64))
-            c.startActivity(Intent(Intent.ACTION_VIEW,Uri.parse(replacement),c,MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
-            click("Replace");assertTrue(visible("Couldn't start pairing"));assertEquals(before.peer,app.preferences.flow.first().peer);assertNull(app.preferences.flow.first().pending);screen("pair-write-failed")
-            app.preferences.beforeMutation={};click("Try again");assertTrue(visible("Replace Trusted PC with New PC?"));click("Cancel")
+            assertTrue(app.requestPairing(replacement,before.peer!!.pin))
+            val attempt=app.connection.attempt.value!!
+            assertTrue(app.cancelPairing(attempt));assertNull(app.connection.attempt.value)
+            assertEquals(before.peer,app.preferences.read().peer)
+            app.preferences.beforeMutation={}
             // Partial durable revocation: failed cleanup must show the actual unpaired state.
             c.startActivity(Intent(c,MainActivity::class.java).putExtra("home",true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK));assertTrue(device.findObject(UiSelector().description("Settings")).waitForExists(5000));device.findObject(UiSelector().description("Settings")).click()
-            app.queue.insert(io.github.stantonmatt.pneu.data.Outgoing().apply {mediaId=randomId();transferId=randomId()})
-            val db=app.database.openHelper.writableDatabase;db.execSQL("CREATE TRIGGER fail_cleanup BEFORE DELETE ON outgoing BEGIN SELECT RAISE(ABORT,'Synthetic cleanup failure'); END")
-            UiScrollable(UiSelector().scrollable(true)).scrollTextIntoView("Unpair");click("Unpair");click("Unpair");assertTrue(visible("Couldn't unpair"));assertNull(app.preferences.flow.first().peer);assertTrue(app.preferences.flow.first().deliveryReset);screen("unpair-cleanup-failed")
+            DeviceFixture.insert(app,io.github.stantonmatt.pneu.data.Outgoing().apply {mediaId=randomId();transferId=randomId()})
+            val db=app.database.openHelper.writableDatabase;db.execSQL("CREATE TRIGGER fail_cleanup BEFORE DELETE ON deliveries BEGIN SELECT RAISE(ABORT,'Synthetic cleanup failure'); END")
+            UiScrollable(UiSelector().scrollable(true)).scrollTextIntoView("Unpair");click("Unpair");click("Unpair");assertTrue(visible("Couldn't unpair"));assertNull(app.preferences.flow.first().peer);assertEquals(setOf("d".repeat(32)),app.preferences.read().resetPeers);screen("unpair-cleanup-failed")
             db.execSQL("DROP TRIGGER fail_cleanup")
             // The foreground service stops on local unpair; explicitly own a
             // background recovery loop to coordinate cleanup before this retry.
-            app.connection.start(this);app.connection.kick()
+            app.reconcileDelivery()
             // Background recovery can beat the user's retry. The completed
-            // revocation must remain idempotent, including its new TLS identity.
-            val revoked=withTimeout(5000) {app.preferences.flow.first {!it.deliveryReset}}
+            // revocation must remain idempotent, while retaining the phone TLS identity.
+            val revoked=withTimeout(5000) {app.preferences.flow.first {it.resetPeers.isEmpty()}}
             click("Try again");assertTrue(visible("Finish unpairing?"));click("Unpair")
-            withTimeout(5000) {app.prefs.first {it.peer==null && !it.deliveryReset}}
+            withTimeout(5000) {app.prefs.first {it.devices.isEmpty() && it.resetPeers.isEmpty()}}
             assertTrue(visible("Scan the QR code on your PC") || visible("Allow camera") || visible("Open settings"))
             assertEquals(revoked.deviceId,app.preferences.flow.first().deviceId)
             assertEquals(revoked.tlsAlias,app.preferences.flow.first().tlsAlias)

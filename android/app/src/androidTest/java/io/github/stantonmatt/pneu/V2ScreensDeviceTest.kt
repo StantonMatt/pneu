@@ -82,7 +82,7 @@ class V2ScreensDeviceTest {
             else->listOf(sent)
         }
         val pending=rows.filter {it.state!="sent"}
-        withContext(Dispatchers.IO) {pending.forEach {app.queue.insert(it)}}
+        withContext(Dispatchers.IO) {pending.forEach {it.peerId=prefs.peer!!.deviceId;it.bindingGeneration=prefs.peer.generation;DeviceFixture.insert(app,it)}}
         withTimeout(5000) {app.waitingCount.first {it==pending.size}}
         // Infinite animation policy cancels loops under autoAdvance; explicitly
         // drive and sample the capsule/dashes instead of capturing their first frame.
@@ -132,7 +132,7 @@ class V2ScreensDeviceTest {
         compose.onNodeWithText("Connected").assertIsDisplayed()
         capture("v2-dark-home-connected")
         val before=compose.onNodeWithText("Recent").fetchSemanticsNode().boundsInRoot
-        withContext(Dispatchers.IO) {app.queue.insert(waiting)}
+        withContext(Dispatchers.IO) {waiting.peerId="d".repeat(32);DeviceFixture.insert(app,waiting)}
         compose.waitUntil(5000) {app.waitingCount.value==1 && compose.onAllNodesWithText("1 waiting").fetchSemanticsNodes().isNotEmpty()}
         val after=compose.onNodeWithText("Recent").fetchSemanticsNode().boundsInRoot
         assertEquals("Recent title must not jump when waiting appears",before.top,after.top,.5f)
@@ -155,7 +155,7 @@ class V2ScreensDeviceTest {
     }
     @Test(timeout=20000) fun failedRowAndRecordingWithoutPreview()=runBlocking<Unit> {
         render(Scene.FAILED)
-        compose.onNodeWithText("Failed · PC disk is full").assertIsDisplayed();capture("v2-dark-failed-row")
+        compose.onNodeWithText("Failed · Computer storage is full").assertIsDisplayed();capture("v2-dark-failed-row")
     }
     @Test(timeout=20000) fun waitingMenu()=runBlocking<Unit> {
         render(Scene.WAITING_MENU);compose.onNodeWithText("2 waiting").performClick()

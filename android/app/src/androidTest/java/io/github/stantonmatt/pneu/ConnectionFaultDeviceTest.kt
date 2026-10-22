@@ -31,7 +31,7 @@ class ConnectionFaultDeviceTest {
         DeviceFixture.reset()
         c.stopService(Intent(c,PneuService::class.java));app.connection.stop();app.initialized.await();delay(250)
         if(args.getString("identityPrepared")=="true") {
-            assertNull(app.preferences.flow.first().peer);assertNull(app.preferences.flow.first().pending)
+            assertNull(app.preferences.flow.first().peer);assertNull(app.connection.attempt.value?.invitation)
         } else app.forgetBinding()
         i.uiAutomation.grantRuntimePermission(c.packageName,Manifest.permission.ACCESS_LOCAL_NETWORK)
         app.preferences.toggle("wifi",true);app.preferences.toggle("tailscale",true);app.preferences.toggle("mobile",true);app.preferences.toggle("paused",false);seed()
@@ -54,7 +54,7 @@ class ConnectionFaultDeviceTest {
         val db=app.database.openHelper.writableDatabase
         val opens=java.util.concurrent.atomic.AtomicInteger()
         app.connection.openPayload={opens.incrementAndGet();it.inputStream()}
-        db.execSQL("CREATE TRIGGER fail_delivery_completion BEFORE UPDATE ON outgoing WHEN OLD.state='sending' AND NEW.state IN ('sent','failed') BEGIN SELECT RAISE(ABORT,'completion and fallback fault'); END")
+        db.execSQL("CREATE TRIGGER fail_delivery_completion BEFORE UPDATE ON deliveries WHEN OLD.state='sending' AND NEW.state IN ('sent','failed') BEGIN SELECT RAISE(ABORT,'completion and fallback fault'); END")
         try {
             val first=file();val text=ManualEntries.text(app,"Text with failed completion write","share")
             withTimeout(10000) {while(PeerFixture.evidence().count {it.asJsonObject["event"].asString in setOf("FILE","TEXT")}<2)delay(20)}
@@ -202,8 +202,8 @@ class ConnectionFaultDeviceTest {
     }
     @Test(timeout=30000) fun localUnpairDurablyRemovesBindingBeforeCapturedNotification()=runBlocking<Unit> {
         connect();val old=app.preferences.flow.first();app.connection.unpair()
-        val fresh=app.preferences.flow.first();assertNull(fresh.peer);assertNull(fresh.pending);assertFalse(fresh.deliveryReset)
-        assertNotEquals(old.deviceId,fresh.deviceId);assertNotEquals(old.tlsAlias,fresh.tlsAlias)
+        val fresh=app.preferences.flow.first();assertNull(fresh.peer);assertNull(app.connection.attempt.value?.invitation);assertFalse(fresh.deliveryReset)
+        assertEquals(old.deviceId,fresh.deviceId);assertEquals(old.tlsAlias,fresh.tlsAlias)
         assertFalse(app.connection.connected);assertTrue(app.queue.all().isEmpty())
         // Independent peer must receive UNPAIR on this authenticated old session.
     }
@@ -230,8 +230,12 @@ class ConnectionFaultDeviceTest {
         val peer=app.preferences.flow.first().peer!!
         val raw="pneu://pair?v=1&name=Fault%20PC&fp=${peer.pin}&addr=10.0.2.2%3A${args.getString("pcPort")}&token=${"b".repeat(64)}&exp=${System.currentTimeMillis()+300000}"
         assertTrue(app.requestPairing(raw,peer.pin));app.connection.start(scope)
-        withTimeout(12000) {app.connection.state.first {it.pairingSuccess(app.prefs.value)}}
-        withTimeout(10000) {app.preferences.flow.first {it.peer==null && it.pending==null && !it.deliveryReset}}
+        try {withTimeout(12000) {app.connection.state.first {it.pairingSuccess(app.prefs.value)}}}
+        finally {
+            val link=app.connection.state.value
+            i.sendStatus(0,android.os.Bundle().apply {putString("stream","Remote-unpair transition: status=${link.status}, pairing=${link.pairing}, pending=${app.connection.attempt.value?.invitation!=null}, peers=${app.prefs.value.devices.size}, connected=${app.connection.connected}\n")})
+        }
+        withTimeout(10000) {DeviceFixture.awaitPrefs(app) {it.peer==null && app.connection.attempt.value?.invitation==null && !it.deliveryReset}}
         val link=app.connection.state.value
         assertEquals("",link.pairing);assertEquals("",link.route);assertEquals("",link.transferMediaId)
         assertFalse(link.pairingSuccess(app.preferences.flow.first()))
@@ -254,9 +258,9 @@ class ConnectionFaultDeviceTest {
     @Test(timeout=60000) fun threePinnedClientRejectionsForgetBindingAndRetainLostName()=runBlocking<Unit> {
         // --unauthorized-hello from the authenticated pinned peer.
         app.connection.start(scope)
-        withTimeout(50000) {app.preferences.flow.first {it.pairingLost && it.peer==null && !it.deliveryReset}}
+        withTimeout(50000) {app.preferences.flow.first {it.pairingLost && it.devices.all {peer->peer.pairingLost} && it.resetPeers.isEmpty()}}
         val p=app.preferences.flow.first()
-        assertNull(p.pending);assertEquals("Fault PC",p.lostPcName)
+        assertNull(app.connection.attempt.value?.invitation);assertEquals("Fault PC",p.lostPcName)
         assertEquals("Pairing lost",app.connection.state.value.status)
         assertEquals("",app.connection.state.value.pairing);assertTrue(app.queue.pending().isEmpty())
         app.preferences.toggle("setup",true)
@@ -268,34 +272,39 @@ class ConnectionFaultDeviceTest {
         device.takeScreenshot(File(c.filesDir,"e2e-fix-screens/pairing-lost.png"))
     }
     @Test(timeout=30000) fun bindingChangesInvalidateTransientState()=runBlocking<Unit> {
-        val p=app.preferences.flow.first();val peer=p.peer!!
-        app.connection.state.value=io.github.stantonmatt.pneu.connection.LinkState("Connected","Wi-Fi","Paired with Fault PC",1,2,"fixture",pairingPin=peer.pin)
-        assertTrue(app.connection.state.value.pairingSuccess(p))
-        app.forgetBinding();assertEquals(io.github.stantonmatt.pneu.connection.LinkState(),app.connection.state.value)
-        seed();val replacement=app.preferences.flow.first().peer!!
-        app.connection.state.value=io.github.stantonmatt.pneu.connection.LinkState(pairing="Paired with Fault PC",pairingPin=replacement.pin)
-        val raw="pneu://pair?v=1&name=Replacement&fp=${replacement.pin}&addr=10.0.2.2%3A${args.getString("pcPort")}&token=${"c".repeat(64)}&exp=${System.currentTimeMillis()+300000}"
+        // Aggregate state is published by recipient workers; populate it through
+        // a real session rather than injecting the old single-worker state field.
+        connect()
+        withTimeout(5000) {app.connection.state.first {it.status=="Connected"}}
+        val peer=app.preferences.read().peer!!
+        assertEquals("Connected",app.connection.devices.value.getValue(peer.deviceId).status)
+        app.forgetBinding()
+        withTimeout(5000) {while(app.connection.devices.value.isNotEmpty() || app.connection.state.value!=io.github.stantonmatt.pneu.connection.LinkState())delay(20)}
+        assertFalse(app.connection.connected)
+        app.connection.stop();app.connection.awaitStopped()
+        seed();val replacement=app.preferences.read().peer!!
+        val raw="pneu://pair?v=1&name=Replacement&fp=${"e".repeat(64)}&addr=10.0.2.2%3A${args.getString("pcPort")}&token=${"c".repeat(64)}&exp=${System.currentTimeMillis()+300000}"
         assertTrue(app.requestPairing(raw,replacement.pin));assertEquals("",app.connection.state.value.pairing)
-        assertTrue(app.installBinding(Invitation.parse(raw),"e".repeat(32)));assertEquals("",app.connection.state.value.pairing)
+        assertTrue(DeviceFixture.installApprovedBinding(app,Invitation.parse(raw),replacement.deviceId));assertEquals("",app.connection.state.value.pairing)
         // A stale old session's UNPAIR/revocation must not forget the replacement.
         assertFalse(app.loseBinding(replacement));app.forgetBinding(replacement)
-        assertEquals("e".repeat(32),app.preferences.flow.first().peer!!.deviceId)
+        assertEquals("e".repeat(64),app.preferences.flow.first().peer!!.pin)
         assertFalse(app.connection.connected)
         app.connection.unpair();assertEquals("",app.connection.state.value.pairing)
     }
     @Test(timeout=30000) fun pinFailureFallsBackWithoutLosingTrust()=runBlocking<Unit> {
-        app.preferences.setString("lastLan","10.0.2.2:${requireNotNull(args.getString("rejectPort"))}")
+        assertTrue(app.preferences.connected(io.github.stantonmatt.pneu.data.DeliveryBinding.from(app.preferences.read())!!,Endpoint.parse("10.0.2.2:${requireNotNull(args.getString("rejectPort"))}")))
         connect();assertFalse(app.preferences.flow.first().pairingLost);assertNotNull(app.preferences.flow.first().peer)
     }
     @Test(timeout=30000) fun currentTransportPolicyStopsSessionAndEveryRetry()=runBlocking<Unit> {
         connect();app.preferences.toggle("wifi",false)
         withTimeout(5000) {while(app.connection.connected)delay(20)}
-        val row=ManualEntries.text(app,"Held by current Wi-Fi policy","share");delay(3000)
+        val row=DeviceFixture.text(app,"Held by current Wi-Fi policy","share");delay(3000)
         assertFalse(app.connection.connected);assertEquals("waiting",app.queue.find(row.mediaId)!!.state)
         app.preferences.toggle("wifi",true);withTimeout(7000) {while(!app.connection.connected)delay(20)};state(row.mediaId,"sent")
         if(app.connection.cellular()) {
             app.preferences.toggle("mobile",false);withTimeout(5000) {while(app.connection.connected)delay(20)}
-            val next=ManualEntries.text(app,"Held by mobile policy","share");delay(3000);assertEquals("waiting",app.queue.find(next.mediaId)!!.state)
+            val next=DeviceFixture.text(app,"Held by mobile policy","share");delay(3000);assertEquals("waiting",app.queue.find(next.mediaId)!!.state)
         }
     }
     @Test(timeout=30000) fun missingFileCapabilityIsVisibleAndDoesNotBlockText()=runBlocking<Unit> {
@@ -333,7 +342,7 @@ class ConnectionFaultDeviceTest {
         app.requestPairing(raw,peer.pin);app.connection.start(scope)
         withTimeout(5000) {app.connection.state.first {it.status=="Connecting…"}}
         withTimeout(14000) {app.connection.state.first {it.status=="PC unreachable"}}
-        assertFalse(app.connection.connected);assertEquals(peer,app.preferences.flow.first().peer);assertNotNull(app.preferences.flow.first().pending)
+        assertFalse(app.connection.connected);assertEquals(peer,app.preferences.flow.first().peer);assertNotNull(app.connection.attempt.value?.invitation)
     }
     @Test(timeout=30000) fun healthySessionsResetBackoffOnReadyEvenAfterEof()=runBlocking<Unit> {
         val times=mutableListOf<Long>();app.connection.start(scope)

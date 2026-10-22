@@ -9,14 +9,24 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Mutex
 
 private val Context.pneuDataStore by preferencesDataStore("pneu")
-data class Peer(val name: String, val pin: String, val deviceId: String, val addresses: List<Endpoint>)
+data class Peer(val name: String, val pin: String, val deviceId: String, val addresses: List<Endpoint>,
+    val role:String="computer",val lastLan:String="",val lastConnected:Long=0,val generation:Long=0,
+    val pairingLost:Boolean=false,val clipboardSend:Boolean=true,val clipboardReceive:Boolean=true,val automaticMedia:Boolean=true,
+    val settings:Map<String,PairField> = emptyMap(),val pendingSettings:String="",val confirmedSettings:String="",
+    private val settingsReceipts:Map<String,String>? = null,
+    @com.google.gson.annotations.SerializedName("localSettingsEdits") private val localEdits:Set<String>? = null,val settingsSupported:Boolean?=null,
+    private val acknowledgedSettings:String?=null) {
+    internal val acknowledgedSnapshot get()=acknowledgedSettings.orEmpty()
+    val localSettingsEdits get()=localEdits.orEmpty()
+    internal val legacySettingsReceipts get()=settingsReceipts.orEmpty()
+}
 data class Prefs(
     val setup: Boolean = false, val paused: Boolean = false,
     val screenshots: Boolean = true, val photos: Boolean = false, val recordings: Boolean = false,
     val wifi: Boolean = true, val tailscale: Boolean = true, val mobile: Boolean = true,
-    val originals: Boolean = false, val queue: Boolean = true, val clipboardButton: Boolean = true,
+    val originals: Boolean = false, val queue: Boolean = false, val clipboardButton: Boolean = true,
     val clipboardFromPc: Boolean = true, val shareSheet: Boolean = true, val quickSettings: Boolean = true,
-    val deviceId: String = "", val peer: Peer? = null, val pending: Invitation? = null,
+    val deviceId: String = "", val peer: Peer? = null,
     val lastLan: String = "", val lastConnected: Long = 0, val mediaSince: Long = 0,
     val pairingLost: Boolean = false, val neverSleeping: Boolean = false,
     val photosSince: Long = 0, val recordingsSince: Long = 0, val photosAfterId: Long = 0, val recordingsAfterId: Long = 0,
@@ -24,26 +34,81 @@ data class Prefs(
     val deliveryReset: Boolean=false,
     val imageVersion: String="",val videoVersion: String="",val imageGeneration: Long=0,val videoGeneration: Long=0,
     val imagePairId: Long=0,val videoPairId: Long=0, val lostPcName: String="", val tlsAlias:String="",
-    val imageFloor:Long=0,val videoFloor:Long=0,val policyEpoch:Long=0,val screenshotsAfterId:Long=0, val pairingRevision:Long=0, val loaded:Boolean=true
-)
-class Preferences(private val context: Context) {
+    val imageFloor:Long=0,val videoFloor:Long=0,val policyEpoch:Long=0,val screenshotsAfterId:Long=0, val pairingRevision:Long=0, val loaded:Boolean=true,
+    val peers:List<Peer> = emptyList(), val resetPeers:Set<String> = emptySet(),
+    val recentClipboardHashes:List<String> = emptyList(),val legacyQueuePeer:String="",val legacyQueueGeneration:Long=0,val selfName:String="",val chooseDevicesEachTime:Boolean=false,val lastReceivedSource:String="",
+    val recentClipboardSources:Map<String,String> = emptyMap(),
+    val automaticRevocations:Map<String,Long> = emptyMap()
+) {
+    fun automaticRevocation(kind:String)=automaticRevocations[when(kind) {"photo"->"photos";"recording"->"recordings";else->"screenshots"}] ?: 0
+    // Compatibility projection for the existing single-computer screens/fixtures.
+    val devices get()=peers.ifEmpty {listOfNotNull(peer)}
+    fun installedAfter(revision:Long):DeliveryBinding? = devices.filter {it.generation>revision}.maxByOrNull {it.generation}?.let {DeliveryBinding.from(this,it.deviceId)}
+    fun forPeer(id:String):Prefs {
+        val selected=devices.find {it.deviceId==id}
+        return copy(peer=selected,lastLan=selected?.lastLan.orEmpty(),lastConnected=selected?.lastConnected ?: 0,
+            pairingLost=selected?.pairingLost ?: false,pairingRevision=selected?.generation ?: pairingRevision)
+    }
+}
+class Preferences(private val context:Context,internal val store:androidx.datastore.core.DataStore<androidx.datastore.preferences.core.Preferences> = context.pneuDataStore) {
     internal var beforeMutation:(String)->Unit={}
     @Volatile internal var beforeRead:suspend ()->Unit={}
     @Volatile internal var beforeReadStart:suspend ()->Unit={}
     @Volatile internal var readBoundary:suspend (Boolean)->Long={MediaCatalog.latest(context,it)}
     internal val policy=AdmissionPolicy()
     @Volatile internal var readCatalogVersion:suspend ()->String={MediaCatalog.version(context)}
+    @Volatile internal var pairingBoundary:suspend ()->CatalogBoundary={MediaCatalog.boundary(context)}
     @Volatile internal var readSnapshot:suspend ()->CatalogSnapshot={MediaCatalog.snapshot(context)}
-    @androidx.annotation.VisibleForTesting(otherwise=androidx.annotation.VisibleForTesting.PRIVATE)
-    internal val store = context.pneuDataStore
+    private data class ClipboardEffect(val stamp:ClipboardStamp,val hash:String,val peerId:String,val generation:Long,val id:String)
+    private val unfinishedEffects=java.util.concurrent.ConcurrentHashMap<String,ClipboardEffect>()
+    internal fun clipboardEffect(peerId:String,generation:Long,id:String)=unfinishedEffects[completionKey(peerId,generation,id)]?.stamp
+    /** Register the OS effect before any fallible persistence. Shared by every
+     * receiver and every device-wide ordering/ownership decision. */
+    internal fun recordClipboardEffect(stamp:ClipboardStamp,hash:String,peerId:String,generation:Long,id:String) {
+        unfinishedEffects[completionKey(peerId,generation,id)]=ClipboardEffect(stamp,hash,peerId,generation,id)
+    }
+    private fun effectiveClipboardRegister(p:androidx.datastore.preferences.core.Preferences):ClipboardStamp? =
+        (unfinishedEffects.values.map {it.stamp}+listOfNotNull(MeshClock.register(p))).maxOrNull()
+    private fun reconcileClipboardEffects(p:MutablePreferences,effects:Collection<ClipboardEffect>) {
+        for(effect in effects.sortedBy {it.stamp}) {
+            if(MeshClock.wins(p,effect.stamp)) {
+                MeshClock.applied(p,effect.stamp)
+                ClipboardHistory.remember(p,effect.hash,effect.peerId)
+            }
+            val current=PeerRegistry.read(p).any {it.deviceId==effect.peerId && it.generation==effect.generation}
+            if(current)p[clipboardCompletions]=p[clipboardCompletions].orEmpty()+completionKey(effect.peerId,effect.generation,effect.id)
+        }
+    }
+    /** Any successful settings write also persists abandoned clipboard effects.
+     * Remove the in-memory fence only after the DataStore commit has succeeded. */
+    private suspend fun edit(body:suspend (MutablePreferences)->Unit) {
+        var effects=emptyList<ClipboardEffect>()
+        store.edit {p->
+            effects=unfinishedEffects.values.toList()
+            reconcileClipboardEffects(p,effects)
+            body(p)
+        }
+        effects.forEach {unfinishedEffects.remove(completionKey(it.peerId,it.generation,it.id),it)}
+    }
+    internal suspend fun reconcileClipboardEffects() {edit {}}
     private fun b(p: androidx.datastore.preferences.core.Preferences, key: String, default: Boolean = false) = p[booleanPreferencesKey(key)] ?: default
     private fun s(p: androidx.datastore.preferences.core.Preferences, key: String) = p[stringPreferencesKey(key)] ?: ""
     private fun l(p: androidx.datastore.preferences.core.Preferences, key: String) = p[longPreferencesKey(key)] ?: 0
-    private val raw: Flow<Prefs> = store.data.onEach {beforeRead()}.map { p ->
-        val addresses = s(p, "addresses").split('|').filter(String::isNotEmpty).mapNotNull { runCatching { Endpoint.parse(it) }.getOrNull() }
-        val peer = s(p, "pin").takeIf { it.isNotEmpty() }?.let { Peer(s(p, "pcName"), it, s(p, "pcId"), addresses) }
-        val pending = s(p, "pending").takeIf { it.isNotEmpty() }?.let { runCatching { Invitation.parse(it) }.getOrNull() }
-        Prefs(b(p,"setup"),b(p,"paused"),b(p,"screenshots",true),b(p,"photos"),b(p,"recordings"),b(p,"wifi",true),b(p,"tailscale",true),b(p,"mobile",true),b(p,"originals"),b(p,"queue",true),b(p,"clipboardButton",true),b(p,"clipboardFromPc",true),b(p,"shareSheet",true),b(p,"quickSettings",true),s(p,"deviceId"),peer,pending,s(p,"lastLan"),l(p,"lastConnected"),l(p,"mediaSince"),b(p,"pairingLost"),b(p,"neverSleeping"),l(p,"photosSince"),l(p,"recordingsSince"),l(p,"photosAfterId"),l(p,"recordingsAfterId"),s(p,"lastReceivedHash"),s(p,"lastSentHash"),b(p,"localCapacity"),b(p,"deliveryReset"),s(p,"imageVersion"),s(p,"videoVersion"),l(p,"imageGeneration"),l(p,"videoGeneration"),l(p,"imagePairId"),l(p,"videoPairId"),s(p,"lostPcName"),s(p,"tlsAlias"),l(p,"imageFloor"),l(p,"videoFloor"),l(p,"mediaEpoch"),l(p,"screenshotsAfterId"),l(p,"pairingRevision"))
+    private val raw: Flow<Prefs> = flow {
+        // A DataStore edit is atomic: no migrated snapshot or delivery authority is
+        // exposed until the peer list and original queue owner are durable.
+        edit {PeerRegistry.migrate(it);it.remove(stringPreferencesKey("pending"))}
+        emitAll(store.data)
+    }.onEach {beforeRead()}.map { durable ->
+        val p=durable.toMutablePreferences().also {reconcileClipboardEffects(it,unfinishedEffects.values.toList())}
+        val peers=PeerRegistry.read(p)
+        val peer=peers.firstOrNull()
+        Prefs(b(p,"setup"),b(p,"paused"),b(p,"screenshots",true),b(p,"photos"),b(p,"recordings"),b(p,"wifi",true),b(p,"tailscale",true),b(p,"mobile",true),b(p,"originals"),b(p,"queue"),b(p,"clipboardButton",true),b(p,"clipboardFromPc",true),b(p,"shareSheet",true),b(p,"quickSettings",true),s(p,"deviceId"),peer,s(p,"lastLan"),l(p,"lastConnected"),l(p,"mediaSince"),b(p,"pairingLost"),b(p,"neverSleeping"),l(p,"photosSince"),l(p,"recordingsSince"),l(p,"photosAfterId"),l(p,"recordingsAfterId"),s(p,"lastReceivedHash"),s(p,"lastSentHash"),b(p,"localCapacity"),b(p,"deliveryReset"),s(p,"imageVersion"),s(p,"videoVersion"),l(p,"imageGeneration"),l(p,"videoGeneration"),l(p,"imagePairId"),l(p,"videoPairId"),s(p,"lostPcName"),s(p,"tlsAlias"),l(p,"imageFloor"),l(p,"videoFloor"),l(p,"mediaEpoch"),l(p,"screenshotsAfterId"),l(p,"pairingRevision")).copy(peers=peers,clipboardFromPc=peer?.clipboardReceive ?: b(p,"clipboardFromPc",true),lastLan=peer?.lastLan.orEmpty(),lastConnected=peers.maxOfOrNull {it.lastConnected} ?: 0,
+            pairingLost=peers.isNotEmpty() && peers.all {it.pairingLost} || peers.isEmpty() && b(p,"pairingLost"),
+            pairingRevision=l(p,"pairingRevision"),lastReceivedSource=s(p,"lastReceivedSource"),resetPeers=PeerRegistry.resets(p),
+            legacyQueuePeer=s(p,"legacyQueuePeer"),legacyQueueGeneration=l(p,"legacyQueueGeneration"),
+            recentClipboardHashes=s(p,"recentClipboardHashes").split('|').filter {it.isNotEmpty()},recentClipboardSources=ClipboardHistory.read(p),selfName=s(p,"selfName"),chooseDevicesEachTime=b(p,"chooseDevicesEachTime"),
+            automaticRevocations=listOf("screenshots","photos","recordings").associateWith {l(p,it+"AdmissionEpoch")}.filterValues {it!=0L})
     }
     val flow=raw.recoverReads()
     suspend fun read():Prefs=storageDeadline {beforeReadStart();raw.first()}
@@ -51,25 +116,22 @@ class Preferences(private val context: Context) {
      * Upgrades preserve the old fixed certificate for the existing identity. */
     suspend fun ensureIdentity():Unit=policy.locked {
         beforeMutation("ensureIdentity")
-        var retired=""
-        store.edit {
-            it.remove(stringPreferencesKey("pauseHistory")) // One-time legacy state removal.
+        edit {
+            PeerRegistry.migrate(it)
+            it.remove(stringPreferencesKey("pauseHistory"))
             val existing=s(it,"deviceId");val savedAlias=s(it,"tlsAlias")
-            // Legacy offline forget changed IDs without certificates. With no
-            // binding/recovery record, migrate that possibly mismatched identity.
-            val legacyUnpaired=existing.isNotEmpty() && savedAlias.isEmpty() && s(it,"pin").isEmpty() && s(it,"pending").isEmpty()
-            val id=if(legacyUnpaired)randomId() else existing.ifEmpty {randomId()}
-            val alias=savedAlias.ifEmpty {if(existing.isNotEmpty() && !legacyUnpaired)TlsIdentity.LEGACY_ALIAS else TlsIdentity.aliasFor(id)}
+            val id=existing.ifEmpty {randomId()}
+            val alias=savedAlias.ifEmpty {if(existing.isNotEmpty())TlsIdentity.LEGACY_ALIAS else TlsIdentity.aliasFor(id)}
             TlsIdentity(alias,create=true)
             if(existing!=id || savedAlias!=alias)advanceEpoch(it)
             it[stringPreferencesKey("deviceId")]=id;it[stringPreferencesKey("tlsAlias")]=alias
-            if(legacyUnpaired)retired=TlsIdentity.LEGACY_ALIAS
         }
-        runCatching {TlsIdentity.retire(retired)};Unit
+        Unit
     }
     private fun advanceEpoch(p:MutablePreferences) {p[longPreferencesKey("mediaEpoch")]=AdmissionPolicy.next(l(p,"mediaEpoch"))}
     private val policyKeys=setOf("paused","screenshots","photos","recordings","wifi","tailscale","mobile","originals","queue","deliveryReset")
     suspend fun toggle(key:String,value:Boolean)=kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        if(key=="clipboardFromPc") {read().peer?.let {setPairSwitch(it.deviceId,"receiveClipboard",value)};return@withContext}
         suspend fun apply() {
             beforeMutation(key)
             // All decisions and provider reads belong to the policy lock, including
@@ -82,9 +144,16 @@ class Preferences(private val context: Context) {
             val snapshot=if(resume || enable)readSnapshot() else null
             val afterId=if(enable)readBoundary(key=="recordings") else 0
             if(snapshot!=null && readCatalogVersion()!=snapshot.version)throw java.io.IOException("Catalog changed")
-            store.edit {
+            edit {
                 if(!value && ((key=="wifi" && !b(it,"tailscale",true)) || (key=="tailscale" && !b(it,"wifi",true))))throw IllegalArgumentException("Pneu needs Wi-Fi or Tailscale")
-                if(key in policyKeys && b(it,key,key in listOf("screenshots","wifi","tailscale","mobile","queue"))!=value)advanceEpoch(it)
+                if(key in policyKeys && b(it,key,key in listOf("screenshots","wifi","tailscale","mobile"))!=value) {
+                    advanceEpoch(it)
+                    // Only user observation boundaries revoke discoveries.
+                    // Startup/permission baselines must preserve pending work,
+                    // and changing encoding/network policy only retries its copy.
+                    val revoked=when(key) {"paused"->listOf("screenshots","photos","recordings");"screenshots","photos","recordings"->listOf(key);else->emptyList()}
+                    for(feature in revoked)it[longPreferencesKey(feature+"AdmissionEpoch")]=AdmissionPolicy.next(l(it,feature+"AdmissionEpoch"))
+                }
                 if(resume) {
                     requireNotNull(snapshot)
                     for(prefix in listOf("image","video")) {
@@ -118,46 +187,49 @@ class Preferences(private val context: Context) {
         val current=read()
         if(!AdmissionPolicy.accepts(token,current,readCatalogVersion()) || !MediaCatalog.fullAccess(context,token.video))false else body(current)
     }
-    suspend fun setLong(key: String, value: Long) { store.edit { it[longPreferencesKey(key)] = value } }
+    suspend fun setLong(key: String, value: Long) { edit { it[longPreferencesKey(key)] = value } }
     suspend fun setString(key: String, value: String) {
-        if(key in setOf("deviceId","tlsAlias"))policy.locked {store.edit {if(s(it,key)!=value)advanceEpoch(it);it[stringPreferencesKey(key)]=value}}
-        else store.edit {it[stringPreferencesKey(key)]=value}
+        if(key in setOf("deviceId","tlsAlias"))policy.locked {edit {if(s(it,key)!=value)advanceEpoch(it);it[stringPreferencesKey(key)]=value}}
+        else edit {it[stringPreferencesKey(key)]=value}
     }
     /** Old sessions cannot repopulate a replacement PC's connection cache. */
     internal suspend fun connected(binding:DeliveryBinding,endpoint:Endpoint,at:Long=System.currentTimeMillis()):Boolean {
         var recorded=false
-        store.edit {
-            if(s(it,"deviceId")!=binding.phoneId || s(it,"pin")!=binding.pin || s(it,"pcId")!=binding.pcId || b(it,"deliveryReset") || b(it,"pairingLost"))return@edit
-            if(!endpoint.tailscale)it[stringPreferencesKey("lastLan")]=endpoint.toString()
-            it[longPreferencesKey("lastConnected")]=at
+        edit {
+            val peers=PeerRegistry.read(it);val peer=peers.find {peer->peer.deviceId==binding.pcId} ?: return@edit
+            if(s(it,"deviceId")!=binding.phoneId || peer.pin!=binding.pin || peer.generation!=binding.generation || peer.deviceId in PeerRegistry.resets(it) || peer.pairingLost)return@edit
+            PeerRegistry.write(it,peers.map {if(it==peer)it.copy(lastLan=if(endpoint.tailscale)it.lastLan else endpoint.toString(),lastConnected=at) else it})
             recorded=true
         }
         return recorded
     }
-    suspend fun pending(uri: String)=policy.locked {beforeMutation("pending");store.edit {advanceEpoch(it);it[stringPreferencesKey("pending")]=uri;it[booleanPreferencesKey("pairingLost")]=false}}
-
-    suspend fun cancelPending(expected: Invitation?=null):Boolean=policy.locked {
-        beforeMutation("cancelPending");var cancelled=false
-        store.edit {
-            val current=s(it,"pending").takeIf(String::isNotEmpty)?.let {raw->runCatching {Invitation.parse(raw)}.getOrNull()}
-            if(expected==null || expected==current) {if(current!=null)advanceEpoch(it);it.remove(stringPreferencesKey("pending"));cancelled=true}
-        }
-        cancelled
-    }
-    suspend fun paired(invitation: Invitation, pcId: String, expectedPending: Invitation?=null): Boolean=policy.locked {
-        val boundary=MediaCatalog.boundary(context);var installed=false
-        store.edit {
-            if(expectedPending!=null && runCatching {Invitation.parse(s(it,"pending"))}.getOrNull()!=expectedPending)return@edit
-            val reset=s(it,"pin")!=invitation.fingerprint || s(it,"pcId")!=pcId
-            advanceEpoch(it)
-            it[stringPreferencesKey("pin")]=invitation.fingerprint;it[stringPreferencesKey("pcName")]=invitation.name
-            it[stringPreferencesKey("pcId")]=pcId;it[stringPreferencesKey("addresses")]=invitation.addresses.joinToString("|")
-            it.remove(stringPreferencesKey("pending"));it[booleanPreferencesKey("pairingLost")]=false;it.remove(stringPreferencesKey("lostPcName"))
-            it[longPreferencesKey("pairingRevision")]=l(it,"pairingRevision")+1
-            if(reset) {
-                listOf("lastLan","lastReceivedHash","lastSentHash").forEach {key->it.remove(stringPreferencesKey(key))}
-                it[longPreferencesKey("lastConnected")]=0
-                it[booleanPreferencesKey("deliveryReset")]=true
+    suspend fun paired(invitation: Invitation, pcId: String,
+                       replacement:ConfirmedBinding?=null,onInstalled:(DeliveryBinding)->Unit={}): Boolean=policy.locked {
+        val boundary=if(read().devices.isEmpty())pairingBoundary() else null;var installed:DeliveryBinding?=null
+        edit {
+            val peers=PeerRegistry.read(it)
+            val prior=PairingIdentity.prior(peers,invitation,pcId,s(it,"deviceId"))
+            val current=Prefs(deviceId=s(it,"deviceId"),peers=peers,pairingRevision=l(it,"pairingRevision"))
+            if(prior!=null &&
+                (replacement==null || replacement.pcId!=prior.deviceId || !replacement.matches(current)))return@edit
+            if(replacement!=null && (prior==null || !replacement.matches(current)))return@edit
+            require(pcId!=s(it,"deviceId")) {"Remote device ID is the phone's own ID"}
+            if(prior!=null && prior.pin!=invitation.fingerprint && !prior.pairingLost)return@edit
+            val first=peers.isEmpty()
+            val unchanged=prior!=null && !PairingIdentity.changes(prior,invitation,pcId)
+            val generation=if(unchanged)requireNotNull(prior).generation else Math.addExact(l(it,"pairingRevision"),1)
+            if(!unchanged)it[longPreferencesKey("pairingRevision")]=generation
+            val peer=if(unchanged)requireNotNull(prior).copy(name=invitation.name,addresses=invitation.addresses,pairingLost=false) else Peer(invitation.name,invitation.fingerprint,pcId,invitation.addresses,generation=generation,
+                lastLan=prior?.takeIf {it.deviceId==pcId && it.pin==invitation.fingerprint}?.lastLan.orEmpty(),
+                lastConnected=prior?.takeIf {it.deviceId==pcId && it.pin==invitation.fingerprint}?.lastConnected ?: 0,
+                clipboardSend=prior?.clipboardSend ?: true,clipboardReceive=prior?.clipboardReceive ?: true,automaticMedia=prior?.automaticMedia ?: true,
+                settings=prior?.takeIf {it.deviceId==pcId}?.settings.orEmpty(),localEdits=prior?.takeIf {it.deviceId==pcId}?.localSettingsEdits.orEmpty(),settingsSupported=prior?.settingsSupported)
+            PeerRegistry.write(it,if(prior==null)peers+peer else peers.map {p->if(p==prior)peer else p})
+            if(prior!=null && !unchanged)PeerRegistry.reset(it,prior.deviceId)
+            it[booleanPreferencesKey("pairingLost")]=false;it.remove(stringPreferencesKey("lostPcName"))
+            if(first) {
+                requireNotNull(boundary)
+                advanceEpoch(it)
                 for(prefix in listOf("image","video")) {
                     val oldVersion=s(it,prefix+"Version")
                     it[longPreferencesKey(prefix+"Generation")]=AdmissionPolicy.watermark(oldVersion,l(it,prefix+"Generation"),boundary.version,boundary.generation+1)
@@ -169,14 +241,15 @@ class Preferences(private val context: Context) {
                 }
             }
             it[longPreferencesKey("mediaSince")]=System.currentTimeMillis()/1000
-            installed=true
+            installed=DeliveryBinding(s(it,"deviceId"),peer.pin,peer.deviceId,peer.generation)
+            onInstalled(requireNotNull(installed))
         }
-        installed
+        installed!=null
     }
     /** Scan progress is monotonic; baselines/floor changes invalidate older work. */
     suspend fun checkpoint(video:Boolean,version:String,generation:Long,pairId:Long?=null,floor:Long?=null,expected:AdmissionToken?=null):Boolean=policy.locked {
         if(expected!=null && !AdmissionPolicy.accepts(expected.copy(version=version),read(),readCatalogVersion()))return@locked false
-        store.edit {
+        edit {
             val prefix=if(video)"video" else "image"
             val oldVersion=s(it,prefix+"Version")
             val nextFloor=floor?.let {f->AdmissionPolicy.watermark(oldVersion,l(it,prefix+"Floor"),version,f)}
@@ -193,23 +266,149 @@ class Preferences(private val context: Context) {
         }
         true
     }
-    suspend fun forget(lostPcName: String?=null):Unit=policy.locked {
-        beforeMutation("forget")
-        var retired=""
-        store.edit {
-        val id=randomId();val alias=TlsIdentity.aliasFor(id)
-        advanceEpoch(it)
-        // If Keystore fails, the old DataStore identity and binding remain intact.
-        TlsIdentity(alias,create=true)
-        retired=s(it,"tlsAlias").ifEmpty {TlsIdentity.LEGACY_ALIAS}
-        listOf("pin","pcName","pcId","addresses","pending","lastLan","lastReceivedHash","lastSentHash").forEach { key -> it.remove(stringPreferencesKey(key)) }
-        it[booleanPreferencesKey("pairingLost")] = lostPcName != null; it[booleanPreferencesKey("paused")] = false
-        it[stringPreferencesKey("lostPcName")]=lostPcName.orEmpty()
-        it[longPreferencesKey("lastConnected")]=0;it[booleanPreferencesKey("localCapacity")]=false
-        it[stringPreferencesKey("deviceId")] = id;it[stringPreferencesKey("tlsAlias")]=alias;it[booleanPreferencesKey("deliveryReset")]=true
+    internal suspend fun originateText(floor:Long,apply:Boolean=true):Pair<ClipboardStamp,Long> =originateTexts(1,floor,apply).single()
+    /** The entire batch shares one policy lock and one durable edit. No local or
+     * remote origination can acquire an order between its elements. */
+    internal suspend fun originateTexts(count:Int,floor:Long,apply:Boolean=true):List<Pair<ClipboardStamp,Long>> =policy.locked {
+        require(count>=0)
+        var result=emptyList<Pair<ClipboardStamp,Long>>()
+        if(count>0)edit {p->
+            result=List(count) {index->
+                val time=maxOf(System.currentTimeMillis(),Math.addExact(l(p,"outgoingTextTime"),1),Math.addExact(floor,1))
+                val stamp=MeshClock.next(p,s(p,"deviceId"),apply)
+                p[longPreferencesKey("outgoingTextTime")]=time
+                beforeMutation("textOrderReserved:$index")
+                stamp to time
+            }
+        }
+        result
     }
-        // Existing authenticated sockets no longer need CertificateVerify. A
-        // failed retirement is harmless and must not undo durable revocation.
-        runCatching {TlsIdentity.retire(retired)};Unit
+    suspend fun originateClipboard(apply:Boolean=true):ClipboardStamp=policy.locked {
+        var stamp:ClipboardStamp?=null
+        edit {stamp=MeshClock.next(it,s(it,"deviceId"),apply)}
+        requireNotNull(stamp)
+    }
+    internal suspend fun legacyClipboardStamp(peerId:String):ClipboardStamp {
+        var stamp:ClipboardStamp?=null
+        edit {stamp=MeshClock.next(it,peerId,false)}
+        return requireNotNull(stamp)
+    }
+    internal suspend fun rememberClipboardHash(hash:String,source:String="") {edit {
+        ClipboardHistory.remember(it,hash,source)
+    }}
+    internal suspend fun observeClipboard(stamp:ClipboardStamp) {edit {MeshClock.observe(it,stamp.hlc)}}
+    internal suspend fun clipboardWins(stamp:ClipboardStamp)=effectiveClipboardRegister(store.data.first())?.let {stamp>it} ?: true
+    private val clipboardCompletions=stringSetPreferencesKey("clipboardCompletions")
+    private fun completionKey(peerId:String,generation:Long,id:String)="$peerId/$generation/$id"
+    internal suspend fun unfinishedClipboardCompletions(peerId:String,generation:Long):Set<String> {
+        val prefix="$peerId/$generation/"
+        return store.data.first()[clipboardCompletions].orEmpty().filter {it.startsWith(prefix)}.map {it.removePrefix(prefix)}.toSet()
+    }
+    /** Commit the ordering register, ownership and unfinished Room completion
+     * together. A Room retry finishes the journal without another OS effect. */
+    internal suspend fun appliedClipboard(stamp:ClipboardStamp,hash:String,peerId:String,generation:Long,id:String) {
+        beforeMutation("clipboardApplied")
+        edit {p->
+            if(MeshClock.wins(p,stamp)) {MeshClock.applied(p,stamp);ClipboardHistory.remember(p,hash,peerId)}
+            val current=PeerRegistry.read(p).map {"${it.deviceId}/${it.generation}/"}
+            p[clipboardCompletions]=p[clipboardCompletions].orEmpty().filter {key->current.any(key::startsWith)}.toSet()+completionKey(peerId,generation,id)
+        }
+    }
+    internal suspend fun finishClipboardCompletion(peerId:String,generation:Long,id:String) {edit {p->
+        p[clipboardCompletions]=p[clipboardCompletions].orEmpty()-completionKey(peerId,generation,id)
+    }}
+    suspend fun setPairSwitch(peerId:String,feature:String,enabled:Boolean)=policy.locked {edit {p->
+        val peers=PeerRegistry.read(p);val peer=requireNotNull(peers.find {it.deviceId==peerId})
+        val key=PairSettings.keys(s(p,"deviceId"),peerId)[when(feature) {"sendClipboard"->0;"receiveClipboard"->1;"automaticMedia"->2;else->error("Unknown pair switch")}]
+        if(peer.settings.getValue(key).enabled!=enabled) {
+            val stamp=MeshClock.next(p,s(p,"deviceId"),false)
+            PeerRegistry.write(p,peers.map {if(it==peer)it.copy(settings=it.settings+(key to PairField(enabled,stamp.hlc.toString(),stamp.source)),localEdits=it.localSettingsEdits+key) else it})
+        }
+    }}
+    internal suspend fun prepareSettings(binding:DeliveryBinding):com.google.gson.JsonObject=policy.locked {
+        var result:com.google.gson.JsonObject?=null
+        edit {p->
+            val peers=PeerRegistry.read(p);val peer=requireNotNull(peers.find {it.deviceId==binding.pcId && it.generation==binding.generation && it.pin==binding.pin})
+            result=if(peer.pendingSettings.isNotEmpty())com.google.gson.JsonParser.parseString(peer.pendingSettings).asJsonObject
+                else peer.acknowledgedSnapshot.takeIf(String::isNotEmpty)?.let {com.google.gson.JsonParser.parseString(it).asJsonObject}
+                    ?.takeIf {PairSettings.canonical(it)==PairSettings.signature(peer)}
+                    ?: json("transfer_id" to randomId(),"settings" to PairSettings.snapshot(peer))
+            PeerRegistry.write(p,peers.map {if(it==peer)it.copy(pendingSettings=result.toString()) else it})
+        }
+        requireNotNull(result)
+    }
+    internal suspend fun acknowledgeSettings(binding:DeliveryBinding,body:com.google.gson.JsonObject)=policy.locked {edit {p->
+        PeerRegistry.write(p,PeerRegistry.read(p).map {peer->
+            if(peer.deviceId==binding.pcId && peer.generation==binding.generation && peer.pendingSettings==body.toString())
+                peer.copy(pendingSettings="",acknowledgedSettings=body.toString(),confirmedSettings=body["settings"].toString(),
+                    localEdits=peer.localSettingsEdits.filterNot {key->PairSettings.contains(body, key,peer.settings.getValue(key))}.toSet()) else peer
+        })
+    }}
+    /** Room reserves the ID before DataStore merges. A pending reservation is a
+     * crash journal: identical retry can finish, conflicting reuse never can.
+     * No ACK is emitted until both durable stores have completed. */
+    internal suspend fun receiveSettings(binding:DeliveryBinding,body:com.google.gson.JsonObject,queue:QueueDao):Boolean=policy.locked {
+        val id=body["transfer_id"].asString
+        val hash=sha256(PairSettings.canonical(body).toByteArray())
+        var duplicate=false
+        edit {p->
+            val peers=PeerRegistry.read(p);val peer=requireNotNull(peers.find {it.deviceId==binding.pcId && it.generation==binding.generation && it.pin==binding.pin})
+            require(s(p,"deviceId")==binding.phoneId && binding.pcId !in PeerRegistry.resets(p) && !peer.pairingLost)
+            // Validate the entire snapshot, including all clocks, before reserving.
+            PairSettings.validate(peer,s(p,"deviceId"),body)
+            val old=queue.receipt(binding.pcId,id)
+            if(old!=null && (old.origin!="peer_settings" || old.hash!=hash))throw SettingsConflict()
+            val merged=PairSettings.merge(peer,s(p,"deviceId"),body)
+            if(old==null) {
+                // Indexed Room history has no lifetime count limit. Preserve ID
+                // conflicts for the binding lifetime, just like file receipts.
+                // Actual storage failures remain retryable; reconnects replay
+                // the acknowledged ID instead of growing this history.
+                check(queue.insertReceipt(Receipt().apply {peerId=binding.pcId;transferId=id;this.hash=hash;origin="peer_settings";createdAt=System.currentTimeMillis()})!=-1L)
+            }
+            beforeMutation("settingsReserved")
+            duplicate=old?.state=="applied"
+            body["settings"].asJsonArray.forEach {MeshClock.observe(p,it.asJsonObject["hlc"].asString.toBigInteger())}
+            PeerRegistry.write(p,peers.map {if(it==peer)merged.copy(localEdits=merged.localSettingsEdits.filterNot {key->PairSettings.contains(body,key,merged.settings.getValue(key))}.toSet()) else it})
+        }
+        beforeMutation("settingsMerged")
+        queue.updateReceipt(requireNotNull(queue.receipt(binding.pcId,id)).apply {state="applied"})
+        duplicate
+    }
+    internal suspend fun migrateSettingsReceipts(queue:QueueDao)=policy.locked {
+        edit {p->
+            val peers=PeerRegistry.read(p)
+            peers.filter {it.legacySettingsReceipts.isNotEmpty()}.forEach {peer->
+                peer.legacySettingsReceipts.forEach {(id,hash)->
+                    val old=queue.receipt(peer.deviceId,id)
+                    if(old!=null && (old.origin!="peer_settings" || old.hash!=hash))throw SettingsConflict()
+                    queue.insertReceipt(Receipt().apply {peerId=peer.deviceId;transferId=id;this.hash=hash;origin="peer_settings";state="applied"})
+                }
+            }
+            if(peers.any {it.legacySettingsReceipts.isNotEmpty()})PeerRegistry.write(p,peers.map {it.copy(settingsReceipts=emptyMap())})
+        }
+    }
+    internal class SettingsConflict:Exception()
+    internal suspend fun hello(binding:DeliveryBinding,name:String,addresses:List<Endpoint>,mesh:Boolean=true) {edit {p->
+        PeerRegistry.write(p,PeerRegistry.read(p).map {if(it.deviceId==binding.pcId && it.generation==binding.generation && it.pin==binding.pin)
+            it.copy(name=name,settingsSupported=mesh,addresses=if(addresses.isEmpty())it.addresses else (addresses+it.addresses).distinct().take(8)) else it})
+    }}
+    suspend fun finishPeerReset(peerId:String) {edit {PeerRegistry.finishReset(it,peerId)}}
+    suspend fun forget(lostPcName:String?=null,peerId:String?=null):Unit=policy.locked {
+        beforeMutation("forget")
+        edit {
+            PeerRegistry.migrate(it)
+            val peers=PeerRegistry.read(it)
+            val target=peers.find {peer->peer.deviceId==(peerId ?: peers.firstOrNull()?.deviceId)}
+            if(target!=null) {
+                if(lostPcName!=null)PeerRegistry.write(it,peers.map {peer->if(peer==target)peer.copy(pairingLost=true) else peer})
+                else PeerRegistry.remove(it,target.deviceId)
+                PeerRegistry.reset(it,target.deviceId)
+            }
+            if(peers.size<=1)advanceEpoch(it)
+            it[booleanPreferencesKey("pairingLost")]=lostPcName!=null
+            it[stringPreferencesKey("lostPcName")]=lostPcName.orEmpty()
+            // Device ID and Keystore alias belong to the phone, never to a pair.
+        }
     }
 }

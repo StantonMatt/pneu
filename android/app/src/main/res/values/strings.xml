@@ -1,6 +1,6 @@
 <resources>
 <string name="app_name">Pneu</string>
-<string name="share_label">Send to PC</string>
+<string name="share_label">Pneu</string>
 <string name="setup_title">Set up Pneu</string>
 <string name="permissions_title">Permissions and battery</string>
 <string name="perm_notifications">Notifications</string>
@@ -23,6 +23,7 @@
 <string name="pair_not_pneu">That isn\'t a Pneu code</string>
 <string name="pair_expired">This code expired. Scan the new one.</string>
 <string name="pair_pairing">Pairing…</string>
+<string name="pair_already_paired">Already paired with %1$s</string>
 <string name="pair_success">Paired with %1$s</string>
 <string name="pair_unreachable_title">Can\'t reach your PC</string>
 <string name="pair_unreachable_text">Make sure both are on the same Wi-Fi, or that Tailscale is connected.</string>
@@ -32,7 +33,7 @@
 <string name="cd_settings">Settings</string>
 <string name="status_connecting">Connecting…</string>
 <string name="status_connected">Connected</string>
-<string name="status_unreachable">PC unreachable</string>
+<string name="status_unreachable">Computer unreachable</string>
 <string name="status_waiting_wifi">Waiting for Wi-Fi</string>
 <string name="status_no_network">No network</string>
 <string name="status_paused">Paused</string>
@@ -67,8 +68,8 @@
 <string name="item_waiting">Waiting</string>
 <string name="item_waiting_wifi">Waiting for Wi-Fi</string>
 <string name="item_sending">Sending · %1$s of %2$s</string>
-<string name="item_failed_disk">Failed · PC disk is full</string>
-<string name="item_failed_write">Failed · PC can\'t save files</string>
+<string name="item_failed_disk">Failed · Computer storage is full</string>
+<string name="item_failed_write">Failed · Computer can\'t save files</string>
 <string name="cd_dont_send">Don\'t send</string>
 <string name="cd_cancel">Cancel</string>
 <string name="cd_retry">Retry</string>
@@ -84,11 +85,11 @@
 <string name="pref_tailscale_missing">Tailscale app isn\'t installed</string>
 <string name="pref_mobile_data">Use mobile data</string>
 <string name="pref_originals">Send originals on mobile data</string>
-<string name="pref_queue">Queue while PC is unreachable</string>
+<string name="pref_queue">Queue for offline devices</string>
 <string name="snackbar_need_route">Pneu needs Wi-Fi or Tailscale</string>
 <string name="group_clipboard">Clipboard</string>
 <string name="pref_clipboard_button">Send button in notification</string>
-<string name="group_pc">Paired PC</string>
+<string name="group_pc">Paired computer</string>
 <string name="pref_unpair">Unpair</string>
 <string name="group_phone">This phone</string>
 <string name="pref_permissions">Permissions and battery</string>
@@ -117,9 +118,9 @@
 <string name="tile_not_paired">Not paired</string>
 <string name="toast_clipboard_sent">Clipboard sent</string>
 <string name="toast_clipboard_empty">Clipboard is empty</string>
-<string name="toast_not_sent">PC unreachable. Not sent.</string>
-<string name="toast_sending">Sending to PC</string>
-<string name="toast_queued">PC unreachable. Queued.</string>
+<string name="toast_not_sent">Computer unreachable. Not sent.</string>
+<string name="toast_sending">Sending to computer</string>
+<string name="toast_queued">Computer unreachable. Queued.</string>
 <string name="toast_queued_wifi">Waiting for Wi-Fi. Queued.</string>
 <string name="toast_cant_read">Couldn\'t read this item</string>
 <plurals name="banner_many"><item quantity="one">%d settings need attention</item><item quantity="other">%d settings need attention</item></plurals>
@@ -128,30 +129,35 @@
 <plurals name="unpair_text"><item quantity="one">%d waiting item won\'t be sent.</item><item quantity="other">%d waiting items won\'t be sent.</item></plurals>
 <plurals name="notif_sending_many"><item quantity="one">Sending %d items</item><item quantity="other">Sending %d items</item></plurals>
 <plurals name="notif_waiting"><item quantity="one">%d waiting</item><item quantity="other">%d waiting</item></plurals>
-<plurals name="toast_sending_many"><item quantity="one">Sending %d items to PC</item><item quantity="other">Sending %d items to PC</item></plurals>
+<plurals name="toast_sending_many"><item quantity="one">Sending %d items to computer</item><item quantity="other">Sending %d items to computer</item></plurals>
 <plurals name="waiting"><item quantity="one">%d waiting</item><item quantity="other">%d waiting</item></plurals>
 <string name="cd_back">Back</string>
 <string name="cd_granted">Granted</string>
 <string name="perm_local_network">Local network</string>
-<string name="pref_clipboard_from_pc">Receive clipboard from PC</string>
+<string name="pref_clipboard_from_pc">Receive clipboard from computer</string>
 <string name="pref_share_sheet">Show in share sheet</string>
 <string name="pref_quick_settings">Quick Settings tiles</string>
 <string name="pair_confirm_title">Pair with %1$s?</string>
-<string name="pair_replace_title">Replace %1$s with %2$s?</string>
+<string name="detail_devices">%1$d devices</string>
+<string name="detail_connected_devices">%1$d of %2$d devices</string>
+<string name="detail_two_devices">%1$s and %2$s</string>
+<string name="pair_add_title">Add %1$s?</string>
 <string name="action_pair">Pair</string>
-<string name="action_replace">Replace</string>
+<string name="action_add_device">Add device</string>
+<string name="pref_clipboard_from_device">Receive clipboard from %1$s</string>
+<string name="action_add">Add</string>
 <string name="action_dismiss">Dismiss</string>
 <string name="action_close">Close</string>
 <string name="unpair_finish_title">Finish unpairing?</string>
 <string name="banner_capacity">No room for more waiting items</string>
-<string name="banner_local_network">Pneu can\'t connect to your PC</string>
+<string name="banner_local_network">Pneu can\'t connect to your computer</string>
 <string name="load_failed">Couldn\'t load Pneu settings</string>
 <string name="load_pending">Loading Pneu settings</string>
 <string name="notif_starting">Starting…</string>
 <string name="kind_image">Image</string>
 <string name="detail_mobile">%1$s · Mobile data</string>
 <string name="detail_route">%1$s · %2$s</string>
-<string name="item_failed_unsupported">Failed · PC can\'t receive this</string>
+<string name="item_failed_unsupported">Failed · Computer can\'t receive this</string>
 <string name="item_failed_image">Failed · Couldn\'t read image</string>
 <string name="item_failed_gone">Failed · File is gone</string>
 <string name="item_failed">Failed</string>
@@ -190,4 +196,10 @@
 <string name="shared_items">Shared items</string>
 <string name="clipboard_label">Pneu clipboard</string>
 <string name="kind_file">file</string>
+<string name="computer">computer</string>
+<string name="toast_sending_to">Sending to %1$s</string>
+<plurals name="toast_sending_computers"><item quantity="one">Sending to %d computer</item><item quantity="other">Sending to %d computers</item></plurals>
+<string name="item_sent_to">Sent to %1$d of %2$d</string>
+<string name="item_failed_on">Failed on %1$s</string>
+<plurals name="item_failed_computers"><item quantity="one">Failed on %d computer</item><item quantity="other">Failed on %d computers</item></plurals>
 </resources>

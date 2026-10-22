@@ -22,7 +22,7 @@ import javax.net.ssl.SSLSocket
 import kotlin.random.Random
 
 data class LinkState(val status: String = "PC unreachable", val route: String = "", val pairing: String = "", val sent: Long = 0, val total: Long = 0, val transferMediaId: String = "", val cellular: Boolean = false, val pairingPin: String = "", val transferKind: String = "", val transferFileName: String = "",
-    val pairingFeedback:UiFeedback?=pairing.takeIf(String::isNotEmpty)?.let {UiFeedback(it)}) {
+    val pairingFeedback:UiFeedback?=pairing.takeIf(String::isNotEmpty)?.let {UiFeedback(it)},val pairingGeneration:Long=0) {
     /** Emit a new pairing result even when its copy matches the preceding one.
      * Ordinary route/progress copies preserve the existing event identity. */
     fun withPairing(message:String)=copy(pairing=message,pairingFeedback=message.takeIf(String::isNotEmpty)?.let {UiFeedback(it)})
@@ -33,10 +33,24 @@ data class LinkState(val status: String = "PC unreachable", val route: String = 
         "clipboard_image" -> "Sending clipboard image"
         else -> "Sending screenshot"
     }
-    fun pairingSuccess(p: Prefs) = pairing.startsWith("Paired with ") && pairingPin.isNotEmpty() && p.peer?.pin == pairingPin && p.pending == null && !p.pairingLost
+    fun pairingSuccess(p: Prefs) = pairing.startsWith("Paired with ") && pairingPin.isNotEmpty() && p.devices.any {it.pin==pairingPin && it.generation==pairingGeneration && !it.pairingLost} && !p.pairingLost
 }
 private class RemoteError(val code: String) : Exception(code)
-class ConnectionManager(private val app: AppGraph) {
+class ConnectionManager(private val app:AppGraph,private val peerPin:String?=null) {
+    private fun scoped(p:Prefs)=BindingTransitions.scoped(p,peerPin)
+    private fun pairingAttempt()=app.connection.attemptFor(peerPin)
+    private suspend fun readPrefs()=scoped(app.preferences.read())
+    private var clipboardCleanup:Pair<DeliveryBinding,Boolean>?=null
+    private suspend fun retryClipboardCleanup():Boolean {
+        val (binding,sessionOnly)=clipboardCleanup ?: return true
+        return try {app.abandonClipboard(binding,sessionOnly);clipboardCleanup=null;true}
+        catch(e:CancellationException) {throw e}
+        catch(e:Exception) {android.util.Log.w("PneuCleanup",e.javaClass.simpleName);false}
+    }
+    private suspend fun recoverPeer() {
+        if(!retryClipboardCleanup())throw java.io.IOException("Clipboard cleanup pending")
+        val p=readPrefs();DeliveryBinding.from(p,p.peer?.deviceId)?.let {app.recoverDeliveryLane(false,it);app.recoverDeliveryLane(true,it)}
+    }
     val state = MutableStateFlow(LinkState())
     private val context = app.context
     private val cm = context.getSystemService(ConnectivityManager::class.java)
@@ -66,7 +80,12 @@ class ConnectionManager(private val app: AppGraph) {
         if(target===socket)tcpSocket?.runCatching {close()}
         target?.runCatching {close()}
     }
+    @Volatile private var settingsReady=false
+    private val settingsEvents=Channel<Unit>(Channel.CONFLATED)
+    @Volatile private var settingsReceipt:Pair<String,CompletableDeferred<Frame.Control>>?=null
     @Volatile private var ready = false
+    // A UUID also fences restored PendingIntents and pending media after process death.
+    @Volatile private var admissionSession:String?=null
     @Volatile private var txAt = 0L
     private val writing = ProgressDeadline(60_000, SystemClock::elapsedRealtime)
     private val rejections = RejectionStreak()
@@ -80,6 +99,13 @@ class ConnectionManager(private val app: AppGraph) {
     private val dialEpoch=java.util.concurrent.atomic.AtomicLong()
     @Volatile private var activeEndpoint:Endpoint?=null
     @Volatile private var activePin=""
+    @Volatile private var authenticatedBinding:DeliveryBinding?=null
+    internal fun authenticatedAs(binding:DeliveryBinding)=authenticatedBinding==binding
+    internal fun freezeSession(binding:DeliveryBinding):DeliveryBinding? {
+        val id=admissionSession ?: return null
+        return binding.copy(sessionId=id).takeIf {ready && authenticatedBinding==binding.copy(sessionId=null) && admissionSession==id}
+    }
+    internal fun ownsSession(binding:DeliveryBinding)=binding.sessionId!=null && freezeSession(binding.copy(sessionId=null))==binding
     val connected get()=ready
     fun supports(capability: String)=ready && capability in capabilities
     fun kick() {wake.trySend(Unit)}
@@ -138,10 +164,13 @@ class ConnectionManager(private val app: AppGraph) {
             app.initialized.await();cm.registerDefaultNetworkCallback(callback);discoveryLease.open()
             launch {
                 var previous: Prefs? = null
-                app.prefs.filter {it.loaded}.collect { p ->
+                var previousAttempt:String?=null
+                combine(app.prefs.filter {it.loaded}.map(::scoped),app.connection.attempt) {p,a->p to a?.takeIf {peerPin==null || it.invitation.fingerprint==peerPin}}.collect { (p,a) ->
+                    val changedAttempt=previousAttempt!=a?.id && a!=null
+                    previousAttempt=a?.id
                     val old = previous; previous = p
                     ensureDiscovery(p)
-                    if (old != null && ((old.pending != p.pending && p.pending != null) || old.wifi != p.wifi || old.tailscale != p.tailscale || old.mobile != p.mobile)) retry()
+                    if (old != null && (changedAttempt || BindingTransitions.restart(old,p,authenticatedBinding))) retry()
                     if (old != null && old.paused != p.paused && ready) runCatching { send(Frame.Control(Type.STATUS, json("paused" to p.paused))) }
                 }
             }
@@ -151,65 +180,70 @@ class ConnectionManager(private val app: AppGraph) {
                 try {
                 if(unpairing) {delay(100);continue}
                 app.reconcileDelivery()
-                val prefs = app.preferences.read()
+                val view=app.connectionView(peerPin)
+                val prefs=view.prefs;val attempt=view.attempt;val outcome=view.outcome
                 ensureDiscovery(prefs)
-                if (prefs.deviceId.isEmpty() || (prefs.peer == null && prefs.pending == null) || prefs.pairingLost) { delay(100); continue }
+                if (!BindingTransitions.mayDial(prefs,attempt)) { delay(100); continue }
                 if (!networkAllowed(prefs)) { withTimeoutOrNull(2000) { wake.receive() }; continue }
-                val invitation = prefs.pending
+                val invitation = attempt?.invitation
                 val pin = invitation?.fingerprint ?: prefs.peer!!.pin
                 val endpoints = candidates(prefs)
                 for (endpoint in endpoints) {
-                    app.reconcileDelivery();app.recoverOutgoing()
-                    val current=app.preferences.read()
-                    if(!isActive || current.pending!=prefs.pending || current.peer!=prefs.peer || !endpointAllowed(current,endpoint))break
+                    app.reconcileDelivery();recoverPeer()
+                    val current=readPrefs()
+                    if(!isActive || pairingAttempt()?.id!=attempt?.id || current.peer!=prefs.peer || !endpointAllowed(current,endpoint))break
                     val epoch=dialEpoch.get()
                     var pinnedLeafVerified=false
                     var rejected=false
                     activeEndpoint=endpoint;activePin=pin
+                    authenticatedBinding=if(invitation==null)DeliveryBinding.from(prefs,prefs.peer?.deviceId) else null
                     state.value = LinkState("Connecting…", pairing = if (invitation != null) "Pairing…" else "")
                     try {
                         val ssl = TlsIdentity(prefs.tlsAlias).socket(endpoint, pin, {pinnedLeafVerified=it}) { socket = it;if(it !is SSLSocket)tcpSocket=it;if(epoch!=dialEpoch.get())closeSocket(it) }
-                        if(epoch!=dialEpoch.get() || !endpointAllowed(app.preferences.read(),endpoint))throw java.io.IOException("Policy changed")
-                        session(ssl,endpoint,prefs,epoch) {failures=0;succeeded=true}
+                        if(epoch!=dialEpoch.get() || !endpointAllowed(readPrefs(),endpoint))throw java.io.IOException("Policy changed")
+                        session(ssl,endpoint,prefs,epoch,attempt,outcome) {failures=0;succeeded=true}
                     } catch (e: CancellationException) { throw e }
                     catch (e: RemoteError) {
                         if (e.code == "unauthorized") {
                             if(invitation == null) {rejected=PairingRejection.unauthorized(e.code,pinnedLeafVerified);if(rejected)onUnauthorized?.invoke()}
-                            else if(app.cancelPairing(invitation))state.value=LinkState(pairing="Can't reach your PC")
+                            else app.rejectPairing(requireNotNull(attempt),"Can't reach your PC")
                             break
                         }
                         if (invitation != null && e.code in setOf("invalid_token", "expired_token", "pairing_closed", "already_paired", "storage_failed")) {
-                            if(app.cancelPairing(invitation))state.value = LinkState(pairing = if (e.code == "expired_token") { if(invitation.expires > System.currentTimeMillis()) "Your PC's clock says this code expired. Check both clocks and scan the new code." else "This code expired. Scan the new one." } else "Can't reach your PC")
+                            app.rejectPairing(requireNotNull(attempt),if (e.code == "expired_token") { if(invitation.expires > System.currentTimeMillis()) "Your PC's clock says this code expired. Check both clocks and scan the new code." else "This code expired. Scan the new one." } else "Can't reach your PC")
                             break
                         }
-                        if (e.code == "identity_mismatch") {lost(prefs.peer,prefs.deviceId);break}
+                        if (e.code == "protocol_identity") break
                         if (e.code == "connection_replaced") break
                     } catch (e: Exception) {
                         // Only exception classes are logged; never endpoints, tokens, or user content.
                         android.util.Log.w("PneuConnection", generateSequence<Throwable>(e) { it.cause }.joinToString(" <- ") { it.javaClass.simpleName })
                     } finally {
-                        ready = false; closeSocket(); socket = null;tcpSocket=null;activeEndpoint=null;activePin=""
+                        admissionSession=null;ready = false; closeSocket(); socket = null;tcpSocket=null;activeEndpoint=null;activePin=""
+                        val endingBinding=authenticatedBinding
+                        clipboardCleanup=endingBinding?.let {it to ("mesh" !in capabilities)}
+                        authenticatedBinding=null
+                        settingsReady=false;settingsReceipt=null
                         activeReceipt = null; textReceipt=null;textEmission=null;capabilities=emptySet(); receiptReady=false;fileEmission=null
                         // Reconcile even if a subsequent pairing-loss persistence step fails.
-                        withContext(NonCancellable) {recoverSession()}
+                        // Runtime authority and disconnected UI are mandatory:
+                        // publish before any fallible durable maintenance.
+                        publishDisconnected(if(scoped(app.prefs.value).pairingLost)"Pairing lost" else "PC unreachable")
+                        withContext(NonCancellable) {retryClipboardCleanup();recoverSession(endingBinding)}
                         try {
-                            if(invitation == null && epoch==dialEpoch.get() && prefs.peer!=null && rejections.record("${prefs.peer.pin}:${prefs.peer.deviceId}",rejected)) lost(prefs.peer,prefs.deviceId)
+                            if(invitation == null && epoch==dialEpoch.get() && prefs.peer!=null && rejections.record("${prefs.peer.pin}:${prefs.peer.deviceId}:${prefs.peer.generation}",rejected)) lost(prefs.peer,prefs.deviceId,outcome)
                         } finally {
-                            val status=if(app.awaitPrefs().pairingLost)"Pairing lost" else "PC unreachable"
-                            state.update {
-                                val disconnected=it.copy(status=status,route="",cellular=false,sent=0,total=0,transferMediaId="",transferKind="",transferFileName="",pairingPin="")
-                                if(disconnected.pairing.startsWith("Paired with "))disconnected.withPairing("") else disconnected
-                            }
+                            publishDisconnected(if(scoped(app.prefs.value).pairingLost)"Pairing lost" else "PC unreachable")
                         }
                     }
                     if (succeeded) break
                 }
-                if (invitation != null && app.awaitPrefs().pending != null) state.value = LinkState(pairing = "Can't reach your PC")
+                if (attempt != null && pairingAttempt()?.id==attempt.id) state.value = LinkState(pairing = "Can't reach your PC")
                 } catch(e:CancellationException) {throw e}
                 catch(e:Exception) {android.util.Log.w("PneuAttempt",e.javaClass.simpleName)}
                 failures=backoff(failures,succeeded)
             }
-            } finally {discoveryLease.close();runCatching {cm.unregisterNetworkCallback(callback)}}
+            } finally {try {discoveryLease.close()}finally {runCatching {cm.unregisterNetworkCallback(callback)}}}
         }
     }
     private suspend fun backoff(failures:Int,succeeded:Boolean):Int {
@@ -218,11 +252,23 @@ class ConnectionManager(private val app: AppGraph) {
         withTimeoutOrNull((seconds*1000*Random.nextDouble(.8,1.2)).toLong()) {wake.receive();next=0}
         return next
     }
+    private fun publishDisconnected(status:String) {
+        state.update {
+            val disconnected=it.copy(status=status,route="",cellular=false,sent=0,total=0,transferMediaId="",transferKind="",transferFileName="",pairingPin="")
+            if(disconnected.pairing.startsWith("Paired with "))disconnected.withPairing("") else disconnected
+        }
+    }
     /** session() has joined its cancelled senders before this reconciliation.
      * Dial-time recovery runs inside the outer attempt/backoff boundary. */
-    private suspend fun recoverSession():Boolean=try {app.recoverOutgoing();true}
+    @androidx.annotation.VisibleForTesting
+    internal suspend fun recoverSession(binding:DeliveryBinding?):Boolean {
+        var recovered=true
+        // A storage failure in one lane must not skip recovery of the other.
+        if(binding!=null)for(text in listOf(false,true))try {app.recoverDeliveryLane(text,binding)}
         catch(e:CancellationException) {throw e}
-        catch(e:Exception) {android.util.Log.w("PneuRecovery",e.javaClass.simpleName);false}
+        catch(e:Exception) {android.util.Log.w("PneuRecovery",e.javaClass.simpleName);recovered=false}
+        return recovered
+    }
     private fun watchService(info: NsdServiceInfo,token:Long) {
         synchronized(serviceCallbacks) {
             if(info.serviceName in serviceCallbacks || serviceCallbacks.size >= 32) return
@@ -253,10 +299,11 @@ class ConnectionManager(private val app: AppGraph) {
         }
     }
     internal fun candidates(p: Prefs): List<Endpoint> {
-        val addresses = p.pending?.addresses ?: p.peer?.addresses.orEmpty()
-        val pin = p.pending?.fingerprint ?: p.peer?.pin
+        val invitation=pairingAttempt()?.invitation
+        val addresses = invitation?.addresses ?: p.peer?.addresses.orEmpty()
+        val pin = invitation?.fingerprint ?: p.peer?.pin
         val lan = if (p.wifi) buildList {
-            if (p.pending == null && p.lastLan.isNotEmpty()) runCatching { Endpoint.parse(p.lastLan) }.getOrNull()?.let { add(it) }
+            if (invitation == null && p.lastLan.isNotEmpty()) runCatching { Endpoint.parse(p.lastLan) }.getOrNull()?.let { add(it) }
             synchronized(discovery) { addAll(discovery.values.filter { it.first == pin }.flatMap { it.second }.filter { !it.tailscale }) }
             addAll(addresses.filter { !it.tailscale })
         } else emptyList()
@@ -266,7 +313,7 @@ class ConnectionManager(private val app: AppGraph) {
     private fun ensureDiscovery(p:Prefs) {
         // API 37 can otherwise open a system NSD picker from the foreground service,
         // covering Pneu's own confirmation/settings recovery UI.
-        discoveryLease.update(p.wifi && localNetworkGranted() && !p.deliveryReset && !p.pairingLost && (p.peer!=null || p.pending!=null))
+        discoveryLease.update(p.wifi && localNetworkGranted() && !p.deliveryReset && (pairingAttempt()!=null || !p.pairingLost && p.peer!=null))
     }
     private fun networkAllowed(p: Prefs, network:RoutePolicy.Active=RoutePolicy.active(cm)): Boolean {
         if(!localNetworkGranted()) {state.update {it.copy(status="Local network access is off")};return false}
@@ -279,10 +326,12 @@ class ConnectionManager(private val app: AppGraph) {
         val deadline=launch(Dispatchers.Default) {delay(timeout);closeSocket(ssl)}
         try {body()} finally {deadline.cancel()}
     }
-    private suspend fun session(ssl: SSLSocket, endpoint: Endpoint, p: Prefs,epoch:Long,onReady:()->Unit) = coroutineScope {
-        val name = Settings.Global.getString(context.contentResolver, Settings.Global.DEVICE_NAME) ?: android.os.Build.MODEL
+    private suspend fun session(ssl: SSLSocket, endpoint: Endpoint, p: Prefs,epoch:Long,
+                                attempt:PairingAttempt?,outcome:ConnectionOutcome?,onReady:()->Unit):Unit = coroutineScope {
+        var sessionOutcome=outcome
+        val name=p.selfName.ifEmpty {Settings.Global.getString(context.contentResolver,Settings.Global.DEVICE_NAME) ?: android.os.Build.MODEL}
         val hello=phase(ssl,10000) {
-        send(Frame.Control(Type.HELLO, json("version" to 1, "device_id" to p.deviceId, "name" to utf8Prefix(name,128).ifEmpty {"Pneu"}, "capabilities" to listOf("clipboard_text"), "paused" to p.paused)))
+        send(Frame.Control(Type.HELLO, json("version" to 1, "device_id" to p.deviceId, "name" to utf8Prefix(name,128).ifEmpty {"Pneu"}, "capabilities" to listOf("clipboard_text","mesh"),"role" to "phone", "paused" to p.paused)))
         readControl(ssl)
         }
         if (hello.type == Type.ERROR) throw RemoteError(hello.body["code"].asString)
@@ -290,17 +339,27 @@ class ConnectionManager(private val app: AppGraph) {
         if (hello.body["version"].asLong != 1L) {
             send(Frame.Control(Type.ERROR, json("code" to "version_mismatch", "supported_version" to 1))); throw RemoteError("version_mismatch")
         }
+        val mesh=hello.body["capabilities"].asJsonArray.any {it.asString=="mesh"}
+        if(mesh && hello.body["role"]?.asString!="computer") {send(Frame.Control(Type.ERROR,json("code" to "malformed_message")));throw RemoteError("malformed_message")}
         val pcId = hello.body["device_id"].asString
-        if (p.pending == null && pcId != p.peer?.deviceId) { lost(p.peer,p.deviceId); throw RemoteError("identity_mismatch") }
+        // A self ID or a known certificate claiming another ID is a protocol
+        // violation, never evidence that the retained binding was lost.
+        if(pcId==p.deviceId || pcId.isEmpty() || attempt==null && pcId!=p.peer?.deviceId) {
+            attempt?.let {app.rejectPairing(it,"Conflicting peer identity")}
+            send(Frame.Control(Type.ERROR,json("code" to "unauthorized")))
+            throw RemoteError("protocol_identity")
+        }
         val deferred=ArrayDeque<Frame.Control>()
-        p.pending?.let { invitation ->
+        attempt?.let { scanned ->
+            val invitation=scanned.invitation
+            val resolved=app.pairingHello(scanned,pcId) ?: throw RemoteError("closing")
             phase(ssl,10000) {
             send(Frame.Control(Type.PAIR_REQUEST, json("token" to invitation.token)))
             var result=readControl(ssl)
             while(result.type!=Type.PAIR_RESULT && result.type!=Type.ERROR) {
                 when(result.type) {
                     Type.PING->send(Frame.Control(Type.PONG,result.body))
-                    Type.CLIPBOARD,Type.STATUS->{require(deferred.size<4);deferred.add(result)}
+                    Type.CLIPBOARD,Type.STATUS,Type.PEER_SETTINGS->{require(deferred.size<4);deferred.add(result)}
                     else->throw RemoteError("unexpected_message")
                 }
                 result=readControl(ssl)
@@ -309,25 +368,33 @@ class ConnectionManager(private val app: AppGraph) {
             require(result.type == Type.PAIR_RESULT)
             if (!result.body["accepted"].asBoolean) throw RemoteError(result.body["code"].asString)
             // Persist before processing any READY traffic, including immediate peer data.
-            if(epoch!=dialEpoch.get() || !app.installBinding(invitation,pcId))throw java.io.IOException("Stale pairing")
+            if(epoch!=dialEpoch.get())throw java.io.IOException("Stale pairing")
+            authenticatedBinding=app.installSessionBinding(resolved,pcId,p.deviceId,onOutcome={sessionOutcome=it}) {authenticatedBinding=it}
+                ?: throw java.io.IOException("Stale pairing")
             }
         }
-        if(epoch!=dialEpoch.get() || !endpointAllowed(app.preferences.read(),endpoint))throw java.io.IOException("Policy changed")
-        val boundPeer=p.pending?.let {Peer(it.name,it.fingerprint,pcId,it.addresses)} ?: p.peer
-        val sessionBinding=DeliveryBinding(p.deviceId,requireNotNull(boundPeer).pin,pcId)
+        if(epoch!=dialEpoch.get() || !endpointAllowed(readPrefs(),endpoint))throw java.io.IOException("Policy changed")
+        // This binding comes only from the authenticated dial or its PAIR_RESULT
+        // transaction. Registry reads can revoke it, never replace its authority.
+        val sessionBinding=requireNotNull(authenticatedBinding)
+        require(sessionBinding.pcId==pcId && sessionBinding.pin==(attempt?.invitation?.fingerprint ?: p.peer?.pin))
+        val boundPeer=Peer(attempt?.invitation?.name ?: p.peer!!.name,sessionBinding.pin,pcId,emptyList(),generation=sessionBinding.generation)
         check(app.preferences.connected(sessionBinding,endpoint)) {"Binding changed"}
         capabilities=hello.body["capabilities"].asJsonArray.map {it.asString}.toSet()
-        app.queue.pending().filter {it.error=="unsupported_kind" && it.rejectedCapabilities!=capabilities.sorted().joinToString(",") && (if(it.kind=="text")"clipboard_text" in capabilities else "files" in capabilities && (it.kind!="clipboard_image" || "clipboard_image" in capabilities))}.forEach {
+        app.preferences.hello(sessionBinding,hello.body["name"].asString,hello.body["addresses"]?.asJsonArray?.map {Endpoint.parse(it.asString)}.orEmpty(),mesh)
+        app.abandonClipboard(sessionBinding,sessionOnly=!mesh)
+        settingsReady=!mesh
+        app.queue.pendingPeer(pcId).filter {it.bindingGeneration==sessionBinding.generation && it.error=="unsupported_kind" && !it.rejectedCapabilities.startsWith("settings:") && it.rejectedCapabilities!=capabilities.sorted().joinToString(",") && (if(it.kind=="text")"clipboard_text" in capabilities else "files" in capabilities && (it.kind!="clipboard_image" || "clipboard_image" in capabilities))}.forEach {
             it.state="waiting";it.error="";it.nextAttempt=0;updateRow(it)
         }
         // A progressing upload can receive nothing until ACK. READY liveness
         // belongs to PING/PONG, write progress and post-END receipt deadlines.
-        ready = true;onReady();ssl.soTimeout = 0
-        val currentPaused=app.preferences.read().paused
+        admissionSession=randomId();ready = true;onReady();ssl.soTimeout = 0
+        val currentPaused=readPrefs().paused
         if(currentPaused!=p.paused)send(Frame.Control(Type.STATUS,json("paused" to currentPaused)))
-        deferred.forEach {if(it.type==Type.CLIPBOARD)send(app.clipboard.receive(pcId,it.body,sessionBinding))}
+
         val network = RoutePolicy.active(cm)
-        state.value = LinkState("Connected", network.label(endpoint.tailscale), if (p.pending != null) "Paired with ${p.pending.name}" else "",cellular=network.mobile,pairingPin=if(p.pending!=null)p.pending.fingerprint else "")
+        state.value = LinkState("Connected", network.label(endpoint.tailscale), if (attempt != null) "Paired with ${attempt.invitation.name}" else "",cellular=network.mobile,pairingPin=if(attempt!=null)attempt.invitation.fingerprint else "",pairingGeneration=sessionBinding.generation)
         val ping = PingDeadline(30_000, SystemClock::elapsedRealtime)
         val livenessWake = Channel<Unit>(Channel.CONFLATED)
         val writeWatchdog = launch {
@@ -361,6 +428,64 @@ class ConnectionManager(private val app: AppGraph) {
                 ping.sent(pending)
             }
         }
+        var receivedSettings=!mesh
+        suspend fun receiveSettings(frame:Frame.Control) {
+            if(!mesh)throw MeshViolation("unexpected_message")
+            val id=frame.body["transfer_id"].asString
+            try {
+                val duplicate=app.withBinding(sessionBinding) {
+                    val duplicate=app.preferences.receiveSettings(sessionBinding,frame.body,app.queue)
+                    if(readPrefs().peer?.clipboardSend!=true)app.queueMutex.withLock {app.queue.supersedeBoundText(pcId,sessionBinding.generation)}
+                    duplicate
+                } ?: throw java.io.IOException("Binding changed")
+                receivedSettings=true;settingsEvents.trySend(Unit)
+                send(Frame.Control(Type.ACK,json("transfer_id" to id,"deduplicated" to duplicate)))
+            }catch(e:MeshViolation) {throw e}
+            catch(_:Preferences.SettingsConflict) {send(Frame.Control(Type.NACK,json("transfer_id" to id,"code" to "id_conflict","retryable" to false)))}
+            catch(e:CancellationException) {throw e}
+            catch(_:Exception) {send(Frame.Control(Type.NACK,json("transfer_id" to id,"code" to "storage_failed","retryable" to true)))}
+        }
+        suspend fun content(frame:Frame.Control) {
+            try {when(frame.type) {
+                Type.PEER_SETTINGS->receiveSettings(frame)
+                Type.CLIPBOARD->send(app.clipboard.receive(pcId,frame.body,sessionBinding,mesh))
+                else->Unit
+            }}catch(e:MeshViolation) {send(Frame.Control(Type.ERROR,json("code" to e.code)));throw RemoteError(e.code)}
+        }
+        val settingsSender=if(mesh)launch {SessionTasks.settings({closeSocket(ssl)}) {
+            val events=launch {app.prefs.map {it.devices.find {it.deviceId==pcId}}.distinctUntilChanged().collect {settingsEvents.trySend(Unit)}}
+            var full=true
+            try {while(isActive) {
+                try {
+                    val peer=SendFailures.local("local_storage") {requireNotNull(readPrefs().peer)}
+                    if(full || peer.pendingSettings.isNotEmpty() || PairSettings.syncing(peer)) {
+                        settingsReady=false
+                        val snapshot=SendFailures.local("local_storage") {app.withBinding(sessionBinding) {app.preferences.prepareSettings(sessionBinding)}}
+                            ?: throw RemoteError("closing")
+                        val receipt=CompletableDeferred<Frame.Control>();settingsReceipt=snapshot["transfer_id"].asString to receipt
+                        send(Frame.Control(Type.PEER_SETTINGS,snapshot))
+                        val response=awaitReceipt(receipt);settingsReceipt=null
+                        if(response.type==Type.ACK) {SendFailures.local("local_storage") {app.preferences.acknowledgeSettings(sessionBinding,snapshot)};full=false}
+                        else {if(response.body["code"].asString!="storage_failed")throw RemoteError("unexpected_message");delay(60000)}
+                        continue
+                    }
+                    if(receivedSettings)SendFailures.local("local_storage") {releaseSettingsBlocked(sessionBinding,peer)}
+                    settingsReady=receivedSettings
+                    settingsEvents.receive()
+                }catch(e:CancellationException) {throw e}
+                catch(e:TransportFailure) {throw e}
+                catch(e:RemoteError) {throw e}
+                catch(e:LocalSendFailure) {
+                    // Local reads/preparation/ACK commits retain the exact pending
+                    // snapshot. Keep the control reader and keepalive alive.
+                    settingsReady=false;settingsReceipt=null;delay(60000)
+                }
+            }}finally {
+                // Cancellation cannot interrupt blocking TLS read.
+                events.cancel();settingsReceipt=null
+            }
+        }} else null
+        deferred.forEach {content(it)}
         fun launchSender(text: Boolean)=launch {
             val work=Channel<Unit>(Channel.CONFLATED)
             val events=launch {combine(app.prefs,app.work,state.map {it.status to it.cellular}.distinctUntilChanged()) {_,_,_->Unit}.collect {work.trySend(Unit)}}
@@ -371,17 +496,19 @@ class ConnectionManager(private val app: AppGraph) {
                 LaneWait.await(work,waitMillis)
                 var selected:Outgoing?=null
                 try {
-                val prefs=app.preferences.read()
+                val prefs=readPrefs()
+                if(!settingsReady) {waitMillis=1000;continue}
+                if(text && prefs.peer?.clipboardSend!=true)app.queueMutex.withLock {app.queue.supersedeBoundText(sessionBinding.pcId,sessionBinding.generation)}
                 val network=RoutePolicy.active(cm)
                 if(!endpointAllowed(prefs,endpoint,network))throw TransportFailure(java.io.IOException("Policy changed"))
                 // This lane has no active transfer here. A failed completion AND
                 // failed fallback write can leave sending durable after the receipt.
-                app.recoverDeliveryLane(text)
-                val lane=app.queue.pending().filter {(it.kind=="text")==text}
+                app.recoverDeliveryLane(text,sessionBinding)
+                val lane=app.queue.pendingPeer(sessionBinding.pcId).filter {it.bindingGeneration==sessionBinding.generation && (it.kind=="text")==text && (!it.automatic || prefs.peer?.automaticMedia==true) && (it.kind!="clipboard_image" || prefs.peer?.clipboardSend==true)}
                 retries.read(lane)
                 val now=SystemClock.elapsedRealtime()
                 deferred.entries.removeAll {it.value<=now || lane.none {row->row.mediaId==it.key}}
-                val selection=QueueSchedule.choose(lane.filter {!DeliveryPolicy.hold(it.kind,it.automatic,prefs.paused,network.mobile,prefs.originals,it.attempted,it.optimized)},now,retries::deadline,deferred)
+                val selection=QueueSchedule.choose(lane.filter {!DeliveryPolicy.hold(it.kind,it.automatic,prefs.paused,network.mobile,prefs.originals,(it.attempted || it.payloadAttempted),it.optimized)},now,retries::deadline,deferred)
                 waitMillis=selection.waitMillis
                 var row=selection.row
                 if(row==null)continue
@@ -390,7 +517,7 @@ class ConnectionManager(private val app: AppGraph) {
                 if(!supported) {row.state="failed";row.error="unsupported_kind";row.nextAttempt=Long.MAX_VALUE;row.rejectedCapabilities=capabilities.sorted().joinToString(",");updateRow(row);waitMillis=0;continue}
                     val processed=if(text) transferText(row,sessionBinding,retries)
                     else {
-                        if(DeliveryPolicy.optimize(row.kind,row.mime,network.mobile,prefs.originals,row.attempted,row.optimized)) {
+                        if(DeliveryPolicy.optimize(row.kind,row.mime,network.mobile,prefs.originals,(row.attempted || row.payloadAttempted),row.optimized)) {
                             try {row=app.staging.optimize(row);selected=row}
                             catch(e: LocalCapacityException) {throw e}
                             catch(e: CancellationException) {throw e}
@@ -436,19 +563,25 @@ class ConnectionManager(private val app: AppGraph) {
                     Type.ACK, Type.NACK -> {
                         val receipt = activeReceipt
                         val id=frame.body["transfer_id"].asString
-                        val target=if(receiptReady && receipt?.first==id)receipt else textReceipt?.takeIf {it.first==id}
+                        val target=if(receiptReady && receipt?.first==id)receipt else textReceipt?.takeIf {it.first==id} ?: settingsReceipt?.takeIf {it.first==id}
                         require(target != null && target.second.complete(frame))
                     }
                     Type.UNPAIR -> {
-                        app.forgetBinding(boundPeer,sessionBinding.phoneId); throw RemoteError("closing")
+                        // The peer has ended this authenticated session. Clear
+                        // visible authority before any DataStore observer can see
+                        // removal; persistence failure cannot make this link READY.
+                        bindingChanged();app.connection.sessionChanged(sessionBinding)
+                        app.forgetBinding(boundPeer,sessionBinding.phoneId,internalOutcome=sessionOutcome); throw RemoteError("closing")
                     }
                     Type.ERROR -> throw RemoteError(frame.body["code"].asString)
                     Type.STATUS -> Unit
-                    Type.CLIPBOARD -> send(app.clipboard.receive(pcId,frame.body,sessionBinding))
+                    Type.CLIPBOARD,Type.PEER_SETTINGS -> content(frame)
                     else -> { send(Frame.Control(Type.ERROR, json("code" to "unexpected_message"))); throw RemoteError("unexpected_message") }
                 }
             }
-        } finally { closeSocket(ssl); monitor.cancel(); sender.cancel(); textSender.cancel(); writeWatchdog.cancel() }
+        } finally { closeSocket(ssl); monitor.cancel(); sender.cancel(); textSender.cancel(); writeWatchdog.cancel();settingsSender?.cancel()
+            withContext(NonCancellable) {runCatching {app.preferences.connected(sessionBinding,endpoint)}}
+        }
     }
     private fun readControl(ssl: SSLSocket): Frame.Control = Protocol.read(ssl.inputStream).also { require(it is Frame.Control) } as Frame.Control
     internal var openPayload:(File)->java.io.FileInputStream={it.inputStream()}
@@ -468,7 +601,7 @@ class ConnectionManager(private val app: AppGraph) {
             if(digest.digest().hex()!=row.hash) {localMismatch(row,"hash_mismatch",retries);return true}
             val receipt=CompletableDeferred<Frame.Control>();activeReceipt=row.transferId to receipt
             val emission=QueuedEmission(row,binding);fileEmission=emission
-            if(!send(Frame.Control(Type.FILE_BEGIN,Staging.metadata(row)),emission))return false
+            if(!send(Frame.Control(Type.FILE_BEGIN,Staging.metadata(row).apply {if("mesh" in capabilities && row.hlc.isNotEmpty()) {addProperty("hlc",row.hlc.toBigInteger());addProperty("source_device",row.sourceDevice)}}),emission))return false
             began=true
             val buffer=ByteArray(CHUNK_SIZE);var offset=0L
             while(offset<row.size) {
@@ -484,9 +617,12 @@ class ConnectionManager(private val app: AppGraph) {
             if(response.type==Type.ACK) {
                 row.state="sent";row.error="";app.staging.completeFile(row)
             } else {
-                val code=response.body["code"].asString;row.error=code;row.state="failed";if(code=="unsupported_kind")row.rejectedCapabilities=capabilities.sorted().joinToString(",")
+                val code=response.body["code"].asString;row.error=code;row.state="failed";if(code=="unsupported_kind")row.rejectedCapabilities=emission.rejectedCapabilities
                 val decision=RetryPolicy.nack(code,row.mismatches,Random.nextDouble(.8,1.2))
                 row.mismatches=decision.mismatches;retries.retryAfter(row,decision.waitMillis);updateRow(row)
+                // A newer settings sync can finish before this NACK. Revalidate
+                // after recording it as well as when the sync itself completes.
+                if(code=="unsupported_kind")settingsEvents.trySend(Unit)
             }
             return true
         } catch(e:LocalSendFailure) {
@@ -499,7 +635,7 @@ class ConnectionManager(private val app: AppGraph) {
             }
             throw e
         } catch(e:TransportFailure) {
-            if(app.queue.find(row.mediaId)?.state!="discarded") {row.state="waiting";runCatching {updateRow(row)}}
+            if(app.queue.delivery(row.mediaId,row.peerId)?.state!="discarded") {row.state="waiting";runCatching {updateRow(row)}}
             throw e
         } finally {
             runCatching {input.close()}
@@ -513,16 +649,25 @@ class ConnectionManager(private val app: AppGraph) {
         val receipt=CompletableDeferred<Frame.Control>();textReceipt=row.transferId to receipt
         val emission=QueuedEmission(row,binding);textEmission=emission
         try {
-            if(!send(Frame.Control(Type.CLIPBOARD,json("transfer_id" to row.transferId,"text" to row.text,"created_at" to row.createdAt,"origin" to row.origin)),emission))return false
+            val body=json("transfer_id" to row.transferId,"text" to row.text,"created_at" to row.createdAt,"origin" to row.origin)
+            if("mesh" in capabilities) {body.addProperty("hlc",row.hlc.toBigInteger());body.addProperty("source_device",row.sourceDevice)}
+            if(!send(Frame.Control(Type.CLIPBOARD,body),emission))return false
             val response=awaitReceipt(receipt)
             if(response.type==Type.ACK) {row.state="sent";row.error="";updateRow(row)}
             else {
-                val code=response.body["code"].asString;if(code=="unsupported_kind")row.rejectedCapabilities=capabilities.sorted().joinToString(",");val decision=RetryPolicy.nack(code,row.mismatches,Random.nextDouble(.8,1.2))
+                val code=response.body["code"].asString;if(code=="unsupported_kind")row.rejectedCapabilities=emission.rejectedCapabilities
+                val decision=RetryPolicy.nack(code,row.mismatches,Random.nextDouble(.8,1.2))
                 row.state="failed";row.error=code;retries.retryAfter(row,decision.waitMillis);row.mismatches=decision.mismatches;updateRow(row)
+                if(code=="unsupported_kind")settingsEvents.trySend(Unit)
             }
             return true
         } catch(e: TransportFailure) {row.state="waiting";runCatching {updateRow(row)};throw e}
         finally {textReceipt=null;textEmission=null}
+    }
+    private suspend fun releaseSettingsBlocked(binding:DeliveryBinding,peer:Peer) {
+        app.queue.pendingPeer(binding.pcId).filter {it.bindingGeneration==binding.generation && SettingsDeliveryPolicy.releasable(it,peer,capabilities)}.forEach {
+            it.state="waiting";it.error="";it.nextAttempt=0;it.rejectedCapabilities="";updateRow(it)
+        }
     }
     private suspend fun updateRow(row:Outgoing)=app.updateDelivery(row)
     private suspend fun localMismatch(row: Outgoing, code: String,retries:RetryDeadlines) {
@@ -539,10 +684,12 @@ class ConnectionManager(private val app: AppGraph) {
         val s = socket ?: throw TransportFailure(java.io.IOException("Disconnected"))
         if(unpairing)throw TransportFailure(java.io.IOException("Unpairing"))
         if(frame is Frame.Chunk || (frame is Frame.Control && frame.type in setOf(Type.FILE_BEGIN,Type.CLIPBOARD))) {
-            val current=SendFailures.local("local_storage") {app.preferences.read()}
-            if(activeEndpoint?.let {endpointAllowed(current,it)}!=true || (current.pending?.fingerprint ?: current.peer?.pin)!=activePin) {closeSocket(s);throw TransportFailure(java.io.IOException("Policy changed"))}
+            val current=SendFailures.local("local_storage") {readPrefs()}
+            if(activeEndpoint?.let {endpointAllowed(current,it)}!=true || (pairingAttempt()?.invitation?.fingerprint ?: current.peer?.pin)!=activePin) {closeSocket(s);throw TransportFailure(java.io.IOException("Policy changed"))}
         }
         if(emission!=null) {
+            if(!settingsReady)return@withLock false
+            if(emission.row.sessionId.isNotEmpty() && emission.row.sessionId!=admissionSession)return@withLock false
             // Revalidate both lanes after preparation AND after waiting for the
             // frame writer. Discard, replacement, Pause and cost-policy changes
             // cannot authorize a first frame from a stale selection.
@@ -550,7 +697,8 @@ class ConnectionManager(private val app: AppGraph) {
                 eligible={p,current,newer->
                     val network=RoutePolicy.active(cm)
                     EmissionPolicy.eligible(emission.row,current,p,emission.binding,
-                        activeEndpoint?.let {endpointAllowed(p,it,network)}==true,network.mobile,capabilities,newer)},begin=emission::begin)}
+                        activeEndpoint?.let {endpointAllowed(p,it,network)}==true,network.mobile,capabilities,newer)},
+                begin={p->emission.begin(requireNotNull(p.devices.find {it.deviceId==emission.binding.pcId}),capabilities)})}
             if(!accepted)return@withLock false
             if(frame is Frame.Control && frame.type==Type.FILE_BEGIN) {
                 val row=emission.row
@@ -577,9 +725,9 @@ class ConnectionManager(private val app: AppGraph) {
         true
         }
     }
-    private suspend fun lost(expected:Peer?,phoneId:String) {if(app.loseBinding(expected,phoneId))state.value=LinkState("Pairing lost")}
-    fun bindingChanged(lost: Boolean=false) { ready=false;capabilities=emptySet();rejections.clear();state.value=LinkState(if(lost)"Pairing lost" else "PC unreachable") }
-    fun retry() { dialEpoch.incrementAndGet();closeSocket(); wake.trySend(Unit) }
+    private suspend fun lost(expected:Peer?,phoneId:String,outcome:ConnectionOutcome?) {if(app.loseBinding(expected,phoneId,outcome))state.value=LinkState("Pairing lost")}
+    fun bindingChanged(lost: Boolean=false) { admissionSession=null;ready=false;capabilities=emptySet();rejections.clear();state.value=LinkState(if(lost)"Pairing lost" else "PC unreachable") }
+    fun retry() { admissionSession=null;dialEpoch.incrementAndGet();closeSocket(); wake.trySend(Unit) }
     fun cancelTransfer(mediaId: String) {
         fileEmission?.takeIf {it.row.mediaId==mediaId}?.let {if(it.cancel())retry()}
         // Already-emitted text must consume its ACK/NACK without resetting the
@@ -599,7 +747,7 @@ class ConnectionManager(private val app: AppGraph) {
                 // binding lock. A stale confirmation must not close a new session.
                 matched=true
                 captured=(socket.takeIf {ready} as? SSLSocket)?.let {CapturedConnection(it,tcpSocket)}
-                revoking=captured;unpairing=true;ready=false
+                revoking=captured;unpairing=true;admissionSession=null;ready=false
             })}) {
                 val connection=captured
                 if(connection!=null)coroutineScope {
@@ -620,10 +768,9 @@ class ConnectionManager(private val app: AppGraph) {
             if(matched) {revoking=null;unpairing=false;kick()}
         }
     }}
-    @androidx.annotation.VisibleForTesting
     internal suspend fun awaitStopped() {job?.join()}
     fun stop() {
-        ready=false; closeSocket(); job?.cancel()
+        admissionSession=null;ready=false; closeSocket(); job?.cancel()
         runCatching { cm.unregisterNetworkCallback(callback) }
         discoveryLease.close()
     }

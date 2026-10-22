@@ -17,7 +17,7 @@ internal object PeerFixture {
     suspend fun preservePreparedIdentity(app:AppGraph) {
         app.initialized.await()
         assertEquals("Prepare/export identity before starting the peer","true",InstrumentationRegistry.getArguments().getString("identityPrepared"))
-        val p=app.preferences.flow.first();assertNull(p.peer);assertNull(p.pending)
+        val p=app.preferences.flow.first();assertTrue(p.devices.isEmpty());assertNull(app.connection.attempt.value?.invitation)
         assertArrayEquals(File(app.context.filesDir,"client.der").readBytes(),TlsIdentity(p.tlsAlias).certificate.encoded)
         for(key in listOf("wifi","tailscale","mobile"))app.preferences.toggle(key,true)
         app.preferences.toggle("paused",false)
@@ -30,6 +30,9 @@ internal object PeerFixture {
             val line=socket.inputStream.bufferedReader().readLine();check(line.length<1024*1024)
             JsonParser.parseString(line).asJsonArray
         }
+    }
+    suspend fun rejected(code:String,previous:Int) = withTimeout(7000) {
+        while(evidence().count {it.asJsonObject.let {row->row["event"].asString=="PHONE_NACK" && row["code"].asString==code}}<=previous)delay(50)
     }
     suspend fun acknowledged(id:String) = withTimeout(7000) {
         while(!evidence().any {it.asJsonObject.let {row->row["event"].asString=="PHONE_ACK" && row["transfer_id"].asString==id}})delay(50)

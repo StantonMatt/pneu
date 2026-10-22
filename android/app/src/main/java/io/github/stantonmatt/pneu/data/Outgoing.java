@@ -1,12 +1,20 @@
 package io.github.stantonmatt.pneu.data;
 import androidx.annotation.NonNull;
-import androidx.room.Entity;
+import androidx.room.DatabaseView;
 import androidx.room.PrimaryKey;
 import androidx.room.Index;
 import androidx.room.ColumnInfo;
-@Entity(tableName = "outgoing", indices = {@Index(value = {"state", "createdAt"}), @Index(value = {"state", "orderId"})})
+@DatabaseView(viewName="outgoing",value=OutgoingView.SQL)
 public class Outgoing {
-    @PrimaryKey @NonNull public String mediaId = "";
+    @androidx.room.Ignore public java.util.List<DeliveryBinding> recipients;
+    @androidx.room.Ignore public long admissionEpoch;
+    @NonNull public String peerId="";
+    public long bindingGeneration;
+    @NonNull @ColumnInfo(defaultValue = "''") public String sessionId="";
+    public boolean payloadAttempted;
+    @NonNull public String hlc="";
+    @NonNull public String sourceDevice="";
+    @NonNull public String mediaId = "";
     @NonNull public String transferId = "";
     @NonNull public String uri = "";
     @NonNull public String path = "";

@@ -45,6 +45,12 @@ class TlsDeviceTest {
         val pin=requireNotNull(args.getString("pcPin"))
         val encoded=android.util.Base64.decode(requireNotNull(args.getString("pcCert")),android.util.Base64.DEFAULT)
         val cert=java.security.cert.CertificateFactory.getInstance("X.509").generateCertificate(encoded.inputStream()) as java.security.cert.X509Certificate
+        // The host issues this valid fixture leaf immediately before install.
+        // Wait for its notBefore across the host/emulator second boundary;
+        // the production trust manager still performs every validity check.
+        kotlinx.coroutines.runBlocking {kotlinx.coroutines.withTimeout(5000) {
+            while(System.currentTimeMillis()<cert.notBefore.time)kotlinx.coroutines.delay(20)
+        }}
         io.github.stantonmatt.pneu.connection.PinnedTrustManager(pin).checkServerTrusted(arrayOf(cert),"EC")
         val started=android.os.SystemClock.elapsedRealtime()
         assertThrows(javax.net.ssl.SSLHandshakeException::class.java) {TlsIdentity(kotlinx.coroutines.runBlocking {val app=InstrumentationRegistry.getInstrumentation().targetContext.graph;app.initialized.await();app.preferences.flow.first().tlsAlias}).socket(Endpoint(args.getString("pcHost") ?: "10.0.2.2",args.getString("rejectPort")!!.toInt()),pin) {}.close()}

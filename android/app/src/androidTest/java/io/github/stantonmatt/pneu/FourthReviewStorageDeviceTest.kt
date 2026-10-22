@@ -29,7 +29,7 @@ class FourthReviewStorageDeviceTest {
             val row=Outgoing().apply {mediaId=randomId();transferId=randomId();kind="file";automatic=false;fileName="Storage fixture.bin";mime="application/octet-stream";uri="content://io.github.stantonmatt.pneu.test.review/complete";createdAt=System.currentTimeMillis()}
             val source=File(c.filesDir,"outgoing/${row.transferId}.bin").apply {parentFile!!.mkdirs();writeBytes(byteArrayOf(1,2,3,4))}
             row.path=source.path;row.size=4;row.hash=sha256(source.readBytes());assertTrue(app.enqueueFixture(row));val oldUri=row.uri;row.state="sent"
-            db.execSQL("CREATE TRIGGER fail_receipt BEFORE UPDATE ON outgoing WHEN NEW.state='sent' BEGIN SELECT RAISE(ABORT,'Synthetic receipt commit failure'); END")
+            db.execSQL("CREATE TRIGGER fail_receipt BEFORE UPDATE ON deliveries WHEN NEW.state='sent' BEGIN SELECT RAISE(ABORT,'Synthetic receipt commit failure'); END")
             try {app.staging.completeFile(row);fail("Committed faulted receipt")}catch(_:android.database.sqlite.SQLiteException) {}
             assertEquals(source.path,row.path);assertEquals(oldUri,row.uri);assertTrue(source.exists());assertEquals("waiting",app.queue.find(row.mediaId)!!.state)
             db.execSQL("DROP TRIGGER fail_receipt")

@@ -20,7 +20,8 @@ import java.io.File
 import com.google.gson.JsonParser
 
 /** Host force-stops between these phases; instrumentation must not warm the app
- * before SEND. The host witnesses the Room row before starting verification. */
+ * before SEND. File shares retain recipient deliveries; connected-only text
+ * must not queue for the deliberately offline computer. */
 @RunWith(AndroidJUnit4::class)
 class ThirteenthReviewDeviceTest {
     @get:Rule val fixtureTestName=org.junit.rules.TestName()
@@ -48,7 +49,7 @@ class ThirteenthReviewDeviceTest {
             c.contentResolver.update(source,ContentValues().apply {put("is_pending",0)},null,null);uri=source.toString()
         }
         val paired=app.preferences.read()
-        record.writeText(json("mode" to mode,"uri" to uri,"hash" to hash,"phone" to paired.deviceId,"pin" to paired.peer!!.pin,"pc" to paired.peer.deviceId,"text" to "Cold process text").toString())
+        record.writeText(json("mode" to mode,"uri" to uri,"hash" to hash,"phone" to paired.deviceId,"pin" to paired.peer!!.pin,"pc" to paired.peer.deviceId,"generation" to paired.peer.generation,"text" to "Cold process text").toString())
         assertTrue(app.queue.pending().isEmpty())
     }
     @Test(timeout=15000) fun verifyColdShareAndCleanUp()=runBlocking<Unit> {
@@ -57,14 +58,18 @@ class ThirteenthReviewDeviceTest {
         try {
             val paired=app.awaitPrefs();assertTrue(paired.loaded)
             assertEquals(data["phone"].asString,paired.deviceId);assertEquals(data["pin"].asString,paired.peer!!.pin);assertEquals(data["pc"].asString,paired.peer.deviceId)
-            val mode=data["mode"].asString;val rows=app.queue.pending();assertEquals(if(mode=="multiple")2 else 1,rows.size)
+            assertEquals(data["generation"].asLong,paired.peer.generation)
+            val mode=data["mode"].asString;val rows=app.queue.pending()
+            assertEquals(when(mode) {"multiple"->2;"text"->0;else->1},rows.size)
+            if(mode=="text") {
+                assertTrue("Offline text must not leave queued or terminal plaintext",app.queue.all().isEmpty())
+                assertEquals(0L,app.queue.latestTextTime())
+            }
             rows.forEach {row->
                 assertEquals("",row.uri)
-                if(mode=="text") {assertEquals("text",row.kind);assertEquals(data["text"].asString,row.text)}
-                else {
-                    assertEquals("file",row.kind);val bytes=File(row.path).readBytes();assertEquals(row.size,bytes.size.toLong());assertEquals(row.hash,sha256(bytes))
-                    if(mode=="single") {assertEquals(1048576L,row.size);assertEquals(data["hash"].asString,row.hash)}
-                }
+                assertEquals(data["pc"].asString,row.peerId);assertEquals(data["generation"].asLong,row.bindingGeneration)
+                assertEquals("file",row.kind);val bytes=File(row.path).readBytes();assertEquals(row.size,bytes.size.toLong());assertEquals(row.hash,sha256(bytes))
+                if(mode=="single") {assertEquals(1048576L,row.size);assertEquals(data["hash"].asString,row.hash)}
             }
         } finally {
             c.stopService(Intent(c,PneuService::class.java));app.connection.stop();app.forgetBinding()

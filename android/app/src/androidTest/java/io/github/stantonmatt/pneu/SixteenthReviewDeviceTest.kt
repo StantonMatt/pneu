@@ -51,13 +51,14 @@ class SixteenthReviewDeviceTest {
         assertTrue(device.findObject(UiSelector().text("Pair with Ready PC?")).waitForExists(5000))
         val original=app.preferences.read();app.preferences.setString("deviceId",randomId());withTimeout(3000) {app.prefs.first {it.deviceId!=original.deviceId}}
         device.findObject(UiSelector().text("Pair")).click()
-        assertTrue(device.findObject(UiSelector().text("Couldn't start pairing")).waitForExists(5000));assertNull(app.preferences.read().pending)
+        assertTrue(device.findObject(UiSelector().text("Couldn't start pairing")).waitForExists(5000));assertNull(app.connection.attempt.value?.invitation)
     }
     @Test(timeout=15000) fun interruptedOptimizationReusesExactPublishedSnapshot()=runBlocking<Unit> {
+        val invitation=raw();assertTrue(app.requestPairing(invitation,null));assertTrue(app.installBinding(Invitation.parse(invitation),randomId()))
         val row=item(1).apply {kind="photo";mime="image/png";fileName="fixture.png"}
         val source=File(c.filesDir,"outgoing/${row.transferId}.bin").apply {parentFile!!.mkdirs()}
         source.outputStream().use {out->Bitmap.createBitmap(128,128,Bitmap.Config.ARGB_8888).apply {eraseColor(0xff286ad8.toInt());compress(Bitmap.CompressFormat.PNG,100,out);recycle()}}
-        row.path=source.path;row.size=source.length();row.hash=sha256(source.readBytes());app.queue.insert(row)
+        row.path=source.path;row.size=source.length();row.hash=sha256(source.readBytes());DeviceFixture.insert(app,row)
         val encoded=app.staging.optimize(row);assertTrue(encoded.optimized);assertFalse(encoded.attempted);assertFalse(source.exists())
         val bytes=File(encoded.path).readBytes();val id=encoded.transferId;val hash=encoded.hash;val path=encoded.path
         // Simulate cancellation/death between the durable encoding commit and attempted=true.
@@ -94,9 +95,9 @@ class SixteenthRecentDeviceTest {
     @Test(timeout=45000) fun recentReservesActiveSlotsAndNotificationUsesTransferMetadata()=runBlocking<Unit> {
         val invitation=raw()
         assertTrue(app.requestPairing(invitation,null));assertTrue(app.installBinding(Invitation.parse(invitation),randomId()))
-        repeat(60) {n->app.queue.insert(item(n+1L).apply {state=if(n%2==0)"failed" else "waiting"})}
+        repeat(60) {n->DeviceFixture.insert(app,item(n+1L).apply {state=if(n%2==0)"failed" else "waiting"})}
         val active=item(61).apply {state="sending";attempted=true;fileName="Active-report.pdf";size=8192}
-        val text=item(62).apply {state="sending";kind="text";text="active clipboard"};app.queue.insert(active);app.queue.insert(text)
+        val text=item(62).apply {state="sending";kind="text";text="active clipboard"};DeviceFixture.insert(app,active);DeviceFixture.insert(app,text)
         val recent=withTimeout(3000) {app.queue.recent().first {rows->rows.any {it.mediaId==active.mediaId}}}
         assertEquals(50,recent.size);assertTrue(recent.any {it.mediaId==text.mediaId});assertEquals((1L..48L).toList(),recent.take(48).map {it.orderId})
         withTimeout(3000) {app.recent.first {rows->rows.any {it.mediaId==active.mediaId} && rows.any {it.mediaId==text.mediaId}}}
@@ -122,11 +123,11 @@ class SixteenthRecentDeviceTest {
         withTimeout(3000) {while(app.queue.find(active.mediaId)?.state!="discarded")delay(50)}
         assertEquals("sending",app.queue.find(text.mediaId)!!.state)
         app.queue.clearOutgoing()
-        repeat(70) {n->app.queue.insert(item(100+n.toLong()).apply {state="sent"})}
+        repeat(70) {n->DeviceFixture.insert(app,item(100+n.toLong()).apply {state="sent"})}
         val history=withTimeout(3000) {app.queue.recent().first {it.size==50 && it.all {row->row.state=="sent"}}}
         assertEquals((169L downTo 120L).toList(),history.map {it.orderId})
         val waiting=item(200);val sending=item(201).apply {state="sending"}
-        app.queue.insert(waiting);app.queue.insert(sending)
+        DeviceFixture.insert(app,waiting);DeviceFixture.insert(app,sending)
         val mixed=withTimeout(3000) {app.queue.recent().first {rows->rows.any {it.mediaId==sending.mediaId}}}
         assertEquals(50,mixed.size);assertEquals(listOf(200L,201L),mixed.take(2).map {it.orderId})
         assertEquals((169L downTo 122L).toList(),mixed.drop(2).map {it.orderId})
@@ -145,7 +146,7 @@ class SixteenthFreshPairingDeviceTest {
         val i=InstrumentationRegistry.getInstrumentation();val c=i.targetContext;val app=c.graph
         // The host already witnessed the confirmation. Starting instrumentation
         // restarts the target process and removes its activity; inspect durable state.
-        val p=app.awaitPrefs();assertTrue(p.loaded);assertTrue(p.deviceId.isNotEmpty());assertTrue(p.tlsAlias.isNotEmpty());assertNull(p.peer);assertNull(p.pending)
+        val p=app.awaitPrefs();assertTrue(p.loaded);assertTrue(p.deviceId.isNotEmpty());assertTrue(p.tlsAlias.isNotEmpty());assertNull(p.peer);assertNull(app.connection.attempt.value?.invitation)
         UiDevice.getInstance(i).pressHome()
     }
 }

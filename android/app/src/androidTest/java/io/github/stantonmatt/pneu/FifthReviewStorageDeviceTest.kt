@@ -28,22 +28,24 @@ class FifthReviewStorageDeviceTest {
         assertTrue(app.requestPairing(raw,null));assertTrue(app.installBinding(Invitation.parse(raw),"d".repeat(32)))
         val db=app.database.openHelper.writableDatabase
         try {
-            repeat(51) {n->app.queue.insert(Outgoing().apply {mediaId="terminal:$n";transferId=randomId();state="sent";automatic=false;orderId=n+1L})}
+            repeat(51) {n->DeviceFixture.insert(app,Outgoing().apply {mediaId="terminal:$n";transferId=randomId();state="sent";automatic=false;orderId=n+1L})}
             app.queue.rememberOutgoing(0,51)
-            db.execSQL("CREATE TRIGGER fail_pruning BEFORE DELETE ON outgoing WHEN OLD.state='sent' BEGIN SELECT RAISE(ABORT,'Synthetic maintenance failure'); END")
+            db.execSQL("CREATE TRIGGER fail_pruning BEFORE DELETE ON artifacts WHEN EXISTS (SELECT 1 FROM deliveries WHERE mediaId=OLD.mediaId AND state='sent') BEGIN SELECT RAISE(ABORT,'Synthetic maintenance failure'); END")
             app.preferences.beforeMutation={if(it=="localCapacity")throw IOException("Synthetic post-admission flag failure")}
             val row=Outgoing().apply {mediaId=randomId();transferId=randomId();kind="screenshot";automatic=true;fileName="Fixture.bin";mime="application/octet-stream";uri="content://io.github.stantonmatt.pneu.test.review/complete";createdAt=System.currentTimeMillis()}
             app.staging.capture(row)
             assertTrue(File(row.path).exists());assertEquals(sha256(byteArrayOf(1,2,3,4)),row.hash);assertEquals(row.path,app.queue.find(row.mediaId)!!.path);assertEquals(1,app.queue.seen(row.mediaId))
-            val text=ManualEntries.text(app,"Admitted through maintenance failure","share");assertNotNull(app.queue.find(text.mediaId))
+            val text=DeviceFixture.text(app,"Admitted through maintenance failure","share");assertNotNull(app.queue.find(text.mediaId))
             app.preferences.beforeMutation={};db.execSQL("DROP TRIGGER fail_pruning")
-            val image=ManualEntries.file(app,Uri.parse("content://io.github.stantonmatt.pneu.test.review/image"),"file")
+            // Storage-only fixture explicitly names its offline recipient.
+            val image=ManualEntries.file(app,Uri.parse("content://io.github.stantonmatt.pneu.test.review/image"),"file",
+                io.github.stantonmatt.pneu.data.DeliveryBinding.from(app.preferences.read()))
             val optimized=Staging(app,deleteCommittedSource={throw IOException("Synthetic committed-source cleanup failure")}).optimize(image)
             assertEquals(optimized.path,app.queue.find(image.mediaId)!!.path);assertTrue(File(optimized.path).exists());assertEquals(optimized.hash,sha256(File(optimized.path).readBytes()));assertTrue(File(image.path).exists())
             optimized.state="sent"
             assertTrue(Staging(app,deleteCommittedSource={throw IOException("Synthetic committed-source cleanup failure")}).completeFile(optimized));assertEquals("sent",app.queue.find(image.mediaId)!!.state);assertTrue(File(optimized.path).exists())
             val old=text.apply {state="sending";attempted=true};assertTrue(app.updateDelivery(old))
-            val newer=ManualEntries.text(app,"Newest after interruption","share").apply {state="failed";nextAttempt=System.currentTimeMillis()+60000};assertTrue(app.updateDelivery(newer))
+            val newer=DeviceFixture.text(app,"Newest after interruption","share").apply {state="failed";nextAttempt=System.currentTimeMillis()+60000};assertTrue(app.updateDelivery(newer))
             row.state="sending";assertTrue(app.updateDelivery(row))
             app.recoverOutgoing()
             assertEquals("superseded",app.queue.find(old.mediaId)!!.state);assertEquals("failed",app.queue.find(newer.mediaId)!!.state);assertEquals(newer.nextAttempt,app.queue.find(newer.mediaId)!!.nextAttempt)

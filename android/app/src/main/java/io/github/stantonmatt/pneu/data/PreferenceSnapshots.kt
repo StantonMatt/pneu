@@ -13,9 +13,10 @@ internal class PreferenceSnapshots(source:Flow<Prefs>,private val scope:Coroutin
         val current=state.value
         return if(current.loaded)current else storageDeadline {first.await()}
     }
-    fun captureBinding(select:(Prefs)->DeliveryBinding?={DeliveryBinding.from(it)}):Deferred<DeliveryBinding?> {
+    fun <T> capture(select:(Prefs)->T):Deferred<T> {
         val current=state.value
         return if(current.loaded)CompletableDeferred(select(current))
         else scope.async(start=CoroutineStart.UNDISPATCHED) {select(storageDeadline {first.await()})}
     }
+    fun captureBinding(select:(Prefs)->DeliveryBinding?={DeliveryBinding.from(it)}):Deferred<DeliveryBinding?> =capture(select)
 }

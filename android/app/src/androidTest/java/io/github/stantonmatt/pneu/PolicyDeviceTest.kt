@@ -109,7 +109,10 @@ class PolicyDeviceTest {
         try {
             app.preferences.toggle("mobile",false);app.prefs.first {!it.mobile}
             withTimeout(5000) {app.connection.state.first {it.status=="Waiting for Wi-Fi"}}
-            app.preferences.toggle("queue",false);app.prefs.first {!it.queue}
+            // Automatic delivery to a disconnected computer now requires the
+            // explicit offline-queue policy, including Waiting for Wi-Fi.
+            app.preferences.toggle("queue",true);app.prefs.first {it.queue}
+            instrumentation.sendStatus(0,android.os.Bundle().apply {putString("stream","Offline automatic policy: queue=${app.prefs.value.queue}, mobile=${app.prefs.value.mobile}, connected=${app.connection.connected}\n")})
             val automatic=DeviceFixture.changePolicyDuringCapture({media("DCIM/Camera/")}) {app.preferences.toggle("originals",true)}
             val queued=row(automatic)
             assertEquals("waiting",queued.state)
@@ -181,11 +184,11 @@ class PolicyDeviceTest {
             val paused=ManualEntries.text(app,"Request paused receive fixture","share");sent(paused.mediaId);PeerFixture.acknowledged("f".repeat(32))
             assertEquals(receiptCount,app.queue.receiptCount());assertEquals(watermark,app.queue.lastApplied("d".repeat(32)));assertEquals(receivedHash,app.prefs.value.lastReceivedHash);assertNull(app.queue.receipt("d".repeat(32),"f".repeat(32)))
             home();instrumentation.runOnMainSync {assertEquals("Keep this clipboard",context.getSystemService(ClipboardManager::class.java).primaryClip!!.getItemAt(0).text.toString())}
-            app.preferences.toggle("paused",false);app.preferences.toggle("clipboardFromPc",false);app.prefs.first {!it.paused && !it.clipboardFromPc}
+            app.preferences.toggle("paused",false);app.setPairSwitch("d".repeat(32),"receiveClipboard",false);app.prefs.first {!it.paused && !it.clipboardFromPc}
             val disabled=ManualEntries.text(app,"Request disabled receive fixture","share");sent(disabled.mediaId);PeerFixture.acknowledged("c".repeat(32))
             assertEquals(receiptCount,app.queue.receiptCount());assertEquals(watermark,app.queue.lastApplied("d".repeat(32)));assertEquals(receivedHash,app.prefs.value.lastReceivedHash);assertNull(app.queue.receipt("d".repeat(32),"c".repeat(32)))
             home();instrumentation.runOnMainSync {assertEquals("Keep this clipboard",context.getSystemService(ClipboardManager::class.java).primaryClip!!.getItemAt(0).text.toString())}
-            app.preferences.toggle("clipboardFromPc",true);app.prefs.first {it.clipboardFromPc}
+            app.setPairSwitch("d".repeat(32),"receiveClipboard",true);app.prefs.first {it.clipboardFromPc}
             val enabled=ManualEntries.text(app,"Request enabled receive fixture","share");sent(enabled.mediaId);receipt("9")
             home();instrumentation.runOnMainSync {assertEquals("Enabled PC clipboard",context.getSystemService(ClipboardManager::class.java).primaryClip!!.getItemAt(0).text.toString())}
             // Sparse quota fixture reserves no large RAM-backed file or network payload.
