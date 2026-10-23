@@ -5,6 +5,13 @@ use anyhow::{Context, Result, ensure};
 use pneu_proto::{Hash, Id};
 use serde::{Deserialize, Serialize};
 use std::{os::unix::fs::PermissionsExt, path::Path, sync::Arc, time::Duration};
+// 128 PATH_MAX (4096-byte) paths, up to six JSON bytes per path byte,
+// plus recipient authorities and framing, fit below 4 MiB. This also covers
+// clipboard text (16 KiB), invitations (8 KiB), and config/path commands.
+pub const REQUEST_LIMIT: usize = 4 * 1024 * 1024;
+pub const RESPONSE_LIMIT: usize = 2 * 1024 * 1024;
+const RESPONSE_PAGE_BYTES: usize = 1024 * 1024;
+
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
@@ -13,6 +20,54 @@ use tokio::{
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Command {
+    SendFiles {
+        paths: Vec<std::path::PathBuf>,
+        targets: crate::outbox::Targets,
+        #[serde(default)]
+        request_id: Option<String>,
+    },
+    /// UI entry point: choose recipients before admission, then show Recent.
+    PresentFiles {
+        paths: Vec<std::path::PathBuf>,
+        targets: crate::outbox::Targets,
+        request_id: Option<String>,
+    },
+    PresentSendError {
+        message: String,
+    },
+    AcknowledgeSend {
+        request: String,
+    },
+    OperationStatus {
+        operation: Id,
+    },
+    DismissTransfer {
+        operation: Id,
+        #[serde(default)]
+        artifact: Option<Id>,
+    },
+    CancelTransfer {
+        operation: Id,
+        #[serde(default)]
+        artifact: Option<Id>,
+        device: Option<Id>,
+    },
+    RetryTransfer {
+        operation: Id,
+        #[serde(default)]
+        artifact: Option<Id>,
+        device: Id,
+    },
+    SetSetting {
+        key: String,
+        value: serde_json::Value,
+    },
+    SendClipboard {
+        targets: crate::outbox::Targets,
+    },
+    Rename {
+        name: String,
+    },
     Pair,
     Join {
         uri: String,
@@ -64,6 +119,7 @@ pub enum Command {
         request: u64,
         focused: bool,
     },
+    AddDevice,
     ShowWindow {
         choose_folder: bool,
     },
@@ -72,6 +128,10 @@ pub enum Command {
 pub struct Reply {
     pub ok: bool,
     pub value: serde_json::Value,
+    /// More array projection pages follow on this same connection. A missing
+    /// flag is the original one-line protocol. Only the last page completes it.
+    #[serde(default)]
+    pub more: bool,
 }
 /// Holds the instance lock and the exact socket entry created by this daemon.
 /// Shutdown must not unlink a replacement socket/file or a replaced parent.
@@ -177,7 +237,10 @@ pub async fn serve(
     while tasks.join_next().await.is_some() {}
     Ok(())
 }
-async fn line(reader: &mut (impl tokio::io::AsyncBufRead + Unpin)) -> Result<Vec<u8>> {
+async fn line(
+    reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
+    limit: usize,
+) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     loop {
         let buf = reader.fill_buf().await?;
@@ -187,7 +250,7 @@ async fn line(reader: &mut (impl tokio::io::AsyncBufRead + Unpin)) -> Result<Vec
             .position(|b| *b == b'\n')
             .map(|n| n + 1)
             .unwrap_or(buf.len());
-        ensure!(bytes.len() + n <= 65536, "IPC request too large");
+        ensure!(bytes.len() + n <= limit, "IPC frame too large");
         let ended = buf[n - 1] == b'\n';
         bytes.extend_from_slice(&buf[..n]);
         reader.consume(n);
@@ -201,9 +264,33 @@ async fn handle(core: Arc<Core>, stream: UnixStream) -> Result<()> {
 
     let mut stream = BufReader::new(stream);
     let request: Command = serde_json::from_slice(
-        &tokio::time::timeout(Duration::from_secs(10), line(&mut stream)).await??,
+        &tokio::time::timeout(Duration::from_secs(10), line(&mut stream,REQUEST_LIMIT)).await??,
     )?;
+    let ask = core.config().choose_devices_each_time;
+    let desktop_send = match &request {
+        Command::PresentFiles {..} | Command::PresentSendError {..} => true,
+        Command::SendFiles {targets,..} | Command::SendClipboard {targets} => !matches!(targets, crate::outbox::Targets::Captured(_)),
+        _ => false,
+    };
     let result: Result<serde_json::Value> = async { Ok(match request {
+        Command::SendFiles{paths,targets,request_id} if ask && matches!(&targets, crate::outbox::Targets::All(_))=>core.present_files(paths,targets,request_id)?,
+        Command::SendFiles{paths,targets,request_id}=>{
+            if desktop_send { core.request_window(false); }
+            core.send_files_request(paths,targets,request_id).await?
+        },
+        Command::PresentFiles{paths,targets,request_id}=>core.present_files(paths,targets,request_id)?,
+        Command::PresentSendError{message}=>core.present_send_error(message)?,
+        Command::AcknowledgeSend{request}=>{core.acknowledge_send(&request);serde_json::Value::Null},
+        Command::OperationStatus{operation}=>core.operation_status(operation).await?,
+        Command::DismissTransfer{operation,artifact}=>{core.dismiss_transfer_artifact(operation,artifact).await?;serde_json::Value::Null},
+        Command::CancelTransfer{operation,artifact,device}=>{core.cancel_transfer_artifact(operation,artifact,device).await?;serde_json::Value::Null},
+        Command::RetryTransfer{operation,artifact,device}=>{core.retry_transfer_artifact(operation,artifact,device).await?;serde_json::Value::Null},
+        Command::SetSetting{key,value}=>{core.set_setting(key,value).await?;serde_json::Value::Null},
+        Command::Rename{name}=>{core.rename(name).await?;serde_json::Value::Null},
+        Command::SendClipboard{targets:crate::outbox::Targets::All(_)} if ask=>core.present_send(crate::ui::window::SendRequest {
+            id:crate::random_hex(16),paths:None,targets:crate::ui::captured_authorities(&core.ui_snapshot()),clipboard:true,targeted:false,error:None,
+        })?,
+        Command::SendClipboard{targets}=>serde_json::json!({"transfer_id":core.share_clipboard(targets).await?}),
         Command::Join { uri } => core.join(&uri).await?,
         Command::JoinConfirm { attempt } => core.confirm_join(&attempt).await?,
         Command::JoinStatus { attempt } => core.join_status(&attempt)?,
@@ -221,29 +308,36 @@ async fn handle(core: Arc<Core>, stream: UnixStream) -> Result<()> {
         Command::SetPeerSetting {device,key,enabled} => core.set_peer_setting(device,key,enabled).await?,
         Command::DiscardClipboard {device} => { core.discard_clipboard(device).await?; serde_json::Value::Null },
         Command::WindowFocus { request, focused } => { core.set_window_focus(request, focused); serde_json::Value::Null },
-        Command::UiStatus => { let (revision, invitation) = core.pairing_status(); let snapshot = core.ui_snapshot(); let (window_request, activation_token) = core.window_request_with_activation(); serde_json::json!({"device":snapshot.device, "snapshot":snapshot, "config": core.config(), "window_request":window_request,"activation_token":activation_token,"invitation_revision":revision,"invitation":invitation}) },
+        Command::UiStatus => { let (revision, invitation) = core.pairing_status(); let snapshot = core.ui_snapshot(); let (window_request, activation_token) = core.window_request_with_activation(); serde_json::json!({"device":snapshot.device, "snapshot":snapshot, "config": core.config(), "window_request":window_request,"add_device":core.window_add_device(window_request),"activation_token":activation_token,"invitation_revision":revision,"invitation":invitation,"pending_send":core.pending_send()}) },
+        Command::AddDevice => { core.request_add_device(); serde_json::Value::Null },
         Command::ShowWindow { choose_folder } => { core.request_window(choose_folder); serde_json::Value::Null },
         Command::Status => {
             let snapshot = core.ui_snapshot();
             let paired = snapshot.paired_devices;
             let connected = snapshot.connected_devices;
             let paused = snapshot.paused_devices;
-            serde_json::json!({"device_id":core.identity.device_id,"fingerprint":core.identity.fingerprint,"port":core.bound_port(),"paired_devices":paired,"connected_devices":connected,"paused_devices":paused,"devices":snapshot.devices,"config":core.config()})
+            serde_json::json!({"device_id":core.identity.device_id,"fingerprint":core.identity.fingerprint,"port":core.bound_port(),"paired_devices":paired,"connected_devices":connected,"paused_devices":paused,"devices":snapshot.devices,"transfers":snapshot.transfers,"send_targets":snapshot.send_targets,"config":core.config()})
         },
     }) }.await;
+    if desktop_send && let Err(error) = &result {
+        core.notify_send_admission_failure(&error.to_string()).await;
+    }
     let reply = match result {
-        Ok(value) => Reply { ok: true, value },
+        Ok(value) => Reply { ok: true, value, more: false },
         Err(e) => Reply {
             ok: false,
             value: serde_json::Value::String(e.to_string()),
+            more: false,
         },
     };
+    let pages = response_pages(reply).unwrap_or_else(|error| vec![Reply {
+        ok: false, value: serde_json::Value::String(error.to_string()), more: false,
+    }]);
     tokio::time::timeout(Duration::from_secs(10), async {
-        stream
-            .get_mut()
-            .write_all(&serde_json::to_vec(&reply)?)
-            .await?;
-        stream.get_mut().write_all(b"\n").await?;
+        for page in pages {
+            stream.get_mut().write_all(&serde_json::to_vec(&page)?).await?;
+            stream.get_mut().write_all(b"\n").await?;
+        }
         Ok::<_, anyhow::Error>(())
     })
     .await??;
@@ -251,22 +345,402 @@ async fn handle(core: Arc<Core>, stream: UnixStream) -> Result<()> {
 
         }).await
 }
+/// Split array projections into <= 1 MiB JSON pages, leaving 1 MiB of
+/// headroom below the reader's hard limit. This covers both status forms and
+/// operation_status accepted/rejected history, without discarding siblings.
+/// Pages belong to one captured reply on one connection; no mutable offsets or
+/// retained server-side cursors are needed. Scalar metadata appears only once.
+fn response_pages(mut reply: Reply) -> Result<Vec<Reply>> {
+    if serde_json::to_vec(&reply)?.len() < RESPONSE_PAGE_BYTES {
+        return Ok(vec![reply]);
+    }
+    fn arrays(
+        value: &mut serde_json::Value,
+        path: &mut Vec<String>,
+        out: &mut Vec<(Vec<String>, Vec<serde_json::Value>)>,
+    ) {
+        match value {
+            serde_json::Value::Array(items) => out.push((path.clone(), std::mem::take(items))),
+            serde_json::Value::Object(fields) => {
+                for (key, value) in fields {
+                    path.push(key.clone());
+                    arrays(value, path, out);
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut projections = Vec::new();
+    arrays(&mut reply.value, &mut Vec::new(), &mut projections);
+    reply.more = true;
+    let mut bytes = serde_json::to_vec(&reply)?.len() + 8;
+    ensure!(
+        bytes <= RESPONSE_PAGE_BYTES,
+        "IPC response metadata is too large"
+    );
+    let mut pages = Vec::new();
+    for (path, items) in projections {
+        for item in items {
+            // Overestimate path/object/array framing for every row, even where
+            // it is already present. Never truncate a pathname or recipient.
+            let cost = serde_json::to_vec(&item)?.len()
+                + path.iter().map(|p| p.len() * 6 + 8).sum::<usize>()
+                + 8;
+            ensure!(
+                cost + 64 <= RESPONSE_PAGE_BYTES,
+                "IPC response item is too large"
+            );
+            if bytes + cost > RESPONSE_PAGE_BYTES {
+                pages.push(reply);
+                reply = Reply {
+                    ok: true,
+                    value: serde_json::Value::Null,
+                    more: true,
+                };
+                bytes = serde_json::to_vec(&reply)?.len() + 8;
+            }
+            let mut destination = &mut reply.value;
+            for key in &path {
+                if destination.is_null() {
+                    *destination = serde_json::json!({});
+                }
+                destination = destination
+                    .as_object_mut()
+                    .context("IPC projection object")?
+                    .entry(key.clone())
+                    .or_insert(serde_json::Value::Null);
+            }
+            if destination.is_null() {
+                *destination = serde_json::json!([]);
+            }
+            destination
+                .as_array_mut()
+                .context("IPC projection array")?
+                .push(item);
+            bytes += cost;
+        }
+    }
+    reply.more = false;
+    pages.push(reply);
+    Ok(pages)
+}
+fn append_page(value: &mut serde_json::Value, page: serde_json::Value) -> Result<()> {
+    match (value, page) {
+        (serde_json::Value::Array(items), serde_json::Value::Array(mut next)) => {
+            items.append(&mut next)
+        }
+        (serde_json::Value::Object(fields), serde_json::Value::Object(next)) => {
+            for (key, value) in next {
+                append_page(
+                    fields
+                        .get_mut(&key)
+                        .context("unexpected IPC continuation field")?,
+                    value,
+                )?;
+            }
+        }
+        _ => anyhow::bail!("invalid IPC continuation"),
+    }
+    Ok(())
+}
 pub async fn request(path: &Path, command: Command) -> Result<serde_json::Value> {
+    let encoded = serde_json::to_vec(&command)?;
+    ensure!(
+        encoded.len() < REQUEST_LIMIT,
+        "IPC request exceeds the 4 MiB limit; choose fewer files"
+    );
     tokio::time::timeout(Duration::from_secs(20), async {
         let mut stream = UnixStream::connect(path)
             .await
             .context("connect to running pneud")?;
-        stream.write_all(&serde_json::to_vec(&command)?).await?;
+        stream.write_all(&encoded).await?;
         stream.write_all(b"\n").await?;
-        let reply: Reply = serde_json::from_slice(&line(&mut BufReader::new(stream)).await?)?;
-        ensure!(reply.ok, "daemon command failed: {}", reply.value);
-        Ok(reply.value)
+        let mut reader = BufReader::new(stream);
+        let first: Reply = serde_json::from_slice(&line(&mut reader, RESPONSE_LIMIT).await?)?;
+        ensure!(first.ok, "daemon command failed: {}", first.value);
+        let mut value = first.value;
+        let mut more = first.more;
+        while more {
+            let page: Reply = serde_json::from_slice(&line(&mut reader, RESPONSE_LIMIT).await?)?;
+            ensure!(page.ok, "daemon command failed: {}", page.value);
+            more = page.more;
+            append_page(&mut value, page.value)?;
+        }
+        Ok(value)
     })
     .await?
+}
+/// Shared CLI parser; keep original path semantics and reject links before IPC.
+pub fn send_command(args: &[String]) -> Result<Command> {
+    parse_send_command(args, true)
+}
+/// Desktop entry points leave file errors to the window so Dolphin users see them.
+pub fn desktop_send_command(args: &[String]) -> Command {
+    match parse_send_command(args, false) {
+        Ok(Command::SendFiles {
+            paths,
+            targets: targets @ crate::outbox::Targets::All(_),
+            request_id,
+        }) => Command::PresentFiles {
+            paths,
+            targets,
+            request_id,
+        },
+        Ok(command @ Command::SendFiles { .. }) => command,
+        Ok(_) => unreachable!("send parser"),
+        Err(error) => Command::PresentSendError {
+            message: error.to_string(),
+        },
+    }
+}
+fn parse_send_command(args: &[String], validate_files: bool) -> Result<Command> {
+    let mut paths = Vec::new();
+    let mut devices = Vec::new();
+    let mut args = args.iter();
+    let mut options = true;
+    let mut request_id = None;
+    while let Some(arg) = args.next() {
+        if options && arg == "--" {
+            options = false;
+            continue;
+        }
+        if options && arg == "--request-id" {
+            request_id = Some(args.next().context("--request-id needs an ID")?.clone());
+            continue;
+        }
+        if options && arg == "--to" {
+            devices.push(Id::new(
+                args.next().context("--to needs a device ID")?.clone(),
+            )?);
+            continue;
+        }
+        ensure!(
+            !options || !arg.starts_with('-'),
+            "unknown send option; use -- before a filename starting with -"
+        );
+        let path = std::path::absolute(arg)?;
+        if validate_files {
+            let file = crate::storage::open_regular_file(&path)?;
+            ensure!(
+                file.metadata()?.len() <= crate::outbox::PEER_BYTES.min(pneu_proto::MAX_FILE_SIZE),
+                "file exceeds send size limit"
+            );
+        }
+        paths.push(path);
+    }
+    ensure!(
+        !paths.is_empty() && paths.len() <= 128,
+        "send needs 1 to 128 regular files"
+    );
+    Ok(Command::SendFiles {
+        paths,
+        request_id: Some(request_id.unwrap_or_else(|| crate::random_hex(16))),
+        targets: if devices.is_empty() {
+            crate::outbox::Targets::All("all".into())
+        } else {
+            crate::outbox::Targets::Devices(devices)
+        },
+    })
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn transfer_commands_accept_optional_artifact_and_roundtrip_it() -> Result<()> {
+        let operation = Id::from_bytes([1; 16]);
+        let artifact = Id::from_bytes([2; 16]);
+        let device = Id::from_bytes([3; 16]);
+        for command in ["dismiss_transfer", "cancel_transfer", "retry_transfer"] {
+            for scoped in [false, true] {
+                let mut value =
+                    serde_json::json!({"command":command,"operation":operation,"device":device});
+                if scoped {
+                    value["artifact"] = serde_json::json!(artifact);
+                }
+                let parsed: Command = serde_json::from_value(value)?;
+                let actual = match &parsed {
+                    Command::DismissTransfer { artifact, .. }
+                    | Command::CancelTransfer { artifact, .. }
+                    | Command::RetryTransfer { artifact, .. } => artifact,
+                    _ => unreachable!(),
+                };
+                assert_eq!(actual.as_ref(), scoped.then_some(&artifact));
+                let encoded = serde_json::to_value(parsed)?;
+                assert_eq!(
+                    encoded["artifact"],
+                    if scoped {
+                        serde_json::json!(artifact)
+                    } else {
+                        serde_json::Value::Null
+                    }
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn desktop_cli_defers_unreadable_sources_and_parser_errors_to_the_window() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let missing = dir
+            .path()
+            .join("missing.txt")
+            .to_string_lossy()
+            .into_owned();
+        assert!(send_command(std::slice::from_ref(&missing)).is_err());
+        assert!(
+            matches!(desktop_send_command(&[missing]), Command::PresentFiles {paths, ..} if paths.len() == 1)
+        );
+        assert!(
+            matches!(desktop_send_command(&[]), Command::PresentSendError {message} if message.contains("1 to 128"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn maximum_supported_requests_fit_including_json_escaping() -> Result<()> {
+        // Linux PATH_MAX includes the NUL. Control bytes are legal in names
+        // and JSON expands each one to six bytes. No real paths are touched.
+        let path = std::path::PathBuf::from(format!("/{}", "\u{1}".repeat(4094)));
+        let targets = crate::outbox::Targets::Captured(
+            (1..=16)
+                .map(|n| crate::outbox::Authority {
+                    device: Id::from_bytes([n; 16]),
+                    generation: u64::MAX,
+                    fingerprint: Hash::new("f".repeat(64)).unwrap(),
+                })
+                .collect(),
+        );
+        let commands = [
+            Command::SendFiles {
+                paths: vec![path.clone(); 128],
+                targets,
+                request_id: Some("r".repeat(128)),
+            },
+            Command::Clipboard {
+                device: Id::from_bytes([1; 16]),
+                text: "\u{1}".repeat(pneu_proto::MAX_CLIPBOARD_BYTES),
+            },
+            Command::Join {
+                uri: "\u{1}".repeat(pneu_proto::MAX_PAIRING_URI_BYTES),
+            },
+            Command::SaveFolder { folder: path },
+            Command::Rename {
+                name: "\u{1}".repeat(128),
+            },
+        ];
+        for command in commands {
+            let mut encoded = serde_json::to_vec(&command)?;
+            encoded.push(b'\n');
+            assert!(encoded.len() <= REQUEST_LIMIT);
+            assert_eq!(
+                line(&mut BufReader::new(encoded.as_slice()), REQUEST_LIMIT).await?,
+                encoded
+            );
+            let _: Command = serde_json::from_slice(&encoded)?;
+        }
+        let encoded = vec![b'x'; REQUEST_LIMIT + 1];
+        assert!(
+            line(&mut BufReader::new(encoded.as_slice()), REQUEST_LIMIT)
+                .await
+                .is_err()
+        );
+        let command = Command::Rename {
+            name: "x".repeat(REQUEST_LIMIT),
+        };
+        let error = request(Path::new("/does-not-exist"), command)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("4 MiB"),
+            "preflight before connect: {error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn maximum_transfer_status_and_admission_history_use_bounded_lossless_pages() -> Result<()>
+    {
+        // 128 artifacts x 16 recipients, each with PATH_MAX-length source paths,
+        // maximum filename/error escaping, and all terminal rows in one batch.
+        let rows: Vec<_> = (0..128u8)
+            .flat_map(|artifact| {
+                (1..=16).map(move |device| serde_json::json!({
+            "operation": Id::from_bytes([255;16]), "transfer_id": Id::from_bytes([artifact;16]),
+            "device": Id::from_bytes([device;16]), "file_name": "\u{1}".repeat(255),
+            "size": u64::MAX, "sent": u64::MAX, "state": "sent", "direction":"outgoing",
+            "path": format!("/{}", "\u{1}".repeat(4094)), "error": "e".repeat(1024),
+            "finished_at": u64::MAX
+        }))
+            })
+            .collect();
+        let values = [
+            serde_json::json!({"snapshot":{"transfers":rows,"devices":[]},"config": Config::default(),"window_request":1}),
+            serde_json::json!({"transfers":rows,"devices":[],"config":Config::default()}),
+            serde_json::json!({"operation":Id::from_bytes([255;16]),"accepted":rows.iter().take(128).collect::<Vec<_>>(),"rejected":rows}),
+        ];
+        for value in values {
+            let expected = value.clone();
+            let pages = response_pages(Reply {
+                ok: true,
+                value,
+                more: false,
+            })?;
+            assert!(pages.len() > 1);
+            let count = pages.len();
+            let mut assembled = None;
+            for (index, page) in pages.into_iter().enumerate() {
+                assert_eq!(page.more, index + 1 < count);
+                let mut encoded = serde_json::to_vec(&page)?;
+                encoded.push(b'\n');
+                assert!(
+                    encoded.len() <= RESPONSE_PAGE_BYTES,
+                    "{} bytes",
+                    encoded.len()
+                );
+                assert!(encoded.len() <= RESPONSE_LIMIT / 2);
+                let decoded: Reply = serde_json::from_slice(
+                    &line(&mut BufReader::new(encoded.as_slice()), RESPONSE_LIMIT).await?,
+                )?;
+                match &mut assembled {
+                    None => assembled = Some(decoded.value),
+                    Some(value) => append_page(value, decoded.value)?,
+                }
+            }
+            assert_eq!(assembled, Some(expected));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn request_reassembles_pages_on_one_socket_and_rejects_incomplete_replies() -> Result<()>
+    {
+        for complete in [true, false] {
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("ipc.sock");
+            let listener = UnixListener::bind(&path)?;
+            let expected = serde_json::json!({"snapshot":{"transfers":["a","b","c"]},"config":{}});
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await?;
+                let mut stream = BufReader::new(stream);
+                let _ = line(&mut stream, REQUEST_LIMIT).await?;
+                stream.get_mut().write_all(b"{\"ok\":true,\"more\":true,\"value\":{\"snapshot\":{\"transfers\":[\"a\"]},\"config\":{}}}\n").await?;
+                if complete {
+                    stream.get_mut().write_all(b"{\"ok\":true,\"more\":false,\"value\":{\"snapshot\":{\"transfers\":[\"b\",\"c\"]}}}\n").await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            });
+            let result = request(&path, Command::UiStatus).await;
+            if complete {
+                assert_eq!(result?, expected);
+            } else {
+                assert!(result.is_err());
+            }
+            server.await??;
+        }
+        Ok(())
+    }
     #[tokio::test]
     async fn socket_owner_deletes_only_its_original_entry_and_parent() -> Result<()> {
         for replacement in ["none", "file", "symlink", "socket", "parent"] {

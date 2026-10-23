@@ -4,10 +4,12 @@ mod clipboard_fingerprint;
 pub mod config;
 pub mod core;
 mod discovery;
+mod file_recipients;
 pub mod identity;
 pub mod ipc;
 mod storage;
 mod store;
+pub use store::outbox;
 #[cfg(test)]
 mod test_support;
 pub mod tls;

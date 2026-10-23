@@ -2,6 +2,7 @@
 //! helper lifetimes belong to the driver, and every completion carries a token.
 use super::{ClipboardOffer, ClipboardRecipient};
 use crate::clipboard_fingerprint::FingerprintKey;
+use crate::config::ClipboardMode;
 use crate::ui::clipboard::Content;
 use pneu_proto::Id;
 use serde::{Deserialize, Serialize};
@@ -87,6 +88,17 @@ pub(super) enum Failure {
 }
 #[derive(Clone, Debug)]
 pub(super) enum Event {
+    Mode(ClipboardMode),
+    Share {
+        token: Token,
+        id: Id,
+        source: Id,
+        offer: ClipboardOffer,
+    },
+    ShareReady {
+        token: Token,
+        content: Option<Content>,
+    },
     Observe {
         token: Token,
         id: Id,
@@ -124,6 +136,10 @@ pub(super) enum Event {
         token: Token,
         success: bool,
     },
+    Published {
+        token: Token,
+        accepted: bool,
+    },
     Cancel(Token),
     Deadline(Token),
     Revoked(Token),
@@ -140,6 +156,12 @@ pub(super) enum Event {
 }
 #[derive(Clone, Debug)]
 pub(super) enum Effect {
+    /// Local UI hint, independent from the ordinary sharing classification.
+    PairingLink(Option<String>),
+    LoadShare {
+        token: Token,
+        payload: Arc<Payload>,
+    },
     Clock {
         token: Token,
         floor: Option<Key>,
@@ -227,6 +249,13 @@ struct ClockRetry {
 #[derive(Default)]
 pub(super) struct State {
     pub register: Option<Key>,
+    mode: ClipboardMode,
+    sharing: HashMap<Token, (Token, Option<Key>, Operation)>,
+    // A manual request retains the exact OS selection and register it captured
+    // until queued/clocked admission and publication have finished.
+    manual: HashMap<Token, (Token, Option<Key>, u64)>,
+    manual_epoch: u64,
+    publishing: HashMap<Token, Persistence>,
     fingerprint_key: FingerprintKey,
     pub history: VecDeque<Fingerprint>,
     current_hashes: Vec<[u8; 32]>,
@@ -366,7 +395,9 @@ impl State {
     }
     fn pending_count(&self) -> usize {
         self.queue.len()
+            + self.sharing.len()
             + self.persistence.len()
+            + self.publishing.len()
             + usize::from(self.local_completion.is_some())
             + usize::from(self.installing.is_some())
             + usize::from(self.clocking.as_ref().is_some_and(|o| {
@@ -578,6 +609,11 @@ impl State {
         }
     }
     fn narrow_peer(&mut self, peer: &Id, effects: &mut Vec<Effect>) {
+        for (_, _, op) in self.sharing.values_mut() {
+            if let Some(offer) = &mut op.offer {
+                offer.recipients.retain(|r| &r.target.device != peer);
+            }
+        }
         effects.push(Effect::Invalidate(Some(peer.clone())));
         for old in self
             .observation
@@ -673,6 +709,41 @@ impl State {
             && !fingerprints.is_empty()
             && fingerprints.iter().all(|hash| self.known_hash(hash))
         {
+            if self
+                .current
+                .as_ref()
+                .is_none_or(|o| o.payload.is_none() || o.key != self.register)
+                && token == self.os_token
+                && let Some(original) = original
+                && let Some(fingerprint) = self
+                    .history
+                    .iter()
+                    .rev()
+                    .find(|f| fingerprints.iter().any(|hash| f.hashes.contains(hash)))
+                    .cloned()
+            {
+                // Restart restores provenance, not payloads. Retain the actual
+                // observed echo for manual sharing without a clock, receipt or
+                // publication. Its historical key must stay intact: an older
+                // echo is not a repair payload for the register winner.
+                self.current = Some(Operation {
+                    token,
+                    id: fingerprint.id,
+                    source: fingerprint.key.source.clone(),
+                    created_at: fingerprint.key.hlc,
+                    key: Some(fingerprint.key),
+                    content: Some(original.clone()),
+                    payload: Some(Arc::new(Payload::Content(original))),
+                    hashes: fingerprints.clone(),
+                    offer: None,
+                    received: true,
+                    legacy: false,
+                    restore: false,
+                    repair: false,
+                    observation: None,
+                });
+                self.current_hashes = fingerprints.clone();
+            }
             self.os_current = fingerprints
                 .iter()
                 .any(|hash| self.current_hashes.contains(hash));
@@ -724,7 +795,11 @@ impl State {
             restore: content.is_some() && (observation.restore || token != self.os_token),
             content,
             payload: original.map(Payload::Content).map(Arc::new),
-            offer: observation.offer,
+            offer: if self.mode == ClipboardMode::Automatic {
+                observation.offer.filter(|o| !o.recipients.is_empty())
+            } else {
+                None
+            },
             received: false,
             legacy: false,
             repair: false,
@@ -732,6 +807,49 @@ impl State {
         };
         self.stop_install(effects);
         self.queue.push_front(operation);
+    }
+    fn share_current(&self, operation: &Operation) -> bool {
+        self.manual
+            .get(&operation.token)
+            .is_none_or(|(physical, key, epoch)| {
+                self.mode == ClipboardMode::Manual
+                    && *epoch == self.manual_epoch
+                    && *physical == self.os_token
+                    && self.os_current
+                    && self.observation.is_none()
+                    && self.held_observations.is_empty()
+                    && (key == &self.register
+                        || (operation.key.is_some() && operation.key == self.register))
+                    && operation
+                        .offer
+                        .as_ref()
+                        .is_some_and(|o| !o.recipients.is_empty())
+            })
+    }
+    fn exclude_received_representations(&self, content: &Content, offer: &mut ClipboardOffer) {
+        let (text, image) = match content {
+            Content::Text(text) => (Some(self.hashes(&Content::Text(text.clone()))[0]), None),
+            Content::Image(bytes) => (None, Some(self.hashes(&Content::Image(bytes.clone()))[0])),
+            Content::Formats(text, bytes) => (
+                Some(self.hashes(&Content::Text(text.clone()))[0]),
+                Some(self.hashes(&Content::Image(bytes.clone()))[0]),
+            ),
+        };
+        for recipient in &mut offer.recipients {
+            let received = |hash: Option<[u8; 32]>| {
+                hash.is_some_and(|h| {
+                    self.physical.iter().any(|r| {
+                        r.hash == h
+                            && r.received
+                                .as_ref()
+                                .is_some_and(|(peer, _)| peer == &recipient.target.device)
+                    })
+                })
+            };
+            recipient.text &= text.is_some() && !received(text);
+            recipient.image &= image.is_some() && !received(image);
+        }
+        offer.recipients.retain(|r| r.text || r.image);
     }
     fn pump(&mut self, effects: &mut Vec<Effect>) {
         if self.shutdown
@@ -759,6 +877,15 @@ impl State {
             return;
         }
         while let Some(mut operation) = self.queue.pop_front() {
+            if !self.share_current(&operation) {
+                effects.push(Effect::Reply {
+                    token: operation.token,
+                    applied: false,
+                    deduplicated: false,
+                    failure: Some(Failure::Cancelled),
+                });
+                continue;
+            }
             if operation.repair && (operation.key != self.register || operation.payload.is_none()) {
                 continue;
             }
@@ -909,15 +1036,26 @@ impl State {
     }
     pub fn idle(&self) -> bool {
         self.observation.is_none()
+            && self.sharing.is_empty()
             && self.held_observations.is_empty()
             && self.clocking.is_none()
             && self.queue.is_empty()
             && self.installing.is_none()
             && self.stopping.is_none()
             && self.persistence.is_empty()
+            && self.publishing.is_empty()
             && self.local_completion.is_none()
     }
     pub fn step(&mut self, event: Event) -> Vec<Effect> {
+        let effects = self.step_inner(event);
+        for effect in &effects {
+            if let Effect::Reply { token, .. } = effect {
+                self.manual.remove(token);
+            }
+        }
+        effects
+    }
+    fn step_inner(&mut self, event: Event) -> Vec<Effect> {
         let mut effects = Vec::new();
         if self.shutdown
             && matches!(
@@ -936,6 +1074,143 @@ impl State {
             return effects;
         }
         match event {
+            Event::Mode(mode) => {
+                if self.mode != mode {
+                    self.mode = mode;
+                    self.invalidate_publications(&mut effects);
+                    for old in self
+                        .observation
+                        .iter_mut()
+                        .chain(self.held_observations.iter_mut())
+                    {
+                        if let Some(offer) = &mut old.offer {
+                            offer.recipients.clear();
+                        }
+                    }
+                    for old in self
+                        .queue
+                        .iter_mut()
+                        .chain(self.clocking.iter_mut())
+                        .chain(self.persistence.values_mut().map(|p| &mut p.operation))
+                        .chain(self.local_completion.iter_mut().map(|p| &mut p.operation))
+                    {
+                        if !old.received {
+                            old.offer = None;
+                        }
+                    }
+                    for (token, _) in self.sharing.drain() {
+                        effects.push(Effect::Reply {
+                            token,
+                            applied: false,
+                            deduplicated: false,
+                            failure: Some(Failure::Cancelled),
+                        });
+                    }
+                }
+            }
+            Event::Share {
+                token,
+                id,
+                source,
+                offer,
+            } => {
+                let payload = self.current.as_ref().and_then(|o| o.payload.clone());
+                if self.shutdown
+                    || self.mode != ClipboardMode::Manual
+                    || !self.os_current
+                    || self.observation.is_some()
+                    || !self.held_observations.is_empty()
+                    || offer.recipients.is_empty()
+                    || payload.is_none()
+                    || self.pending_count() >= 61
+                {
+                    effects.push(Effect::Reply {
+                        token,
+                        applied: false,
+                        deduplicated: false,
+                        failure: Some(Failure::Clipboard),
+                    });
+                } else if let Some(payload) = payload {
+                    let operation = Operation {
+                        token,
+                        id,
+                        source,
+                        key: None,
+                        created_at: 0,
+                        content: None,
+                        payload: Some(payload.clone()),
+                        hashes: Vec::new(),
+                        offer: Some(offer),
+                        received: false,
+                        legacy: false,
+                        restore: false,
+                        repair: false,
+                        observation: None,
+                    };
+                    self.manual.insert(
+                        token,
+                        (self.os_token, self.register.clone(), self.manual_epoch),
+                    );
+                    self.sharing
+                        .insert(token, (self.os_token, self.register.clone(), operation));
+                    effects.push(Effect::LoadShare { token, payload });
+                }
+            }
+            Event::ShareReady { token, content } => {
+                if let Some((physical, key, mut operation)) = self.sharing.remove(&token) {
+                    if self.mode == ClipboardMode::Manual
+                        && physical == self.os_token
+                        && key == self.register
+                        && self.observation.is_none()
+                        && self.held_observations.is_empty()
+                        && self.os_current
+                        && let Some(content) = content
+                    {
+                        let fingerprints = self.hashes(&content);
+                        // File-backed payloads may have been edited since the
+                        // OS installation. Only captured representation bytes
+                        // (including normalized image aliases) can be shared.
+                        if fingerprints
+                            .iter()
+                            .any(|h| !self.current_hashes.contains(h))
+                        {
+                            effects.push(Effect::Reply {
+                                token,
+                                applied: false,
+                                deduplicated: false,
+                                failure: Some(Failure::Clipboard),
+                            });
+                        } else {
+                            if let Some(offer) = &mut operation.offer {
+                                self.exclude_received_representations(&content, offer);
+                            }
+                            if operation
+                                .offer
+                                .as_ref()
+                                .is_none_or(|o| o.recipients.is_empty())
+                            {
+                                effects.push(Effect::Reply {
+                                    token,
+                                    applied: false,
+                                    deduplicated: false,
+                                    failure: Some(Failure::Cancelled),
+                                });
+                            } else {
+                                operation.hashes = hashes(&content);
+                                operation.content = Some(content);
+                                effects.extend(self.step(Event::Submit(operation)));
+                            }
+                        }
+                    } else {
+                        effects.push(Effect::Reply {
+                            token,
+                            applied: false,
+                            deduplicated: false,
+                            failure: Some(Failure::Clipboard),
+                        });
+                    }
+                }
+            }
             Event::Observe {
                 token,
                 id,
@@ -943,6 +1218,7 @@ impl State {
                 origin,
                 clear,
             } => {
+                effects.push(Effect::PairingLink(None));
                 if clear
                     && self
                         .last_marker
@@ -985,7 +1261,11 @@ impl State {
                     self.observation = Some(Observation {
                         token,
                         id,
-                        offer,
+                        offer: if self.mode == ClipboardMode::Automatic {
+                            offer
+                        } else {
+                            None
+                        },
                         read: None,
                         restore,
                         due: false,
@@ -1000,6 +1280,18 @@ impl State {
                 fingerprints,
                 debounce,
             } => {
+                if token == self.os_token
+                    && self.observation.as_ref().is_some_and(|o| o.token == token)
+                {
+                    let text = match &content {
+                        Some(Content::Text(text) | Content::Formats(text, _)) => Some(text.trim()),
+                        _ => None,
+                    };
+                    effects.push(Effect::PairingLink(
+                        text.filter(|text| text.starts_with("pneu://pair") && text.len() <= 16384)
+                            .map(str::to_owned),
+                    ));
+                }
                 if let Some(observation) = self.read_slot(token) {
                     observation.read = Some((content, fingerprints));
                     if !debounce {
@@ -1041,6 +1333,22 @@ impl State {
                 }
             }
             Event::Submit(mut operation) => {
+                if !operation.received && !operation.repair {
+                    if self.mode != ClipboardMode::Automatic
+                        && (self.mode == ClipboardMode::Off || operation.observation.is_some())
+                    {
+                        effects.push(Effect::Reply {
+                            token: operation.token,
+                            applied: false,
+                            deduplicated: false,
+                            failure: Some(Failure::Cancelled),
+                        });
+                        return effects;
+                    }
+                    if operation.observation.is_some() && self.mode != ClipboardMode::Automatic {
+                        operation.offer = None;
+                    }
+                }
                 if operation.payload.is_none() {
                     operation.payload = operation
                         .content
@@ -1086,7 +1394,11 @@ impl State {
                         return effects;
                     }
                     operation.restore = observation.restore;
-                    operation.offer = observation.offer;
+                    operation.offer = if self.mode == ClipboardMode::Automatic {
+                        observation.offer
+                    } else {
+                        None
+                    };
                     if operation
                         .offer
                         .as_ref()
@@ -1106,6 +1418,18 @@ impl State {
                     self.stop_install(&mut effects);
                 }
 
+                if operation.received
+                    && !operation.repair
+                    && operation
+                        .key
+                        .as_ref()
+                        .zip(self.register.as_ref())
+                        .is_none_or(|(new, current)| new > current)
+                {
+                    // A remote winner admitted after a manual click supersedes
+                    // queued clicks before they can allocate a newer local HLC.
+                    self.manual_epoch = self.manual_epoch.wrapping_add(1);
+                }
                 if !operation.received {
                     // Explicit shares narrow an unresolved physical offer. They
                     // never add later connections to its frozen recipient set.
@@ -1186,7 +1510,14 @@ impl State {
             Event::Clock { token, result } => {
                 if self.clocking.as_ref().is_some_and(|o| o.token == token) {
                     let mut operation = self.clocking.take().unwrap();
-                    if let Some(key) = result {
+                    if !self.share_current(&operation) {
+                        effects.push(Effect::Reply {
+                            token,
+                            applied: false,
+                            deduplicated: false,
+                            failure: Some(Failure::Cancelled),
+                        });
+                    } else if let Some(key) = result {
                         operation.created_at = if operation.legacy {
                             operation.created_at
                         } else {
@@ -1313,6 +1644,13 @@ impl State {
                 }
             }
             Event::Installed(ticket) => {
+                if self
+                    .installing
+                    .as_ref()
+                    .is_some_and(|i| i.ticket == ticket && i.operation.received)
+                {
+                    effects.push(Effect::PairingLink(None));
+                }
                 if self.installing.as_ref().is_some_and(|i| i.ticket == ticket)
                     || self.owner == Some(ticket)
                     || self.stopping_markers.contains(&ticket)
@@ -1336,8 +1674,14 @@ impl State {
             }
             Event::Persisted { token, success } => {
                 if let Some(pending) = self.persistence.remove(&token) {
-                    if success
+                    let explicit = !pending.operation.received
+                        && !pending.operation.repair
+                        && pending.operation.observation.is_none();
+                    let publish = success
                         && pending.applied
+                        && (self.mode == ClipboardMode::Automatic
+                            || (self.mode == ClipboardMode::Manual
+                                && pending.operation.observation.is_none()))
                         && !pending.operation.received
                         && !pending.operation.repair
                         && pending.operation.content.is_some()
@@ -1346,14 +1690,42 @@ impl State {
                             .offer
                             .as_ref()
                             .is_some_and(|o| !o.recipients.is_empty())
-                    {
-                        effects.push(Effect::Publish(pending.operation));
+                        && self.share_current(&pending.operation);
+                    if publish {
+                        effects.push(Effect::Publish(pending.operation.clone()));
+                        if explicit {
+                            self.publishing.insert(token, pending);
+                        } else {
+                            effects.push(Effect::Reply {
+                                token,
+                                applied: pending.applied,
+                                deduplicated: pending.deduplicated,
+                                failure: None,
+                            });
+                        }
+                    } else {
+                        effects.push(Effect::Reply {
+                            token,
+                            applied: pending.applied && !explicit,
+                            deduplicated: pending.deduplicated,
+                            failure: if !success {
+                                Some(Failure::Storage)
+                            } else if explicit {
+                                Some(Failure::Cancelled)
+                            } else {
+                                None
+                            },
+                        });
                     }
+                }
+            }
+            Event::Published { token, accepted } => {
+                if let Some(pending) = self.publishing.remove(&token) {
                     effects.push(Effect::Reply {
-                        applied: pending.applied,
                         token,
+                        applied: accepted,
                         deduplicated: pending.deduplicated,
-                        failure: (!success).then_some(Failure::Storage),
+                        failure: (!accepted).then_some(Failure::Cancelled),
                     });
                 }
             }
@@ -1380,12 +1752,21 @@ impl State {
             }
             event @ (Event::Cancel(token) | Event::Deadline(token)) => {
                 let deadline = matches!(event, Event::Deadline(_));
+                if self.sharing.remove(&token).is_some() {
+                    effects.push(Effect::Reply {
+                        token,
+                        applied: false,
+                        deduplicated: false,
+                        failure: Some(Failure::Cancelled),
+                    });
+                }
                 let failure = if deadline {
                     Failure::Clipboard
                 } else {
                     Failure::Cancelled
                 };
                 if self.persistence.contains_key(&token)
+                    || self.publishing.contains_key(&token)
                     || (!deadline
                         && self.installing.as_ref().is_some_and(|i| {
                             i.operation.token == token && i.phase == Phase::Authorized
@@ -1433,6 +1814,13 @@ impl State {
             }
             Event::Revoke(peer) => self.revoke_peer(&peer, &mut effects),
             Event::Policy { allowed } => {
+                for (_, _, op) in self.sharing.values_mut() {
+                    if let Some(offer) = &mut op.offer {
+                        offer
+                            .recipients
+                            .retain(|old| allowed.iter().any(|new| old.target == new.target));
+                    }
+                }
                 let narrow = |offer: &mut ClipboardOffer| {
                     offer
                         .recipients
@@ -1466,6 +1854,14 @@ impl State {
                 }
             }
             Event::Shutdown => {
+                for (token, _) in self.sharing.drain() {
+                    effects.push(Effect::Reply {
+                        token,
+                        applied: false,
+                        deduplicated: false,
+                        failure: Some(Failure::Cancelled),
+                    });
+                }
                 self.shutdown = true;
                 for old in self
                     .observation
@@ -1507,6 +1903,11 @@ impl State {
             self.persist(pending, &mut effects);
         }
         self.pump(&mut effects);
+        for effect in &effects {
+            if let Effect::Reply { token, .. } = effect {
+                self.manual.remove(token);
+            }
+        }
         effects
     }
 }

@@ -1,8 +1,14 @@
-use super::{Command, Snapshot, Toggle};
+use super::{
+    Command, Snapshot, Toggle,
+    window::{ClipboardMode, Peer, contract::Transfer, display_peer_text, peers},
+};
 use crate::Config;
 use anyhow::Result;
 use ksni::{TrayMethods, menu::*};
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 use tokio::sync::mpsc;
 
 pub const ICONS: [(&str, &str); 5] = [
@@ -34,11 +40,100 @@ pub struct Tray {
     pub pixmaps: Vec<(String, ksni::Icon)>,
     pub named_icons: bool,
     pub commands: mpsc::Sender<Command>,
+    device_slots: Mutex<Vec<String>>,
 }
 impl Tray {
     fn send(&self, command: Command) {
         let _ = self.commands.try_send(command);
     }
+    fn transfers(&self) -> Vec<Transfer> {
+        self.snapshot.transfers.iter().map(Transfer::from).collect()
+    }
+    fn clipboard_mode(&self) -> ClipboardMode {
+        let config = serde_json::to_value(&self.config).unwrap_or_default();
+        ClipboardMode::from_config(
+            Some(&config["clipboard_mode"]).filter(|v| !v.is_null()),
+            self.config.clipboard_sync_to_phone,
+        )
+    }
+}
+/// The tray's first line, which also starts its tooltip.
+pub(crate) fn status(snapshot: &Snapshot, peers: &[Peer], transfers: &[Transfer]) -> String {
+    let sending: Vec<&str> = peers
+        .iter()
+        .filter(|p| p.sending())
+        .map(|p| p.name.as_str())
+        .collect();
+    let receiving = peers
+        .iter()
+        .find(|p| p.receiving())
+        .map(|p| p.name.clone())
+        .or_else(|| {
+            (snapshot.receiving && snapshot.connected)
+                .then(|| display_peer_text(&snapshot.phone.name))
+        });
+    let connected: Vec<&Peer> = peers.iter().filter(|p| p.connected()).collect();
+    if let Some(error) = &snapshot.error {
+        error.tooltip()
+    } else if let Some(name) = &snapshot.pairing {
+        format!("Pairing with {}…", display_peer_text(name))
+    } else if peers.is_empty() {
+        "No devices paired".into()
+    } else if let [one] = sending.as_slice() {
+        format!("Sending to {one}…")
+    } else if !sending.is_empty() {
+        format!("Sending to {} devices…", sending.len())
+    } else if let Some(name) = receiving {
+        format!("Receiving from {name}…")
+    } else if let [one] = peers {
+        // One device keeps v2's wording.
+        if one.paused() {
+            format!("{} paused sending", one.name)
+        } else if let (true, Some(route)) = (one.connected(), &one.route) {
+            format!("{} connected over {route}", one.name)
+        } else if one.connected() {
+            format!("{} connected", one.name)
+        } else if one.lost() {
+            format!("{} doesn't recognize this computer", one.name)
+        } else {
+            format!("{} isn't connected", one.name)
+        }
+    } else if connected.len() == 2 && peers.len() == 2 {
+        format!("{} and {} connected", connected[0].name, connected[1].name)
+    } else if connected.is_empty() {
+        let _ = transfers;
+        "No devices connected".into()
+    } else {
+        format!("{} of {} devices connected", connected.len(), peers.len())
+    }
+}
+pub(crate) fn icon(snapshot: &Snapshot, peers: &[Peer]) -> &'static str {
+    if snapshot.error.is_some() {
+        "pneu-tray-error"
+    } else if peers.iter().any(Peer::paused) {
+        "pneu-tray-paused"
+    } else if peers.iter().any(|p| p.sending() || p.receiving())
+        || (snapshot.receiving && snapshot.connected)
+    {
+        "pneu-tray-receiving"
+    } else if peers.iter().any(Peer::connected) {
+        "pneu-tray-connected"
+    } else {
+        "pneu-tray-disconnected"
+    }
+}
+fn item<T>(
+    label: impl Into<String>,
+    icon: &str,
+    activate: impl Fn(&mut T) + Send + 'static,
+) -> ksni::MenuItem<T> {
+    StandardItem {
+        label: label.into(),
+        icon_name: icon.into(),
+        activate: Box::new(activate),
+        ..Default::default()
+    }
+    .into()
 }
 impl ksni::Tray for Tray {
     fn id(&self) -> String {
@@ -62,15 +157,16 @@ impl ksni::Tray for Tray {
     }
     fn icon_name(&self) -> String {
         if self.named_icons {
-            self.snapshot.icon().into()
+            icon(&self.snapshot, &peers(&self.snapshot, &self.transfers())).into()
         } else {
             String::new()
         }
     }
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        let name = icon(&self.snapshot, &peers(&self.snapshot, &self.transfers()));
         self.pixmaps
             .iter()
-            .filter(|(name, _)| name == self.snapshot.icon())
+            .filter(|(n, _)| n == name)
             .map(|(_, icon)| icon.clone())
             .collect()
     }
@@ -81,11 +177,21 @@ impl ksni::Tray for Tray {
         self.icon_pixmap()
     }
     fn tool_tip(&self) -> ksni::ToolTip {
+        let transfers = self.transfers();
+        let peers = peers(&self.snapshot, &transfers);
+        // One line per device; the status line leads only when it adds something.
+        let mut lines: Vec<String> = peers.iter().map(Peer::short).collect();
+        if self.snapshot.error.is_some()
+            || self.snapshot.pairing.is_some()
+            || lines.is_empty()
+            || peers.iter().any(|p| p.sending() || p.receiving())
+        {
+            lines.insert(0, status(&self.snapshot, &peers, &transfers));
+        }
         ksni::ToolTip {
             icon_name: "pneu".into(),
             title: "Pneu".into(),
-            description: super::notifications::escape(&self.snapshot.tooltip())
-                .replace('\n', "<br/>"),
+            description: super::notifications::escape(&lines.join("\n")).replace('\n', "<br/>"),
             ..Default::default()
         }
     }
@@ -95,72 +201,222 @@ impl ksni::Tray for Tray {
         });
     }
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        let transfers = self.transfers();
+        let peers = peers(&self.snapshot, &transfers);
         let mut items = vec![
             StandardItem {
-                label: self.snapshot.status(),
+                label: status(&self.snapshot, &peers, &transfers),
                 enabled: false,
                 ..Default::default()
             }
             .into(),
             ksni::MenuItem::Separator,
-            StandardItem {
-                label: "Open Folder".into(),
-                icon_name: "folder-open".into(),
-                activate: Box::new(|s: &mut Self| s.send(Command::OpenFolder)),
-                ..Default::default()
-            }
-            .into(),
-            ksni::MenuItem::Separator,
         ];
-        for toggle in Toggle::all() {
-            if toggle == Toggle::Clipboard {
-                items.push(ksni::MenuItem::Separator);
+        if !peers.is_empty() {
+            let connected =
+                super::runtime::file_recipients(self.snapshot.send_targets.clone(), None);
+            let mut targets = vec![
+                item(
+                    "All Connected Devices…",
+                    "network-workgroup",
+                    move |s: &mut Self| {
+                        s.send(Command::SendFiles {
+                            recipients: connected.clone(),
+                            targeted: false,
+                        })
+                    },
+                ),
+                ksni::MenuItem::Separator,
+            ];
+            // ksni IDs are positional until the menu's structure changes.
+            // Never reassign a position: keep invisible tombstones for removed
+            // identities and append new bindings (which invalidates old IDs).
+            let identities = tray_identities(&self.snapshot, &peers);
+            let slots = stable_slots(
+                &mut self.device_slots.lock().expect("tray device slots"),
+                &identities,
+            );
+            for identity in slots {
+                let peer = peers.iter().find(|p| {
+                    identities
+                        .iter()
+                        .any(|(key, id)| key == &identity && id == &p.id)
+                });
+                let Some(peer) = peer else {
+                    targets.push(
+                        StandardItem {
+                            visible: false,
+                            enabled: false,
+                            ..Default::default()
+                        }
+                        .into(),
+                    );
+                    continue;
+                };
+                let Ok(device) = pneu_proto::Id::new(peer.id.as_str()) else {
+                    continue;
+                };
+                let captured = super::runtime::file_recipients(
+                    self.snapshot.send_targets.clone(),
+                    Some(&device),
+                );
+                targets.push(item(
+                    format!("{}…", menu_label(&peer.name)),
+                    if peer.phone { "smartphone" } else { "computer" },
+                    move |s: &mut Self| {
+                        let current = tray_identities(&s.snapshot, &peers_for_menu(s));
+                        if current.iter().any(|(key, _)| key == &identity) {
+                            s.send(Command::SendFiles {
+                                recipients: captured.clone(),
+                                targeted: true,
+                            });
+                        }
+                    },
+                ));
             }
             items.push(
-                CheckmarkItem {
-                    label: toggle.label().into(),
-                    checked: toggle.checked(&self.config),
-                    enabled: toggle.enabled(&self.config),
-                    activate: Box::new(move |s: &mut Self| s.send(Command::Toggle(toggle))),
+                SubMenu {
+                    label: "Send Files To".into(),
+                    icon_name: "document-send".into(),
+                    submenu: targets,
                     ..Default::default()
                 }
                 .into(),
             );
-        }
-        items.push(ksni::MenuItem::Separator);
-        items.push(
-            StandardItem {
-                label: if self.snapshot.paired {
-                    "Configure Pneu…"
-                } else {
-                    "Pair Phone…"
+            let mode = self.clipboard_mode();
+            if mode == ClipboardMode::Manual {
+                let captured = super::captured_authorities(&self.snapshot);
+                items.push(item("Send Clipboard", "edit-paste", move |s: &mut Self| {
+                    s.send(Command::SendClipboard(captured.clone()))
+                }));
+            }
+            items.push(item("Open Folder", "folder-open", |s: &mut Self| {
+                s.send(Command::OpenFolder)
+            }));
+            items.push(ksni::MenuItem::Separator);
+            let modes = [
+                ClipboardMode::Automatic,
+                ClipboardMode::Manual,
+                ClipboardMode::Off,
+            ];
+            items.push(
+                SubMenu {
+                    label: "Clipboard".into(),
+                    icon_name: "edit-paste".into(),
+                    submenu: vec![
+                        RadioGroup {
+                            selected: modes.iter().position(|m| *m == mode).unwrap_or(0),
+                            select: Box::new(move |s: &mut Self, index| {
+                                s.send(Command::ClipboardMode(modes[index].key()));
+                            }),
+                            options: ["Share Automatically", "Share Manually", "Off"]
+                                .into_iter()
+                                .map(|label| RadioItem {
+                                    label: label.into(),
+                                    ..Default::default()
+                                })
+                                .collect(),
+                        }
+                        .into(),
+                        ksni::MenuItem::Separator,
+                        CheckmarkItem {
+                            label: Toggle::IncludeImages.label().into(),
+                            checked: Toggle::IncludeImages.checked(&self.config),
+                            enabled: mode != ClipboardMode::Off,
+                            activate: Box::new(|s: &mut Self| {
+                                s.send(Command::Toggle(Toggle::IncludeImages))
+                            }),
+                            ..Default::default()
+                        }
+                        .into(),
+                    ],
+                    ..Default::default()
                 }
                 .into(),
-                icon_name: if self.snapshot.paired {
-                    "configure"
-                } else {
-                    "smartphone"
-                }
-                .into(),
-                activate: Box::new(|s: &mut Self| {
-                    s.send(Command::Window {
-                        activation_token: None,
+            );
+            items.push(
+                SubMenu {
+                    label: "When Files Arrive".into(),
+                    icon_name: "download".into(),
+                    submenu: [
+                        Toggle::Save,
+                        Toggle::Notifications,
+                        Toggle::CopyImages,
+                        Toggle::Viewer,
+                    ]
+                    .into_iter()
+                    .map(|toggle| {
+                        CheckmarkItem {
+                            label: toggle.label().into(),
+                            checked: toggle.checked(&self.config),
+                            activate: Box::new(move |s: &mut Self| s.send(Command::Toggle(toggle))),
+                            ..Default::default()
+                        }
+                        .into()
                     })
-                }),
-                ..Default::default()
-            }
-            .into(),
-        );
-        items.push(
-            StandardItem {
-                label: "Quit".into(),
-                icon_name: "application-exit".into(),
-                activate: Box::new(|s: &mut Self| s.send(Command::Quit)),
-                ..Default::default()
-            }
-            .into(),
-        );
+                    .collect(),
+                    ..Default::default()
+                }
+                .into(),
+            );
+            items.push(ksni::MenuItem::Separator);
+        }
+        items.push(item("Add Device…", "list-add", |s: &mut Self| {
+            s.send(Command::AddDevice {
+                activation_token: None,
+            })
+        }));
+        items.push(item("Configure Pneu…", "configure", |s: &mut Self| {
+            s.send(Command::Window {
+                activation_token: None,
+            })
+        }));
+        items.push(item("Quit", "application-exit", |s: &mut Self| {
+            s.send(Command::Quit)
+        }));
         items
+    }
+}
+fn peers_for_menu(tray: &Tray) -> Vec<Peer> {
+    peers(&tray.snapshot, &tray.transfers())
+}
+fn tray_identities(snapshot: &Snapshot, peers: &[Peer]) -> Vec<(String, String)> {
+    let targets = serde_json::to_value(&snapshot.send_targets).unwrap_or_default();
+    peers
+        .iter()
+        .map(|peer| {
+            let binding = targets.as_array().and_then(|targets| {
+                targets
+                    .iter()
+                    .find(|t| t["device"].as_str() == Some(&peer.id))
+            });
+            let generation = binding.and_then(|t| t["generation"].as_u64()).unwrap_or(0);
+            let fingerprint = binding
+                .and_then(|t| t["fingerprint"].as_str())
+                .unwrap_or("");
+            (
+                format!("{}/{generation}/{fingerprint}", peer.id),
+                peer.id.clone(),
+            )
+        })
+        .collect()
+}
+fn stable_slots(slots: &mut Vec<String>, current: &[(String, String)]) -> Vec<String> {
+    for (identity, _) in current {
+        if !slots.contains(identity) {
+            slots.push(identity.clone());
+        }
+    }
+    slots.clone()
+}
+
+/// Menu labels treat "_" as an access-key marker; long names end in an ellipsis.
+fn menu_label(name: &str) -> String {
+    let name = name.replace('_', "__");
+    if name.chars().count() > 40 {
+        format!("{}…", name.chars().take(39).collect::<String>().trim_end())
+    } else {
+        name
     }
 }
 pub async fn start(
@@ -178,6 +434,7 @@ pub async fn start(
         pixmaps: pixmaps()?,
         named_icons,
         commands,
+        device_slots: Mutex::new(Vec::new()),
     }
     .assume_sni_available(true)
     .spawn()
@@ -274,6 +531,226 @@ pub fn render_svg(svg: &[u8], size: u32) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn devices(states: &[(&str, bool, &str)]) -> Snapshot {
+        Snapshot {
+            devices: states
+                .iter()
+                .enumerate()
+                .map(
+                    |(i, (name, phone, state))| crate::core::mesh::DeviceSnapshot {
+                        device: pneu_proto::Id::from_bytes([i as u8 + 1; 16]),
+                        name: (*name).into(),
+                        role: if *phone { "phone" } else { "computer" }.into(),
+                        state: (*state).into(),
+                        last_seen: 0,
+                        dialer: None,
+                        route: (*state == "connected").then(|| "Wi-Fi".into()),
+                    },
+                )
+                .collect(),
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn device_menu_slots_never_reassign_stale_ids() {
+        let mut slots = Vec::new();
+        let first = vec![
+            ("A/1/fp-a".into(), "A".into()),
+            ("B/1/fp-b".into(), "B".into()),
+        ];
+        assert_eq!(stable_slots(&mut slots, &first), ["A/1/fp-a", "B/1/fp-b"]);
+        let reordered = vec![first[1].clone(), first[0].clone()];
+        assert_eq!(
+            stable_slots(&mut slots, &reordered),
+            ["A/1/fp-a", "B/1/fp-b"]
+        );
+        let replacement = vec![
+            ("C/1/fp-c".into(), "C".into()),
+            ("A/2/new-fp".into(), "A".into()),
+        ];
+        assert_eq!(
+            stable_slots(&mut slots, &replacement),
+            ["A/1/fp-a", "B/1/fp-b", "C/1/fp-c", "A/2/new-fp"]
+        );
+    }
+
+    #[test]
+    fn stale_device_menu_positions_keep_their_original_identity_or_become_inert() {
+        use ksni::Tray as _;
+        let (commands, mut rx) = mpsc::channel(16);
+        let mut tray = Tray {
+            snapshot: devices(&[("A", false, "connected"), ("B", false, "connected")]),
+            config: Config::default(),
+            icons: PathBuf::new(),
+            pixmaps: Vec::new(),
+            named_icons: false,
+            commands,
+            device_slots: Mutex::new(Vec::new()),
+        };
+        tray.snapshot.send_targets = tray
+            .snapshot
+            .devices
+            .iter()
+            .map(|d| crate::outbox::SendTarget {
+                device: d.device.clone(),
+                name: d.name.clone(),
+                generation: 1,
+                fingerprint: Some(pneu_proto::Hash::new("ab".repeat(32)).unwrap()),
+                eligible: true,
+                would_queue: false,
+                reason: None,
+            })
+            .collect();
+        let original_a = tray.snapshot.devices[0].device.clone();
+        let activate_first_device = |tray: &mut Tray| {
+            let menu = tray.menu();
+            let ksni::MenuItem::SubMenu(send) = &menu[2] else {
+                panic!("send submenu");
+            };
+            let ksni::MenuItem::Standard(first) = &send.submenu[2] else {
+                panic!("device item");
+            };
+            (first.activate)(tray);
+        };
+        activate_first_device(&mut tray);
+        assert!(
+            matches!(rx.try_recv().unwrap(), Command::SendFiles { recipients: targets, .. } if targets.len() == 1 && targets[0].device == original_a)
+        );
+        tray.snapshot.devices.reverse();
+        activate_first_device(&mut tray);
+        assert!(
+            matches!(rx.try_recv().unwrap(), Command::SendFiles { recipients: targets, .. } if targets.len() == 1 && targets[0].device == original_a)
+        );
+        tray.snapshot.devices.retain(|d| d.device != original_a);
+        tray.snapshot
+            .devices
+            .push(crate::core::mesh::DeviceSnapshot {
+                device: pneu_proto::Id::from_bytes([8; 16]),
+                name: "C".into(),
+                role: "computer".into(),
+                state: "connected".into(),
+                last_seen: 0,
+                dialer: None,
+                route: None,
+            });
+        // Even an accessibility/DBus action on an invisible tombstone is inert.
+        activate_first_device(&mut tray);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn queued_tray_sends_keep_the_menu_binding_and_broadcast_recipient_set() {
+        use ksni::Tray as _;
+        let (commands, mut rx) = mpsc::channel(16);
+        let mut tray = Tray {
+            snapshot: devices(&[("A", false, "connected")]),
+            config: Config {
+                clipboard_mode: crate::config::ClipboardMode::Manual,
+                ..Config::default()
+            },
+            icons: PathBuf::new(),
+            pixmaps: Vec::new(),
+            named_icons: false,
+            commands,
+            device_slots: Mutex::new(Vec::new()),
+        };
+        let authority = crate::outbox::Authority {
+            device: tray.snapshot.devices[0].device.clone(),
+            generation: 7,
+            fingerprint: pneu_proto::Hash::new("ab".repeat(32)).unwrap(),
+        };
+        tray.snapshot.send_targets = vec![crate::outbox::SendTarget {
+            device: authority.device.clone(),
+            name: "A".into(),
+            generation: authority.generation,
+            fingerprint: Some(authority.fingerprint.clone()),
+            eligible: true,
+            would_queue: false,
+            reason: None,
+        }];
+        let menu = tray.menu();
+        let ksni::MenuItem::SubMenu(files) = &menu[2] else {
+            panic!("files submenu")
+        };
+        let ksni::MenuItem::Standard(one) = &files.submenu[2] else {
+            panic!("named recipient")
+        };
+        (one.activate)(&mut tray);
+        // The command is already queued when the menu learns of replacement.
+        tray.snapshot.send_targets[0].generation = 99;
+        tray.snapshot.send_targets[0].fingerprint =
+            Some(pneu_proto::Hash::new("cd".repeat(32)).unwrap());
+        assert!(
+            matches!(rx.try_recv().unwrap(), Command::SendFiles { recipients: targets, .. } if targets == vec![authority.clone()])
+        );
+        // Old named menu callbacks become inert once the snapshot is current.
+        (one.activate)(&mut tray);
+        assert!(rx.try_recv().is_err());
+        // The fixed-position broadcast and clipboard callbacks also keep their
+        // original recipients instead of adopting a new pairing when invoked.
+        let ksni::MenuItem::Standard(all) = &files.submenu[0] else {
+            panic!("connected recipients")
+        };
+        (all.activate)(&mut tray);
+        assert!(
+            matches!(rx.try_recv().unwrap(), Command::SendFiles { recipients: targets, .. } if targets == vec![authority.clone()])
+        );
+        let clipboard = menu
+            .iter()
+            .find_map(|item| match item {
+                ksni::MenuItem::Standard(item) if item.label == "Send Clipboard" => Some(item),
+                _ => None,
+            })
+            .unwrap();
+        (clipboard.activate)(&mut tray);
+        assert!(
+            matches!(rx.try_recv().unwrap(), Command::SendClipboard(targets) if targets == vec![authority])
+        );
+    }
+
+    #[test]
+    fn status_line_and_icon_cover_one_and_several_devices() {
+        let line = |s: &Snapshot| status(s, &peers(s, &[]), &[]);
+        let icon_of = |s: &Snapshot| icon(s, &peers(s, &[]));
+        let none = devices(&[]);
+        assert_eq!(line(&none), "No devices paired");
+        assert_eq!(icon_of(&none), "pneu-tray-disconnected");
+        let mut one = devices(&[("Galaxy S25+", true, "connected")]);
+        one.device = Some(pneu_proto::Id::from_bytes([1; 16]));
+        one.phone.route = "Wi-Fi".into();
+        assert_eq!(line(&one), "Galaxy S25+ connected over Wi-Fi");
+        assert_eq!(icon_of(&one), "pneu-tray-connected");
+        one.paused_devices = vec![pneu_proto::Id::from_bytes([1; 16])];
+        assert_eq!(line(&one), "Galaxy S25+ paused sending");
+        assert_eq!(icon_of(&one), "pneu-tray-paused");
+        let two = devices(&[
+            ("Galaxy S25+", true, "connected"),
+            ("MacBook Air", false, "connected"),
+        ]);
+        assert_eq!(line(&two), "Galaxy S25+ and MacBook Air connected");
+        let some = devices(&[
+            ("A", false, "connected"),
+            ("B", false, "disconnected"),
+            ("C", false, "disconnected"),
+        ]);
+        assert_eq!(line(&some), "1 of 3 devices connected");
+        let off = devices(&[("A", false, "disconnected"), ("B", false, "connecting")]);
+        assert_eq!(line(&off), "No devices connected");
+        assert_eq!(icon_of(&off), "pneu-tray-disconnected");
+        let sending = [Transfer {
+            operation: "o".into(),
+            device: pneu_proto::Id::from_bytes([1; 16]).as_str().into(),
+            state: "sending".into(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            status(&two, &peers(&two, &sending), &sending),
+            "Sending to Galaxy S25+…"
+        );
+        assert_eq!(icon(&two, &peers(&two, &sending)), "pneu-tray-receiving");
+        assert_eq!(menu_label("a_b"), "a__b");
+        assert_eq!(menu_label(&"x".repeat(50)).chars().count(), 40);
+    }
     #[test]
     fn icon_preparation_preserves_symlink_targets_and_refuses_redirected_directories() -> Result<()>
     {

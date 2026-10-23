@@ -26,6 +26,17 @@ fn main() -> Result<()> {
 async fn async_main(args: Vec<String>) -> Result<()> {
     let paths = Paths::from_env()?;
     match args.first().map(String::as_str) {
+        Some("send") => {
+            let reply = ipc::request(&paths.socket, ipc::desktop_send_command(&args[1..])).await?;
+            println!("{}", serde_json::to_string_pretty(&reply)?);
+            Ok(())
+        }
+        Some("operation-status") => {
+            let operation = pneu_proto::Id::new(args.get(1).context("operation ID")?.clone())?;
+            let reply = ipc::request(&paths.socket, Command::OperationStatus { operation }).await?;
+            println!("{}", serde_json::to_string_pretty(&reply)?);
+            Ok(())
+        }
         Some("window") => {
             ipc::request(
                 &paths.socket,
@@ -124,7 +135,7 @@ async fn async_main(args: Vec<String>) -> Result<()> {
         }
         Some("--help" | "help") => {
             println!(
-                "pneud [run|window|pair|join (stdin)|join-confirm ATTEMPT|join-status ATTEMPT|join-cancel ATTEMPT|close-pairing|status|reload|unpair DEVICE|clipboard DEVICE TEXT|discard-clipboard DEVICE]"
+                "pneud [send [--to DEVICE] FILE...|run|window|pair|join (stdin)|join-confirm ATTEMPT|join-status ATTEMPT|join-cancel ATTEMPT|close-pairing|status|reload|unpair DEVICE|clipboard DEVICE TEXT|discard-clipboard DEVICE]"
             );
             Ok(())
         }

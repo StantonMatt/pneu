@@ -19,6 +19,7 @@ fn offer(token: u64, peers: &[u8]) -> ClipboardOffer {
                     connection: 1,
                     binding: 1,
                     policy: 0,
+                    config_epoch: 0,
                 },
                 text: true,
                 image: true,
@@ -82,6 +83,14 @@ impl Compositor {
     fn effects(&mut self, effects: Vec<Effect>) {
         for effect in effects {
             match effect {
+                Effect::PairingLink(_) => {}
+                Effect::LoadShare { token, payload } => self.pending.push_back(Event::ShareReady {
+                    token,
+                    content: match payload.as_ref() {
+                        Payload::Content(content) => Some(content.clone()),
+                        _ => None,
+                    },
+                }),
                 Effect::Clock { token, floor } => {
                     if std::mem::take(&mut self.fail_clock) {
                         self.pending.push_back(Event::Clock {
@@ -159,6 +168,16 @@ impl Compositor {
                 }
                 Effect::Publish(operation) => {
                     assert!(!operation.received, "forwarding received operation");
+                    assert!(
+                        self.state.mode == ClipboardMode::Automatic
+                            || (self.state.mode == ClipboardMode::Manual
+                                && operation.observation.is_none()),
+                        "mode allowed a prohibited publication"
+                    );
+                    self.pending.push_back(Event::Published {
+                        token: operation.token,
+                        accepted: true,
+                    });
                     self.published.push(operation);
                 }
                 Effect::Reply {
@@ -936,9 +955,24 @@ fn review_stale_prepared_hashes_do_not_enter_history() {
 }
 #[test]
 fn review_randomized_interleavings() {
+    let seconds = std::env::var("REVIEW_SECONDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let seed = std::env::var("REVIEW_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0x4261_5cda_9d1f);
+    randomized_interleavings(seed, seconds, 3000);
+}
+#[test]
+fn randomized_seed_8019655356852108308_keeps_os_and_register_consistent() {
+    randomized_interleavings(8019655356852108308, 0, 1);
+}
+fn randomized_interleavings(mut seed: u64, seconds: u64, case_limit: u64) {
     fn signature(s: &State) -> String {
         format!(
-            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{:?}|{:?}",
+            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}",
             s.register,
             s.history,
             s.current_hashes,
@@ -958,7 +992,9 @@ fn review_randomized_interleavings() {
             s.clock_retry,
             s.shutdown,
             s.physical,
-            s.local_completion
+            s.local_completion,
+            s.mode,
+            s.sharing
         )
     }
     fn check_recipient_sets(s: &State, seen: &mut HashMap<u64, Vec<Id>>) {
@@ -974,6 +1010,7 @@ fn review_randomized_interleavings() {
             .chain(s.installing.iter().map(|i| &i.operation))
             .chain(s.persistence.values().map(|p| &p.operation))
             .chain(s.local_completion.iter().map(|p| &p.operation))
+            .chain(s.sharing.values().map(|(_, _, o)| o))
             .filter_map(|o| o.offer.as_ref().map(|f| (o.token, f)));
         for (token, f) in observations.chain(operations) {
             let current = f
@@ -989,16 +1026,11 @@ fn review_randomized_interleavings() {
             }
         }
     }
-    let seconds = std::env::var("REVIEW_SECONDS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
     let start = std::time::Instant::now();
-    let mut seed = 0x4261_5cda_9d1fu64;
     let mut cases = 0u64;
     let mut events = 0u64;
     while if seconds == 0 {
-        cases < 3000
+        cases < case_limit
     } else {
         start.elapsed().as_secs() < seconds
     } {
@@ -1013,7 +1045,7 @@ fn review_randomized_interleavings() {
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
-            let choice = seed % 18;
+            let choice = seed % 22;
             let event = match choice {
                 0..=3 if !model.pending.is_empty() => {
                     let index = (seed as usize >> 5) % model.pending.len();
@@ -1091,6 +1123,27 @@ fn review_randomized_interleavings() {
                         debounce: false,
                     }
                 }
+                18 => Event::Mode(match seed >> 8 & 3 {
+                    0 => ClipboardMode::Automatic,
+                    1 => ClipboardMode::Manual,
+                    _ => ClipboardMode::Off,
+                }),
+                19 => {
+                    token += 1;
+                    Event::Share {
+                        token,
+                        id: id(token as u8),
+                        source: id(1),
+                        offer: offer(token, &[2, 3]),
+                    }
+                }
+                20 if !model.state.sharing.is_empty() => {
+                    Event::Deadline(*model.state.sharing.keys().min().unwrap())
+                }
+                21 => Event::ShareReady {
+                    token: 1_000_000 + token,
+                    content: Some(content("stale share")),
+                },
                 7 => Event::Narrow(id(if seed & 128 == 0 { 2 } else { 3 })),
                 8 => Event::Policy {
                     allowed: offer(token, if seed & 128 == 0 { &[2, 4] } else { &[2, 3, 4] })
@@ -1870,32 +1923,60 @@ fn repair_payload_tracks_local_and_deduplicated_winners_across_all_formats() {
 }
 
 #[test]
-fn unavailable_winner_payload_declines_repair_after_restart_and_no_write_dedup() {
-    let mut model = Compositor::default();
-    model.event(Event::Submit(remote(10, 2, 100, "older")));
-    model.settle();
-    model.event(Event::Submit(remote(20, 2, 200, "winner")));
-    model.settle();
-    model.state = State::load(
-        model.state.register.clone(),
-        HashMap::new(),
-        model.state.history.iter().cloned().collect(),
-        model.state.fingerprint_key.clone(),
-    );
-    model.installed.clear();
-    model.live.clear();
-    model.copy(30, Some(content("winner")), &[2]);
-    model.settle();
-    model.event(Event::Submit(remote(40, 3, 300, "winner")));
-    model.settle();
-    assert!(model.state.current.as_ref().unwrap().payload.is_none());
-    let register = model.state.register.clone();
-    model.copy(50, Some(content("older")), &[2]);
-    model.settle();
-    assert!(model.installed.is_empty());
-    assert_eq!(model.os, Some(content("older")));
-    assert_eq!(model.state.register, register);
-    assert!(!model.state.os_current);
+fn restart_repairs_only_when_winner_payload_was_captured() {
+    for captured in [false, true] {
+        let mut model = Compositor::default();
+        model.event(Event::Submit(remote(10, 2, 100, "older")));
+        model.settle();
+        model.event(Event::Submit(remote(20, 2, 200, "winner")));
+        model.settle();
+        model.state = State::load(
+            model.state.register.clone(),
+            HashMap::new(),
+            model.state.history.iter().cloned().collect(),
+            model.state.fingerprint_key.clone(),
+        );
+        model.installed.clear();
+        model.live.clear();
+        model.stopped.clear();
+        model.os = Some(content("winner"));
+        model.event(Event::Observe {
+            token: 30,
+            id: id(30),
+            offer: None,
+            origin: false,
+            clear: false,
+        });
+        // Unsupported representations can still report echo fingerprints without
+        // a usable payload. Only actual captured bytes may enable later repairs.
+        model.event(Event::Read {
+            token: 30,
+            content: captured.then(|| content("winner")),
+            fingerprints: hashes(&content("winner")),
+            debounce: false,
+        });
+        model.settle();
+        model.event(Event::Submit(remote(40, 3, 300, "winner")));
+        model.settle();
+        assert_eq!(
+            model.state.current.as_ref().unwrap().payload.is_some(),
+            captured
+        );
+        let register = model.state.register.clone();
+        model.copy(50, Some(content("older")), &[2]);
+        model.settle();
+        assert_eq!(model.installed.len(), usize::from(captured));
+        assert_eq!(
+            model.os,
+            Some(content(if captured { "winner" } else { "older" }))
+        );
+        assert_eq!(model.state.register, register);
+        assert!(model.state.os_current);
+        assert_eq!(
+            model.state.current.as_ref().unwrap().key == register,
+            captured
+        );
+    }
 }
 
 #[test]
@@ -2084,4 +2165,694 @@ fn lost_reader_completion_has_a_terminal_timer_and_cannot_block_reception() {
         "unread bytes must never be published"
     );
     assert!(model.state.step(Event::ReadTimeout(10)).is_empty());
+}
+
+#[test]
+fn initial_selection_is_manual_only_across_modes_and_watcher_restarts() {
+    for initial_mode in [
+        ClipboardMode::Automatic,
+        ClipboardMode::Manual,
+        ClipboardMode::Off,
+    ] {
+        for value in [
+            content("startup"),
+            Content::Image(vec![1, 2, 3]),
+            Content::Formats("startup".into(), vec![1, 2, 3]),
+        ] {
+            for change_during_read in [false, true] {
+                let mut m = Compositor::default();
+                m.event(Event::Mode(initial_mode));
+                for (token, mode) in [
+                    (10, initial_mode),
+                    (30, ClipboardMode::Off),
+                    (50, ClipboardMode::Automatic),
+                ] {
+                    m.event(Event::Mode(mode));
+                    m.os = Some(value.clone());
+                    // Every watcher generation starts without an automatic offer.
+                    m.event(Event::Observe {
+                        token,
+                        id: id(token as u8),
+                        offer: None,
+                        origin: false,
+                        clear: false,
+                    });
+                    if change_during_read {
+                        m.event(Event::Mode(ClipboardMode::Manual));
+                    }
+                    m.event(Event::Read {
+                        token,
+                        content: Some(value.clone()),
+                        fingerprints: vec![],
+                        debounce: false,
+                    });
+                    m.settle();
+                    assert!(m.published.is_empty());
+                    assert!(m.state.os_current);
+                    assert_eq!(
+                        m.state
+                            .current
+                            .as_ref()
+                            .unwrap()
+                            .payload
+                            .as_deref()
+                            .map(|p| match p {
+                                Payload::Content(c) => c,
+                                _ => panic!("in-memory selection"),
+                            }),
+                        Some(&value)
+                    );
+                }
+                m.event(Event::Mode(ClipboardMode::Manual));
+                m.event(Event::Share {
+                    token: 60,
+                    id: id(60),
+                    source: id(1),
+                    offer: offer(60, &[2, 3]),
+                });
+                m.settle();
+                assert_eq!(m.replies[&60].1, None);
+                assert_eq!(m.published.len(), 1);
+                assert_eq!(m.published[0].content, Some(value.clone()));
+            }
+        }
+    }
+}
+
+#[test]
+fn initial_received_echo_restores_payload_without_advancing_or_repairing_register() {
+    for older in [false, true] {
+        for value in [
+            content("received"),
+            Content::Image(vec![4, 5]),
+            Content::Formats("received".into(), vec![4, 5]),
+        ] {
+            let fingerprint_key = FingerprintKey::default();
+            let fingerprint = Fingerprint {
+                id: id(2),
+                key: Key {
+                    hlc: 10,
+                    source: id(2),
+                },
+                hashes: fingerprint_key.hashes(&hashes(&value)),
+            };
+            let register = if older {
+                Key {
+                    hlc: 20,
+                    source: id(3),
+                }
+            } else {
+                fingerprint.key.clone()
+            };
+            let mut m = Compositor {
+                state: State::load(
+                    Some(register.clone()),
+                    HashMap::new(),
+                    vec![fingerprint],
+                    fingerprint_key,
+                ),
+                clock: register.hlc,
+                ..Default::default()
+            };
+            m.event(Event::Mode(ClipboardMode::Automatic));
+            m.os = Some(value.clone());
+            m.event(Event::Observe {
+                token: 30,
+                id: id(30),
+                offer: None,
+                origin: false,
+                clear: false,
+            });
+            m.event(Event::Read {
+                token: 30,
+                content: Some(value.clone()),
+                fingerprints: hashes(&value),
+                debounce: false,
+            });
+            m.settle();
+            assert_eq!(m.state.register, Some(register.clone()));
+            assert_eq!(m.clock, register.hlc);
+            assert!(m.published.is_empty());
+            assert!(m.installed.is_empty());
+            assert!(m.replies[&30].0);
+            // A stripped-marker manager reoffer is still an echo after capture.
+            m.copy(40, Some(value.clone()), &[2, 3]);
+            m.settle();
+            assert_eq!(m.state.register, Some(register));
+            assert!(m.published.is_empty());
+            m.event(Event::Mode(ClipboardMode::Manual));
+            m.event(Event::Share {
+                token: 50,
+                id: id(50),
+                source: id(1),
+                offer: offer(50, &[2, 3]),
+            });
+            m.settle();
+            assert_eq!(m.replies[&50].1, None);
+            assert_eq!(m.published.len(), 1);
+            assert_eq!(m.published[0].content, Some(value));
+            assert_eq!(
+                m.published[0]
+                    .offer
+                    .as_ref()
+                    .unwrap()
+                    .recipients
+                    .iter()
+                    .map(|r| r.target.device.clone())
+                    .collect::<Vec<_>>(),
+                vec![id(3)]
+            );
+        }
+    }
+}
+
+#[test]
+fn initial_older_echo_can_recover_the_current_winner_payload_on_next_observation() {
+    let fingerprint_key = FingerprintKey::default();
+    let history = [(2, "older"), (3, "winner")]
+        .into_iter()
+        .map(|(n, text)| Fingerprint {
+            id: id(n),
+            key: Key {
+                hlc: n as u64,
+                source: id(n),
+            },
+            hashes: fingerprint_key.hashes(&hashes(&content(text))),
+        })
+        .collect::<Vec<_>>();
+    let register = history[1].key.clone();
+    let mut m = Compositor {
+        state: State::load(
+            Some(register.clone()),
+            HashMap::new(),
+            history,
+            fingerprint_key,
+        ),
+        clock: register.hlc,
+        ..Default::default()
+    };
+    m.os = Some(content("older"));
+    m.event(Event::Observe {
+        token: 10,
+        id: id(10),
+        offer: None,
+        origin: false,
+        clear: false,
+    });
+    m.event(Event::Read {
+        token: 10,
+        content: m.os.clone(),
+        fingerprints: vec![],
+        debounce: false,
+    });
+    m.settle();
+    assert_ne!(
+        m.state.current.as_ref().unwrap().key,
+        Some(register.clone())
+    );
+    m.copy(20, Some(content("winner")), &[2, 3, 4]);
+    m.settle();
+    assert_eq!(m.state.register, Some(register.clone()));
+    assert_eq!(m.state.current.as_ref().unwrap().key, Some(register));
+    assert!(m.installed.is_empty());
+    assert!(m.published.is_empty());
+    m.event(Event::Mode(ClipboardMode::Manual));
+    m.event(Event::Share {
+        token: 30,
+        id: id(30),
+        source: id(1),
+        offer: offer(30, &[2, 3, 4]),
+    });
+    m.settle();
+    assert_eq!(m.replies[&30].1, None);
+    assert_eq!(m.published[0].content, Some(content("winner")));
+    assert_eq!(
+        m.published[0]
+            .offer
+            .as_ref()
+            .unwrap()
+            .recipients
+            .iter()
+            .map(|r| r.target.device.clone())
+            .collect::<Vec<_>>(),
+        vec![id(2), id(4)]
+    );
+}
+
+#[test]
+fn initial_mixed_echo_keeps_each_representations_received_source() {
+    let value = Content::Formats("received text".into(), vec![7, 8, 9]);
+    let fingerprint_key = FingerprintKey::default();
+    let fingerprints = fingerprint_key.hashes(&hashes(&value));
+    let history: Vec<_> = [2, 3]
+        .into_iter()
+        .enumerate()
+        .map(|(i, source)| Fingerprint {
+            id: id(source),
+            key: Key {
+                hlc: source as u64,
+                source: id(source),
+            },
+            hashes: vec![fingerprints[i]],
+        })
+        .collect();
+    let register = history[1].key.clone();
+    let mut m = Compositor {
+        state: State::load(
+            Some(register.clone()),
+            HashMap::new(),
+            history,
+            fingerprint_key,
+        ),
+        clock: register.hlc,
+        ..Default::default()
+    };
+    m.os = Some(value.clone());
+    m.event(Event::Observe {
+        token: 10,
+        id: id(10),
+        offer: None,
+        origin: false,
+        clear: false,
+    });
+    m.event(Event::Read {
+        token: 10,
+        content: Some(value),
+        fingerprints: vec![],
+        debounce: false,
+    });
+    m.settle();
+    assert_eq!(m.state.register, Some(register));
+    assert!(m.published.is_empty());
+    m.event(Event::Mode(ClipboardMode::Manual));
+    m.event(Event::Share {
+        token: 20,
+        id: id(20),
+        source: id(1),
+        offer: offer(20, &[2, 3, 4]),
+    });
+    m.settle();
+    let recipients = &m.published[0].offer.as_ref().unwrap().recipients;
+    assert_eq!(
+        recipients
+            .iter()
+            .map(|r| (r.target.device.clone(), r.text, r.image))
+            .collect::<Vec<_>>(),
+        vec![
+            (id(2), false, true),
+            (id(3), true, false),
+            (id(4), true, true)
+        ]
+    );
+}
+
+#[test]
+fn initial_read_timeout_recovers_on_next_watcher_snapshot_without_publication() {
+    let mut m = Compositor::default();
+    m.event(Event::Mode(ClipboardMode::Off));
+    m.event(Event::Observe {
+        token: 10,
+        id: id(10),
+        offer: None,
+        origin: false,
+        clear: false,
+    });
+    m.event(Event::Mode(ClipboardMode::Automatic));
+    m.event(Event::ReadTimeout(10));
+    m.settle();
+    assert!(m.state.idle());
+    assert!(m.published.is_empty());
+    m.os = Some(content("recovered"));
+    m.event(Event::Observe {
+        token: 20,
+        id: id(20),
+        offer: None,
+        origin: false,
+        clear: false,
+    });
+    m.event(Event::Read {
+        token: 20,
+        content: m.os.clone(),
+        fingerprints: vec![],
+        debounce: false,
+    });
+    m.settle();
+    assert!(m.published.is_empty());
+    m.event(Event::Mode(ClipboardMode::Manual));
+    m.event(Event::Share {
+        token: 30,
+        id: id(30),
+        source: id(1),
+        offer: offer(30, &[2]),
+    });
+    m.settle();
+    assert_eq!(m.replies[&30].1, None);
+    assert_eq!(m.published[0].content, Some(content("recovered")));
+}
+
+#[test]
+fn clipboard_mode_matrix_preserves_ordering_and_received_provenance() {
+    for mode in [
+        ClipboardMode::Automatic,
+        ClipboardMode::Manual,
+        ClipboardMode::Off,
+    ] {
+        let mut m = Compositor::default();
+        m.event(Event::Mode(mode));
+        m.os = Some(content("human"));
+        m.event(Event::Observe {
+            token: 1,
+            id: id(1),
+            offer: Some(offer(1, &[2, 3])),
+            origin: false,
+            clear: false,
+        });
+        m.event(Event::Read {
+            token: 1,
+            content: Some(content("human")),
+            fingerprints: vec![],
+            debounce: false,
+        });
+        m.settle();
+        assert!(m.state.register.is_some());
+        assert_eq!(
+            m.published.len(),
+            usize::from(mode == ClipboardMode::Automatic)
+        );
+        m.event(Event::Share {
+            token: 2,
+            id: id(2),
+            source: id(1),
+            offer: offer(2, &[2, 3]),
+        });
+        m.settle();
+        assert_eq!(
+            m.published.len(),
+            if mode == ClipboardMode::Off { 0 } else { 1 }
+        );
+        m.event(Event::Submit(remote(3, 2, m.clock + 10, "received")));
+        m.settle();
+        assert_eq!(
+            m.os.as_ref().and_then(|c| if let Content::Text(t) = c {
+                Some(t.as_str())
+            } else {
+                None
+            }),
+            Some("received")
+        );
+        let before = m.published.len();
+        m.event(Event::Share {
+            token: 4,
+            id: id(4),
+            source: id(1),
+            offer: offer(4, &[2, 3]),
+        });
+        m.settle();
+        assert_eq!(
+            m.published.len(),
+            before + usize::from(mode == ClipboardMode::Manual)
+        );
+        if mode == ClipboardMode::Manual {
+            assert_eq!(
+                m.published
+                    .last()
+                    .unwrap()
+                    .offer
+                    .as_ref()
+                    .unwrap()
+                    .recipients
+                    .iter()
+                    .map(|r| r.target.device.clone())
+                    .collect::<Vec<_>>(),
+                vec![id(3)]
+            );
+        }
+    }
+}
+#[test]
+fn changing_clipboard_mode_cannot_republish_pending_or_late_manual_content() {
+    let mut m = Compositor::default();
+    m.event(Event::Mode(ClipboardMode::Manual));
+    m.os = Some(content("human"));
+    m.event(Event::Observe {
+        token: 1,
+        id: id(1),
+        offer: Some(offer(1, &[2])),
+        origin: false,
+        clear: false,
+    });
+    m.event(Event::Read {
+        token: 1,
+        content: Some(content("human")),
+        fingerprints: vec![],
+        debounce: false,
+    });
+    m.settle();
+    m.event(Event::Share {
+        token: 2,
+        id: id(2),
+        source: id(1),
+        offer: offer(2, &[2]),
+    });
+    m.event(Event::Mode(ClipboardMode::Off));
+    m.event(Event::Mode(ClipboardMode::Automatic));
+    m.settle();
+    assert!(m.published.is_empty());
+}
+
+#[test]
+fn pairing_link_hint_is_local_current_and_does_not_change_sharing() {
+    for mode in [
+        ClipboardMode::Automatic,
+        ClipboardMode::Manual,
+        ClipboardMode::Off,
+    ] {
+        let mut state = State::default();
+        state.step(Event::Mode(mode));
+        state.step(Event::Observe {
+            token: 1,
+            id: id(1),
+            offer: Some(offer(1, &[2])),
+            origin: false,
+            clear: false,
+        });
+        let link = content("pneu://pair?ui-hint");
+        let effects = state.step(Event::Read {
+            token: 1,
+            fingerprints: hashes(&link),
+            content: Some(link.clone()),
+            debounce: false,
+        });
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::PairingLink(Some(s)) if s == "pneu://pair?ui-hint"))
+        );
+        let local = state
+            .clocking
+            .as_ref()
+            .expect("normal local classification still clocks");
+        assert_eq!(local.content, Some(link));
+        assert_eq!(local.offer.is_some(), mode == ClipboardMode::Automatic);
+        let effects = state.step(Event::Observe {
+            token: 2,
+            id: id(2),
+            offer: None,
+            origin: false,
+            clear: false,
+        });
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::PairingLink(None)))
+        );
+        let stale = content("pneu://pair?stale");
+        let effects = state.step(Event::Read {
+            token: 1,
+            fingerprints: hashes(&stale),
+            content: Some(stale),
+            debounce: false,
+        });
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::PairingLink(Some(_))))
+        );
+        let effects = state.step(Event::Read {
+            token: 2,
+            fingerprints: vec![],
+            content: Some(content("ordinary text")),
+            debounce: false,
+        });
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::PairingLink(None)))
+        );
+        let effects = state.step(Event::Submit(remote(3, 2, 50, "pneu://pair?remote")));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::PairingLink(Some(_))))
+        );
+    }
+}
+
+#[test]
+fn manual_queued_share_keeps_captured_identity_through_clock_and_incoming() {
+    let mut model = Compositor::default();
+    model.event(Event::Mode(ClipboardMode::Manual));
+    model.copy(10, Some(content("human")), &[2, 3]);
+    model.settle();
+    for token in [20, 21] {
+        model.event(Event::Share {
+            token,
+            id: id(token as u8),
+            source: id(1),
+            offer: offer(token, &[2, 3]),
+        });
+    }
+    // Finish both reads while the first clock is outstanding. The second share
+    // must retain the original register, rather than becoming a new local edit.
+    for token in [20, 21] {
+        model.event(Event::ShareReady {
+            token,
+            content: Some(content("human")),
+        });
+    }
+    model.event(Event::Submit(remote(30, 2, model.clock + 10, "remote")));
+    model.settle();
+    model.consistent();
+    assert_eq!(model.os, Some(content("remote")));
+    assert!(model.published.is_empty());
+    assert!(model.replies[&21].1.is_some());
+    assert!(model.state.manual.is_empty());
+}
+#[test]
+fn manual_clocking_share_is_cancelled_by_new_physical_selection() {
+    let mut model = Compositor::default();
+    model.event(Event::Mode(ClipboardMode::Manual));
+    model.copy(10, Some(content("first")), &[2]);
+    model.settle();
+    model.event(Event::Share {
+        token: 20,
+        id: id(20),
+        source: id(1),
+        offer: offer(20, &[2]),
+    });
+    model.event(Event::ShareReady {
+        token: 20,
+        content: Some(content("first")),
+    });
+    model.copy(30, Some(content("second")), &[2]);
+    model.settle();
+    model.consistent();
+    assert!(model.published.is_empty());
+    assert!(model.replies[&20].1.is_some());
+    assert_eq!(model.os, Some(content("second")));
+}
+#[test]
+fn manual_publication_requires_at_least_one_accepted_recipient() {
+    for narrowed in [false, true] {
+        let mut model = Compositor::default();
+        model.event(Event::Mode(ClipboardMode::Manual));
+        model.copy(10, Some(content("share")), &[2]);
+        model.settle();
+        model.event(Event::Share {
+            token: 20,
+            id: id(20),
+            source: id(1),
+            offer: offer(20, &[2]),
+        });
+        while !model
+            .pending
+            .iter()
+            .any(|e| matches!(e, Event::Persisted { token: 20, .. }))
+        {
+            assert!(model.tick());
+        }
+        if narrowed {
+            model.event(Event::Narrow(id(2)));
+            model.settle();
+        } else {
+            while !model
+                .pending
+                .iter()
+                .any(|e| matches!(e, Event::Published { token: 20, .. }))
+            {
+                assert!(model.tick());
+            }
+            assert!(!model.replies.contains_key(&20));
+            model
+                .pending
+                .retain(|e| !matches!(e, Event::Published { token: 20, .. }));
+            model.event(Event::Published {
+                token: 20,
+                accepted: false,
+            });
+            model.settle();
+        }
+        assert!(model.replies[&20].1.is_some());
+        assert!(model.state.manual.is_empty());
+    }
+}
+#[test]
+fn manual_mixed_formats_exclude_received_source_per_representation() {
+    let mut model = Compositor::default();
+    model.event(Event::Mode(ClipboardMode::Manual));
+    let mut incoming = remote(10, 2, 100, "unused");
+    incoming.content = Some(Content::Image(vec![1, 2, 3]));
+    incoming.hashes = hashes(incoming.content.as_ref().unwrap());
+    model.event(Event::Submit(incoming));
+    model.settle();
+    model.copy(
+        20,
+        Some(Content::Formats("local".into(), vec![1, 2, 3])),
+        &[2, 3],
+    );
+    model.settle();
+    model.event(Event::Share {
+        token: 30,
+        id: id(30),
+        source: id(1),
+        offer: offer(30, &[2, 3]),
+    });
+    model.settle();
+    let recipients = &model.published[0].offer.as_ref().unwrap().recipients;
+    let source = recipients
+        .iter()
+        .find(|r| r.target.device == id(2))
+        .unwrap();
+    assert!(source.text);
+    assert!(!source.image);
+    let other = recipients
+        .iter()
+        .find(|r| r.target.device == id(3))
+        .unwrap();
+    assert!(other.text && other.image);
+}
+#[test]
+fn manual_changed_image_bytes_are_rejected_before_clocking() {
+    let mut model = Compositor::default();
+    model.event(Event::Mode(ClipboardMode::Manual));
+    let mut incoming = remote(10, 2, 100, "unused");
+    incoming.content = Some(Content::Image(vec![1, 2, 3]));
+    incoming.hashes = hashes(incoming.content.as_ref().unwrap());
+    model.event(Event::Submit(incoming));
+    model.settle();
+    let register = model.state.register.clone();
+    model.event(Event::Share {
+        token: 20,
+        id: id(20),
+        source: id(1),
+        offer: offer(20, &[3]),
+    });
+    model.event(Event::ShareReady {
+        token: 20,
+        content: Some(Content::Image(vec![4, 5, 6])),
+    });
+    model.settle();
+    assert_eq!(model.state.register, register);
+    assert!(model.published.is_empty());
+    assert!(model.replies[&20].1.is_some());
 }

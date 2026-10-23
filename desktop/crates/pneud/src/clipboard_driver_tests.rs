@@ -840,3 +840,381 @@ async fn lost_read_completion_expires_and_releases_the_actor_without_user_activi
     assert_eq!(core.store.active_jobs(), 0);
     Ok(())
 }
+
+#[tokio::test]
+async fn initial_selection_driver_never_publishes_until_manual_share() -> Result<()> {
+    for mode in [
+        ClipboardMode::Automatic,
+        ClipboardMode::Manual,
+        ClipboardMode::Off,
+    ] {
+        for value in payload_formats("already on clipboard") {
+            let dir = crate::test_support::scratch()?;
+            let actions = Arc::new(PayloadActions::default());
+            let core = payload_core(dir.path(), actions.clone()).await?;
+            core.set_setting("clipboard_include_images".into(), true.into())
+                .await?;
+            core.set_setting("clipboard_mode".into(), serde_json::to_value(mode)?)
+                .await?;
+            let (_peer, _connection) = connect_clipboard_peer(&core, 3).await?;
+            let (offer, token) = core.observe_watched_clipboard_kind(false, false, true);
+            assert!(offer.is_none());
+            core.clipboard_test_read(token, Some(value.clone())).await;
+            core.clipboard_test_idle().await;
+            assert!(core.automatic.lock().unwrap().selections.is_empty());
+            let result = core
+                .share_clipboard(crate::outbox::Targets::All("all".into()))
+                .await;
+            assert_eq!(result.is_ok(), mode == ClipboardMode::Manual);
+            core.clipboard_test_idle().await;
+            core.automatic.lock().unwrap().invalidate();
+            // Off keeps observing. Enabling either mode must not publish the
+            // old selection, even if the bounded initial read is still pending.
+            for next in [ClipboardMode::Automatic, ClipboardMode::Manual] {
+                core.set_setting("clipboard_mode".into(), "off".into())
+                    .await?;
+                let (_, token) = core.observe_watched_clipboard_kind(false, false, true);
+                core.set_setting("clipboard_mode".into(), serde_json::to_value(next)?)
+                    .await?;
+                core.clipboard_test_read(token, Some(value.clone())).await;
+                core.clipboard_test_idle().await;
+                assert!(core.automatic.lock().unwrap().selections.is_empty());
+            }
+            assert!(
+                core.share_clipboard(crate::outbox::Targets::All("all".into()))
+                    .await
+                    .is_ok()
+            );
+            core.clipboard_test_idle().await;
+            assert_eq!(core.automatic.lock().unwrap().selections.len(), 1);
+            assert!(actions.installed.lock().unwrap().is_empty());
+            core.shutdown_actions().await?;
+        }
+    }
+    Ok(())
+}
+
+async fn connect_clipboard_peer(
+    core: &Core,
+    n: u8,
+) -> Result<(Id, watch::Receiver<Option<crate::core::CloseReason>>)> {
+    use crate::core::{CloseReason, Session};
+    let peer = Id::from_bytes([n; 16]);
+    let fingerprint = pneu_proto::Hash::new(format!("{n:x}").repeat(64))?;
+    core.store.pair(peer.clone(), fingerprint.clone()).await?;
+    core.admission
+        .lock()
+        .unwrap()
+        .peers
+        .insert(fingerprint, peer.clone());
+    let (close, connection) = watch::channel::<Option<CloseReason>>(None);
+    core.sessions.lock().unwrap().sessions.insert(
+        peer.clone(),
+        Session {
+            device: peer.clone(),
+            id: 1,
+            close,
+            wake: Arc::new(tokio::sync::Notify::new()),
+            paused: false,
+            capabilities: vec![
+                "mesh".into(),
+                "clipboard_text".into(),
+                "clipboard_image".into(),
+            ],
+            outbound: false,
+            mesh: true,
+            role: "phone".into(),
+            phone: Default::default(),
+        },
+    );
+    Ok((peer, connection))
+}
+
+#[tokio::test]
+async fn initial_received_echo_driver_survives_daemon_restart_and_excludes_source() -> Result<()> {
+    for older in [false, true] {
+        for value in payload_formats("received before restart") {
+            let dir = crate::test_support::scratch()?;
+            let core = payload_core(dir.path(), Arc::new(PayloadActions::default())).await?;
+            submit_payload(&core, &value).await?;
+            if older {
+                submit_payload(&core, &Content::Text("later winner".into())).await?;
+            }
+            let before = core.store.clipboard_snapshot().await?.0;
+            core.shutdown_actions().await?;
+            drop(core);
+            let actions = Arc::new(PayloadActions::default());
+            let core = payload_core(dir.path(), actions.clone()).await?;
+            core.set_setting("clipboard_include_images".into(), true.into())
+                .await?;
+            let (source, _source_connection) = connect_clipboard_peer(&core, 2).await?;
+            let (other, _other_connection) = connect_clipboard_peer(&core, 3).await?;
+            let (offer, token) = core.observe_watched_clipboard_kind(false, false, true);
+            assert!(offer.is_none());
+            core.clipboard_test_read(token, Some(value.clone())).await;
+            core.clipboard_test_idle().await;
+            assert_eq!(core.store.clipboard_snapshot().await?.0, before);
+            assert!(core.automatic.lock().unwrap().selections.is_empty());
+            assert!(actions.installed.lock().unwrap().is_empty());
+            core.set_setting("clipboard_mode".into(), "manual".into())
+                .await?;
+            assert!(
+                core.share_clipboard(crate::outbox::Targets::All("all".into()))
+                    .await
+                    .is_ok()
+            );
+            core.clipboard_test_idle().await;
+            let selections = core.automatic.lock().unwrap().selections.clone();
+            assert!(!selections.contains_key(&source));
+            assert!(selections.contains_key(&other));
+            core.shutdown_actions().await?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn initial_selection_driver_recovers_after_compositor_disconnect() -> Result<()> {
+    for value in payload_formats("restored selection") {
+        let dir = crate::test_support::scratch()?;
+        let actions = Arc::new(PayloadActions::default());
+        let core = payload_core(dir.path(), actions.clone()).await?;
+        core.set_setting("clipboard_include_images".into(), true.into())
+            .await?;
+        submit_payload(&core, &value).await?;
+        let (source, _source_connection) = connect_clipboard_peer(&core, 2).await?;
+        let (other, _other_connection) = connect_clipboard_peer(&core, 3).await?;
+        core.set_setting("clipboard_mode".into(), "manual".into())
+            .await?;
+        // The watcher invalidates the cached selection when its connection dies.
+        let (_, token) = core.observe_watched_clipboard_kind(false, true, true);
+        core.clipboard_test_read(token, None).await;
+        core.clipboard_test_idle().await;
+        assert!(
+            core.share_clipboard(crate::outbox::Targets::All("all".into()))
+                .await
+                .is_err()
+        );
+        let before = core.store.clipboard_snapshot().await?.0;
+        let (offer, token) = core.observe_watched_clipboard_kind(false, false, true);
+        assert!(offer.is_none());
+        core.clipboard_test_read(token, Some(value)).await;
+        core.clipboard_test_idle().await;
+        assert_eq!(core.store.clipboard_snapshot().await?.0, before);
+        assert!(core.automatic.lock().unwrap().selections.is_empty());
+        assert!(
+            core.share_clipboard(crate::outbox::Targets::All("all".into()))
+                .await
+                .is_ok()
+        );
+        core.clipboard_test_idle().await;
+        {
+            let automatic = core.automatic.lock().unwrap();
+            assert!(!automatic.selections.contains_key(&source));
+            assert!(automatic.selections.contains_key(&other));
+        }
+        assert_eq!(actions.installed.lock().unwrap().len(), 1);
+        core.shutdown_actions().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn clipboard_mode_driver_matrix_respects_pair_direction_and_never_queues() -> Result<()> {
+    use crate::core::{CloseReason, Session};
+    for mode in [
+        ClipboardMode::Automatic,
+        ClipboardMode::Manual,
+        ClipboardMode::Off,
+    ] {
+        for allowed in [true, false] {
+            let dir = crate::test_support::scratch()?;
+            let core = Core::new(
+                Paths {
+                    data: dir.path().join("data"),
+                    cache: dir.path().join("cache"),
+                    config: dir.path().join("config/config.toml"),
+                    socket: dir.path().join("socket"),
+                },
+                Config {
+                    port: 49101,
+                    save_path: dir.path().join("saved"),
+                    clipboard_mode: mode,
+                    queue_offline: true,
+                    ..Config::default()
+                },
+                Arc::new(Actions(0)),
+            )
+            .await?;
+            let peer = Id::from_bytes([9; 16]);
+            let fp = pneu_proto::Hash::new("9".repeat(64))?;
+            core.store.pair(peer.clone(), fp.clone()).await?;
+            core.admission
+                .lock()
+                .unwrap()
+                .peers
+                .insert(fp, peer.clone());
+            core.store.pair_settings.lock().unwrap().insert(
+                peer.clone(),
+                vec![pneu_proto::PeerSetting {
+                    key: format!("{}/{peer}/clipboard", core.identity.device_id),
+                    enabled: allowed,
+                    hlc: 1,
+                    writer_device: core.identity.device_id.clone(),
+                }],
+            );
+            let (close, _rx) = watch::channel::<Option<CloseReason>>(None);
+            core.sessions.lock().unwrap().sessions.insert(
+                peer.clone(),
+                Session {
+                    device: peer.clone(),
+                    id: 1,
+                    close,
+                    wake: Arc::new(tokio::sync::Notify::new()),
+                    paused: false,
+                    capabilities: vec!["mesh".into(), "clipboard_text".into()],
+                    outbound: false,
+                    mesh: true,
+                    role: "phone".into(),
+                    phone: Default::default(),
+                },
+            );
+            let (_, token) = core.observe_watched_clipboard(false);
+            core.clipboard_test_read(
+                token,
+                Some(crate::ui::clipboard::Content::Text(
+                    "manual candidate".into(),
+                )),
+            )
+            .await;
+            core.clipboard_test_idle().await;
+            assert_eq!(
+                core.automatic.lock().unwrap().selections.len(),
+                usize::from(mode == ClipboardMode::Automatic && allowed)
+            );
+            let result = core
+                .share_clipboard(crate::outbox::Targets::All("all".into()))
+                .await;
+            assert_eq!(result.is_ok(), mode == ClipboardMode::Manual && allowed);
+            core.clipboard_test_idle().await;
+            core.sessions.lock().unwrap().sessions.clear();
+            core.automatic.lock().unwrap().invalidate();
+            assert!(
+                core.share_clipboard(crate::outbox::Targets::All("all".into()))
+                    .await
+                    .is_err()
+            );
+            assert!(core.outbox.snapshot(&[]).is_empty());
+            core.shutdown_actions().await?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_clipboard_off_migrates_and_the_new_mode_can_enable_sharing() -> Result<()> {
+    let dir = crate::test_support::scratch()?;
+    let paths = Paths {
+        data: dir.path().join("data"),
+        cache: dir.path().join("cache"),
+        config: dir.path().join("config/config.toml"),
+        socket: dir.path().join("socket"),
+    };
+    paths.prepare()?;
+    let config = Config {
+        port: 49102,
+        save_path: dir.path().join("saved"),
+        clipboard_sync_to_phone: false,
+        ..Config::default()
+    };
+    config.save(&paths.config)?;
+    let text = std::fs::read_to_string(&paths.config)?
+        .lines()
+        .filter(|l| !l.starts_with("clipboard_mode"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&paths.config, text)?;
+    let config = Config::load(&paths.config)?;
+    assert_eq!(config.clipboard_mode, ClipboardMode::Off);
+    let core = Core::new(paths, config, Arc::new(Actions(0))).await?;
+    core.set_setting("clipboard_mode".into(), "manual".into())
+        .await?;
+    assert_eq!(core.config().clipboard_mode, ClipboardMode::Manual);
+    assert!(core.config().clipboard_sync_to_phone);
+    core.set_setting("clipboard_mode".into(), "off".into())
+        .await?;
+    assert!(!core.config().clipboard_sync_to_phone);
+    core.shutdown_actions().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn manual_share_verifies_file_backed_image_against_captured_representations() -> Result<()> {
+    use crate::core::{CloseReason, Session};
+    for edited in [false, true] {
+        let dir = crate::test_support::scratch()?;
+        let actions = Arc::new(PayloadActions::default());
+        let core = payload_core(dir.path(), actions).await?;
+        core.set_setting("clipboard_mode".into(), "manual".into())
+            .await?;
+        core.set_setting("clipboard_include_images".into(), true.into())
+            .await?;
+        let peer = Id::from_bytes([3; 16]);
+        let fingerprint = pneu_proto::Hash::new("3".repeat(64))?;
+        core.store.pair(peer.clone(), fingerprint.clone()).await?;
+        core.admission
+            .lock()
+            .unwrap()
+            .peers
+            .insert(fingerprint, peer.clone());
+        let (close, _receiver) = watch::channel::<Option<CloseReason>>(None);
+        core.sessions.lock().unwrap().sessions.insert(
+            peer.clone(),
+            Session {
+                device: peer.clone(),
+                id: 1,
+                close,
+                wake: Arc::new(tokio::sync::Notify::new()),
+                paused: false,
+                capabilities: vec!["clipboard_text".into(), "clipboard_image".into()],
+                outbound: false,
+                mesh: false,
+                role: "phone".into(),
+                phone: Default::default(),
+            },
+        );
+        let bytes = b"captured png bytes".to_vec();
+        submit_payload(&core, &Content::Image(bytes.clone())).await?;
+        if edited {
+            for entry in std::fs::read_dir(&core.paths.cache)? {
+                let path = entry?.path();
+                if path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("received-")
+                {
+                    std::fs::write(path, b"edited png bytes")?;
+                }
+            }
+        }
+        let result = core
+            .share_clipboard(crate::outbox::Targets::All("all".into()))
+            .await;
+        assert_eq!(result.is_ok(), !edited);
+        {
+            let automatic = core.automatic.lock().unwrap();
+            if edited {
+                assert!(automatic.selections.is_empty());
+            } else {
+                let work = automatic.selections.get(&peer).unwrap();
+                let crate::core::OutgoingSelection::Image(_, actual) = &work.selection else {
+                    panic!("image selection")
+                };
+                assert_eq!(**actual, bytes);
+            }
+        }
+        core.shutdown_actions().await?;
+    }
+    Ok(())
+}

@@ -38,7 +38,7 @@ pub async fn run(
             None
         }
     };
-    let watcher = match super::clipboard::Watch::start(core.clone()) {
+    let mut watcher = match super::clipboard::Watch::start(core.clone()) {
         Ok(watcher) => Some(watcher),
         Err(error) => {
             eprintln!("pneud: clipboard watch unavailable: {error}");
@@ -46,6 +46,8 @@ pub async fn run(
         }
     };
     let mut window: Option<Child> = None;
+    // Tray actions that wait on a file picker or on Core.
+    let mut sending = tokio::task::JoinSet::new();
     let mut folder_open: Option<futures_util::future::BoxFuture<'static, Result<()>>> = None;
     let mut last_request = 0;
     let mut last_blocked = None;
@@ -86,7 +88,17 @@ pub async fn run(
                 folder_open=None;
                 if let Err(error)=result { eprintln!("pneud: open folder unavailable: {error}"); let mut notice=Notice::new("Couldn't open folder"); notice.body=error.to_string(); let _=actions.notice(notice,Vec::new(),None,0,None).await; }
             },
-            _=timer.tick()=>{refresh_icons = themes.timer(Instant::now());},
+            _=timer.tick()=>{
+                refresh_icons = themes.timer(Instant::now());
+                if watcher.as_ref().is_some_and(|watcher| watcher.is_finished()) {
+                    if let Some(stopped) = watcher.take() { stopped.shutdown().await; }
+                    eprintln!("pneud: clipboard watcher stopped; reconnecting");
+                }
+                if watcher.is_none() {
+                    watcher = super::clipboard::Watch::start(core.clone()).ok();
+                }
+            },
+            Some(_)=sending.join_next(),if !sending.is_empty()=>{update_tray=false;},
             Some(())=theme_rx.recv()=>{themes.changed(Instant::now());refresh_icons=true;},
             event=events.recv()=>match event {
                 Ok(Event::Error {message,..})=>eprintln!("pneud: {message}"),
@@ -114,6 +126,25 @@ pub async fn run(
                 Some(Command::OpenFolder)=>{
                     if folder_open.is_none() { let folder=core.config().save_path; folder_open=Some(Box::pin(async move {open_folder(&folder).await})); }
                 }
+                Some(Command::SendFiles {recipients, targeted})=>{
+                    if let Err(error) = core.present_send(super::window::SendRequest {
+                        id:crate::random_hex(16), paths:None, targets:recipients, clipboard:false, targeted, error:None,
+                    }) { core.notify_send_admission_failure(&error.to_string()).await; }
+                }
+                Some(Command::SendClipboard(recipients))=>{
+                    if let Err(error) = core.present_send(super::window::SendRequest {
+                        id:crate::random_hex(16), paths:None, targets:recipients, clipboard:true, targeted:false, error:None,
+                    }) { core.notify_send_admission_failure(&error.to_string()).await; }
+                },
+                Some(Command::ClipboardMode(mode))=>{
+                    let core=core.clone();
+                    sending.spawn(async move { if let Err(error)=core.set_setting("clipboard_mode".into(),serde_json::json!(mode)).await {eprintln!("pneud: clipboard setting: {error:#}");} });
+                },
+                Some(Command::RetryTransfer {operation,artifact,device})=>{
+                    let core=core.clone();
+                    sending.spawn(async move { if let Err(error)=core.retry_transfer_artifact(operation,Some(artifact),device).await {eprintln!("pneud: retry: {error:#}"); if core.present_send_error(error.to_string()).is_err() {core.notify_send_admission_failure(&error.to_string()).await;}} });
+                },
+                Some(Command::AddDevice {activation_token})=>core.request_add_device_with_activation(activation_token),
                 None=>break,
             },
         }
@@ -162,6 +193,8 @@ pub async fn run(
         }
     }
     drop(folder_open);
+    sending.abort_all();
+    while sending.join_next().await.is_some() {}
     theme_signals.abort();
     let _ = theme_signals.await;
     if let Some(mut window) = window {
@@ -178,6 +211,21 @@ pub async fn run(
     Ok(())
 
         }).await
+}
+
+pub(super) fn file_recipients(
+    targets: Vec<crate::outbox::SendTarget>,
+    device: Option<&pneu_proto::Id>,
+) -> Vec<crate::outbox::Authority> {
+    use crate::file_recipients::{Selection, resolve};
+    let ids = device.map(|d| [d.clone()]);
+    let mode = match &ids {
+        Some(ids) => Selection::Explicit(ids),
+        None => Selection::ConnectedOnly,
+    };
+    resolve(&targets, mode)
+        .expect("valid tray selection")
+        .recipients
 }
 
 // A supplied credential must exist before Slint creates the adapter. There is
@@ -287,6 +335,36 @@ pub(crate) fn clipboard_policy_event(core: &Core, event: &Event) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn all_connected_file_targets_exclude_offline_and_ineligible_devices() {
+        use crate::outbox::SendTarget;
+        use pneu_proto::{Hash, Id};
+        let targets: Vec<_> = (1..=4)
+            .map(|n| SendTarget {
+                device: Id::from_bytes([n; 16]),
+                name: format!("Device {n}"),
+                generation: n as u64,
+                fingerprint: (n != 4).then(|| Hash::new("ab".repeat(32)).unwrap()),
+                eligible: n != 3,
+                would_queue: n == 2,
+                reason: None,
+            })
+            .collect();
+        let connected = file_recipients(targets.clone(), None);
+        assert_eq!(connected.len(), 1);
+        assert_eq!(connected[0].device, targets[0].device);
+        assert_eq!(connected[0].generation, targets[0].generation);
+        assert_eq!(
+            Some(&connected[0].fingerprint),
+            targets[0].fingerprint.as_ref()
+        );
+        // Explicit device selection can queue an offline device.
+        let offline = file_recipients(targets.clone(), Some(&targets[1].device));
+        assert_eq!(offline.len(), 1);
+        assert_eq!(offline[0].device, targets[1].device);
+        assert!(file_recipients(targets.clone(), Some(&targets[2].device)).is_empty());
+        assert!(file_recipients(targets.clone(), Some(&targets[3].device)).is_empty());
+    }
     #[tokio::test]
     async fn activation_reaps_pair_window_and_ignores_chooser_token() -> Result<()> {
         let mut window = Some(

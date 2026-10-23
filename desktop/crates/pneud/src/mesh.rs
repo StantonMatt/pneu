@@ -98,6 +98,8 @@ pub struct DeviceSnapshot {
     pub state: String,
     pub last_seen: u64,
     pub dialer: Option<Id>,
+    #[serde(default)]
+    pub route: Option<String>,
 }
 impl Mesh {
     pub(super) fn new(peers: Vec<PeerInfo>) -> Self {
@@ -195,7 +197,13 @@ impl Core {
                         "disconnected"
                     }
                     .into(),
-                    last_seen: phone.map(|p| p.last_seen).unwrap_or(0),
+                    last_seen: phone
+                        .or_else(|| session.map(|s| &s.phone))
+                        .map(|p| p.last_seen)
+                        .unwrap_or(0),
+                    route: session
+                        .map(|s| s.phone.route.clone())
+                        .filter(|r| !r.is_empty()),
                     dialer: session.map(|s| {
                         if s.outbound {
                             self.identity.device_id.clone()
@@ -374,7 +382,21 @@ impl Core {
             .as_ref()
             .filter(|j| j.attempt == attempt)
             .context("unknown join attempt")?;
-        Ok(join_value(join))
+        let mut value = join_value(join);
+        if join.state == "paired" {
+            if let Some(authority) = &join.authority {
+                value["device"] = json!(authority.peer);
+            } else if let Some(device) = self
+                .admission
+                .lock()
+                .expect("admission")
+                .peers
+                .get(&join.uri.fingerprint)
+            {
+                value["device"] = json!(device);
+            }
+        }
+        Ok(value)
     }
     pub async fn confirm_join(&self, attempt: &str) -> Result<Value> {
         let _guard = self.mesh.gate.lock().await;

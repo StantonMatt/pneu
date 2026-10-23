@@ -1,0 +1,63 @@
+// Pneu's window palette. Plasma (or macOS) supplies the background, text and
+// light/dark scheme; Pneu adds its cards, accent and state colours on top.
+import { Palette } from "std-widgets.slint";
+
+export global WindowFocus {
+    callback changed(bool);
+}
+
+export global Pneu {
+    out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+    out property <color> card: dark ? #2A2E32 : #FFFFFF;
+    out property <color> card-border: dark ? #373B41 : #DCDEE1;
+    out property <color> text: Palette.foreground;
+    out property <color> text2: dark ? #A4A9B0 : #5E6369;
+    out property <color> accent: #4F5BFF;
+    out property <color> accent-text: dark ? #9AA3FF : #3D47E0;
+    out property <color> accent-soft: dark ? #2B305E : #E8EAFF;
+    out property <color> on-accent-soft: dark ? #C7CCFF : #2F38C8;
+    out property <color> button: dark ? #33373C : #F2F3F5;
+    out property <color> button-border: dark ? #4A4F56 : #C8CBD0;
+    out property <color> switch-off: dark ? #4A4F56 : #C8CBD0;
+    out property <color> danger: dark ? #FF7A7A : #C9302F;
+    out property <color> danger-fill: #D93D42;
+    out property <color> danger-soft: dark ? #3A1F22 : #FBE9EA;
+    out property <color> banner-border: #DA445359;
+    out property <color> warn: dark ? #FFB547 : #B45309;
+    out property <color> warn-soft: dark ? #3A2C14 : #FFF1DC;
+    out property <color> dim: dark ? #00000073 : #14161A52;
+    out property <color> hover: dark ? #FFFFFF0A : #0000000A;
+    out property <color> pressed: dark ? #FFFFFF14 : #00000014;
+    out property <color> focus-ring: #4F5BFF59;
+    out property <length> label-size: 12.5px;
+    out property <length> title-size: 15px;
+}
+
+// Colour family for tiles, status lines and badges.
+export enum Tone { neutral, accent, warn, danger }
+
+export global Icons {
+    out property <image> smartphone: @image-url("../../../assets/smartphone.svg");
+    out property <image> computer: @image-url("../../../assets/desktop.svg");
+    out property <image> chevron-right: @image-url("../../../assets/chevron-right.svg");
+    out property <image> chevron-left: @image-url("../../../assets/chevron-left.svg");
+    out property <image> add: @image-url("../../../assets/add.svg");
+    out property <image> upload: @image-url("../../../assets/upload.svg");
+    out property <image> link-off: @image-url("../../../assets/link-off.svg");
+    out property <image> schedule: @image-url("../../../assets/schedule.svg");
+    out property <image> copy: @image-url("../../../assets/copy.svg");
+    out property <image> qr-code: @image-url("../../../assets/qr-code.svg");
+    out property <image> check: @image-url("../../../assets/check.svg");
+    out property <image> close: @image-url("../../../assets/close.svg");
+    out property <image> refresh: @image-url("../../../assets/refresh.svg");
+    out property <image> file: @image-url("../../../assets/description.svg");
+    out property <image> picture: @image-url("../../../assets/image.svg");
+    out property <image> settings: @image-url("../../../assets/settings.svg");
+    out property <image> cloud-off: @image-url("../../../assets/cloud-off.svg");
+    out property <image> paste: @image-url("../../../assets/content-paste.svg");
+    out property <image> send-clipboard: @image-url("../../../assets/content-paste-go.svg");
+    out property <image> pause: @image-url("../../../assets/pause.svg");
+    out property <image> error: @image-url("../../../assets/error.svg");
+    out property <image> no-network: @image-url("../../../assets/monitor-off.svg");
+    out property <image> ghost: @image-url("../../../assets/ghost-tile.svg");
+}

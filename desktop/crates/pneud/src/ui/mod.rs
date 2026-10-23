@@ -26,6 +26,15 @@ pub struct Phone {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// Local UI hint only. Never a separate clipboard publication or log event.
+    #[serde(default)]
+    pub pairing_clipboard: Option<String>,
+    #[serde(default)]
+    pub pairing_clipboard_revision: u64,
+    #[serde(default)]
+    pub transfers: Vec<crate::outbox::Transfer>,
+    #[serde(default)]
+    pub send_targets: Vec<crate::outbox::SendTarget>,
     #[serde(default)]
     pub devices: Vec<crate::core::mesh::DeviceSnapshot>,
     #[serde(default)]
@@ -133,12 +142,29 @@ pub(crate) struct State {
     pub phone_generation: Option<u64>,
     pub phones: std::collections::HashMap<pneu_proto::Id, Phone>,
     pub phone_generations: std::collections::HashMap<pneu_proto::Id, u64>,
+    /// Recent receives for this daemon session; at most 50 completed items.
+    pub incoming: std::collections::VecDeque<crate::outbox::Transfer>,
     pub active_transfers: std::collections::HashSet<(pneu_proto::Id, pneu_proto::Id)>,
 }
 impl State {
+    pub fn prune_incoming(&mut self) {
+        while self
+            .incoming
+            .iter()
+            .filter(|t| t.state != "sending")
+            .count()
+            > 50
+        {
+            if let Some(index) = self.incoming.iter().position(|t| t.state != "sending") {
+                self.incoming.remove(index);
+            }
+        }
+    }
     pub fn clear_transfers(&mut self, device: &pneu_proto::Id) {
         self.active_transfers.retain(|(id, _)| id != device);
         self.receiving_until.retain(|(id, _), _| id != device);
+        self.incoming
+            .retain(|t| &t.device != device || t.state != "sending");
     }
 }
 impl Snapshot {
@@ -327,13 +353,49 @@ impl Toggle {
         }
     }
 }
+/// Capture pairing identity independently of the file capability/policy. The
+/// clipboard planner narrows this set to connected, authorized recipients.
+pub(crate) fn captured_authorities(snapshot: &Snapshot) -> Vec<crate::outbox::Authority> {
+    snapshot
+        .send_targets
+        .iter()
+        .filter_map(|target| {
+            target
+                .fingerprint
+                .clone()
+                .filter(|_| target.generation > 0)
+                .map(|fingerprint| crate::outbox::Authority {
+                    device: target.device.clone(),
+                    generation: target.generation,
+                    fingerprint,
+                })
+        })
+        .collect()
+}
 #[derive(Clone, Debug)]
 pub enum Command {
-    Window { activation_token: Option<String> },
+    RetryTransfer {
+        operation: pneu_proto::Id,
+        artifact: pneu_proto::Id,
+        device: pneu_proto::Id,
+    },
+    Window {
+        activation_token: Option<String>,
+    },
     ChooseFolder,
     OpenFolder,
     Toggle(Toggle),
     Quit,
+    /// Tray recipients are frozen from the menu, before queueing or picking.
+    SendFiles {
+        recipients: Vec<crate::outbox::Authority>,
+        targeted: bool,
+    },
+    SendClipboard(Vec<crate::outbox::Authority>),
+    ClipboardMode(&'static str),
+    AddDevice {
+        activation_token: Option<String>,
+    },
 }
 #[cfg(test)]
 mod tests {

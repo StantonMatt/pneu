@@ -29,6 +29,11 @@ pub(in crate::core) struct Request {
 }
 pub(in crate::core) enum Message {
     Event(Event),
+    Share(
+        Event,
+        oneshot::Sender<Result<Outcome>>,
+        tokio::sync::OwnedSemaphorePermit,
+    ),
     InstallMarker(Ticket, oneshot::Sender<bool>),
     Submit(Operation, Box<Request>, tokio::sync::OwnedSemaphorePermit),
     ReadHandle(Token, Arc<std::sync::atomic::AtomicBool>),
@@ -103,6 +108,14 @@ impl Handle {
         let _ = self.tx.send(Message::Wait(token, tx));
         rx
     }
+    pub async fn share(&self, event: Event) -> Result<Outcome> {
+        let permit = self.admission.clone().acquire_owned().await?;
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Message::Share(event, tx, permit))
+            .map_err(|_| anyhow!("clipboard actor stopped"))?;
+        rx.await.map_err(|_| anyhow!("clipboard actor stopped"))?
+    }
     pub async fn stop(&self) {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(Message::Stop(tx)).is_ok() {
@@ -120,6 +133,7 @@ struct Driver {
     state: State,
     handle: Handle,
     requests: HashMap<Token, Request>,
+    shares: HashMap<Token, oneshot::Sender<Result<Outcome>>>,
     admissions: HashMap<Token, tokio::sync::OwnedSemaphorePermit>,
     helpers: HashMap<Ticket, Helper>,
     reads: HashMap<Token, Arc<std::sync::atomic::AtomicBool>>,
@@ -131,6 +145,7 @@ struct Driver {
     waiters: HashMap<Token, oneshot::Sender<Result<Outcome>>>,
     timers: Vec<(tokio::time::Instant, Event)>,
     clock_jobs: HashMap<Token, tokio::task::AbortHandle>,
+    share_jobs: HashMap<Token, tokio::task::AbortHandle>,
     history_revision: u64,
 }
 impl Driver {
@@ -210,6 +225,60 @@ impl Driver {
                 continue;
             };
             match effect {
+                Effect::PairingLink(uri) => {
+                    let mut ui = core.ui.lock().expect("UI state");
+                    ui.snapshot.pairing_clipboard = uri;
+                    ui.snapshot.pairing_clipboard_revision =
+                        ui.snapshot.pairing_clipboard_revision.wrapping_add(1);
+                }
+                Effect::LoadShare { token, payload } => {
+                    let handle = self.handle.clone();
+                    let outbox = core.outbox.clone();
+                    let job = self.spawn(
+                        vec![Event::ShareReady {
+                            token,
+                            content: None,
+                        }],
+                        async move {
+                            let content = outbox
+                                .file_io(move || {
+                                    Ok(match payload.as_ref() {
+                                        Payload::Content(content) => content.clone(),
+                                        Payload::Input(ClipboardInput::Text(text)) => {
+                                            Content::Text(text.clone())
+                                        }
+                                        Payload::Input(ClipboardInput::Bytes { bytes, .. }) => {
+                                            Content::Image(bytes.clone())
+                                        }
+                                        Payload::Input(ClipboardInput::Formats {
+                                            text,
+                                            png,
+                                            ..
+                                        }) => Content::Formats(text.clone(), png.clone()),
+                                        Payload::Input(ClipboardInput::Image(file, mime)) => {
+                                            let mut bytes =
+                                                file.read_bounded(crate::ui::clipboard::MAX_IMAGE)?;
+                                            if mime != "image/png" {
+                                                let mut png = std::io::Cursor::new(Vec::new());
+                                                crate::actions::decode_image(&bytes)?
+                                                    .write_to(&mut png, image::ImageFormat::Png)?;
+                                                bytes = png.into_inner();
+                                            }
+                                            anyhow::ensure!(
+                                                bytes.len() <= crate::ui::clipboard::MAX_IMAGE,
+                                                "clipboard image too large"
+                                            );
+                                            Content::Image(bytes)
+                                        }
+                                    })
+                                })
+                                .await
+                                .ok();
+                            handle.event(Event::ShareReady { token, content });
+                        },
+                    );
+                    self.share_jobs.insert(token, job);
+                }
                 Effect::Clock { token, floor } => {
                     let operation = self
                         .state
@@ -523,14 +592,22 @@ impl Driver {
                     );
                 }
                 Effect::Publish(operation) => {
-                    if let Some(offer) = &operation.offer {
-                        let hlc = operation.key.as_ref().expect("stamp").hlc;
-                        if let Ok((text, image)) = core.clipboard_frames(&operation, hlc)
-                            && let Err(error) = core.publish_automatic(offer.clone(), text, image)
-                        {
-                            core.error(None, error.to_string());
-                        }
+                    let result = operation
+                        .offer
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("clipboard recipients changed"))
+                        .and_then(|offer| {
+                            let hlc = operation.key.as_ref().expect("stamp").hlc;
+                            let (text, image) = core.clipboard_frames(&operation, hlc)?;
+                            core.publish_automatic(offer.clone(), text, image)
+                        });
+                    if let Err(error) = &result {
+                        core.error(None, error.to_string());
                     }
+                    self.send(Event::Published {
+                        token: operation.token,
+                        accepted: result.is_ok(),
+                    });
                 }
                 Effect::Reply {
                     token,
@@ -546,6 +623,19 @@ impl Driver {
                                 applied,
                             }),
                             Some(_) => Err(crate::store::ClipboardStorageFailure.into()),
+                        });
+                    }
+                    if let Some(job) = self.share_jobs.remove(&token) {
+                        job.abort();
+                    }
+                    if let Some(reply) = self.shares.remove(&token) {
+                        let _ = reply.send(if failure.is_none() && applied {
+                            Ok(Outcome {
+                                applied,
+                                deduplicated,
+                            })
+                        } else {
+                            Err(anyhow!("clipboard cannot be shared"))
                         });
                     }
                     self.admissions.remove(&token);
@@ -603,6 +693,7 @@ pub(in crate::core) async fn run(
         state,
         handle,
         requests: HashMap::new(),
+        shares: HashMap::new(),
         admissions: HashMap::new(),
         helpers: HashMap::new(),
         reads: HashMap::new(),
@@ -614,6 +705,7 @@ pub(in crate::core) async fn run(
         waiters: HashMap::new(),
         timers: Vec::new(),
         clock_jobs: HashMap::new(),
+        share_jobs: HashMap::new(),
         history_revision: 0,
     };
     loop {
@@ -628,6 +720,11 @@ pub(in crate::core) async fn run(
                 let Some(message)=message else {break;};
                 let event=match message {
                     Message::Event(event)=>event,
+                    Message::Share(event,reply,permit)=>{
+                        let Event::Share{token,..}=&event else {continue;};
+                        driver.shares.insert(*token,reply);driver.admissions.insert(*token,permit);
+                        driver.timers.push((tokio::time::Instant::now()+std::time::Duration::from_secs(10),Event::Deadline(*token)));event
+                    },
                     Message::InstallMarker(ticket,reply)=>{
                         let current=driver.state.confirms_install(ticket);
                         let _=reply.send(current);
@@ -652,6 +749,8 @@ pub(in crate::core) async fn run(
                 if let Event::Stopped(ticket)=&event {driver.helpers.remove(ticket);}
                 driver.timers.retain(|(_,timer)|!matches!((&event,timer),(Event::Installed(ticket)|Event::Failed(ticket)|Event::Stopped(ticket),Event::Timeout(pending)) if ticket==pending));
                 if let Some(core)=driver.core.upgrade() {
+                    let config=core.config();let mode=if config.clipboard_sync_to_phone {config.clipboard_mode} else {ClipboardMode::Off};
+                    let effects=driver.state.step(Event::Mode(mode));driver.effects(effects);
                     let allowed=core.automatic_target().map(|o|o.recipients).unwrap_or_default();
                     let effects=driver.state.step(Event::Policy {allowed});driver.effects(effects);
                 }
@@ -720,6 +819,7 @@ pub(in crate::core) async fn run(
         if driver.stopping.is_some()
             && driver.jobs.is_empty()
             && driver.state.persistence.is_empty()
+            && driver.state.publishing.is_empty()
             && driver.state.stopping.is_none()
         {
             for (_, request) in driver.requests.drain() {

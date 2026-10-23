@@ -14,12 +14,43 @@ use tokio::{
     task::JoinHandle,
 };
 
-/// An anchored received file. Reads use independent positional offsets; no
-/// desktop consumer is allowed to resolve its display pathname again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArrivalSource {
+    pub device: pneu_proto::Id,
+    pub name: String,
+    pub several: bool,
+}
+impl ArrivalSource {
+    fn file_notice(
+        &self,
+        notice: crate::ui::notifications::Notice,
+        clipboard: bool,
+    ) -> crate::ui::notifications::Notice {
+        if clipboard {
+            notice.copied_from(&self.name)
+        } else if self.several {
+            notice.from_device(&self.name)
+        } else {
+            notice
+        }
+    }
+}
+#[derive(Debug)]
+pub(crate) struct FileUnavailable;
+impl std::fmt::Display for FileUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The file was moved or deleted")
+    }
+}
+impl std::error::Error for FileUnavailable {}
+
+/// An anchored received file. Reads and notification Open use the retained
+/// descriptor; its display pathname is only a navigation/recovery hint.
 #[derive(Clone, Debug)]
 pub struct ReceivedFile {
     path: PathBuf,
     file: Arc<std::fs::File>,
+    source: Option<ArrivalSource>,
 }
 impl ReceivedFile {
     pub(crate) fn from_file(path: PathBuf, file: std::fs::File) -> Result<Self> {
@@ -27,7 +58,22 @@ impl ReceivedFile {
         Ok(Self {
             path,
             file: Arc::new(file),
+            source: None,
         })
+    }
+    pub(crate) fn with_source(mut self, source: ArrivalSource) -> Self {
+        self.source = Some(source);
+        self
+    }
+    fn notice(
+        &self,
+        notice: crate::ui::notifications::Notice,
+        clipboard: bool,
+    ) -> crate::ui::notifications::Notice {
+        self.source.as_ref().map_or_else(
+            || notice.clone(),
+            |source| source.file_notice(notice.clone(), clipboard),
+        )
     }
     pub fn open(path: &Path) -> Result<Self> {
         let file = std::fs::File::from(rustix::fs::open(
@@ -336,6 +382,33 @@ pub trait PcActions: Send + Sync {
     async fn notify_text(&self, _text: &str) -> Result<()> {
         Ok(())
     }
+    async fn notify_text_from(&self, text: &str, _source: &ArrivalSource) -> Result<()> {
+        self.notify_text(text).await
+    }
+    async fn notify_text_failure_from(&self, _source: &ArrivalSource) -> Result<()> {
+        self.notify_text_failure().await
+    }
+    async fn notify_save_failure_from(
+        &self,
+        metadata: &pneu_proto::FileBegin,
+        code: pneu_proto::NackCode,
+        destination: crate::ui::ReceiveDestination,
+        folder: &Path,
+        _source: &ArrivalSource,
+    ) -> Result<()> {
+        self.notify_save_failure(metadata, code, destination, folder)
+            .await
+    }
+    async fn notify_send_admission_failure(&self, _reason: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn notify_delivery(
+        &self,
+        _transfer: &crate::outbox::Transfer,
+        _device_name: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
     async fn drain_clipboard(&self) {}
     async fn shutdown(&self) -> Result<()> {
         Ok(())
@@ -389,17 +462,19 @@ impl Drop for ClipboardCandidate {
 #[derive(Clone)]
 struct Target {
     files: Vec<ReceivedFile>,
-    urls: Vec<String>,
+    paths: Vec<PathBuf>,
     link: Option<String>,
+    retry: Option<(pneu_proto::Id, pneu_proto::Id, pneu_proto::Id)>,
 }
 struct Burst {
     id: u32,
-    urls: Vec<String>,
+    paths: Vec<PathBuf>,
     kind: Option<pneu_proto::FileKind>,
     count: usize,
     arrived: std::time::Instant,
     started: std::time::Instant,
     saved: bool,
+    source: Option<ArrivalSource>,
 }
 impl Burst {
     fn accepts(&self, arrived: std::time::Instant) -> bool {
@@ -612,15 +687,16 @@ impl DesktopActions {
                                 let token=tokens.take(id, std::time::Instant::now());
                                 if let Some(target)=target {
                                     match action.as_str() {
-                                        "default"|"open" => { if interactions.available() && let Some(file)=target.files.first() && let Ok(wait)=begin_open_received_file(file,&action_connection,token.as_deref()).await { interactions.push(async move { let _=wait.await; }); } },
-                                        "show" => { let _=show_files(&target.urls,&action_connection,token.as_deref()).await; },
+                                        "default"|"open" => { if interactions.available() && let Some(file)=target.files.first() && let Some(wait)=notification_open(file,&action_connection,token.as_deref()).await { interactions.push(async move { let _=wait.await; }); } },
+                                        "show" => { if let Ok(urls)=target.paths.iter().map(|path| file_uri(path)).collect::<Result<Vec<_>>>() { let _=show_files(&urls,&action_connection,token.as_deref()).await; } else { let _=file_unavailable_notice(&action_connection).await; } },
                                         "link" => { if interactions.available() && let Some(link)=target.link { let wait=begin_open_uri(&link,&action_connection,token.as_deref()).await; interactions.push(async move { let _=wait.await; }); } },
-                                        "folder"|"pair" => { if let Some(commands)=commands.lock().expect("UI commands").clone() { let _=commands.try_send(if action=="folder" { crate::ui::Command::ChooseFolder } else { crate::ui::Command::Window { activation_token: token } }); } },
+                                        "retry" => { if let Some((operation,artifact,device))=target.retry && let Some(commands)=commands.lock().expect("UI commands").clone() { let _=commands.try_send(crate::ui::Command::RetryTransfer {operation,artifact,device}); } },
+                                        "folder"|"pair" => { if let Some(commands)=commands.lock().expect("UI commands").clone() { let _=commands.try_send(if action=="folder" { crate::ui::Command::ChooseFolder } else { crate::ui::Command::AddDevice { activation_token: token } }); } },
                                         _=>{},
                                     }
                                     continue;
                                 }
-                                if let Some(path)=path {match action.as_str() {"default"|"open"=>{if interactions.available() && let Ok(wait)=begin_open_received_file(&path, &action_connection,token.as_deref()).await { interactions.push(async move { let _=wait.await; }); }},"show"=>{if let Ok(uri)=file_uri(path.path()) { let _=show_files(&[uri], &action_connection,token.as_deref()).await; }},_=>{}}}
+                                if let Some(path)=path {match action.as_str() {"default"|"open"=>{if interactions.available() && let Some(wait)=notification_open(&path, &action_connection,token.as_deref()).await { interactions.push(async move { let _=wait.await; }); }},"show"=>{if let Ok(uri)=file_uri(path.path()) { let _=show_files(&[uri], &action_connection,token.as_deref()).await; } else { let _=file_unavailable_notice(&action_connection).await; }},_=>{}}}
                             }
                         }
                     }
@@ -644,6 +720,33 @@ impl DesktopActions {
         link: Option<String>,
         replaces: u32,
         preview: Option<&ReceivedFile>,
+    ) -> Result<u32> {
+        self.notice_with_retry(notice, files, link, replaces, preview, None)
+            .await
+    }
+    async fn notice_with_retry(
+        &self,
+        notice: crate::ui::notifications::Notice,
+        files: Vec<ReceivedFile>,
+        link: Option<String>,
+        replaces: u32,
+        preview: Option<&ReceivedFile>,
+        retry: Option<(pneu_proto::Id, pneu_proto::Id, pneu_proto::Id)>,
+    ) -> Result<u32> {
+        let paths = files.iter().map(|file| file.path().to_owned()).collect();
+        self.notice_with_paths(notice, files, link, replaces, preview, retry, paths)
+            .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn notice_with_paths(
+        &self,
+        notice: crate::ui::notifications::Notice,
+        files: Vec<ReceivedFile>,
+        link: Option<String>,
+        replaces: u32,
+        preview: Option<&ReceivedFile>,
+        retry: Option<(pneu_proto::Id, pneu_proto::Id, pneu_proto::Id)>,
+        paths: Vec<PathBuf>,
     ) -> Result<u32> {
         let current = self.notifications().await?;
         let n = current.as_ref().context("notification proxy")?;
@@ -700,7 +803,15 @@ impl DesktopActions {
         {
             targets.remove(&old);
         }
-        targets.insert(id, Target { files, urls, link });
+        targets.insert(
+            id,
+            Target {
+                files,
+                paths,
+                link,
+                retry,
+            },
+        );
         Ok(id)
     }
 }
@@ -809,7 +920,12 @@ impl PcActions for DesktopActions {
                     "Pneu",
                     0u32,
                     "pneu",
-                    "Image copied from phone",
+                    &file
+                        .notice(
+                            crate::ui::notifications::Notice::new("Image copied from phone"),
+                            true,
+                        )
+                        .summary,
                     "",
                     Vec::<&str>::new(),
                     hints,
@@ -850,14 +966,17 @@ impl PcActions for DesktopActions {
         saved: bool,
     ) -> Result<()> {
         self.notice(
-            crate::ui::notifications::Notice::file(
-                metadata,
-                saved,
-                false,
-                true,
-                None,
-                "",
-                crate::ui::ReceiveDestination::Cache,
+            file.notice(
+                crate::ui::notifications::Notice::file(
+                    metadata,
+                    saved,
+                    false,
+                    true,
+                    None,
+                    "",
+                    crate::ui::ReceiveDestination::Cache,
+                ),
+                metadata.kind == pneu_proto::FileKind::ClipboardImage,
             ),
             if metadata.kind == pneu_proto::FileKind::ClipboardImage {
                 Vec::new()
@@ -916,6 +1035,87 @@ impl PcActions for DesktopActions {
         .await
         .map(|_| ())
     }
+    async fn notify_text_from(&self, text: &str, source: &ArrivalSource) -> Result<()> {
+        self.notice(
+            crate::ui::notifications::Notice::text(text).copied_from(&source.name),
+            Vec::new(),
+            crate::ui::notifications::single_url(text),
+            0,
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+    async fn notify_text_failure_from(&self, source: &ArrivalSource) -> Result<()> {
+        let mut notice =
+            crate::ui::notifications::Notice::new("Copied from phone").copied_from(&source.name);
+        notice.body = "Couldn't copy to clipboard".into();
+        self.notice(notice, Vec::new(), None, 0, None)
+            .await
+            .map(|_| ())
+    }
+    async fn notify_save_failure_from(
+        &self,
+        metadata: &pneu_proto::FileBegin,
+        code: pneu_proto::NackCode,
+        destination: crate::ui::ReceiveDestination,
+        folder: &Path,
+        source: &ArrivalSource,
+    ) -> Result<()> {
+        let mut notice = source.file_notice(
+            crate::ui::notifications::Notice::file(
+                metadata,
+                false,
+                false,
+                false,
+                Some(code),
+                &crate::ui::display_path(folder),
+                destination,
+            ),
+            metadata.kind == pneu_proto::FileKind::ClipboardImage,
+        );
+        notice
+            .actions
+            .retain(|(id, _)| !matches!(*id, "default" | "open"));
+        self.notice(notice, Vec::new(), None, 0, None)
+            .await
+            .map(|_| ())
+    }
+    async fn notify_send_admission_failure(&self, reason: &str) -> Result<()> {
+        let mut notice = crate::ui::notifications::Notice::new("Couldn't send files");
+        notice.body = crate::ui::notifications::escape(reason);
+        self.notice(notice, Vec::new(), None, 0, None)
+            .await
+            .map(|_| ())
+    }
+    async fn notify_delivery(
+        &self,
+        transfer: &crate::outbox::Transfer,
+        device_name: &str,
+    ) -> Result<()> {
+        let (notice, retry) = if transfer.state == "sent" {
+            (
+                crate::ui::notifications::Notice::sent(&transfer.file_name, &[device_name.into()]),
+                None,
+            )
+        } else {
+            (
+                crate::ui::notifications::Notice::send_failed(
+                    &transfer.file_name,
+                    device_name,
+                    transfer.error.as_deref().unwrap_or("Transfer failed"),
+                ),
+                Some((
+                    transfer.operation.clone(),
+                    transfer.transfer_id.clone(),
+                    transfer.device.clone(),
+                )),
+            )
+        };
+        self.notice_with_retry(notice, Vec::new(), None, 0, None, retry)
+            .await
+            .map(|_| ())
+    }
     async fn notify_file(
         &self,
         file: &ReceivedFile,
@@ -954,7 +1154,7 @@ impl PcActions for DesktopActions {
             crate::ui::ReceiveDestination::SaveFolder,
         );
         let mut burst = self.burst.lock().await;
-        let mut urls = vec![file_uri(file.path())?];
+        let mut paths = vec![file.path().to_owned()];
         let mut replaces = 0;
         let mut count = 1;
         let mut kind = Some(metadata.kind);
@@ -964,6 +1164,7 @@ impl PcActions for DesktopActions {
             && copied != Some(false)
             && let Some(previous) = burst.as_ref()
             && previous.accepts(arrived)
+            && previous.source == file.source
         {
             let current = self.notifications().await?;
             if current
@@ -979,7 +1180,7 @@ impl PcActions for DesktopActions {
                 started = previous.started;
                 kind = if previous.kind == kind { kind } else { None };
                 all_saved = saved && previous.saved;
-                urls.extend(previous.urls.iter().cloned());
+                paths.extend(previous.paths.iter().cloned());
                 notice = crate::ui::notifications::Notice::burst(
                     count,
                     kind,
@@ -988,21 +1189,34 @@ impl PcActions for DesktopActions {
                 );
             }
         }
-        notice.urls = urls.clone();
-        // Burst folder actions need every pathname, but only the latest file's
-        // descriptor is needed for Open. Avoid retaining one FD per arrival.
+        notice = file.notice(
+            notice,
+            metadata.kind == pneu_proto::FileKind::ClipboardImage,
+        );
+        notice.urls = paths.iter().map(|p| file_uri(p)).collect::<Result<_>>()?;
+        // Show retains navigation paths for the burst. Open retains only the
+        // latest file's anchored descriptor.
         let id = self
-            .notice(notice, vec![file.clone()], None, replaces, None)
+            .notice_with_paths(
+                notice,
+                vec![file.clone()],
+                None,
+                replaces,
+                None,
+                None,
+                paths.clone(),
+            )
             .await?;
         *burst = if save_error.is_none() && copied != Some(false) {
             Some(Burst {
                 id,
-                urls,
+                paths,
                 kind,
                 count,
                 arrived,
                 started,
                 saved: all_saved,
+                source: file.source.clone(),
             })
         } else {
             None
@@ -1043,7 +1257,7 @@ async fn open_received_file(file: &ReceivedFile, connection: &zbus::Connection) 
         .await?
         .await
 }
-async fn begin_open_received_file(
+pub(crate) async fn begin_open_received_file(
     file: &ReceivedFile,
     connection: &zbus::Connection,
     activation_token: Option<&str>,
@@ -1069,6 +1283,46 @@ async fn begin_open_received_file(
         result?;
         Ok(())
     }))
+}
+async fn notification_open(
+    file: &ReceivedFile,
+    connection: &zbus::Connection,
+    activation_token: Option<&str>,
+) -> Option<crate::ui::portal::Interaction> {
+    match begin_open_received_file(file, connection, activation_token).await {
+        Ok(wait) => Some(wait),
+        Err(error) => {
+            if error.is::<FileUnavailable>() {
+                let _ = file_unavailable_notice(connection).await;
+            }
+            None
+        }
+    }
+}
+async fn file_unavailable_notice(connection: &zbus::Connection) -> Result<()> {
+    let proxy = zbus::Proxy::new(
+        connection,
+        "org.freedesktop.Notifications",
+        "/org/freedesktop/Notifications",
+        "org.freedesktop.Notifications",
+    )
+    .await?;
+    let _: u32 = proxy
+        .call(
+            "Notify",
+            &(
+                "Pneu",
+                0u32,
+                "pneu",
+                "The file was moved or deleted",
+                "",
+                Vec::<&str>::new(),
+                HashMap::<&str, zbus::zvariant::Value<'_>>::new(),
+                -1i32,
+            ),
+        )
+        .await?;
+    Ok(())
 }
 async fn show_files(
     urls: &[String],
@@ -1146,7 +1400,7 @@ async fn begin_open_uri_portal(
         Ok(())
     }))
 }
-fn decode_image(bytes: &[u8]) -> Result<image::DynamicImage> {
+pub(crate) fn decode_image(bytes: &[u8]) -> Result<image::DynamicImage> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(64 * 1024 * 1024);
@@ -1321,12 +1575,13 @@ mod tests {
         let started = Instant::now() - Duration::from_secs(60);
         let mut burst = Burst {
             id: 1,
-            urls: vec![],
+            paths: vec![],
             kind: None,
             count: 1,
             arrived: started,
             started,
             saved: true,
+            source: None,
         };
         assert!(burst.accepts(started + Duration::from_secs(3)));
         assert!(!burst.accepts(started + Duration::from_secs(4)));
@@ -1365,6 +1620,54 @@ mod tests {
         assert!(error.to_string().contains("bounded read"));
         Ok(())
     }
+    #[test]
+    fn received_descriptor_allows_files_above_the_outbox_quota() -> Result<()> {
+        let dir = crate::test_support::scratch()?;
+        let path = dir.path().join("large-received.bin");
+        let sparse = std::fs::File::create(&path)?;
+        let size = crate::outbox::PEER_BYTES + 1;
+        sparse.set_len(size)?;
+        let received = ReceivedFile::from_file(path.clone(), sparse)?;
+        assert_eq!(received.viewer_descriptor()?.metadata()?.len(), size);
+        assert!(file_uri(received.path()).is_ok());
+        assert!(crate::ipc::send_command(&[path.to_string_lossy().into_owned()]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn received_viewer_descriptor_survives_path_replacement_and_unlink() -> Result<()> {
+        for replacement in ["regular", "directory", "symlink", "parent", "deleted"] {
+            let dir = tempfile::tempdir()?;
+            let parent = dir.path().join("received");
+            std::fs::create_dir(&parent)?;
+            let path = parent.join("file");
+            std::fs::write(&path, b"received bytes")?;
+            let file = ReceivedFile::open(&path)?;
+            let target = file.path().to_owned();
+            if replacement == "parent" {
+                std::fs::rename(&parent, dir.path().join("old-parent"))?;
+                std::fs::create_dir(&parent)?;
+                std::fs::write(&path, b"replacement")?;
+            } else {
+                std::fs::remove_file(&path)?;
+                match replacement {
+                    "regular" => std::fs::write(&path, b"replacement")?,
+                    "directory" => std::fs::create_dir(&path)?,
+                    "symlink" => std::os::unix::fs::symlink("/etc/passwd", &path)?,
+                    "deleted" => (),
+                    _ => unreachable!(),
+                }
+            }
+            assert!(file_uri(&target).is_ok()); // Show is pathname navigation.
+            let mut descriptor = file.viewer_descriptor()?;
+            drop(file);
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut descriptor, &mut bytes)?;
+            assert_eq!(bytes, b"received bytes", "{replacement}");
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn retained_file_and_preview_ignore_symlink_and_regular_replacements() -> Result<()> {
         use std::os::unix::fs::symlink;
@@ -1429,6 +1732,7 @@ mod tests {
         std::sync::atomic::AtomicU32,
         Arc<std::sync::Mutex<HashMap<String, zbus::zvariant::OwnedValue>>>,
         Arc<std::sync::Mutex<Vec<String>>>,
+        Arc<std::sync::Mutex<(String, String)>>,
     );
     #[zbus::interface(name = "org.freedesktop.Notifications")]
     impl NotificationServer {
@@ -1438,12 +1742,13 @@ mod tests {
             _app: &str,
             _replaces: u32,
             _icon: &str,
-            _summary: &str,
-            _body: &str,
+            summary: &str,
+            body: &str,
             actions: Vec<String>,
             hints: HashMap<String, zbus::zvariant::OwnedValue>,
             _timeout: i32,
         ) -> u32 {
+            *self.3.lock().unwrap() = (summary.into(), body.into());
             *self.1.lock().unwrap() = hints;
             *self.2.lock().unwrap() = actions;
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
@@ -1620,6 +1925,7 @@ mod tests {
         let deferred_response = Arc::new(std::sync::Mutex::new(None));
         let notification_hints = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let notification_actions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let notification_copy = Arc::new(std::sync::Mutex::new((String::new(), String::new())));
         let issued = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let closed = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let shown = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1650,6 +1956,7 @@ mod tests {
                     std::sync::atomic::AtomicU32::new(0),
                     notification_hints.clone(),
                     notification_actions.clone(),
+                    notification_copy.clone(),
                 ),
             )?
             .build()
@@ -1662,8 +1969,13 @@ mod tests {
         std::fs::write(&original, b"verified viewer bytes")?;
         let file = ReceivedFile::open(&original)?;
         rustix::fs::seek(&*file.file, rustix::fs::SeekFrom::End(0))?;
-        std::fs::remove_file(&original)?;
+        let moved = original.with_extension("moved");
+        std::fs::rename(&original, &moved)?;
         std::os::unix::fs::symlink("/etc/passwd", &original)?;
+        actions.open_received(&file).await?;
+        assert_eq!(&*portal_bytes.lock().unwrap(), b"verified viewer bytes");
+        std::fs::remove_file(&original)?;
+        std::fs::rename(&moved, &original)?;
         actions.open_received(&file).await?;
         assert_eq!(&*portal_bytes.lock().unwrap(), b"verified viewer bytes");
         for n in 0..70 {
@@ -1720,7 +2032,8 @@ mod tests {
         let image_bytes = png.into_inner();
         std::fs::write(&image_path, &image_bytes)?;
         let file = ReceivedFile::open(&image_path)?;
-        std::fs::remove_file(&image_path)?;
+        let moved_image = image_path.with_extension("moved");
+        std::fs::rename(&image_path, &moved_image)?;
         std::os::unix::fs::symlink("/etc/passwd", &image_path)?;
         actions.notify_received(&file, "image/png").await?;
         {
@@ -1729,6 +2042,32 @@ mod tests {
             assert!(!hints.contains_key("image-path"));
         }
         actions.notify_copied_received(&file, "image/png").await?;
+        drop(file); // Notifications own the only retained receive handle.
+        for action in ["open", "show"] {
+            let counter = if action == "open" { &issued } else { &shown };
+            let before = counter.load(std::sync::atomic::Ordering::SeqCst);
+            server
+                .emit_signal(
+                    None::<&str>,
+                    "/org/freedesktop/Notifications",
+                    "org.freedesktop.Notifications",
+                    "ActionInvoked",
+                    &(71u32, action),
+                )
+                .await?;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while counter.load(std::sync::atomic::Ordering::SeqCst) == before {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            if action == "open" {
+                assert_eq!(*portal_bytes.lock().unwrap(), image_bytes);
+            }
+        }
+        std::fs::remove_file(&image_path)?;
+        std::fs::rename(&moved_image, &image_path)?;
+
         server
             .emit_signal(
                 None::<&str>,
@@ -1800,6 +2139,45 @@ mod tests {
             .await?;
             assert_eq!(&*startup_id.lock().unwrap(), token.unwrap_or_default());
         }
+        // Open keeps the receive FD with no caller handle left. Show navigates
+        // recorded paths, including older items in a burst.
+        let retained_path = dir.path().join("1.bin");
+        let burst_id = actions
+            .notice_with_paths(
+                crate::ui::notifications::Notice::blocked("phone"),
+                vec![final_file.clone()],
+                None,
+                0,
+                None,
+                None,
+                vec![final_file.path().to_owned(), retained_path.clone()],
+            )
+            .await?;
+        std::fs::remove_file(&retained_path)?;
+        std::fs::write(&retained_path, b"replacement")?;
+        for (id, action) in [(2, "open"), (2, "show"), (burst_id, "show")] {
+            let counter = if action == "open" { &issued } else { &shown };
+            let before = counter.load(std::sync::atomic::Ordering::SeqCst);
+            server
+                .emit_signal(
+                    None::<&str>,
+                    "/org/freedesktop/Notifications",
+                    "org.freedesktop.Notifications",
+                    "ActionInvoked",
+                    &(id, action),
+                )
+                .await?;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while counter.load(std::sync::atomic::Ordering::SeqCst) == before {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            if action == "open" {
+                assert_eq!(&*portal_bytes.lock().unwrap(), b"file");
+            }
+        }
+
         // Real D-Bus signal ordering and all notification launch destinations.
         for action in ["default", "open", "show", "link", "folder", "pair"] {
             let (tx, mut rx) = tokio::sync::mpsc::channel(2);
@@ -1837,7 +2215,7 @@ mod tests {
                     .await?
                     .unwrap();
                 match command {
-                    crate::ui::Command::Window { activation_token } if action == "pair" => {
+                    crate::ui::Command::AddDevice { activation_token } if action == "pair" => {
                         assert_eq!(activation_token.as_deref(), Some("notification-token"));
                     }
                     crate::ui::Command::ChooseFolder if action == "folder" => {}
@@ -1955,7 +2333,7 @@ mod tests {
         {
             let current = actions.notifications().await?;
             let targets = current.as_ref().unwrap().targets.lock().await;
-            assert!(targets.values().all(|t| t.urls.len() <= 128));
+            assert!(targets.values().all(|t| t.paths.len() <= 128));
             assert_eq!(actions.burst.lock().await.as_ref().unwrap().count, 72);
         }
         actions.burst.lock().await.as_mut().unwrap().started =
@@ -2037,6 +2415,98 @@ mod tests {
             }
         })
         .await?;
+        // Arrival names survive Core's descriptor handoff. Bursts never merge
+        // senders, and clip summaries identify the sender even with one device.
+        let source = ArrivalSource {
+            device: pneu_proto::Id::from_bytes([8; 16]),
+            name: "Office <PC>".into(),
+            several: true,
+        };
+        let named = final_file.clone().with_source(source.clone());
+        actions
+            .notify_file(&named, &metadata, true, None, dir.path())
+            .await?;
+        assert!(
+            notification_copy
+                .lock()
+                .unwrap()
+                .1
+                .starts_with("From Office &lt;PC&gt;")
+        );
+        assert_eq!(actions.burst.lock().await.as_ref().unwrap().count, 1);
+        actions
+            .notify_file(&named, &metadata, true, None, dir.path())
+            .await?;
+        assert_eq!(actions.burst.lock().await.as_ref().unwrap().count, 2);
+        let other = final_file.clone().with_source(ArrivalSource {
+            device: pneu_proto::Id::from_bytes([9; 16]),
+            name: "Phone".into(),
+            several: true,
+        });
+        actions
+            .notify_file(&other, &metadata, true, None, dir.path())
+            .await?;
+        assert_eq!(actions.burst.lock().await.as_ref().unwrap().count, 1);
+        actions.notify_text_from("hello", &source).await?;
+        assert_eq!(
+            notification_copy.lock().unwrap().0,
+            "Copied from Office <PC>"
+        );
+        let (tx, mut retry_rx) = tokio::sync::mpsc::channel(2);
+        actions.set_commands(tx);
+        let mut transfer = crate::outbox::Transfer::received(source.device.clone(), &metadata);
+        transfer.direction = "outgoing".into();
+        transfer.state = "failed".into();
+        transfer.error = Some("Update required".into());
+        actions.notify_delivery(&transfer, &source.name).await?;
+        assert!(
+            notification_copy
+                .lock()
+                .unwrap()
+                .0
+                .starts_with("Couldn't send final.png to Office")
+        );
+        assert!(
+            notification_actions
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|a| a == "retry")
+        );
+        let retry_id = {
+            let current = actions.notifications().await?;
+            let targets = current.as_ref().unwrap().targets.lock().await;
+            *targets.keys().max().unwrap()
+        };
+        // A sibling failure must not overwrite this notification's artifact.
+        let mut sibling = transfer.clone();
+        sibling.transfer_id = pneu_proto::Id::from_bytes([77; 16]);
+        sibling.file_name = "sibling.png".into();
+        actions.notify_delivery(&sibling, &source.name).await?;
+        server
+            .emit_signal(
+                None::<&str>,
+                "/org/freedesktop/Notifications",
+                "org.freedesktop.Notifications",
+                "ActionInvoked",
+                &(retry_id, "retry"),
+            )
+            .await?;
+        let command = tokio::time::timeout(std::time::Duration::from_secs(2), retry_rx.recv())
+            .await?
+            .context("retry command")?;
+        assert!(
+            matches!(command, crate::ui::Command::RetryTransfer { operation, artifact, device } if operation == transfer.operation && artifact == transfer.transfer_id && device == transfer.device)
+        );
+        transfer.state = "sent".into();
+        actions.notify_delivery(&transfer, &source.name).await?;
+        assert_eq!(
+            notification_copy.lock().unwrap().0,
+            "final.png sent to Office <PC>"
+        );
+        assert!(bool::try_from(
+            &notification_hints.lock().unwrap()["transient"]
+        )?);
         // A response failure (after acceptance) falls back; cancellation never does.
         for code in [0, 1, 2] {
             portal_code.store(code, std::sync::atomic::Ordering::SeqCst);
@@ -2136,7 +2606,7 @@ mod tests {
                 (action, command),
                 (
                     "pair",
-                    crate::ui::Command::Window {
+                    crate::ui::Command::AddDevice {
                         activation_token: None
                     }
                 ) | ("folder", crate::ui::Command::ChooseFolder)

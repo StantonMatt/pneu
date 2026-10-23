@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Service
+MimeType=application/octet-stream;
+Actions=pneuSend;
+X-KDE-Priority=TopLevel
+
+[Desktop Action pneuSend]
+Name=Send with Pneu
+Icon=pneu
+Exec=pneud send %F

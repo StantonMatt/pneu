@@ -9,6 +9,48 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+/// Reject links in every path component and open nonblocking before checking
+/// type, so FIFOs and device nodes cannot hang a local IPC worker.
+/// Callers apply their own size policy after opening the descriptor.
+pub(crate) fn open_regular_file(path: &Path) -> Result<File> {
+    ensure!(path.is_absolute(), "file paths must be absolute");
+    let mut directory = File::from(rustix::fs::open(
+        "/",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+    let mut components = path.components().peekable();
+    let file = loop {
+        let component = components.next().context("file name")?;
+        use std::path::Component;
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::ParentDir => std::ffi::OsStr::new(".."),
+            Component::Normal(name) => name,
+            Component::Prefix(_) => anyhow::bail!("unsupported file prefix"),
+        };
+        if components.peek().is_none() {
+            ensure!(matches!(component, Component::Normal(_)), "file name");
+            break File::from(rustix::fs::openat(
+                &directory,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?);
+        }
+        // Resolve .. from the already opened directory. Do not normalize it
+        // lexically: link/../file must still reject the link.
+        directory = File::from(rustix::fs::openat(
+            &directory,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+    };
+    let meta = file.metadata()?;
+    ensure!(meta.is_file(), "only regular files can be opened");
+    Ok(file)
+}
 #[derive(Clone, Debug)]
 pub(crate) struct Folder {
     pub file: Arc<File>,

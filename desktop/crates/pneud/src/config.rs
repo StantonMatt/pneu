@@ -41,10 +41,21 @@ impl Paths {
         Ok(())
     }
 }
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardMode {
+    #[default]
+    Automatic,
+    Manual,
+    Off,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub name: String,
+    pub clipboard_mode: ClipboardMode,
+    pub choose_devices_each_time: bool,
+    pub queue_offline: bool,
     pub save_to_folder: bool,
     pub save_path: PathBuf,
     pub notification_preview: bool,
@@ -62,6 +73,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             name: machine_hostname(),
+            clipboard_mode: ClipboardMode::Automatic,
+            choose_devices_each_time: false,
+            queue_offline: false,
             save_to_folder: true,
             save_path: PathBuf::from(env::var_os("HOME").unwrap_or_else(|| ".".into()))
                 .join("Pictures/Pneu"),
@@ -107,9 +121,18 @@ impl Config {
             ensure!(fs::metadata(path)?.len() <= 65536, "config is too large");
         }
         let mut config: Self = if path.exists() {
-            toml::from_str(std::str::from_utf8(&crate::storage::read_bounded(
-                path, 65536,
-            )?)?)?
+            let bytes = crate::storage::read_bounded(path, 65536)?;
+            let text = std::str::from_utf8(&bytes)?;
+            let mut config: Self = toml::from_str(text)?;
+            let fields: toml::Value = toml::from_str(text)?;
+            if fields.get("clipboard_mode").is_none() {
+                if !config.clipboard_sync_to_phone {
+                    config.clipboard_mode = ClipboardMode::Off;
+                }
+            } else {
+                config.clipboard_sync_to_phone = config.clipboard_mode != ClipboardMode::Off;
+            }
+            config
         } else {
             let c = Self::default();
             c.save(path)?;

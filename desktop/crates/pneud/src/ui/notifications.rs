@@ -122,19 +122,49 @@ impl Notice {
         n
     }
     pub fn paired(name: &str) -> Self {
-        let name: String = name
-            .chars()
-            .map(|c| if c.is_whitespace() { ' ' } else { c })
-            .collect();
-        let mut n = Self::new(format!("Paired with {name}"));
+        let mut n = Self::new(format!("Paired with {}", label(name)));
         n.transient = true;
         n.urgency = 0;
         n.expires = 4000;
         n
     }
-    pub fn unpaired(phone: &str) -> Self {
-        let mut n = Self::new(format!("{phone} unpaired this PC"));
-        n.actions.push(("pair", "Pair Phone…"));
+    pub fn unpaired(device: &str) -> Self {
+        let mut n = Self::new(format!("{} unpaired this computer", label(device)));
+        n.actions.push(("pair", "Add Device…"));
+        n
+    }
+    /// With more than one paired device, arrivals say where they came from:
+    /// "From Galaxy S25+ · Copied to clipboard".
+    pub fn from_device(mut self, device: &str) -> Self {
+        let from = format!("From {}", escape(&label(device)));
+        self.body = if self.body.is_empty() {
+            from
+        } else {
+            format!("{from} · {}", self.body)
+        };
+        self
+    }
+    /// A clip someone sent on purpose from a device, named.
+    pub fn copied_from(mut self, device: &str) -> Self {
+        self.summary = format!("Copied from {}", label(device));
+        self
+    }
+    /// Short, transient: "report.pdf sent to 2 devices".
+    pub fn sent(file: &str, devices: &[String]) -> Self {
+        let mut n = Self::new(match devices {
+            [one] => format!("{file} sent to {}", label(one)),
+            many => format!("{file} sent to {} devices", many.len()),
+        });
+        n.urgency = 0;
+        n.transient = true;
+        n.expires = 4000;
+        n
+    }
+    /// Stays until dismissed: "Couldn't send report.pdf to MacBook Air".
+    pub fn send_failed(file: &str, device: &str, reason: &str) -> Self {
+        let mut n = Self::new(format!("Couldn't send {file} to {}", label(device)));
+        n.body = escape(reason);
+        n.actions.push(("retry", "Retry"));
         n
     }
     pub fn port(port: u16) -> Self {
@@ -142,6 +172,12 @@ impl Notice {
         n.body = format!("Port {port} is in use by another program");
         n
     }
+}
+// Device names are one-line labels in summaries and bodies.
+fn label(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect()
 }
 pub fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
@@ -256,6 +292,55 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn several_devices_name_the_sender_and_results_name_recipients() {
+        let n = Notice::file(
+            &metadata(FileKind::Screenshot),
+            true,
+            true,
+            false,
+            None,
+            "~/Pictures/Pneu",
+            super::super::ReceiveDestination::SaveFolder,
+        )
+        .from_device("Galaxy\nS25+");
+        assert_eq!(n.body, "From Galaxy S25+ · Copied to clipboard");
+        let mut file = metadata(FileKind::File);
+        file.file_name = "Quarterly report final v3.pdf".into();
+        let n = Notice::file(
+            &file,
+            true,
+            false,
+            false,
+            None,
+            "",
+            super::super::ReceiveDestination::SaveFolder,
+        )
+        .from_device("<Mac>");
+        assert_eq!(
+            (n.summary.as_str(), n.body.as_str()),
+            ("Quarterly report final v3.pdf", "From &lt;Mac&gt;")
+        );
+        assert_eq!(
+            Notice::text("hi").copied_from("Galaxy S25+").summary,
+            "Copied from Galaxy S25+"
+        );
+        let sent = Notice::sent("report.pdf", &["Galaxy S25+".into(), "MacBook Air".into()]);
+        assert_eq!(sent.summary, "report.pdf sent to 2 devices");
+        assert!(sent.transient);
+        assert_eq!(
+            Notice::sent("a.png", &["MacBook Air".into()]).summary,
+            "a.png sent to MacBook Air"
+        );
+        let failed = Notice::send_failed("report.pdf", "MacBook Air", "MacBook Air's disk is full");
+        assert_eq!(failed.summary, "Couldn't send report.pdf to MacBook Air");
+        assert_eq!(failed.actions, vec![("retry", "Retry")]);
+        assert!(!failed.transient);
+        assert_eq!(
+            Notice::unpaired("Office-PC").summary,
+            "Office-PC unpaired this computer"
+        );
     }
     #[test]
     fn text_is_bounded_escaped_and_links_are_safe() {

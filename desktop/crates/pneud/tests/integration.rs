@@ -2635,6 +2635,25 @@ async fn text_claim_rejects_interleaved_file_before_placement() -> Result<()> {
 async fn outgoing_clipboard_images_require_capability_and_keep_latest_while_receipting()
 -> Result<()> {
     use tokio::io::AsyncWriteExt;
+    async fn hold_file_lane(h: &Harness, phone: &Phone, tls: &mut PhoneTls) -> Result<Id> {
+        let id = h
+            .core
+            .send_clipboard_image(
+                phone.identity.device_id.clone(),
+                b"\x89PNG\r\n\x1a\nreceipt barrier".to_vec(),
+            )
+            .await?;
+        assert!(
+            matches!(read_frame(tls).await?,Some(Message::FileBegin(begin)) if begin.transfer_id==id)
+        );
+        assert!(
+            matches!(read_frame(tls).await?,Some(Message::FileChunk(chunk)) if chunk.transfer_id==id)
+        );
+        assert!(
+            matches!(read_frame(tls).await?,Some(Message::FileEnd(end)) if end.transfer_id==id)
+        );
+        Ok(id)
+    }
     let h = Harness::new().await?;
     let phone = h.phone("phone")?;
     drop(h.pair(&phone).await?);
@@ -2688,13 +2707,26 @@ async fn outgoing_clipboard_images_require_capability_and_keep_latest_while_rece
         )
     })
     .await?;
-    let initial = h
+    let initial = hold_file_lane(&h, &phone, &mut tls).await?;
+    // Clipboard text has its own receipt lane while this image awaits ACK.
+    let text = h
         .core
-        .send_clipboard(phone.identity.device_id.clone(), "hold this receipt".into())
+        .send_clipboard(
+            phone.identity.device_id.clone(),
+            "text during image receipt".into(),
+        )
         .await?;
     assert!(
-        matches!(read_frame(&mut tls).await?,Some(Message::Clipboard(text)) if text.transfer_id==initial)
+        matches!(read_frame(&mut tls).await?,Some(Message::Clipboard(frame)) if frame.transfer_id==text)
     );
+    write_frame(
+        &mut tls,
+        &Message::Ack(Ack {
+            transfer_id: text,
+            deduplicated: false,
+        }),
+    )
+    .await?;
     let prepared = h.core.observe_clipboard_offer().unwrap();
     h.core
         .send_observed_image(prepared.clone(), b"\x89PNG\r\n\x1a\nprepared".to_vec())
@@ -2755,16 +2787,7 @@ async fn outgoing_clipboard_images_require_capability_and_keep_latest_while_rece
             .is_err(),
         "an invalidated prepared image must not be sent"
     );
-    let initial = h
-        .core
-        .send_clipboard(
-            phone.identity.device_id.clone(),
-            "hold another receipt".into(),
-        )
-        .await?;
-    assert!(
-        matches!(read_frame(&mut tls).await?, Some(Message::Clipboard(text)) if text.transfer_id == initial)
-    );
+    let initial = hold_file_lane(&h, &phone, &mut tls).await?;
     let first = b"\x89PNG\r\n\x1a\nold".to_vec();
     let mut newest = b"\x89PNG\r\n\x1a\n".to_vec();
     newest.extend(vec![7; CHUNK_SIZE * 3]);
@@ -3928,6 +3951,111 @@ async fn link_computers(a: &Harness, b: &Harness) -> Result<()> {
     .await?;
     Ok(())
 }
+#[tokio::test]
+async fn mesh_file_images_from_computer_and_phone_use_the_same_clipboard_register() -> Result<()> {
+    let a = Harness::mesh().await?;
+    let b = Harness::mesh().await?;
+    b.core
+        .set_setting("copy_image_to_clipboard".into(), true.into())
+        .await?;
+    link_computers(&a, &b).await?;
+    let png = b"\x89PNG\r\n\x1a\nfile image".to_vec();
+    let path = a.dir.path().join("selected.png");
+    std::fs::write(&path, &png)?;
+    let operation = a
+        .core
+        .send_files(
+            vec![path],
+            pneud::outbox::Targets::Devices(vec![b.core.identity.device_id.clone()]),
+        )
+        .await?;
+    let operation: Id = serde_json::from_value(operation["operation"].clone())?;
+    b.wait_images(1).await?;
+    assert_eq!(b.actions.image_bytes.lock().unwrap()[0], png);
+    let db = rusqlite::Connection::open(a.core.paths.data.join("state.sqlite3"))?;
+    let meta: String = db.query_row(
+        "SELECT meta FROM outbox_artifacts WHERE operation=?",
+        [operation.as_str()],
+        |r| r.get(0),
+    )?;
+    let begin: FileBegin = serde_json::from_str(&meta)?;
+    assert_eq!(begin.source_device, Some(a.core.identity.device_id.clone()));
+    assert!(begin.hlc.is_some());
+    let applied = || -> Result<(String, String)> {
+        let db = rusqlite::Connection::open(b.core.paths.data.join("state.sqlite3"))?;
+        Ok(
+            db.query_row("SELECT hlc,source_device FROM clipboard_clock", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?,
+        )
+    };
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !applied().is_ok_and(|clock| clock.0 == begin.hlc.unwrap().to_string()) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(
+        applied()?,
+        (
+            begin.hlc.unwrap().to_string(),
+            a.core.identity.device_id.as_str().into()
+        )
+    );
+    let local_effects: i64 =
+        db.query_row("SELECT count(*) FROM clipboard_clock", [], |r| r.get(0))?;
+    assert_eq!(
+        local_effects, 0,
+        "sending an image file must not apply a clipboard value locally"
+    );
+    drop(db);
+    // Android sends ordinary image FILEs with the same authenticated origin
+    // stamp. Exercise the phone receive path against the same global register.
+    let phone = b.phone("image-phone")?;
+    b.pair(&phone).await?.close().await?;
+    let mut link = mesh_phone(&b, &phone).await?;
+    let phone_png = b"\x89PNG\r\n\x1a\nphone image".to_vec();
+    let mut incoming = metadata(Id::from_bytes(rand::random()), &phone_png);
+    incoming.kind = FileKind::File;
+    incoming.hlc = Some(pneud::now_ms().max(begin.hlc.unwrap() + 1));
+    incoming.source_device = Some(phone.identity.device_id.clone());
+    write_frame(&mut link, &Message::FileBegin(incoming.clone())).await?;
+    write_frame(
+        &mut link,
+        &Message::FileChunk(FileChunk {
+            transfer_id: incoming.transfer_id.clone(),
+            offset: 0,
+            data: phone_png,
+        }),
+    )
+    .await?;
+    write_frame(
+        &mut link,
+        &Message::FileEnd(FileEnd {
+            transfer_id: incoming.transfer_id.clone(),
+        }),
+    )
+    .await?;
+    assert!(matches!(wire_reply(&mut link).await?, Message::Ack(_)));
+    b.wait_images(2).await?;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !applied().is_ok_and(|clock| clock.0 == incoming.hlc.unwrap().to_string()) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(
+        applied()?,
+        (
+            incoming.hlc.unwrap().to_string(),
+            phone.identity.device_id.as_str().into()
+        )
+    );
+    drop(link);
+    a.stop().await?;
+    b.stop().await
+}
+
 #[tokio::test]
 async fn mesh_three_way_near_simultaneous_local_copies_converge_without_forwarding() -> Result<()> {
     let a = Harness::mesh().await?;
@@ -5699,3 +5827,6 @@ async fn probe_authorized_mesh_install_after_disable() -> Result<()> {
     );
     Ok(())
 }
+
+#[path = "support/file_outbox.rs"]
+mod file_outbox;

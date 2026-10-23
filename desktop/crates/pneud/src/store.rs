@@ -1,6 +1,8 @@
 //! Paired peers, completed file receipts, bounded clipboard history, latest outgoing text.
 #[path = "store_clipboard.rs"]
 mod clipboard;
+#[path = "outbox.rs"]
+pub mod outbox;
 #[path = "store_settings.rs"]
 mod settings;
 pub(crate) use settings::{SettingsMalformed, SettingsUnexpected};
@@ -472,7 +474,7 @@ impl Store {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;")?;
         let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        ensure!(version <= 2, "unsupported store schema version {version}");
+        ensure!(version <= 3, "unsupported store schema version {version}");
         // All schema changes and legacy cleanup are one transaction. A failed
         // migration leaves the existing pairing, receipts and outbox intact.
         let tx = conn.transaction()?;
@@ -620,6 +622,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS settings_outgoing(device TEXT PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS settings_replay(device TEXT PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS settings_confirmed(device TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,key TEXT NOT NULL,enabled INTEGER NOT NULL,hlc TEXT NOT NULL,writer_device TEXT NOT NULL,PRIMARY KEY(device,key));")?;
+        outbox::migrate(&tx)?;
         // Policy is authoritative before Core can expose any clipboard offers.
         let pair_settings = {
             let mut q = tx.prepare("SELECT id FROM peers")?;
@@ -982,6 +985,7 @@ impl Store {
                     if current.load(Ordering::SeqCst) != connection {
                         return Ok(());
                     }
+                    tx.execute("INSERT INTO outbox_capabilities SELECT id,generation,? FROM peers WHERE id=? ON CONFLICT(device) DO UPDATE SET generation=excluded.generation,files=excluded.files",params![hello.capabilities.iter().any(|c|c=="files"),hello.device_id.as_str()])?;
                     tx.execute("INSERT INTO settings_support VALUES(?,?) ON CONFLICT(device) DO UPDATE SET supported=excluded.supported",params![hello.device_id.as_str(),hello.capabilities.iter().any(|c|c=="mesh")])?;
                     let role = match hello.role {
                         Some(pneu_proto::DeviceRole::Computer) => "computer",
@@ -2084,7 +2088,7 @@ mod tests {
             .call(|c| {
                 assert_eq!(
                     c.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))?,
-                    2
+                    3
                 );
                 assert_eq!(
                     c.query_row(

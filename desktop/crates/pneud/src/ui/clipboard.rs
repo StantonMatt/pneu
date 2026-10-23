@@ -690,19 +690,14 @@ impl Watch {
                         first = false;
                         continue;
                     }
-                    // A retired install MIME is a manager re-offer, including
-                    // the first selection seen after a daemon restart.
-                    if first && marker.is_none() {
-                        first = false;
-                        continue;
-                    }
-                    first = false;
+                    let initial = std::mem::replace(&mut first, false);
                     if marker.is_none() && mimes.iter().any(|mime| mime == ORIGIN_MIME) {
                         continue;
                     }
                     let (_target, token) = core.observe_watched_clipboard_kind(
                         false,
                         !matches!(&event, ClipboardEvent::Changed { .. }),
+                        initial,
                     );
                     let selection = Selection {
                         observation: Some(token),
@@ -726,7 +721,14 @@ impl Watch {
                         core.clipboard_observed(token, None, false);
                     }
                 }
-                stop.store(true, Ordering::SeqCst);
+                if !stop.swap(true, Ordering::SeqCst)
+                    && let Some(core) = weak.upgrade()
+                {
+                    // The selection is unknown while disconnected. Invalidate
+                    // cached manual shares before the runtime reconnects us.
+                    let (_, token) = core.observe_watched_clipboard_kind(false, true, true);
+                    core.clipboard_observed(token, None, false);
+                }
                 observed_reads.shutdown();
             });
         let thread = match thread {
@@ -748,6 +750,11 @@ impl Watch {
             thread: Some(thread),
             readers,
         })
+    }
+    pub(super) fn is_finished(&self) -> bool {
+        self.thread
+            .as_ref()
+            .is_none_or(|thread| thread.is_finished())
     }
     pub async fn shutdown(mut self) {
         self.stopping.store(true, Ordering::SeqCst);

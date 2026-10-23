@@ -41,11 +41,22 @@ source "$1"
             String::from_utf8_lossy(&output.stderr)
         );
         let calls = std::fs::read_to_string(trace)?;
-        let mut expected = "build\ninstall\ninstall\ninstall\ninstall\ninstall\ninstall\ninstall\ninstall\ninstall\n--user daemon-reload\n--user reenable pneud.service\n--user is-active --quiet graphical-session.target\n".to_owned();
+        let mut expected = "build\ninstall\ninstall\ninstall\ninstall\ninstall\ninstall\ninstall\ninstall\ninstall\ninstall\n--user daemon-reload\n--user reenable pneud.service\n--user is-active --quiet graphical-session.target\n".to_owned();
         if active {
             expected.push_str("--user restart pneud.service\n");
         }
         assert_eq!(calls, expected);
     }
     Ok(())
+}
+
+#[test]
+fn dolphin_service_menu_uses_absolute_path_cli_and_executable_kf6_install() {
+    let menu = include_str!("../../../packaging/pneu-send.desktop");
+    assert!(menu.contains("Type=Service"));
+    assert!(menu.contains("MimeType=application/octet-stream;"));
+    assert!(menu.contains("Name=Send with Pneu"));
+    assert!(menu.contains("Exec=pneud send %F"));
+    let installer = include_str!("../../../install.sh");
+    assert!(installer.contains("install -Dm755 packaging/pneu-send.desktop \"$HOME/.local/share/kio/servicemenus/pneu-send.desktop\""));
 }

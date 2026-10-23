@@ -117,41 +117,45 @@ fn headless() -> Result<()> {
             .env("PROBE_ROOT", root)
             .process_group(0);
     };
-    let mut cmd = std::process::Command::new("dbus-run-session");
-    cmd.args([
-        "--",
-        "kwin_wayland",
-        "--virtual",
-        "--socket",
-        "pneu-actor-test",
-        "--width",
-        "800",
-        "--height",
-        "600",
-        "--no-lockscreen",
-        "--no-global-shortcuts",
-        "--no-kactivities",
-    ]);
-    isolate(&mut cmd);
-    let log = root.join("kwin.log");
-    let out = std::fs::File::create(&log)?;
-    cmd.stdout(out.try_clone()?).stderr(out);
-    let mut compositor = Group(cmd.spawn()?);
-    for _ in 0..100 {
-        if runtime.join("pneu-actor-test").exists() {
-            break;
+    let start_compositor = || -> Result<Group> {
+        let mut cmd = std::process::Command::new("dbus-run-session");
+        cmd.args([
+            "--",
+            "kwin_wayland",
+            "--virtual",
+            "--socket",
+            "pneu-actor-test",
+            "--width",
+            "800",
+            "--height",
+            "600",
+            "--no-lockscreen",
+            "--no-global-shortcuts",
+            "--no-kactivities",
+        ]);
+        isolate(&mut cmd);
+        let log = root.join("kwin.log");
+        let out = std::fs::File::create(&log)?;
+        cmd.stdout(out.try_clone()?).stderr(out);
+        let mut compositor = Group(cmd.spawn()?);
+        for _ in 0..100 {
+            if runtime.join("pneu-actor-test").exists() {
+                break;
+            }
+            ensure!(
+                compositor.0.try_wait()?.is_none(),
+                "headless KWin exited: {}",
+                std::fs::read_to_string(&log)?
+            );
+            std::thread::sleep(Duration::from_millis(50));
         }
         ensure!(
-            compositor.0.try_wait()?.is_none(),
-            "headless KWin exited: {}",
-            std::fs::read_to_string(&log)?
+            runtime.join("pneu-actor-test").exists(),
+            "headless Wayland socket unavailable"
         );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    ensure!(
-        runtime.join("pneu-actor-test").exists(),
-        "headless Wayland socket unavailable"
-    );
+        Ok(compositor)
+    };
+    let mut compositor = Some(start_compositor()?);
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
     cmd.arg("--probe");
     isolate(&mut cmd);
@@ -159,6 +163,12 @@ fn headless() -> Result<()> {
     let mut probe = Group(cmd.spawn()?);
     let start = std::time::Instant::now();
     loop {
+        if root.join("restart-compositor").exists() {
+            drop(compositor.take());
+            compositor = Some(start_compositor()?);
+            std::fs::remove_file(root.join("restart-compositor"))?;
+            std::fs::write(root.join("compositor-ready"), b"")?;
+        }
         if let Some(status) = probe.0.try_wait()? {
             ensure!(
                 status.success(),
@@ -251,6 +261,55 @@ async fn local_seen(b: &mut PhoneConnection, expected: &str) -> Result<()> {
         b.read(Duration::from_millis(120)).await.is_err(),
         "duplicated local copy"
     );
+    Ok(())
+}
+async fn manual_selection_seen(b: &mut MeshTls, mime: &str, expected: &[u8]) -> Result<()> {
+    let first = tokio::time::timeout(Duration::from_secs(3), read_frame(&mut *b)).await??;
+    if mime != "image/png" {
+        let Some(Message::Clipboard(text)) = first else {
+            anyhow::bail!("manual text missing");
+        };
+        ensure!(text.text.as_bytes() == expected, "wrong startup text");
+        write_frame(
+            b,
+            &Message::Ack(Ack {
+                transfer_id: text.transfer_id,
+                deduplicated: false,
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+    let Some(Message::FileBegin(begin)) = first else {
+        anyhow::bail!("manual clipboard image missing FILE_BEGIN");
+    };
+    ensure!(begin.kind == FileKind::ClipboardImage, "wrong image kind");
+    let mut bytes = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(3), read_frame(&mut *b)).await?? {
+            Some(Message::FileChunk(chunk)) => {
+                ensure!(
+                    chunk.transfer_id == begin.transfer_id && chunk.offset == bytes.len() as u64,
+                    "wrong image chunk"
+                );
+                bytes.extend(chunk.data);
+            }
+            Some(Message::FileEnd(end)) => {
+                ensure!(end.transfer_id == begin.transfer_id, "wrong image end");
+                break;
+            }
+            other => anyhow::bail!("unexpected image frame: {other:?}"),
+        }
+    }
+    ensure!(bytes == expected, "manual image bytes changed");
+    write_frame(
+        b,
+        &Message::Ack(Ack {
+            transfer_id: begin.transfer_id,
+            deduplicated: false,
+        }),
+    )
+    .await?;
     Ok(())
 }
 async fn wait_image(db: &rusqlite::Connection, before: &str) -> Result<()> {
@@ -367,7 +426,7 @@ async fn run() -> Result<()> {
         actions,
     )
     .await?;
-    let watch = pneud::ui::clipboard::Watch::start(core.clone())?;
+    let mut watch = pneud::ui::clipboard::Watch::start(core.clone())?;
     let serve = tokio::spawn(core.clone().serve(listener, false));
     delay(100).await;
     let a = Phone::new(root.join("sender"))?;
@@ -384,6 +443,112 @@ async fn run() -> Result<()> {
     let db = rusqlite::Connection::open(root.join("data/state.sqlite3"))?;
     let png = root.join("fixture.png");
     let png_bytes = std::fs::read(&png)?;
+    // The stock simulator advertises text only. Use its mesh connection for
+    // this matrix so the recipient really negotiates clipboard images too.
+    bc.close().await?;
+    let mut startup_mesh = mesh_connect(&core, &b).await?;
+    for mode in ["automatic", "manual", "off"] {
+        for (mime, bytes) in [
+            ("text/plain;charset=utf-8", b"startup selection".as_slice()),
+            ("image/png", png_bytes.as_slice()),
+        ] {
+            watch.shutdown().await;
+            core.set_setting("clipboard_mode".into(), mode.into())
+                .await?;
+            core.set_setting("clipboard_include_images".into(), true.into())
+                .await?;
+            let mut startup_owner = copy(bytes, mime).await?;
+            watch = pneud::ui::clipboard::Watch::start(core.clone())?;
+            delay(650).await;
+            ensure!(
+                tokio::time::timeout(Duration::from_millis(120), read_frame(&mut startup_mesh))
+                    .await
+                    .is_err(),
+                "startup selection auto-published in {mode}"
+            );
+            ensure!(
+                ac.read(Duration::from_millis(120)).await.is_err(),
+                "startup selection sent to source in {mode}"
+            );
+            let targets = || pneud::outbox::Targets::Devices(vec![b.identity.device_id.clone()]);
+            if mode == "off" {
+                ensure!(
+                    core.share_clipboard(targets()).await.is_err(),
+                    "Off allowed a share"
+                );
+            }
+            core.set_setting("clipboard_mode".into(), "manual".into())
+                .await?;
+            core.share_clipboard(targets()).await?;
+            manual_selection_seen(&mut startup_mesh, mime, bytes).await?;
+            core.set_setting("clipboard_mode".into(), "automatic".into())
+                .await?;
+            ensure!(
+                tokio::time::timeout(Duration::from_millis(120), read_frame(&mut startup_mesh))
+                    .await
+                    .is_err(),
+                "mode change published old selection"
+            );
+            let _ = startup_owner.kill().await;
+            let _ = startup_owner.wait().await;
+        }
+    }
+    println!(
+        "PASS real watcher first text/PNG: no automatic publication in any mode, explicit share after restart and Off-to-Manual works"
+    );
+    startup_mesh.shutdown().await?;
+    drop(startup_mesh);
+    bc = b.reconnect().await?;
+    core.set_setting("clipboard_mode".into(), "manual".into())
+        .await?;
+    let mut before_restart = copy(b"before compositor restart", "text/plain;charset=utf-8").await?;
+    delay(400).await;
+    core.share_clipboard(pneud::outbox::Targets::Devices(vec![
+        b.identity.device_id.clone(),
+    ]))
+    .await?;
+    local_seen(&mut bc, "before compositor restart").await?;
+    std::fs::write(root.join("restart-compositor"), b"")?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !root.join("compositor-ready").exists() {
+            delay(25).await;
+        }
+    })
+    .await?;
+    tokio::time::timeout(Duration::from_secs(3), watch.shutdown()).await?;
+    ensure!(
+        core.share_clipboard(pneud::outbox::Targets::Devices(vec![
+            b.identity.device_id.clone()
+        ]))
+        .await
+        .is_err(),
+        "disconnected watcher retained a shareable selection"
+    );
+    let _ = before_restart.kill().await;
+    let _ = before_restart.wait().await;
+    let mut after_restart = copy(b"after compositor restart", "text/plain;charset=utf-8").await?;
+    core.set_setting("clipboard_mode".into(), "automatic".into())
+        .await?;
+    watch = pneud::ui::clipboard::Watch::start(core.clone())?;
+    delay(650).await;
+    ensure!(
+        bc.read(Duration::from_millis(120)).await.is_err(),
+        "recovered compositor selection auto-published"
+    );
+    core.set_setting("clipboard_mode".into(), "manual".into())
+        .await?;
+    core.share_clipboard(pneud::outbox::Targets::Devices(vec![
+        b.identity.device_id.clone(),
+    ]))
+    .await?;
+    local_seen(&mut bc, "after compositor restart").await?;
+    core.set_setting("clipboard_mode".into(), "automatic".into())
+        .await?;
+    let _ = after_restart.kill().await;
+    let _ = after_restart.wait().await;
+    println!(
+        "PASS private compositor restart: stale share invalidated, reconnected first selection is manual-only"
+    );
     let text = a.text("remote-short-1234".into(), ClipboardOrigin::Clipboard)?;
     let ack = ac.send_text(text.clone()).await?;
     ensure!(!ack.deduplicated, "first remote text deduplicated");
