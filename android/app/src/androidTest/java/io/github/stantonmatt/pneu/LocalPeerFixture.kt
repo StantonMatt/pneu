@@ -19,6 +19,8 @@ import javax.net.ssl.*
  * first frame so these tests can inspect durable waiting work independently of ACKs. */
 internal class LocalPeerFixture(private val app:AppGraph,
     private val capabilities:Set<String> = setOf("files","clipboard_text","clipboard_image"),
+    private val helloVersion:Int=1,
+    private val helloError:String?=null,
     private val handle:(Frame.Control,(Frame.Control)->Unit)->Boolean={_,_->false}):AutoCloseable {
     private val alias=TlsIdentity.aliasFor(randomId())
     private val identity=TlsIdentity(alias,create=true)
@@ -75,7 +77,8 @@ internal class LocalPeerFixture(private val app:AppGraph,
             val selected=requireNotNull(peer)
             val output=ssl.outputStream
             val send:(Frame.Control)->Unit={frame->synchronized(output) {Protocol.write(output,frame)}}
-            send(Frame.Control(Type.HELLO,json("version" to 1,"device_id" to selected.deviceId,"name" to selected.name,"capabilities" to capabilities.toList(),"role" to "computer")))
+            helloError?.let {send(Frame.Control(Type.ERROR,json("code" to it,"supported_version" to 1)));return}
+            send(Frame.Control(Type.HELLO,json("version" to helloVersion,"device_id" to selected.deviceId,"name" to selected.name,"capabilities" to capabilities.toList(),"role" to "computer")))
             while(!closed) {
                 val frame=Protocol.read(ssl.inputStream)
                 if(frame is Frame.Control && !handle(frame,send))when(frame.type) {

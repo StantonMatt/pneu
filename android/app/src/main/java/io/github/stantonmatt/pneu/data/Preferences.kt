@@ -59,13 +59,13 @@ class Preferences(private val context:Context,internal val store:androidx.datast
     @Volatile internal var readCatalogVersion:suspend ()->String={MediaCatalog.version(context)}
     @Volatile internal var pairingBoundary:suspend ()->CatalogBoundary={MediaCatalog.boundary(context)}
     @Volatile internal var readSnapshot:suspend ()->CatalogSnapshot={MediaCatalog.snapshot(context)}
-    private data class ClipboardEffect(val stamp:ClipboardStamp,val hash:String,val peerId:String,val generation:Long,val id:String)
+    private data class ClipboardEffect(val stamp:ClipboardStamp,val hash:String,val peerId:String,val generation:Long,val id:String,val legacyTime:Long?=null)
     private val unfinishedEffects=java.util.concurrent.ConcurrentHashMap<String,ClipboardEffect>()
     internal fun clipboardEffect(peerId:String,generation:Long,id:String)=unfinishedEffects[completionKey(peerId,generation,id)]?.stamp
     /** Register the OS effect before any fallible persistence. Shared by every
      * receiver and every device-wide ordering/ownership decision. */
-    internal fun recordClipboardEffect(stamp:ClipboardStamp,hash:String,peerId:String,generation:Long,id:String) {
-        unfinishedEffects[completionKey(peerId,generation,id)]=ClipboardEffect(stamp,hash,peerId,generation,id)
+    internal fun recordClipboardEffect(stamp:ClipboardStamp,hash:String,peerId:String,generation:Long,id:String,legacyTime:Long?=null) {
+        unfinishedEffects[completionKey(peerId,generation,id)]=ClipboardEffect(stamp,hash,peerId,generation,id,legacyTime)
     }
     private fun effectiveClipboardRegister(p:androidx.datastore.preferences.core.Preferences):ClipboardStamp? =
         (unfinishedEffects.values.map {it.stamp}+listOfNotNull(MeshClock.register(p))).maxOrNull()
@@ -76,6 +76,12 @@ class Preferences(private val context:Context,internal val store:androidx.datast
                 ClipboardHistory.remember(p,effect.hash,effect.peerId)
             }
             val current=PeerRegistry.read(p).any {it.deviceId==effect.peerId && it.generation==effect.generation}
+            if(current && effect.legacyTime!=null) {
+                val time=longPreferencesKey("legacyImageTime:${effect.peerId}")
+                val generation=longPreferencesKey("legacyImageGeneration:${effect.peerId}")
+                p[time]=if(p[generation]==effect.generation)maxOf(p[time] ?: -1,effect.legacyTime) else effect.legacyTime
+                p[generation]=effect.generation
+            }
             if(current)p[clipboardCompletions]=p[clipboardCompletions].orEmpty()+completionKey(effect.peerId,effect.generation,effect.id)
         }
     }
@@ -111,7 +117,7 @@ class Preferences(private val context:Context,internal val store:androidx.datast
             automaticRevocations=listOf("screenshots","photos","recordings").associateWith {l(p,it+"AdmissionEpoch")}.filterValues {it!=0L})
     }
     val flow=raw.recoverReads()
-    suspend fun read():Prefs=storageDeadline {beforeReadStart();raw.first()}
+    suspend fun read():Prefs=kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {storageDeadline {beforeReadStart();raw.first()}}
     /** Generate the key before publishing its ID/alias in the same durable edit.
      * Upgrades preserve the old fixed certificate for the existing identity. */
     suspend fun ensureIdentity():Unit=policy.locked {
@@ -297,6 +303,14 @@ class Preferences(private val context:Context,internal val store:androidx.datast
         ClipboardHistory.remember(it,hash,source)
     }}
     internal suspend fun observeClipboard(stamp:ClipboardStamp) {edit {MeshClock.observe(it,stamp.hlc)}}
+    /** Legacy image effects also fence older legacy text when either durable
+     * follow-up fails. Scope this auxiliary gate to the original binding. */
+    internal suspend fun legacyClipboardTime(peer:String,generation:Long,durable:Long):Long {
+        val p=store.data.first()
+        val saved=if(p[longPreferencesKey("legacyImageGeneration:$peer")]==generation)p[longPreferencesKey("legacyImageTime:$peer")] ?: -1 else -1
+        val unfinished=unfinishedEffects.values.filter {it.peerId==peer && it.generation==generation}.mapNotNull {it.legacyTime}.maxOrNull() ?: -1
+        return maxOf(durable,saved,unfinished)
+    }
     internal suspend fun clipboardWins(stamp:ClipboardStamp)=effectiveClipboardRegister(store.data.first())?.let {stamp>it} ?: true
     private val clipboardCompletions=stringSetPreferencesKey("clipboardCompletions")
     private fun completionKey(peerId:String,generation:Long,id:String)="$peerId/$generation/$id"
@@ -317,14 +331,17 @@ class Preferences(private val context:Context,internal val store:androidx.datast
     internal suspend fun finishClipboardCompletion(peerId:String,generation:Long,id:String) {edit {p->
         p[clipboardCompletions]=p[clipboardCompletions].orEmpty()-completionKey(peerId,generation,id)
     }}
-    suspend fun setPairSwitch(peerId:String,feature:String,enabled:Boolean)=policy.locked {edit {p->
+    suspend fun setPairSwitch(peerId:String,feature:String,enabled:Boolean)=policy.locked {setPairSwitchLocked(peerId,feature,enabled)}
+    /** Caller holds policy, including across the associated queue transaction. */
+    internal suspend fun setPairSwitchLocked(peerId:String,feature:String,enabled:Boolean)=edit {p->
+        beforeMutation("pairSwitch")
         val peers=PeerRegistry.read(p);val peer=requireNotNull(peers.find {it.deviceId==peerId})
         val key=PairSettings.keys(s(p,"deviceId"),peerId)[when(feature) {"sendClipboard"->0;"receiveClipboard"->1;"automaticMedia"->2;else->error("Unknown pair switch")}]
         if(peer.settings.getValue(key).enabled!=enabled) {
             val stamp=MeshClock.next(p,s(p,"deviceId"),false)
             PeerRegistry.write(p,peers.map {if(it==peer)it.copy(settings=it.settings+(key to PairField(enabled,stamp.hlc.toString(),stamp.source)),localEdits=it.localSettingsEdits+key) else it})
         }
-    }}
+    }
     internal suspend fun prepareSettings(binding:DeliveryBinding):com.google.gson.JsonObject=policy.locked {
         var result:com.google.gson.JsonObject?=null
         edit {p->
@@ -404,6 +421,8 @@ class Preferences(private val context:Context,internal val store:androidx.datast
                 if(lostPcName!=null)PeerRegistry.write(it,peers.map {peer->if(peer==target)peer.copy(pairingLost=true) else peer})
                 else PeerRegistry.remove(it,target.deviceId)
                 PeerRegistry.reset(it,target.deviceId)
+                it.remove(longPreferencesKey("legacyImageTime:${target.deviceId}"))
+                it.remove(longPreferencesKey("legacyImageGeneration:${target.deviceId}"))
             }
             if(peers.size<=1)advanceEpoch(it)
             it[booleanPreferencesKey("pairingLost")]=lostPcName!=null

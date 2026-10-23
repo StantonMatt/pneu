@@ -1,5 +1,7 @@
 package io.github.stantonmatt.pneu
 
+import io.github.stantonmatt.pneu.connection.ConnectionStatus
+import io.github.stantonmatt.pneu.connection.PairingIssue
 import android.Manifest
 import android.app.Activity
 import android.content.*
@@ -102,12 +104,17 @@ fun lastConnectedLabel(context: android.content.Context, timestamp: Long): Strin
     return SimpleDateFormat("d MMM",Locale.getDefault()).format(Date(timestamp))
 }
 
+/** Device pages are "device:{id}". */
+internal const val DEVICE="device:"
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: () -> Unit = {},candidate:String?=null,offerPair:(String?)->Unit={}) {
     val context=LocalContext.current;val resources=LocalResources.current; val app=context.graph; val scope=rememberCoroutineScope()
     val p by app.prefs.collectAsState(); val link by app.connection.state.collectAsState(); val recentModel=remember(context) {androidx.lifecycle.ViewModelProvider(context as ComponentActivity)[RecentViewModel::class.java]}
     val recentItems by recentModel.items.collectAsState()
+    val devicesModel=remember(context) {androidx.lifecycle.ViewModelProvider(context as ComponentActivity)[DevicesViewModel::class.java]}
+    val deviceStates by devicesModel.devices.collectAsState()
     val recent=recentItems.map {it.row}
     val dark=isSystemInDarkTheme()
     if(!p.loaded || p.deviceId.isEmpty()) {
@@ -157,14 +164,26 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
     var unpair by remember { mutableStateOf<ConfirmedBinding?>(null) }
     var actionError by remember {mutableStateOf<Pair<UiFeedback,(() -> Unit)?>?>(null)}
     val actions=remember {UiActions {message,retry->actionError=UiFeedback(message) to retry}}
-    var health by remember { mutableStateOf(context.health()) }
-    LaunchedEffect(refresh,p.recordings,p.neverSleeping) { health=context.health() }
+    var health by remember { mutableStateOf(Health(true,true,true,true)) }
+    LaunchedEffect(refresh,p.recordings,p.neverSleeping) { health=withContext(Dispatchers.IO) {context.health()} }
     LaunchedEffect(p.setup,p.deviceId) { if(screen == null && p.deviceId.isNotEmpty()) navigate(if(!p.setup) "setup" else if(p.peer == null && !p.pairingLost) "pair" else "home") }
     LaunchedEffect(requested) { requested?.let { navigate(it); consume() } }
     LaunchedEffect(p.peer,pairingAttempt,p.pairingLost) { if(pairingAttempt!=null || !p.pairingLost && p.peer != null && screen != "pair") actions.run(resources.getString(R.string.ui_error_connection)) {PneuService.start(context)}
         if(p.peer == null && !p.pairingLost && p.setup && screen == "home") navigate("pair") }
+    var filesFor by rememberSaveable(stateSaver=CapturedAuthoritySaver) {mutableStateOf<CapturedAuthority?>(null)}
+    val files=rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) {uris->
+        val authority=filesFor;filesFor=null
+        if(uris.isNotEmpty())runCatching {sendFilesTo(context as Activity,requireNotNull(authority),uris)}
+            .onFailure {actionError=UiFeedback(resources.getString(R.string.toast_cant_read)) to null}
+    }
+    fun sendFiles(id:String) {
+        runCatching {
+            filesFor=CapturedAuthority(requireNotNull(DeliveryBinding.from(p,id)))
+            files.launch("*/*")
+        }.onFailure {filesFor=null;actionError=UiFeedback(resources.getString(R.string.toast_cant_read)) to null}
+    }
     var backProgress by remember {mutableFloatStateOf(0f)}
-    PredictiveBackHandler(enabled=screen in listOf("settings","permissions") || (screen=="pair" && p.peer != null)) { events ->
+    PredictiveBackHandler(enabled=screen in listOf("settings","permissions") || screen?.startsWith(DEVICE)==true || (screen=="pair" && p.peer != null)) { events ->
         try {events.collect {backProgress=it.progress};navigate(if(screen=="permissions") permissionOrigin else "home")}
         finally {backProgress=0f}
     }
@@ -174,7 +193,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
         Surface(Modifier.fillMaxSize().graphicsLayer {scaleX=1f-backProgress*.06f;scaleY=scaleX;shape=RoundedCornerShape((24*backProgress).dp);clip=backProgress>0f},color=background) {
             AnimatedContent(screen,transitionSpec={fadeIn(androidx.compose.animation.core.tween(PneuMotion.short)) togetherWith fadeOut(androidx.compose.animation.core.tween(PneuMotion.short))},label="Screen") { visibleScreen ->
             when(visibleScreen) {
-                "setup","permissions" -> SetupScreen(visibleScreen=="setup",health,refresh,{ navigate(permissionOrigin) },{health=context.health()}) {
+                "setup","permissions" -> SetupScreen(visibleScreen=="setup",health,refresh,{ navigate(permissionOrigin) },{scope.launch {health=withContext(Dispatchers.IO) {context.health()}}}) {
                     scope.launch {if(actions.run(resources.getString(R.string.ui_error_setup)) {app.preferences.toggle("setup",true)})navigate("pair")}
                 }
                 "pair" -> {
@@ -182,16 +201,27 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
                     key(session) {PairScreen(p,link,{ if(screen=="pair" && session==scannerSession)navigate("home") },{ if(p.peer != null)navigate("home") else (context as Activity).finish() },{offerPair(it)},lastAttemptedInvitation=lastAttemptedInvitation,initialPairingRevision=scannerPairingRevision,initialAttemptId=scannerAttemptId,validationFeedback=rejectedLinkFeedback)}
                 }
                 "home" -> {var homeScrolled by remember {mutableStateOf(false)};Scaffold(containerColor=background,contentWindowInsets=WindowInsets.statusBars,topBar={HomeTopBar(homeScrolled){navigate("settings")}}) { padding ->
-                    HomeScreen(p,link,recent,health,Modifier.padding(padding),{permissionOrigin="home";navigate("permissions")},{navigate("pair")},{homeScrolled=it},recentItems.associateBy {it.row.mediaId})
+                    HomeScreen(p,link,recent,health,Modifier.padding(padding),{permissionOrigin="home";navigate("permissions")},{navigate("pair")},{homeScrolled=it},recentItems.associateBy {it.row.mediaId},deviceStates) {navigate(DEVICE+it)}
                 }}
-                "settings" -> SettingsScreen(p,health,refresh,{navigate("home")},{permissionOrigin="settings";navigate("permissions")},{id->unpair=ConfirmedBinding.from(p,id)},{navigate("pair")})
+                "settings" -> SettingsScreen(p,health,refresh,{navigate("home")},{permissionOrigin="settings";navigate("permissions")})
+                else -> visibleScreen?.removePrefix(DEVICE)?.takeIf {visibleScreen.startsWith(DEVICE)}?.let {id->
+                    // Unpaired here or on the other device: the page has nothing left to show.
+                    val state=deviceStates.find {it.peer.deviceId==id}
+                    LaunchedEffect(state==null,p.devices) {if(state==null && p.devices.none {it.deviceId==id} && screen==visibleScreen)navigate("home")}
+                    if(state!=null)DeviceScreen(p,state,{navigate("home")},{navigate("pair")},{unpair=ConfirmedBinding.from(p,id)},{sendFiles(id)}) {key,value->
+                        val authority=DeliveryBinding.from(p,id)?.let(::CapturedAuthority)
+                        if(authority!=null)scope.launch {actions.run(resources.getString(R.string.ui_error_setting)) {devicesModel.setPairSwitch(authority,key,value)}}
+                    }
+                }
             }
             }
         }
         val proposed=remember(candidate) {candidate?.let {runCatching {Invitation.parse(it)}.getOrNull()}}
         var confirmationAttempt by remember {mutableIntStateOf(0)}
         val pairingTarget=remember(candidate,confirmationAttempt) {proposed?.let {ConfirmedBinding.forInvitation(p,it)}}
-        var permissionPair by rememberSaveable {mutableStateOf<List<String>?>(null)}
+        // Saved state restores the candidate preview, never an accepted approval.
+        // Permission callbacks after recreation therefore require another Pair tap.
+        var permissionPair by remember {mutableStateOf<List<String>?>(null)}
         var permissionRevision by remember {mutableIntStateOf(0)}
         fun startConfirmed(raw:String,target:ConfirmedBinding) {
             // Both camera and deep-link confirmations use this owner. Retain before
@@ -365,7 +395,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
     val installed=installedBinding!=null
     val paired=installed
     val success=paired
-    val disconnected=link.status !in listOf("Connected","Connecting…")
+    val disconnected=link.connectionStatus !in setOf(ConnectionStatus.CONNECTED,ConnectionStatus.CONNECTING)
     val snackbar=remember { SnackbarHostState() }
     var consumedValidation by rememberSaveable {mutableStateOf<String?>(null)}
     LaunchedEffect(validationFeedback?.id) {validationFeedback?.let {
@@ -382,7 +412,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
         lifecycle.lifecycle.addObserver(observer);onDispose { lifecycle.lifecycle.removeObserver(observer) }
     }
     var feedbackTimedOut by rememberSaveable(attempt?.id) { mutableStateOf(false) }
-    val busy=attempt != null && !feedbackTimedOut && link.pairing != resources.getString(R.string.pair_unreachable_title)
+    val busy=attempt != null && !feedbackTimedOut && link.pairingFeedback?.issue != PairingIssue.UNREACHABLE
     val scanBlocked=attempt!=null || installed
     BackHandler(busy) {}
     LaunchedEffect(busy,attempt?.id) {
@@ -395,8 +425,8 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
         if(event.id==consumedPairing)return@LaunchedEffect
         consumedPairing=event.id
         when {
-            event.message==resources.getString(R.string.pair_unreachable_title) -> dialog=true
-            event.message in listOf(resources.getString(R.string.pair_not_pneu),resources.getString(R.string.pair_expired),"Computer limit reached","Conflicting peer identity") || event.message.startsWith("Your PC's clock") || event.message.startsWith("Already paired") || event.message=="Pairing cancelled" || event.message=="Remote device ID is the phone's own ID" -> snackbar.showSnackbar(UiPresentation.pairing(context,event.message),duration=SnackbarDuration.Short)
+            event.issue==PairingIssue.UNREACHABLE -> dialog=true
+            event.issue in setOf(PairingIssue.CLOCK,PairingIssue.FEEDBACK) -> snackbar.showSnackbar(UiPresentation.pairing(context,event),duration=SnackbarDuration.Short)
         }
     }
     LaunchedEffect(paired,p.peer,p.pairingRevision,disconnected) {
@@ -438,22 +468,27 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
 }
 
 @OptIn(ExperimentalLayoutApi::class)
-@Composable internal fun HomeScreen(p: Prefs,link: LinkState,recent: List<Outgoing>,health: Health,modifier: Modifier,permissions: () -> Unit,pair: () -> Unit,onScrolled:(Boolean)->Unit,outcomes:Map<String,RecentItem> = emptyMap()) {
+@Composable internal fun HomeScreen(p: Prefs,link: LinkState,recent: List<Outgoing>,health: Health,modifier: Modifier,permissions: () -> Unit,pair: () -> Unit,onScrolled:(Boolean)->Unit,outcomes:Map<String,RecentItem> = emptyMap(),
+                                    devices:List<DeviceState>?=null,deviceLinks:Map<String,LinkState>?=null,openDevice:(String)->Unit={}) {
     val context=LocalContext.current;val resources=LocalResources.current; val app=context.graph; val scope=rememberCoroutineScope();val actions=LocalUiActions.current
-    val links by app.connection.devices.collectAsState()
+    val liveLinks by app.connection.devices.collectAsState()
+    val links=deviceLinks ?: liveLinks
+    val deviceList=devices ?: remember(p,links) {DeviceProjection.states(p,links)}
+    var details by rememberSaveable {mutableStateOf<String?>(null)}
+    val clipboardReady=rememberClipboardAvailable(p,links)
     var queueMenu by remember { mutableStateOf(false) }
     val waiting by app.waitingCount.collectAsState()
     var showProgress by remember(link.transferMediaId) {mutableStateOf(false)}
     LaunchedEffect(link.transferMediaId) {if(link.transferMediaId.isNotEmpty()){delay(1000);showProgress=true}}
-    val title=if(p.pairingLost) "Pairing lost" else if(p.paused) "Paused" else link.status
+    val title=if(p.pairingLost) ConnectionStatus.PAIRING_LOST else if(p.paused) ConnectionStatus.PAUSED else link.connectionStatus
     val network=RoutePolicy.active(context.getSystemService(android.net.ConnectivityManager::class.java))
-    val tailscaleOff=title=="PC unreachable" && p.tailscale && !network.vpn && p.devices.any {peer->!peer.pairingLost && peer.addresses.any {it.tailscale}}
+    val tailscaleOff=title==ConnectionStatus.UNREACHABLE && p.tailscale && !network.vpn && p.devices.any {peer->!peer.pairingLost && peer.addresses.any {it.tailscale}}
     val detail=when(title) {
-        "Pairing lost" -> resources.getString(R.string.detail_pairing_lost,p.lostPcName.ifEmpty {p.peer?.name.orEmpty()})
-        "Paused" -> resources.getString(R.string.detail_paused)
-        "Connected" -> UiPresentation.connectionDetail(context,p,links,link)
-        "Connecting…" -> UiPresentation.connectionDetail(context,p,links,link)
-        "Waiting for Wi-Fi" -> resources.getString(R.string.detail_mobile_data_off)
+        ConnectionStatus.PAIRING_LOST -> resources.getString(R.string.detail_pairing_lost,p.lostPcName.ifEmpty {p.peer?.name.orEmpty()})
+        ConnectionStatus.PAUSED -> resources.getString(R.string.detail_paused)
+        ConnectionStatus.CONNECTED -> UiPresentation.connectionDetail(context,p,links,link)
+        ConnectionStatus.CONNECTING -> UiPresentation.connectionDetail(context,p,links,link)
+        ConnectionStatus.WAITING_WIFI -> resources.getString(R.string.detail_mobile_data_off)
         else -> if(tailscaleOff) resources.getString(R.string.detail_tailscale_off) else if(p.lastConnected>0) resources.getString(R.string.detail_last_connected,lastConnectedLabel(context,p.lastConnected)) else ""
     }
     val navigationBottom=WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
@@ -473,13 +508,16 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
             item {
                 Surface(shape=RoundedCornerShape(24.dp),border=if(LocalPneuColors.current.dark)BorderStroke(1.dp,LocalPneuColors.current.hairline)else null,color=groupColor(),modifier=Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(start=20.dp,end=20.dp,top=24.dp,bottom=20.dp),horizontalAlignment=Alignment.CenterHorizontally) {
-                        LinkView(link.copy(status=title),sending=link.transferMediaId.isNotEmpty())
+                        LinkView(link.copy(status=title.key),sending=link.transferMediaId.isNotEmpty(),receiving=link.incoming!=null,others=if(deviceList.size>1)linkTones(p,deviceList) else emptyList())
                         Crossfade(title,animationSpec=androidx.compose.animation.core.tween(PneuMotion.short),label="Connection status") {Text(UiPresentation.status(context,it),Modifier.fillMaxWidth().padding(top=16.dp),style=PneuType.title1,textAlign=TextAlign.Center)}
                         if(detail.isNotEmpty()) Text(detail,Modifier.padding(top=4.dp),style=MaterialTheme.typography.bodyMedium,color=MaterialTheme.colorScheme.onSurfaceVariant,maxLines=2,overflow=TextOverflow.Ellipsis,textAlign=TextAlign.Center)
                         FlowRow(Modifier.fillMaxWidth().padding(top=20.dp),horizontalArrangement=Arrangement.spacedBy(10.dp),verticalArrangement=Arrangement.spacedBy(10.dp),maxItemsInEachRow=if(androidx.compose.ui.platform.LocalDensity.current.fontScale>1.3f)1 else 2) {
                             if(p.pairingLost) PneuButton(pair,Modifier.fillMaxWidth().height(48.dp)) {Symbol(R.drawable.ic_qr_code_scanner,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_pair_again))}
                             else {
-                                PneuTonalButton(onClick={if(tailscaleOff) context.packageManager.getLaunchIntentForPackage("com.tailscale.ipn")?.let { context.startActivity(it) } else context.startActivity(ManualEntries.clipboardIntent(context,p))},modifier=Modifier.weight(1f).height(48.dp),enabled=app.connection.clipboardAvailable(p) || tailscaleOff,contentPadding=PaddingValues(horizontal=12.dp)) {Symbol(if(tailscaleOff)R.drawable.ic_open_in_new else R.drawable.ic_content_paste_go,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(if(tailscaleOff) resources.getString(R.string.action_open_tailscale) else resources.getString(R.string.tile_send_clipboard))}
+                                PneuTonalButton(onClick={scope.launch {actions.run(resources.getString(if(tailscaleOff)R.string.ui_error_connection else R.string.toast_not_sent)) {
+                                    if(tailscaleOff)context.startActivity(requireNotNull(context.packageManager.getLaunchIntentForPackage("com.tailscale.ipn")))
+                                    else context.startActivity(ManualEntries.clipboardIntent(context,p))
+                                }}},modifier=Modifier.weight(1f).height(48.dp),enabled=clipboardReady || tailscaleOff,contentPadding=PaddingValues(horizontal=12.dp)) {Symbol(if(tailscaleOff)R.drawable.ic_open_in_new else R.drawable.ic_content_paste_go,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(if(tailscaleOff) resources.getString(R.string.action_open_tailscale) else resources.getString(R.string.tile_send_clipboard))}
                                 if(p.paused) PneuButton(onClick={scope.launch {actions.run(resources.getString(R.string.ui_error_resume)) {app.preferences.toggle("paused",false)}}},modifier=Modifier.weight(1f).height(48.dp)) {Symbol(R.drawable.ic_play_arrow,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_resume))}
                                 else PneuNeutralButton(onClick={scope.launch {actions.run(resources.getString(R.string.ui_error_pause)) {app.preferences.toggle("paused",true)}}},modifier=Modifier.weight(1f).height(48.dp)) {Symbol(R.drawable.ic_pause,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_pause))}
                             }
@@ -487,6 +525,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
                     }
                 }
             }
+            item {DevicesCard(p,deviceList,openDevice,pair)}
             item {
                 Row(Modifier.fillMaxWidth().padding(start=16.dp,end=8.dp,top=20.dp,bottom=8.dp).height(32.dp),verticalAlignment=Alignment.CenterVertically) {
                     Text(resources.getString(R.string.recent_title),Modifier.weight(1f),style=PneuType.section,color=LocalPneuColors.current.text2)
@@ -506,22 +545,36 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
             else items(recent,key={it.mediaId}) {row ->
                 Surface(color=groupColor(),modifier=Modifier.then(if(LocalPneuMotion.current)Modifier.animateItem(fadeInSpec=androidx.compose.animation.core.tween(200),fadeOutSpec=androidx.compose.animation.core.tween(200))else Modifier).fillMaxWidth().pneuCardRowHairline(row==recent.first(),row==recent.last()),shape=RoundedCornerShape(topStart=if(row==recent.first())24.dp else 0.dp,topEnd=if(row==recent.first())24.dp else 0.dp,bottomStart=if(row==recent.last())24.dp else 0.dp,bottomEnd=if(row==recent.last())24.dp else 0.dp)) {
                     val outcome=outcomes[row.mediaId]
+                    val multi=outcome!=null && outcome.recipients.size>1
+                    val settled=outcome?.let {!it.actionable} ?: (row.state !in setOf("waiting","sending","failed"))
                     val progress=outcome?.sending==true || link.transferMediaId==row.mediaId && showProgress
                     val sent=if(outcome?.sending==true)outcome.sent else link.sent
                     val total=if(outcome?.sending==true)outcome.total else link.total
-                    Row(Modifier.fillMaxWidth().pneuRow(row!=recent.first(),76.dp).heightIn(min=68.dp).pneuClick(enabled=row.state=="sent" && (if(row.kind=="text")row.text.matches(Regex("""https?://\S+""")) else row.uri.isNotEmpty())) {scope.launch {if(row.kind=="text")runCatching {context.startActivity(Intent(Intent.ACTION_VIEW,Uri.parse(row.text)))} else RecentItems.openOriginal(context,row)}}.padding(horizontal=16.dp,vertical=12.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(16.dp)) {
+                    Row(Modifier.fillMaxWidth().pneuRow(row!=recent.first(),76.dp).heightIn(min=68.dp).pneuClick(enabled=multi && !settled || row.state=="sent" && (if(row.kind=="text")row.text.matches(Regex("""https?://\S+""")) else row.uri.isNotEmpty())) {if(multi && !settled)details=row.mediaId else scope.launch {actions.run(resources.getString(R.string.toast_cant_read)) {
+                        if(row.kind=="text")context.startActivity(Intent(Intent.ACTION_VIEW,Uri.parse(row.text)))
+                        else outcome?.received?.let {file->context.startActivity(ReceivedFileNotifications.openIntent(context,file))}
+                            ?: check(RecentItems.openOriginal(context,row)) {"Original unavailable"}
+                    }}}.padding(horizontal=16.dp,vertical=12.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(16.dp)) {
                         MediaThumb(row)
                         Column(Modifier.weight(1f)) {
                             Text(when(row.kind) {"photo"->resources.getString(R.string.kind_photo);"recording"->resources.getString(R.string.kind_recording);"file"->row.fileName;"text"->row.text.lineSequence().firstOrNull().orEmpty().removePrefix("https://");"clipboard_image"->resources.getString(R.string.kind_image);else->resources.getString(R.string.kind_screenshot)},style=MaterialTheme.typography.bodyLarge,maxLines=1,overflow=if(row.kind=="file")TextOverflow.MiddleEllipsis else TextOverflow.Ellipsis)
+                            // With one paired device the lines stay v2's; with several they name recipients.
+                            val several=p.devices.size>1 && outcome!=null
+                            val clipboard=row.kind=="clipboard_image" || row.kind=="text" && row.origin=="clipboard"
+                            val time=lastConnectedLabel(context,row.createdAt)
+                            val failing=outcome?.failed?.isNotEmpty()==true
                             val supporting=when {
-                                outcome!=null && outcome.recipients.size>1 -> UiPresentation.recentOutcome(context,outcome)
-                                progress -> resources.getString(R.string.item_sending,android.text.format.Formatter.formatShortFileSize(context,sent),android.text.format.Formatter.formatShortFileSize(context,total))
-                                row.state=="sent" -> if(row.kind=="clipboard_image" || row.kind=="text" && row.origin=="clipboard")resources.getString(R.string.item_clipboard_time,lastConnectedLabel(context,row.createdAt)) else lastConnectedLabel(context,row.createdAt)
+                                outcome?.received!=null -> UiPresentation.recentReceived(context,outcome,time,p.devices.size)!!
+                                several && settled -> UiPresentation.recentSent(context,outcome,clipboard,time) ?: time
+                                several && failing -> UiPresentation.recentOutcome(context,outcome!!)
+                                progress -> if(multi)UiPresentation.recentOutcome(context,outcome!!) else resources.getString(R.string.item_sending,android.text.format.Formatter.formatShortFileSize(context,sent),android.text.format.Formatter.formatShortFileSize(context,total))
+                                row.state=="sent" -> if(clipboard)resources.getString(R.string.item_clipboard_time,time) else time
                                 row.state=="failed" -> resources.getString(UiPresentation.failedItem(row.error))
                                 DeliveryPolicy.hold(row.kind,row.automatic,false,network.mobile,p.originals,row.attempted,row.optimized) -> resources.getString(R.string.item_waiting_wifi)
+                                several -> UiPresentation.recentOutcome(context,outcome!!)
                                 else -> resources.getString(R.string.item_waiting)
                             }
-                            Text(supporting,style=MaterialTheme.typography.bodyMedium,color=if(row.state=="failed") LocalPneuColors.current.danger else if(progress)LocalPneuColors.current.accentText else LocalPneuColors.current.text2,maxLines=1,overflow=TextOverflow.Ellipsis)
+                            Text(supporting,style=MaterialTheme.typography.bodyMedium,color=if(row.state=="failed" || several && failing) LocalPneuColors.current.danger else if(progress)LocalPneuColors.current.accentText else LocalPneuColors.current.text2,maxLines=1,overflow=TextOverflow.Ellipsis)
                             if(progress)LinearProgressIndicator(progress={if(total>0)(sent.toFloat()/total).coerceIn(0f,1f)else 0f},modifier=Modifier.fillMaxWidth().padding(top=7.dp).height(3.dp).clip(RoundedCornerShape(2.dp)),color=LocalPneuColors.current.accent,trackColor=LocalPneuColors.current.fill2,gapSize=0.dp,drawStopIndicator={})
                         }
                         if(row.state=="failed") IconButton(modifier=Modifier.size(40.dp),onClick={val reference=ConfirmedItem.from(row);scope.launch {actions.run(resources.getString(R.string.ui_error_retry_item)) {val selected=app.confirmArtifact(p,reference);check(app.retry(reference.mediaId,selected)) {"Queue item changed"}}}}) {Symbol(R.drawable.ic_refresh,resources.getString(R.string.cd_retry),modifier=Modifier.size(22.dp),tint=LocalPneuColors.current.text2)}
@@ -533,6 +586,18 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
             }
         }
     }
+    RecentDetails(p,details,outcomes,links) {details=null}
+}
+@Composable private fun RecentDetails(p:Prefs,details:String?,outcomes:Map<String,RecentItem>,links:Map<String,LinkState>,close:()->Unit) {
+    val context=LocalContext.current;val resources=LocalResources.current;val app=context.graph;val scope=rememberCoroutineScope();val actions=LocalUiActions.current
+    val item=details?.let(outcomes::get)
+    LaunchedEffect(details,item==null) {if(details!=null && item==null)close()}
+    if(item==null)return
+    val row=item.row
+    val title=when(row.kind) {"photo"->resources.getString(R.string.kind_photo);"recording"->resources.getString(R.string.kind_recording);"file"->row.fileName;"text"->row.text.lineSequence().firstOrNull().orEmpty().removePrefix("https://");"clipboard_image"->resources.getString(R.string.kind_image);else->resources.getString(R.string.kind_screenshot)}
+    RecipientsSheet(title,item,p.devices.associate {it.deviceId to (links[it.deviceId]?.connectionStatus==ConnectionStatus.CONNECTED && !it.pairingLost && it.deviceId !in p.resetPeers)},close,
+        stop={recipient->val selected=ConfirmedQueue(ConfirmedBinding.from(p),listOfNotNull(recipient.item));scope.launch {actions.run(resources.getString(R.string.ui_error_remove_item)) {check(app.discard(selected)) {"Queue item changed"}}}},
+        retry={recipient->val selected=ConfirmedQueue(ConfirmedBinding.from(p),listOfNotNull(recipient.item));scope.launch {actions.run(resources.getString(R.string.ui_error_retry_item)) {check(app.retry(row.mediaId,selected)) {"Queue item changed"}}}})
 }
 @Composable private fun MediaThumb(row: Outgoing) {
     val context=LocalContext.current
@@ -550,8 +615,10 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun SettingsScreen(p: Prefs,health: Health,refresh:Int,back: () -> Unit,permissions: () -> Unit,unpair: (String?) -> Unit,pair:()->Unit) {
+@Composable internal fun SettingsScreen(p: Prefs,health: Health,refresh:Int,back: () -> Unit,permissions: () -> Unit) {
     val context=LocalContext.current;val resources=LocalResources.current;val app=context.graph;val scope=rememberCoroutineScope();val actions=LocalUiActions.current;val snackbar=remember {SnackbarHostState()}
+    val devicesModel=remember(context) {androidx.lifecycle.ViewModelProvider(context as ComponentActivity)[DevicesViewModel::class.java]}
+    var renaming by rememberSaveable {mutableStateOf(false)}
     var pendingMedia by rememberSaveable {mutableStateOf("")}
     fun mediaPermissionFor(key:String)=if(key=="recordings")Manifest.permission.READ_MEDIA_VIDEO else Manifest.permission.READ_MEDIA_IMAGES
     LaunchedEffect(refresh,pendingMedia) {if(pendingMedia.isNotEmpty() && context.granted(mediaPermissionFor(pendingMedia))) {val key=pendingMedia;if(actions.run(resources.getString(R.string.ui_error_setting)) {app.preferences.toggle(key,true)})pendingMedia=""}}
@@ -573,35 +640,20 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
     Scaffold(modifier=Modifier.nestedScroll(scroll.nestedScrollConnection),containerColor=Color.Transparent,contentWindowInsets=WindowInsets.statusBars,topBar={LargeTopAppBar(expandedHeight=114.dp,collapsedHeight=56.dp,scrollBehavior=scroll,title={Text(resources.getString(R.string.settings_title),Modifier.padding(start=4.dp),style=if(scroll.state.collapsedFraction>.5f)PneuType.title2 else PneuType.largeTitle)},navigationIcon={NavIcon(back)},colors=TopAppBarDefaults.topAppBarColors(containerColor=LocalPneuColors.current.bg,scrolledContainerColor=LocalPneuColors.current.bg))},snackbarHost={PneuSnackbarHost(snackbar,Modifier.navigationBarsPadding())}) {padding ->
         Box(Modifier.padding(padding).fillMaxSize(),contentAlignment=Alignment.TopCenter) {
             Column(Modifier.widthIn(max=600.dp).fillMaxWidth().verticalScroll(rememberScrollState()).navigationBarsPadding().padding(horizontal=16.dp)) {
-                p.devices.ifEmpty {listOf(null)}.forEach {peer->
-                PneuCard {
-                    Row(Modifier.fillMaxWidth().heightIn(min=76.dp).padding(16.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(16.dp)) {
-                        val c=LocalPneuColors.current
-                        Box(Modifier.size(44.dp).background(if(peer?.pairingLost==true || p.pairingLost)c.dangerSoft else c.accentSoft,RoundedCornerShape(14.dp)),contentAlignment=Alignment.Center){Symbol(if(peer?.pairingLost==true || p.pairingLost)R.drawable.ic_link_off else R.drawable.ic_computer,tint=if(peer?.pairingLost==true || p.pairingLost)c.danger else c.onAccentSoft)}
-                        Column(Modifier.weight(1f)) {
-                            Text(peer?.name ?: p.lostPcName.ifEmpty {resources.getString(R.string.not_paired)},style=PneuType.headline)
-                            val identityDetail=if(peer?.pairingLost==true || p.pairingLost)resources.getString(R.string.status_pairing_lost) else peer?.addresses?.let {UiPresentation.pairedAddresses(it).joinToString(" · ")}.orEmpty()
-                            if(identityDetail.isNotEmpty())Text(identityDetail,style=PneuType.subhead,color=if(peer?.pairingLost==true || p.pairingLost)c.danger else c.text2,maxLines=1,overflow=TextOverflow.Ellipsis)
-                        }
-                    }
-                    SettingRow(resources.getString(R.string.action_unpair),error=true,click={unpair(peer?.deviceId)})
-                }
-                }
-                PneuCard {SettingRow(resources.getString(R.string.action_add_device),click=pair)}
                 Header(resources.getString(R.string.group_auto))
                 PneuCard {
                     ToggleRow(resources.getString(R.string.pref_screenshots),p.screenshots,divider=false) {toggle("screenshots",it)}
                     ToggleRow(resources.getString(R.string.pref_photos),p.photos) {toggle("photos",it)}
                     ToggleRow(resources.getString(R.string.pref_recordings),p.recordings) {toggle("recordings",it)}
                 }
+                Header(resources.getString(R.string.group_sharing))
+                PneuCard {
+                    ToggleRow(resources.getString(R.string.pref_share_sheet),p.shareSheet,divider=false) {toggle("shareSheet",it)}
+                    ToggleRow(resources.getString(R.string.pref_choose_devices),p.chooseDevicesEachTime) {toggle("chooseDevicesEachTime",it)}
+                }
                 Header(resources.getString(R.string.group_clipboard))
                 PneuCard {
                     ToggleRow(resources.getString(R.string.pref_clipboard_button),p.clipboardButton,divider=false) {toggle("clipboardButton",it)}
-                    p.devices.forEach {peer->
-                        ToggleRow(UiPresentation.clipboardReceiveLabel(context,p,peer),peer.clipboardReceive) {value->
-                            scope.launch {actions.run(resources.getString(R.string.ui_error_setting)) {app.setPairSwitch(peer.deviceId,"receiveClipboard",value)}}
-                        }
-                    }
                 }
                 Header(resources.getString(R.string.group_connection))
                 PneuCard {
@@ -613,23 +665,26 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
                 }
                 Header(resources.getString(R.string.group_phone))
                 PneuCard {
-                    ToggleRow(resources.getString(R.string.pref_share_sheet),p.shareSheet,divider=false) {toggle("shareSheet",it)}
+                    SettingRow(resources.getString(R.string.pref_name),selfName(context,p),divider=false) {renaming=true}
                     ToggleRow(resources.getString(R.string.pref_quick_settings),p.quickSettings) {toggle("quickSettings",it)}
                     SettingRow(resources.getString(R.string.pref_permissions),if(health.issues.isEmpty())resources.getString(R.string.pref_permissions_ok) else resources.getQuantityString(R.plurals.pref_permissions_issues,health.issues.size,health.issues.size),error=health.issues.isNotEmpty(),click=permissions)}
                 Text(resources.getString(R.string.version,BuildConfig.VERSION_NAME),Modifier.fillMaxWidth().padding(24.dp),style=PneuType.caption,color=LocalPneuColors.current.text3,textAlign=TextAlign.Center)
             }
         }
     }
+    if(renaming)RenameDialog(selfName(context,p),{renaming=false}) {name->
+        scope.launch {if(actions.run(resources.getString(R.string.ui_error_setting)) {devicesModel.renameSelf(name)})renaming=false}
+    }
 }
 @Composable private fun ToggleRow(title: String,checked: Boolean,enabled: Boolean=true,detail: String?=null,divider:Boolean=true,change: (Boolean) -> Unit) {
-    Row(Modifier.fillMaxWidth().pneuRow(divider).pneuToggle(checked,enabled,change).heightIn(min=if(detail==null)56.dp else 68.dp).padding(horizontal=16.dp,vertical=8.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(16.dp)) {
+    Row(Modifier.fillMaxWidth().pneuRow(divider).pneuToggle(checked,enabled,onChange=change).heightIn(min=if(detail==null)56.dp else 68.dp).padding(horizontal=16.dp,vertical=8.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(16.dp)) {
         Column(Modifier.weight(1f).graphicsLayer {alpha=if(enabled)1f else .4f}) {Text(title,style=PneuType.body);if(detail!=null) Text(detail,style=PneuType.subhead,color=LocalPneuColors.current.danger)}
         PneuSwitch(checked=checked,onCheckedChange=null,enabled=enabled)
     }
 }
-@Composable private fun SettingRow(title: String,detail: String?=null,error: Boolean=false,click: (() -> Unit)?=null) {
+@Composable private fun SettingRow(title: String,detail: String?=null,error: Boolean=false,divider:Boolean=true,click: (() -> Unit)?=null) {
     val c=LocalPneuColors.current
-    Row(Modifier.fillMaxWidth().pneuRow(true).then(if(click!=null)Modifier.pneuClick(onClick=click)else Modifier).heightIn(min=if(detail==null)56.dp else 68.dp).padding(horizontal=16.dp,vertical=12.dp),verticalAlignment=Alignment.CenterVertically) {
+    Row(Modifier.fillMaxWidth().pneuRow(divider).then(if(click!=null)Modifier.pneuClick(onClick=click)else Modifier).heightIn(min=if(detail==null)56.dp else 68.dp).padding(horizontal=16.dp,vertical=12.dp),verticalAlignment=Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {
             Text(title,style=PneuType.body,color=if(error&&detail==null)c.danger else c.text,maxLines=1,overflow=TextOverflow.Ellipsis)
             if(detail!=null)Text(detail,style=PneuType.subhead,color=if(error)c.warn else c.text2,maxLines=1,overflow=TextOverflow.Ellipsis)

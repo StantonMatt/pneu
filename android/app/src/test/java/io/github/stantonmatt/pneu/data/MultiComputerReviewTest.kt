@@ -24,14 +24,14 @@ class MultiComputerReviewTest {
     private val a=Peer("A","a".repeat(64),"a".repeat(32),emptyList(),generation=1)
     private val b=a.copy(name="B",pin="b".repeat(64),deviceId="b".repeat(32),generation=2)
     private val prefs=Prefs(deviceId="f".repeat(32),peer=a,peers=listOf(a,b))
-    @Test fun connectedSecondaryComputerWinsOverOfflineOrLostFirstComputer() {
+    @Test fun connectedSecondaryComputerWinsOverOfflineOrLostFirstComputer()=runBlocking<Unit>(Dispatchers.IO) {
         for(first in listOf(LinkState("PC unreachable"),LinkState("Pairing lost"),LinkState("Connecting…"))) {
             val result=LinkProjection.aggregate(prefs,mapOf(a.pin to first,b.pin to LinkState("Connected","Tailscale")),null)
             assertEquals("Connected",result.status);assertEquals("Tailscale",result.route)
         }
     }
-    @Test fun terminalRetentionKeepsFiftyDistinctArtifactsRegardlessOfRecipientCount()=runBlocking {
-        val room=Room.inMemoryDatabaseBuilder(context,QueueDatabase::class.java).allowMainThreadQueries().build()
+    @Test fun terminalRetentionKeepsFiftyDistinctArtifactsRegardlessOfRecipientCount()=runBlocking<Unit>(Dispatchers.IO) {
+        val room=Room.inMemoryDatabaseBuilder(context,QueueDatabase::class.java).build()
         try {
             val queue=room.queue()
             repeat(55) {i->repeat(16) {peer->queue.insert(Outgoing().apply {mediaId="item$i";transferId="transfer$i";peerId="peer$peer";state="sent";orderId=i.toLong()})}}
@@ -40,7 +40,7 @@ class MultiComputerReviewTest {
             assertEquals(0,queue.waitingCount().first())
         }finally {room.close()}
     }
-    @Test fun addingAndRepairingSecondaryComputerAdvancesScannerInstallationFloor()=runBlocking {
+    @Test fun addingAndRepairingSecondaryComputerAdvancesScannerInstallationFloor()=runBlocking<Unit>(Dispatchers.IO) {
         val owner=CoroutineScope(SupervisorJob()+Dispatchers.IO)
         val file=File(context.cacheDir,"review-${randomId()}.preferences_pb")
         val store=PreferenceDataStoreFactory.create(scope=owner) {file}
@@ -61,7 +61,7 @@ class MultiComputerReviewTest {
             assertEquals(200L,preferences.read().lastConnected)
         }finally {owner.cancel();owner.coroutineContext[Job]?.join();file.delete()}
     }
-    @Test fun pairingUsesAddWordingAndNeverPromisesToReplaceAnotherDevice() {
+    @Test fun pairingUsesAddWordingAndNeverPromisesToReplaceAnotherDevice()=runBlocking<Unit>(Dispatchers.IO) {
         assertEquals("Add B?",context.getString(R.string.pair_add_title,"B"))
         assertEquals("Add",context.getString(R.string.action_add))
         assertEquals("Pair with B?",context.getString(R.string.pair_confirm_title,"B"))
@@ -69,7 +69,7 @@ class MultiComputerReviewTest {
         assertEquals(b.generation,ConfirmedBinding.from(prefs,b.deviceId).revision)
         assertTrue(ConfirmedBinding.from(prefs,b.deviceId).matches(prefs.copy(pairingRevision=99)))
     }
-    @Test fun scannerTracksInstalledBindingForFirstAdditionalAndRepairedDevices() {
+    @Test fun scannerTracksInstalledBindingForFirstAdditionalAndRepairedDevices()=runBlocking<Unit>(Dispatchers.IO) {
         val first=prefs.copy(peer=a,peers=listOf(a),pairingRevision=1)
         assertEquals(a.deviceId,first.installedAfter(0)?.pcId)
         assertNull(first.installedAfter(1))
@@ -77,18 +77,28 @@ class MultiComputerReviewTest {
         assertEquals(b.deviceId,prefs.copy(peers=listOf(a,b.copy(generation=3))).installedAfter(2)?.pcId)
         assertNull(prefs.copy(peers=listOf(a,b.copy(pairingLost=true))).installedAfter(1))
     }
-    @Test fun survivingCapturedTargetsDoNotDependOnTheRemovedAnchorOrGainNewRecipients() {
+    @Test fun survivingCapturedTargetsDoNotDependOnTheRemovedAnchorOrGainNewRecipients()=runBlocking<Unit>(Dispatchers.IO) {
         val captured=prefs.devices.map {DeliveryBinding.from(prefs,it.deviceId)!!}
         val after=prefs.copy(peer=b,peers=listOf(b,b.copy(name="C",pin="c",deviceId="c")))
         assertEquals(listOf(captured[1]),RecipientSelection.surviving(after,captured))
-        assertTrue(RecipientSelection.hasAuthority(after,captured,captured[0]))
-        assertFalse(RecipientSelection.hasAuthority(after,emptyList(),captured[0]))
-        assertTrue(RecipientSelection.hasAuthority(prefs,emptyList(),captured[0]))
+        assertTrue(RecipientSelection.hasAuthority(after,captured))
+        assertFalse(RecipientSelection.hasAuthority(after,emptyList()))
+        assertFalse(RecipientSelection.hasAuthority(prefs,emptyList()))
         assertEquals(listOf(captured[1]),RecipientSelection.surviving(prefs.copy(peers=listOf(a.copy(generation=9),b)),captured))
         assertTrue(RecipientSelection.surviving(prefs.copy(deviceId="other-phone"),captured).isEmpty())
         assertTrue(RecipientSelection.surviving(prefs.copy(peers=listOf(a.copy(pairingLost=true),b.copy(generation=3))),captured).isEmpty())
     }
-    @Test fun recentActionsCaptureTheWholeOperationAndRejectEveryStaleDelivery() {
+    @Test fun emptyRecipientSetsHaveNoAuthorityDespiteAValidDefaultComputer()=runBlocking<Unit>(Dispatchers.IO) {
+        assertTrue(requireNotNull(DeliveryBinding.from(prefs)).matches(prefs))
+        for(kind in listOf("text","clipboard_image","file")) {
+            val empty=RecipientSelection.freeze(prefs.copy(queue=false),emptySet(),kind)
+            assertTrue(empty.isEmpty())
+            assertFalse(RecipientSelection.hasAuthority(prefs,empty))
+        }
+        val disabled=prefs.copy(peers=prefs.devices.map {it.copy(clipboardSend=false)})
+        assertFalse(RecipientSelection.hasAuthority(disabled,RecipientSelection.freeze(disabled,setOf(a.deviceId,b.deviceId),"text")))
+    }
+    @Test fun recentActionsCaptureTheWholeOperationAndRejectEveryStaleDelivery()=runBlocking<Unit>(Dispatchers.IO) {
         fun row(peer:Peer,state:String)=Outgoing().apply {mediaId="artifact";transferId="transfer";peerId=peer.deviceId;bindingGeneration=peer.generation;this.state=state}
         val first=row(a,"failed");val second=row(b,"sending");val other=row(a,"waiting").apply {mediaId="other"}
         val selected=ConfirmedQueue.artifact(prefs,ConfirmedItem.from(first),listOf(first,second,other))
@@ -105,8 +115,8 @@ class MultiComputerReviewTest {
         val onlyB=ConfirmedQueue.artifact(prefs,ConfirmedItem.from(second),listOf(second))
         assertTrue("Unrelated anchor removal must not block B",onlyB.matches(prefs.copy(peer=b,peers=listOf(b))))
     }
-    @Test fun recentPagingAndCapacityCountsUseOperationsAndKeepActiveSiblingsVisible()=runBlocking {
-        val room=Room.inMemoryDatabaseBuilder(context,QueueDatabase::class.java).allowMainThreadQueries().build()
+    @Test fun recentPagingAndCapacityCountsUseOperationsAndKeepActiveSiblingsVisible()=runBlocking<Unit>(Dispatchers.IO) {
+        val room=Room.inMemoryDatabaseBuilder(context,QueueDatabase::class.java).build()
         try {
             val queue=room.queue()
             repeat(60) {i->repeat(16) {peer->queue.insert(Outgoing().apply {mediaId="item$i";transferId="transfer$i";peerId="peer$peer";state=if(i<10)"waiting" else "sent";orderId=i.toLong()})}}
@@ -119,7 +129,7 @@ class MultiComputerReviewTest {
         }finally {room.close()}
     }
 
-    @Test fun connectionDetailNamesBothConnectedComputersAndCountsPartialConnectivity() {
+    @Test fun connectionDetailNamesBothConnectedComputersAndCountsPartialConnectivity()=runBlocking<Unit>(Dispatchers.IO) {
         val connected=LinkState("Connected","Wi-Fi")
         assertEquals("1 of 2 devices",UiPresentation.connectionDetail(context,prefs,mapOf(b.deviceId to connected),connected))
         assertEquals("A and B",UiPresentation.connectionDetail(context,prefs,mapOf(a.deviceId to connected,b.deviceId to connected),connected))
@@ -127,7 +137,7 @@ class MultiComputerReviewTest {
         assertEquals("A · Wi-Fi",UiPresentation.connectionDetail(context,prefs.copy(peers=listOf(a)),mapOf(a.deviceId to connected),connected))
     }
 
-    @Test fun settingsNamesEachPairsClipboardSwitchAndRetryCaptureCannotAcquireANewBinding() {
+    @Test fun settingsNamesEachPairsClipboardSwitchAndRetryCaptureCannotAcquireANewBinding()=runBlocking<Unit>(Dispatchers.IO) {
         assertEquals("Receive clipboard from A",UiPresentation.clipboardReceiveLabel(context,prefs,a))
         assertEquals("Receive clipboard from B",UiPresentation.clipboardReceiveLabel(context,prefs,b))
         assertEquals("Receive clipboard from computer",UiPresentation.clipboardReceiveLabel(context,prefs.copy(peers=listOf(a)),a))
@@ -137,8 +147,8 @@ class MultiComputerReviewTest {
         assertEquals(listOf(a.pin,b.pin),confirmed.map {it.pin})
     }
 
-    @Test fun recentOpenKeepsSuccessfulArtifactVisibleWhenAnotherDeliveryWasDiscarded()=runBlocking {
-        val room=Room.inMemoryDatabaseBuilder(context,QueueDatabase::class.java).allowMainThreadQueries().build()
+    @Test fun recentOpenKeepsSuccessfulArtifactVisibleWhenAnotherDeliveryWasDiscarded()=runBlocking<Unit>(Dispatchers.IO) {
+        val room=Room.inMemoryDatabaseBuilder(context,QueueDatabase::class.java).build()
         try {
             val queue=room.queue()
             listOf("a" to "discarded","b" to "sent").forEach {(peer,state)->queue.insert(Outgoing().apply {mediaId="file";transferId="transfer";peerId=peer;this.state=state;uri="content://media/source";automatic=true})}
@@ -152,7 +162,7 @@ class MultiComputerReviewTest {
         }finally {room.close()}
     }
 
-    @Test fun retryingAnAlreadyRemovedSecondaryBindingRetainsItsIdentityForCleanup() {
+    @Test fun retryingAnAlreadyRemovedSecondaryBindingRetainsItsIdentityForCleanup()=runBlocking<Unit>(Dispatchers.IO) {
         val after=prefs.copy(peer=a,peers=listOf(a),resetPeers=setOf(b.deviceId),pairingRevision=4)
         val cleanup=ConfirmedBinding.from(after,b.deviceId)
         assertNull(cleanup.pin);assertEquals(b.deviceId,cleanup.pcId);assertTrue(cleanup.matches(after))
@@ -162,7 +172,7 @@ class MultiComputerReviewTest {
         assertNotEquals(ConfirmedBinding.from(after),cleanup)
     }
 
-    @Test fun unpairWarningCountsOnlyTheNamedBindingsDistinctOperations() {
+    @Test fun unpairWarningCountsOnlyTheNamedBindingsDistinctOperations()=runBlocking<Unit>(Dispatchers.IO) {
         fun row(peer:Peer,id:String)=Outgoing().apply {mediaId=id;peerId=peer.deviceId;bindingGeneration=peer.generation}
         val rows=listOf(row(a,"shared"),row(b,"shared"),row(a,"only-a"),row(b,"shared"),row(b,"terminal").apply {state="sent"},row(b.copy(generation=1),"old-b"))
         assertEquals(1,ConfirmedBinding.from(prefs,b.deviceId).pendingCount(rows))
@@ -171,7 +181,7 @@ class MultiComputerReviewTest {
         assertFalse(BindingTransitions.hasWork(prefs.copy(peer=null,peers=emptyList())))
     }
 
-    @Test fun quarantinedPairingKeepsRecoveryFeedbackWithoutAdvertisingAConnectedRecipient() {
+    @Test fun quarantinedPairingKeepsRecoveryFeedbackWithoutAdvertisingAConnectedRecipient()=runBlocking<Unit>(Dispatchers.IO) {
         val p=prefs.copy(peer=a,peers=listOf(a),resetPeers=setOf(a.deviceId))
         val failed=LinkState("PC unreachable",pairing="Pairing…")
         assertEquals("Pairing…",LinkProjection.aggregate(p,mapOf(a.pin to failed),null).pairing)

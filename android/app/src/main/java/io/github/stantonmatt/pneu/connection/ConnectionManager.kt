@@ -22,10 +22,14 @@ import javax.net.ssl.SSLSocket
 import kotlin.random.Random
 
 data class LinkState(val status: String = "PC unreachable", val route: String = "", val pairing: String = "", val sent: Long = 0, val total: Long = 0, val transferMediaId: String = "", val cellular: Boolean = false, val pairingPin: String = "", val transferKind: String = "", val transferFileName: String = "",
-    val pairingFeedback:UiFeedback?=pairing.takeIf(String::isNotEmpty)?.let {UiFeedback(it)},val pairingGeneration:Long=0) {
+    val capabilities:Set<String> = emptySet(),val incoming:IncomingTransfer?=null,val pairingFeedback:UiFeedback?=pairing.takeIf(String::isNotEmpty)?.let {UiFeedback(it)},val pairingGeneration:Long=0) {
+    val connectionStatus get()=ConnectionStatus.fromKey(status)
     /** Emit a new pairing result even when its copy matches the preceding one.
      * Ordinary route/progress copies preserve the existing event identity. */
     fun withPairing(message:String)=copy(pairing=message,pairingFeedback=message.takeIf(String::isNotEmpty)?.let {UiFeedback(it)})
+    companion object {
+        fun pairingFailure(status:ConnectionStatus)=LinkState(status.key,pairing=status.key,pairingFeedback=UiFeedback(status.key,status=status))
+    }
     fun sendingTitle():String? = if(transferMediaId.isEmpty())null else when(transferKind) {
         "photo" -> "Sending photo"
         "recording" -> "Sending screen recording"
@@ -62,6 +66,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
     private val serviceCallbacks = linkedMapOf<String, NsdManager.ServiceInfoCallback>()
     private val multicast = context.getSystemService(WifiManager::class.java).createMulticastLock("pneu.discovery").apply { setReferenceCounted(false) }
     private var job: Job? = null
+    @Volatile private var lastIssue:ConnectionStatus?=null
     @Volatile private var socket: Socket? = null
     @Volatile private var tcpSocket:Socket?=null
     private data class CapturedConnection(val ssl:SSLSocket,val tcp:Socket?)
@@ -188,6 +193,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                 val invitation = attempt?.invitation
                 val pin = invitation?.fingerprint ?: prefs.peer!!.pin
                 val endpoints = candidates(prefs)
+                var attemptIssue:ConnectionStatus?=null
                 for (endpoint in endpoints) {
                     app.reconcileDelivery();recoverPeer()
                     val current=readPrefs()
@@ -195,27 +201,35 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                     val epoch=dialEpoch.get()
                     var pinnedLeafVerified=false
                     var rejected=false
+                    var issue:ConnectionStatus?=null
                     activeEndpoint=endpoint;activePin=pin
                     authenticatedBinding=if(invitation==null)DeliveryBinding.from(prefs,prefs.peer?.deviceId) else null
                     state.value = LinkState("Connecting…", pairing = if (invitation != null) "Pairing…" else "")
                     try {
                         val ssl = TlsIdentity(prefs.tlsAlias).socket(endpoint, pin, {pinnedLeafVerified=it}) { socket = it;if(it !is SSLSocket)tcpSocket=it;if(epoch!=dialEpoch.get())closeSocket(it) }
                         if(epoch!=dialEpoch.get() || !endpointAllowed(readPrefs(),endpoint))throw java.io.IOException("Policy changed")
-                        session(ssl,endpoint,prefs,epoch,attempt,outcome) {failures=0;succeeded=true}
+                        session(ssl,endpoint,prefs,epoch,attempt,outcome) {lastIssue=null;failures=0;succeeded=true}
                     } catch (e: CancellationException) { throw e }
                     catch (e: RemoteError) {
+                        issue=ConnectionStatus.remoteError(e.code)
+                        if(issue!=null)lastIssue=issue
+                        if(issue!=null) {attempt?.let {app.rejectPairing(it,issue)};break}
                         if (e.code == "unauthorized") {
                             if(invitation == null) {rejected=PairingRejection.unauthorized(e.code,pinnedLeafVerified);if(rejected)onUnauthorized?.invoke()}
-                            else app.rejectPairing(requireNotNull(attempt),"Can't reach your PC")
+                            else app.rejectPairing(requireNotNull(attempt),ConnectionStatus.UNREACHABLE)
                             break
                         }
                         if (invitation != null && e.code in setOf("invalid_token", "expired_token", "pairing_closed", "already_paired", "storage_failed")) {
-                            app.rejectPairing(requireNotNull(attempt),if (e.code == "expired_token") { if(invitation.expires > System.currentTimeMillis()) "Your PC's clock says this code expired. Check both clocks and scan the new code." else "This code expired. Scan the new one." } else "Can't reach your PC")
+                            if(e.code=="expired_token")app.rejectPairing(requireNotNull(attempt),if(invitation.expires > System.currentTimeMillis()) "Your PC's clock says this code expired. Check both clocks and scan the new code." else "This code expired. Scan the new one.")
+                            else app.rejectPairing(requireNotNull(attempt),ConnectionStatus.UNREACHABLE)
                             break
                         }
                         if (e.code == "protocol_identity") break
                         if (e.code == "connection_replaced") break
                     } catch (e: Exception) {
+                        if(generateSequence<Throwable>(e) {it.cause}.any {it is FingerprintMismatch}) {
+                            issue=ConnectionStatus.FINGERPRINT_MISMATCH;lastIssue=issue;attemptIssue=issue
+                        }
                         // Only exception classes are logged; never endpoints, tokens, or user content.
                         android.util.Log.w("PneuConnection", generateSequence<Throwable>(e) { it.cause }.joinToString(" <- ") { it.javaClass.simpleName })
                     } finally {
@@ -228,17 +242,22 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                         // Reconcile even if a subsequent pairing-loss persistence step fails.
                         // Runtime authority and disconnected UI are mandatory:
                         // publish before any fallible durable maintenance.
-                        publishDisconnected(if(scoped(app.prefs.value).pairingLost)"Pairing lost" else "PC unreachable")
+                        publishDisconnected(if(scoped(app.prefs.value).pairingLost)"Pairing lost" else (issue ?: lastIssue)?.key ?: "PC unreachable")
                         withContext(NonCancellable) {retryClipboardCleanup();recoverSession(endingBinding)}
                         try {
                             if(invitation == null && epoch==dialEpoch.get() && prefs.peer!=null && rejections.record("${prefs.peer.pin}:${prefs.peer.deviceId}:${prefs.peer.generation}",rejected)) lost(prefs.peer,prefs.deviceId,outcome)
                         } finally {
-                            publishDisconnected(if(scoped(app.prefs.value).pairingLost)"Pairing lost" else "PC unreachable")
+                            publishDisconnected(if(scoped(app.prefs.value).pairingLost)"Pairing lost" else (issue ?: lastIssue)?.key ?: "PC unreachable")
                         }
                     }
                     if (succeeded) break
                 }
-                if (attempt != null && pairingAttempt()?.id==attempt.id) state.value = LinkState(pairing = "Can't reach your PC")
+                if (attempt != null && pairingAttempt()?.id==attempt.id) {
+                    // A stale address may serve another certificate. Try all
+                    // candidates, then retain the typed failure if none work.
+                    if(attemptIssue!=null)app.rejectPairing(attempt,attemptIssue)
+                    else state.value = LinkState.pairingFailure(ConnectionStatus.UNREACHABLE)
+                }
                 } catch(e:CancellationException) {throw e}
                 catch(e:Exception) {android.util.Log.w("PneuAttempt",e.javaClass.simpleName)}
                 failures=backoff(failures,succeeded)
@@ -254,7 +273,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
     }
     private fun publishDisconnected(status:String) {
         state.update {
-            val disconnected=it.copy(status=status,route="",cellular=false,sent=0,total=0,transferMediaId="",transferKind="",transferFileName="",pairingPin="")
+            val disconnected=it.copy(status=status,route="",cellular=false,sent=0,total=0,transferMediaId="",transferKind="",transferFileName="",pairingPin="",incoming=null)
             if(disconnected.pairing.startsWith("Paired with "))disconnected.withPairing("") else disconnected
         }
     }
@@ -324,20 +343,26 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
     private fun endpointAllowed(p: Prefs,endpoint: Endpoint,network:RoutePolicy.Active=RoutePolicy.active(cm))=networkAllowed(p,network) && !p.deliveryReset && DeliveryPolicy.transport(endpoint.tailscale,p.wifi,p.tailscale,network.connectivity,p.mobile)
     private suspend fun <T> phase(ssl:SSLSocket,timeout:Long,body:suspend ()->T):T=coroutineScope {
         val deadline=launch(Dispatchers.Default) {delay(timeout);closeSocket(ssl)}
-        try {body()} finally {deadline.cancel()}
+        try {body()} finally {deadline.cancel();state.update {it.copy(incoming=null)}}
     }
     private suspend fun session(ssl: SSLSocket, endpoint: Endpoint, p: Prefs,epoch:Long,
                                 attempt:PairingAttempt?,outcome:ConnectionOutcome?,onReady:()->Unit):Unit = coroutineScope {
         var sessionOutcome=outcome
         val name=p.selfName.ifEmpty {Settings.Global.getString(context.contentResolver,Settings.Global.DEVICE_NAME) ?: android.os.Build.MODEL}
         val hello=phase(ssl,10000) {
-        send(Frame.Control(Type.HELLO, json("version" to 1, "device_id" to p.deviceId, "name" to utf8Prefix(name,128).ifEmpty {"Pneu"}, "capabilities" to listOf("clipboard_text","mesh"),"role" to "phone", "paused" to p.paused)))
+        send(Frame.Control(Type.HELLO, json("version" to 1, "device_id" to p.deviceId, "name" to utf8Prefix(name,128).ifEmpty {"Pneu"}, "capabilities" to listOf("files","clipboard_text","clipboard_image","mesh"),"role" to "phone", "paused" to p.paused)))
         readControl(ssl)
         }
         if (hello.type == Type.ERROR) throw RemoteError(hello.body["code"].asString)
         require(hello.type == Type.HELLO)
-        if (hello.body["version"].asLong != 1L) {
-            send(Frame.Control(Type.ERROR, json("code" to "version_mismatch", "supported_version" to 1))); throw RemoteError("version_mismatch")
+        val advertised=hello.body["capabilities"].asJsonArray.map {it.asString}.toSet()
+        if (ConnectionStatus.hello(hello.body["version"].asLong,advertised)!=null) {
+            // HELLO already establishes the actionable failure. A failed
+            // diagnostic write must not turn it into a generic network error.
+            try {send(Frame.Control(Type.ERROR, json("code" to "version_mismatch", "supported_version" to 1)))}
+            catch(e:CancellationException) {throw e}
+            catch(_:Exception) { }
+            throw RemoteError("version_mismatch")
         }
         val mesh=hello.body["capabilities"].asJsonArray.any {it.asString=="mesh"}
         if(mesh && hello.body["role"]?.asString!="computer") {send(Frame.Control(Type.ERROR,json("code" to "malformed_message")));throw RemoteError("malformed_message")}
@@ -350,22 +375,42 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
             throw RemoteError("protocol_identity")
         }
         val deferred=ArrayDeque<Frame.Control>()
+        // Recovery can race a READY peer's file lane. Drain with the ordinary
+        // framing checks and NACK only at END; never acquire storage or effects
+        // before PAIR_RESULT has durably installed the binding. An in-flight
+        // drain keeps its slot even when PAIR_RESULT interleaves before END.
+        val recoveryFiles=FileReceiveMachine(ReceiveBackend {ReceiveAdmission(reply=ReceiveReply("storage_failed"))})
+        suspend fun recoveryFile(frame:Frame) {
+            try {
+                when(frame) {
+                    is Frame.Chunk->recoveryFiles.chunk(frame)
+                    is Frame.Control->when(frame.type) {
+                        Type.FILE_BEGIN->recoveryFiles.begin(frame.body)
+                        Type.FILE_END->send(recoveryFiles.end(frame.body["transfer_id"].asString))
+                        else->throw ReceiveViolation()
+                    }
+                }
+            }catch(e:ReceiveViolation) {send(Frame.Control(Type.ERROR,json("code" to e.code)));throw RemoteError(e.code)}
+        }
         attempt?.let { scanned ->
             val invitation=scanned.invitation
             val resolved=app.pairingHello(scanned,pcId) ?: throw RemoteError("closing")
             phase(ssl,10000) {
             send(Frame.Control(Type.PAIR_REQUEST, json("token" to invitation.token)))
-            var result=readControl(ssl)
-            while(result.type!=Type.PAIR_RESULT && result.type!=Type.ERROR) {
-                when(result.type) {
-                    Type.PING->send(Frame.Control(Type.PONG,result.body))
-                    Type.CLIPBOARD,Type.STATUS,Type.PEER_SETTINGS->{require(deferred.size<4);deferred.add(result)}
+            var result:Frame.Control
+            while(true) {
+                val frame=Protocol.read(ssl.inputStream)
+                if(frame is Frame.Chunk) {recoveryFile(frame);continue}
+                require(frame is Frame.Control)
+                if(frame.type==Type.PAIR_RESULT || frame.type==Type.ERROR) {result=frame;break}
+                when(frame.type) {
+                    Type.PING->send(Frame.Control(Type.PONG,frame.body))
+                    Type.CLIPBOARD,Type.STATUS,Type.PEER_SETTINGS->{require(deferred.size<4);deferred.add(frame)}
+                    Type.FILE_BEGIN,Type.FILE_END->recoveryFile(frame)
                     else->throw RemoteError("unexpected_message")
                 }
-                result=readControl(ssl)
             }
             if (result.type == Type.ERROR) throw RemoteError(result.body["code"].asString)
-            require(result.type == Type.PAIR_RESULT)
             if (!result.body["accepted"].asBoolean) throw RemoteError(result.body["code"].asString)
             // Persist before processing any READY traffic, including immediate peer data.
             if(epoch!=dialEpoch.get())throw java.io.IOException("Stale pairing")
@@ -389,12 +434,19 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
         }
         // A progressing upload can receive nothing until ACK. READY liveness
         // belongs to PING/PONG, write progress and post-END receipt deadlines.
-        admissionSession=randomId();ready = true;onReady();ssl.soTimeout = 0
+        val admitted=app.withBinding(sessionBinding) {
+            if(epoch!=dialEpoch.get())return@withBinding false
+            admissionSession=randomId()
+            app.connection.admitted(sessionBinding,requireNotNull(admissionSession))
+            ready=true;true
+        }
+        if(admitted!=true)throw RemoteError("closing")
+        onReady();ssl.soTimeout = 0
         val currentPaused=readPrefs().paused
         if(currentPaused!=p.paused)send(Frame.Control(Type.STATUS,json("paused" to currentPaused)))
 
         val network = RoutePolicy.active(cm)
-        state.value = LinkState("Connected", network.label(endpoint.tailscale), if (attempt != null) "Paired with ${attempt.invitation.name}" else "",cellular=network.mobile,pairingPin=if(attempt!=null)attempt.invitation.fingerprint else "",pairingGeneration=sessionBinding.generation)
+        state.value = LinkState("Connected", network.label(endpoint.tailscale), if (attempt != null) "Paired with ${attempt.invitation.name}" else "",cellular=network.mobile,pairingPin=if(attempt!=null)attempt.invitation.fingerprint else "",pairingGeneration=sessionBinding.generation,capabilities=capabilities)
         val ping = PingDeadline(30_000, SystemClock::elapsedRealtime)
         val livenessWake = Channel<Unit>(Channel.CONFLATED)
         val writeWatchdog = launch {
@@ -551,9 +603,50 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
         }
         val sender=launchSender(false)
         val textSender=launchSender(true)
+        val receiveSession=admissionSession
+        val receiver=app.receivedFiles.connection(CapturedAuthority(sessionBinding,requireNotNull(receiveSession)),mesh) {ready && admissionSession==receiveSession && authenticatedBinding==sessionBinding}
+        val receiveProgress=ProgressDeadline(60_000,SystemClock::elapsedRealtime)
+        val receiveWake=Channel<Unit>(Channel.CONFLATED)
+        val receiveWatchdog=launch(Dispatchers.Default) {
+            while(isActive) {
+                val snapshot=receiveProgress.snapshot()
+                if(snapshot==null)receiveWake.receive()
+                else {
+                    val remaining=receiveProgress.remaining(snapshot)
+                    if(remaining<=0) {
+                        if(receiveProgress.expire(snapshot)) {closeSocket(ssl);throw RemoteError("timeout")}
+                    } else withTimeoutOrNull(remaining) {receiveWake.receive()}
+                }
+            }
+        }
+        suspend fun receiveFile(frame:Frame) {
+            if(recoveryFiles.active) {
+                recoveryFile(frame)
+                if(recoveryFiles.active)receiveProgress.progress() else receiveProgress.complete()
+                receiveWake.trySend(Unit)
+                return
+            }
+            try {
+                when(frame) {
+                    is Frame.Chunk->{receiver.chunk(frame);state.update {it.copy(incoming=it.incoming?.copy(received=receiver.receivedBytes))};receiveProgress.progress();receiveWake.trySend(Unit)}
+                    is Frame.Control->when(frame.type) {
+                        Type.FILE_BEGIN->{receiveProgress.progress();receiveWake.trySend(Unit);receiver.begin(frame.body)
+                            state.update {it.copy(incoming=receiver.metadata?.let {meta->IncomingTransfer(pcId,meta.id,meta.name,0,meta.size)})}}
+                        Type.FILE_END->{
+                            receiveProgress.complete();receiveWake.trySend(Unit)
+                            val deadline=launch(Dispatchers.Default) {delay(120000);closeSocket(ssl)}
+                            try {send(receiver.end(frame.body["transfer_id"].asString))}finally {deadline.cancel();state.update {it.copy(incoming=null)}}
+                        }
+                        else->throw ReceiveViolation()
+                    }
+                }
+            }catch(e:ReceiveViolation) {send(Frame.Control(Type.ERROR,json("code" to e.code)));throw RemoteError(e.code)}
+        }
+        if(recoveryFiles.active) {receiveProgress.progress();receiveWake.trySend(Unit)}
         try {
             while (isActive) {
                 val frame = Protocol.read(ssl.inputStream)
+                if(frame is Frame.Chunk) {receiveFile(frame);continue}
                 require(frame is Frame.Control)
                 when (frame.type) {
                     Type.PING -> send(Frame.Control(Type.PONG, frame.body))
@@ -576,11 +669,16 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                     Type.ERROR -> throw RemoteError(frame.body["code"].asString)
                     Type.STATUS -> Unit
                     Type.CLIPBOARD,Type.PEER_SETTINGS -> content(frame)
+                    Type.FILE_BEGIN,Type.FILE_END -> receiveFile(frame)
                     else -> { send(Frame.Control(Type.ERROR, json("code" to "unexpected_message"))); throw RemoteError("unexpected_message") }
                 }
             }
-        } finally { closeSocket(ssl); monitor.cancel(); sender.cancel(); textSender.cancel(); writeWatchdog.cancel();settingsSender?.cancel()
-            withContext(NonCancellable) {runCatching {app.preferences.connected(sessionBinding,endpoint)}}
+        } finally { closeSocket(ssl); monitor.cancel(); sender.cancel(); textSender.cancel(); writeWatchdog.cancel();settingsSender?.cancel();receiveWatchdog.cancel();receiveWake.close()
+            withContext(NonCancellable) {
+                state.update {it.copy(incoming=null)}
+                runCatching {receiver.disconnect()}
+                runCatching {app.preferences.connected(sessionBinding,endpoint)}
+            }
         }
     }
     private fun readControl(ssl: SSLSocket): Frame.Control = Protocol.read(ssl.inputStream).also { require(it is Frame.Control) } as Frame.Control
@@ -726,7 +824,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
         }
     }
     private suspend fun lost(expected:Peer?,phoneId:String,outcome:ConnectionOutcome?) {if(app.loseBinding(expected,phoneId,outcome))state.value=LinkState("Pairing lost")}
-    fun bindingChanged(lost: Boolean=false) { admissionSession=null;ready=false;capabilities=emptySet();rejections.clear();state.value=LinkState(if(lost)"Pairing lost" else "PC unreachable") }
+    fun bindingChanged(lost: Boolean=false) { lastIssue=null;admissionSession=null;ready=false;capabilities=emptySet();rejections.clear();state.value=LinkState(if(lost)"Pairing lost" else "PC unreachable") }
     fun retry() { admissionSession=null;dialEpoch.incrementAndGet();closeSocket(); wake.trySend(Unit) }
     fun cancelTransfer(mediaId: String) {
         fileEmission?.takeIf {it.row.mediaId==mediaId}?.let {if(it.cancel())retry()}

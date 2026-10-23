@@ -34,7 +34,7 @@ class TwentyFirstPairingDeviceTest {
         ActivityScenario.launch<MainActivity>(Intent(c,MainActivity::class.java).setAction(Intent.ACTION_VIEW).setData(Uri.parse(raw))).use {scenario->
             compose.waitUntil(10000) {visible("Pair with Retry PC?")}
             compose.onNodeWithText("Pair").performClick()
-            try {compose.waitUntil(20000) {visible("Can't reach your PC") && visible("Try again")}}
+            try {compose.waitUntil(20000) {visible("Can't reach your computer") && visible("Try again")}}
             finally {
                 val link=app.connection.state.value
                 i.sendStatus(0,android.os.Bundle().apply {putString("stream","Pair-rejection feedback: status=${link.status}, pairing=${link.pairing}, pending=${app.connection.attempt.value?.invitation!=null}, peers=${app.prefs.value.devices.size}\n")})
@@ -42,7 +42,7 @@ class TwentyFirstPairingDeviceTest {
             assertNull(app.connection.attempt.value?.invitation);assertNull(app.preferences.read().peer)
             assertEquals(1,PeerFixture.evidence().count {it.asJsonObject["event"].asString=="PAIR_REJECTED"})
             scenario.recreate()
-            compose.waitUntil(10000) {visible("Can't reach your PC") && visible("Try again")}
+            compose.waitUntil(10000) {visible("Can't reach your computer") && visible("Try again")}
             compose.onNodeWithText("Try again").performClick()
             compose.waitUntil(5000) {visible("Pair with Retry PC?")}
             // Re-presenting the invitation is not permission to send another request.

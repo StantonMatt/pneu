@@ -25,10 +25,10 @@ class MeshStorageTest {
     private val context get()=RuntimeEnvironment.getApplication()
     private fun peer(id:String)=Peer(id,"f".repeat(64),id,emptyList())
     private fun Invitation.toUri()="pneu://pair?v=1&name=$name&fp=$fingerprint&addr=${addresses.first()}&token=$token&exp=$expires"
-    private fun db()=Room.inMemoryDatabaseBuilder(context,QueueDatabase::class.java).allowMainThreadQueries().build()
-    @Test fun pendingAdmissionSurvivesDatabaseReopenAndCannotAcquireNewRecipientsOrOrder() {
+    private fun db()=Room.inMemoryDatabaseBuilder(context,QueueDatabase::class.java).build()
+    @Test fun pendingAdmissionSurvivesDatabaseReopenAndCannotAcquireNewRecipientsOrOrder()=runBlocking<Unit>(Dispatchers.IO) {
         val name="pending-admission.db";context.deleteDatabase(name)
-        fun open()=Room.databaseBuilder(context,QueueDatabase::class.java,name).allowMainThreadQueries().build()
+        fun open()=Room.databaseBuilder(context,QueueDatabase::class.java,name).build()
         val first=Outgoing().apply {
             mediaId="discovered";transferId="original";hlc="123";sourceDevice=phone;admissionEpoch=8
             recipients=listOf(DeliveryBinding(phone,"pin",pc,7,"original-session"))
@@ -46,7 +46,7 @@ class MeshStorageTest {
         }finally {room.close()}
         context.deleteDatabase(name)
     }
-    @Test fun legacyCleanupDropsSessionClipboardButRetainsDeliberatelyRestoredFixturesAndFiles() {
+    @Test fun legacyCleanupDropsSessionClipboardButRetainsDeliberatelyRestoredFixturesAndFiles()=runBlocking<Unit>(Dispatchers.IO) {
         val room=db()
         try {
             val queue=room.queue()
@@ -58,7 +58,7 @@ class MeshStorageTest {
             assertEquals(setOf("fixture","shared"),queue.pending().map {it.mediaId}.toSet())
         }finally {room.close()}
     }
-    @Test fun roomSevenToEightPreservesRowsAndQuarantinesTheOriginalRecipient() {
+    @Test fun roomSevenToEightPreservesRowsAndQuarantinesTheOriginalRecipient()=runBlocking<Unit>(Dispatchers.IO) {
         val name="mesh-migration.db";context.deleteDatabase(name)
         val helper=FrameworkSQLiteOpenHelperFactory().create(SupportSQLiteOpenHelper.Configuration.builder(context).name(name).callback(object:SupportSQLiteOpenHelper.Callback(7) {
             override fun onCreate(db:SupportSQLiteDatabase) {
@@ -73,7 +73,7 @@ class MeshStorageTest {
             override fun onUpgrade(db:SupportSQLiteDatabase,oldVersion:Int,newVersion:Int)=error("Unexpected upgrade")
         }).build())
         helper.writableDatabase;helper.close()
-        val room=Room.databaseBuilder(context,QueueDatabase::class.java,name).addMigrations(QueueMigrations.recipients,QueueMigrations.peerWatermarks,QueueMigrations.pendingAdmissions).allowMainThreadQueries().build()
+        val room=Room.databaseBuilder(context,QueueDatabase::class.java,name).addMigrations(QueueMigrations.recipients,QueueMigrations.peerWatermarks,QueueMigrations.pendingAdmissions,QueueMigrations.receivedFiles).build()
         try {
             val queue=room.queue();val row=queue.all().single {it.mediaId=="old"}
             assertEquals("Unfenced clipboard work cannot survive upgrade", "superseded",queue.find("old-text").state)
@@ -83,7 +83,7 @@ class MeshStorageTest {
             assertEquals(7L,queue.delivery("old",pc).bindingGeneration);assertNull(queue.delivery("old",other))
         }finally {room.close();context.deleteDatabase(name)}
     }
-    @Test fun recipientAckAndUnpairDoNotCompleteOrDeleteAnotherRecipientsPayload() {
+    @Test fun recipientAckAndUnpairDoNotCompleteOrDeleteAnotherRecipientsPayload()=runBlocking<Unit>(Dispatchers.IO) {
         val room=db()
         try {
             val queue=room.queue()
@@ -98,7 +98,7 @@ class MeshStorageTest {
             assertNotNull(queue.receipt(other,"two"));assertNull(queue.receipt(pc,"one"));assertEquals(1,queue.hasPath("/shared/bytes"))
         }finally {room.close()}
     }
-    @Test fun clipboardPruningLeavesPermanentReceiptsUntouched() {
+    @Test fun clipboardPruningLeavesPermanentReceiptsUntouched()=runBlocking<Unit>(Dispatchers.IO) {
         val room=db()
         try {
             val queue=room.queue();queue.insertReceipt(Receipt().apply {peerId=pc;transferId="settings";origin="peer_settings"})
@@ -108,7 +108,7 @@ class MeshStorageTest {
             assertEquals(67,queue.receiptCount());assertEquals("reserved",queue.receipt(pc,"unfinished").state);assertNotNull(queue.receipt(pc,"settings"));assertNotNull(queue.receipt(pc,"file"))
         }finally {room.close()}
     }
-    private fun withPrefs(body:suspend (Preferences,QueueDao)->Unit)=runBlocking {
+    private fun withPrefs(body:suspend (Preferences,QueueDao)->Unit)=runBlocking<Unit>(Dispatchers.IO) {
         val owner=CoroutineScope(SupervisorJob()+Dispatchers.IO)
         val file=File(context.cacheDir,"mesh-${randomId()}.preferences_pb")
         val store=PreferenceDataStoreFactory.create(scope=owner) {file}
@@ -310,7 +310,7 @@ class MeshStorageTest {
         assertEquals(before,prefs.store.data.first())
     }
 
-    @Test fun recoveringOneTextLaneCannotResetAnotherPeersSendingRowOrReplayAnOlderValue() {
+    @Test fun recoveringOneTextLaneCannotResetAnotherPeersSendingRowOrReplayAnOlderValue()=runBlocking<Unit>(Dispatchers.IO) {
         val room=db()
         try {
             val queue=room.queue()
@@ -337,7 +337,7 @@ class MeshStorageTest {
         assertNull(prefs.store.data.first()[stringPreferencesKey("pending")])
     }
 
-    @Test fun textSupersessionAndEvictionWatermarksArePerRecipient() {
+    @Test fun textSupersessionAndEvictionWatermarksArePerRecipient()=runBlocking<Unit>(Dispatchers.IO) {
         val room=db()
         try {
             val queue=room.queue()
@@ -353,7 +353,7 @@ class MeshStorageTest {
             assertEquals(102L,queue.peerTextTime(pc));assertEquals(102L,queue.peerTextTime(other))
         }finally {room.close()}
     }
-    @Test fun oldSessionTeardownCannotSupersedeReplacementGenerationOrOtherRecipients() {
+    @Test fun oldSessionTeardownCannotSupersedeReplacementGenerationOrOtherRecipients()=runBlocking<Unit>(Dispatchers.IO) {
         val room=db()
         try {
             val queue=room.queue()
@@ -504,7 +504,7 @@ class MeshStorageTest {
         }
     }
 
-    @Test fun oldLaneRecoveryCannotResetOrSupersedeTheReplacementGenerationsSendingRows() {
+    @Test fun oldLaneRecoveryCannotResetOrSupersedeTheReplacementGenerationsSendingRows()=runBlocking<Unit>(Dispatchers.IO) {
         val room=db()
         try {
             val queue=room.queue()

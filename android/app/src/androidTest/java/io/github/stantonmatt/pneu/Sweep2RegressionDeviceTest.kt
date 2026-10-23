@@ -210,9 +210,9 @@ class Sweep2RegressionDeviceTest {
             val item=withTimeout(5000) {vm.items.first {it.any {item->item.row.mediaId=="aggregate"}}}.single()
             assertEquals(100L,item.sent);assertEquals(200L,item.total);assertEquals(2,item.recipients.size)
             ActivityScenario.launch<MainActivity>(Intent(c,MainActivity::class.java).putExtra("home",true)).use {
-                compose.waitUntil(10000) {compose.onAllNodesWithText("Sent to 1 of 2").fetchSemanticsNodes().isNotEmpty()}
+                compose.waitUntil(10000) {compose.onAllNodesWithText("Waiting for MacBook").fetchSemanticsNodes().isNotEmpty()}
                 app.queue.update(rows[1].apply {state="failed";error="disk_full"})
-                compose.waitUntil(5000) {compose.onAllNodesWithText("Failed on MacBook").fetchSemanticsNodes().isNotEmpty()}
+                compose.waitUntil(5000) {compose.onAllNodesWithText("Failed on MacBook · Disk is full").fetchSemanticsNodes().isNotEmpty()}
                 compose.onNodeWithContentDescription("Retry").assertExists()
             }
         }finally {collector.cancelAndJoin();withContext(Dispatchers.Main) {androidx.lifecycle.ViewModelStore().apply {put("recent",vm);clear()}}}

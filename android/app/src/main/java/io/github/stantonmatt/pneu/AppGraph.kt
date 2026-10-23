@@ -2,6 +2,7 @@ package io.github.stantonmatt.pneu
 
 import android.app.Application
 import android.content.Context
+import androidx.room.withTransaction
 import androidx.room.Room
 import io.github.stantonmatt.pneu.connection.*
 import io.github.stantonmatt.pneu.data.*
@@ -23,7 +24,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
     suspend fun awaitPrefs():Prefs=snapshots.awaitLoaded()
     internal fun captureBinding(select:(Prefs)->DeliveryBinding?={DeliveryBinding.from(it)}):Deferred<DeliveryBinding?> =snapshots.captureBinding(select)
     internal fun captureAdmission(select:(Prefs)->DeliveryBinding?={DeliveryBinding.from(it)}):Deferred<FrozenAdmission> =snapshots.capture {p->
-        FrozenAdmission(select(p),recipients(p,"text"),recipients(p,"clipboard_image"),recipients(p,"file"))
+        FrozenAdmission(select(p),recipients(p,"text"),recipients(p,"clipboard_image"),recipients(p,"file"),recipients(p,"file",selected=p.devices.map {it.deviceId}.toSet()))
     }
     val database = Room.databaseBuilder(context, QueueDatabase::class.java, "outgoing.db").addMigrations(object : androidx.room.migration.Migration(1,2) {
         override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
@@ -50,7 +51,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
             db.execSQL("UPDATE receipts SET state='applied' WHERE state='complete'")
             db.execSQL("UPDATE outgoing SET state='superseded' WHERE kind='text' AND state IN ('waiting','sending','failed') AND orderId < (SELECT MAX(orderId) FROM outgoing WHERE kind='text' AND state IN ('waiting','sending','failed'))")
         }
-    }, QueueMigrations.clipboardWindow, QueueMigrations.outboundWindow, QueueMigrations.recipients, QueueMigrations.peerWatermarks, QueueMigrations.pendingAdmissions).addCallback(object : androidx.room.RoomDatabase.Callback() {
+    }, QueueMigrations.clipboardWindow, QueueMigrations.outboundWindow, QueueMigrations.recipients, QueueMigrations.peerWatermarks, QueueMigrations.pendingAdmissions, QueueMigrations.receivedFiles).addCallback(object : androidx.room.RoomDatabase.Callback() {
         override fun onOpen(db: androidx.sqlite.db.SupportSQLiteDatabase) { db.execSQL("PRAGMA synchronous=FULL") }
     }).build()
     val queue = database.queue()
@@ -68,6 +69,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
     private val outcomes=mutableMapOf<String,Long>()
     private fun invalidateOutcomes(id:String) {outcomes[id]=Math.addExact(outcomes[id] ?: 0,1)}
     private fun changed(peer:Peer) {
+        connection.revoked(peer)
         for(key in listOf("id:${peer.deviceId}","pin:${peer.pin}"))lifecycle[key]=Math.addExact(lifecycle[key] ?: 0,1)
         invalidateOutcomes(peer.deviceId)
     }
@@ -87,6 +89,9 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
     fun requestMediaScan() {mediaRefresh.update {it+1}}
     val staging = Staging(this)
     val clipboard = ClipboardDelivery(this)
+    // Receive data hook; the designer-owned Recent ViewModel can combine this flow.
+    val receivedFiles = ReceivedFiles(this)
+    val receivedRecent get()=receivedFiles.recent
     val connection = Connections(this)
     fun recipients(p:Prefs,kind:String,automatic:Boolean=false,selected:Set<String>?=null):List<DeliveryBinding> {
         val online=p.devices.filter {connection.connected(it.deviceId)}.map {it.deviceId}.toSet()
@@ -96,7 +101,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
                 if(kind in setOf("text","clipboard_image") || automatic && !p.queue)connection.freezeSession(target) else target
             }
     }
-    internal fun recipientCurrent(target:DeliveryBinding,p:Prefs)=target.matches(p) &&
+    internal fun recipientCurrent(target:DeliveryBinding,p:Prefs)=CapturedAuthority(target).stillValid(p,connection.generation(target)) &&
         (target.sessionId==null || connection.ownsSession(target))
     internal fun hasRecipient(row:Outgoing,binding:DeliveryBinding?,p:Prefs)=
         (row.recipients ?: listOfNotNull(binding)).any {recipientCurrent(it,p)}
@@ -165,6 +170,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
         evicted.forEach {if(it.path.isNotEmpty())java.io.File(it.path).delete()}
     }
     private suspend fun clearPeerDelivery(peerId:String)=queueMutex.withLock {
+        receivedFiles.forget(peerId)
         database.runInTransaction {queue.clearPeer(peerId)}
         pruneOrphansLocked()
         releaseTerminalBytesLocked()
@@ -178,7 +184,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
     @androidx.annotation.VisibleForTesting
     internal suspend fun clearDelivery()=queueMutex.withLock {
         queue.all().forEach {if(it.path.isNotEmpty())java.io.File(it.path).delete()}
-        queue.clear();queue.clearReceipts();staging.clearThumbnails()
+        receivedFiles.forgetAll();queue.clear();queue.clearReceipts();staging.clearThumbnails()
     }
     @androidx.annotation.VisibleForTesting
     internal suspend fun recoverDeliveryLane(text:Boolean)=recoverDeliveryLane(text,preferences.read().peer?.deviceId.orEmpty())
@@ -186,9 +192,22 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
         queue.deleteArtifact(artifact.mediaId)
         if(artifact.path.isNotEmpty())java.io.File(artifact.path).delete()
     }}
-    suspend fun setPairSwitch(peerId:String,key:String,value:Boolean)=bindingMutex.withLock {
-        preferences.setPairSwitch(peerId,key,value)
-        if(key=="sendClipboard" && !value)queueMutex.withLock {queue.supersedePeerText(peerId)}
+    suspend fun setPairSwitch(peerId:String,key:String,value:Boolean)=withContext(Dispatchers.IO) {bindingMutex.withLock {
+        setPairSwitchLocked(peerId,key,value)
+    }}
+    internal suspend fun setPairSwitch(authority:CapturedAuthority,key:String,value:Boolean):Boolean=withContext(Dispatchers.IO) {withAuthority(authority) {
+        setPairSwitchLocked(authority.binding.pcId,key,value);true
+    } ?: false}
+    private suspend fun setPairSwitchLocked(peerId:String,key:String,value:Boolean) {
+        // Policy -> queue is the same lock order as admission. A failed queue
+        // update leaves preferences untouched; a failed preference edit rolls
+        // back the queue. Finish both commits even if the UI owner goes away.
+        withContext(NonCancellable) {preferences.policy.locked {queueMutex.withLock {
+            database.withTransaction {
+                if(key=="sendClipboard" && !value)queue.supersedePeerText(peerId)
+                preferences.setPairSwitchLocked(peerId,key,value)
+            }
+        }}}
     }
     suspend fun updateDelivery(row:Outgoing):Boolean=queueMutex.withLock {
         val current=queue.delivery(row.mediaId,row.peerId)
@@ -215,6 +234,11 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
         val current=preferences.read()
         if(binding==null || !binding.matches(current))null else body()
     }
+    internal suspend fun <T> withBindingLifecycle(body:suspend ()->T):T=bindingMutex.withLock {body()}
+    /** Connection admission and deferred effects share the binding lifecycle lock. */
+    internal suspend fun <T> withAuthority(authority:CapturedAuthority,body:suspend ()->T):T?=withBinding(authority.binding) {
+        if(authority.stillValid(preferences.read(),connection.generation(authority.binding)))body() else null
+    }
     suspend fun checkpoint(binding:DeliveryBinding,video:Boolean,version:String,generation:Long,pairId:Long?=null,floor:Long?=null,expected:AdmissionToken?=null):Boolean=bindingMutex.withLock {
         val committed=binding.matches(preferences.read()) && preferences.checkpoint(video,version,generation,pairId,floor,expected)
         if(!committed)requestMediaScan()
@@ -230,6 +254,8 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
     suspend fun reconcileDelivery()=withContext(Dispatchers.IO) {bindingMutex.withLock {
         preferences.migrateSettingsReceipts(queue)
         deliveryResets.reconcile()
+        // Recover a process death between the DataStore and Room commits.
+        queueMutex.withLock {preferences.read().devices.filter {!it.clipboardSend}.forEach {queue.supersedePeerText(it.deviceId)}}
     }}
     suspend fun loseBinding(expected:Peer?,expectedPhoneId:String?=null,internalOutcome:ConnectionOutcome?=null):Boolean=withContext(NonCancellable) {bindingMutex.withLock {
         val current=preferences.read()
@@ -241,17 +267,19 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
         completePeerReset(expected.deviceId)
         true
     }}
-    suspend fun requestPairing(uri:String,expected:ConfirmedBinding):Boolean = bindingMutex.withLock {
+    suspend fun requestPairing(uri:String,expected:ConfirmedBinding):Boolean = withContext(Dispatchers.IO) {bindingMutex.withLock {
         val p=preferences.read()
         if(!expected.matches(p))return@withLock false
         startPairing(uri,p)
-    }
+    }}
+
     // Fixture callers explicitly supply their already-selected pin.
-    suspend fun requestPairing(uri:String,expectedPin:String?):Boolean = bindingMutex.withLock {
+    suspend fun requestPairing(uri:String,expectedPin:String?):Boolean = withContext(Dispatchers.IO) {bindingMutex.withLock {
         val p=preferences.read()
         if(p.peer?.pin!=expectedPin)return@withLock false
         startPairing(uri,p)
-    }
+    }}
+
     private fun startPairing(uri:String,p:Prefs):Boolean {
         if(connection.attempt.value!=null)return false
         val invitation=io.github.stantonmatt.pneu.protocol.Invitation.parse(uri)
@@ -267,13 +295,14 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
         connection.retryPeer(invitation.fingerprint)
         return true
     }
-    suspend fun cancelPairing(expected:PairingAttempt?=connection.attempt.value):Boolean=bindingMutex.withLock {
+    suspend fun cancelPairing(expected:PairingAttempt?=connection.attempt.value):Boolean=withContext(Dispatchers.IO) {bindingMutex.withLock {
         if(expected==null) {
             if(connection.attempt.value!=null)return@withLock false
         } else if(!endPairing(expected))return@withLock false
         connection.clearPairingResult(expected?.invitation?.fingerprint)
         true
-    }
+    }}
+
     private fun endPairing(expected:PairingAttempt?,message:String?=null):Boolean {
         if(expected==null || connection.attempt.value?.id!=expected.id)return false
         // Revoke first. Closing is local and never sends UNPAIR.
@@ -282,6 +311,9 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
         connection.retryPeer(expected.invitation.fingerprint)
         return true
     }
+    internal suspend fun rejectPairing(expected:PairingAttempt,status:ConnectionStatus):Boolean=withContext(NonCancellable) {bindingMutex.withLock {
+        if(!endPairing(expected))false else {connection.pairingFailed(status);true}
+    }}
     internal suspend fun rejectPairing(expected:PairingAttempt,message:String):Boolean=withContext(NonCancellable) {bindingMutex.withLock {endPairing(expected,message)}}
     internal suspend fun pairingHello(expected:PairingAttempt,pcId:String):PairingAttempt?=bindingMutex.withLock {
         val a=connection.attempt.value?.takeIf {it.id==expected.id} ?: return@withLock null
@@ -298,20 +330,22 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
         connection.setAttempt(resolved)
         resolved
     }
-    suspend fun retryConnection(expected:ConfirmedBinding,attempt:PairingAttempt?,feedback:Boolean=false):Boolean=bindingMutex.withLock {
+    suspend fun retryConnection(expected:ConfirmedBinding,attempt:PairingAttempt?,feedback:Boolean=false):Boolean=withContext(Dispatchers.IO) {bindingMutex.withLock {
         val p=preferences.read()
         if(attempt!=null) {
             if(connection.attempt.value?.id!=attempt.id)return@withLock false
         } else if(connection.attempt.value!=null || !expected.matches(p))return@withLock false
         if(feedback)connection.state.update {it.withPairing("Pairing…")}
         connection.retryPeer(attempt?.invitation?.fingerprint ?: expected.pin);true
-    }
-    suspend fun retryConnections(expected:List<ConfirmedBinding>):Boolean=bindingMutex.withLock {
+    }}
+
+    suspend fun retryConnections(expected:List<ConfirmedBinding>):Boolean=withContext(Dispatchers.IO) {bindingMutex.withLock {
         val current=preferences.read()
         if(expected.isEmpty() || expected.any {!it.matches(current)})return@withLock false
         expected.forEach {connection.retryPeer(it.pin)}
         true
-    }
+    }}
+
     @androidx.annotation.VisibleForTesting
     suspend fun installBinding(invitation:io.github.stantonmatt.pneu.protocol.Invitation,pcId:String):Boolean {
         val attempt=connection.attempt.value?.takeIf {it.invitation==invitation} ?: return false
@@ -370,7 +404,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
                 catch(e:CancellationException) {throw e}
                 catch(e:Exception) {android.util.Log.w("PneuInitialize",e.javaClass.simpleName);delay(2000)}
             }
-            try {clipboard.reconcile();reconcileDelivery();recoverOutgoing()}
+            try {receivedFiles.recover();clipboard.reconcile();reconcileDelivery();recoverOutgoing()}
             catch(e:CancellationException) {throw e}
             catch(e:Exception) {android.util.Log.w("PneuRecovery",e.javaClass.simpleName)}
             initialized.complete(Unit)

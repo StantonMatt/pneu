@@ -38,7 +38,9 @@ class AdvisoryDeviceTest {
     }
     private fun launch(extra:String="home") {context.startActivity(Intent(context,MainActivity::class.java).putExtra(extra,true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK));Thread.sleep(650)}
     private fun caller(uri:String,grant:Boolean=true,action:String=Intent.ACTION_SEND) {
-        context.startActivity(Intent().setComponent(ComponentName(context.packageName+".test",FixtureCallerActivity::class.java.name)).putExtra("uri",uri).putExtra("grant",grant).putExtra("action",action).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));Thread.sleep(400)
+        // A new request must run onCreate, even while the previous caller/task
+        // is finishing. NEW_TASK alone can deliver it to that old root instead.
+        context.startActivity(Intent().setComponent(ComponentName(context.packageName+".test",FixtureCallerActivity::class.java.name)).putExtra("uri",uri).putExtra("grant",grant).putExtra("action",action).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_MULTIPLE_TASK));Thread.sleep(400)
     }
     private fun image(folder:String="Pictures/Screenshots/"):Uri {
         val source=context.contentResolver.insert(MediaStore.Images.Media.getContentUri("external_primary"),ContentValues().apply {
@@ -187,7 +189,7 @@ class AdvisoryDeviceTest {
         assertTrue(device.findObject(UiSelector().text("Settings")).waitForExists(3000))
         context.startActivity(Intent(context,MainActivity::class.java).putExtra("home",true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         assertTrue(device.findObject(UiSelector().text("Pneu")).waitForExists(3000))
-        device.findObject(UiSelector().description("Settings")).click();assertTrue(device.findObject(UiSelector().text("Settings")).waitForExists(4000));delay(350);UiScrollable(UiSelector().scrollable(true)).scrollTextIntoView("Unpair")
+        DeviceFixture.openDevice(instrumentation,"Trusted PC");delay(350);UiScrollable(UiSelector().scrollable(true)).let {if(it.exists())it.scrollTextIntoView("Unpair")}
         device.findObject(UiSelector().text("Unpair")).click();assertTrue(device.findObject(UiSelector().textContains("60")).waitForExists(3000))
     }
     @Test(timeout=45000) fun permanentFailureRemainsVisibleOnMobile()=runBlocking<Unit> {

@@ -166,18 +166,18 @@ class TenthReviewUiDeviceTest {
         assertTrue(app.installBinding(invitation,"f".repeat(32)))
         compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Settings").fetchSemanticsNodes().isNotEmpty()}
         compose.runOnIdle {requested="pair"}
-        compose.waitUntil(5000) {compose.onAllNodesWithText("Scan the QR code on your PC").fetchSemanticsNodes().isNotEmpty()}
+        compose.waitUntil(5000) {compose.onAllNodesWithText("Scan the QR code on your computer").fetchSemanticsNodes().isNotEmpty()}
         // The old floor would report the previous install as a fresh success
         // and navigate Home immediately (or after the 800 ms success delay).
         compose.mainClock.advanceTimeBy(1200)
-        compose.onNodeWithText("Scan the QR code on your PC").assertIsDisplayed()
+        compose.onNodeWithText("Scan the QR code on your computer").assertIsDisplayed()
         compose.onNodeWithContentDescription("Settings").assertDoesNotExist()
         // Re-enter while AnimatedContent still retains the leaving scanner.
         compose.mainClock.autoAdvance=false
         compose.onNodeWithContentDescription("Back").performClick()
         compose.runOnIdle {requested="pair"}
         compose.mainClock.advanceTimeBy(1200)
-        compose.onNodeWithText("Scan the QR code on your PC").assertIsDisplayed()
+        compose.onNodeWithText("Scan the QR code on your computer").assertIsDisplayed()
         compose.onNodeWithContentDescription("Settings").assertDoesNotExist()
         compose.mainClock.autoAdvance=true
         compose.onNodeWithContentDescription("Back").performClick()
@@ -348,11 +348,11 @@ class TenthReviewUiDeviceTest {
         compose.waitUntil(5000) {app.connection.attempt.value?.invitation==invitation}
         DeviceFixture.stopPneuService();app.connection.stop();app.connection.awaitStopped()
         assertTrue(app.cancelPairing(app.connection.attempt.value))
-        app.connection.state.value=LinkState(pairing=c.getString(R.string.pair_unreachable_title))
-        compose.onNodeWithText("Can't reach your PC").assertIsDisplayed()
+        app.connection.state.value=LinkState(pairing="Can't reach your PC")
+        compose.onNodeWithText("Can't reach your computer").assertIsDisplayed()
         compose.onNodeWithText("Try again").assertIsDisplayed()
         restore.emulateSavedInstanceStateRestore()
-        compose.onNodeWithText("Can't reach your PC").assertIsDisplayed()
+        compose.onNodeWithText("Can't reach your computer").assertIsDisplayed()
         compose.onNodeWithText("Try again").performClick()
         compose.onNodeWithText("Pair with Twelfth?").assertIsDisplayed()
         assertNull(app.connection.attempt.value?.invitation);assertNull(app.preferences.read().peer)
@@ -360,7 +360,7 @@ class TenthReviewUiDeviceTest {
         // silently approve another pairing attempt.
         restore.emulateSavedInstanceStateRestore()
         compose.onNodeWithText("Pair with Twelfth?").assertIsDisplayed()
-        compose.onNodeWithText("Can't reach your PC").assertDoesNotExist()
+        compose.onNodeWithText("Can't reach your computer").assertDoesNotExist()
         assertNull(app.connection.attempt.value?.invitation)
         compose.onNodeWithText("Cancel").performClick()
     }
@@ -395,7 +395,7 @@ class TenthReviewUiDeviceTest {
         app.preferences.toggle("setup",true)
         var candidate by mutableStateOf<String?>(null)
         content {PneuScreen(candidate=candidate,offerPair={candidate=it})}
-        compose.onNodeWithText("Scan the QR code on your PC").assertIsDisplayed()
+        compose.onNodeWithText("Scan the QR code on your computer").assertIsDisplayed()
         fun shownThenGone(message:String) {
             compose.waitUntil(5000) {compose.onAllNodesWithText(message).fetchSemanticsNodes().isNotEmpty()}
             compose.onNodeWithText(message).assertIsDisplayed()
@@ -424,9 +424,9 @@ class TenthReviewUiDeviceTest {
     @Test fun scannerKeepsItsPaneTitleWithoutDrawingTheOldHeading()=runBlocking<Unit> {
         val prefs=app.preferences.read()
         content {PairScreen(prefs,LinkState(),{},{},{},cameraPreview={_,_->})}
-        compose.onNode(SemanticsMatcher.expectValue(SemanticsProperties.PaneTitle,"Pair with PC")).assertExists()
-        compose.onNodeWithText("Pair with PC").assertDoesNotExist()
-        compose.onNodeWithText("Scan the QR code on your PC").assertIsDisplayed()
+        compose.onNode(SemanticsMatcher.expectValue(SemanticsProperties.PaneTitle,"Add device")).assertExists()
+        compose.onNodeWithText("Add device").assertDoesNotExist()
+        compose.onNodeWithText("Scan the QR code on your computer").assertIsDisplayed()
         compose.onNodeWithContentDescription("Back").assertHasClickAction()
     }
     @Test fun customSwitchKeepsItsAccessibleStateAndInteraction() {

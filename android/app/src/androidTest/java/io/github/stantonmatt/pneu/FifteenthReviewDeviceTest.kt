@@ -43,8 +43,8 @@ class FifteenthReviewDeviceTest {
     }
     @Test(timeout=25000) fun unpairDialogKeepsTheOriginallyNamedPcAndRejectsReplacement()=runBlocking<Unit> {
         c.startActivity(Intent(c,MainActivity::class.java).putExtra("home",true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
-        assertTrue(device.findObject(UiSelector().description("Settings")).waitForExists(5000));device.findObject(UiSelector().description("Settings")).click()
-        UiScrollable(UiSelector().scrollable(true)).scrollTextIntoView("Unpair");click("Unpair");assertTrue(visible("Unpair from Original?"))
+        DeviceFixture.openDevice(i,"Original")
+        UiScrollable(UiSelector().scrollable(true)).let {if(it.exists())it.scrollTextIntoView("Unpair")};click("Unpair");assertTrue(visible("Unpair from Original?"))
         bind("Replacement",'c');val row=item();val replacement=app.preferences.read();delay(200)
         assertTrue(visible("Unpair from Original?"));click("Unpair")
         assertTrue(visible("Couldn't unpair"));assertEquals(replacement.peer,app.preferences.read().peer);assertEquals(replacement.deviceId,app.preferences.read().deviceId);assertNotNull(app.queue.find(row.mediaId));assertTrue(File(row.path).exists())

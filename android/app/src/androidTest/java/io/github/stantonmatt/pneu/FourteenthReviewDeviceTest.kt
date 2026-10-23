@@ -70,8 +70,8 @@ class FourteenthReviewDeviceTest {
         try {
             c.startActivity(Intent(c,MainActivity::class.java).putExtra("home",true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
             withTimeout(5000) {while(!app.connection.discoveryActive)delay(10)}
-            assertTrue(device.findObject(UiSelector().description("Settings")).waitForExists(5000));device.findObject(UiSelector().description("Settings")).click()
-            UiScrollable(UiSelector().scrollable(true)).scrollTextIntoView("Unpair");click("Unpair");click("Unpair")
+            DeviceFixture.openDevice(i,"Original")
+            UiScrollable(UiSelector().scrollable(true)).let {if(it.exists())it.scrollTextIntoView("Unpair")};click("Unpair");click("Unpair")
             withTimeout(5000) {entered.await()};bind("Replacement",'c');val row=image();val replacement=app.preferences.read()
             app.connection.beforeUnpairRemoval={};release.complete(Unit)
             assertTrue(visible("Couldn't unpair"));click("Close");assertTrue(visible("Replacement"))

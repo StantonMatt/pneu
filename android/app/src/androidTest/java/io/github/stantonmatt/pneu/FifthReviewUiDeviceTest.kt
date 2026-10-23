@@ -48,12 +48,15 @@ class FifthReviewUiDeviceTest {
             // Tile actions may already collapse Quick Settings. A blind Back
             // can then navigate Settings to Home; restore the intended screen.
             shell("cmd statusbar collapse");device.waitForIdle()
-            val settings=device.findObject(UiSelector().description("Settings"))
-            if(settings.exists())settings.click()
+            // Unpair lives on the device's page, reached from Home.
+            c.startActivity(Intent(c,MainActivity::class.java).putExtra("home",true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            DeviceFixture.openDevice(i,"Trusted PC")
             app.preferences.beforeMutation={if(it=="forget")throw GeneralSecurityException("Synthetic trust removal failure")}
-            UiScrollable(UiSelector().scrollable(true)).scrollTextIntoView("Unpair");click("Unpair");click("Unpair")
+            UiScrollable(UiSelector().scrollable(true)).let {if(it.exists())it.scrollTextIntoView("Unpair")};click("Unpair");click("Unpair")
             assertTrue(visible("Couldn't unpair"));assertEquals(before.peer,app.preferences.flow.first().peer);assertEquals(before.deviceId,app.preferences.flow.first().deviceId);screen("unpair-write-failed")
             click("Close");assertTrue(visible("Trusted PC"))
+            device.findObject(UiSelector().description("Back")).click()
+            assertTrue(device.findObject(UiSelector().description("Settings")).waitForExists(5000));device.findObject(UiSelector().description("Settings")).click()
             app.preferences.beforeMutation={if(it=="shareSheet")throw IOException("Synthetic setting write failure")}
             UiScrollable(UiSelector().scrollable(true)).scrollTextIntoView("Show in share sheet");val original=app.preferences.flow.first().shareSheet
             click("Show in share sheet");assertTrue(visible("Couldn't save setting"));assertEquals(original,app.preferences.flow.first().shareSheet)
@@ -67,10 +70,10 @@ class FifthReviewUiDeviceTest {
             assertEquals(before.peer,app.preferences.read().peer)
             app.preferences.beforeMutation={}
             // Partial durable revocation: failed cleanup must show the actual unpaired state.
-            c.startActivity(Intent(c,MainActivity::class.java).putExtra("home",true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK));assertTrue(device.findObject(UiSelector().description("Settings")).waitForExists(5000));device.findObject(UiSelector().description("Settings")).click()
+            c.startActivity(Intent(c,MainActivity::class.java).putExtra("home",true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK));DeviceFixture.openDevice(i,"Trusted PC")
             DeviceFixture.insert(app,io.github.stantonmatt.pneu.data.Outgoing().apply {mediaId=randomId();transferId=randomId()})
             val db=app.database.openHelper.writableDatabase;db.execSQL("CREATE TRIGGER fail_cleanup BEFORE DELETE ON deliveries BEGIN SELECT RAISE(ABORT,'Synthetic cleanup failure'); END")
-            UiScrollable(UiSelector().scrollable(true)).scrollTextIntoView("Unpair");click("Unpair");click("Unpair");assertTrue(visible("Couldn't unpair"));assertNull(app.preferences.flow.first().peer);assertEquals(setOf("d".repeat(32)),app.preferences.read().resetPeers);screen("unpair-cleanup-failed")
+            UiScrollable(UiSelector().scrollable(true)).let {if(it.exists())it.scrollTextIntoView("Unpair")};click("Unpair");click("Unpair");assertTrue(visible("Couldn't unpair"));assertNull(app.preferences.flow.first().peer);assertEquals(setOf("d".repeat(32)),app.preferences.read().resetPeers);screen("unpair-cleanup-failed")
             db.execSQL("DROP TRIGGER fail_cleanup")
             // The foreground service stops on local unpair; explicitly own a
             // background recovery loop to coordinate cleanup before this retry.
@@ -80,7 +83,7 @@ class FifthReviewUiDeviceTest {
             val revoked=withTimeout(5000) {app.preferences.flow.first {it.resetPeers.isEmpty()}}
             click("Try again");assertTrue(visible("Finish unpairing?"));click("Unpair")
             withTimeout(5000) {app.prefs.first {it.devices.isEmpty() && it.resetPeers.isEmpty()}}
-            assertTrue(visible("Scan the QR code on your PC") || visible("Allow camera") || visible("Open settings"))
+            assertTrue(visible("Scan the QR code on your computer") || visible("Allow camera") || visible("Open settings"))
             assertEquals(revoked.deviceId,app.preferences.flow.first().deviceId)
             assertEquals(revoked.tlsAlias,app.preferences.flow.first().tlsAlias)
         } catch(e:Throwable) {screen("ui-failure");device.dumpWindowHierarchy(File(c.filesDir,"fifth-review-screens/ui-failure.xml"));throw e

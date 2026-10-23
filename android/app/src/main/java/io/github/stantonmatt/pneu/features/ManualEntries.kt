@@ -12,6 +12,7 @@ import android.service.quicksettings.TileService
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
+import androidx.activity.compose.setContent
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
 import io.github.stantonmatt.pneu.*
@@ -65,8 +66,10 @@ object ManualEntries {
         val captured=targets ?: listOfNotNull(binding?.let {app.connection.freezeSession(it)})
         val (stamp,timestamp)=order ?: shareStep("settings") {app.newTextOrder()}
         val current=shareStep("settings") {app.preferences.read()}
-        if(!RecipientSelection.hasAuthority(current,captured,binding))throw ShareFailure("binding_mismatch")
-        val recipients=captured.filter {app.recipientCurrent(it,current)}
+        if(captured.isEmpty())throw ShareFailure("no_recipient")
+        if(!RecipientSelection.hasAuthority(current,captured))throw ShareFailure("binding_mismatch")
+        val eligible=app.recipients(current,"text")
+        val recipients=captured.filter {app.recipientCurrent(it,current) && eligible.any {target->target.pcId==it.pcId}}
         if(recipients.isEmpty())throw ShareFailure("no_recipient")
         val row=Outgoing().apply {mediaId="manual:${randomId()}";transferId=randomId();kind="text";automatic=false;this.text=text;this.origin=origin;createdAt=timestamp;mime="text/plain";this.recipients=recipients;hlc=stamp.hlc.toString();sourceDevice=stamp.source}
         shareStep("invalid_text") {
@@ -88,8 +91,10 @@ object ManualEntries {
         // unknown, and retain this order if it turns out to be an image.
         val (stamp,timestamp)=order ?: shareStep("settings") {app.newTextOrder(apply=kind=="clipboard_image")}
         val current=shareStep("settings") {app.preferences.read()}
-        if(!RecipientSelection.hasAuthority(current,captured,binding))throw ShareFailure("binding_mismatch")
-        val recipients=captured.filter {app.recipientCurrent(it,current)}
+        if(captured.isEmpty())throw ShareFailure("no_recipient")
+        if(!RecipientSelection.hasAuthority(current,captured))throw ShareFailure("binding_mismatch")
+        val eligible=app.recipients(current,kind,selected=if(kind=="clipboard_image")null else captured.map {it.pcId}.toSet())
+        val recipients=captured.filter {app.recipientCurrent(it,current) && eligible.any {target->target.pcId==it.pcId}}
         if(recipients.isEmpty())throw ShareFailure("no_recipient")
         shareStep("metadata_failed") {ShareAdmission.rejection(app.context,uri)}?.let {throw ShareFailure(it)}
         val type=resolvedMime ?: shareStep("metadata_failed") {ProviderReads.call {app.context.contentResolver.getType(uri)}}
@@ -123,9 +128,7 @@ abstract class ManualEntryActivity : ComponentActivity() {
             override fun handleOnBackPressed() {moveTaskToBack(true)}
         })
         lifecycleScope.launch {
-            val result=operation.result.filterNotNull().first()
-            if(result.pair)startActivity(Intent(this@ManualEntryActivity,MainActivity::class.java).putExtra("pair",true))
-            result.message?.let {Toast.makeText(this@ManualEntryActivity,it,Toast.LENGTH_LONG).show()}
+            operation.showResult(this@ManualEntryActivity)
             finish()
         }
         operationReady.complete(operation)
@@ -172,6 +175,10 @@ class ShareActivity : ManualEntryActivity() {
         val binding=graph.scope.async(start=CoroutineStart.UNDISPATCHED) {admission.await().binding}
         super.onCreate(state)
         val operation=requireNotNull(operation)
+        // Choose devices each time: the sheet appears over the sharing app while
+        // the operation waits. Back, Cancel, the deadline or finishing cancel it.
+        operation.targetPickerAvailable=true
+        setContent {SharePicker(operation)}
         if(operation.started)return
         if(intent.hasExtra(Intent.EXTRA_SHORTCUT_ID)) {ShareAdmission.warn("shortcut");finish();return}
         if(!ShareAdmission.supported(intent.action)) {ShareAdmission.warn("unsupported_action");finish();return}
@@ -209,11 +216,11 @@ abstract class PneuTileBase : TileService() {
 }
 class PneuTile : PneuTileBase() {
     override fun render(p: Prefs,s: io.github.stantonmatt.pneu.connection.LinkState) {
-        val presentation=TilePolicy.present(p,s.status,s.route)
+        val presentation=TilePolicy.present(p,s.connectionStatus,s.route)
         qsTile?.apply {
             label=this@PneuTile.getString(R.string.tile_pneu);icon=Icon.createWithResource(this@PneuTile,R.drawable.ic_stat_pneu)
             state=when {!presentation.available->Tile.STATE_UNAVAILABLE;presentation.active->Tile.STATE_ACTIVE;else->Tile.STATE_INACTIVE}
-            subtitle=presentation.subtitle?.let {getString(it)};updateTile()
+            subtitle=if(p.devices.size>1 && presentation.active)getString(R.string.tile_connected_computers,graph.connection.devices.value.values.count {it.connectionStatus==io.github.stantonmatt.pneu.connection.ConnectionStatus.CONNECTED},p.devices.size) else presentation.subtitle?.let {getString(it)};updateTile()
         }
     }
     override fun onClick() {super.onClick();scope.launch {UiActions.feedback(this@PneuTile).run(getString(R.string.toast_settings)) {
@@ -224,8 +231,8 @@ class PneuTile : PneuTileBase() {
 }
 class ClipboardTile : PneuTileBase() {
     override fun render(p: Prefs,s: io.github.stantonmatt.pneu.connection.LinkState) {
-        val presentation=TilePolicy.present(p,s.status,s.route,clipboard=true,clipboardAvailable=graph.connection.clipboardAvailable(p))
-        qsTile?.apply {label=this@ClipboardTile.getString(R.string.tile_send_clipboard);icon=Icon.createWithResource(this@ClipboardTile,R.drawable.ic_content_paste_go);state=if(presentation.available)Tile.STATE_INACTIVE else Tile.STATE_UNAVAILABLE;subtitle=presentation.subtitle?.let {getString(it)};updateTile()}
+        val presentation=TilePolicy.present(p,s.connectionStatus,s.route,clipboard=true,clipboardAvailable=graph.connection.clipboardAvailable(p))
+        qsTile?.apply {label=this@ClipboardTile.getString(R.string.tile_send_clipboard);icon=Icon.createWithResource(this@ClipboardTile,R.drawable.ic_content_paste_go);state=if(presentation.available)Tile.STATE_INACTIVE else Tile.STATE_UNAVAILABLE;subtitle=if(p.devices.size>1 && graph.connection.clipboardAvailable(p))getString(R.string.tile_connected_computers,graph.connection.devices.value.values.count {it.connectionStatus==io.github.stantonmatt.pneu.connection.ConnectionStatus.CONNECTED},p.devices.size) else presentation.subtitle?.let {getString(it)};updateTile()}
     }
     override fun onClick() {super.onClick();scope.launch {UiActions.feedback(this@ClipboardTile).run(getString(R.string.toast_settings)) {
         val p=graph.awaitPrefs();if(!p.quickSettings)return@run

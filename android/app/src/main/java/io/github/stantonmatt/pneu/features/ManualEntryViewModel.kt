@@ -1,5 +1,6 @@
 package io.github.stantonmatt.pneu.features
 
+import io.github.stantonmatt.pneu.connection.ConnectionStatus
 import android.app.Application
 import android.content.*
 import android.net.Uri
@@ -13,8 +14,15 @@ import io.github.stantonmatt.pneu.protocol.sha256
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
-internal data class ShareRequest(val binding:Deferred<DeliveryBinding?>,val items:List<Uri>,val texts:List<String>,val admission:Deferred<FrozenAdmission>?=null)
-internal data class EntryResult(val message:String?=null,val pair:Boolean=false,val id:String=java.util.UUID.randomUUID().toString())
+internal data class ShareRequest(val binding:Deferred<DeliveryBinding?>,val items:List<Uri>,val texts:List<String>,val admission:Deferred<FrozenAdmission>?=null,val explicitTargets:List<CapturedAuthority>?=null)
+internal data class EntryResult(val message:String?=null,val pair:Boolean=false,val id:String=java.util.UUID.randomUUID().toString()) {
+    fun show(context:Context) {
+        if(pair)context.startActivity(Intent(context,MainActivity::class.java).putExtra("pair",true).apply {
+            if(context !is android.app.Activity)addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        })
+        message?.let {Toast.makeText(context,it,Toast.LENGTH_LONG).show()}
+    }
+}
 
 /** Retains one admission across rotation. Shares run in the process scope with
  * service-owned grants, so clearing the entry task cannot cancel them. */
@@ -22,6 +30,7 @@ internal class ManualEntryViewModel(application:Application):AndroidViewModel(ap
     private val app=application.graph
     private val terminal=MutableStateFlow<EntryResult?>(null)
     val result=terminal.asStateFlow()
+    internal suspend fun showResult(context:Context) {result.filterNotNull().first().show(context)}
     internal val startedSignal=CompletableDeferred<Unit>()
     var started=false
         private set
@@ -31,7 +40,7 @@ internal class ManualEntryViewModel(application:Application):AndroidViewModel(ap
     private fun launch(processOwned:Boolean=false,body:suspend ()->EntryResult) {
         if(started)return
         started=true;startedSignal.complete(Unit)
-        (if(processOwned)app.scope else viewModelScope).launch(Dispatchers.Main.immediate) {
+        (if(processOwned)app.scope else viewModelScope).launch(Dispatchers.Main.immediate+CoroutineName("manual-entry")) {
             terminal.value=try {body()}
             catch(e:CancellationException) {warn(processOwned,"cancelled");terminal.value=EntryResult();throw e}
             catch(e:Exception) {warn(processOwned,(e as? ShareFailure)?.reason ?: "read_failed");EntryResult(app.context.getString(R.string.toast_cant_read))}
@@ -42,8 +51,8 @@ internal class ManualEntryViewModel(application:Application):AndroidViewModel(ap
     fun failure(message:String,reason:String="read_failed") {if(!started) {Log.w("Pneu","manual_entry_rejected: $reason");started=true;startedSignal.complete(Unit);terminal.value=EntryResult(message)}}
     val targetSelection=MutableStateFlow<List<Peer>?>(null)
     private val selectedTargets=CompletableDeferred<Set<String>>()
-    // Enable only when an activity owns the picker. Persisted opt-ins are inert
-    // until then; the deadline still protects a missing/destroyed consumer.
+    // ShareActivity owns the picker and enables it. Other owners never wait for
+    // a choice; the deadline still protects a missing/destroyed consumer.
     internal var targetPickerAvailable=false
     internal var targetSelectionTimeoutMillis=120000L
     fun selectTargets(ids:Set<String>) {require(ids.all {id->targetSelection.value?.any {it.deviceId==id}==true});selectedTargets.complete(ids)}
@@ -66,12 +75,32 @@ internal class ManualEntryViewModel(application:Application):AndroidViewModel(ap
             return@launch EntryResult(app.context.getString(R.string.toast_settings))
         }
         if(p.devices.isEmpty() || p.pairingLost) {ShareAdmission.warn("not_paired");return@launch EntryResult(pair=true)}
-        if(!p.shareSheet) {ShareAdmission.warn("disabled");return@launch EntryResult()}
-        val frozen=request.admission?.await()?.targets(if(request.items.isNotEmpty())"file" else "text") ?: listOfNotNull(binding)
-        if(!RecipientSelection.hasAuthority(p,frozen,binding)) {ShareAdmission.warn("binding_mismatch");return@launch EntryResult()}
-        val selected=if(p.chooseDevicesEachTime && targetPickerAvailable)awaitTargets(p.devices.filter {peer->frozen.any {it.pcId==peer.deviceId}}) else null
+        if(request.explicitTargets==null && !p.shareSheet) {ShareAdmission.warn("disabled");return@launch EntryResult()}
+        val admission=request.admission?.await()
+        val frozen=request.explicitTargets?.map {it.binding} ?: admission?.targets(if(request.items.isNotEmpty())"file" else "text") ?: listOfNotNull(binding)
+        // Files may go to a computer that is offline now and wait for it. Shared
+        // text never waits, so the picker offers only its frozen (connected) targets.
+        val files=request.items.isNotEmpty()
+        val choices=(request.explicitTargets ?: (if(files)admission?.fileChoices ?: frozen else frozen).map(::CapturedAuthority))
+        val picking=request.explicitTargets==null && p.chooseDevicesEachTime && targetPickerAvailable
+        val authority=if(picking && files)choices.map {it.binding} else frozen
+        if(authority.isEmpty()) {ShareAdmission.warn("no_recipient");return@launch EntryResult(app.context.getString(R.string.toast_not_sent))}
+        if(!RecipientSelection.hasAuthority(p,authority)) {ShareAdmission.warn("binding_mismatch");return@launch EntryResult(app.context.getString(R.string.toast_cant_read))}
+        val eligible=app.recipients(p,if(files)"file" else "text",selected=if(picking && files || request.explicitTargets!=null)choices.map {it.binding.pcId}.toSet() else null)
+        val offered=p.devices.filter {peer->eligible.any {it.pcId==peer.deviceId} && choices.any {
+            it.binding.pcId==peer.deviceId && it.stillValid(p,app.connection.generation(it.binding)) && app.recipientCurrent(it.binding,p)
+        }}
+        if(offered.isEmpty()) {ShareAdmission.warn("no_recipient");return@launch EntryResult(app.context.getString(R.string.toast_not_sent))}
+        val selected=if(picking)awaitTargets(offered) else null
         if(selected?.isEmpty()==true) {ShareAdmission.warn("cancelled");return@launch EntryResult()}
-        val targets=frozen.filter {selected==null || it.pcId in selected}
+        val targets=when {
+            selected==null->frozen.filter {target->offered.any {it.deviceId==target.pcId}}
+            files->choices.filter {it.binding.pcId in selected}.map {it.binding}
+            else->frozen.filter {it.pcId in selected}
+        }
+        val current=shareStep("settings") {app.preferences.read()}
+        val surviving=targets.filter {target->choices.find {it.binding==target}?.stillValid(current,app.connection.generation(target))!=false && app.recipientCurrent(target,current)}
+        if(surviving.isEmpty()) {ShareAdmission.warn("no_recipient");return@launch EntryResult(app.context.getString(R.string.toast_not_sent))}
         var count=0;var failed=request.items.isEmpty() && request.texts.isEmpty()
         if(failed)ShareAdmission.warn("empty")
         withContext(Dispatchers.IO) {
@@ -80,13 +109,14 @@ internal class ManualEntryViewModel(application:Application):AndroidViewModel(ap
                 catch(e:CancellationException) {throw e}
                 catch(e:Exception) {ShareAdmission.warn((e as? ShareFailure)?.reason ?: "read_failed");completed.add(null);failed=true}
             }
-            if(request.items.isNotEmpty())for((index,uri) in request.items.withIndex())admit {ManualEntries.file(app,uri,"file",binding,targets=targets,order=orders[index])}
-            else for((index,text) in request.texts.withIndex())admit {ManualEntries.text(app,text,"share",binding,targets,orders[index])}
+            if(request.items.isNotEmpty())for((index,uri) in request.items.withIndex())admit {ManualEntries.file(app,uri,"file",binding,targets=surviving,order=orders[index])}
+            else for((index,text) in request.texts.withIndex())admit {ManualEntries.text(app,text,"share",binding,surviving,orders[index])}
         }
         return@launch EntryResult(when {
             failed->app.context.getString(R.string.toast_cant_read)
-            app.connection.state.value.status=="Waiting for Wi-Fi"->app.context.getString(R.string.toast_queued_wifi)
-            targets.any {app.connection.connected(it.pcId)}->UiPresentation.sendingTo(app.context,p.devices.filter {peer->targets.any {it.pcId==peer.deviceId}})
+            app.connection.state.value.connectionStatus==ConnectionStatus.WAITING_WIFI->app.context.getString(R.string.toast_queued_wifi)
+            targets.any {app.connection.connected(it.pcId)}->UiPresentation.sendingTo(app.context,p.devices.filter {peer->targets.any {it.pcId==peer.deviceId}},count)
+            selected!=null && targets.size==1->app.context.getString(R.string.item_waiting_for,p.devices.find {it.deviceId==targets.single().pcId}?.name.orEmpty())
             else->app.context.getString(R.string.toast_queued)
         })
     }
@@ -114,16 +144,21 @@ internal class ManualEntryViewModel(application:Application):AndroidViewModel(ap
         }
         val frozen=clipboardAdmission?.await() ?: FrozenAdmission(binding,listOfNotNull(binding),listOfNotNull(binding),emptyList())
         val current=shareStep("settings") {app.preferences.read()}
+        val textEligible=app.recipients(current,"text").map {it.pcId}.toSet()
+        val imageEligible=app.recipients(current,"clipboard_image").map {it.pcId}.toSet()
         val textTargets=clip?.let {ClipboardSendPolicy.targets(it,current,frozen.text)}.orEmpty()
-            .filter {app.recipientCurrent(it,current) && app.connection.connected(it.pcId) && app.connection.supports(it.pcId,"clipboard_text")}
+            .filter {app.recipientCurrent(it,current) && it.pcId in textEligible}
         val imageTargets=clip?.let {ClipboardSendPolicy.targets(it,current,frozen.images)}.orEmpty()
-            .filter {app.recipientCurrent(it,current) && app.connection.connected(it.pcId) && app.connection.supports(it.pcId,"clipboard_image") && app.connection.supports(it.pcId,"files")}
+            .filter {app.recipientCurrent(it,current) && it.pcId in imageEligible}
         when {
             !app.connection.connected || frozen.text.plus(frozen.images).none {it.matches(current)}-> {
                 Log.w("Pneu","manual_entry_rejected: unavailable_binding");EntryResult(app.context.getString(R.string.toast_not_sent))
             }
             clip==null || clip.itemCount==0-> {Log.w("Pneu","manual_entry_rejected: empty");EntryResult(app.context.getString(R.string.toast_clipboard_empty))}
             clip.description.extras?.getBoolean(ClipDescription.EXTRA_IS_SENSITIVE)==true-> {Log.w("Pneu","manual_entry_rejected: sensitive");EntryResult(app.context.getString(R.string.toast_sensitive))}
+            textTargets.isEmpty() && imageTargets.isEmpty()-> {
+                Log.w("Pneu","manual_entry_rejected: no_recipient");EntryResult(app.context.getString(R.string.toast_not_sent))
+            }
             else->try {
                 val row=withContext(Dispatchers.IO) {
                     val item=clip.getItemAt(0)

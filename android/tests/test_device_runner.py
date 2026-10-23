@@ -1,4 +1,5 @@
 """Focused host-only checks; run with PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests."""
+import ast
 import contextlib
 import importlib.util
 import io
@@ -309,7 +310,7 @@ class DeviceCoverageTest(unittest.TestCase):
             # Tests are ordinary top-level Kotlin classes with JUnit annotations.
             # Ignore comments so examples cannot appear as executable tests.
             text = re.sub(r'/\*.*?\*/|//[^\n]*', '', text, flags=re.S)
-            classes = list(re.finditer(r'^\s*(?:(?:internal|open|abstract)\s+)*class\s+(\w+)', text, re.M))
+            classes = list(re.finditer(r'^(?:(?:internal|open|abstract)\s+)*class\s+(\w+)', text, re.M))
             seen = 0
             for index, match in enumerate(classes):
                 end = classes[index + 1].start() if index + 1 < len(classes) else len(text)
@@ -334,6 +335,17 @@ class DeviceCoverageTest(unittest.TestCase):
                 selected.update((cls, method) for method in methods[cls])
         missing = {(cls, method) for cls, names in methods.items() for method in names} - selected
         self.assertFalse(missing, 'Full runner omits: ' + ', '.join(cls + '#' + method for cls, method in sorted(missing)))
+
+    def test_host_fixture_scripts_parse_before_device_execution(self):
+        for script in (Path(runner.root) / 'tools').glob('*.py'):
+            with self.subTest(script=script.name):
+                ast.parse(script.read_text(),filename=str(script))
+
+    def test_inventory_keeps_methods_after_local_helper_in_owning_test_class(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source=Path(directory) / 'Example.kt'
+            source.write_text('class Example {\n    @Test fun first() {}\n    class Helper {}\n    @Test fun second() {}\n}\n')
+            self.assertEqual(self.methods(Path(directory)), {'Example': {'first','second'}})
 
     def test_full_runner_selects_every_android_test_class_and_method(self):
         methods = self.methods(Path(runner.root) / 'app/src/androidTest')

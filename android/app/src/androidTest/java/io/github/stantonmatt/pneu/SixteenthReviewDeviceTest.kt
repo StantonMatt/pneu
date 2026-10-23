@@ -109,7 +109,11 @@ class SixteenthRecentDeviceTest {
         assertEquals(StatusNotificationChannel.id(c),nm.activeNotifications.first {it.id==1}.notification.channelId)
         assertFalse(nm.getNotificationChannel(StatusNotificationChannel.id(c)).canShowBadge())
         assertFalse(app.recent.value.any {it.mediaId==marker.transferMediaId})
-        app.connection.state.value=marker.copy(transferMediaId=active.mediaId)
+        val activeLink=marker.copy(transferMediaId=active.mediaId)
+        // Recent now projects each recipient's live link, as production workers do.
+        // Keep the synthetic aggregate and per-computer snapshots consistent.
+        app.connection.devices.value=mapOf(app.preferences.read().devices.single().deviceId to activeLink)
+        app.connection.state.value=activeLink
         c.startActivity(Intent(c,MainActivity::class.java).putExtra("home",true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
         compose.waitForIdle();compose.onNodeWithText("Recent").assertExists()
         // Exercise the production LazyColumn directly; platform UiScrollable on

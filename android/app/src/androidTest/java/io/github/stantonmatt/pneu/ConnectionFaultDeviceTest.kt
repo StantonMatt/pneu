@@ -49,6 +49,15 @@ class ConnectionFaultDeviceTest {
     private suspend fun discard(vararg rows:Outgoing) {
         assertTrue(app.discard(io.github.stantonmatt.pneu.data.ConfirmedQueue.from(app.preferences.read(),rows.toList())))
     }
+    @Test(timeout=30000) fun incompatibleComputerRequiresUpdateAndKeepsPairing()=runBlocking<Unit> {
+        val before=app.preferences.read().devices.single()
+        app.connection.start(scope)
+        withTimeout(12000) {app.connection.devices.first {it[before.deviceId]?.connectionStatus==io.github.stantonmatt.pneu.connection.ConnectionStatus.UPDATE_REQUIRED}}
+        val after=app.preferences.read().devices.single()
+        assertEquals(before.pin,after.pin);assertEquals(before.generation,after.generation)
+        assertFalse(after.pairingLost);assertFalse(app.connection.connected)
+        assertEquals(io.github.stantonmatt.pneu.connection.ConnectionStatus.UPDATE_REQUIRED,app.connection.state.value.connectionStatus)
+    }
     @Test(timeout=100000) fun failedCompletionAndFallbackWritesRecoverBothLanesWithoutSpinning()=runBlocking<Unit> {
         connect();app.preferences.toggle("screenshots",false)
         val db=app.database.openHelper.writableDatabase
@@ -244,7 +253,7 @@ class ConnectionFaultDeviceTest {
         i.uiAutomation.grantRuntimePermission(c.packageName,Manifest.permission.CAMERA)
         c.startActivity(Intent(c,MainActivity::class.java).putExtra("pair",true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
         val device=androidx.test.uiautomator.UiDevice.getInstance(i)
-        assertTrue(device.wait(androidx.test.uiautomator.Until.hasObject(androidx.test.uiautomator.By.text("Scan the QR code on your PC")),5000))
+        assertTrue(device.wait(androidx.test.uiautomator.Until.hasObject(androidx.test.uiautomator.By.text("Scan the QR code on your computer")),5000))
         assertFalse(device.hasObject(androidx.test.uiautomator.By.textStartsWith("Paired with ")))
         File(c.filesDir,"e2e-fix-screens").mkdirs()
         device.takeScreenshot(File(c.filesDir,"e2e-fix-screens/remote-unpair.png"))

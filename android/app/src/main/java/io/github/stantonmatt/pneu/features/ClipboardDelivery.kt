@@ -105,7 +105,7 @@ class ClipboardDelivery(private val app: AppGraph, private val applyText:(suspen
         val p=app.preferences.read()
         val peer=p.devices.find {it.deviceId==peerId}
         if(peer?.clipboardReceive!=true)return disabledDirection(id,stamp!=null)
-        val stale=if(stamp==null)!DeliveryPolicy.newer(timestamp,app.queue.lastApplied(peerId)) else !app.preferences.clipboardWins(stamp)
+        val stale=if(stamp==null)!DeliveryPolicy.newer(timestamp,app.preferences.legacyClipboardTime(peerId,generation,app.queue.lastApplied(peerId))) else !app.preferences.clipboardWins(stamp)
         if(!stale && !p.paused) {
             // Reserve the full wire metadata before touching the OS. A changed
             // retry must conflict even when the final receipt write failed.

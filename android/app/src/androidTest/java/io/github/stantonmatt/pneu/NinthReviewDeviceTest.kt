@@ -89,7 +89,7 @@ class NinthReviewDeviceTest {
         val activity=withTimeout(4000) {clipboardCreated.await()}
         val operation=startedOperation(activity)
         val result=withTimeout(4000) {operation.result.filterNotNull().first()}
-        assertEquals("Computer unreachable. Not sent.",result.message)
+        assertEquals("No device connected. Not sent.",result.message)
         assertNotNull(operation.clipboardBinding);assertTrue(app.queue.pending().isEmpty())
     }
     @Test(timeout=30000) fun chooserRelaysTemporaryGrantToBoundedShareRead()=runBlocking<Unit> {
@@ -178,8 +178,8 @@ class NinthReviewDeviceTest {
         val original=DeliveryBinding.from(app.prefs.value)!!
         val entered=CompletableDeferred<Unit>();val release=CompletableDeferred<Unit>();val first=AtomicBoolean(true)
         // Reserve-order work runs on IO before this read. Pause the share's
-        // main-thread settings read, not a concurrent service/connection read.
-        app.preferences.beforeReadStart={if(android.os.Looper.myLooper()==android.os.Looper.getMainLooper() && first.compareAndSet(true,false)) {entered.complete(Unit);release.await()}}
+        // settings read by coroutine identity, not a concurrent service/connection read.
+        app.preferences.beforeReadStart={if(currentCoroutineContext()[CoroutineName]?.name=="manual-entry" && first.compareAndSet(true,false)) {assertNotEquals(android.os.Looper.getMainLooper(),android.os.Looper.myLooper());entered.complete(Unit);release.await()}}
         try {
             if(text==null)caller(*paths,newTask=true)
             else c.startActivity(Intent().setComponent(ComponentName(c.packageName+".test",FixtureCallerActivity::class.java.name)).putExtra("text",text).putExtra("newTask",true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))

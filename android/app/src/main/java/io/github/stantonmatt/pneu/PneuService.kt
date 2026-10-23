@@ -1,5 +1,6 @@
 package io.github.stantonmatt.pneu
 
+import io.github.stantonmatt.pneu.connection.ConnectionStatus
 import android.app.*
 import android.content.*
 import android.content.pm.ServiceInfo
@@ -118,18 +119,18 @@ class PneuService : Service() {
     private fun notification(): Notification {
         val p=graph.prefs.value; val s=graph.connection.state.value
         if(!p.loaded)return NotificationCompat.Builder(this,StatusNotificationChannel.id(this)).setSmallIcon(R.drawable.ic_stat_pneu).setColor(0xFF4F5BFF.toInt())
-            .setContentTitle(if(s.status=="Storage unavailable")getString(R.string.load_failed) else getString(R.string.load_pending))
+            .setContentTitle(if(s.connectionStatus==ConnectionStatus.STORAGE_UNAVAILABLE)getString(R.string.load_failed) else getString(R.string.load_pending))
             .setContentIntent(activityIntent(0,MainActivity::class.java)).setOngoing(true).setOnlyAlertOnce(true).setShowWhen(false).setSilent(true).build()
-        val title=if(p.pairingLost) "Pairing lost" else if(p.paused) "Paused" else UiPresentation.sending(this,s) ?: s.status
+        val title=if(p.pairingLost) getString(R.string.status_pairing_lost) else if(p.paused) getString(R.string.status_paused) else UiPresentation.sending(this,s) ?: UiPresentation.status(this,s.connectionStatus)
         val count=graph.waitingCount.value
         val detail=when {
             p.pairingLost -> getString(R.string.detail_pairing_lost,p.lostPcName)
             p.paused -> getString(R.string.detail_paused)
             s.transferMediaId.isNotEmpty() -> getString(R.string.notif_progress,android.text.format.Formatter.formatShortFileSize(this,s.sent),android.text.format.Formatter.formatShortFileSize(this,s.total))
-            s.status == "Connected" -> UiPresentation.connectionDetail(this,p,graph.connection.devices.value,s)
-            s.status == "Connecting…" -> graph.connection.attempt.value?.invitation?.name ?: UiPresentation.connectionDetail(this,p,graph.connection.devices.value,s)
+            s.connectionStatus==ConnectionStatus.CONNECTED -> UiPresentation.connectionDetail(this,p,graph.connection.devices.value,s,computers=true)
+            s.connectionStatus==ConnectionStatus.CONNECTING -> graph.connection.attempt.value?.invitation?.name ?: UiPresentation.connectionDetail(this,p,graph.connection.devices.value,s,computers=true)
             count > 0 -> resources.getQuantityString(R.plurals.waiting,count,count)
-            s.status == "Waiting for Wi-Fi" -> getString(R.string.detail_mobile_data_off)
+            s.connectionStatus==ConnectionStatus.WAITING_WIFI -> getString(R.string.detail_mobile_data_off)
             else -> if(p.lastConnected>0) getString(R.string.detail_last_connected,lastConnectedLabel(this,p.lastConnected)) else null
         }
         val pause=PendingIntent.getService(this,2,Intent(this,PneuService::class.java).setAction(ACTION_PAUSE),PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)

@@ -1,5 +1,6 @@
 package io.github.stantonmatt.pneu.features
 
+import io.github.stantonmatt.pneu.connection.ConnectionStatus
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -8,34 +9,40 @@ import io.github.stantonmatt.pneu.connection.LinkState
 import io.github.stantonmatt.pneu.data.*
 import io.github.stantonmatt.pneu.protocol.utf8Prefix
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 data class DeviceState(val peer:Peer,val connection:LinkState,val pendingSwitches:Set<String>,val settingsSupported:Boolean?) {
     val settingsPending get()=pendingSwitches.isNotEmpty() && settingsSupported!=false
     val lastSeen get()=peer.lastConnected
 }
-/** State/actions for the upcoming device screens. Actions suspend so the caller
- * can use the existing UI action-error presentation and confirmation patterns. */
-class DevicesViewModel(application:Application):AndroidViewModel(application) {
-    private val app=application.graph
-    val devices=combine(app.prefs,app.connection.devices) {prefs,links->prefs.devices.map {peer->
+/** Connected devices first, then by last seen. No manual reordering. */
+internal object DeviceProjection {
+    fun states(prefs:Prefs,links:Map<String,LinkState>)=prefs.devices.map {peer->
         DeviceState(peer,links[peer.deviceId] ?: LinkState(),
             PairSettings.keys(prefs.deviceId,peer.deviceId).zip(listOf("sendClipboard","receiveClipboard","automaticMedia"))
                 .filter {it.first in peer.localSettingsEdits}.map {it.second}.toSet(),peer.settingsSupported)
-    }.sortedWith(compareByDescending<DeviceState> {it.connection.status=="Connected"}.thenByDescending {it.lastSeen})}
+    }.sortedWith(compareByDescending<DeviceState> {it.connection.connectionStatus==ConnectionStatus.CONNECTED}.thenByDescending {it.lastSeen})
+}
+/** State/actions for Home's Devices card and the device pages. Actions suspend so the
+ * caller can use the existing UI action-error presentation and confirmation patterns. */
+class DevicesViewModel(application:Application):AndroidViewModel(application) {
+    private val app=application.graph
+    val devices=combine(app.prefs,app.connection.devices,DeviceProjection::states)
         .stateIn(viewModelScope,SharingStarted.WhileSubscribed(5000),emptyList())
-    val chooseDevicesEachTime=app.prefs.map {false}
-    suspend fun setChooseDevicesEachTime(value:Boolean) {
-        check(!value) {"Device picker is not available"}
-        app.preferences.toggle("chooseDevicesEachTime",false)
-    }
-    suspend fun setPairSwitch(peerId:String,key:String,value:Boolean)=app.setPairSwitch(peerId,key,value)
-    suspend fun addDevice(invitation:String):Boolean {
-        val accepted=app.requestPairing(invitation,ConfirmedBinding.forInvitation(app.awaitPrefs(),io.github.stantonmatt.pneu.protocol.Invitation.parse(invitation)))
+    val chooseDevicesEachTime=app.prefs.map {it.chooseDevicesEachTime}
+    suspend fun setChooseDevicesEachTime(value:Boolean)=app.preferences.toggle("chooseDevicesEachTime",value)
+    suspend fun setPairSwitch(authority:CapturedAuthority,key:String,value:Boolean) {check(app.setPairSwitch(authority,key,value)) {"Pairing changed during setting edit"}}
+    suspend fun addDevice(invitation:String):Boolean=withContext(Dispatchers.IO) {
+        val captured=app.prefs.value
+        check(captured.loaded) {"Settings not loaded"}
+        val expected=ConfirmedBinding.forInvitation(captured,io.github.stantonmatt.pneu.protocol.Invitation.parse(invitation))
+        val accepted=app.requestPairing(invitation,expected)
         if(accepted)PneuService.start(app.context)
-        return accepted
+        accepted
     }
     suspend fun unpairOne(confirmed:ConfirmedBinding)=app.connection.unpair(confirmed)
-    suspend fun renameSelf(name:String) {
+    suspend fun renameSelf(name:String)=withContext(Dispatchers.IO) {
         val value=name.trim();require(value.isNotEmpty() && utf8Prefix(value,128)==value && '\u0000' !in value)
         app.preferences.setString("selfName",value)
     }

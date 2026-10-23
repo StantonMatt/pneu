@@ -7,16 +7,19 @@ internal object LinkProjection {
         val available=p.devices.filterNot {it.pairingLost}.mapNotNull {peer->states[peer.pin]?.let {state->
             if(peer.deviceId !in p.resetPeers)state else state.copy(
                 status=if(state.status=="Connected")"PC unreachable" else state.status,
-                route="",sent=0,total=0,transferMediaId="",transferKind="",transferFileName="")
+                route="",sent=0,total=0,transferMediaId="",transferKind="",transferFileName="",incoming=null)
         }}
         val base=available.firstOrNull {it.status=="Connected" && it.transferMediaId.isNotEmpty()}
+            ?: available.firstOrNull {it.status=="Connected" && it.incoming!=null}
             ?: available.firstOrNull {it.status=="Connected"}
             ?: states[attempt?.invitation?.fingerprint]
             ?: available.firstOrNull {it.status=="Connecting…"}
             ?: available.firstOrNull()
             ?: LinkState(if(p.pairingLost)"Pairing lost" else "PC unreachable")
         val feedback=outcome ?: states[pairingPin]?.takeIf {it.pairingSuccess(p)}
-        return if(attempt==null && feedback!=null)base.copy(pairing=feedback.pairing,pairingPin=feedback.pairingPin,
+        return if(attempt==null && feedback!=null)base.copy(
+            status=if(feedback.pairingFeedback?.status!=null && base.connectionStatus!=ConnectionStatus.CONNECTED)feedback.status else base.status,
+            pairing=feedback.pairing,pairingPin=feedback.pairingPin,
             pairingGeneration=feedback.pairingGeneration,pairingFeedback=feedback.pairingFeedback) else base
     }
 }

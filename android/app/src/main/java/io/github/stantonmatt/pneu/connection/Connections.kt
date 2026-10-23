@@ -19,6 +19,7 @@ class Connections(private val app:AppGraph) {
     internal fun attemptFor(pin:String?)=attempt.value?.takeIf {pin==null || it.invitation.fingerprint==pin}
     val state=MutableStateFlow(LinkState()) // Aggregate status; action eligibility is computed from every recipient.
     val devices=MutableStateFlow<Map<String,LinkState>>(emptyMap())
+    val incomingTransfers:Flow<Map<String,IncomingTransfer>> = devices.map {links->links.mapNotNull {(id,state)->state.incoming?.let {id to it}}.toMap()}.distinctUntilChanged()
     @Volatile private var workers:Map<String,ConnectionManager> = emptyMap()
     @Volatile private var pairingResult:LinkState?=null
     @Volatile private var pairingPin:String?=null
@@ -31,6 +32,12 @@ class Connections(private val app:AppGraph) {
     fun supports(peerId:String,capability:String)=app.prefs.value.devices.find {it.deviceId==peerId}?.let {workers[it.pin]?.supports(capability)}==true
     internal fun freezeSession(binding:DeliveryBinding)=workers[binding.pin]?.freezeSession(binding)
     internal fun ownsSession(binding:DeliveryBinding)=workers[binding.pin]?.ownsSession(binding)==true
+    // Retained across ordinary disconnect/worker shutdown. Only a newer admitted
+    // connection supersedes a deferred receive effect. UUIDs fence process death.
+    private val generations=java.util.concurrent.ConcurrentHashMap<DeliveryBinding,String>()
+    internal fun generation(binding:DeliveryBinding)=generations[binding.copy(sessionId=null)]
+    internal fun admitted(binding:DeliveryBinding,token:String) {generations[binding.copy(sessionId=null)]=token}
+    internal fun revoked(peer:Peer) {generations.keys.removeAll {it.pcId==peer.deviceId && it.generation==peer.generation}}
     fun clipboardAvailable(p:Prefs=app.prefs.value)=
         app.recipients(p,"text").isNotEmpty() || app.recipients(p,"clipboard_image").isNotEmpty()
     fun connectivity()=RoutePolicy.active(app.context.getSystemService(android.net.ConnectivityManager::class.java)).connectivity
@@ -73,6 +80,7 @@ class Connections(private val app:AppGraph) {
     fun kick()=workers.values.forEach {it.kick()}
     fun retry()=workers.values.forEach {it.retry()}
     fun retryPeer(pin:String?) {workers[pin]?.retry()}
+    internal fun pairingFailed(status:ConnectionStatus) {pairingResult=LinkState.pairingFailure(status);publish()}
     internal fun pairingFailed(message:String) {pairingResult=LinkState(pairing=message);publish()}
     internal fun clearPairingResult(pin:String?=null) {
         pairingResult=null;lastStartedAttemptId=null

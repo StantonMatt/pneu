@@ -4,8 +4,8 @@ import android.app.Application
 import androidx.room.Room
 import io.github.stantonmatt.pneu.connection.LinkState
 import io.github.stantonmatt.pneu.data.*
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.*
 import org.junit.Test
 import org.junit.Assert.*
 import org.junit.runner.RunWith
@@ -22,7 +22,7 @@ class RecentProjectionTest {
     private fun delivery(peer:Peer,state:String,id:String="artifact",order:Long=1)=Outgoing().apply {
         mediaId=id;peerId=peer.deviceId;transferId=id;this.state=state;size=100;orderId=order;error=if(state=="failed")"disk_full" else ""
     }
-    @Test fun progressCombinesCompletedAndConcurrentRecipientsAndKeepsFailures() {
+    @Test fun progressCombinesCompletedAndConcurrentRecipientsAndKeepsFailures()=runBlocking<Unit>(Dispatchers.IO) {
         val context=RuntimeEnvironment.getApplication()
         val unmatched=RecentProjection.items(listOf(delivery(a,"sending"),delivery(b,"sending")),p,emptyMap()).single()
         assertFalse(unmatched.sending)
@@ -33,21 +33,55 @@ class RecentProjectionTest {
         assertEquals(2,sending.recipients.size)
         val failed=RecentProjection.items(listOf(delivery(a,"sent"),delivery(b,"failed")),p,emptyMap()).single()
         assertEquals("failed",failed.row.state);assertEquals("disk_full",failed.failed.single().error)
-        assertEquals("Failed on MacBook",UiPresentation.recentOutcome(context,failed))
+        assertEquals("Failed on MacBook · Disk is full",UiPresentation.recentOutcome(context,failed))
         val partial=RecentProjection.items(listOf(delivery(a,"sending"),delivery(b,"failed")),p,mapOf(a.deviceId to LinkState("Connected",sent=25,total=100,transferMediaId="artifact"))).single()
         assertTrue(partial.sending);assertEquals(25L,partial.sent);assertEquals(200L,partial.total)
-        assertEquals("Failed on MacBook",UiPresentation.recentOutcome(context,partial))
+        assertEquals("Failed on MacBook · Disk is full",UiPresentation.recentOutcome(context,partial))
         val waiting=RecentProjection.items(listOf(delivery(a,"sent"),delivery(b,"waiting")),p,emptyMap()).single()
-        assertEquals("Sent to 1 of 2",UiPresentation.recentOutcome(context,waiting))
+        assertEquals("Waiting for MacBook",UiPresentation.recentOutcome(context,waiting))
+        assertEquals("To Desktop · 9:41",UiPresentation.recentSent(context,waiting,clipboard=false,time="9:41"))
+        val sent=RecentProjection.items(listOf(delivery(a,"sent"),delivery(b,"sent")),p,emptyMap()).single()
+        assertEquals("Clipboard · To 2 devices · 9:41",UiPresentation.recentSent(context,sent,clipboard=true,time="9:41"))
+        val generic=RecentProjection.items(listOf(delivery(a,"sent"),delivery(b,"failed").apply {error="timeout"}),p,emptyMap()).single()
+        assertEquals("Failed on MacBook",UiPresentation.recentOutcome(context,generic))
         val both=RecentProjection.items(listOf(delivery(a,"sending"),delivery(b,"sending")),p,mapOf(
             a.deviceId to LinkState("Connected",sent=20,total=100,transferMediaId="artifact"),
             b.deviceId to LinkState("Connected",sent=40,total=100,transferMediaId="artifact"))).single()
         assertEquals(60L,both.sent);assertEquals(200L,both.total)
+        assertTrue(UiPresentation.recentOutcome(context,both).startsWith("Sending to 2 devices · "))
+        assertEquals(listOf(a.deviceId,b.deviceId),both.recipients.map {it.item!!.peerId})
         assertEquals("Sending to MacBook",UiPresentation.sendingTo(context,listOf(b)))
         assertEquals("Sending to 2 computers",UiPresentation.sendingTo(context,listOf(a,b)))
     }
-    @Test fun queryLimitsArtifactsWhileRetainingEveryRecipientAndActivePartialFailures()=runBlocking {
-        val room=Room.inMemoryDatabaseBuilder(RuntimeEnvironment.getApplication(),QueueDatabase::class.java).allowMainThreadQueries().build()
+    @Test fun receivedAndSentMergeByTimeAndKeepCapturedSender()=runBlocking<Unit>(Dispatchers.IO) {
+        val context=RuntimeEnvironment.getApplication()
+        val received=ReceivedFile().apply {peerId=b.deviceId;transferId="receipt";senderName="Original MacBook";receivedAt=200;fileName="report.pdf";uri="content://received/1";mime="application/pdf";kind="file";state="complete"}
+        val rows=listOf(delivery(a,"sent","older").apply {createdAt=100},delivery(b,"sent","newer").apply {createdAt=300},delivery(a,"waiting","pending").apply {createdAt=50})
+        val merged=RecentProjection.merged(rows,listOf(received),p,emptyMap())
+        assertEquals(listOf("pending","newer","received:${b.deviceId}:receipt","older"),merged.map {it.row.mediaId})
+        val item=merged[2]
+        assertSame(received,item.received);assertTrue(item.recipients.isEmpty())
+        assertEquals("From Original MacBook · 9:41",UiPresentation.recentReceived(context,item,"9:41",2))
+        assertEquals("9:41",UiPresentation.recentReceived(context,item,"9:41",1))
+        val intent=ReceivedFileNotifications.openIntent(context,received)
+        assertEquals(ReceivedFileActionActivity::class.java.name,intent.component!!.className)
+        assertEquals(received.uri,ReceivedFileActions.expected(intent)!!.uri)
+        assertEquals(0,intent.flags and android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    @Test fun mergedKeepsActiveSendOrderRegardlessOfTimestampsAndRecipientProgress()=runBlocking<Unit>(Dispatchers.IO) {
+        val rows=listOf(delivery(a,"waiting","later",20).apply {createdAt=500},
+            delivery(a,"sending","first",10).apply {createdAt=900},
+            delivery(b,"failed","first",10).apply {createdAt=900},
+            delivery(b,"sent","old",99).apply {createdAt=100},
+            delivery(a,"sent","new",1).apply {createdAt=300})
+        val received=ReceivedFile().apply {peerId=b.deviceId;transferId="receipt";receivedAt=200;state="complete"}
+        for(links in listOf(emptyMap(),mapOf(a.deviceId to LinkState("Connected",sent=40,total=100,transferMediaId="first")))) {
+            assertEquals(listOf("first","later","new","received:${b.deviceId}:receipt","old"),
+                RecentProjection.merged(rows,listOf(received),p,links).map {it.row.mediaId})
+        }
+    }
+    @Test fun queryLimitsArtifactsWhileRetainingEveryRecipientAndActivePartialFailures()=runBlocking<Unit>(Dispatchers.IO) {
+        val room=Room.inMemoryDatabaseBuilder(RuntimeEnvironment.getApplication(),QueueDatabase::class.java).build()
         try {
             val queue=room.queue()
             repeat(60) {n->for(peer in listOf(a,b))queue.insert(delivery(peer,"sent","old$n",n.toLong()))}
@@ -59,4 +93,18 @@ class RecentProjectionTest {
             assertEquals("active",items.first().row.mediaId);assertEquals(2,items.first().recipients.size)
         }finally {room.close()}
     }
+    @Test fun terminalSiblingsAreNotPendingEvenWhenTheirArtifactStillHasActiveRecipients()=runBlocking<Unit>(Dispatchers.IO) {
+        for(state in listOf("sent","discarded","superseded","skipped")) {
+            val item=RecentProjection.items(listOf(delivery(a,state)),p,emptyMap()).single()
+            assertFalse(state,item.pending);assertFalse(state,item.actionable)
+            assertFalse(state,item.recipients.single().pending);assertFalse(state,item.recipients.single().retryable)
+        }
+        for(state in listOf("waiting","sending")) {
+            val item=RecentProjection.items(listOf(delivery(a,"discarded"),delivery(b,state)),p,emptyMap()).single()
+            assertTrue(state,item.pending);assertEquals(listOf(b.deviceId),item.waiting.map {it.peerId})
+        }
+        val failed=RecentProjection.items(listOf(delivery(a,"failed"),delivery(b,"discarded")),p,emptyMap()).single()
+        assertFalse(failed.pending);assertTrue(failed.actionable);assertTrue(failed.recipients.first().retryable)
+    }
+
 }

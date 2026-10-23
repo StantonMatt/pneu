@@ -4,6 +4,12 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
 object QueueMigrations {
+    val receivedFiles=object : Migration(10,11) {
+        override fun migrate(db:SupportSQLiteDatabase) {
+            db.execSQL("CREATE TABLE received_files (peerId TEXT NOT NULL,transferId TEXT NOT NULL,metadata TEXT NOT NULL,uri TEXT NOT NULL,catalogVersion TEXT NOT NULL,fileName TEXT NOT NULL,mime TEXT NOT NULL,kind TEXT NOT NULL,senderName TEXT NOT NULL,state TEXT NOT NULL,generation INTEGER NOT NULL,size INTEGER NOT NULL,receivedAt INTEGER NOT NULL,PRIMARY KEY(peerId,transferId))")
+        }
+    }
+
     val pendingAdmissions=object : Migration(9,10) {
         override fun migrate(db:SupportSQLiteDatabase) {
             db.execSQL("CREATE TABLE IF NOT EXISTS pending_media_admissions (mediaId TEXT NOT NULL, snapshot TEXT NOT NULL, PRIMARY KEY(mediaId))")

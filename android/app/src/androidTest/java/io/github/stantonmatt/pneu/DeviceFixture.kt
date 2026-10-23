@@ -33,6 +33,15 @@ import java.util.concurrent.atomic.AtomicBoolean
  * than erase the state whose creation is the subject of the test. Permissions are
  * managed by each fixture/host (the permanent-denial class must retain its denials). */
 internal object DeviceFixture {
+    /** Home → a device's page. The row is the lowest match: the Link card's detail can repeat the name. */
+    fun openDevice(instrumentation:android.app.Instrumentation,name:String) {
+        val device=UiDevice.getInstance(instrumentation)
+        assertTrue("Device row $name",device.wait(Until.hasObject(By.textStartsWith(name)),5000))
+        device.findObjects(By.textStartsWith(name)).maxBy {it.visibleBounds.top}.click()
+        assertTrue("Device page $name",device.wait(Until.hasObject(By.desc("Back")),5000))
+        // Home cross-fades out; wait until its list is gone before looking for scrollables.
+        assertTrue("Home left",device.wait(Until.gone(By.text("Add device")),5000))
+    }
     /** Stale-action fixtures intentionally simulate a lost prior certificate.
      * Production never asks for replacement approval during a handshake. */
     suspend fun installApprovedBinding(app:AppGraph,invitation:io.github.stantonmatt.pneu.protocol.Invitation,id:String):Boolean {
@@ -56,7 +65,14 @@ internal object DeviceFixture {
      * clipboard entry now selects online recipients only. */
     suspend fun text(app:AppGraph,text:String,origin:String,binding:DeliveryBinding?=null):Outgoing {
         val recipient=binding ?: DeliveryBinding.from(app.preferences.read())
-        return io.github.stantonmatt.pneu.features.ManualEntries.text(app,text,origin,recipient,listOfNotNull(recipient))
+        val (stamp,timestamp)=app.newTextOrder()
+        val row=Outgoing().apply {
+            mediaId="manual:${io.github.stantonmatt.pneu.protocol.randomId()}";transferId=io.github.stantonmatt.pneu.protocol.randomId()
+            kind="text";automatic=false;this.text=text;this.origin=origin;createdAt=timestamp;mime="text/plain"
+            recipients=listOfNotNull(recipient);hlc=stamp.hlc.toString();sourceDevice=stamp.source
+        }
+        if(!app.enqueueFixture(row))throw io.github.stantonmatt.pneu.features.ShareFailure("binding_mismatch")
+        app.connection.kick();return row
     }
 
     /** Direct queue restoration must name its recipient, just like admission.

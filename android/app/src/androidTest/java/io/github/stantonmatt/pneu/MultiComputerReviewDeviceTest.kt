@@ -61,6 +61,134 @@ class MultiComputerReviewDeviceTest {
         sources.forEach {c.contentResolver.delete(it,null,null)}
         DeviceFixture.reset()
     }
+    private suspend fun unavailableShare(request:ShareRequest,picker:Boolean=true) {
+        val operation=ManualEntryViewModel(c.applicationContext as Application).apply {targetPickerAvailable=picker}
+        val opened=AtomicBoolean()
+        val observer=app.scope.launch(start=CoroutineStart.UNDISPATCHED) {operation.targetSelection.collect {if(it!=null)opened.set(true)}}
+        try {
+            i.runOnMainSync {operation.share(request)}
+            val result=withTimeout(5000) {operation.result.filterNotNull().first()}
+            assertEquals(c.getString(R.string.toast_not_sent),result.message)
+            assertFalse("No empty picker may be published",opened.get())
+            assertNull(operation.targetSelection.value);assertTrue(operation.completed.isEmpty())
+            assertTrue(app.queue.all().isEmpty())
+        }finally {observer.cancelAndJoin()}
+    }
+    private suspend fun unavailableCapturedShare(files:Boolean=false,picker:Boolean=true) {
+        val captured=app.captureAdmission().await()
+        unavailableShare(ShareRequest(CompletableDeferred(captured.binding),
+            if(files)listOf(reviewProvider.buildUpon().appendPath("slow-type").build()) else emptyList(),
+            if(files)emptyList() else listOf("No recipient"),CompletableDeferred(captured)),picker)
+    }
+    @Test(timeout=30000) fun offlineTextSharesFailImmediatelyWithAndWithoutPicker()=runBlocking<Unit> {
+        bind(b,"B",'b');app.preferences.toggle("chooseDevicesEachTime",true)
+        for(picker in listOf(true,false))unavailableCapturedShare(picker=picker)
+    }
+    @Test(timeout=30000) fun connectedTextIneligibleComputersNeverOpenAnEmptyPicker()=runBlocking<Unit> {
+        LocalPeerFixture(app,setOf("files","clipboard_image")).also {local+=it}.connect(a)
+        app.preferences.toggle("chooseDevicesEachTime",true)
+        assertTrue(app.connection.connected(a))
+        for(picker in listOf(true,false))unavailableCapturedShare(picker=picker)
+    }
+    @Test(timeout=30000) fun clipboardDisabledComputersNeverOpenAnEmptyTextPicker()=runBlocking<Unit> {
+        online(a);app.setPairSwitch(a,"sendClipboard",false);app.preferences.toggle("chooseDevicesEachTime",true)
+        assertTrue(app.connection.connected(a))
+        for(picker in listOf(true,false))unavailableCapturedShare(picker=picker)
+    }
+    @Test(timeout=30000) fun emptyFileOffersCannotUseDefaultBindingOrReachProvider()=runBlocking<Unit> {
+        app.preferences.toggle("chooseDevicesEachTime",true);control("reset")
+        val binding=requireNotNull(DeliveryBinding.from(app.preferences.read()))
+        val empty=FrozenAdmission(binding,emptyList(),emptyList(),emptyList())
+        for(picker in listOf(true,false))unavailableShare(ShareRequest(CompletableDeferred(binding),
+            listOf(reviewProvider.buildUpon().appendPath("slow-type").build()),emptyList(),CompletableDeferred(empty)),picker)
+        assertEquals(0,control("status").getInt("types"));assertEquals(0,control("status").getInt("opens"))
+        // Binding-only entries also obey computed eligibility when queueing is off.
+        app.preferences.toggle("queue",false)
+        unavailableShare(ShareRequest(CompletableDeferred(binding),listOf(reviewProvider.buildUpon().appendPath("slow-type").build()),emptyList()),picker=false)
+    }
+    @Test(timeout=30000) fun unsupportedFileComputerIsRejectedByShareAndDevicePage()=runBlocking<Unit> {
+        LocalPeerFixture(app,setOf("clipboard_text")).also {local+=it}.connect(a)
+        app.preferences.toggle("chooseDevicesEachTime",true);control("reset")
+        for(picker in listOf(true,false))unavailableCapturedShare(files=true,picker=picker)
+        val authority=CapturedAuthority(requireNotNull(DeliveryBinding.from(app.preferences.read(),a)))
+        ActivityScenario.launch<MainActivity>(home()).use {scenario->
+            lateinit var operation:ManualEntryViewModel
+            val expected=c.getString(R.string.toast_not_sent)
+            val event=i.uiAutomation.executeAndWaitForEvent({scenario.onActivity {activity->
+                operation=sendFilesTo(activity,authority,listOf(reviewProvider.buildUpon().appendPath("slow-type").build()))
+            }},{it.text.any {text->text.toString().contains(expected)}},10000)
+            event.recycle()
+            assertEquals(expected,withTimeout(5000) {operation.result.filterNotNull().first()}.message)
+            assertTrue(operation.completed.isEmpty());assertTrue(app.queue.all().isEmpty())
+        }
+        assertEquals(0,control("status").getInt("types"));assertEquals(0,control("status").getInt("opens"))
+    }
+    @Test(timeout=30000) fun emptyClipboardTargetsRejectBeforeProviderEvenWithConnectedDefaultBinding()=runBlocking<Unit> {
+        online(a);control("reset")
+        val binding=requireNotNull(DeliveryBinding.from(app.preferences.read()))
+        for(clip in listOf(ClipData.newPlainText("text","No recipient"),ClipData.newRawUri("image",reviewProvider.buildUpon().appendPath("slow-type").build()))) {
+            val operation=ManualEntryViewModel(c.applicationContext as Application)
+            operation.captureClipboardAdmission(CompletableDeferred(FrozenAdmission(binding,emptyList(),emptyList(),emptyList())))
+            i.runOnMainSync {operation.clipboard(clip)}
+            assertEquals(c.getString(R.string.toast_not_sent),withTimeout(5000) {operation.result.filterNotNull().first()}.message)
+            assertTrue(operation.completed.isEmpty());assertTrue(app.queue.all().isEmpty())
+        }
+        assertEquals(0,control("status").getInt("types"));assertEquals(0,control("status").getInt("opens"))
+    }
+    @Test(timeout=30000) fun clipboardPolicyCanRemoveEveryFrozenRecipientWithoutReadingProvider()=runBlocking<Unit> {
+        online(a);control("reset")
+        val captured=app.captureAdmission().await()
+        assertTrue(captured.text.isNotEmpty());assertTrue(captured.images.isNotEmpty())
+        // A received clip cannot be explicitly echoed to its sole source. This
+        // removes all otherwise connected, valid targets for both representations.
+        for(image in listOf(false,true)) {
+            val clip=if(image)ClipData.newRawUri("image",reviewProvider.buildUpon().appendPath("slow-type").build())
+                else ClipData.newPlainText("text","Received clip")
+            clip.description.extras=PersistableBundle().apply {
+                putBoolean(ClipboardDelivery.OWN_CLIP,true);putString(ClipboardDelivery.OWN_SOURCE,a)
+            }
+            val operation=ManualEntryViewModel(c.applicationContext as Application)
+            operation.captureClipboardAdmission(CompletableDeferred(captured))
+            i.runOnMainSync {operation.clipboard(clip)}
+            assertEquals(c.getString(R.string.toast_not_sent),withTimeout(5000) {operation.result.filterNotNull().first()}.message)
+            assertTrue(operation.completed.isEmpty())
+        }
+        app.setPairSwitch(a,"sendClipboard",false)
+        val disabled=ManualEntryViewModel(c.applicationContext as Application)
+        disabled.captureClipboardAdmission(CompletableDeferred(captured))
+        i.runOnMainSync {disabled.clipboard(ClipData.newRawUri("image",reviewProvider.buildUpon().appendPath("slow-type").build()))}
+        assertEquals(c.getString(R.string.toast_not_sent),withTimeout(5000) {disabled.result.filterNotNull().first()}.message)
+        assertTrue(disabled.completed.isEmpty());assertTrue(app.queue.all().isEmpty())
+        assertEquals(0,control("status").getInt("types"));assertEquals(0,control("status").getInt("opens"))
+    }
+    @Test(timeout=30000) fun directAdmissionsNeverReplaceComputedEmptyTargetsWithDefaultBinding()=runBlocking<Unit> {
+        online(a);control("reset")
+        val binding=requireNotNull(DeliveryBinding.from(app.preferences.read()))
+        for(kind in listOf("text","file","clipboard_image")) {
+            val failure=try {
+                if(kind=="text")ManualEntries.text(app,"No recipient","share",binding,emptyList())
+                else ManualEntries.file(app,reviewProvider.buildUpon().appendPath("slow-type").build(),kind,binding,targets=emptyList())
+                null
+            }catch(e:ShareFailure) {e}
+            assertEquals(kind,"no_recipient",failure?.reason)
+        }
+        assertTrue(app.queue.all().isEmpty())
+        assertEquals(0,control("status").getInt("types"));assertEquals(0,control("status").getInt("opens"))
+    }
+    @Test(timeout=30000) fun defaultBindingCannotAdmitWhenComputedTextOrFileRecipientsAreEmpty()=runBlocking<Unit> {
+        app.preferences.toggle("queue",false);control("reset")
+        val binding=requireNotNull(DeliveryBinding.from(app.preferences.read()))
+        for(kind in listOf("text","file","clipboard_image")) {
+            val failure=try {
+                if(kind=="text")ManualEntries.text(app,"No recipient","share",binding)
+                else ManualEntries.file(app,reviewProvider.buildUpon().appendPath("slow-type").build(),kind)
+                null
+            }catch(e:ShareFailure) {e}
+            assertEquals(kind,"no_recipient",failure?.reason)
+        }
+        assertTrue(app.queue.all().isEmpty())
+        assertEquals(0,control("status").getInt("types"));assertEquals(0,control("status").getInt("opens"))
+    }
     @Test(timeout=45000) fun clipboardImageKeepsItsOrderAcrossMimeProviderStalls()=runBlocking<Unit> {
         online(a);control("reset")
         val admission=app.captureAdmission()
@@ -83,7 +211,7 @@ class MultiComputerReviewDeviceTest {
         online(a)
         for(image in listOf(false,true)) {
             val entered=CompletableDeferred<Unit>();val release=CompletableDeferred<Unit>();val once=AtomicBoolean()
-            app.preferences.beforeReadStart={if(Looper.myLooper()==Looper.getMainLooper() && once.compareAndSet(false,true)) {entered.complete(Unit);release.await()}}
+            app.preferences.beforeReadStart={if(currentCoroutineContext()[CoroutineName]?.name=="manual-entry" && once.compareAndSet(false,true)) {assertNotEquals(Looper.getMainLooper(),Looper.myLooper());entered.complete(Unit);release.await()}}
             val admission=app.captureAdmission()
             val clip=if(image)ClipData.newRawUri("image",reviewProvider.buildUpon().appendPath("image").build()) else ClipData.newPlainText("text","Older text")
             val operation=withContext(Dispatchers.Main) {ManualEntryViewModel(c.applicationContext as Application).also {
@@ -107,7 +235,7 @@ class MultiComputerReviewDeviceTest {
         online(a)
         val p=app.preferences.read();val targets=app.recipients(p,"text");val binding=DeliveryBinding.from(p)
         val entered=CompletableDeferred<Unit>();val release=CompletableDeferred<Unit>();val once=AtomicBoolean()
-        app.preferences.beforeReadStart={if(Looper.myLooper()==Looper.getMainLooper() && once.compareAndSet(false,true)) {entered.complete(Unit);release.await()}}
+        app.preferences.beforeReadStart={if(currentCoroutineContext()[CoroutineName]?.name=="manual-entry" && once.compareAndSet(false,true)) {assertNotEquals(Looper.getMainLooper(),Looper.myLooper());entered.complete(Unit);release.await()}}
         val operation=withContext(Dispatchers.Main) {ManualEntryViewModel(c.applicationContext as Application).also {
             it.share(ShareRequest(CompletableDeferred(binding),emptyList(),listOf("Older one","Older two"),CompletableDeferred(FrozenAdmission(binding,targets,targets,targets))))
         }}
@@ -118,12 +246,12 @@ class MultiComputerReviewDeviceTest {
             for(id in operation.completed)assertTrue(app.queue.find(id!!)!!.hlc.toBigInteger()<newer.hlc)
         }finally {release.complete(Unit);app.preferences.beforeReadStart={}}
     }
-    @Test(timeout=45000) fun unwiredPickerOptInIsRefusedAndSavedOptInSharesToEligibleComputers()=runBlocking<Unit> {
+    @Test(timeout=45000) fun pickerOptInIsSavedAndOwnersWithoutAPickerShareToEligibleComputers()=runBlocking<Unit> {
         bind(b,"B",'b');online(a)
         val devices=withContext(Dispatchers.Main) {DevicesViewModel(c.applicationContext as Application)}
-        try {devices.setChooseDevicesEachTime(true);fail("Unwired picker enabled")}catch(_:IllegalStateException) {}
         assertFalse(devices.chooseDevicesEachTime.first())
-        app.preferences.toggle("chooseDevicesEachTime",true);app.preferences.toggle("queue",false)
+        devices.setChooseDevicesEachTime(true);withTimeout(5000) {devices.chooseDevicesEachTime.first {it}}
+        app.preferences.toggle("queue",false)
         withTimeout(5000) {app.prefs.first {it.chooseDevicesEachTime && !it.queue}}
         val admission=app.captureAdmission();val frozen=admission.await();assertEquals(listOf(a),frozen.files.map {it.pcId})
         val operation=withContext(Dispatchers.Main) {ManualEntryViewModel(c.applicationContext as Application).also {
@@ -191,13 +319,96 @@ class MultiComputerReviewDeviceTest {
                     .putExtra("uri",source.toString()).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                 val activity=withTimeout(5000) {created.await()};val operation=activity.operation!!
                 withTimeout(5000) {operation.targetSelection.filterNotNull().first()}
+                compose.waitUntil(5000) {compose.onAllNodesWithText("Send to").fetchSemanticsNodes().isNotEmpty()}
                 assertTrue(granted())
                 if(finishActivity)withContext(Dispatchers.Main) {activity.finish()}
                 withTimeout(5000) {operation.result.filterNotNull().first()}
                 assertNull(operation.targetSelection.value);assertTrue(operation.completed.isEmpty())
+                // Once the activity finishes there may be no hierarchy left to query at all.
+                compose.waitUntil(5000) {runCatching {compose.onAllNodesWithText("Send to").fetchSemanticsNodes().isEmpty()}.getOrDefault(true)}
                 withTimeout(5000) {while(!activity.isDestroyed || granted() || c.getSystemService(NotificationManager::class.java).activeNotifications.any {it.id==4})delay(30)}
                 assertTrue(app.queue.pending().isEmpty())
             }finally {application.unregisterActivityLifecycleCallbacks(callbacks)}
+        }
+    }
+    @Test(timeout=45000) fun pickerKeepsOfflineChoiceWhenOnlyDefaultRecipientWasRevokedBeforeSettingsRead()=runBlocking<Unit> {
+        bind(b,"B",'b');online(a);app.preferences.toggle("chooseDevicesEachTime",true);app.preferences.toggle("queue",false)
+        withTimeout(5000) {app.prefs.first {it.chooseDevicesEachTime && !it.queue}}
+        val captured=app.captureAdmission().await()
+        assertEquals(listOf(a),captured.files.map {it.pcId});assertEquals(setOf(a,b),captured.fileChoices.map {it.pcId}.toSet())
+        assertTrue(app.forgetBinding(confirmed=ConfirmedBinding.from(app.preferences.read(),a)))
+        val operation=ManualEntryViewModel(c.applicationContext as Application).apply {targetPickerAvailable=true}
+        i.runOnMainSync {operation.share(ShareRequest(CompletableDeferred(captured.binding),listOf(Uri.parse("content://io.github.stantonmatt.pneu.test.review/image")),emptyList(),CompletableDeferred(captured)))}
+        val offered=withTimeout(5000) {operation.targetSelection.filterNotNull().first()}
+        assertEquals(listOf(b),offered.map {it.deviceId})
+        i.runOnMainSync {operation.selectTargets(setOf(b))}
+        withTimeout(10000) {operation.result.filterNotNull().first()}
+        val rows=app.queue.deliveries(operation.completed.filterNotNull().single())
+        assertEquals(listOf(b),rows.map {it.peerId});assertEquals("waiting",rows.single().state)
+    }
+    @Test(timeout=45000) fun pickerSheetSendsOnlyToTheChosenComputerAndWaitsForIt()=runBlocking<Unit> {
+        bind(b,"B",'b');online(a);app.preferences.toggle("chooseDevicesEachTime",true);app.preferences.toggle("queue",false)
+        val created=CompletableDeferred<ShareActivity>()
+        val callbacks=object:Application.ActivityLifecycleCallbacks {
+            override fun onActivityCreated(activity:Activity,state:Bundle?) {}
+            override fun onActivityPostCreated(activity:Activity,state:Bundle?) {if(activity is ShareActivity)created.complete(activity)}
+            override fun onActivityStarted(a:Activity) {}
+            override fun onActivityResumed(a:Activity) {}
+            override fun onActivityPaused(a:Activity) {}
+            override fun onActivityStopped(a:Activity) {}
+            override fun onActivitySaveInstanceState(a:Activity,s:Bundle) {}
+            override fun onActivityDestroyed(a:Activity) {}
+        }
+        val application=c.applicationContext as Application
+        val source=ChooserShareFixture.source("chosen-${randomId()}")
+        application.registerActivityLifecycleCallbacks(callbacks)
+        try {
+            c.startActivity(Intent().setComponent(ComponentName(c.packageName+".test",FixtureCallerActivity::class.java.name))
+                .putExtra("uri",source.toString()).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            val operation=withTimeout(5000) {created.await()}.operation!!
+            compose.waitUntil(5000) {compose.onAllNodesWithText("Send to").fetchSemanticsNodes().isNotEmpty()}
+            // A is connected and starts chosen; B is offline and can be chosen to wait.
+            compose.onNodeWithText("A").performClick();compose.onNodeWithText("Send").assertIsNotEnabled()
+            compose.onNodeWithText("B").performClick();compose.onNodeWithText("Sends when connected").assertIsDisplayed()
+            compose.onNodeWithText("Send").performClick()
+            withTimeout(10000) {operation.result.filterNotNull().first()}
+            assertEquals(listOf(b),app.queue.deliveries(operation.completed.single()!!).map {it.peerId})
+        }finally {application.unregisterActivityLifecycleCallbacks(callbacks)}
+    }
+    @Test(timeout=45000) fun devicePageSwitchAppliesAtOnceAndWaitsForItsComputer()=runBlocking<Unit> {
+        bind(b,"Laptop",'b');online(a)
+        ActivityScenario.launch<MainActivity>(home()).use {
+            compose.waitUntil(10000) {compose.onAllNodesWithText("Laptop").fetchSemanticsNodes().isNotEmpty()}
+            compose.onNodeWithText("Laptop").performClick()
+            compose.waitUntil(5000) {compose.onAllNodesWithText("Receive clipboard").fetchSemanticsNodes().isNotEmpty()}
+            compose.onNodeWithText("Receive clipboard").performClick()
+            withTimeout(5000) {app.prefs.first {it.devices.first {peer->peer.deviceId==b}.clipboardReceive==false}}
+            assertTrue(app.preferences.read().devices.first {peer->peer.deviceId==a}.clipboardReceive)
+            // Offline: the change applies here at once and waits for Laptop to sync.
+            compose.waitUntil(5000) {compose.onAllNodesWithText("Applies when Laptop connects").fetchSemanticsNodes().isNotEmpty()}
+            compose.onNodeWithContentDescription("Back").performClick()
+            compose.waitUntil(5000) {compose.onAllNodesWithText("Devices").fetchSemanticsNodes().isNotEmpty()}
+            // A connected computer shows no pending line for its own change.
+            compose.onNodeWithText("A").performClick()
+            compose.waitUntil(5000) {compose.onAllNodesWithText("Send clipboard").fetchSemanticsNodes().isNotEmpty()}
+            compose.onNodeWithText("Send clipboard").performClick()
+            withTimeout(5000) {app.prefs.first {it.devices.first {peer->peer.deviceId==a}.clipboardSend==false}}
+            compose.onAllNodesWithText("Applies when A connects").assertCountEquals(0)
+        }
+    }
+    @Test(timeout=45000) fun renameNeedsANameAndSavesWhatOthersSee()=runBlocking<Unit> {
+        ActivityScenario.launch<MainActivity>(home()).use {
+            compose.waitUntil(10000) {compose.onAllNodesWithContentDescription("Settings").fetchSemanticsNodes().isNotEmpty()}
+            compose.onNodeWithContentDescription("Settings").performClick()
+            compose.onNodeWithText("Name").performScrollTo().performClick()
+            compose.onNodeWithText("Rename this phone").assertIsDisplayed()
+            compose.onNode(hasSetTextAction()).performTextClearance()
+            compose.onNodeWithText("Save").assertIsNotEnabled()
+            compose.onNode(hasSetTextAction()).performTextInput("  Field Phone ")
+            compose.onNodeWithText("Save").performClick()
+            withTimeout(5000) {app.prefs.first {it.selfName=="Field Phone"}}
+            compose.waitUntil(5000) {compose.onAllNodesWithText("Rename this phone").fetchSemanticsNodes().isEmpty()}
+            compose.onNodeWithText("Field Phone").assertExists()
         }
     }
     @Test(timeout=45000) fun addingAnotherComputerSaysAddAndScannerCompletesForItsBinding()=runBlocking<Unit> {
@@ -368,23 +579,23 @@ class MultiComputerReviewDeviceTest {
             assertNull(p.installedAfter(before.pairingRevision))
         }
     }
-    @Test(timeout=45000) fun settingsExposeNamedPairControlsAndAnAddDeviceEntry()=runBlocking<Unit> {
+    @Test(timeout=45000) fun devicePagesExposeNamedPairControlsAndHomeAddsDevices()=runBlocking<Unit> {
         bind(b,"B",'b');online(a)
         ActivityScenario.launch<MainActivity>(home()).use {
-            compose.waitUntil(10000) {compose.onAllNodesWithContentDescription("Settings").fetchSemanticsNodes().isNotEmpty()}
-            compose.onNodeWithContentDescription("Settings").performClick()
-            compose.onNodeWithText("Receive clipboard from B").performScrollTo().performClick()
+            compose.waitUntil(10000) {compose.onAllNodesWithText("B").fetchSemanticsNodes().isNotEmpty()}
+            compose.onNodeWithText("Connected · ",substring=true).assertIsDisplayed()
+            compose.onNodeWithText("B").performClick()
+            compose.onNodeWithText("Receive clipboard").performScrollTo().performClick()
             withTimeout(5000) {app.prefs.first {it.devices.first {peer->peer.deviceId==b}.clipboardReceive==false}}
             assertTrue(app.preferences.read().devices.first {peer->peer.deviceId==a}.clipboardReceive)
-            compose.onAllNodesWithText("Unpair")[1].performScrollTo().performClick()
+            compose.onNodeWithText("Unpair").performScrollTo().performClick()
             compose.onNodeWithText("Unpair from B?").assertIsDisplayed()
             compose.onAllNodesWithText("Unpair").onLast().performClick()
             compose.waitUntil(5000) {compose.onAllNodesWithText("Recent").fetchSemanticsNodes().isNotEmpty()}
             assertEquals(listOf(a),app.preferences.read().devices.map {peer->peer.deviceId})
             assertTrue(app.connection.connected(a))
-            compose.onNodeWithContentDescription("Settings").performClick()
             compose.onNodeWithText("Add device").performScrollTo().performClick()
-            compose.waitUntil(5000) {compose.onAllNodesWithText("Scan the QR code on your PC").fetchSemanticsNodes().isNotEmpty()}
+            compose.waitUntil(5000) {compose.onAllNodesWithText("Scan the QR code on your computer").fetchSemanticsNodes().isNotEmpty()}
         }
     }
 

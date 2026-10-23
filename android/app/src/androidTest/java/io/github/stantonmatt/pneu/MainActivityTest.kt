@@ -33,8 +33,8 @@ class MainActivityTest {
     @Test fun unpairUsesSingularAndPluralWaitingCopy() {
         val context=InstrumentationRegistry.getInstrumentation().targetContext
         val resources=context.createConfigurationContext(Configuration(context.resources.configuration).apply {setLocale(Locale.US)}).resources
-        assertEquals("1 waiting item won't be sent.",resources.getQuantityString(R.plurals.unpair_text,1,1))
-        assertEquals("2 waiting items won't be sent.",resources.getQuantityString(R.plurals.unpair_text,2,2))
+        assertEquals("1 waiting item won't be sent to it.",resources.getQuantityString(R.plurals.unpair_text,1,1))
+        assertEquals("2 waiting items won't be sent to it.",resources.getQuantityString(R.plurals.unpair_text,2,2))
     }
 
     @Test fun samsungActivitiesFallBackAfterMissingAndUnexportedComponents() {

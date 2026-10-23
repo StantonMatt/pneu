@@ -3,6 +3,43 @@ import androidx.room.*;
 import java.util.List;
 import kotlinx.coroutines.flow.Flow;
 @Dao public interface QueueDao {
+    @Insert(onConflict=OnConflictStrategy.ABORT) void insertReceivedFile(ReceivedFile row);
+    @Update void updateReceivedFile(ReceivedFile row);
+    @Query("SELECT * FROM received_files WHERE peerId=:peer AND transferId=:id") ReceivedFile receivedFile(String peer,String id);
+    @Query("SELECT * FROM received_files WHERE state!='complete'") List<ReceivedFile> unfinishedReceivedFiles();
+    @Query("SELECT * FROM received_files WHERE peerId=:peer AND state!='complete' AND transferId>:after ORDER BY transferId LIMIT :limit") List<ReceivedFile> unfinishedPeerReceivedFiles(String peer,String after,int limit);
+    @Query("SELECT COUNT(*) FROM received_files WHERE peerId=:peer") int receivedFileCount(String peer);
+    @Query("SELECT COUNT(*) FROM received_files") int receivedFileCount();
+    int RECEIVE_PEER_LIMIT=4096;
+    int RECEIVE_GLOBAL_LIMIT=16384;
+    @Query("SELECT * FROM received_files WHERE state='complete' ORDER BY receivedAt DESC,peerId,transferId LIMIT 50") Flow<List<ReceivedFile>> recentReceivedFiles();
+    @Query("DELETE FROM received_files WHERE peerId=:peer") void deletePeerReceivedFiles(String peer);
+    @Query("DELETE FROM received_files") void clearReceivedFiles();
+    @Query("DELETE FROM received_files WHERE peerId=:peer AND transferId=:id AND generation=:generation AND metadata=:metadata AND uri=:uri AND catalogVersion=:version AND state=:state AND state!='complete'")
+    int deleteReceivedFileIfCurrent(String peer,String id,long generation,String metadata,String uri,String version,String state);
+    @Transaction default boolean reserveReceivedFile(ReceivedFile row,Receipt receipt,int peerLimit,int globalLimit) {
+        // Counts include permanent receipts/history and unfinished reservations.
+        // Room's write transaction makes concurrent peers share one durable cap.
+        if(receivedFileCount(row.peerId)>=peerLimit || receivedFileCount()>=globalLimit)return false;
+        if(insertReceipt(receipt)==-1L)throw new IllegalStateException("Transfer ID already reserved");
+        insertReceivedFile(row);return true;
+    }
+    @Transaction default void completeReceivedFile(ReceivedFile row) {
+        ReceivedFile retained=receivedFile(row.peerId,row.transferId);
+        Receipt receipt=receipt(row.peerId,row.transferId);
+        if(!sameReceivedFile(retained,row) || !retained.state.equals("verified") || receipt==null || !receipt.origin.equals("file") || !receipt.state.equals("reserved"))throw new IllegalStateException("Missing file reservation");
+        receipt.state="applied";updateReceipt(receipt);row.state="complete";updateReceivedFile(row);
+    }
+    static boolean sameReceivedFile(ReceivedFile retained,ReceivedFile row) {
+        return retained!=null && retained.generation==row.generation && retained.metadata.equals(row.metadata) && retained.uri.equals(row.uri) && retained.catalogVersion.equals(row.catalogVersion);
+    }
+    @Transaction default boolean abandonReceivedFile(ReceivedFile row) {
+        Receipt receipt=receipt(row.peerId,row.transferId);
+        if(receipt==null || !receipt.origin.equals("file") || !receipt.state.equals("reserved"))return false;
+        if(deleteReceivedFileIfCurrent(row.peerId,row.transferId,row.generation,row.metadata,row.uri,row.catalogVersion,row.state)!=1)return false;
+        deleteReceipt(row.peerId,row.transferId);return true;
+    }
+
     @Insert(onConflict=OnConflictStrategy.IGNORE) long insertPendingAdmission(PendingMediaAdmission row);
     @Query("SELECT * FROM pending_media_admissions WHERE mediaId=:id") PendingMediaAdmission pendingAdmission(String id);
     @Query("SELECT * FROM pending_media_admissions ORDER BY rowid") List<PendingMediaAdmission> pendingAdmissions();
@@ -48,7 +85,7 @@ import kotlinx.coroutines.flow.Flow;
     @Query("DELETE FROM deliveries WHERE peerId=:peer") void deletePeerDeliveries(String peer);
     @Query("DELETE FROM receipts WHERE peerId=:peer") void deletePeerReceipts(String peer);
     @Query("DELETE FROM clipboard_clock WHERE peerId=:peer") void deletePeerClock(String peer);
-    @Transaction default void clearPeer(String peer) {deletePeerDeliveries(peer);deletePeerReceipts(peer);deletePeerClock(peer);deletePeerOutboundClock(peer);}
+    @Transaction default void clearPeer(String peer) {deletePeerDeliveries(peer);deletePeerReceipts(peer);deletePeerClock(peer);deletePeerOutboundClock(peer);deletePeerReceivedFiles(peer);}
     @Query("SELECT * FROM artifacts WHERE mediaId NOT IN (SELECT mediaId FROM deliveries)") List<Artifact> orphanArtifacts();
     @Query("DELETE FROM artifacts WHERE mediaId=:id") void deleteArtifact(String id);
     @Query("SELECT COUNT(*) FROM outgoing WHERE mediaId=:id AND attempted=1") int anyAttempted(String id);
@@ -128,7 +165,7 @@ import kotlinx.coroutines.flow.Flow;
     @Query("SELECT COUNT(*) FROM receipts") int receiptCount();
     @Query("DELETE FROM receipts") void clearReceiptRows();
     @Query("DELETE FROM clipboard_clock") void clearClipboardClocks();
-    @Transaction default void clearReceipts() { clearReceiptRows();clearClipboardClocks();clearPeerOutboundClocks(); }
+    @Transaction default void clearReceipts() { clearReceiptRows();clearClipboardClocks();clearPeerOutboundClocks();clearReceivedFiles(); }
     @Query("DELETE FROM artifacts") void clearOutgoing();
     @Query("DELETE FROM media_seen") void clearSeen();
     @Query("DELETE FROM outbound_clock") void clearOutboundClock();

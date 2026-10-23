@@ -15,8 +15,8 @@
 <string name="action_open">Open</string>
 <string name="action_settings">Settings</string>
 <string name="action_continue">Continue</string>
-<string name="pair_title">Pair with PC</string>
-<string name="pair_instruction">Scan the QR code on your PC</string>
+<string name="pair_title">Add device</string>
+<string name="pair_instruction">Scan the QR code on your computer</string>
 <string name="pair_allow_camera">Allow camera</string>
 <string name="pair_camera_off">Camera access is off</string>
 <string name="action_open_settings">Open settings</string>
@@ -25,7 +25,7 @@
 <string name="pair_pairing">Pairing…</string>
 <string name="pair_already_paired">Already paired with %1$s</string>
 <string name="pair_success">Paired with %1$s</string>
-<string name="pair_unreachable_title">Can\'t reach your PC</string>
+<string name="pair_unreachable_title">Can\'t reach your computer</string>
 <string name="pair_unreachable_text">Make sure both are on the same Wi-Fi, or that Tailscale is connected.</string>
 <string name="action_try_again">Try again</string>
 <string name="action_cancel">Cancel</string>
@@ -33,7 +33,7 @@
 <string name="cd_settings">Settings</string>
 <string name="status_connecting">Connecting…</string>
 <string name="status_connected">Connected</string>
-<string name="status_unreachable">Computer unreachable</string>
+<string name="status_unreachable">Unreachable</string>
 <string name="status_waiting_wifi">Waiting for Wi-Fi</string>
 <string name="status_no_network">No network</string>
 <string name="status_paused">Paused</string>
@@ -118,15 +118,15 @@
 <string name="tile_not_paired">Not paired</string>
 <string name="toast_clipboard_sent">Clipboard sent</string>
 <string name="toast_clipboard_empty">Clipboard is empty</string>
-<string name="toast_not_sent">Computer unreachable. Not sent.</string>
+<string name="toast_not_sent">No device connected. Not sent.</string>
 <string name="toast_sending">Sending to computer</string>
-<string name="toast_queued">Computer unreachable. Queued.</string>
+<string name="toast_queued">No device connected. Queued.</string>
 <string name="toast_queued_wifi">Waiting for Wi-Fi. Queued.</string>
 <string name="toast_cant_read">Couldn\'t read this item</string>
 <plurals name="banner_many"><item quantity="one">%d settings need attention</item><item quantity="other">%d settings need attention</item></plurals>
 <plurals name="recent_waiting"><item quantity="one">%d waiting</item><item quantity="other">%d waiting</item></plurals>
 <plurals name="pref_permissions_issues"><item quantity="one">%d needs attention</item><item quantity="other">%d need attention</item></plurals>
-<plurals name="unpair_text"><item quantity="one">%d waiting item won\'t be sent.</item><item quantity="other">%d waiting items won\'t be sent.</item></plurals>
+<plurals name="unpair_text"><item quantity="one">%d waiting item won\'t be sent to it.</item><item quantity="other">%d waiting items won\'t be sent to it.</item></plurals>
 <plurals name="notif_sending_many"><item quantity="one">Sending %d items</item><item quantity="other">Sending %d items</item></plurals>
 <plurals name="notif_waiting"><item quantity="one">%d waiting</item><item quantity="other">%d waiting</item></plurals>
 <plurals name="toast_sending_many"><item quantity="one">Sending %d items to computer</item><item quantity="other">Sending %d items to computer</item></plurals>
@@ -165,7 +165,7 @@
 <string name="notif_preparing_share">Preparing share</string>
 <string name="alert_local_network_text">Local network access is off</string>
 <string name="alert_killed_generic_text">Check permissions and battery settings</string>
-<string name="pair_clock_ahead">Your PC\'s clock says this code expired. Check both clocks and scan the new code.</string>
+<string name="pair_clock_ahead">Your computer\'s clock says this code expired. Check both clocks and scan the new code.</string>
 <string name="ui_error_pause">Couldn\'t pause</string>
 <string name="ui_error_resume">Couldn\'t resume</string>
 <string name="ui_error_setting">Couldn\'t save setting</string>
@@ -199,7 +199,60 @@
 <string name="computer">computer</string>
 <string name="toast_sending_to">Sending to %1$s</string>
 <plurals name="toast_sending_computers"><item quantity="one">Sending to %d computer</item><item quantity="other">Sending to %d computers</item></plurals>
-<string name="item_sent_to">Sent to %1$d of %2$d</string>
 <string name="item_failed_on">Failed on %1$s</string>
-<plurals name="item_failed_computers"><item quantity="one">Failed on %d computer</item><item quantity="other">Failed on %d computers</item></plurals>
+<plurals name="item_failed_computers"><item quantity="one">Failed on %d device</item><item quantity="other">Failed on %d devices</item></plurals>
+<string name="item_failed_on_reason">Failed on %1$s · %2$s</string>
+<string name="item_sending_devices">Sending to %1$d devices · %2$s of %3$s</string>
+<string name="item_waiting_for">Waiting for %1$s</string>
+<plurals name="item_waiting_for_devices"><item quantity="one">Waiting for %d device</item><item quantity="other">Waiting for %d devices</item></plurals>
+<string name="recent_to_device">To %1$s · %2$s</string>
+<string name="recent_to_devices">To %1$d devices · %2$s</string>
+<string name="recent_clipboard_to_device">Clipboard · To %1$s · %2$s</string>
+<string name="recent_clipboard_to_devices">Clipboard · To %1$d devices · %2$s</string>
+<string name="reason_disk">Disk is full</string>
+<string name="reason_write">Can\'t save files</string>
+<string name="reason_unsupported">Can\'t receive this</string>
+<string name="reason_image">Couldn\'t read image</string>
+<string name="reason_gone">File is gone</string>
+<string name="delivery_sent">Sent · %1$s</string>
+<string name="delivery_waiting_offline">Waiting · not connected</string>
+<string name="delivery_failed">Failed · %1$s</string>
+<string name="cd_stop_sending">Stop sending</string>
+<string name="group_devices">Devices</string>
+<string name="group_sharing">Sharing</string>
+<string name="device_connected">Connected · %1$s</string>
+<string name="device_last_seen">Not connected · last seen %1$s</string>
+<string name="device_last_seen_yesterday">Not connected · last seen yesterday</string>
+<string name="device_not_connected">Not connected</string>
+<string name="device_update_required">Update required</string>
+<string name="device_update_detail">Update Pneu on %1$s</string>
+<string name="pref_send_clipboard">Send clipboard</string>
+<string name="pref_receive_clipboard">Receive clipboard</string>
+<string name="pref_automatic_sending">Automatic sending</string>
+<string name="auto_kind_screenshots">screenshots</string>
+<string name="auto_kind_photos">camera photos</string>
+<string name="auto_kind_recordings">screen recordings</string>
+<string name="list_two">%1$s and %2$s</string>
+<string name="list_three">%1$s, %2$s and %3$s</string>
+<string name="auto_off_all">Off for all devices in Settings</string>
+<string name="switch_pending">Applies when %1$s connects</string>
+<string name="sharing_needs_update">Update Pneu on %1$s to sync these switches.</string>
+<string name="action_send_files">Send files</string>
+<string name="pref_choose_devices">Choose devices each time</string>
+<string name="pref_name">Name</string>
+<string name="rename_title">Rename this phone</string>
+<string name="action_save">Save</string>
+<string name="picker_title">Send to</string>
+<string name="action_send">Send</string>
+<string name="picker_sends_when_connected">Sends when connected</string>
+<string name="recent_from_computer">From %1$s · %2$s</string>
+<string name="status_fingerprint_mismatch">Couldn\'t verify computer</string>
+<string name="status_local_network_off">Local network access is off</string>
+<plurals name="toast_sending_items_computers"><item quantity="one">Sending %1$d items to %2$d computer</item><item quantity="other">Sending %1$d items to %2$d computers</item></plurals>
+<string name="detail_computers">%1$d computers</string>
+<string name="detail_connected_computers">%1$d of %2$d computers</string>
+<string name="tile_connected_computers">%1$d of %2$d computers connected</string>
+    <string name="delivery_stopped">Stopped</string>
+    <string name="delivery_superseded">Replaced by a newer item</string>
+    <string name="delivery_skipped">Skipped</string>
 </resources>

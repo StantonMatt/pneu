@@ -203,6 +203,8 @@ def authenticated(rows, digest):
 
 
 LOCAL_TESTS = (
+    'Sweep4RegressionDeviceTest',
+    'ReceiveStorageDeviceTest', 'DeviceScreensDeviceTest', 'Sweep3RegressionDeviceTest', 'OperationFeedbackDeviceTest',
     'AdmissionFenceDeviceTest',
     'PairingAttemptDeviceTest',
     'Sweep2RegressionDeviceTest', 'MultiComputerReviewDeviceTest', 'DeviceFixtureDeviceTest', 'MainActivityTest', 'CoreDeviceTest', 'V2ScreensDeviceTest',
@@ -226,6 +228,8 @@ def local_case(test):
         screenshots('files/fifth-review-screens', 'screens')
         if test == 'V2ScreensDeviceTest':
             screenshots('files/v2-screens', 'screens')
+        if test == 'DeviceScreensDeviceTest':
+            screenshots('files/device-screens', 'device-screens')
         if test == 'SixteenthRecentDeviceTest':
             hierarchy = subprocess.run([*adb, 'exec-out', 'run-as', package, 'cat', 'cache/sixteenth-recent.xml'],
                                        capture_output=True, timeout=15)
@@ -404,6 +408,44 @@ class SilentTls:
             reader.join(timeout=2)
 
 
+def receive_files(test, mesh=False):
+    name='receive-mesh' if mesh else 'receive-legacy'
+    ca, digest = identity(name)
+    server = cert(name + '-pc')
+    # MediaStore writes/reads of app-owned receive rows must need no broad grants.
+    for permission in ('READ_MEDIA_IMAGES', 'READ_MEDIA_VIDEO'):
+        run([*adb, 'shell', 'pm', 'revoke', package, 'android.permission.' + permission])
+    flags=['--receive-files','--receive-progress-delay','1.5'] + (['--mesh'] if mesh else [])
+    try:
+        with peer(name, server, ca, flags, witness=True) as (extras, events, _):
+            instrument(name, test, extras, 180)
+            rows=records(events)
+            authenticated(rows,digest)
+            assert count(rows,'DROPPED_FILE_ACK')==1, rows
+            acks=[r for r in rows if r['event']=='PHONE_ACK' and r['transfer_id']=='1'*32]
+            assert len(acks)==1 and acks[0]['deduplicated'], rows
+            assert any(r['event']=='PHONE_ACK' and r['transfer_id']=='2'*32 and not r['deduplicated'] for r in rows), rows
+            assert all('files' in r['capabilities'] and 'clipboard_image' in r['capabilities'] for r in rows if r['event']=='HELLO'), rows
+            assert count(rows,'FILE')==0, 'Received content must never be sent back'
+    finally:
+        restore()
+
+
+def recovery_files(test, mesh=False):
+    name='recovery-files-mesh' if mesh else 'recovery-files-legacy'
+    ca,digest=identity(name)
+    server=cert(name+'-pc')
+    flags=['--recovery-files','--drop-first-pair-result']+(['--mesh'] if mesh else [])
+    with peer(name,server,ca,flags,witness=True) as (extras,events,_):
+        instrument(name,test,extras,120)
+        rows=records(events);authenticated(rows,digest)
+        assert count(rows,'PAIR')==3,rows
+        nacks=[r for r in rows if r['event']=='PHONE_NACK']
+        assert len(nacks)==6 and all(r['code']=='storage_failed' and r['retryable'] for r in nacks),rows
+        assert {r['transfer_id'] for r in nacks}=={c*32 for c in '678'},rows
+        assert count(rows,'PHONE_PONG')==2,rows
+
+
 def feature_suite(name, test):
     ca, digest = identity(name)
     server = cert(name + '-pc')
@@ -467,6 +509,9 @@ def connection_case(name, test, flags):
 
 
 FAULT_CASES = [
+    ('hello-version', 'incompatibleComputerRequiresUpdateAndKeepsPairing', ('--hello-version','2'), None),
+    ('hello-capabilities', 'incompatibleComputerRequiresUpdateAndKeepsPairing', ('--incompatible-capabilities',), None),
+    ('version-mismatch', 'incompatibleComputerRequiresUpdateAndKeepsPairing', ('--version-mismatch',), None),
     ('completion-write-recovery', 'failedCompletionAndFallbackWritesRecoverBothLanesWithoutSpinning', (), None),
     ('ineligible-backoff', 'repeatedlyIneligibleSelectionBacksOffAndDoesNotStarveSibling', (), None),
     ('discard-writer-waiters', 'discardedWriterWaitersNeverEmitAndDoNotResetEitherLane', (), None),
@@ -764,7 +809,8 @@ def cleanup():
 
 SUITES = {
     'local': [DeviceCase(test, test, local_case) for test in LOCAL_TESTS] +
-             [DeviceCase('permission-denials', 'FourthReviewUiDeviceTest', permission_denials)],
+             [DeviceCase('permission-denials', 'FourthReviewUiDeviceTest', permission_denials),
+              DeviceCase('pairing-preview-restore', 'Sweep3PairingRestoreDeviceTest', permission_denials)],
     'cold': [DeviceCase('fresh-pairing', 'SixteenthFreshPairingDeviceTest', fresh_pairing)] +
             [DeviceCase('pairing-process-' + phase,
                         ('PairingProcessDeviceTest#prepareBeforeProcessDeath', 'PairingProcessDeviceTest#verifyAfterProcessDeath'),
@@ -784,6 +830,10 @@ SUITES = {
                                ('address-fallback', 'RoundTwoTlsDeviceTest'),
                                ('tls12', 'TlsDeviceTest#rejectedHandshake'),
                                ('invalid-proof', 'TlsDeviceTest#rejectedHandshake')]],
+    'receive': [DeviceCase('recovery-files-legacy','RecoveryFilesDeviceTest',recovery_files,identity=True),
+                DeviceCase('recovery-files-mesh','RecoveryFilesDeviceTest',lambda test: recovery_files(test,mesh=True),identity=True),
+                DeviceCase('receive-legacy', 'ReceiveFilesDeviceTest', receive_files, identity=True),
+                DeviceCase('receive-mesh', 'ReceiveFilesDeviceTest', lambda test: receive_files(test, mesh=True), identity=True)],
     'features': [DeviceCase('features', 'FeaturesDeviceTest', lambda test: feature_suite('features', test), identity=True)],
     'policy': [DeviceCase('policy', 'PolicyDeviceTest', lambda test: feature_suite('policy', test), identity=True)],
     'upload': [DeviceCase('long-upload', 'ConnectionFaultDeviceTest#progressingUploadBeyondThreeMinutesReachesVerifiedPeerAck', upload, identity=True)],

@@ -94,13 +94,15 @@ class TlsIdentity(private val alias: String, create:Boolean=false) {
     }
 }
 
+internal class FingerprintMismatch:CertificateException("Peer certificate changed")
+
 class PinnedTrustManager(private val pin: String, private val verified: () -> Unit = {}) : X509TrustManager {
     override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
     override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) = throw CertificateException("Client verification not used")
     override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {
         if (chain?.size != 1) throw CertificateException("Expected one self-signed leaf")
         val cert = chain.single()
-        if (!MessageDigest.isEqual(sha256(cert.encoded).toByteArray(), pin.toByteArray())) throw CertificateException("PC certificate changed")
+        if (!MessageDigest.isEqual(sha256(cert.encoded).toByteArray(), pin.toByteArray())) throw FingerprintMismatch()
         cert.checkValidity()
         val publicKey = cert.publicKey as? ECPublicKey ?: throw CertificateException("Expected P-256")
         val expected = AlgorithmParameters.getInstance("EC").apply { init(ECGenParameterSpec("secp256r1")) }.getParameterSpec(ECParameterSpec::class.java)

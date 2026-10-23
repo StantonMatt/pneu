@@ -103,13 +103,13 @@ class CoreDeviceTest {
         withContext(Dispatchers.Main) {assertTrue(context.graph.discardAll(selected))}
         assertEquals("discarded",context.graph.queue.find(id)!!.state)
         // UI callers run on Main: unpair must dispatch blocking Room/file cleanup to IO.
-        launch();clickSettings()
+        launch();DeviceFixture.openDevice(instrumentation,context.graph.prefs.value.peer!!.name)
         val device=androidx.test.uiautomator.UiDevice.getInstance(instrumentation)
         assertTrue(device.findObject(androidx.test.uiautomator.UiSelector().text("Unpair")).waitForExists(4000))
         click("Unpair");click("Unpair")
         withTimeout(3000) { while(context.graph.prefs.value.peer != null) delay(50) }
         delay(1200)
-        assertTrue(device.findObject(androidx.test.uiautomator.UiSelector().text("Scan the QR code on your PC")).exists())
+        assertTrue(device.findObject(androidx.test.uiautomator.UiSelector().text("Scan the QR code on your computer")).exists())
         assertTrue(context.graph.queue.pending().isEmpty())
         assertNull(context.graph.queue.find(id))
         assertFalse(File(row.path).exists())

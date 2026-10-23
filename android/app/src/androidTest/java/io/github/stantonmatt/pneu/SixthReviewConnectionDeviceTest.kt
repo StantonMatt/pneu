@@ -66,8 +66,17 @@ class SixthReviewConnectionDeviceTest {
             withTimeout(5000) {while(c.checkUriPermission(source,android.os.Process.myPid(),c.applicationInfo.uid,Intent.FLAG_GRANT_READ_URI_PERMISSION)==PackageManager.PERMISSION_GRANTED)delay(20)}
             assertThrows(SecurityException::class.java) {c.contentResolver.openInputStream(source)?.close()}
             app.preferences.toggle("mobile",true)
-            withTimeout(10000) {while(app.queue.find(row.mediaId)?.state!="sent")delay(20)}
-            val sent=app.queue.find(row.mediaId)!!;assertEquals("",sent.uri);assertFalse(File(row.path).exists())
+            // Delivery ACK is persisted before terminal thumbnail/source maintenance.
+            // Observe the completed maintenance, not the intermediate sent delivery.
+            val sent=withTimeout(10000) {
+                while(true) {
+                    val current=app.queue.find(row.mediaId)
+                    if(current?.state=="sent" && current.path!=row.path && !File(row.path).exists())return@withTimeout current
+                    delay(20)
+                }
+                error("unreachable")
+            }
+            assertEquals("",sent.uri);assertFalse(File(row.path).exists())
             assertEquals(File(c.cacheDir,"thumbnails"),File(sent.path).parentFile);assertTrue(File(sent.path).length() in 1..65536)
             val events=PeerFixture.evidence();assertEquals(1,events.count {it.asJsonObject["event"].asString=="PAIR"})
             assertTrue(events.none {it.asJsonObject["event"].asString=="TEXT"})
