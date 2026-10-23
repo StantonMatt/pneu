@@ -32,9 +32,9 @@ internal val LocalButtonKind=staticCompositionLocalOf {ButtonKind.Text}
         }
     }
 }
-@Composable fun PneuTextButton(onClick:()->Unit,modifier:Modifier=Modifier,content:@Composable RowScope.()->Unit) {
+@Composable fun PneuTextButton(onClick:()->Unit,modifier:Modifier=Modifier,enabled:Boolean=true,content:@Composable RowScope.()->Unit) {
     val kind=LocalButtonKind.current
-    PneuButton(onClick,if(kind==ButtonKind.Text)modifier else modifier.fillMaxWidth(),kind=kind,content=content)
+    PneuButton(onClick,if(kind==ButtonKind.Text)modifier else modifier.fillMaxWidth(),enabled=enabled,kind=kind,content=content)
 }
 @Composable fun PneuTonalButton(onClick:()->Unit,modifier:Modifier=Modifier,enabled:Boolean=true,contentPadding:PaddingValues=PaddingValues(horizontal=12.dp),content:@Composable RowScope.()->Unit)=PneuButton(onClick,modifier,enabled,ButtonKind.Tonal,contentPadding,content)
 @Composable fun PneuNeutralButton(onClick:()->Unit,modifier:Modifier=Modifier,content:@Composable RowScope.()->Unit)=PneuButton(onClick,modifier,kind=ButtonKind.Neutral,content=content)

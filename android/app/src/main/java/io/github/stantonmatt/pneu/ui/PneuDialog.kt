@@ -31,7 +31,7 @@ import io.github.stantonmatt.pneu.Symbol
         LaunchedEffect(Unit) {entered=true}
         Box(Modifier.fillMaxSize().background(c.scrim.copy(alpha=c.scrim.alpha*dim)).pointerInput(onDismissRequest,dismissible){detectTapGestures(onTap={if(dismissible)onDismissRequest()})},contentAlignment=Alignment.BottomCenter) {
             AnimatedVisibility(entered,enter=if(animate)slideInVertically(tween(PneuMotion.medium,easing=PneuMotion.easeOut)){rise}+fadeIn(tween(PneuMotion.medium)) else fadeIn(tween(PneuMotion.short))) {
-                Surface(Modifier.statusBarsPadding().navigationBarsPadding().padding(12.dp).widthIn(max=600.dp).fillMaxWidth().pointerInput(Unit){detectTapGestures(onTap={})},
+                Surface(Modifier.statusBarsPadding().navigationBarsPadding().imePadding().padding(12.dp).widthIn(max=600.dp).fillMaxWidth().pointerInput(Unit){detectTapGestures(onTap={})},
                     shape=RoundedCornerShape(28.dp),color=c.raised,border=if(c.dark)BorderStroke(1.dp,c.hairline)else null,shadowElevation=PneuElevation.dialog) {
                     PneuDialogContent(title,confirmButton,dismissButton,text,destructive,pairingHeader)
                 }

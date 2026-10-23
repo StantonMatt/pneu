@@ -32,18 +32,28 @@ class FifthReviewConnectionDeviceTest {
             withTimeout(10000) {while(!app.connection.connected)delay(20)}
             val old=ManualEntries.text(app,"EOF older value","share");observed(old.transferId)
             val latest=ManualEntries.text(app,"EOF latest value","share")
+            val firstSession=app.queue.find(old.mediaId)!!.sessionId
             assertEquals("sending",app.queue.find(old.mediaId)!!.state)
             Socket().use {s->s.connect(InetSocketAddress("10.0.2.2",requireNotNull(args.getString("witnessPort")).toInt()),1000);s.soTimeout=1000;s.outputStream.write("{\"close_text\":true}\n".toByteArray());s.inputStream.bufferedReader().readLine()}
-            sent(latest.mediaId);assertEquals("superseded",app.queue.find(old.mediaId)!!.state)
+            // Clipboard work is never queued onto the replacement session,
+            // including a newer value that had not emitted its first frame.
+            withTimeout(10000) {while(app.recipients(app.preferences.read(),"text").none {it.sessionId!=firstSession})delay(20)}
+            assertEquals("superseded",app.queue.find(old.mediaId)!!.state)
+            assertEquals("superseded",app.queue.find(latest.mediaId)!!.state)
+            val resumed=ManualEntries.text(app,"Fresh value after EOF","share");sent(resumed.mediaId)
             val cancelled=ManualEntries.text(app,"Cancelled older value","share");observed(cancelled.transferId)
             val newest=ManualEntries.text(app,"Cancelled latest value","share")
             assertEquals("sending",app.queue.find(cancelled.mediaId)!!.state)
             app.connection.stop() // CancellationException, not a transport wrapper.
-            withTimeout(5000) {while(app.queue.find(cancelled.mediaId)?.state!="superseded")delay(20)}
-            app.connection.start(scope);sent(newest.mediaId)
+            app.connection.awaitStopped()
+            assertEquals("superseded",app.queue.find(cancelled.mediaId)!!.state)
+            assertEquals("superseded",app.queue.find(newest.mediaId)!!.state)
+            app.connection.start(scope)
+            withTimeout(10000) {while(!app.connection.connected)delay(20)}
+            val restarted=ManualEntries.text(app,"Fresh value after cancellation","share");sent(restarted.mediaId)
             val texts=PeerFixture.evidence().filter {it.asJsonObject["event"].asString=="TEXT"}.map {it.asJsonObject["transfer_id"].asString}
-            assertEquals(listOf(old.transferId,latest.transferId,cancelled.transferId,newest.transferId),texts)
-            assertEquals(listOf("superseded","sent","superseded","sent"),listOf(old,latest,cancelled,newest).map {app.queue.find(it.mediaId)!!.state})
+            assertEquals(listOf(old.transferId,resumed.transferId,cancelled.transferId,restarted.transferId),texts)
+            assertTrue(listOf(old,latest,cancelled,newest).all {app.queue.find(it.mediaId)!!.state=="superseded"})
         } finally {app.connection.stop();app.forgetBinding();scope.cancel()}
     }
 }

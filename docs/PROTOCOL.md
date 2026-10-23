@@ -164,8 +164,12 @@ negotiation, authenticated identities, clocks and settings.
 
 Mesh uses direct connections to each selected peer, originator-only fan-out,
 device-wide clipboard ordering and synced per-pair settings specified below.
-Received content MUST NOT be forwarded, even through a clipboard watcher. Origin
-markers plus a bounded recent-content hash set SHOULD suppress OS echoes.
+Received content MUST NOT be forwarded automatically, including through a clipboard
+watcher. An explicit user-initiated send of previously received content is a new
+operation originated by the sending device, with a new `transfer_id` and `hlc`,
+and `source_device` set to that device. It excludes the device from which the
+content was received. Origin markers plus a bounded recent-content hash set SHOULD
+suppress automatic OS echoes.
 
 A version or capability mismatch MUST NEVER unpair a peer, change its binding
 generation, or discard queued work. Unsupported versions close with
@@ -524,8 +528,8 @@ Suppress clipboard watchers for received operations; never echo them with new ID
    dialer processes it only once its own pairing state is persisted. Rejection
    sends accepted=false plus code, then closes TLS. The acceptor checks failures in order:
    closed window, expiry, token mismatch, storage.
-   Lost success response is recoverable: dialer reconnects with the same cert
-   and repeats PAIR_REQUEST from its pending record as specified below. The
+   Lost success response is recoverable: the phone reconnects with the same cert
+   and repeats PAIR_REQUEST from its in-memory attempt as specified below. The
    already-bound acceptor returns accepted=true without requiring a new token.
 6. **READY → CLOSED.** Either endpoint may send ERROR, then orderly TLS close;
    peer does not reply with ERROR. ERROR is legal in every post-TLS state. On
@@ -533,16 +537,45 @@ Suppress clipboard watchers for received operations; never echo them with new ID
    an attacker-supplied length. Close within 2 s. EOF without ERROR is normal
    network loss and triggers reconnect for pending work.
 
-Dialer cannot distinguish known/unknown admission from HELLO alone. Before its
-first PAIR_REQUEST, a phone dialer MUST durably save a pending pairing record with
-the acceptor fingerprint, ordered addresses and token (and invitation metadata).
-A computer joiner holds its attempt in memory only. Only one unresolved computer
-join is allowed, including a preview awaiting confirmation. A new join MUST fail
-with a pairing-in-progress error until the existing attempt completes, is
-definitively rejected, or is cancelled locally. Display errors, including TLS or
-fingerprint mismatch, MUST NOT replace the attempt.
+A dialer cannot distinguish known/unknown admission from HELLO alone.
 
-If PAIR_RESULT is lost, the dialer reconnects using the same token and pin and
+**Phone dialer.** A phone dialer holds one app-scoped, in-memory pairing attempt
+with a unique attempt ID, invitation, and frozen per-peer install fence. At scan it
+captures the prior binding by pin (or absence) and its lifecycle revision; at the
+first authenticated HELLO it fixes the remote device ID and the prior binding and
+revision for that ID. Retries never refresh this fence. Installation requires both
+captured targets to be unchanged; changes to unrelated peers do not invalidate the
+attempt. Starting a repair also invalidates older connection outcomes for its
+target. Explicit unpair cancels an attempt targeting that device; connection loss
+never cancels an attempt.
+
+If PAIR_RESULT is lost, the phone keeps this attempt and reconnects using its pin
+and sends PAIR_REQUEST again, even after the invitation's `exp`. Only a brand-new
+attempt is subject to the local expiry check. Activity or service recreation within
+the process preserves the attempt; process death abandons it and requires a
+re-scan. Rejection or local cancellation ends the attempt. Cancellation invalidates
+its ID before closing transport, sends no UNPAIR, and does not undo acceptance by
+the computer. Re-scanning can recover the computer's retained binding using the
+known-certificate recovery exception below. Accepted=true durably installs the
+binding before processing application data. Any outstanding delivery cleanup is
+journaled with the installation and resumes after a crash without reinstalling or
+advancing its generation again. The old binding remains until installation.
+
+A re-scan with the same pin and device ID is idempotent: retain the generation,
+queue, receipts and switches, and clear pairing loss. A different certificate for a
+known device ID may replace that binding only if the prior is lost, under the
+frozen fence, using its existing capacity slot and preserving switches. Otherwise
+the phone requires the user to unpair it first; there is no replacement prompt
+during the handshake. A known certificate claiming a different device ID fails
+closed without automatic replacement.
+
+**Computer joiner.** A computer joiner holds its attempt in memory only. Only one
+unresolved computer join is allowed, including a preview awaiting confirmation. A
+new join MUST fail with a pairing-in-progress error until the existing attempt
+completes, is definitively rejected, or is cancelled locally. Display errors,
+including TLS or fingerprint mismatch, MUST NOT replace the attempt.
+
+If PAIR_RESULT is lost, the joiner reconnects using the same token and pin and
 sends PAIR_REQUEST again, even after the invitation's `exp`. Only a brand-new
 invitation is subject to the local expiry check. A definitive rejected result ends
 the attempt; storage failures, missing rejection codes and generic admission denials
@@ -583,7 +616,7 @@ wait until the dialer's binding has been persisted.
 
 On a mesh connection CLIPBOARD MUST include both `hlc` and `source_device`.
 The latter MUST equal the authenticated sending peer's device ID: there is no
-content forwarding. `created_at` stays a Timestamp for display, never the mesh
+automatic content forwarding. `created_at` stays a Timestamp for display, never the mesh
 ordering key. The same optional fields are carried on image FILE_BEGIN messages
 to order deferred clipboard effects; these fields occur together or are both
 absent, and require a MIME beginning with `image/` and a nonempty subtype.

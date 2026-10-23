@@ -105,7 +105,7 @@ class FeaturesDeviceTest {
         assertTrue("Pair confirmation button must appear",pairButton.waitForExists(5000));pairButton.click()
         step("pairing recovery connected",90000) {while(!app.connection.connected)delay(50)}
         // Peer consumed the token then deliberately lost PAIR_RESULT. Expiry must not block recovery.
-        assertTrue(System.currentTimeMillis()>expires);assertNull(step("paired preferences loaded",5000) {app.preferences.flow.first()}.pending)
+        assertTrue(System.currentTimeMillis()>expires);assertNull(app.connection.attempt.value)
         val attempts=PeerFixture.evidence().filter {it.asJsonObject["event"].asString=="PAIR"}.map {it.asJsonObject}
         assertEquals(2,attempts.size);assertTrue(attempts[0]["at"].asLong<expires);assertTrue(attempts[1]["at"].asLong>expires)
         // Two silent TLS candidates cross the UI's 15 s timer before the reachable fallback.

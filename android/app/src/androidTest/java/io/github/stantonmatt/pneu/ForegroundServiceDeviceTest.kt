@@ -56,9 +56,12 @@ class ForegroundServiceDeviceTest {
     }
     private suspend fun delivered(count:Int) = withTimeout(5000) {while(commands.size<count)delay(20)}
     private suspend fun pending() {
+        // Each promotion iteration starts a fresh scan. Service destruction
+        // deliberately preserves an app-scoped attempt, so cancel it explicitly.
+        app.cancelPairing()
         val raw="pneu://pair?v=1&name=Startup&fp=${"a".repeat(64)}&addr=127.0.0.1%3A1&token=${"b".repeat(64)}&exp=${System.currentTimeMillis()+300000}"
         assertTrue(app.requestPairing(raw,null))
-        withTimeout(5000) {app.prefs.first {it.pending!=null}}
+        withTimeout(5000) {DeviceFixture.awaitPrefs(app) {app.connection.attempt.value?.invitation!=null}}
     }
     private fun assertBadgeFreeChannel(nm:NotificationManager) {
         val status=nm.getNotificationChannel(StatusNotificationChannel.id(c))

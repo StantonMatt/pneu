@@ -26,4 +26,12 @@ class TilePolicyTest {
             assertFalse(TilePolicy.present(p,"Connected","Wi-Fi",clipboard).recovery)
         }
     }
+    @Test fun clipboardTileUsesRecipientEligibilityIndependentlyOfTheDisplayedStatus() {
+        val a=Peer("A","a","a",emptyList());val b=a.copy(name="B",pin="b",deviceId="b")
+        val p=Prefs(deviceId="phone",peers=listOf(a,b))
+        assertTrue(TilePolicy.present(p,"PC unreachable","",clipboard=true,clipboardAvailable=true).available)
+        assertFalse(TilePolicy.present(p,"Connected","Wi-Fi",clipboard=true,clipboardAvailable=false).available)
+        assertFalse(TilePolicy.present(p.copy(quickSettings=false),"Connected","Wi-Fi",clipboard=true,clipboardAvailable=true).available)
+    }
+
 }

@@ -25,20 +25,20 @@ object MediaPreview {
         return BitmapFactory.decodeFile(file.path,BitmapFactory.Options().apply {inSampleSize=sample})?.let {ImageOrientation.apply(file,it)}
     }
     suspend fun load(context:Context,row:Outgoing):Bitmap?=try {
-        ProviderReads.preview(timeout=2000,discard={it?.recycle()}) {decode(context,row)}
+        ProviderReads.preview(timeout=2000,discard={it?.recycle()}) {ImageWorkBudget.run {decode(context,row)}}
     }catch(e:CancellationException) {throw e}catch(_:Exception) {null}
     suspend fun makeThumbnail(context:Context,row:Outgoing,target:File,beforeWrite:(File)->Unit={}):File?=try {
         // Open before launching the abandonable worker. Timeout/cancellation
         // closes this stream; a late decoder cannot recreate an unlinked path.
         target.outputStream().use {output->
-            ProviderReads.preview {
-                val bitmap=decode(context,row) ?: return@preview null
+            ProviderReads.preview {ImageWorkBudget.run {
+                val bitmap=decode(context,row) ?: return@run null
                 try {
                     beforeWrite(target)
                     check(bitmap.compress(Bitmap.CompressFormat.JPEG,75,output))
                     if(target.length()>64*1024)null else target
                 }finally {bitmap.recycle()}
-            }
+            }}
         }
     }catch(e:CancellationException) {throw e}catch(_:Exception) {null}
 }

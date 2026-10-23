@@ -15,18 +15,23 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 class TwentiethReviewDeviceTest {
     private val app=InstrumentationRegistry.getInstrumentation().targetContext.graph
-    @Before fun reset()=runBlocking<Unit> {DeviceFixture.reset()}
+    @Before fun reset()=runBlocking<Unit> {
+        DeviceFixture.reset()
+        val raw="pneu://pair?v=1&name=Recovery&fp=${"a".repeat(64)}&addr=127.0.0.1%3A1&token=${"b".repeat(64)}&exp=${System.currentTimeMillis()+300000}"
+        assertTrue(app.requestPairing(raw,null));assertTrue(app.installBinding(io.github.stantonmatt.pneu.protocol.Invitation.parse(raw),"d".repeat(32)))
+    }
     private fun row(kind:String,order:Long,state:String)=Outgoing().apply {
         mediaId=randomId();transferId=randomId();this.kind=kind;orderId=order;this.state=state
         attempted=true;optimized=true;revision=7;path="private-snapshot";hash="retained-hash";size=42;nextAttempt=1234;mismatches=2
-        app.queue.insert(this)
+        DeviceFixture.insert(app,this)
     }
     @Test fun fileRecoveryPreservesLiveTextAndSnapshotIdentity()=runBlocking<Unit> {
         val file=row("file",1,"sending");val text=row("text",2,"sending")
         app.recoverDeliveryLane(false)
         val current=app.queue.find(file.mediaId)!!
         assertEquals("waiting",current.state);assertEquals("sending",app.queue.find(text.mediaId)!!.state)
-        for(field in Outgoing::class.java.fields.filter {it.name!="state"})assertEquals(field.name,field.get(file),field.get(current))
+        assertTrue("Attempted payload is derived across recipient deliveries",current.payloadAttempted)
+        for(field in Outgoing::class.java.fields.filter {it.name !in setOf("state","payloadAttempted")})assertEquals(field.name,field.get(file),field.get(current))
         assertEquals(file.mediaId,QueueSchedule.choose(app.queue.pending(),2000,RetryDeadlines({2000},{2000})::deadline).row!!.mediaId)
         app.recoverDeliveryLane(false) // no abandoned file: text still owns its active slot
         assertEquals("sending",app.queue.find(text.mediaId)!!.state)
@@ -44,7 +49,7 @@ class TwentiethReviewDeviceTest {
     @Test fun failedRecoveryRollsBackBeforeSelectionAndCanBeRetried()=runBlocking<Unit> {
         val text=row("text",1,"sending");val latest=row("text",2,"waiting")
         val db=app.database.openHelper.writableDatabase
-        db.execSQL("CREATE TRIGGER fail_lane_recovery BEFORE UPDATE ON outgoing WHEN NEW.state='superseded' BEGIN SELECT RAISE(ABORT,'recovery fault'); END")
+        db.execSQL("CREATE TRIGGER fail_lane_recovery BEFORE UPDATE ON deliveries WHEN NEW.state='superseded' BEGIN SELECT RAISE(ABORT,'recovery fault'); END")
         try {
             try {app.recoverDeliveryLane(true);fail("Recovery must report storage failure")}catch(_:android.database.sqlite.SQLiteException) {}
             assertEquals("sending",app.queue.find(text.mediaId)!!.state)

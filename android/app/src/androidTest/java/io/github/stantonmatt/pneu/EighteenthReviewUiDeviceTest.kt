@@ -11,7 +11,7 @@ import org.junit.*
 import org.junit.Assert.*
 import org.junit.runner.RunWith
 
-/** Real lost binding (peer cleared), Home and installed SystemUI tile recovery. */
+/** Real lost binding (peer retained as lost), Home and installed SystemUI tile recovery. */
 @RunWith(AndroidJUnit4::class)
 class EighteenthReviewUiDeviceTest {
     private val i=InstrumentationRegistry.getInstrumentation()
@@ -27,14 +27,14 @@ class EighteenthReviewUiDeviceTest {
         assertTrue(app.requestPairing(raw,null));assertTrue(app.installBinding(Invitation.parse(raw),"c".repeat(32)))
         assertTrue(app.loseBinding(app.preferences.read().peer))
         app.preferences.toggle("paused",true)
-        withTimeout(5000) {app.prefs.first {it.pairingLost && it.peer==null && !it.deliveryReset && it.paused}}
+        withTimeout(5000) {app.prefs.first {it.pairingLost && it.devices.all {peer->peer.pairingLost} && it.resetPeers.isEmpty() && it.paused}}
     }
     @After fun cleanup()=runBlocking<Unit> {
         shell("cmd statusbar collapse")
         for(tile in listOf("PneuTile","ClipboardTile"))shell("cmd statusbar remove-tile io.github.stantonmatt.pneu/.features.$tile")
         c.stopService(Intent(c,PneuService::class.java));app.connection.stop();app.forgetBinding()
     }
-    @Test(timeout=45000) fun bothLostPairingTilesOpenHomeRecoveryEvenWhenPausedAndPeerIsGone()=runBlocking<Unit> {
+    @Test(timeout=45000) fun bothLostPairingTilesOpenHomeRecoveryEvenWhenPausedAndPeerIsRetainedAsLost()=runBlocking<Unit> {
         for(tile in listOf("PneuTile","ClipboardTile"))shell("cmd statusbar add-tile io.github.stantonmatt.pneu/.features.$tile")
         for(tile in listOf("PneuTile","ClipboardTile")) {
             device.pressHome();device.openQuickSettings();delay(1200)

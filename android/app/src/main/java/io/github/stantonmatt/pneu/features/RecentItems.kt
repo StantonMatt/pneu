@@ -10,11 +10,11 @@ import io.github.stantonmatt.pneu.data.Outgoing
 import kotlinx.coroutines.CancellationException
 
 object RecentItems {
-    suspend fun openOriginal(context:Context,row:Outgoing,open:(Intent)->Unit={context.startActivity(it)}) {
-        if(row.state!="sent" || !row.automatic)return
+    suspend fun openOriginal(context:Context,row:Outgoing,open:(Intent)->Unit={context.startActivity(it)}):Boolean {
+        if(row.state!="sent" || !row.automatic)return false
         val uri=Uri.parse(row.uri)
-        if(uri.scheme!="content" || uri.authority!="media")return
-        try {
+        if(uri.scheme!="content" || uri.authority!="media")return false
+        return try {
             val mime=ProviderReads.call {signal->
                 val version=MediaStore.getVersion(context,MediaCatalog.VOLUME)
                 val id=ContentUris.parseId(uri)
@@ -29,7 +29,9 @@ object RecentItems {
                 }
                 if(MediaStore.getVersion(context,MediaCatalog.VOLUME)==version)type?.takeIf(String::isNotBlank) else null
             }
-            if(mime!=null)open(Intent(Intent.ACTION_VIEW).setDataAndType(uri,mime).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
-        }catch(e:CancellationException) {throw e}catch(_:Exception) { /* Missing/inaccessible originals do nothing. */ }
+            if(mime==null)false else {
+                open(Intent(Intent.ACTION_VIEW).setDataAndType(uri,mime).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION));true
+            }
+        }catch(e:CancellationException) {throw e}catch(_:Exception) {false}
     }
 }

@@ -32,9 +32,12 @@ $ANDROID_HOME/platform-tools/adb -s emulator-5554 install -r app/build/outputs/a
   values are projected once per snapshot into monotonic deadlines on read,
   clamped to 72 seconds (maximum jittered backoff); permanent/manual-retry
   markers stay blocked. Every lane wait selects work signals or timeout, and
-  fresh ready rows bypass a failed row's storage cooldown. Pending
-  pairing is persisted before PAIR_REQUEST and survives loss of PAIR_RESULT and
-  invitation expiry. A rejected replacement leaves the previous binding intact.
+  fresh ready rows bypass a failed row's storage cooldown. One app-scoped,
+  in-memory pairing attempt survives Activity/service recreation, lost PAIR_RESULT
+  and invitation expiry; process death abandons it and requires a re-scan. Unique
+  attempt IDs and frozen per-target fences reject stale outcomes. Cancellation is
+  local, without UNPAIR. Same-identity re-scans retain delivery authority; a changed
+  certificate can replace only a lost binding, without a handshake-time prompt.
   Pending delivery-reset journals are retried before each dialing pass/endpoint
   through the same jittered backoff as connection failure. Transient startup
   identity errors retry rather than permanently failing the initialization latch.
@@ -194,7 +197,18 @@ $ANDROID_HOME/platform-tools/adb -s emulator-5554 shell am start -W \
 ```
 
 `10.0.2.2` is the emulator host; physical phones use PC LAN/Tailscale addresses.
-Every deep link/QR requires explicit confirmation in Pneu, naming both PCs for replacement. API 37 requires local-network permission. Tokens, keys and user content are not
+Every deep link/QR requires explicit Pair or Add confirmation in Pneu. If the
+authenticated HELLO matches a saved device ID with a new certificate, or a saved
+certificate with a different device ID, Pneu separately names the existing
+computer and asks to replace it before sending PAIR_REQUEST. Add/repair approval
+alone cannot replace that binding. Approval captures its exact generation;
+cancellation, a changed invitation or a stale binding leaves trust and deliveries
+intact. Pneu closes the discovery connection while awaiting consent, then repeats
+mTLS and HELLO with the same fingerprint and device ID before using the token;
+the user is not constrained by the 10-second PAIR_REQUEST deadline.
+The 16-computer capacity check runs against the authenticated identity,
+so certificate-changing repairs work at the limit. API 37 requires local-network
+permission. Tokens, keys and user content are not
 logged. There is no production authentication bypass.
 
 `tools/protocol_peer.py` is an independent Python/OpenSSL test peer. Supply
@@ -220,18 +234,29 @@ an API 37 `pneu-test` emulator and run the **whole** device runner through `heav
 
 ```sh
 export ANDROID_HOME=$HOME/Android/Sdk
-$ANDROID_HOME/emulator/emulator -avd pneu-test -memory 2048 -no-window -no-audio -no-snapshot-save -gpu swiftshader_indirect -no-boot-anim &
-timeout 180 "$ANDROID_HOME/platform-tools/adb" -s emulator-5554 wait-for-device
+export ANDROID_SERIAL=emulator-5580
+case "$ANDROID_SERIAL" in emulator-*) ;; *) exit 1;; esac
+$ANDROID_HOME/emulator/emulator -avd pneu-test -port 5580 -memory 2048 -no-window -no-audio -no-snapshot-save -gpu swiftshader_indirect -no-boot-anim &
+emulator_pid=$!
+timeout 180 "$ANDROID_HOME/platform-tools/adb" -s "$ANDROID_SERIAL" wait-for-device
+"$ANDROID_HOME/platform-tools/adb" -s "$ANDROID_SERIAL" emu avd name # Must say pneu-test
 /home/mjstanton/.local/bin/heavy python3 tools/run_device_tests.py
 # Once the runner completes:
-$ANDROID_HOME/platform-tools/adb -s emulator-5554 emu kill
+case "$ANDROID_SERIAL" in emulator-*) ;; *) exit 1;; esac
+$ANDROID_HOME/platform-tools/adb -s "$ANDROID_SERIAL" emu kill
+wait "$emulator_pid"
 ```
 
-Wait for the emulator to finish booting before running the tests.
-No suite arguments runs all suites. Select one or more by name, for example:
+Wait for the emulator to finish booting before running the tests. The canonical
+runner checks the `emulator-*` serial and `pneu-test` AVD before any fixture work,
+and checks the explicit serial and `ANDROID_SERIAL` before every adb command.
+No suite arguments runs all suites. `--cases` selects comma-separated named cases
+within the selected suites without changing the full inventory. Select one or
+more suites by name, for example:
 
 ```sh
 /home/mjstanton/.local/bin/heavy python3 tools/run_device_tests.py local cold
+/home/mjstanton/.local/bin/heavy python3 tools/run_device_tests.py cold --cases cold-text
 /home/mjstanton/.local/bin/heavy python3 tools/run_device_tests.py policy upload daemon \
   --scratch "$HOME/.cache/agent-scratch/pneu/device-check"
 ```
@@ -285,8 +310,11 @@ witness sockets are test tooling only.
 The emulator's default route must be metered for Policy; the runner does not
 change routing. The daemon build defaults to
 `~/.cache/agent-scratch/pneu/android10-target`; `--daemon` selects its binary and
-build target directory. `--serial` selects a device (default `emulator-5554`).
-The suites change app state, and `cold` clears app data; use a test device.
+build target directory. `--serial` selects the `pneu-test` emulator (default
+`ANDROID_SERIAL`, falling back to `emulator-5554`). The suites change app state,
+and `cold` clears app data. Physical devices and other AVDs are refused. Cold
+offline text must complete with `no_recipient` and no queued delivery; the host
+witnesses that rejection before launching verification instrumentation.
 Each device test resets preferences, queue, identity and injected faults through
 `DeviceFixture` in `@Before`. Prepared mTLS fixtures preserve the exported identity;
 host-witnessed cold verification phases validate their recorded state without
@@ -487,8 +515,8 @@ surrogates on read and write while accepting valid pairs and future capabilities
 within their UTF-8 bounds.
 
 Pass 15 binds each confirmation to the phone identity, PC pin/ID and durable
-pairing revision shown to the user. Unpair and replacement dialogs keep their
-original PC name while open. Deferred permission approval retains the same
+pairing revision shown to the user. Unpair dialogs keep their original PC name
+while open; certificate replacement no longer uses a mid-handshake dialog. Deferred permission approval retains the same
 identity, and stale choices fail visibly; retry shows a fresh confirmation.
 Queue removal, bulk clearing and retry capture exact row IDs, transfer IDs and
 revisions before launching work. Bulk clear never expands to later arrivals;
@@ -591,3 +619,40 @@ sending (capsule and progress), connecting, failed/recording rows, waiting menu,
 unpair/pair confirmations, permissions/battery, plus light first-run setup. Real
 pairing and transfer behavior is validated separately by the existing peer suites.
 The fixture also checks that the Recent header stays put when waiting appears.
+
+### Multi-computer resource limits
+
+The phone supports at most 16 paired computers (matching the desktop session
+cap), including lost pairings. A repair uses its existing slot. Automatic media
+sends to connected eligible computers by default; the explicit offline-queue
+setting adds offline paired computers to the frozen recipient set.
+
+Clipboard text (including shared text) and clipboard images capture each
+recipient's authenticated session before settings, focus, pickers or provider
+work. Admission and first-frame emission revalidate that session. Disconnect
+supersedes its clipboard deliveries; a delayed capture cannot enter a newer
+session. Shared files retain their deliberate queue behavior and frozen pairing
+identities across reconnects.
+
+Automatic media discovery journals its original recipients and ordering stamp
+in Room before opening the provider. Provider errors and pending
+MediaStore items retry that same operation, including after observer/process
+restart. With offline queuing disabled, an unfinished capture loses a recipient
+when its original session ends; if none survive, it is marked seen and skipped.
+With offline queuing enabled, the frozen paired recipients may reconnect; newly
+paired or connected computers are never added to that operation. Already staged
+automatic deliveries retain their existing queue behavior. Policy changes can
+revoke an unfinished discovery but cannot replace its recipients or ordering.
+Uncommitted copy attempts use distinct output/transfer IDs so a losing overlap
+cannot replace or delete the payload another observer has already admitted.
+
+Settings receipts live in Room, indexed by sender and operation ID, and are
+retained until that binding is reset. Each peer admits at most 4096 distinct
+settings operations; at capacity a new operation receives retryable
+`storage_failed` without changing settings. Identical retained operations still
+replay safely. Legacy receipts are imported without eviction before admission.
+Only one snapshot is outstanding per direction, and registry state holds only
+the three settings fields, local pending edits and that outgoing snapshot.
+
+Image optimization and preview/thumbnail decoding share two process-wide permits.
+A timed-out preview retains its permit until its actual worker finishes.
