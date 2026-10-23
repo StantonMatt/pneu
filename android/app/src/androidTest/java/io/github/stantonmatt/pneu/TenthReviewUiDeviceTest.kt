@@ -46,6 +46,11 @@ class TenthReviewUiDeviceTest {
             CompositionLocalProvider(LocalUiActions provides UiActions {_,_->fail("Unexpected UI failure")}) {body()}
         }
     }
+    private fun awaitText(text:String) {
+        // Flow collection and LaunchedEffect can run after Compose first goes idle.
+        compose.waitUntil(5000) {compose.onNodeWithText(text).isDisplayed()}
+        compose.onNodeWithText(text).assertIsDisplayed()
+    }
     @Before fun setup()=runBlocking<Unit> {
         DeviceFixture.reset()
         DeviceFixture.stopPneuService();app.connection.stop();app.initialized.await();delay(200);app.forgetBinding()
@@ -346,20 +351,26 @@ class TenthReviewUiDeviceTest {
         compose.onNodeWithText("Pair with Twelfth?").assertIsDisplayed()
         compose.onNodeWithText("Pair").performClick()
         compose.waitUntil(5000) {app.connection.attempt.value?.invitation==invitation}
+        // requestPairing publishes the attempt before beginPair finishes and the
+        // confirmation coroutine navigates to the scanner. Stop only after entry.
+        compose.waitUntil(5000) {
+            compose.onNode(SemanticsMatcher.expectValue(SemanticsProperties.PaneTitle,"Add device")).isDisplayed() &&
+                !compose.onNodeWithText("Pair with Twelfth?").isDisplayed()
+        }
         DeviceFixture.stopPneuService();app.connection.stop();app.connection.awaitStopped()
         assertTrue(app.cancelPairing(app.connection.attempt.value))
-        app.connection.state.value=LinkState(pairing="Can't reach your PC")
-        compose.onNodeWithText("Can't reach your computer").assertIsDisplayed()
-        compose.onNodeWithText("Try again").assertIsDisplayed()
+        compose.runOnIdle {app.connection.state.value=LinkState(pairing="Can't reach your PC")}
+        awaitText("Can't reach your computer")
+        awaitText("Try again")
         restore.emulateSavedInstanceStateRestore()
-        compose.onNodeWithText("Can't reach your computer").assertIsDisplayed()
+        awaitText("Can't reach your computer")
         compose.onNodeWithText("Try again").performClick()
-        compose.onNodeWithText("Pair with Twelfth?").assertIsDisplayed()
+        awaitText("Pair with Twelfth?")
         assertNull(app.connection.attempt.value?.invitation);assertNull(app.preferences.read().peer)
         // Restoring the confirmation must not replay the consumed failure or
         // silently approve another pairing attempt.
         restore.emulateSavedInstanceStateRestore()
-        compose.onNodeWithText("Pair with Twelfth?").assertIsDisplayed()
+        awaitText("Pair with Twelfth?")
         compose.onNodeWithText("Can't reach your computer").assertDoesNotExist()
         assertNull(app.connection.attempt.value?.invitation)
         compose.onNodeWithText("Cancel").performClick()
@@ -478,7 +489,7 @@ class TenthReviewUiDeviceTest {
         compose.waitForIdle();compose.runOnIdle {requireNotNull(scan)(scanned)}
         assertEquals(listOf(scanned),offered)
         compose.runOnIdle {link=LinkState(status="PC unreachable",pairing="Can't reach your PC")}
-        compose.waitUntil(5000) {compose.onAllNodesWithText("Try again").fetchSemanticsNodes().isNotEmpty()}
+        awaitText("Try again")
         compose.onNodeWithText("Try again").performClick()
         compose.waitUntil(5000) {offered.size==2}
         assertEquals(listOf(scanned,raw),offered);assertNull(app.connection.attempt.value?.invitation)

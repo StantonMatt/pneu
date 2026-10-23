@@ -17,6 +17,7 @@ import re
 import shutil
 import shlex
 import socket
+import ssl
 import sqlite3
 import subprocess
 import threading
@@ -157,7 +158,21 @@ def cert(stem):
          '-nodes', '-keyout', str(key), '-out', str(pem), '-days', '2', '-subj', '/CN=' + stem],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     der = run(['openssl', 'x509', '-in', str(pem), '-outform', 'DER'], capture_output=True).stdout
+    # The host and emulator can straddle a whole-second boundary. Do not start
+    # a TLS fixture until this freshly issued leaf is valid on the verifier's
+    # clock; production validity checks and rejection expectations stay intact.
+    validity = run(['openssl', 'x509', '-in', str(pem), '-startdate', '-noout'],
+                   capture_output=True, text=True).stdout.strip()
+    await_certificate_valid_on_device(ssl.cert_time_to_seconds(validity.removeprefix('notBefore=')))
     return pem, key, hashlib.sha256(der).hexdigest()
+
+
+def await_certificate_valid_on_device(not_before):
+    deadline = time.monotonic() + 5
+    while int(run([*adb, 'shell', 'date', '+%s'], capture_output=True, text=True).stdout.strip()) < not_before:
+        if time.monotonic() >= deadline:
+            raise TimeoutError('Fixture certificate is not yet valid on the emulator clock')
+        time.sleep(.05)
 
 
 def identity(name):

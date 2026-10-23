@@ -36,7 +36,14 @@ class AdvisoryDeviceTest {
     private suspend fun seed(pin:String="a".repeat(64)) {
         val raw=uri(pin);assertTrue(app.requestPairing(raw,null));assertTrue(app.installBinding(Invitation.parse(raw),"d".repeat(32)))
     }
-    private fun launch(extra:String="home") {context.startActivity(Intent(context,MainActivity::class.java).putExtra(extra,true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK));Thread.sleep(650)}
+    private fun awaitUi(selector:BySelector,label:String) {
+        assertTrue(label,device.wait(Until.hasObject(selector.pkg(context.packageName)),5000))
+    }
+    private fun launch(extra:String="home") {
+        context.startActivity(Intent(context,MainActivity::class.java).putExtra(extra,true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
+        if(extra=="permissions")awaitUi(By.text(context.getString(R.string.perm_notifications)),"Permissions page")
+        else awaitUi(By.desc("Settings"),"Home toolbar")
+    }
     private fun caller(uri:String,grant:Boolean=true,action:String=Intent.ACTION_SEND) {
         // A new request must run onCreate, even while the previous caller/task
         // is finishing. NEW_TASK alone can deliver it to that old root instead.
@@ -183,13 +190,22 @@ class AdvisoryDeviceTest {
     @Test(timeout=45000) fun toolbarAndExternalHomeNavigationAgreeAndQueueCountIsComplete()=runBlocking {
         seed();repeat(60) {app.enqueueFixture(Outgoing().apply {mediaId=randomId();transferId=randomId();kind="file";fileName="Fixture"})}
         withTimeout(5000) {app.waitingCount.first {it==60}};launch()
-        device.findObject(UiSelector().description("Settings")).click();assertTrue(device.findObject(UiSelector().text("Settings")).waitForExists(4000));delay(350)
+        device.findObject(UiSelector().description("Settings")).click()
+        assertTrue("Home left",device.wait(Until.gone(By.desc("Settings")),5000))
+        awaitUi(By.text("Settings"),"Settings toolbar")
         val scroll=UiScrollable(UiSelector().scrollable(true));scroll.scrollTextIntoView("Permissions and battery")
-        device.findObject(UiSelector().text("Permissions and battery")).click();device.findObject(UiSelector().description("Back")).click()
-        assertTrue(device.findObject(UiSelector().text("Settings")).waitForExists(3000))
+        device.findObject(UiSelector().text("Permissions and battery")).click()
+        awaitUi(By.text(context.getString(R.string.perm_notifications)),"Permissions page entered")
+        assertTrue("Settings list left",device.wait(Until.gone(By.text(context.getString(R.string.pref_name))),5000))
+        device.findObject(UiSelector().description("Back")).click()
+        // Permissions may itself contain Settings action buttons, and both
+        // screens retain Back during the cross-fade. Wait for that page to leave.
+        assertTrue("Permissions page left",device.wait(Until.gone(By.text(context.getString(R.string.perm_notifications))),5000))
+        awaitUi(By.text("Settings"),"Returned to Settings")
         context.startActivity(Intent(context,MainActivity::class.java).putExtra("home",true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-        assertTrue(device.findObject(UiSelector().text("Pneu")).waitForExists(3000))
-        DeviceFixture.openDevice(instrumentation,"Trusted PC");delay(350);UiScrollable(UiSelector().scrollable(true)).let {if(it.exists())it.scrollTextIntoView("Unpair")}
+        awaitUi(By.desc("Settings"),"External Home navigation")
+        assertTrue("Settings toolbar left",device.wait(Until.gone(By.text("Settings")),5000))
+        DeviceFixture.openDevice(instrumentation,"Trusted PC");UiScrollable(UiSelector().scrollable(true)).let {if(it.exists())it.scrollTextIntoView("Unpair")}
         device.findObject(UiSelector().text("Unpair")).click();assertTrue(device.findObject(UiSelector().textContains("60")).waitForExists(3000))
     }
     @Test(timeout=45000) fun permanentFailureRemainsVisibleOnMobile()=runBlocking<Unit> {

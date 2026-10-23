@@ -93,6 +93,13 @@ internal object DeviceFixture {
         val i=InstrumentationRegistry.getInstrumentation();val c=i.targetContext
         val nm=c.getSystemService(NotificationManager::class.java);val device=UiDevice.getInstance(i)
         if((nm.getNotificationChannel(channelId).importance!=NotificationManager.IMPORTANCE_NONE)==enabled)return
+        // ChannelPanelActivity launches SubSettings inside the Settings process.
+        // Repeated fixture launches accumulate Android's rapid-activity-launch
+        // counter there, even across instrumentation processes. Start fresh, and
+        // remove the old identically labelled control before checking readiness.
+        device.pressHome()
+        device.executeShellCommand("am force-stop com.android.settings")
+        assertTrue("Previous Settings window left",device.wait(Until.gone(By.pkg("com.android.settings")),5000))
         c.startActivity(Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
             .putExtra(Settings.EXTRA_APP_PACKAGE,c.packageName).putExtra(Settings.EXTRA_CHANNEL_ID,channelId)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))

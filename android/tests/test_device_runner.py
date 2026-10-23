@@ -37,6 +37,32 @@ class DeviceRunnerTest(unittest.TestCase):
         runner.logs.clear()
         runner.keys.clear()
 
+    def test_fresh_certificate_waits_for_verifier_clock_not_host_clock(self):
+        # A fresh host leaf can be a second in the future on Android. The
+        # verifier's clock must cross notBefore before a peer is started.
+        clocks = [subprocess.CompletedProcess([], 0, stdout=str(value)) for value in (99, 99, 100)]
+        with patch.object(runner, 'run', side_effect=clocks) as command, \
+             patch.object(runner.time, 'monotonic', return_value=0), \
+             patch.object(runner.time, 'time', return_value=1000), \
+             patch.object(runner.time, 'sleep') as sleep:
+            runner.await_certificate_valid_on_device(100)
+        self.assertEqual(command.call_count, 3)
+        self.assertTrue(all(call.args[0] == ['adb', 'shell', 'date', '+%s'] for call in command.call_args_list))
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_certificate_clock_wait_is_bounded_and_does_not_delay_valid_leaf(self):
+        for clock, expires in ((99, True), (100, False), (101, False)):
+            with self.subTest(clock=clock), \
+                 patch.object(runner, 'run', return_value=subprocess.CompletedProcess([], 0, stdout=str(clock))), \
+                 patch.object(runner.time, 'monotonic', side_effect=[0, 5]), \
+                 patch.object(runner.time, 'sleep') as sleep:
+                if expires:
+                    with self.assertRaisesRegex(TimeoutError, 'not yet valid'):
+                        runner.await_certificate_valid_on_device(100)
+                else:
+                    runner.await_certificate_valid_on_device(100)
+                sleep.assert_not_called()
+
     def test_cold_offline_text_waits_for_rejection_without_requiring_a_queue_row(self):
         response = subprocess.CompletedProcess([], 0, stdout='')
         marker = 'cold-text-test-marker'
