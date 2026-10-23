@@ -421,8 +421,11 @@ async fn outbox_cli_and_ipc_validate_paths_and_persist_settings() -> Result<()> 
         )
         .await?;
     }
-    // Untargeted IPC is also an entry point. With the preference on it must
-    // hand off to the existing picker; captured admissions bypass re-prompting.
+    // Untargeted IPC must hand off to a picker with the preference on, or
+    // reject before queuing any UI work on the headless M1 runtime.
+    #[cfg(target_os = "macos")]
+    let ui_before_picker =
+        pneud::ipc::request(&h.core.paths.socket, pneud::ipc::Command::UiStatus).await?;
     for command in [
         pneud::ipc::Command::SendFiles {
             paths: vec![path.clone()],
@@ -430,25 +433,47 @@ async fn outbox_cli_and_ipc_validate_paths_and_persist_settings() -> Result<()> 
             request_id: None,
         },
         pneud::ipc::Command::SendClipboard { targets: all() },
+        #[cfg(target_os = "macos")]
+        pneud::ipc::desktop_send_command(&[path.to_str().unwrap().into()]),
+        #[cfg(target_os = "macos")]
+        pneud::ipc::Command::ShowWindow {
+            choose_folder: false,
+        },
+        #[cfg(target_os = "macos")]
+        pneud::ipc::Command::ShowWindow {
+            choose_folder: true,
+        },
     ] {
-        let reply = pneud::ipc::request(&h.core.paths.socket, command).await?;
-        assert!(reply["operation"].is_null() && reply["transfer_id"].is_null());
-        let status =
-            pneud::ipc::request(&h.core.paths.socket, pneud::ipc::Command::UiStatus).await?;
-        let request = &status["pending_send"];
-        assert_eq!(request["id"], reply["request"]);
-        assert_eq!(request["targeted"], false);
-        assert_eq!(
-            request["targets"][0]["device"],
-            phone.identity.device_id.as_str()
-        );
-        pneud::ipc::request(
-            &h.core.paths.socket,
-            pneud::ipc::Command::AcknowledgeSend {
-                request: request["id"].as_str().unwrap().into(),
-            },
-        )
-        .await?;
+        let reply = pneud::ipc::request(&h.core.paths.socket, command).await;
+        #[cfg(target_os = "macos")]
+        {
+            assert!(reply.unwrap_err().to_string().contains("macOS M1"));
+            let status =
+                pneud::ipc::request(&h.core.paths.socket, pneud::ipc::Command::UiStatus).await?;
+            assert!(status["pending_send"].is_null());
+            assert_eq!(status["window_request"], ui_before_picker["window_request"]);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let reply = reply?;
+            assert!(reply["operation"].is_null() && reply["transfer_id"].is_null());
+            let status =
+                pneud::ipc::request(&h.core.paths.socket, pneud::ipc::Command::UiStatus).await?;
+            let request = &status["pending_send"];
+            assert_eq!(request["id"], reply["request"]);
+            assert_eq!(request["targeted"], false);
+            assert_eq!(
+                request["targets"][0]["device"],
+                phone.identity.device_id.as_str()
+            );
+            pneud::ipc::request(
+                &h.core.paths.socket,
+                pneud::ipc::Command::AcknowledgeSend {
+                    request: request["id"].as_str().unwrap().into(),
+                },
+            )
+            .await?;
+        }
     }
     pneud::ipc::request(
         &h.core.paths.socket,
@@ -457,9 +482,20 @@ async fn outbox_cli_and_ipc_validate_paths_and_persist_settings() -> Result<()> 
         },
     )
     .await?;
-    pneud::ipc::request(&h.core.paths.socket, pneud::ipc::Command::AddDevice).await?;
+    let add_device =
+        pneud::ipc::request(&h.core.paths.socket, pneud::ipc::Command::AddDevice).await;
     let ui = pneud::ipc::request(&h.core.paths.socket, pneud::ipc::Command::UiStatus).await?;
-    assert_eq!(ui["add_device"], true);
+    #[cfg(target_os = "linux")]
+    {
+        add_device?;
+        assert_eq!(ui["add_device"], true);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        assert!(add_device.unwrap_err().to_string().contains("macOS M1"));
+        assert_eq!(ui["add_device"], false);
+        assert_eq!(ui["window_request"], ui_before_picker["window_request"]);
+    }
     h.core.request_window(false);
     assert!(!h.core.window_add_device(h.core.window_request()));
     assert_eq!(ui["config"]["clipboard_mode"], "manual");
@@ -479,6 +515,64 @@ async fn outbox_cli_and_ipc_validate_paths_and_persist_settings() -> Result<()> 
     stop.send(true)?;
     ipc.await??;
     drop(link);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn desktop_send_parser_errors_reach_the_cli_or_window() -> Result<()> {
+    let h = Harness::new().await?;
+    let (listener, _owner) = pneud::ipc::bind(&h.core.paths.socket)?;
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let ipc = tokio::spawn(pneud::ipc::serve(h.core.clone(), listener, rx));
+    for (args, expected) in [
+        (vec!["send"], "send needs 1 to 128 regular files"),
+        (vec!["send", "--to"], "--to needs a device ID"),
+        (vec!["send", "--unknown"], "unknown send option"),
+    ] {
+        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_pneud"))
+            .args(args)
+            .current_dir(h.dir.path())
+            .env("HOME", h.dir.path())
+            .env("XDG_RUNTIME_DIR", h.dir.path())
+            .output()
+            .await?;
+        let status =
+            pneud::ipc::request(&h.core.paths.socket, pneud::ipc::Command::UiStatus).await?;
+        #[cfg(target_os = "macos")]
+        {
+            assert!(!output.status.success());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(expected), "{stderr}");
+            assert!(!stderr.contains("unavailable"), "{stderr}");
+            assert!(status["pending_send"].is_null());
+            assert_eq!(status["window_request"], 0);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let reply: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            assert_eq!(status["pending_send"]["id"], reply["request"]);
+            assert!(
+                status["pending_send"]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains(expected)
+            );
+            pneud::ipc::request(
+                &h.core.paths.socket,
+                pneud::ipc::Command::AcknowledgeSend {
+                    request: reply["request"].as_str().unwrap().into(),
+                },
+            )
+            .await?;
+        }
+    }
+    stop.send(true)?;
+    ipc.await??;
     h.stop().await
 }
 

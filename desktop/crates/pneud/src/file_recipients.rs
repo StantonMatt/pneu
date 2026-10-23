@@ -7,6 +7,7 @@ pub(crate) enum Selection<'a> {
     /// Default send, or the picker candidates when offline choices are allowed.
     AllEligible { queue_offline: bool },
     /// The tray's explicitly connected-only action, regardless of preferences.
+    #[cfg_attr(target_os = "macos", allow(dead_code))] // M2 tray uses this policy.
     ConnectedOnly,
     /// Naming a device explicitly permits queueing it while offline.
     Explicit(&'a [Id]),

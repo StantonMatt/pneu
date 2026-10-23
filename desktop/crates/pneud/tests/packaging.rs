@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 use anyhow::Result;
 use std::process::Command;
 

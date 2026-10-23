@@ -1,11 +1,22 @@
 //! Desktop presentation state. The protocol core remains usable without a tray host.
+#[cfg(target_os = "linux")]
 pub(crate) mod activation;
+#[cfg_attr(target_os = "macos", path = "macos/clipboard.rs")]
 pub mod clipboard;
+mod interactions;
 pub mod notifications;
+#[cfg_attr(target_os = "macos", path = "macos/palette.rs")]
 pub mod palette;
+#[cfg(any(target_os = "macos", test))]
+mod pasteboard_reader;
+#[cfg_attr(target_os = "macos", path = "macos/portal.rs")]
 pub(crate) mod portal;
+#[cfg_attr(target_os = "macos", path = "macos/runtime.rs")]
 pub mod runtime;
+mod send_request;
+#[cfg(target_os = "linux")]
 pub mod tray;
+#[cfg_attr(target_os = "macos", path = "macos/window.rs")]
 pub mod window;
 
 use crate::Config;
@@ -244,6 +255,12 @@ pub fn last_seen(timestamp: u64) -> String {
     }
 }
 // Plasma writes regional overrides here; fall back to the process locale.
+#[cfg(target_os = "macos")]
+fn twelve_hour_clock() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
 fn twelve_hour_clock() -> bool {
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)

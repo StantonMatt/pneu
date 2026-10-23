@@ -35,6 +35,7 @@ impl FingerprintKey {
             }
             Err(e) => return Err(e).context("open clipboard fingerprint key"),
         };
+        crate::platform::private::check(&file)?;
         let meta = file.metadata()?;
         ensure!(
             meta.is_file()
@@ -97,6 +98,7 @@ impl FingerprintKey {
                 && meta.uid() == rustix::process::geteuid().as_raw()
                 && meta.mode() & 0o777 == 0o600
             {
+                crate::platform::private::check(&file)?;
                 crate::storage::remove_file(&folder.file, name, &file)?;
             }
         }

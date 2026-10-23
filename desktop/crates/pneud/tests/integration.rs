@@ -3684,8 +3684,11 @@ async fn computer_invitation_errors_and_cli_stdin_are_private() -> Result<()> {
         child.id().unwrap(),
         b.dir.path().display()
     );
-    let argv = std::fs::read(format!("/proc/{}/cmdline", child.id().unwrap()))?;
-    assert!(!argv.windows(uri.len()).any(|w| w == uri.as_bytes()));
+    #[cfg(target_os = "linux")]
+    {
+        let argv = std::fs::read(format!("/proc/{}/cmdline", child.id().unwrap()))?;
+        assert!(!argv.windows(uri.len()).any(|w| w == uri.as_bytes()));
+    }
     use tokio::io::AsyncWriteExt;
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(format!("{uri}\n").as_bytes()).await?;
@@ -5344,7 +5347,15 @@ async fn retained_settings_snapshot_resumes_after_legacy_capability_loss() -> Re
     .await?;
     write_frame(&mut mesh, &ping).await?;
     assert!(matches!(wire_reply(&mut mesh).await?, Message::Pong(_)));
-    assert_eq!(device_rows(&h, &peer, "settings_outgoing")?, 0);
+    // PONG uses the priority control lane and is not a persistence barrier for
+    // the preceding application ACK. Wait for that ACK's durable effect.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while device_rows(&h, &peer, "settings_outgoing")? != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
     drop(mesh);
     h.stop().await
 }

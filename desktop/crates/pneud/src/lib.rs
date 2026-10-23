@@ -7,6 +7,7 @@ mod discovery;
 mod file_recipients;
 pub mod identity;
 pub mod ipc;
+mod platform;
 mod storage;
 mod store;
 pub use store::outbox;

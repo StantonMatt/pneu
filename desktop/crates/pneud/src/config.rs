@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
-    env, fs,
+    fs,
     io::Write,
     os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
@@ -16,20 +16,10 @@ pub struct Paths {
 }
 impl Paths {
     pub fn from_env() -> Result<Self> {
-        let home = PathBuf::from(env::var_os("HOME").context("HOME is unset")?);
-        let base = |key: &str, fallback: &str| {
-            env::var_os(key)
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(fallback))
-        };
-        let runtime =
-            PathBuf::from(env::var_os("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is unset")?);
-        Ok(Self {
-            data: base("XDG_DATA_HOME", ".local/share").join("pneu"),
-            cache: cache_dir_from_env()?,
-            config: base("XDG_CONFIG_HOME", ".config").join("pneu/config.toml"),
-            socket: runtime.join("pneud.sock"),
-        })
+        crate::platform::paths()
+    }
+    pub fn prepare_runtime(&self) -> Result<()> {
+        crate::platform::prepare_runtime(&self.socket)
     }
     pub fn prepare(&self) -> Result<()> {
         for path in [&self.data, self.config.parent().context("config parent")?] {
@@ -38,6 +28,7 @@ impl Paths {
         if let Err(error) = private_dir(&self.cache) {
             eprintln!("pneud: cache directory unavailable: {error}");
         }
+        crate::platform::prepare_runtime(&self.socket)?;
         Ok(())
     }
 }
@@ -77,8 +68,7 @@ impl Default for Config {
             choose_devices_each_time: false,
             queue_offline: false,
             save_to_folder: true,
-            save_path: PathBuf::from(env::var_os("HOME").unwrap_or_else(|| ".".into()))
-                .join("Pictures/Pneu"),
+            save_path: crate::platform::received_files(),
             notification_preview: true,
             copy_image_to_clipboard: true,
             open_in_viewer: false,
@@ -159,12 +149,7 @@ pub(crate) fn save_folder_overlaps_cache(save: &Path, cache: &Path) -> bool {
         _ => false,
     }
 }
-fn cache_dir_from_env() -> Result<PathBuf> {
-    Ok(env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or(PathBuf::from(env::var_os("HOME").context("HOME is unset")?).join(".cache"))
-        .join("pneu"))
-}
+use crate::platform::cache_dir_from_env;
 
 // Resolve existing symlinks while retaining missing components: choosing a
 // folder that has not been created yet must enforce the same cache boundary.
@@ -202,12 +187,7 @@ fn resolve_folder(path: &Path, links: &mut usize) -> Result<PathBuf> {
     }
     Ok(resolved)
 }
-fn machine_hostname() -> String {
-    rustix::system::uname()
-        .nodename()
-        .to_string_lossy()
-        .into_owned()
-}
+use crate::platform::machine_hostname;
 pub fn private_dir(path: &Path) -> Result<()> {
     let folder = crate::storage::Folder::open_private(path)?;
     folder
@@ -272,6 +252,7 @@ fn publish_private_in(
         rustix::fs::Mode::from_raw_mode(0o600),
     )?);
     let result = (|| {
+        crate::platform::private::created(&file)?;
         before_write()?;
         file.write_all(bytes)?;
         file.sync_all()?;

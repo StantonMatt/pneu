@@ -1,6 +1,7 @@
 // Released 2.0.2 startup fixture, from 55c8068:desktop/crates/pneud/src/store.rs.
 // Store fields and Store::open are copied verbatim; supporting types come from the parent.
 use super::*;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 #[allow(dead_code)]
 pub struct Store {

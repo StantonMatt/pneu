@@ -14,7 +14,9 @@ use pneu_proto::{Clipboard, ClipboardOrigin, FileBegin, Hash, Id, NackCode};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -460,6 +462,9 @@ impl Store {
             !path.exists() || !fs::symlink_metadata(path)?.file_type().is_symlink(),
             "database is a symlink"
         );
+        #[cfg(target_os = "macos")]
+        let lock = crate::platform::private::open(&path.with_extension("lock"))?;
+        #[cfg(not(target_os = "macos"))]
         let lock = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -470,6 +475,23 @@ impl Store {
             .open(path.with_extension("lock"))?;
         rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
             .context("data store is already owned by another daemon")?;
+        #[cfg(target_os = "macos")]
+        {
+            // Precreate the database before SQLite can write secret state. New
+            // sidecars inherit from this ACL-free parent, existing ones must pass.
+            let parent =
+                crate::storage::Folder::open(path.parent().context("database parent")?, false)?;
+            crate::platform::private::check(&parent.file)?;
+            crate::platform::private::open(path)?;
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let sidecar = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+                match fs::symlink_metadata(&sidecar) {
+                    Ok(_) => crate::platform::private::check_path(&sidecar)?,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
         let mut conn = Connection::open(path)?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;")?;
@@ -2366,6 +2388,7 @@ mod tests {
         }
         Ok(())
     }
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn restart_releases_lock_even_while_concurrent_child_is_before_exec() -> Result<()> {
         use std::os::{fd::AsRawFd, unix::process::CommandExt};
@@ -2852,6 +2875,7 @@ mod tests {
         assert_eq!(fs::read(path)?, b"owned");
         Ok(())
     }
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn cache_evidence_never_pins_expired_files_across_pairing_lifecycles() -> Result<()> {
         use std::os::unix::fs::MetadataExt;
@@ -3326,10 +3350,10 @@ mod tests {
     #[test]
     fn save_error_causes_survive_context() {
         for (errno, code) in [
-            (libc_errno(28), NackCode::DiskFull),
-            (libc_errno(122), NackCode::DiskFull),
-            (libc_errno(13), NackCode::NotWritable),
-            (libc_errno(30), NackCode::NotWritable),
+            (libc_errno(libc::ENOSPC), NackCode::DiskFull),
+            (libc_errno(libc::EDQUOT), NackCode::DiskFull),
+            (libc_errno(libc::EACCES), NackCode::NotWritable),
+            (libc_errno(libc::EROFS), NackCode::NotWritable),
         ] {
             assert_eq!(
                 save_failure_code(&anyhow::Error::new(errno).context("save")),

@@ -150,7 +150,7 @@ pub(super) enum Event {
     Policy {
         allowed: Vec<ClipboardRecipient>,
     },
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     TestEcho(Token),
     Shutdown,
 }
@@ -1847,7 +1847,7 @@ impl State {
                     }
                 }
             }
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             Event::TestEcho(token) => {
                 if self.observation.as_ref().is_some_and(|o| o.token == token) {
                     self.observation.take();

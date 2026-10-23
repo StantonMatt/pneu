@@ -268,6 +268,7 @@ impl Outbox {
                     OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
                     Mode::empty(),
                 )?);
+                crate::platform::private::check(&file)?;
                 if file.metadata()?.is_file() {
                     crate::storage::remove_file(&outbox.folder.file, name.as_os_str(), &file)?;
                 }
@@ -546,6 +547,7 @@ impl Outbox {
             } else { None };
             let id=Id::new(crate::random_hex(16))?;
             let mut staged=File::from(rustix::fs::openat(&*this.folder.file,id.as_str(),OFlags::RDWR|OFlags::CREATE|OFlags::EXCL|OFlags::NOFOLLOW|OFlags::CLOEXEC,Mode::from_raw_mode(0o600))?);
+            crate::platform::private::created(&staged)?;
             let result=(|| {
                 #[cfg(test)]
                 if let Some(hook)=this.copy_hook.lock().unwrap().take() {hook(&path);}
@@ -625,6 +627,7 @@ impl Outbox {
                 OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
                 Mode::empty(),
             )?);
+            crate::platform::private::check(&file)?;
             ensure!(
                 file.metadata()?.is_file() && file.metadata()?.len() == delivery.begin.size,
                 "staged file changed"
@@ -756,7 +759,9 @@ impl Outbox {
                 Mode::empty(),
             ) {
                 Ok(fd) => {
-                    crate::storage::remove_file(&self.folder.file, id.as_str(), &File::from(fd))?
+                    let file = File::from(fd);
+                    crate::platform::private::check(&file)?;
+                    crate::storage::remove_file(&self.folder.file, id.as_str(), &file)?
                 }
                 Err(rustix::io::Errno::NOENT) => {}
                 Err(e) => return Err(e.into()),

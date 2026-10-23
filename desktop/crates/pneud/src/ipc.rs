@@ -4,7 +4,9 @@ use crate::{Config, Core};
 use anyhow::{Context, Result, ensure};
 use pneu_proto::{Hash, Id};
 use serde::{Deserialize, Serialize};
-use std::{os::unix::fs::PermissionsExt, path::Path, sync::Arc, time::Duration};
+#[cfg(any(target_os = "linux", test))]
+use std::os::unix::fs::PermissionsExt;
+use std::{path::Path, sync::Arc, time::Duration};
 // 128 PATH_MAX (4096-byte) paths, up to six JSON bytes per path byte,
 // plus recipient authorities and framing, fit below 4 MiB. This also covers
 // clipboard text (16 KiB), invitations (8 KiB), and config/path commands.
@@ -124,6 +126,48 @@ pub enum Command {
         choose_folder: bool,
     },
 }
+impl Command {
+    fn check_desktop(
+        &self,
+        choose_devices: bool,
+        require_ui: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        if self.requires_desktop(choose_devices) {
+            require_ui().map_err(|error| match self {
+                // A headless runtime cannot present the error in a window.
+                // Return it over IPC so the CLI can still show the cause.
+                Self::PresentSendError { message } => {
+                    if message.len() > 4096 {
+                        anyhow::anyhow!("send error is too long")
+                    } else {
+                        anyhow::anyhow!("{message}")
+                    }
+                }
+                _ => error,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn requires_desktop(&self, choose_devices: bool) -> bool {
+        matches!(
+            self,
+            Self::AddDevice
+                | Self::ShowWindow { .. }
+                | Self::PresentFiles { .. }
+                | Self::PresentSendError { .. }
+        ) || (choose_devices
+            && matches!(
+                self,
+                Self::SendFiles {
+                    targets: crate::outbox::Targets::All(_),
+                    ..
+                } | Self::SendClipboard {
+                    targets: crate::outbox::Targets::All(_)
+                }
+            ))
+    }
+}
 #[derive(Serialize, Deserialize)]
 pub struct Reply {
     pub ok: bool,
@@ -139,13 +183,27 @@ pub struct SocketOwner {
     _lock: std::fs::File,
     folder: crate::storage::Folder,
     name: std::ffi::OsString,
+    #[cfg(target_os = "linux")]
     socket: std::fs::File,
+    #[cfg(target_os = "macos")]
+    socket: rustix::fs::Stat,
+    #[cfg(target_os = "macos")]
+    _socket_pin: std::os::unix::net::UnixListener,
 }
 impl Drop for SocketOwner {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
         let _ = crate::storage::remove_file(&self.folder.file, &self.name, &self.socket);
+        #[cfg(target_os = "macos")]
+        let _ = macos::remove_socket(&self.folder, &self.name, &self.socket);
     }
 }
+#[cfg(target_os = "macos")]
+#[path = "platform/macos_ipc.rs"]
+mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::bind;
+#[cfg(target_os = "linux")]
 pub fn bind(path: &Path) -> Result<(UnixListener, SocketOwner)> {
     use rustix::fs::{Mode, OFlags};
     use std::os::{
@@ -272,7 +330,9 @@ async fn handle(core: Arc<Core>, stream: UnixStream) -> Result<()> {
         Command::SendFiles {targets,..} | Command::SendClipboard {targets} => !matches!(targets, crate::outbox::Targets::Captured(_)),
         _ => false,
     };
-    let result: Result<serde_json::Value> = async { Ok(match request {
+    let result: Result<serde_json::Value> = async {
+    request.check_desktop(ask, crate::ui::runtime::require_ui)?;
+    Ok(match request {
         Command::SendFiles{paths,targets,request_id} if ask && matches!(&targets, crate::outbox::Targets::All(_))=>core.present_files(paths,targets,request_id)?,
         Command::SendFiles{paths,targets,request_id}=>{
             if desktop_send { core.request_window(false); }
@@ -547,6 +607,98 @@ fn parse_send_command(args: &[String], validate_files: bool) -> Result<Command> 
 mod tests {
     use super::*;
     #[test]
+    fn unavailable_desktop_preserves_send_parser_errors() {
+        for args in [vec![], vec!["--to".into()], vec!["--unknown".into()]] {
+            let expected = send_command(&args).err().unwrap().to_string();
+            let command = desktop_send_command(&args);
+            let error = command
+                .check_desktop(false, || anyhow::bail!("desktop unavailable"))
+                .unwrap_err();
+            assert_eq!(error.to_string(), expected);
+            assert!(command.check_desktop(false, || Ok(())).is_ok());
+        }
+        let error = Command::PresentSendError {
+            message: "x".repeat(4097),
+        }
+        .check_desktop(false, || anyhow::bail!("desktop unavailable"))
+        .unwrap_err();
+        assert_eq!(error.to_string(), "send error is too long");
+    }
+
+    #[test]
+    fn unavailable_desktop_gates_only_window_and_picker_requests() {
+        use crate::outbox::Targets;
+        for choose_devices in [false, true] {
+            let all = || Targets::All("all".into());
+            let devices = || Targets::Devices(vec![Id::from_bytes([1; 16])]);
+            let captured = || Targets::Captured(Vec::new());
+            for (command, needs_ui) in [
+                (Command::AddDevice, true),
+                (
+                    Command::ShowWindow {
+                        choose_folder: false,
+                    },
+                    true,
+                ),
+                (
+                    Command::ShowWindow {
+                        choose_folder: true,
+                    },
+                    true,
+                ),
+                (
+                    Command::PresentFiles {
+                        paths: vec![],
+                        targets: all(),
+                        request_id: None,
+                    },
+                    true,
+                ),
+                (
+                    Command::SendFiles {
+                        paths: vec![],
+                        targets: all(),
+                        request_id: None,
+                    },
+                    choose_devices,
+                ),
+                (Command::SendClipboard { targets: all() }, choose_devices),
+                (
+                    Command::SendFiles {
+                        paths: vec![],
+                        targets: devices(),
+                        request_id: None,
+                    },
+                    false,
+                ),
+                (Command::SendClipboard { targets: devices() }, false),
+                (
+                    Command::SendFiles {
+                        paths: vec![],
+                        targets: captured(),
+                        request_id: None,
+                    },
+                    false,
+                ),
+                (
+                    Command::SendClipboard {
+                        targets: captured(),
+                    },
+                    false,
+                ),
+                (Command::Status, false),
+            ] {
+                let result =
+                    command.check_desktop(choose_devices, || anyhow::bail!("desktop unavailable"));
+                assert_eq!(result.is_err(), needs_ui);
+                if let Err(error) = result {
+                    assert_eq!(error.to_string(), "desktop unavailable");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn transfer_commands_accept_optional_artifact_and_roundtrip_it() -> Result<()> {
         let operation = Id::from_bytes([1; 16]);
         let artifact = Id::from_bytes([2; 16]);
@@ -747,6 +899,8 @@ mod tests {
             let dir = tempfile::tempdir()?;
             let parent = dir.path().join("runtime");
             std::fs::create_dir(&parent)?;
+            #[cfg(target_os = "macos")]
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))?;
             let path = parent.join("pneu.sock");
             let (listener, owner) = bind(&path)?;
             // Binding through /proc still accepts clients via the canonical path.
@@ -797,6 +951,8 @@ mod tests {
     #[tokio::test]
     async fn binding_reclaims_stale_owned_socket_but_preserves_foreign_entries() -> Result<()> {
         let dir = tempfile::tempdir()?;
+        #[cfg(target_os = "macos")]
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
         let path = dir.path().join("pneu.sock");
         drop(std::os::unix::net::UnixListener::bind(&path)?);
         let (listener, owner) = bind(&path)?;

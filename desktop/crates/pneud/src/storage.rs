@@ -4,7 +4,6 @@ use anyhow::{Context, Result, ensure};
 use rustix::fs::{AtFlags, Mode, OFlags};
 use std::{
     fs::File,
-    os::fd::AsRawFd,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -78,16 +77,30 @@ impl Folder {
                     let next = match rustix::fs::openat(&current, name, flags, Mode::empty()) {
                         Ok(fd) => fd,
                         Err(rustix::io::Errno::NOENT) if create => {
-                            match rustix::fs::mkdirat(&current, name, Mode::from_raw_mode(mode)) {
-                                Ok(()) => {}
-                                Err(rustix::io::Errno::EXIST) => {}
+                            let created = match rustix::fs::mkdirat(
+                                &current,
+                                name,
+                                Mode::from_raw_mode(mode as _),
+                            ) {
+                                Ok(()) => true,
+                                Err(rustix::io::Errno::EXIST) => false,
                                 Err(e) => return Err(e.into()),
-                            }
+                            };
                             // Durably link each new ancestor before a later file ACK.
                             current.sync_all()?;
                             let fd = rustix::fs::openat(&current, name, flags, Mode::empty())?;
-                            rustix::fs::fsync(&fd)?;
-                            fd
+                            if mode == 0o700 {
+                                let file = File::from(fd);
+                                if created {
+                                    crate::platform::private::created(&file)?;
+                                } else {
+                                    crate::platform::private::check(&file)?;
+                                }
+                                rustix::fs::fsync(&file)?;
+                                file.into()
+                            } else {
+                                fd
+                            }
                         }
                         Err(e) => return Err(e.into()),
                     };
@@ -96,25 +109,23 @@ impl Folder {
                 _ => anyhow::bail!("unsafe folder component"),
             }
         }
+        if mode == 0o700 {
+            crate::platform::private::check(&current)?;
+        }
         Ok(Self {
             file: Arc::new(current),
         })
     }
     pub fn path(&self) -> Result<PathBuf> {
-        let path = std::fs::read_link(format!("/proc/self/fd/{}", self.file.as_raw_fd()))?;
-        ensure!(
-            !path.as_os_str().as_encoded_bytes().ends_with(b" (deleted)"),
-            "folder was deleted"
-        );
-        Ok(path)
+        crate::platform::directory_path(&self.file)
     }
     pub fn space(&self) -> Result<u64> {
         let s = rustix::fs::fstatvfs(&*self.file)?;
-        Ok(s.f_bavail.saturating_mul(s.f_frsize))
+        Ok((s.f_bavail as u64).saturating_mul(s.f_frsize as u64))
     }
     pub fn identity(&self) -> Result<(u64, u64)> {
         let s = rustix::fs::fstat(&*self.file)?;
-        Ok((s.st_dev, s.st_ino))
+        Ok((s.st_dev as u64, s.st_ino))
     }
 }
 pub(crate) const STAGING_DIR: &str = ".pneu-staging";
@@ -211,6 +222,7 @@ pub(crate) fn clean_legacy_staging(folder: &Folder) -> Result<()> {
         if stat.st_uid != rustix::process::geteuid().as_raw() || stat.st_mode & 0o777 != 0o700 {
             continue;
         }
+        crate::platform::private::check(&directory)?;
         wipe(&directory)?;
         remove_directory(&folder.file, name, &directory)?;
     }
@@ -218,19 +230,28 @@ pub(crate) fn clean_legacy_staging(folder: &Folder) -> Result<()> {
     Ok(())
 }
 pub(crate) fn staging_directory(folder: &Folder) -> Result<Folder> {
-    match rustix::fs::mkdirat(&*folder.file, STAGING_DIR, Mode::from_raw_mode(0o700)) {
-        Ok(()) => folder.file.sync_all()?,
-        Err(rustix::io::Errno::EXIST) => {}
+    let created = match rustix::fs::mkdirat(&*folder.file, STAGING_DIR, Mode::from_raw_mode(0o700))
+    {
+        Ok(()) => {
+            folder.file.sync_all()?;
+            true
+        }
+        Err(rustix::io::Errno::EXIST) => false,
         Err(e) => return Err(e.into()),
-    }
-    owned_staging(File::from(rustix::fs::openat(
+    };
+    let file = File::from(rustix::fs::openat(
         &*folder.file,
         STAGING_DIR,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
-    )?))
+    )?);
+    if created {
+        crate::platform::private::created(&file)?;
+    }
+    owned_staging(file)
 }
 fn owned_staging(file: File) -> Result<Folder> {
+    crate::platform::private::check(&file)?;
     let stat = rustix::fs::fstat(&file)?;
     ensure!(
         stat.st_uid == rustix::process::geteuid().as_raw() && stat.st_mode & 0o077 == 0,
@@ -251,13 +272,14 @@ fn wipe(directory: &File) -> Result<()> {
             continue;
         }
         let stat = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)?;
-        if rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::Directory {
+        if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
             let child = File::from(rustix::fs::openat(
                 directory,
                 name,
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )?);
+            crate::platform::private::check(&child)?;
             wipe(&child)?;
             // The tree is daemon-owned, but still never follow swapped entries.
             let own = rustix::fs::fstat(&child)?;
@@ -268,12 +290,10 @@ fn wipe(directory: &File) -> Result<()> {
             );
             unlink(directory, name, AtFlags::REMOVEDIR)?;
         } else {
-            let file = File::from(rustix::fs::openat(
-                directory,
-                name,
-                OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )?);
+            let file = crate::platform::metadata_file(directory, name)?;
+            if file.metadata()?.is_file() {
+                crate::platform::private::check(&file)?;
+            }
             remove_file(directory, name, &file)?;
         }
     }
@@ -314,6 +334,7 @@ impl Stage {
             OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::from_raw_mode(0o600),
         )?);
+        crate::platform::private::created(&file)?;
         Ok(Self(Arc::new(StageInner {
             folder,
             directory,
@@ -567,6 +588,7 @@ pub(crate) fn prune_cache(folder: &Folder, cutoff: std::time::SystemTime) -> Res
         };
         let meta = file.metadata()?;
         if meta.is_file() && meta.modified()? < cutoff {
+            crate::platform::private::check(&file)?;
             remove_file(&folder.file, name, &file)?;
         }
     }
@@ -613,6 +635,7 @@ pub(crate) fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )?);
+    crate::platform::private::check(&file)?;
     let meta = file.metadata()?;
     ensure!(
         meta.is_file() && meta.len() <= limit as u64,

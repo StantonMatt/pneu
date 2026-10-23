@@ -827,7 +827,7 @@ impl ClipboardOffer {
             .collect()
     }
 }
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl ClipboardOffer {
     pub(crate) fn test_offer() -> Self {
         Self {
@@ -1039,6 +1039,15 @@ impl Core {
                     .values()
                     .any(|id| id == device)
         };
+        #[cfg(target_os = "macos")]
+        for name in ["phone.json", "phones.json"] {
+            let path = paths.data.join(name);
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => crate::platform::private::check_path(&path)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         let phone: crate::ui::Phone = std::fs::read(paths.data.join("phone.json"))
             .ok()
             .and_then(|bytes| serde_json::from_slice::<crate::ui::Phone>(&bytes).ok())
@@ -1959,6 +1968,10 @@ impl Core {
             .tx
             .send(clipboard_driver::Message::ReadHandle(token, cancel));
     }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn retire_clipboard_observation(&self, token: u64) {
+        self.clipboard.event(ClipboardEvent::AbandonRead(token));
+    }
     pub(crate) fn clipboard_observed(
         &self,
         token: u64,
@@ -2000,7 +2013,7 @@ impl Core {
         }
         result.blocking_recv().unwrap_or(false)
     }
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn clipboard_test_echo(&self, token: u64) {
         self.clipboard.event(ClipboardEvent::TestEcho(token));
     }
@@ -2018,7 +2031,7 @@ impl Core {
         self.clipboard_observed(token, content, false);
         let _ = reply.await;
     }
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     async fn wait_clipboard_observation(&self) {
         self.clipboard.barrier().await;
     }
@@ -2036,6 +2049,7 @@ impl Core {
                 focused.then_some((request, Instant::now()));
         }
     }
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn window_focused(&self) -> bool {
         let request = self.window_request.lock().expect("window request").0;
         self.window_focus
@@ -6786,6 +6800,7 @@ mod tests {
         core.shutdown_actions().await?;
         Ok(())
     }
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn failed_cache_arrivals_and_recovery_use_actual_destination() -> Result<()> {
         use crate::ui::{ReceiveDestination as D, ReceiveError};
@@ -7289,6 +7304,7 @@ mod tests {
         );
         core.shutdown_actions().await
     }
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn automatic_formats_ignore_paused_image_peer() -> Result<()> {
         let (_dir, core, text_peer) = fixture(Arc::new(NoActions)).await?;
@@ -7323,6 +7339,7 @@ mod tests {
         core.shutdown_actions().await?;
         Ok(())
     }
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn automatic_formats_deliver_best_format_to_each_peer() -> Result<()> {
         let (_dir, core, image_peer) = fixture(Arc::new(NoActions)).await?;
@@ -7428,6 +7445,7 @@ mod tests {
         assert_eq!(hlc, text.hlc.unwrap().to_string());
         core.shutdown_actions().await
     }
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn automatic_formats_validate_independently_before_recipient_preference() -> Result<()> {
         let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
@@ -7497,6 +7515,7 @@ mod tests {
         core.shutdown_actions().await?;
         Ok(())
     }
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn failed_local_clock_commit_keeps_remote_effects_fenced_until_recovery() -> Result<()> {
         let (_dir, core, _device) = fixture(Arc::new(NoActions)).await?;
@@ -7537,6 +7556,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), core.wait_clipboard_observation()).await?;
         core.shutdown_actions().await
     }
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn watcher_classification_is_independent_of_paused_disabled_and_offline_policy()
     -> Result<()> {
@@ -7629,6 +7649,7 @@ mod tests {
         }
         Ok(())
     }
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn automatic_formats_image_only_text_recipients_are_silent() -> Result<()> {
         let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
@@ -7673,6 +7694,7 @@ mod tests {
         core.shutdown_actions().await?;
         Ok(())
     }
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn automatic_formats_sensitive_policy_gates_every_representation() -> Result<()> {
         let (_dir, core, image_peer) = fixture(Arc::new(NoActions)).await?;
@@ -7717,6 +7739,7 @@ mod tests {
         core.shutdown_actions().await?;
         Ok(())
     }
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn automatic_formats_image_policy_and_text_aliases_follow_frozen_offer() -> Result<()> {
         let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
@@ -7752,6 +7775,7 @@ mod tests {
         core.shutdown_actions().await?;
         Ok(())
     }
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn automatic_formats_resuming_or_connecting_cannot_expand_frozen_recipients() -> Result<()>
     {
@@ -8089,6 +8113,7 @@ mod tests {
         core.shutdown_actions().await?;
         Ok(())
     }
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn clipboard_observation_ignores_paused_offers_during_slow_reads() -> Result<()> {
         let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
@@ -8906,6 +8931,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(3), server).await???;
         Ok(())
     }
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn disk_full_on_flush_nacks_and_retains_cache_without_receipt() -> Result<()> {
         let dir = crate::test_support::scratch()?;
@@ -9087,6 +9113,7 @@ mod tests {
             source_media_id: None,
         }
     }
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn canceled_chunk_flush_retains_cleanup_ownership() -> Result<()> {
         use std::io::Read;
@@ -11062,6 +11089,8 @@ mod tests {
         Ok((dir, core, connected, offline, close))
     }
 
+    // The send window handoff needs the UI child; macOS gains it in the M2 slice.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn desktop_handoff_rejections_notify_even_when_the_cli_cannot_show_errors() -> Result<()>
     {
@@ -11311,6 +11340,8 @@ mod tests {
         Ok(())
     }
 
+    // The send window handoff needs the UI child; macOS gains it in the M2 slice.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn desktop_cli_exits_before_admission_but_window_recent_keeps_failures() -> Result<()> {
         use crate::ipc::Command;

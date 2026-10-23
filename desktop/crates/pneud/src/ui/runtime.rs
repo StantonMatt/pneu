@@ -14,6 +14,11 @@ use tokio::{
     sync::{mpsc, watch},
 };
 
+/// UI request capability seam; the Linux desktop backend is available.
+pub(crate) fn require_ui() -> Result<()> {
+    Ok(())
+}
+
 pub async fn run(
     core: Arc<Core>,
     actions: Arc<DesktopActions>,

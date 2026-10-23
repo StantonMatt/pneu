@@ -312,6 +312,9 @@ impl Phone {
         encode_frame(&Message::Clipboard(text.clone()))?;
         // Independent simulator commands share this small persistent clock.
         // Lock a separate file so atomic replacement cannot change the lock inode.
+        #[cfg(target_os = "macos")]
+        let lock = crate::platform::private::open(&self.directory.join("clipboard-clock.lock"))?;
+        #[cfg(not(target_os = "macos"))]
         let lock = std::fs::File::from(rustix::fs::open(
             self.directory.join("clipboard-clock.lock"),
             rustix::fs::OFlags::CREATE
@@ -1071,11 +1074,13 @@ mod tests {
             tokio::time::advance(Duration::from_secs(20)).await;
             tokio::time::resume();
         }
-        assert!(
-            matches!(futures_util::poll!(read.as_mut()), std::task::Poll::Ready(Err(error))
-                if error.to_string() == "PC read deadline"),
-            "PING traffic extended the original read deadline"
-        );
+        // Darwin's timer driver may need another runtime turn after resume.
+        // Await a bounded wake instead of assuming one manual poll has already
+        // processed the timer. A renewed 60-second deadline still fails here.
+        let result = tokio::time::timeout(Duration::from_secs(1), read.as_mut())
+            .await
+            .context("PING traffic extended the original read deadline")?;
+        assert_eq!(result.unwrap_err().to_string(), "PC read deadline");
         drop(read);
         connection.close().await?;
         tokio::time::timeout(Duration::from_secs(10), pc).await???;

@@ -2856,3 +2856,96 @@ fn manual_changed_image_bytes_are_rejected_before_clocking() {
     assert!(model.published.is_empty());
     assert!(model.replies[&20].1.is_some());
 }
+
+#[test]
+fn marker_read_observation_keeps_recipients_frozen_across_policy_expansion() {
+    let mut model = Compositor::default();
+    // The macOS watcher must capture this before its marker subprocess, exactly
+    // as Wayland captures policy before reading an offered secret-hint marker.
+    model.event(Event::Observe {
+        token: 20,
+        id: id(20),
+        offer: Some(offer(20, &[2])),
+        origin: false,
+        clear: false,
+    });
+    model.event(Event::Policy {
+        allowed: offer(20, &[2, 3]).recipients,
+    });
+    model.event(Event::Read {
+        token: 20,
+        content: Some(content("human copy before peer 3 connected")),
+        fingerprints: Vec::new(),
+        debounce: false,
+    });
+    model.settle();
+    assert_eq!(model.published.len(), 1);
+    let recipients = &model.published[0].offer.as_ref().unwrap().recipients;
+    assert_eq!(recipients.len(), 1);
+    assert_eq!(recipients[0].target.device, id(2));
+    assert!(model.state.idle());
+}
+
+#[test]
+fn discarded_reader_then_manager_echo_releases_incoming_install_without_read_timeout() {
+    let mut model = Compositor::default();
+    model.event(Event::Submit(remote(10, 2, 100, "received")));
+    model.settle();
+    for token in [20, 30] {
+        model.event(Event::Observe {
+            token,
+            id: id(token as u8),
+            offer: Some(offer(token, &[2, 3])),
+            origin: false,
+            clear: false,
+        });
+    }
+    assert_eq!(model.state.held_observations.len(), 1);
+    // Reaping reader 20 must also retire its held actor observation. Completing
+    // only the manager echo at 30 would retain 20 until the six-second timeout.
+    model.event(Event::AbandonRead(20));
+    model.event(Event::Read {
+        token: 30,
+        content: Some(content("received")),
+        fingerprints: Vec::new(),
+        debounce: false,
+    });
+    model.event(Event::Submit(remote(40, 3, 200, "next incoming")));
+    model.settle(); // this model never fires ReadTimeout implicitly
+    assert!(model.state.held_observations.is_empty());
+    assert!(model.read_timeouts.is_empty());
+    assert!(model.state.idle());
+    assert_eq!(model.os, Some(content("next incoming")));
+    assert!(model.published.is_empty());
+    model.consistent();
+}
+
+#[test]
+fn confirmed_marker_retires_provisional_observation_without_a_local_clock() {
+    // A watcher may first see the selection after an authorized write,
+    // including on restart. Initial marker reads carry no recipients.
+    for initial in [false, true] {
+        let mut model = Compositor::default();
+        model.event(Event::Submit(remote(10, 2, 100, "received")));
+        while !matches!(model.pending.front(), Some(Event::Installed(_))) {
+            assert!(model.tick());
+        }
+        let ticket = model.state.installing.as_ref().unwrap().ticket;
+        model.event(Event::Observe {
+            token: 20,
+            id: id(20),
+            offer: (!initial).then(|| offer(20, &[2, 3])),
+            origin: false,
+            clear: false,
+        });
+        assert!(model.state.confirms_install(ticket));
+        model.tick(); // independent watcher confirms the authorized install
+        model.event(Event::AbandonRead(20));
+        model.settle();
+        assert!(model.read_timeouts.is_empty());
+        assert!(model.state.idle());
+        assert_eq!(model.state.register.as_ref().unwrap().hlc, 100);
+        assert!(model.published.is_empty());
+        model.consistent();
+    }
+}

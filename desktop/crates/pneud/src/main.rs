@@ -7,6 +7,15 @@ use pneud::{
 use std::sync::Arc;
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(target_os = "macos")]
+    if args.first().is_some_and(|s| s == "pasteboard-read") {
+        anyhow::ensure!(args.len() == 3, "pasteboard-read expects count and mode");
+        anyhow::ensure!(
+            matches!(args[2].as_str(), "marker" | "payload"),
+            "invalid reader mode"
+        );
+        return pneud::ui::clipboard::read_helper(args[1].parse()?, args[2] == "marker");
+    }
     if args.first().is_some_and(|s| s == "clipboard-helper") {
         return pneud::actions::clipboard_helper(
             args.get(1).context("MIME argument")?.clone(),
@@ -146,6 +155,7 @@ async fn async_main(args: Vec<String>) -> Result<()> {
 async fn run(paths: Paths) -> Result<()> {
     // Claim IPC before loading/recovering the data store, so a second daemon
     // cannot recover staging files owned by the running instance.
+    paths.prepare_runtime()?;
     let (ipc_listener, _instance_lock) = ipc::bind(&paths.socket)?;
     async {
         paths.prepare()?;

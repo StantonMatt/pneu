@@ -13,5 +13,11 @@ pub(crate) fn scratch() -> anyhow::Result<tempfile::TempDir> {
         .unwrap_or_else(std::env::temp_dir);
     let base = cache.join("agent-scratch/pneu/tests");
     std::fs::create_dir_all(&base)?;
-    Ok(tempfile::tempdir_in(base)?)
+    let dir = tempfile::tempdir_in(base)?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(dir)
 }
