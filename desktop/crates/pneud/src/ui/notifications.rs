@@ -129,7 +129,11 @@ impl Notice {
         n
     }
     pub fn unpaired(device: &str) -> Self {
-        let mut n = Self::new(format!("{} unpaired this computer", label(device)));
+        let mut n = Self::new(format!(
+            "{} unpaired {}",
+            label(device),
+            super::window::this_computer()
+        ));
         n.actions.push(("pair", "Add Device…"));
         n
     }
@@ -339,7 +343,11 @@ mod tests {
         assert!(!failed.transient);
         assert_eq!(
             Notice::unpaired("Office-PC").summary,
-            "Office-PC unpaired this computer"
+            if cfg!(target_os = "macos") {
+                "Office-PC unpaired this Mac"
+            } else {
+                "Office-PC unpaired this computer"
+            }
         );
     }
     #[test]

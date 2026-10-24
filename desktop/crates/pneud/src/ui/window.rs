@@ -5,8 +5,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -18,7 +20,7 @@ use std::{
 slint::slint! {
     export {
         PneuWindow, Ui, WindowFocus, Page, Dialog, CodeState, DeviceItem, RecentItem, SettingItem,
-        PickItem, RecipientItem, Message, Summary, Tone, Tube, LinkState, LinkTile
+        PickItem, RecipientItem, Message, Summary, Tone, Tube, LinkState, LinkTile, DropItem, DropGeometry
     } from "../../ui/window.slint";
 }
 
@@ -174,6 +176,15 @@ impl PartialEq for View {
 enum Action {
     Scoped(View, Box<Action>),
     Close,
+    #[cfg(target_os = "macos")]
+    Native(super::macos::native::MenuAction),
+    #[cfg(target_os = "macos")]
+    DropFiles {
+        files: Vec<PathBuf>,
+        targets: Vec<contract::CapturedTarget>,
+        origin: View,
+        targeted: bool,
+    },
     Navigated,
     Folder,
     Unpair(String),
@@ -191,6 +202,8 @@ enum Action {
     SetMode(i32),
     SetFlag(String, bool),
     Rename(String),
+    Login(bool),
+    SystemSettings(String),
     ShowCode,
     NewCode,
     PasteLink(String),
@@ -478,8 +491,8 @@ fn summary(peers: &[Peer], transfers: &[Transfer]) -> SummaryData {
         (
             "Pairing lost".to_owned(),
             match peers {
-                [one] => format!("{} doesn't recognize this computer", one.name),
-                _ => format!("{total} devices don't recognize this computer"),
+                [one] => format!("{} doesn't recognize {}", one.name, this_computer()),
+                _ => format!("{total} devices don't recognize {}", this_computer()),
             },
         )
     } else if let [one] = peers {
@@ -557,7 +570,7 @@ fn device_summary(peer: &Peer) -> (SummaryData, &'static str) {
         ),
         Health::Lost => (
             "Pairing lost".into(),
-            format!("{} doesn't recognize this computer", peer.name),
+            format!("{} doesn't recognize {}", peer.name, this_computer()),
         ),
         Health::Mismatch => (
             "Pairing lost".into(),
@@ -1010,30 +1023,49 @@ struct Code {
 }
 
 pub fn run(paths: Paths) -> Result<()> {
-    // Prefer Qt/native; selecting winit is an explicit fallback for Qt-less builds.
-    use slint::winit_030::winit::{
-        platform::startup_notify::WindowAttributesExtStartupNotify, window::ActivationToken,
-    };
-    // Slint applies this hook at adapter creation, not during later hide/show.
-    // Notification activation therefore starts a fresh supervised window process.
-    let startup_activation = std::cell::RefCell::new(std::env::var("XDG_ACTIVATION_TOKEN").ok());
     let startup_request = std::env::var("PNEU_WINDOW_REQUEST")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|request| request & 1 == 0)
         .unwrap_or(0);
-    slint::BackendSelector::new()
-        .with_winit_window_attributes_hook(move |attributes| {
-            if let Some(token) = startup_activation.borrow_mut().take() {
-                attributes.with_activation_token(ActivationToken::from_raw(token))
-            } else {
-                attributes
-            }
-        })
-        .select()?;
-    slint::set_xdg_app_id("pneu")?;
+    #[cfg(target_os = "linux")]
+    {
+        use slint::winit_030::winit::{
+            platform::startup_notify::WindowAttributesExtStartupNotify, window::ActivationToken,
+        };
+        let startup_activation =
+            std::cell::RefCell::new(std::env::var("XDG_ACTIVATION_TOKEN").ok());
+        slint::BackendSelector::new()
+            .with_winit_window_attributes_hook(move |attributes| {
+                if let Some(token) = startup_activation.borrow_mut().take() {
+                    attributes.with_activation_token(ActivationToken::from_raw(token))
+                } else {
+                    attributes
+                }
+            })
+            .select()?;
+        slint::set_xdg_app_id("pneu")?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use slint::winit_030::{
+            EventLoopBuilder,
+            winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS},
+        };
+        let mut builder: EventLoopBuilder =
+            slint::winit_030::winit::event_loop::EventLoop::with_user_event();
+        builder
+            .with_activation_policy(ActivationPolicy::Accessory)
+            .with_default_menu(false);
+        slint::BackendSelector::new()
+            .backend_name("winit".into())
+            .with_winit_event_loop_builder(builder)
+            .select()?;
+    }
     let window = PneuWindow::new()?;
-    let visible = Arc::new(AtomicBool::new(true));
+    let visible = Arc::new(AtomicBool::new(
+        cfg!(target_os = "linux") || startup_request != 0,
+    ));
     let focused = Arc::new(AtomicBool::new(false));
     let view = Arc::new(Mutex::new(View::default()));
     let focus = focused.clone();
@@ -1047,6 +1079,16 @@ pub fn run(paths: Paths) -> Result<()> {
         let _ = c.send(Action::Close);
         slint::CloseRequestResponse::KeepWindowShown
     });
+    #[cfg(target_os = "macos")]
+    {
+        window.global::<Ui>().set_is_mac(true);
+        let commands_for_drop = commands.clone();
+        let commands = commands.clone();
+        super::macos::native::install(&window, paths.cache.clone(), move |action| {
+            let _ = commands.send(Action::Native(action));
+        })?;
+        install_drop(&window, &view, &commands_for_drop);
+    }
     let weak = window.as_weak();
     let worker = std::thread::Builder::new().name("pneu-window-ipc".into()).stack_size(8 * 1024 * 1024).spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1089,11 +1131,222 @@ pub fn run(paths: Paths) -> Result<()> {
         }));
     });
     let worker = worker.context("start window IPC thread")?;
+    #[cfg(target_os = "linux")]
     window.show()?;
+    #[cfg(target_os = "macos")]
+    if startup_request != 0 {
+        window.show()?;
+        let weak = window.as_weak();
+        slint::Timer::single_shot(Duration::ZERO, move || {
+            if let Some(w) = weak.upgrade() {
+                super::macos::native::activate(&w);
+            }
+        });
+    }
+    #[cfg(target_os = "macos")]
+    slint::Timer::single_shot(Duration::ZERO, || {
+        if let Err(error) = super::macos::native::ready() {
+            eprintln!("pneud: UI readiness: {error:#}");
+            let _ = slint::quit_event_loop();
+        }
+    });
     slint::run_event_loop_until_quit()?;
+    #[cfg(target_os = "macos")]
+    super::macos::native::cleanup();
     drop(window);
+    drop(commands);
     let _ = worker.join();
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn install_drop(
+    window: &PneuWindow,
+    view: &Arc<Mutex<View>>,
+    commands: &tokio::sync::mpsc::UnboundedSender<Action>,
+) {
+    use slint::winit_030::{EventResult, WinitWindowAccessor};
+    struct DropSession {
+        origin: View,
+        targets: Vec<Vec<contract::CapturedTarget>>,
+        enabled: Vec<bool>,
+    }
+    impl DropSession {
+        fn enabled_now(&self, window: &PneuWindow) -> Vec<bool> {
+            let peers = window.global::<Ui>().get_devices();
+            self.enabled
+                .iter()
+                .enumerate()
+                .map(|(index, enabled)| {
+                    *enabled
+                        && super::drop_target::has_connected_target(
+                            self.targets[index]
+                                .iter()
+                                .map(|target| target.device.as_str()),
+                            |id| {
+                                peers
+                                    .iter()
+                                    .any(|peer| peer.id.as_str() == id && peer.connected)
+                            },
+                        )
+                })
+                .collect()
+        }
+        fn hit(&self, window: &PneuWindow, point: (f64, f64)) -> Option<usize> {
+            let enabled = self.enabled_now(window);
+            let ui = window.global::<Ui>();
+            let mut items = ui.get_drop_items().iter().collect::<Vec<_>>();
+            for (item, enabled) in items.iter_mut().zip(&enabled) {
+                item.enabled = *enabled;
+            }
+            sync(ui.get_drop_items(), &items);
+            let g = window.get_drop_geometry();
+            super::drop_target::hit(
+                super::drop_target::Geometry {
+                    x: g.x as f64,
+                    y: g.y as f64,
+                    width: g.width as f64,
+                    height: g.height as f64,
+                    scroll: g.scroll as f64,
+                    row_height: 56.0,
+                },
+                point,
+                &enabled,
+            )
+        }
+    }
+    let session = std::rc::Rc::new(std::cell::RefCell::new(None::<DropSession>));
+    let pending = session.clone();
+    let weak = window.as_weak();
+    let frame = view.clone();
+    let begin = std::rc::Rc::new(move || {
+        let Some(w) = weak.upgrade() else {
+            return false;
+        };
+        let ui = w.global::<Ui>();
+        if ui.get_dialog() != Dialog::None || !super::macos::native::accepts_drop() {
+            return false;
+        }
+        let origin = frame.lock().expect("drop frame").clone();
+        let bindings = origin.targets.clone().unwrap_or_default();
+        let all =
+            contract::resolve_files(&bindings, crate::file_recipients::Selection::ConnectedOnly)
+                .unwrap_or_default();
+        let mut targets = vec![all];
+        let mut labels = vec![DropItem {
+            name: "All connected devices".into(),
+            enabled: !targets[0].is_empty(),
+        }];
+        for device in ui.get_devices().iter() {
+            let authority = bindings
+                .iter()
+                .find(|t| t.device == device.id.as_str())
+                .and_then(|t| {
+                    Some(contract::CapturedTarget {
+                        device: t.device.clone(),
+                        generation: t.generation,
+                        fingerprint: t.fingerprint.clone()?,
+                    })
+                });
+            labels.push(DropItem {
+                name: device.name,
+                enabled: device.connected && authority.is_some(),
+            });
+            targets.push(authority.into_iter().collect());
+        }
+        let enabled = labels.iter().map(|l| l.enabled).collect();
+        ui.set_drop_items(ModelRc::new(VecModel::from(labels)));
+        ui.set_drop_active(true);
+        *pending.borrow_mut() = Some(DropSession {
+            origin,
+            targets,
+            enabled,
+        });
+        true
+    });
+    let pending = session.clone();
+    let weak = window.as_weak();
+    let hover = std::rc::Rc::new(move |point| {
+        let Some(w) = weak.upgrade() else {
+            return false;
+        };
+        let selected = pending
+            .borrow()
+            .as_ref()
+            .filter(|_| w.global::<Ui>().get_drop_active())
+            .and_then(|s| s.hit(&w, point));
+        w.global::<Ui>()
+            .set_drop_hover(selected.map(|i| i as i32).unwrap_or(-1));
+        selected.is_some()
+    });
+    let pending = session.clone();
+    let weak = window.as_weak();
+    let frame = view.clone();
+    let output = commands.clone();
+    let drop = std::rc::Rc::new(move |point, files: Vec<PathBuf>| {
+        let Some(w) = weak.upgrade() else {
+            return false;
+        };
+        let Some(session) = pending.borrow_mut().take() else {
+            return false;
+        };
+        if !w.global::<Ui>().get_drop_active()
+            || files.is_empty()
+            || files.len() > 128
+            || *frame.lock().expect("drop frame") != session.origin
+        {
+            return false;
+        }
+        let Some(index) = session.hit(&w, point) else {
+            return false;
+        };
+        let Some(targets) = session.targets.get(index).filter(|t| !t.is_empty()) else {
+            return false;
+        };
+        let peers = w.global::<Ui>().get_devices();
+        let targets = targets
+            .iter()
+            .filter(|target| {
+                peers
+                    .iter()
+                    .any(|peer| peer.id.as_str() == target.device.as_str() && peer.connected)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return false;
+        }
+        output
+            .send(Action::DropFiles {
+                files,
+                targets,
+                origin: session.origin,
+                targeted: index != 0,
+            })
+            .is_ok()
+    });
+    let weak = window.as_weak();
+    let cancel = std::rc::Rc::new(move || {
+        session.borrow_mut().take();
+        if let Some(w) = weak.upgrade() {
+            let ui = w.global::<Ui>();
+            ui.set_drop_active(false);
+            ui.set_drop_hover(-1);
+        }
+    });
+    let callbacks = super::macos::drag::Callbacks {
+        begin,
+        hover,
+        drop,
+        cancel,
+    };
+    let weak = window.as_weak();
+    window.window().on_winit_window_event(move |_, _| {
+        if let Some(w) = weak.upgrade() {
+            super::macos::drag::install(&w, callbacks.clone());
+        }
+        EventResult::Propagate
+    });
 }
 
 #[derive(Clone)]
@@ -1161,6 +1414,11 @@ fn connect(
     ui.on_valid_name(|name| !name.trim().is_empty());
     ui.on_open_item(with(Action::Open));
     ui.on_rename(with(Action::Rename));
+    ui.on_system_settings(with(Action::SystemSettings));
+    let c = commands.clone();
+    ui.on_login(move |on| {
+        let _ = c.send(Action::Login(on));
+    });
     ui.on_paste_link(with(Action::PasteLink));
     ui.on_probed(with(Action::Probed));
     let c = commands.clone();
@@ -1262,6 +1520,7 @@ struct Worker {
     paired: Option<Paired>,
     peer_settings: Option<(String, Value, Instant)>,
     last_view: View,
+    requested_page: Option<Page>,
 }
 
 impl Worker {
@@ -1313,6 +1572,7 @@ impl Worker {
             lost: HashSet::new(),
             paired: None,
             peer_settings: None,
+            requested_page: None,
             last_view: View {
                 page: Page::Main,
                 ..Default::default()
@@ -1543,6 +1803,102 @@ impl Worker {
                 self.picker_files.clear();
                 self.picker_targets.clear();
             }
+            #[cfg(target_os = "macos")]
+            Action::DropFiles {
+                files,
+                targets,
+                origin,
+                targeted,
+            } => {
+                if self.view() == origin {
+                    let result = async {
+                        let targets = serde_json::from_value(serde_json::to_value(targets)?)?;
+                        self.command(ipc::Command::PresentPicker {
+                            paths: Some(files),
+                            targets,
+                            clipboard: false,
+                            targeted,
+                        })
+                        .await?;
+                        Ok::<_, anyhow::Error>(())
+                    }
+                    .await;
+                    if let Err(error) = result {
+                        self.fail("Couldn't send files", error);
+                    }
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Action::Native(action) => {
+                use super::macos::native::MenuAction;
+                let result = match action {
+                    MenuAction::Command(value) => match serde_json::from_value(value) {
+                        Ok(command) => self.command(command).await.map(|_| ()),
+                        Err(error) => Err(error.into()),
+                    },
+                    MenuAction::Send {
+                        recipients,
+                        targeted,
+                        clipboard,
+                    } => self
+                        .command(ipc::Command::PresentPicker {
+                            paths: None,
+                            targets: recipients,
+                            clipboard,
+                            targeted,
+                        })
+                        .await
+                        .map(|_| ()),
+                    MenuAction::Folder => {
+                        let folder = self.status["config"]["save_path"]
+                            .as_str()
+                            .map(PathBuf::from)
+                            .context("save folder");
+                        match folder {
+                            Ok(folder) => {
+                                let create = folder.clone();
+                                let created = tokio::task::spawn_blocking(move || {
+                                    crate::storage::Folder::open(&create, true)
+                                })
+                                .await;
+                                match created {
+                                    Ok(Ok(_anchor)) => {
+                                        let (send, receive) = tokio::sync::oneshot::channel();
+                                        match slint::invoke_from_event_loop(move || {
+                                            let _ =
+                                                send.send(super::macos::native::open_path(&folder));
+                                        }) {
+                                            Ok(()) => receive
+                                                .await
+                                                .map_err(anyhow::Error::from)
+                                                .and_then(|result| result),
+                                            Err(error) => Err(error.into()),
+                                        }
+                                    }
+                                    Ok(Err(error)) => Err(error),
+                                    Err(error) => Err(error.into()),
+                                }
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    MenuAction::Settings => {
+                        let result = self
+                            .command(ipc::Command::ShowWindow {
+                                choose_folder: false,
+                            })
+                            .await
+                            .map(|_| ());
+                        if result.is_ok() {
+                            self.requested_page = Some(Page::Settings);
+                        }
+                        result
+                    }
+                };
+                if let Err(error) = result {
+                    self.fail("Couldn't complete the menu action", error);
+                }
+            }
             Action::SendClipboard => {
                 let bindings = self
                     .origin
@@ -1628,9 +1984,44 @@ impl Worker {
                     self.open_job = Some(Box::pin(async move {
                         let path = row.path.as_ref().context("file path")?;
                         let file = recent_file(path)?;
-                        open_file_on(file, zbus::Connection::session().await?).await
+                        #[cfg(target_os = "linux")]
+                        {
+                            open_file_on(file, zbus::Connection::session().await?).await
+                        }
+                        #[cfg(target_os = "macos")]
+                        {
+                            open_recent(file).await
+                        }
                     }));
                 }
+            }
+            Action::Login(enabled) => {
+                #[cfg(target_os = "macos")]
+                {
+                    let (send, receive) = tokio::sync::oneshot::channel();
+                    let result = slint::invoke_from_event_loop(move || {
+                        let _ = send.send(super::macos::native::set_login(enabled));
+                    });
+                    let result = match result {
+                        Ok(()) => receive.await.map_err(anyhow::Error::from).and_then(|r| r),
+                        Err(error) => Err(error.into()),
+                    };
+                    if let Err(error) = result {
+                        self.fail("Couldn't change Open at Login", error);
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                let _ = enabled;
+            }
+            Action::SystemSettings(pane) => {
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = slint::invoke_from_event_loop(move || {
+                        let _ = super::macos::native::system_settings(&pane);
+                    });
+                }
+                #[cfg(target_os = "linux")]
+                let _ = pane;
             }
             Action::SetPeer(key, enabled) => {
                 let device = self.view().device;
@@ -1684,7 +2075,7 @@ impl Worker {
                 if !name.is_empty()
                     && let Err(error) = self.command(ipc::Command::Rename { name }).await
                 {
-                    self.fail("Couldn't rename this computer", error);
+                    self.fail(&format!("Couldn't rename {}", this_computer()), error);
                 }
             }
             Action::ShowCode => self.show_code(false).await,
@@ -2127,7 +2518,7 @@ impl Worker {
                 "ok",
             ),
             "own_code" => (
-                "That's this computer's own code".into(),
+                format!("That's {}'s own code", this_computer()),
                 "Use it on the other computer.".into(),
                 0,
                 "",
@@ -2412,6 +2803,14 @@ impl Worker {
         self.invitation_revision = value["invitation_revision"].as_u64().unwrap_or(0);
         self.transfers = snapshot.transfers.iter().map(Transfer::from).collect();
         self.snapshot = snapshot;
+        #[cfg(target_os = "macos")]
+        {
+            let snapshot = self.snapshot.clone();
+            let config = config.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                super::macos::native::update(snapshot, config)
+            });
+        }
         let initial_status = self.status.is_null();
         self.status = value;
         let saved_join = if initial_status || self.join.is_none() {
@@ -2461,10 +2860,18 @@ impl Worker {
             let choose_folder = current & 1 != 0;
             let preserve_send = !self.status["pending_send"].is_null()
                 && (self.picker_active || self.chooser.is_some());
+            let requested_page = self.requested_page.take();
             self.ui(move |w| {
+                #[cfg(target_os = "linux")]
                 if !initial_status {
                     let _ = w.hide();
                     let _ = w.show();
+                }
+                #[cfg(target_os = "macos")]
+                super::macos::native::activate(w);
+                if let Some(page) = requested_page {
+                    w.invoke_go(page);
+                    return;
                 }
                 // Reopening starts at the top: Add Device without devices, else
                 // the main page (or Settings for Choose Folder…).
@@ -2490,7 +2897,12 @@ impl Worker {
             return Ok(());
         }
         let view = self.view();
-        if first_run && view.page != Page::Add && view.page != Page::Code && self.paired.is_none() {
+        if first_run
+            && view.page != Page::Add
+            && view.page != Page::Code
+            && self.paired.is_none()
+            && !(cfg!(target_os = "macos") && view.page == Page::Settings)
+        {
             // Unpairing the last device returns to Add Device.
             self.ui(|w| w.invoke_open_add(0));
             return Ok(());
@@ -2863,6 +3275,14 @@ fn sync<T: Clone + PartialEq + 'static>(model: ModelRc<T>, items: &[T]) {
 
 // Peer names are labels, not paragraphs. Keep their bytes on the wire and in
 // storage unchanged while rendering all line separators as spaces in the window.
+pub(crate) fn this_computer() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "this Mac"
+    } else {
+        "this computer"
+    }
+}
+
 pub(crate) fn display_peer_text(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_whitespace() { ' ' } else { c })
@@ -2932,14 +3352,33 @@ fn recent_file(path: &Path) -> Result<crate::actions::ReceivedFile> {
         crate::storage::open_regular_file(path).map_err(|_| crate::actions::FileUnavailable)?;
     crate::actions::ReceivedFile::from_file(path.to_owned(), file)
 }
+#[cfg(target_os = "macos")]
+async fn open_recent(file: crate::actions::ReceivedFile) -> Result<()> {
+    super::macos::native::open_received_local(file).await
+}
+#[cfg(target_os = "macos")]
+pub async fn choose_folder(current: &Path) -> Result<Option<PathBuf>> {
+    Ok(
+        super::macos::native::choose("Choose Folder", true, Some(current))
+            .await?
+            .and_then(|paths| paths.into_iter().next()),
+    )
+}
+#[cfg(target_os = "macos")]
+pub async fn choose_files(title: &str) -> Result<Option<Vec<PathBuf>>> {
+    super::macos::native::choose(title, false, None).await
+}
+#[cfg(target_os = "linux")]
 async fn open_file_on(file: crate::actions::ReceivedFile, bus: zbus::Connection) -> Result<()> {
     crate::actions::begin_open_received_file(&file, &bus, None)
         .await?
         .await
 }
+#[cfg(target_os = "linux")]
 pub async fn choose_folder(current: &Path) -> Result<Option<PathBuf>> {
     choose_folder_on(zbus::Connection::session().await?, current).await
 }
+#[cfg(target_os = "linux")]
 async fn choose_folder_on(connection: zbus::Connection, current: &Path) -> Result<Option<PathBuf>> {
     use std::os::unix::ffi::OsStrExt;
     use zbus::zvariant::Value;
@@ -2972,9 +3411,11 @@ async fn choose_folder_on(connection: zbus::Connection, current: &Path) -> Resul
     ))
 }
 /// The system file picker (XDG portal); several files at once.
+#[cfg(target_os = "linux")]
 pub async fn choose_files(title: &str) -> Result<Option<Vec<PathBuf>>> {
     choose_files_on(zbus::Connection::session().await?, title).await
 }
+#[cfg(target_os = "linux")]
 async fn choose_files_on(
     connection: zbus::Connection,
     title: &str,
@@ -3464,6 +3905,33 @@ mod tests {
         );
         slint::platform::set_platform(Box::new(Headless(window.clone())))?;
         Ok(window)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn headless_native_refresh_and_activation_do_not_enter_appkit() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::headless_native_refresh_and_activation_do_not_enter_appkit",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        assert!(!window.window().is_visible());
+        super::super::macos::native::activate(&window);
+        super::super::macos::native::update(super::super::Snapshot::default(), Config::default());
+        assert!(!super::super::macos::native::reduced_motion());
+        assert!(!window.window().is_visible());
+        let picker = super::super::macos::native::choose("Headless test", false, None);
+        tokio::pin!(picker);
+        assert!(futures_util::poll!(picker.as_mut()).is_pending());
+        flush_ui();
+        assert!(picker.await.is_err());
+        super::super::macos::native::cleanup();
+        Ok(())
     }
 
     struct MockIpc {
@@ -5541,18 +6009,22 @@ mod tests {
             ),
         ]
     }
+    #[cfg(target_os = "linux")]
     struct Chooser(
         Arc<tokio::sync::Notify>,
         Arc<tokio::sync::Notify>,
         Arc<std::sync::atomic::AtomicU32>,
     );
+    #[cfg(target_os = "linux")]
     struct Request(Arc<tokio::sync::Notify>);
+    #[cfg(target_os = "linux")]
     #[zbus::interface(name = "org.freedesktop.portal.Request")]
     impl Request {
         fn close(&self) {
             self.0.notify_one();
         }
     }
+    #[cfg(target_os = "linux")]
     #[zbus::interface(name = "org.freedesktop.portal.FileChooser")]
     impl Chooser {
         async fn open_file(
@@ -5608,12 +6080,14 @@ mod tests {
             Ok(path.try_into().unwrap())
         }
     }
+    #[cfg(target_os = "linux")]
     struct OpenPortal {
         entered: Arc<tokio::sync::Notify>,
         closed: Arc<tokio::sync::Notify>,
         calls: Arc<std::sync::atomic::AtomicUsize>,
         observed: Arc<Mutex<(u64, Vec<u8>)>>,
     }
+    #[cfg(target_os = "linux")]
     #[zbus::interface(name = "org.freedesktop.portal.OpenURI")]
     impl OpenPortal {
         async fn open_file(
@@ -5648,6 +6122,7 @@ mod tests {
         }
     }
     #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn recent_open_keeps_polling_commands_and_close_responsive() -> Result<()> {
         if in_offscreen_child(
             "ui::window::tests::recent_open_keeps_polling_commands_and_close_responsive",
@@ -5823,6 +6298,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn missing_folder_response_does_not_block_polling_and_cancel_closes_portal() -> Result<()>
     {
         use tokio::io::AsyncBufReadExt;

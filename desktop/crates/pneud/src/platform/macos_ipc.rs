@@ -250,7 +250,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod ui_stub_tests {
+mod ui_capability_tests {
     use super::*;
     #[tokio::test]
     async fn ui_requests_report_unavailable_without_queuing_a_picker() -> Result<()> {
@@ -297,14 +297,56 @@ mod ui_stub_tests {
         ] {
             let error = request(&paths.socket, command).await.unwrap_err();
             assert!(
-                error
-                    .to_string()
-                    .contains("unavailable on this platform yet"),
+                error.to_string().contains("menu bar is unavailable"),
                 "{error}"
             );
         }
         let status = request(&paths.socket, Command::UiStatus).await?;
         assert!(status["pending_send"].is_null());
+        // A ready child enables the same pending-send handoff on M2. Simulate
+        // readiness only for this test-owned Core; no AppKit or pasteboard I/O.
+        core.ui_ready
+            .lock()
+            .unwrap()
+            .store(true, std::sync::atomic::Ordering::Release);
+        request(
+            &paths.socket,
+            Command::ShowWindow {
+                choose_folder: false,
+            },
+        )
+        .await?;
+        let recipient = crate::outbox::Authority {
+            device: pneu_proto::Id::from_bytes([42; 16]),
+            generation: 7,
+            fingerprint: pneu_proto::Hash::new("a".repeat(64))?,
+        };
+        let reply = request(
+            &paths.socket,
+            Command::PresentPicker {
+                paths: None,
+                targets: vec![recipient.clone()],
+                clipboard: false,
+                targeted: true,
+            },
+        )
+        .await?;
+        let status = request(&paths.socket, Command::UiStatus).await?;
+        assert_eq!(status["pending_send"]["id"], reply["request"]);
+        assert_eq!(
+            status["pending_send"]["targets"][0],
+            serde_json::to_value(recipient)?
+        );
+        assert!(status["pending_send"]["paths"].is_null());
+        core.ui_ready
+            .lock()
+            .unwrap()
+            .store(false, std::sync::atomic::Ordering::Release);
+        assert!(request(&paths.socket, Command::AddDevice).await.is_err());
+        assert_eq!(
+            request(&paths.socket, Command::UiStatus).await?["window_request"],
+            status["window_request"]
+        );
         stop.send_replace(true);
         serving.await??;
         core.shutdown_actions().await?;

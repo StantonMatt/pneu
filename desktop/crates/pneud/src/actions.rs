@@ -11,7 +11,6 @@ pub struct ArrivalSource {
     pub name: String,
     pub several: bool,
 }
-#[cfg(target_os = "linux")]
 impl ArrivalSource {
     fn file_notice(
         &self,
@@ -27,16 +26,13 @@ impl ArrivalSource {
         }
     }
 }
-#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub(crate) struct FileUnavailable;
-#[cfg(target_os = "linux")]
 impl std::fmt::Display for FileUnavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("The file was moved or deleted")
     }
 }
-#[cfg(target_os = "linux")]
 impl std::error::Error for FileUnavailable {}
 
 /// An anchored received file. Reads and notification Open use the retained
@@ -60,7 +56,6 @@ impl ReceivedFile {
         self.source = Some(source);
         self
     }
-    #[cfg(target_os = "linux")]
     fn notice(
         &self,
         notice: crate::ui::notifications::Notice,
@@ -103,6 +98,10 @@ impl ReceivedFile {
             "viewer descriptor changed identity"
         );
         Ok(descriptor)
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn viewer_descriptor(&self) -> Result<std::fs::File> {
+        Ok(self.file.try_clone()?)
     }
     pub fn read_bounded(&self, limit: usize) -> Result<Vec<u8>> {
         use std::os::unix::fs::FileExt;
@@ -302,6 +301,11 @@ impl PreparedClipboard {
 }
 #[async_trait]
 pub trait PcActions: Send + Sync {
+    #[cfg(target_os = "macos")]
+    async fn ui_test_notification(&self, _transient: bool) -> Result<u32> {
+        anyhow::bail!("UI test notifications unavailable")
+    }
+
     async fn clipboard_text(&self, text: &str) -> Result<()>;
     async fn clipboard_image(&self, path: &Path, mime: &str) -> Result<()>;
     async fn notify(&self, path: &Path, mime: &str) -> Result<()>;
@@ -348,6 +352,66 @@ pub trait PcActions: Send + Sync {
         file: &ReceivedFile,
     ) -> Result<crate::ui::portal::Interaction> {
         self.open_received(file).await?;
+        Ok(Box::pin(async { Ok(()) }))
+    }
+    /// Issue while the caller holds its authority gate; await the returned
+    /// acknowledgement only after releasing that gate. Synchronous backends
+    /// retain their existing completion semantics.
+    async fn begin_notify_copied_received(
+        &self,
+        file: &ReceivedFile,
+        mime: &str,
+    ) -> Result<crate::ui::portal::Interaction> {
+        self.notify_copied_received(file, mime).await?;
+        Ok(Box::pin(async { Ok(()) }))
+    }
+    async fn begin_notify_image_failure(
+        &self,
+        file: &ReceivedFile,
+        metadata: &pneu_proto::FileBegin,
+        saved: bool,
+    ) -> Result<crate::ui::portal::Interaction> {
+        self.notify_image_failure(file, metadata, saved).await?;
+        Ok(Box::pin(async { Ok(()) }))
+    }
+    async fn begin_notify_file_at(
+        &self,
+        file: &ReceivedFile,
+        metadata: &pneu_proto::FileBegin,
+        saved: bool,
+        save_error: Option<pneu_proto::NackCode>,
+        folder: &Path,
+        arrived: std::time::Instant,
+    ) -> Result<crate::ui::portal::Interaction> {
+        self.notify_file_at(file, metadata, saved, save_error, folder, arrived)
+            .await?;
+        Ok(Box::pin(async { Ok(()) }))
+    }
+    async fn begin_notify_text_from(
+        &self,
+        text: &str,
+        source: &ArrivalSource,
+    ) -> Result<crate::ui::portal::Interaction> {
+        self.notify_text_from(text, source).await?;
+        Ok(Box::pin(async { Ok(()) }))
+    }
+    async fn begin_notify_text_failure_from(
+        &self,
+        source: &ArrivalSource,
+    ) -> Result<crate::ui::portal::Interaction> {
+        self.notify_text_failure_from(source).await?;
+        Ok(Box::pin(async { Ok(()) }))
+    }
+    async fn begin_notify_save_failure_from(
+        &self,
+        metadata: &pneu_proto::FileBegin,
+        code: pneu_proto::NackCode,
+        destination: crate::ui::ReceiveDestination,
+        folder: &Path,
+        source: &ArrivalSource,
+    ) -> Result<crate::ui::portal::Interaction> {
+        self.notify_save_failure_from(metadata, code, destination, folder, source)
+            .await?;
         Ok(Box::pin(async { Ok(()) }))
     }
     async fn notify_clipboard_failure(&self) -> Result<()> {

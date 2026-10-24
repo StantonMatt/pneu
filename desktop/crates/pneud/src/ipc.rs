@@ -34,6 +34,18 @@ pub enum Command {
         targets: crate::outbox::Targets,
         request_id: Option<String>,
     },
+    #[cfg(target_os = "macos")]
+    UiTest {
+        action: String,
+    },
+    #[cfg(target_os = "macos")]
+    PresentPicker {
+        #[serde(default)]
+        paths: Option<Vec<std::path::PathBuf>>,
+        targets: Vec<crate::outbox::Authority>,
+        clipboard: bool,
+        targeted: bool,
+    },
     PresentSendError {
         message: String,
     },
@@ -150,6 +162,10 @@ impl Command {
     }
 
     fn requires_desktop(&self, choose_devices: bool) -> bool {
+        #[cfg(target_os = "macos")]
+        if matches!(self, Self::PresentPicker { .. } | Self::UiTest { .. }) {
+            return true;
+        }
         matches!(
             self,
             Self::AddDevice
@@ -326,12 +342,14 @@ async fn handle(core: Arc<Core>, stream: UnixStream) -> Result<()> {
     )?;
     let ask = core.config().choose_devices_each_time;
     let desktop_send = match &request {
+        #[cfg(target_os = "macos")]
+        Command::PresentPicker {..} => true,
         Command::PresentFiles {..} | Command::PresentSendError {..} => true,
         Command::SendFiles {targets,..} | Command::SendClipboard {targets} => !matches!(targets, crate::outbox::Targets::Captured(_)),
         _ => false,
     };
     let result: Result<serde_json::Value> = async {
-    request.check_desktop(ask, crate::ui::runtime::require_ui)?;
+    request.check_desktop(ask, || crate::ui::runtime::require_ui(&core))?;
     Ok(match request {
         Command::SendFiles{paths,targets,request_id} if ask && matches!(&targets, crate::outbox::Targets::All(_))=>core.present_files(paths,targets,request_id)?,
         Command::SendFiles{paths,targets,request_id}=>{
@@ -339,6 +357,18 @@ async fn handle(core: Arc<Core>, stream: UnixStream) -> Result<()> {
             core.send_files_request(paths,targets,request_id).await?
         },
         Command::PresentFiles{paths,targets,request_id}=>core.present_files(paths,targets,request_id)?,
+        #[cfg(target_os = "macos")]
+        Command::UiTest {action} => {
+            anyhow::ensure!(std::env::var_os("PNEU_UI_TEST").is_some(),"UI acceptance controls are disabled");
+            if action=="notify" || action=="notify-transient" {serde_json::json!({"notification":core.ui_test_notification(action=="notify-transient").await?})}
+            else if action=="open-test" {core.ui_test_open().await?;serde_json::Value::Null}
+            else {crate::ui::child_bridge::begin(crate::ui::child_bridge::Request::Test(action),None)?.await?;serde_json::Value::Null}
+        },
+        #[cfg(target_os = "macos")]
+        Command::PresentPicker {paths,targets,clipboard,targeted} => {
+            anyhow::ensure!(paths.as_ref().is_none_or(|paths|!clipboard && !paths.is_empty() && paths.len()<=128),"choose 1 to 128 files");
+            core.present_send(crate::ui::window::SendRequest {id:crate::random_hex(16),paths,targets,clipboard,targeted,error:None})?
+        },
         Command::PresentSendError{message}=>core.present_send_error(message)?,
         Command::AcknowledgeSend{request}=>{core.acknowledge_send(&request);serde_json::Value::Null},
         Command::OperationStatus{operation}=>core.operation_status(operation).await?,

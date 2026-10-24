@@ -14,3 +14,6 @@ mod macos;
 pub(crate) use macos::*;
 
 pub(crate) mod private;
+
+#[cfg(any(target_os = "macos", test))]
+pub mod macos_login;

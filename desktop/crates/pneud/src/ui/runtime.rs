@@ -15,7 +15,7 @@ use tokio::{
 };
 
 /// UI request capability seam; the Linux desktop backend is available.
-pub(crate) fn require_ui() -> Result<()> {
+pub(crate) fn require_ui(_core: &Core) -> Result<()> {
     Ok(())
 }
 

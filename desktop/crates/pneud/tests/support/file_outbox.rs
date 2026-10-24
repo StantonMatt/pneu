@@ -422,11 +422,18 @@ async fn outbox_cli_and_ipc_validate_paths_and_persist_settings() -> Result<()> 
         .await?;
     }
     // Untargeted IPC must hand off to a picker with the preference on, or
-    // reject before queuing any UI work on the headless M1 runtime.
+    // reject before queuing any UI work on the runtime without a ready UI child.
     #[cfg(target_os = "macos")]
     let ui_before_picker =
         pneud::ipc::request(&h.core.paths.socket, pneud::ipc::Command::UiStatus).await?;
     for command in [
+        #[cfg(target_os = "macos")]
+        pneud::ipc::Command::PresentPicker {
+            paths: None,
+            targets: Vec::new(),
+            clipboard: false,
+            targeted: false,
+        },
         pneud::ipc::Command::SendFiles {
             paths: vec![path.clone()],
             targets: all(),
@@ -447,7 +454,12 @@ async fn outbox_cli_and_ipc_validate_paths_and_persist_settings() -> Result<()> 
         let reply = pneud::ipc::request(&h.core.paths.socket, command).await;
         #[cfg(target_os = "macos")]
         {
-            assert!(reply.unwrap_err().to_string().contains("macOS M1"));
+            assert!(
+                reply
+                    .unwrap_err()
+                    .to_string()
+                    .contains("menu bar is unavailable")
+            );
             let status =
                 pneud::ipc::request(&h.core.paths.socket, pneud::ipc::Command::UiStatus).await?;
             assert!(status["pending_send"].is_null());
@@ -492,7 +504,12 @@ async fn outbox_cli_and_ipc_validate_paths_and_persist_settings() -> Result<()> 
     }
     #[cfg(target_os = "macos")]
     {
-        assert!(add_device.unwrap_err().to_string().contains("macOS M1"));
+        assert!(
+            add_device
+                .unwrap_err()
+                .to_string()
+                .contains("menu bar is unavailable")
+        );
         assert_eq!(ui["add_device"], false);
         assert_eq!(ui["window_request"], ui_before_picker["window_request"]);
     }
@@ -540,6 +557,8 @@ async fn desktop_send_parser_errors_reach_the_cli_or_window() -> Result<()> {
             pneud::ipc::request(&h.core.paths.socket, pneud::ipc::Command::UiStatus).await?;
         #[cfg(target_os = "macos")]
         {
+            // This harness deliberately starts IPC without a UI child. M2 must
+            // preserve the CLI cause while its real supervised UI is unavailable.
             assert!(!output.status.success());
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(stderr.contains(expected), "{stderr}");
@@ -601,11 +620,14 @@ async fn incoming_phone_progress_and_recent_are_scoped_to_each_device() -> Resul
     )
     .await?;
     until(|| {
-        h.core
-            .ui_snapshot()
-            .transfers
-            .iter()
-            .any(|t| t.device == q.identity.device_id && t.sent == 4)
+        // Independent connections may process their FileBegin frames in either
+        // order. Progress on b alone is not a barrier for a's begin frame.
+        let snapshot = h.core.ui_snapshot();
+        snapshot.transfers.len() == 2
+            && snapshot
+                .transfers
+                .iter()
+                .any(|t| t.device == q.identity.device_id && t.sent == 4)
     })
     .await?;
     let snapshot = h.core.ui_snapshot();

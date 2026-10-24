@@ -181,6 +181,27 @@ impl ActionScope {
             } => result,
         }
     }
+    /// Native notification submission is gated; its acknowledgement is not.
+    async fn notification<F, Fut>(&self, origin: &ActionOrigin, issue: F) -> Option<Result<()>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<crate::ui::portal::Interaction>>,
+    {
+        let mut cancelled = self.cancelled.subscribe();
+        let mut generation = self.generation_changed.subscribe();
+        let wait = match self.effect(origin, issue).await? {
+            Ok(wait) => wait,
+            Err(error) => return Some(Err(error)),
+        };
+        if !self.allows(origin) {
+            return None;
+        }
+        tokio::select! { biased;
+            _ = cancelled.changed() => None,
+            _ = generation.changed() => None,
+            result = wait => Some(result),
+        }
+    }
 }
 #[derive(Clone)]
 struct ActionOrigin {
@@ -929,6 +950,8 @@ struct PhoneWrites {
 /// Clone the Arc<Core> into a tray/window. Commands below are async; subscribe()
 /// returns a bounded broadcast stream (lagging UI consumers must resnapshot).
 pub struct Core {
+    #[cfg(target_os = "macos")]
+    pub(crate) ui_ready: Mutex<Arc<std::sync::atomic::AtomicBool>>,
     mesh: mesh::Mesh,
     transports: Arc<Semaphore>,
     ingress: Arc<Semaphore>,
@@ -1098,6 +1121,8 @@ impl Core {
             })),
             identity,
             file_admissions: Arc::default(),
+            #[cfg(target_os = "macos")]
+            ui_ready: Mutex::new(Arc::new(std::sync::atomic::AtomicBool::new(false))),
             paths,
             config,
             events,
@@ -1143,6 +1168,15 @@ impl Core {
                 clipboard_state,
             )));
         Ok(core)
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn ui_test_notification(&self, transient: bool) -> Result<u32> {
+        self.actions.ui_test_notification(transient).await
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn ui_test_open(&self) -> Result<()> {
+        let file = ReceivedFile::open(&self.paths.cache.join("Pneu test viewer.png"))?;
+        self.actions.open_received(&file).await
     }
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.events.subscribe()
@@ -2049,7 +2083,6 @@ impl Core {
                 focused.then_some((request, Instant::now()));
         }
     }
-    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn window_focused(&self) -> bool {
         let request = self.window_request.lock().expect("window request").0;
         self.window_focus
@@ -4550,9 +4583,9 @@ impl Core {
         if matches!(action, DesktopAction::CopyFailed) {
             if let Some(Err(error)) = job
                 .scope
-                .effect(&job.origin, || {
+                .notification(&job.origin, || {
                     self.actions
-                        .notify_image_failure(&job.file, &job.metadata, job.saved())
+                        .begin_notify_image_failure(&job.file, &job.metadata, job.saved())
                 })
                 .await
             {
@@ -4570,8 +4603,8 @@ impl Core {
             }
             if let Some(Err(error)) = job
                 .scope
-                .effect(&job.origin, || {
-                    self.actions.notify_file_at(
+                .notification(&job.origin, || {
+                    self.actions.begin_notify_file_at(
                         &job.file,
                         &metadata,
                         job.saved(),
@@ -4597,9 +4630,9 @@ impl Core {
             );
             let _ = job
                 .scope
-                .effect(&job.origin, || {
+                .notification(&job.origin, || {
                     self.actions
-                        .notify_image_failure(&job.file, &job.metadata, job.saved())
+                        .begin_notify_image_failure(&job.file, &job.metadata, job.saved())
                 })
                 .await;
             return;
@@ -4681,9 +4714,9 @@ impl Core {
         {
             let _ = job
                 .scope
-                .effect(&job.origin, || {
+                .notification(&job.origin, || {
                     self.actions
-                        .notify_image_failure(&job.file, &job.metadata, job.saved())
+                        .begin_notify_image_failure(&job.file, &job.metadata, job.saved())
                 })
                 .await;
         }
@@ -4692,9 +4725,9 @@ impl Core {
             && job.config.notification_preview
             && let Some(Err(e)) = job
                 .scope
-                .effect(&job.origin, || {
+                .notification(&job.origin, || {
                     self.actions
-                        .notify_copied_received(&job.file, &job.metadata.mime)
+                        .begin_notify_copied_received(&job.file, &job.metadata.mime)
                 })
                 .await
         {
@@ -4745,10 +4778,10 @@ async fn run_receipt_notice(core: &Core, job: &ReceiptJob, stop: &mut watch::Rec
         return;
     }
     let source = core.arrival_source(&job.origin.device);
-    let effect = job.scope.effect(&job.origin, || async {
+    let effect = job.scope.notification(&job.origin, || async {
         match &job.notice {
-            ReceiptNotice::Text(text) => core.actions.notify_text_from(text, &source).await,
-            ReceiptNotice::TextFailed => core.actions.notify_text_failure_from(&source).await,
+            ReceiptNotice::Text(text) => core.actions.begin_notify_text_from(text, &source).await,
+            ReceiptNotice::TextFailed => core.actions.begin_notify_text_failure_from(&source).await,
             ReceiptNotice::SaveFailed {
                 metadata,
                 code,
@@ -4756,7 +4789,7 @@ async fn run_receipt_notice(core: &Core, job: &ReceiptJob, stop: &mut watch::Rec
                 folder,
             } => {
                 core.actions
-                    .notify_save_failure_from(metadata, *code, *destination, folder, &source)
+                    .begin_notify_save_failure_from(metadata, *code, *destination, folder, &source)
                     .await
             }
         }
@@ -5915,6 +5948,48 @@ mod tests {
                 std::future::pending().await
             }))
         }
+    }
+    #[tokio::test]
+    async fn notification_ack_releases_the_authority_gate_and_revocation_cancels_wait() -> Result<()>
+    {
+        let scope = ActionScope::new();
+        let origin = ActionOrigin {
+            mesh: false,
+            device: Id::new("11".repeat(16))?,
+            connection_id: Some(0),
+        };
+        let issued = Arc::new(tokio::sync::Notify::new());
+        let alive = Arc::new(AtomicU64::new(1));
+        let task = {
+            let scope = scope.clone();
+            let origin = origin.clone();
+            let issued = issued.clone();
+            let alive = alive.clone();
+            tokio::spawn(async move {
+                scope
+                    .notification(&origin, || async move {
+                        let lifetime = ViewerLifetime(alive);
+                        issued.notify_one();
+                        Ok(Box::pin(async move {
+                            let _lifetime = lifetime;
+                            std::future::pending().await
+                        }) as crate::ui::portal::Interaction)
+                    })
+                    .await
+            })
+        };
+        issued.notified().await;
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            scope.effect(&origin, || async { 42 }),
+        )
+        .await?
+        .unwrap();
+        assert_eq!(alive.load(Ordering::SeqCst), 1);
+        scope.cancelled.send_replace(true);
+        assert!(task.await?.is_none());
+        assert_eq!(alive.load(Ordering::SeqCst), 0);
+        Ok(())
     }
     #[tokio::test(start_paused = true)]
     async fn viewer_wait_releases_gate_is_bounded_and_cancels_on_revocation_and_shutdown()
@@ -11089,8 +11164,6 @@ mod tests {
         Ok((dir, core, connected, offline, close))
     }
 
-    // The send window handoff needs the UI child; macOS gains it in the M2 slice.
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn desktop_handoff_rejections_notify_even_when_the_cli_cannot_show_errors() -> Result<()>
     {
@@ -11120,6 +11193,11 @@ mod tests {
         for n in 0..16 {
             core.present_send_error(format!("pending {n}"))?;
         }
+        #[cfg(target_os = "macos")]
+        core.ui_ready
+            .lock()
+            .unwrap()
+            .store(true, std::sync::atomic::Ordering::Release);
         let (listener, _owner) = crate::ipc::bind(&core.paths.socket)?;
         let (stop, stopped) = watch::channel(false);
         let ipc = tokio::spawn(crate::ipc::serve(core.clone(), listener, stopped));
@@ -11340,13 +11418,16 @@ mod tests {
         Ok(())
     }
 
-    // The send window handoff needs the UI child; macOS gains it in the M2 slice.
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn desktop_cli_exits_before_admission_but_window_recent_keeps_failures() -> Result<()> {
         use crate::ipc::Command;
         use crate::outbox::Targets;
         let (dir, core, connected, _, _close) = file_recipient_fixture().await?;
+        #[cfg(target_os = "macos")]
+        core.ui_ready
+            .lock()
+            .unwrap()
+            .store(true, std::sync::atomic::Ordering::Release);
         let (listener, _owner) = crate::ipc::bind(&core.paths.socket)?;
         let (stop, stopped) = watch::channel(false);
         let ipc = tokio::spawn(crate::ipc::serve(core.clone(), listener, stopped));

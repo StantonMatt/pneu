@@ -1,9 +1,116 @@
-# macOS daemon (M1)
+# macOS
 
-M1 runs `pneud run` headless on macOS 15.4 or later. It uses the same Core,
-TLS transport, pairing, file outbox, receipt store and clipboard actor as Linux.
-A native Rust build is required. No `.app`, LaunchAgent, login item, menu bar,
-window, picker, notification delivery or camera scanner is installed by M1.
+Pneu runs on macOS 15.4 or later. The headless `pneud run` daemon owns Core,
+TLS transport, pairing, file admission, receipt storage and the clipboard actor.
+One supervised `pneud ui-window` child hosts the native menu bar, notifications,
+file pickers and shared Slint window using winit. Closing the window keeps the
+menu bar and transfers running. Camera QR scanning is a later slice.
+
+## Install
+
+M2 packages the native daemon and its supervised UI child as an ad-hoc-signed
+`Pneu.app` (macOS 15.4 or later). Run from the `desktop` directory on the Mac:
+
+```sh
+export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$HOME/.local/bin:$PATH"
+./install-macos.sh
+```
+
+This builds a release bundle through `heavy`, installs it at
+`~/Applications/Pneu.app`, links `~/.local/bin/pneud` to its executable, and
+starts Pneu. Add `~/.local/bin` to PATH to use the CLI. Re-running the installer
+upgrades the bundle after stopping the session LaunchAgent and waiting for the
+daemon and UI child to exit. It preserves the Open at login setting.
+`./install-macos.sh --system` selects `/Applications`; run as your logged-in
+user with write access to that directory, never with `sudo`.
+
+Install, upgrade and uninstall check every process named `pneud` owned by the
+current user, including foreground daemons and instances using custom paths.
+They refuse to replace the bundle or delete state while any unmanaged Pneu
+process remains. Stop a foreground `pneud run` with Ctrl-C and retry. These
+scripts never signal an unmanaged process; an unrelated executable also named
+`pneud` must finish before installation can proceed.
+
+Open Pneu from Finder or Spotlight to show its window. A no-argument launch
+requests `ShowWindow` from the running daemon, or starts a session LaunchAgent
+and then shows the window. `pneud run` remains the foreground daemon command.
+Malformed configuration produces a startup error and does not enter a restart
+loop. Daemon startup errors are recorded at `run/pneud.log` beside its IPC socket;
+opening the app also presents startup errors in a dialog.
+
+**Open at login** under **Settings → This Mac** defaults to on at the first
+installation/open. It uses `SMAppService.mainAppService`, independently of the
+current session's daemon. Turning it off leaves Pneu running; reopening the
+app keeps the setting off. Turning it on registers the app for future logins.
+The bundle’s `PneuLoginItemInitialized` macOS preference records that its
+one-time default has been applied. Subsequent opens respect changes made in
+System Settings, including when Finder uses different paths from a shell.
+Registration can display a “background item added” notification. If approval is required,
+allow Pneu in **System Settings → General → Login Items**. Inspect/change it with:
+
+```sh
+pneud login-item status
+pneud login-item register
+pneud login-item unregister
+```
+
+The daemon uses a separate LaunchAgent bootstrapped only into the current
+`gui/<uid>` session. Its private plist is `run/daemon-session.plist`; it is never
+placed in `~/Library/LaunchAgents` or registered through SMAppService. Logout
+removes the job from launchd. After a stopped app is moved, startup reloads a
+session job whose old executable is missing. A running job or another live
+bundle is retained and startup reports the conflict. Only the main app's login item can recreate it at
+the next login. `KeepAlive { Crashed: true }` restarts signal crashes, while
+ordinary nonzero exits (including configuration errors) remain stopped.
+Both KeepAlive itself and SuccessfulExit imply RunAtLoad according to
+`man launchd.plist`, so removing an explicit RunAtLoad key from a persistent
+agent would not implement the off setting. The session-only agent intentionally
+uses RunAtLoad; login startup belongs exclusively to the main app.
+
+Build without installing or registering anything:
+
+```sh
+./packaging/macos/build-app.sh --profile debug --out "$HOME/Developer/pneu-build/bundles"
+codesign --verify --strict "$HOME/Developer/pneu-build/bundles/Pneu.app"
+```
+
+Use `--profile release` for an optimized build. Packaging creates `AppIcon.icns`
+with `iconutil` from `assets/macos/AppIcon.iconset`, copies `assets/macos/menubar-*.png`
+images (including Retina variants) into `Resources/menubar/pneu-tray-*.png`, lints
+the Info.plist and daemon template (`Resources/daemon.plist.in`), signs ad-hoc
+with the hardened runtime, and verifies the signature. The executable renders
+the session plist with its current absolute bundle path and explicit Pneu paths.
+If designer icons are absent the builder reports a temporary SVG-derived icon.
+Ad-hoc signing provides no Developer ID or notarization.
+
+For isolated login acceptance, use `--bundle-id io.github.stantonmatt.pneu.test.pkg`
+(or `.test.pkg2`), keep the bundle in a private build directory, and override all
+four `PNEU_*` directories. Use an explicit non-default port, clipboard mode off,
+and a private receive directory. Unregister the test main-app login item and
+boot out its test session LaunchAgent afterwards; verify both are absent.
+Do not register the production bundle for tests.
+
+Uninstall using the same location flag as installation:
+
+```sh
+./uninstall-macos.sh
+# Or, for an installation in /Applications:
+./uninstall-macos.sh --system
+```
+
+Uninstall stops the session agent, refuses if other Pneu processes remain,
+unregisters the login item, and removes the bundle and CLI link. User data stays
+in `~/Library/Application Support/Pneu` and `~/Library/Caches/Pneu`. Add `--purge`
+to unlink Pneu's explicit state/cache entries (DB and sidecars/lock, identity,
+fingerprint key, config, runtime files, outbox artifacts, cache files and viewer
+leases), without following symlinks. Directories are removed only when empty;
+unknown files and received folders are kept, with a message. Bundle removal also
+uses an explicit entry list. Upgrade refuses a bundle containing extra files;
+move those files before upgrading. No receive-path overlap comparison is used.
+Without an installed bundle, `--purge` requires reinstalling its entry remover.
+The macOS initialization preference is retained,
+so reinstalling respects login-off. Received files are retained; custom
+`PNEU_*`/XDG data directories are never removed by this script.
 
 ## Paths and overrides
 
@@ -33,8 +140,8 @@ Override every directory for private acceptance tests. The config's
 
 Linux retains its original XDG layout, Pictures/Pneu receive default, Wayland,
 D-Bus, ksni and Slint/Qt behavior. Linux-only dependencies are target-scoped;
-M1 does not link Slint into the Mac daemon. AppKit is used for NSPasteboard
-without creating an NSApplication or window.
+The daemon never creates an NSApplication or window. Its NSPasteboard adapter
+remains independent of the child; all rendered UI runs on the child's main thread.
 
 ## Storage and IPC security
 
@@ -111,9 +218,8 @@ temporary one. M1 does not read Linux route tables or rank Mac default-route
 metrics: eligible physical interfaces retain deterministic ordering.
 
 The default name is `scutil --get ComputerName`, falling back to uname. No KDE
-palette or locale file is read on macOS. Native appearance and the user's system
-time-format preference belong to M2; M1's shared last-seen formatter uses a
-24-hour placeholder.
+palette or locale file is read on macOS. The window follows the system light/dark appearance. Last-seen times use the
+system 12/24-hour preference, including explicit macOS clock overrides.
 
 ## Clipboard
 
@@ -171,17 +277,68 @@ sequences with an unchanged selection.
 an origin marker gets one separate bounded read before payload admission.
 Nil/denied reads invalidate that observation and are not retried until another copy; they never
 cause a crash or prompt loop. M1 does not change access policy. These modes can
-produce a system permission prompt. Unavailable desktop notifications are logged
-without pretending to deliver them; open/reveal/window actions return an explicit
-M1-unavailable error. Window/picker IPC requests (including sends requiring a
-recipient picker) fail before queuing UI work. Direct `SendFiles` IPC and
-`pneud send --to DEVICE FILE...` remain available, including relative paths
-resolved against the CLI's working directory. Untargeted `pneud send` awaits M2's
-recipient picker. Send parser errors return their original message over IPC to
-the CLI when no window is available, rather than replacing the cause with the
-M1 UI-unavailable error. Picker/tray/window
-supervision is a cfg-selected runtime
-boundary ready for the persistent M2 UI child.
+produce a system permission prompt.
+
+## Persistent UI and local IPC
+
+The daemon starts the child from its own executable and restarts it with a
+250 ms to 30 s backoff. A child that runs for a minute resets that backoff.
+An initial handshake must finish within 15 s, after the child's main loop starts.
+A missing acknowledgement revokes readiness and restarts the child. UI failure
+never shuts down Core.
+The clipboard watcher remains in the daemon.
+
+Snapshots, settings, pairing, focus leases and send admission use the existing
+0600, uid-checked, bounded/paged local IPC. `PresentPicker` adds a macOS menu
+handoff carrying frozen recipient authorities, clipboard/file mode and explicit
+recipient scope into the same bounded pending-send queue as window/CLI sends.
+The same handoff accepts a complete dropped-file selection. The child acknowledges
+adoption with `AcknowledgeSend`; it cannot mutate Core storage.
+UI-only requests fail before queuing when the particular daemon has no ready
+child. Direct `pneud send --to DEVICE FILE...` remains available then, and parser
+errors retain their original CLI message.
+
+A separate inherited Unix socketpair carries bounded daemon-to-child frames.
+Both peers check uid and exchange a fresh per-child capability before readiness.
+There is no filesystem endpoint to reconnect to. Notification submission,
+open/reveal, URL and window-show requests have sequence IDs and acknowledgements;
+EOF revokes readiness and fails outstanding waits. Shutdown closes the channel
+and allows up to three seconds for main-thread notification withdrawal before
+killing and reaping a stuck child. Startup sweeps stale Pneu notifications from
+earlier daemon namespaces as well as earlier children. Notification responses carry
+a per-daemon namespace, notification ID and action ID back to a bounded
+daemon-owned registry. A response from an earlier daemon session cannot consume
+a current notification with the same numeric ID.
+Unknown, expired or unoffered actions cannot act on another notification's file.
+Viewer waits use the shared interaction budget outside Core's action gates.
+
+Notification Open transfers the retained received-file descriptor with
+`SCM_RIGHTS`; it never reopens the received display path. Since a viewer launched
+by NSWorkspace cannot inherit the child's fd, the child copies from that fd with
+positioned reads into a private, read-only materialization before asking macOS to
+open it. Configured automatic image opens explicitly use Preview; notification
+Open and Recent use the file's normal application. An unavailable cache disables
+only descriptor-materialized opens; the menu bar still starts and later opens
+retry lease creation. A per-child cache lease
+retains those bytes until shutdown; the daemon
+cleans the lease by retained directory identity even after a child is killed.
+Recent first resolves the current regular file at its recorded path, rejecting
+symlinks in every component, then opens that path directly through NSWorkspace
+without making a cache copy. Recent is navigation to the current file, not an
+identity guarantee.
+Reveal uses paths only for Finder navigation.
+
+Pickers use asynchronous NSOpenPanel requests; cancellation closes the panel.
+Menu items retain immutable recipient device/generation/fingerprint payloads.
+Login-item status uses one background worker, with at most one query in flight;
+ServiceManagement XPC cannot stall the menu or window.
+Native drag callbacks capture the complete file selection, recipient authorities
+and NSDraggingInfo coordinates as one gesture, without inferring gesture boundaries
+from winit's path-only events. Drop hit-testing uses the rendered, clipped and scrolled
+Slint target list and frozen authorities. An unknown location or offline target
+is rejected. Camera scanning has an opt-in `Ui.camera-available` / `Ui.scan-qr`
+hook for the later camera page. System Settings links are available for Camera,
+Notifications, Clipboard and Login Items.
 
 ## Native verification and private acceptance
 

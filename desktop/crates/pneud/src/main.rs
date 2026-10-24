@@ -8,6 +8,10 @@ use std::sync::Arc;
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     #[cfg(target_os = "macos")]
+    if args.is_empty() {
+        pneud::macos_login::enter_bundle()?;
+    }
+    #[cfg(target_os = "macos")]
     if args.first().is_some_and(|s| s == "pasteboard-read") {
         anyhow::ensure!(args.len() == 3, "pasteboard-read expects count and mode");
         anyhow::ensure!(
@@ -15,6 +19,13 @@ fn main() -> Result<()> {
             "invalid reader mode"
         );
         return pneud::ui::clipboard::read_helper(args[1].parse()?, args[2] == "marker");
+    }
+    #[cfg(target_os = "macos")]
+    if args.first().is_some_and(|s| s == "login-item") {
+        return pneud::macos_login::cli(&args[1..]);
+    }
+    if args.first().is_some_and(|s| s == "uninstall-owned") {
+        return pneud::macos_removal::cli(&args[1..]);
     }
     if args.first().is_some_and(|s| s == "clipboard-helper") {
         return pneud::actions::clipboard_helper(
@@ -146,9 +157,21 @@ async fn async_main(args: Vec<String>) -> Result<()> {
             println!(
                 "pneud [send [--to DEVICE] FILE...|run|window|pair|join (stdin)|join-confirm ATTEMPT|join-status ATTEMPT|join-cancel ATTEMPT|close-pairing|status|reload|unpair DEVICE|clipboard DEVICE TEXT|discard-clipboard DEVICE]"
             );
+            #[cfg(target_os = "macos")]
+            println!("pneud login-item register|unregister|status (from Pneu.app)");
             Ok(())
         }
-        None | Some("run") => run(paths).await,
+        #[cfg(target_os = "macos")]
+        None => {
+            let result = pneud::macos_login::launch(&paths).await;
+            if let Err(error) = &result {
+                pneud::macos_login::show_startup_error(error);
+            }
+            result
+        }
+        #[cfg(not(target_os = "macos"))]
+        None => run(paths).await,
+        Some("run") => run(paths).await,
         _ => bail!("unknown subcommand; use pneud --help"),
     }
 }

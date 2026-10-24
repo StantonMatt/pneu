@@ -1,9 +1,23 @@
 //! Desktop presentation state. The protocol core remains usable without a tray host.
 #[cfg(target_os = "linux")]
 pub(crate) mod activation;
+#[cfg(any(target_os = "macos", test))]
+#[path = "macos/bridge.rs"]
+pub(crate) mod child_bridge;
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod child_channel;
+#[cfg(any(target_os = "macos", test))]
+mod child_supervision;
 #[cfg_attr(target_os = "macos", path = "macos/clipboard.rs")]
 pub mod clipboard;
+#[cfg(any(target_os = "macos", test))]
+#[path = "macos/drop_target.rs"]
+mod drop_target;
 mod interactions;
+#[cfg(target_os = "macos")]
+pub(crate) mod macos;
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod notice_lifecycle;
 pub mod notifications;
 #[cfg_attr(target_os = "macos", path = "macos/palette.rs")]
 pub mod palette;
@@ -16,7 +30,9 @@ pub mod runtime;
 mod send_request;
 #[cfg(target_os = "linux")]
 pub mod tray;
-#[cfg_attr(target_os = "macos", path = "macos/window.rs")]
+mod tray_model;
+#[cfg(any(target_os = "macos", test))]
+mod viewer_cache;
 pub mod window;
 
 use crate::Config;
@@ -257,7 +273,7 @@ pub fn last_seen(timestamp: u64) -> String {
 // Plasma writes regional overrides here; fall back to the process locale.
 #[cfg(target_os = "macos")]
 fn twelve_hour_clock() -> bool {
-    false
+    macos::native::twelve_hour_clock()
 }
 
 #[cfg(target_os = "linux")]

@@ -264,7 +264,7 @@ fn owned_staging(file: File) -> Result<Folder> {
     })
 }
 
-fn wipe(directory: &File) -> Result<()> {
+pub(crate) fn wipe(directory: &File) -> Result<()> {
     for entry in rustix::fs::Dir::read_from(directory)? {
         let entry = entry?;
         let name = entry.file_name();

@@ -66,7 +66,23 @@ export struct Message { title: string, text: string, tile: int, primary: string,
 
 export struct Summary { title: string, detail: string, link: LinkState }
 
+export struct DropItem { name: string, enabled: bool }
+export struct DropGeometry { x: float, y: float, width: float, height: float, scroll: float }
+
 export global Ui {
+    in-out property <bool> drop-active;
+    in-out property <int> drop-hover: -1;
+    in-out property <[DropItem]> drop-items;
+    in property <bool> is-mac: false;
+    in property <bool> login-enabled;
+    in property <bool> login-busy;
+    in property <string> login-error;
+    in property <bool> login-pending;
+    in property <bool> camera-available: false;
+    callback login(bool);
+    callback system-settings(string);
+    // The camera worker enables this row and supplies the scanning page.
+    callback scan-qr();
     in-out property <int> navigation-revision;
     in property <int> device-revision: -1;
     in-out property <Page> page;
@@ -310,6 +326,10 @@ component PopupCard inherits Rectangle {
 
 export component PneuWindow inherits Window {
     title: "Pneu";
+    out property <DropGeometry> drop-geometry: {
+        x: drop-list.absolute-position.x / 1px, y: drop-list.absolute-position.y / 1px,
+        width: drop-list.width / 1px, height: drop-list.height / 1px, scroll: drop-list.viewport-y / 1px
+    };
     icon: @image-url("../../../assets/pneu.svg");
     background: Palette.background;
     // Keep the last real QR size across invitation/pairing transitions.
@@ -416,6 +436,7 @@ export component PneuWindow inherits Window {
         focus-on-tab-navigation: false;
         key-pressed(event) => {
             if event.text == Key.Escape {
+                if Ui.drop-active { Ui.drop-active = false; return accept; }
                 if Ui.dialog != Dialog.none { root.dismiss(); } else { root.back(); }
                 return accept;
             }
@@ -621,6 +642,20 @@ export component PneuWindow inherits Window {
                                         VerticalLayout { alignment: center; Image { accessible-role: none; width: 16px; height: 16px; source: Icons.chevron-right; colorize: Pneu.text2; } }
                                     }
                                 }
+                                if Ui.is-mac && Ui.camera-available: Divider {}
+                                if Ui.is-mac && Ui.camera-available: NavRow {
+                                    accessible-label: "Scan QR Code"; min-height: 56px;
+                                    clicked => { Ui.scan-qr(); }
+                                    Row {
+                                        Tile { icon: Icons.qr-code; tone: Tone.accent; }
+                                        VerticalLayout {
+                                            horizontal-stretch: 1;
+                                            Text { text: "Scan QR Code"; font-weight: 600; color: Pneu.text; }
+                                            Text { text: "On the other computer's screen"; font-size: Pneu.label-size; color: Pneu.text2; }
+                                        }
+                                    }
+                                }
+
                             }
                         }
                     }
@@ -744,7 +779,7 @@ export component PneuWindow inherits Window {
                                 }
                                 Divider {}
                                 SwitchRow {
-                                    label: "Open in image viewer"; checked: Ui.viewer;
+                                    label: Ui.is-mac ? "Open in Preview" : "Open in image viewer"; checked: Ui.viewer;
                                     toggled(on) => { Ui.set-flag("open_in_viewer", on); }
                                 }
                             }
@@ -752,7 +787,7 @@ export component PneuWindow inherits Window {
                     }
                     VerticalLayout {
                         spacing: 6px;
-                        SectionLabel { text: "This computer"; }
+                        SectionLabel { text: Ui.is-mac ? "This Mac" : "This computer"; }
                         Card {
                             Row {
                                 VerticalLayout {
@@ -769,6 +804,16 @@ export component PneuWindow inherits Window {
                                 }
                             }
                         }
+                        if Ui.is-mac: Card {
+                            VerticalLayout {
+                                SwitchRow {label: "Open at login"; checked: Ui.login-enabled; enabled: !Ui.login-busy; toggled(on) => {Ui.login(on);} }
+                                if Ui.login-error != "": Row { Text {text: Ui.login-error; color: Pneu.danger; wrap: word-wrap;} }
+                                if Ui.login-pending || Ui.login-error != "": Row {
+                                    PneuButton {text: "Open System Settings"; clicked => {Ui.system-settings("login");} }
+                                }
+                            }
+                        }
+
                     }
                 }
             }
@@ -779,6 +824,30 @@ export component PneuWindow inherits Window {
             height: max(24px, flick.height * flick.height / flick.viewport-height);
             y: (flick.height - self.height) * (-flick.viewport-y / (flick.viewport-height - flick.height));
             background: Pneu.text2; opacity: 0.35;
+        }
+
+        drop-overlay := Rectangle {
+            visible: Ui.is-mac && Ui.drop-active;
+            x: 0; y: 0; width: root.width; height: root.height;
+            background: Pneu.dim;
+            TouchArea {}
+            Rectangle {
+                x: 16px; y: 16px; width: parent.width - 32px;
+                height: min(parent.height - 32px, Ui.drop-items.length * 56px + 24px);
+                background: Pneu.card; border-color: Pneu.card-border; border-width: 1px; border-radius: 10px;
+                drop-list := Flickable {
+                    x: 12px; y: 12px; width: parent.width - 24px; height: parent.height - 24px;
+                    viewport-height: Ui.drop-items.length * 56px;
+                    for item[index] in Ui.drop-items: Rectangle {
+                        y: index * 56px; width: drop-list.width; height: 56px;
+                        border-radius: 8px;
+                        background: Ui.drop-hover == index && item.enabled ? Pneu.accent-soft : transparent;
+                        border-color: Ui.drop-hover == index && item.enabled ? Pneu.accent : transparent; border-width: 1px;
+                        Text { x: 12px; width: parent.width - 24px; height: parent.height; text: item.name;
+                            color: item.enabled ? Pneu.text : Pneu.text2; overflow: elide; vertical-alignment: center; }
+                    }
+                }
+            }
         }
 
         // ---- Popups ----
@@ -798,7 +867,7 @@ export component PneuWindow inherits Window {
         }
         if Ui.dialog == Dialog.rename: PopupCard {
             limit: root.height - 32px;
-            Text { text: "Rename this computer"; font-size: Pneu.title-size; font-weight: 700; color: Pneu.text; }
+            Text { text: Ui.is-mac ? "Rename This Mac" : "Rename this computer"; font-size: Pneu.title-size; font-weight: 700; color: Pneu.text; }
             Rectangle { height: 14px; }
             TextField {
                 text <=> Ui.rename-text;
