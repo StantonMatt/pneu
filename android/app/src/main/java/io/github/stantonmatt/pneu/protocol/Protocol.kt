@@ -4,7 +4,7 @@ import com.google.gson.*
 import com.google.gson.stream.JsonReader
 import com.google.gson.stream.JsonToken
 import java.io.*
-import java.math.BigDecimal
+import java.math.BigInteger
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 import java.security.MessageDigest
@@ -16,7 +16,7 @@ const val CHUNK_SIZE = 262_144
 
 enum class Type(val wire: Int) {
     HELLO(1), PAIR_REQUEST(2), PAIR_RESULT(3), PING(4), PONG(5), STATUS(6), UNPAIR(7),
-    FILE_BEGIN(16), FILE_CHUNK(17), FILE_END(18), ACK(19), NACK(20), CLIPBOARD(32), ERROR(127);
+    FILE_BEGIN(16), FILE_CHUNK(17), FILE_END(18), ACK(19), NACK(20), CLIPBOARD(32), PEER_SETTINGS(33), ERROR(127);
     val label get() = name.lowercase()
 }
 sealed interface Frame {
@@ -36,18 +36,40 @@ fun strictUtf8(bytes: ByteArray): String = Charsets.UTF_8.newDecoder()
 
 object Protocol {
     private val known = mapOf(
-        Type.HELLO to setOf("version", "device_id", "name", "capabilities", "paused"),
+        Type.HELLO to setOf("version", "device_id", "name", "capabilities", "paused", "role", "addresses"),
         Type.PAIR_REQUEST to setOf("token"), Type.PAIR_RESULT to setOf("accepted", "code", "message"),
         Type.PING to setOf("nonce"), Type.PONG to setOf("nonce"), Type.STATUS to setOf("paused"), Type.UNPAIR to emptySet(),
-        Type.FILE_BEGIN to setOf("transfer_id", "file_name", "mime", "size", "sha256", "kind", "created_at", "source_media_id"),
+        Type.FILE_BEGIN to setOf("transfer_id", "file_name", "mime", "size", "sha256", "kind", "created_at", "source_media_id", "hlc", "source_device"),
         Type.FILE_END to setOf("transfer_id"), Type.ACK to setOf("transfer_id", "deduplicated"),
         Type.NACK to setOf("transfer_id", "code", "retryable", "message"),
-        Type.CLIPBOARD to setOf("transfer_id", "text", "created_at", "origin"),
+        Type.CLIPBOARD to setOf("transfer_id", "text", "created_at", "origin", "hlc", "source_device"),
+        Type.PEER_SETTINGS to setOf("transfer_id", "settings"),
         Type.ERROR to setOf("code", "message", "supported_version")
     )
     val nackCodes = setOf("hash_mismatch", "size_mismatch", "storage_failed", "disk_full", "not_writable", "unsupported_kind", "id_conflict", "clipboard_unavailable")
     private val errors = setOf("version_mismatch", "unauthorized", "unexpected_message", "malformed_message", "frame_too_large", "unknown_message", "timeout", "busy", "connection_replaced", "closing")
     private val pairCodes = setOf("invalid_token", "expired_token", "pairing_closed", "already_paired", "storage_failed")
+    private fun validateUnicode(value: String) {
+        // Gson permits escaped unpaired surrogates; these are not Unicode strings.
+        var i = 0
+        while (i < value.length) {
+            val c = value[i++]
+            if (c.isHighSurrogate()) { require(i < value.length && value[i++].isLowSurrogate()) }
+            else require(!c.isLowSurrogate())
+        }
+    }
+    private fun validateAddress(value: String) {
+        val endpoint = Endpoint.parse(value)
+        if (':' in endpoint.host) {
+            // Java also permits overlong hex groups padded with leading zeroes.
+            require(endpoint.host.split(':').all { '.' in it || it.length <= 4 })
+        }
+        if (':' in endpoint.host && '.' in endpoint.host) {
+            // InetAddress accepts leading zeroes in an IPv6 embedded IPv4 tail,
+            // unlike the protocol's IPv4 literal grammar.
+            require(endpoint.host.substringAfterLast(':').split('.').all { it.length == 1 || !it.startsWith('0') })
+        }
+    }
     fun read(input: InputStream): Frame {
         val stream = DataInputStream(input)
         val length = stream.readInt().toLong() and 0xffffffffL
@@ -62,6 +84,7 @@ object Protocol {
             require(length in 26..262169)
             val id = ByteArray(16).also { stream.readFully(it) }.hex()
             val offset = stream.readLong(); require(offset in 0..MAX_FILE)
+            require((length - 25).toLong() <= MAX_FILE - offset)
             return Frame.Chunk(id, offset, ByteArray(length - 25).also { stream.readFully(it) })
         }
         require(length <= 65537)
@@ -72,20 +95,40 @@ object Protocol {
         val result = JsonObject(); val seen = mutableSetOf<String>()
         reader.beginObject()
         while (reader.hasNext()) {
-            val name = reader.nextName()
+            val name = reader.nextName().also(::validateUnicode)
             require(name !in known.getValue(type) || seen.add(name)) { "Duplicate field" }
-            val value = JsonParser.parseReader(reader)
+            val value = if (type == Type.PEER_SETTINGS && name == "settings") readSettings(reader) else JsonParser.parseReader(reader)
             if (name in known.getValue(type)) result.add(name, value)
         }
         reader.endObject(); require(reader.peek() == JsonToken.END_DOCUMENT)
         validate(type, result)
         return Frame.Control(type, result)
     }
+    private fun readSettings(reader: JsonReader): JsonArray {
+        require(reader.peek() == JsonToken.BEGIN_ARRAY)
+        val result=JsonArray()
+        val fields=setOf("key", "enabled", "hlc", "writer_device")
+        reader.beginArray()
+        while(reader.hasNext()) {
+            require(result.size() < 3 && reader.peek() == JsonToken.BEGIN_OBJECT)
+            val item=JsonObject();val seen=mutableSetOf<String>()
+            reader.beginObject()
+            while(reader.hasNext()) {
+                val name=reader.nextName().also(::validateUnicode)
+                require(name !in fields || seen.add(name)) { "Duplicate settings field" }
+                val value=JsonParser.parseReader(reader)
+                if(name in fields)item.add(name,value)
+            }
+            reader.endObject();result.add(item)
+        }
+        reader.endArray();return result
+    }
     fun write(output: OutputStream, frame: Frame) {
         val stream = DataOutputStream(output)
         when (frame) {
             is Frame.Chunk -> {
                 require(frame.id.matches(Regex("[0-9a-f]{32}")) && frame.offset in 0..MAX_FILE && frame.data.size in 1..CHUNK_SIZE)
+                require(frame.data.size.toLong() <= MAX_FILE - frame.offset)
                 stream.writeInt(25 + frame.data.size); stream.writeByte(17); stream.write(frame.id.unhex()); stream.writeLong(frame.offset); stream.write(frame.data)
             }
             is Frame.Control -> {
@@ -101,24 +144,27 @@ object Protocol {
             require(e is JsonPrimitive && e.isString) { "Missing/string value" }
             return e.asString.also { value ->
                 require('\u0000' !in value && value.toByteArray(Charsets.UTF_8).size in min..max)
-                // Gson permits escaped unpaired surrogates; these are not Unicode strings.
-                var i = 0
-                while (i < value.length) {
-                    val c = value[i++]
-                    if (c.isHighSurrogate()) { require(i < value.length && value[i++].isLowSurrogate()) }
-                    else require(!c.isLowSurrogate())
-                }
+                validateUnicode(value)
             }
         }
         fun str(k: String, max: Int, min: Int = 1)=string(o.get(k),max,min)
-        fun num(k: String, max: Long, min: Long = 0): Long {
-            val e = o.get(k); require(e is JsonPrimitive && e.isNumber)
-            require(e.asString.matches(Regex("-?(0|[1-9][0-9]*)"))) { "Integer token required" }
-            return BigDecimal(e.asString).longValueExact().also { require(it in min..max) }
+        fun unsigned(e: JsonElement?, max: BigInteger): BigInteger {
+            require(e is JsonPrimitive && e.isNumber && e.asString.matches(Regex("0|[1-9][0-9]*"))) { "Unsigned integer token required" }
+            return e.asString.toBigInteger().also { require(it <= max) }
         }
+        fun num(k: String, max: Long, min: Long = 0): Long =
+            unsigned(o.get(k), BigInteger.valueOf(max)).longValueExact().also { require(it >= min) }
         fun bool(k: String): Boolean { val e = o.get(k); require(e is JsonPrimitive && e.isBoolean); return e.asBoolean }
         fun hex(k: String, n: Int) { require(str(k, n).matches(Regex("[0-9a-f]{$n}"))) }
         fun optional(k: String, f: () -> Unit) { if (o.has(k)) f() }
+        fun hlc(e: JsonElement?) {
+            // Do not narrow a wire u64 to signed Long or Double.
+            unsigned(e, BigInteger("18446744073709551615"))
+        }
+        fun clipboardClock() {
+            require(o.has("hlc") == o.has("source_device"))
+            optional("hlc") { hlc(o.get("hlc"));hex("source_device",32) }
+        }
         if (type in setOf(Type.PAIR_RESULT, Type.NACK, Type.ERROR)) optional("message") { str("message", 512, 0) }
         when (type) {
             Type.HELLO -> {
@@ -127,6 +173,12 @@ object Protocol {
                 val names = caps.map { string(it,64) }
                 require(names.distinct().size == names.size && ("clipboard_image" !in names || "files" in names))
                 optional("paused") { bool("paused") }
+                optional("role") { require(str("role",8) in setOf("phone","computer")) }
+                optional("addresses") {
+                    val addresses=o.get("addresses");require(addresses is JsonArray && addresses.size() <= 8)
+                    val names=addresses.map { string(it, 65536).also(::validateAddress) }
+                    require(names.distinct().size == names.size)
+                }
             }
             Type.PAIR_REQUEST -> hex("token", 64)
             Type.PAIR_RESULT -> if (bool("accepted")) require(!o.has("code") && !o.has("message")) else require(str("code", 64) in pairCodes)
@@ -140,11 +192,27 @@ object Protocol {
                 require(kind in setOf("screenshot", "photo", "recording", "file", "clipboard_image"))
                 if (kind == "clipboard_image") require(mime.startsWith("image/") && mime.length > 6)
                 optional("source_media_id") { str("source_media_id", 256) }
+                clipboardClock();require(!o.has("hlc") || (mime.startsWith("image/") && mime.length > 6))
             }
             Type.FILE_END -> hex("transfer_id", 32)
             Type.ACK -> { hex("transfer_id", 32); bool("deduplicated") }
             Type.NACK -> { hex("transfer_id", 32); val code = str("code", 64); require(code in nackCodes); require(bool("retryable") == (code !in setOf("unsupported_kind", "id_conflict"))) }
-            Type.CLIPBOARD -> { hex("transfer_id", 32); str("text", 16384, 0); num("created_at", MAX_TIMESTAMP); optional("origin") { require(str("origin", 16) in setOf("clipboard", "share")) } }
+            Type.CLIPBOARD -> { hex("transfer_id", 32); str("text", 16384, 0); num("created_at", MAX_TIMESTAMP); optional("origin") { require(str("origin", 16) in setOf("clipboard", "share")) };clipboardClock() }
+            Type.PEER_SETTINGS -> {
+                hex("transfer_id",32)
+                val settings=o.get("settings");require(settings is JsonArray && settings.size() in 1..3)
+                val keys=mutableSetOf<String>()
+                for(entry in settings) {
+                    require(entry is JsonObject)
+                    val key=string(entry.get("key"),81)
+                    val parts=key.split('/')
+                    require(parts.size == 3 && parts.take(2).all { it.matches(Regex("[0-9a-f]{32}")) } && parts[0] != parts[1])
+                    require(parts[2] in setOf("clipboard","automatic_media") && keys.add(key))
+                    val enabled=entry.get("enabled");require(enabled is JsonPrimitive && enabled.isBoolean)
+                    hlc(entry.get("hlc"))
+                    require(string(entry.get("writer_device"),32) in parts.take(2))
+                }
+            }
             Type.ERROR -> { val code = str("code", 64); require(code in errors); if (code == "version_mismatch") num("supported_version", 4294967295, 1) else require(!o.has("supported_version")) }
             Type.FILE_CHUNK -> error("Binary only")
         }

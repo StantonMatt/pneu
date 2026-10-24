@@ -1,6 +1,13 @@
 //! Route-aware discovery, with a compact, interface-diverse pairing shortlist.
 use anyhow::Result;
-use std::{collections::HashSet, net::IpAddr, path::Path};
+#[cfg(target_os = "linux")]
+use std::path::Path;
+use std::{collections::HashSet, net::IpAddr};
+#[cfg(target_os = "macos")]
+#[path = "platform/macos_discovery.rs"]
+mod macos;
+#[cfg(target_os = "macos")]
+pub(crate) use macos::candidates;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InterfaceAddress {
@@ -11,6 +18,7 @@ pub(crate) struct InterfaceAddress {
     pub temporary: bool,
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn candidates() -> Result<Vec<InterfaceAddress>> {
     let routes = default_routes(
         &network_table("/proc/net/route"),
@@ -62,6 +70,7 @@ fn pairing_shortlist(interfaces: Vec<InterfaceAddress>) -> Vec<InterfaceAddress>
         .take(3)
         .collect()
 }
+#[cfg(target_os = "linux")]
 fn network_table(path: &str) -> String {
     match std::fs::read_to_string(path) {
         Ok(table) => table,
@@ -73,6 +82,7 @@ fn network_table(path: &str) -> String {
         }
     }
 }
+#[cfg(any(target_os = "linux", test))]
 fn temporary_ipv6_addresses(table: &str) -> HashSet<(String, IpAddr)> {
     table
         .lines()
@@ -91,6 +101,7 @@ fn temporary_ipv6_addresses(table: &str) -> HashSet<(String, IpAddr)> {
         })
         .collect()
 }
+#[cfg(any(target_os = "linux", test))]
 fn default_routes(v4: &str, v6: &str) -> HashSet<String> {
     let mut routes = HashSet::new();
     for line in v4.lines() {
@@ -115,6 +126,7 @@ fn default_routes(v4: &str, v6: &str) -> HashSet<String> {
     }
     routes
 }
+#[cfg(any(target_os = "linux", test))]
 fn route_is_up(flags: &str) -> bool {
     u32::from_str_radix(flags, 16).is_ok_and(|flags| flags & 1 != 0 && flags & 0x200 == 0)
 }

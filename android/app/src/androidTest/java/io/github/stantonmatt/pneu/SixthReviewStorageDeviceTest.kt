@@ -2,6 +2,8 @@ package io.github.stantonmatt.pneu
 
 import android.Manifest
 import android.content.*
+import androidx.datastore.preferences.core.edit
+import io.github.stantonmatt.pneu.data.PeerRegistry
 import android.content.pm.PackageManager
 import android.net.Uri
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -41,11 +43,25 @@ class SixthReviewStorageDeviceTest {
         // Reproduce an older build's durable read/write grant, never production admission.
         c.contentResolver.takePersistableUriPermission(uri,Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
         assertTrue(c.contentResolver.persistedUriPermissions.any {it.uri==uri && it.isReadPermission && it.isWritePermission})
-        app.preferences.toggle("deliveryReset",true)
+        val raw="pneu://pair?v=1&name=Reset&fp=${"a".repeat(64)}&addr=127.0.0.1%3A1&token=${"b".repeat(64)}&exp=${System.currentTimeMillis()+300000}"
+        assertTrue(app.requestPairing(raw,null));assertTrue(app.installBinding(Invitation.parse(raw),"d".repeat(32)))
+        val peerId=app.preferences.read().peer!!.deviceId
+        app.preferences.store.edit {PeerRegistry.reset(it,peerId)}
         val identityCalls=AtomicInteger();val resetCalls=AtomicInteger();val allowIdentity=AtomicBoolean(false);val allowReset=AtomicBoolean(false)
-        val preferences=Preferences(c).apply {beforeMutation={key->
+        val failingStore=object:androidx.datastore.core.DataStore<androidx.datastore.preferences.core.Preferences> {
+            override val data=app.preferences.store.data
+            override suspend fun updateData(transform:suspend (androidx.datastore.preferences.core.Preferences)->androidx.datastore.preferences.core.Preferences)=
+                app.preferences.store.updateData {before->
+                    val after=transform(before)
+                    if(peerId in PeerRegistry.resets(before) && peerId !in PeerRegistry.resets(after)) {
+                        resetCalls.incrementAndGet()
+                        if(!allowReset.get())throw IOException("Synthetic final peer reset write failure")
+                    }
+                    after
+                }
+        }
+        val preferences=Preferences(c,failingStore).apply {beforeMutation={key->
             if(key=="ensureIdentity") {identityCalls.incrementAndGet();if(!allowIdentity.get())throw IOException("Synthetic identity failure")}
-            if(key=="deliveryReset") {resetCalls.incrementAndGet();if(!allowReset.get())throw IOException("Synthetic final reset write failure")}
         }}
         val secondary=AppGraph(c,preferences)
         try {
@@ -53,15 +69,15 @@ class SixthReviewStorageDeviceTest {
             assertFalse(secondary.initialized.isCompleted)
             assertTrue(c.contentResolver.persistedUriPermissions.none {it.uri==uri})
             allowIdentity.set(true);withTimeout(6000) {secondary.initialized.await()}
-            assertTrue(identityCalls.get()>=2);assertTrue(preferences.flow.first().deliveryReset)
+            assertTrue(identityCalls.get()>=2);assertEquals(setOf(peerId),preferences.read().resetPeers)
             // Initialized is not poisoned by cleanup; the same manager retries even unpaired.
             secondary.connection.start(scope)
             withTimeout(6000) {while(resetCalls.get()<2)delay(20)}
             allowReset.set(true);secondary.connection.kick()
-            withTimeout(6000) {preferences.flow.first {!it.deliveryReset}}
+            withTimeout(6000) {preferences.flow.first {it.resetPeers.isEmpty()}}
             assertTrue(secondary.initialized.isCompleted && !secondary.initialized.isCancelled)
         } finally {
-            allowIdentity.set(true);allowReset.set(true);secondary.connection.stop();secondary.scope.cancel();secondary.scope.coroutineContext[Job]!!.join();secondary.database.close()
+            allowIdentity.set(true);allowReset.set(true);secondary.connection.stop();secondary.connection.awaitStopped();secondary.scope.cancel();secondary.scope.coroutineContext[Job]!!.join();secondary.database.close()
             grantOperation(uri,"revoke")
         }
     }
@@ -84,7 +100,8 @@ class SixthReviewStorageDeviceTest {
         val raw="pneu://pair?v=1&name=Sources&fp=${"a".repeat(64)}&addr=127.0.0.1%3A1&token=${"b".repeat(64)}&exp=${System.currentTimeMillis()+300000}"
         assertTrue(app.requestPairing(raw,null));assertTrue(app.installBinding(Invitation.parse(raw),"d".repeat(32)))
         val source=Uri.parse("content://io.github.stantonmatt.pneu.test.review/image")
-        val manual=ManualEntries.file(app,source,"file");assertEquals("",manual.uri);assertEquals("",app.queue.find(manual.mediaId)!!.uri)
+        // A named offline send remains allowed with the default queue policy off.
+        val manual=ManualEntries.file(app,source,"file",DeliveryBinding.from(app.preferences.read()));assertEquals("",manual.uri);assertEquals("",app.queue.find(manual.mediaId)!!.uri)
         manual.state="sent"
         assertTrue(Staging(app).completeFile(manual))
         assertEquals("",app.queue.find(manual.mediaId)!!.uri) // Never fall back to the provider.

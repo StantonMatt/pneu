@@ -50,6 +50,7 @@ public class FixtureCallerActivity extends Activity {
         if(getIntent().getBooleanExtra("persistable",false))target.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
         if(target.getClipData()==null && text==null)target.setClipData(ClipData.newRawUri("fixture",uri));
         if(getIntent().getBooleanExtra("clipOnly",false))target.removeExtra(Intent.EXTRA_STREAM);
+        if(getIntent().getBooleanExtra("main",false))target.setComponent(new ComponentName("io.github.stantonmatt.pneu","io.github.stantonmatt.pneu.MainActivity"));
         Intent launch=target;
         boolean chooser=getIntent().getBooleanExtra("chooser",false);
         if(chooser) {

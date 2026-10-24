@@ -14,6 +14,7 @@ fi
 install -Dm755 target/release/pneud "$HOME/.local/bin/pneud"
 install -Dm644 assets/pneu.svg "$HOME/.local/share/icons/hicolor/scalable/apps/pneu.svg"
 install -Dm644 packaging/pneu.desktop "$HOME/.local/share/applications/pneu.desktop"
+install -Dm755 packaging/pneu-send.desktop "$HOME/.local/share/kio/servicemenus/pneu-send.desktop"
 for icon in assets/pneu-tray-*.svg; do
     install -Dm644 "$icon" "$HOME/.local/share/pneu/icons/hicolor/scalable/status/${icon##*/}"
 done

@@ -63,11 +63,45 @@ class ScreenshotObserver(private val app: AppGraph,private val cleanup:suspend (
             } finally {settings.cancel();runCatching {resolver.unregisterContentObserver(observer)}}
         }
     }
+    /** A discovery journal is already an operation. Retry it independently of
+     * startup/permission baselines, which only exclude undiscovered backlog. */
+    private suspend fun retryPending(p:io.github.stantonmatt.pneu.data.Prefs,binding:DeliveryBinding):Set<String>? {
+        val retried=mutableSetOf<String>()
+        for(pending in app.queue.pendingAdmissions()) {
+            // Every uncommitted copy owns a unique output. Old/new service
+            // observers can overlap while cancellation settles; a losing copy
+            // must never replace or unlink the winner's admitted payload.
+            val row=pending.row().apply {transferId=randomId()};val video=row.kind=="recording"
+            if(!canRead(video))continue
+            retried+=row.mediaId
+            val version=if(video)p.videoVersion else p.imageVersion
+            if(!row.mediaId.startsWith("external_primary:$version:")) {app.queue.deletePendingAdmission(row.mediaId);continue}
+            if(app.queue.seen(row.mediaId)!=0 || app.queue.find(row.mediaId)!=null) {app.queue.deletePendingAdmission(row.mediaId);continue}
+            val token=AdmissionToken.from(p,video)
+            val enabled=when(row.kind) {"photo"->p.photos;"recording"->p.recordings;else->p.screenshots}
+            // Baselines exclude undiscovered backlog, never this journal.
+            // Pause and feature off/on revoke even if they span a process gap.
+            val crossedBoundary=row.admissionEpoch!=p.automaticRevocation(row.kind)
+            if(crossedBoundary || !app.hasRecipient(row,binding,p) || DeliveryPolicy.skipAutomatic(p.paused,enabled,p.queue,app.connection.connected,connectivity(),p.mobile)) {
+                row.state="skipped";if(!app.enqueue(row,binding,token))return null;continue
+            }
+            try {
+                val isPending=ProviderReads.call {signal->resolver.query(Uri.parse(row.uri),arrayOf("is_pending"),null,null,null,signal)?.use {if(it.moveToFirst())it.getInt(0)!=0 else null}}
+                if(isPending==null) {row.state="skipped";if(!app.enqueue(row,binding,token))return null}
+                else if(isPending)pendingRows=true
+                else if(!app.staging.capture(row,binding,token))return null
+            } catch(e:CancellationException) {throw e}
+            catch(e:Exception) {pendingRows=true;android.util.Log.w("PneuMedia",e.javaClass.simpleName)}
+        }
+        return retried
+    }
     internal suspend fun scanOnce() {
         pendingRows=false
         val p=app.preferences.read()
         if(p.paused)return
         val binding=DeliveryBinding.from(p) ?: return
+        val recipients=app.recipients(p,"photo",automatic=true)
+        val retried=retryPending(p,binding) ?: return
         for(video in listOf(false,true)) {
             if(!canRead(video)) {needsBaseline.add(video);continue}
             val collection=if(video)MediaStore.Video.Media.getContentUri("external_primary") else MediaStore.Images.Media.getContentUri("external_primary")
@@ -101,20 +135,30 @@ class ScreenshotObserver(private val app: AppGraph,private val cleanup:suspend (
                     else->continue
                 }
                 val id="external_primary:$version:${if(video)"video" else "images"}:${cursor.getLong(0)}"
-                if(app.queue.seen(id)!=0 || app.queue.find(id)!=null)continue
-                if(cursor.getLong(7)<(if(video)p.videoFloor else p.imageFloor))continue
-                val row=Outgoing().apply {mediaId=id;transferId=randomId();uri=ContentUris.withAppendedId(collection,cursor.getLong(0)).toString();this.kind=kind
+                if(id in retried)continue
+                // Discovery starts this item's operation. Queue/storage reads
+                // and payload staging must not move it past a later clipboard.
+                val stamp=if(!video)app.preferences.originateClipboard(apply=false) else null
+                if(app.queue.seen(id)!=0 || app.queue.find(id)!=null) {app.queue.deletePendingAdmission(id);continue}
+                if(cursor.getLong(7)<(if(video)p.videoFloor else p.imageFloor)) {app.queue.deletePendingAdmission(id);continue}
+                val discovered=Outgoing().apply {mediaId=id;transferId=randomId();uri=ContentUris.withAppendedId(collection,cursor.getLong(0)).toString();this.kind=kind
                     fileName=cursor.getString(3) ?: if(video)"Screen recording.mp4" else "Image.png";mime=cursor.getString(4) ?: if(video)"video/mp4" else "image/png"
-                    createdAt=cursor.getLong(6).takeIf {it>0} ?: cursor.getLong(5)*1000}
+                    createdAt=cursor.getLong(6).takeIf {it>0} ?: cursor.getLong(5)*1000;this.recipients=recipients
+                    admissionEpoch=p.automaticRevocation(kind)}
+                if(discovered.mime.startsWith("image/") && stamp!=null) {discovered.hlc=stamp.hlc.toString();discovered.sourceDevice=stamp.source}
+                // This survives provider errors, pending MediaStore rows, observer
+                // restart and process death. Policy rescans may remove authority,
+                // but must never add recipients or originate a replacement order.
+                val row=app.queue.freezeAutomaticAdmission(discovered).apply {transferId=randomId()}
                 val enabled=when(kind) {"photo"->p.photos && cursor.getLong(0)>p.photosAfterId;"recording"->p.recordings && cursor.getLong(0)>p.recordingsAfterId;else->p.screenshots && cursor.getLong(0)>p.screenshotsAfterId}
-                if(DeliveryPolicy.skipAutomatic(p.paused,enabled,p.queue,app.connection.connected,connectivity(),p.mobile)) {
+                if(!app.hasRecipient(row,binding,p) || DeliveryPolicy.skipAutomatic(p.paused,enabled,p.queue,app.connection.connected,connectivity(),p.mobile)) {
                     row.state="skipped";if(!app.enqueue(row,binding,token))return;continue
                 }
                 if(cursor.getInt(2)!=0) {pendingRows=true;watermark=minOf(watermark,maxOf(cursor.getLong(7),cursor.getLong(8)));continue}
                 try {
                     if(!app.staging.capture(row,binding,token))return
 
-                } catch(e: Exception) {if(e is CancellationException)throw e;watermark=minOf(watermark,maxOf(cursor.getLong(7),cursor.getLong(8)));android.util.Log.w("PneuMedia",e.javaClass.simpleName)}
+                } catch(e: Exception) {if(e is CancellationException)throw e;pendingRows=true;watermark=minOf(watermark,maxOf(cursor.getLong(7),cursor.getLong(8)));android.util.Log.w("PneuMedia",e.javaClass.simpleName)}
             }}
             if(!app.checkpoint(binding,video,version,watermark,expected=token))return
         }

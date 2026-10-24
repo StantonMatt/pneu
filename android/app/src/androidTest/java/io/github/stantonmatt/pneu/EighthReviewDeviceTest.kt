@@ -56,6 +56,7 @@ class EighthReviewDeviceTest {
         ManualEntries.clearLegacyShortcuts(c)
     }
     @Test(timeout=15000) fun resumeFloorExcludesPendingRowsAndCheckpointsCannotRegressIt()=runBlocking<Unit> {
+        DeviceFixture.connectLocalPeer(app)
         val observer=ScreenshotObserver(app);observer.scanOnce();observer.scanOnce()
         app.preferences.toggle("paused",true);val before=image(true)
         observer.scanOnce();assertNull(app.queue.find(key(before)))
@@ -67,6 +68,7 @@ class EighthReviewDeviceTest {
         val after=image();observer.scanOnce();assertNotNull(app.queue.find(key(after)))
     }
     @Test(timeout=15000) fun permissionRestorationBaselinesTheGapAndLateCaptureCannotPublishAcrossResume()=runBlocking<Unit> {
+        DeviceFixture.connectLocalPeer(app)
         var readable=false;val observer=ScreenshotObserver(app,canRead={readable && !it})
         val unseen=image();observer.scanOnce();assertNull(app.queue.find(key(unseen)))
         readable=true;observer.scanOnce();observer.scanOnce();assertNull(app.queue.find(key(unseen)))
@@ -111,6 +113,7 @@ class EighthReviewDeviceTest {
         withTimeout(4000) {while(c.getSystemService(NotificationManager::class.java).activeNotifications.any {it.id==1})delay(50)}
     }
     @Test(timeout=15000) fun cachedDirectShareIsRejectedAndLegacyShortcutsAreRemoved()=runBlocking<Unit> {
+        DeviceFixture.connectLocalPeer(app)
         val manager=c.getSystemService(ShortcutManager::class.java)
         manager.addDynamicShortcuts(listOf(ShortcutInfo.Builder(c,"pc").setShortLabel("Old PC").setLongLived(true).setIntent(Intent(c,MainActivity::class.java).setAction(Intent.ACTION_VIEW)).build()))
         ManualEntries.clearLegacyShortcuts(c);assertTrue(manager.dynamicShortcuts.isEmpty());assertTrue(manager.getShortcuts(ShortcutManager.FLAG_MATCH_CACHED).none {it.id=="pc"})

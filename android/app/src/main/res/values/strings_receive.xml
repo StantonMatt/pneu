@@ -1,0 +1,7 @@
+<resources>
+    <string name="receive_channel">Received files</string>
+    <string name="receive_from">From %1$s</string>
+    <string name="receive_received">Received %1$s from %2$s</string>
+    <string name="receive_open">Open</string>
+    <string name="receive_share">Share</string>
+</resources>

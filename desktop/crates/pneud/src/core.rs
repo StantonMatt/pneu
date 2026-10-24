@@ -1,17 +1,26 @@
+#[path = "clipboard_actor.rs"]
+pub(crate) mod clipboard_actor;
 use crate::{
     Config, Paths,
     actions::{PcActions, ReceivedFile},
     identity::Identity,
     storage::{Stage, VerifiedFile, cache_basename, safe_basename},
-    store::{Metadata, Store},
+    store::{Metadata, Store, normalize_legacy_hello},
     tls::{Admission, ClientVerifier, Invitation},
 };
 use anyhow::{Context, Result, bail, ensure};
+use clipboard_actor::{
+    Event as ClipboardEvent, Operation as ClipboardOperation, driver as clipboard_driver,
+};
+use futures_util::{
+    FutureExt,
+    future::{BoxFuture, Shared},
+};
 use pneu_proto::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     path::PathBuf,
     sync::{
@@ -28,7 +37,14 @@ use tokio::{
     task::JoinSet,
     time::Instant,
 };
-use tokio_rustls::{TlsAcceptor, server::TlsStream};
+use tokio_rustls::{TlsAcceptor, TlsStream};
+#[path = "file_sender.rs"]
+mod file_sender;
+#[path = "mesh.rs"]
+pub mod mesh;
+#[path = "peer_settings.rs"]
+mod peer_settings;
+use file_sender::{FileWrite, transmit_file};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -43,6 +59,10 @@ pub enum Event {
     },
     Paired {
         device: Id,
+    },
+    ComputerPaired {
+        device: Id,
+        name: String,
     },
     Unpaired {
         device: Id,
@@ -88,7 +108,7 @@ pub enum Event {
     },
 }
 #[derive(Clone, Copy)]
-enum CloseReason {
+pub(crate) enum CloseReason {
     Error(ErrorCode),
     Unpair,
 }
@@ -106,6 +126,9 @@ struct ActionScope {
     active: Arc<tokio::sync::Mutex<()>>,
     // Retained across disconnects; only admitting a newer connection advances it.
     connection_generation: Arc<AtomicU64>,
+    registration_generation: Arc<AtomicU64>,
+    candidate_generation: Arc<AtomicU64>,
+    generation_changed: watch::Sender<u64>,
 }
 impl ActionScope {
     fn new() -> Self {
@@ -113,6 +136,9 @@ impl ActionScope {
             cancelled: watch::channel(false).0,
             active: Arc::new(tokio::sync::Mutex::new(())),
             connection_generation: Arc::new(AtomicU64::new(0)),
+            registration_generation: Arc::new(AtomicU64::new(0)),
+            candidate_generation: Arc::new(AtomicU64::new(0)),
+            generation_changed: watch::channel(0).0,
         }
     }
     fn allows(&self, origin: &ActionOrigin) -> bool {
@@ -130,11 +156,13 @@ impl ActionScope {
         Fut: std::future::Future<Output = T>,
     {
         let mut cancelled = self.cancelled.subscribe();
+        let mut generation_changed = self.generation_changed.subscribe();
         if *cancelled.borrow() {
             return None;
         }
         let _active = tokio::select! { biased;
             _ = cancelled.changed() => return None,
+            _ = generation_changed.changed() => return None,
             guard = self.active.lock() => guard,
         };
         if *cancelled.borrow() {
@@ -142,6 +170,7 @@ impl ActionScope {
         }
         tokio::select! { biased;
             _ = cancelled.changed() => None,
+            _ = generation_changed.changed() => None,
             result = async {
                 // A reconnect shares the pairing scope. Check its independent
                 // connection authority here, after acquiring the action mutex.
@@ -152,17 +181,40 @@ impl ActionScope {
             } => result,
         }
     }
+    /// Native notification submission is gated; its acknowledgement is not.
+    async fn notification<F, Fut>(&self, origin: &ActionOrigin, issue: F) -> Option<Result<()>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<crate::ui::portal::Interaction>>,
+    {
+        let mut cancelled = self.cancelled.subscribe();
+        let mut generation = self.generation_changed.subscribe();
+        let wait = match self.effect(origin, issue).await? {
+            Ok(wait) => wait,
+            Err(error) => return Some(Err(error)),
+        };
+        if !self.allows(origin) {
+            return None;
+        }
+        tokio::select! { biased;
+            _ = cancelled.changed() => None,
+            _ = generation.changed() => None,
+            result = wait => Some(result),
+        }
+    }
 }
 #[derive(Clone)]
 struct ActionOrigin {
+    mesh: bool,
     device: Id,
     connection_id: Option<u64>,
 }
 impl ActionOrigin {
     fn captured(store: &Store, device: &Id) -> Self {
         Self {
+            mesh: store.mesh,
             device: device.clone(),
-            connection_id: store.connection_id,
+            connection_id: store.action_connection_id.or(store.connection_id),
         }
     }
 }
@@ -204,15 +256,25 @@ struct ReceiptJob {
 enum NotificationJob {
     File(ActionJob, DesktopAction),
     Receipt(ReceiptJob),
+    Delivery(crate::outbox::Transfer, String),
 }
 impl NotificationJob {
     fn allows(&self) -> bool {
         match self {
             Self::File(job, _) => job.scope.allows(&job.origin),
             Self::Receipt(job) => job.scope.allows(&job.origin),
+            Self::Delivery(..) => true,
         }
     }
 }
+// Established peer slots plus bounded ingress headroom let a known peer
+// replace its session even when every established slot is occupied.
+const SESSION_LIMIT: usize = 16;
+const ADMISSION_LIMIT: usize = 16;
+// Outbound candidate handshakes never borrow the inbound reserve. Account for
+// their own headroom in the total socket cap as well as the admission cap.
+const OUTBOUND_ADMISSION_LIMIT: usize = 4;
+const TRANSPORT_LIMIT: usize = SESSION_LIMIT + ADMISSION_LIMIT + OUTBOUND_ADMISSION_LIMIT;
 const NOTIFICATION_LIMIT: usize = 16;
 const EXPLICIT_IMAGE_LIMIT: usize = 8;
 #[derive(Default)]
@@ -281,6 +343,12 @@ impl ActionQueue {
         drop(pending);
         self.changed.notify_one();
     }
+    fn delivery(&self, transfer: crate::outbox::Transfer, name: String) {
+        let mut pending = self.pending.lock().expect("pending actions");
+        Self::push_notice(&mut pending, NotificationJob::Delivery(transfer, name));
+        drop(pending);
+        self.changed.notify_one();
+    }
     fn discard_invalid(&self) {
         let mut pending = self.pending.lock().expect("pending actions");
         if pending
@@ -315,41 +383,187 @@ fn persist_phone_generation(
     path: &std::path::Path,
     generation: u64,
 ) -> Result<()> {
-    let ui = ui.lock().expect("UI state");
-    if ui.phone_generation == Some(generation) {
-        crate::config::atomic_private(path, &serde_json::to_vec(&ui.snapshot.phone)?)?;
+    let mut ui = ui.lock().expect("UI state");
+    // Metadata authority outlives the socket. A different live peer cannot
+    // revoke it; replacement/re-pair of this device can.
+    if !ui.phone_generations.values().any(|id| *id == generation) {
+        return Ok(());
     }
+    if ui.phone_generation == Some(generation)
+        && let Some(device) = ui.snapshot.phone.device.clone()
+    {
+        let phone = ui.snapshot.phone.clone();
+        ui.phones.insert(device, phone);
+    }
+    // The per-device cache preserves ended peers when phone.json moves to the
+    // next displayed device. Both files use private atomic publication.
+    crate::config::atomic_private(
+        &path.with_file_name("phones.json"),
+        &serde_json::to_vec(&ui.phones)?,
+    )?;
+    crate::config::atomic_private(path, &serde_json::to_vec(&ui.snapshot.phone)?)?;
     Ok(())
 }
+
+/// Called under sessions -> admission -> UI locks by snapshots and lifecycle
+/// writers alike, so identity, metadata, generation and status move together.
+fn select_display(state: &Connections, admission: &Admission, ui: &mut crate::ui::State) {
+    let mut paired: Vec<_> = admission.peers.values().cloned().collect();
+    paired.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    paired.dedup();
+    let mut connected: Vec<_> = state
+        .sessions
+        .values()
+        .filter(|s| {
+            paired.contains(&s.device) && !s.close.is_closed() && s.close.borrow().is_none()
+        })
+        .map(|s| s.device.clone())
+        .collect();
+    connected.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    let previous = ui.snapshot.phone.device.clone();
+    let device = previous
+        .as_ref()
+        .filter(|id| connected.contains(id))
+        .cloned()
+        .or_else(|| connected.first().cloned())
+        .or_else(|| previous.filter(|id| paired.contains(id)))
+        .or_else(|| paired.first().cloned());
+    let phone = device
+        .as_ref()
+        .and_then(|id| ui.phones.get(id))
+        .cloned()
+        .or_else(|| {
+            device
+                .as_ref()
+                .and_then(|id| state.sessions.get(id))
+                .filter(|s| s.phone.device == device)
+                .map(|s| s.phone.clone())
+        })
+        .unwrap_or_else(|| crate::ui::Phone {
+            device: device.clone(),
+            name: if device.is_some() {
+                "Phone".into()
+            } else {
+                String::new()
+            },
+            ..Default::default()
+        });
+    let session = device
+        .as_ref()
+        .filter(|id| connected.contains(id))
+        .and_then(|id| state.sessions.get(id));
+    ui.phone_generation = device
+        .as_ref()
+        .and_then(|id| ui.phone_generations.get(id))
+        .copied();
+    ui.receiving_until
+        .retain(|_, until| *until > std::time::Instant::now());
+    ui.snapshot.receiving = session.is_some()
+        && device.as_ref().is_some_and(|id| {
+            ui.active_transfers.iter().any(|(d, _)| d == id)
+                || ui.receiving_until.keys().any(|(d, _)| d == id)
+        });
+    ui.snapshot.phone = phone;
+    ui.snapshot.device = device;
+    ui.snapshot.generation = ui.phone_generation;
+    ui.snapshot.paired = ui.snapshot.device.is_some();
+    ui.snapshot.connected = session.is_some();
+    ui.snapshot.paused = session.is_some_and(|s| s.paused);
+    ui.snapshot.paused_devices = connected
+        .iter()
+        .filter(|id| state.sessions.get(*id).is_some_and(|s| s.paused))
+        .cloned()
+        .collect();
+    ui.snapshot.paired_devices = paired;
+    ui.snapshot.connected_devices = connected;
+}
+
 fn update_ui_state(ui: &Mutex<crate::ui::State>, event: &Event) {
-    {
-        let mut ui = ui.lock().expect("UI state");
-        match event {
-            Event::ConnectionChanged { connected, .. } => {
+    let mut ui = ui.lock().expect("UI state");
+    match event {
+        Event::ConnectionChanged { device, connected } => {
+            let now = crate::now_ms();
+            if let Some(phone) = ui.phones.get_mut(device) {
+                phone.last_seen = now;
+            }
+            if ui.snapshot.phone.device.as_ref() == Some(device) {
                 ui.snapshot.connected = *connected;
-                ui.snapshot.phone.last_seen = crate::now_ms();
-                ui.clear_transfers();
+                ui.snapshot.phone.last_seen = now;
             }
-            Event::PhonePaused { paused, .. } => ui.snapshot.paused = *paused,
-            Event::PairingProgress { name } => ui.snapshot.pairing = name.clone(),
-            Event::TransferStarted { metadata, .. } => {
-                ui.active_transfers.insert(metadata.transfer_id.clone());
-                ui.receiving_until = Some(std::time::Instant::now() + Duration::from_millis(1500));
+            ui.clear_transfers(device);
+        }
+        Event::PhonePaused { device, paused }
+            if ui.snapshot.phone.device.as_ref() == Some(device) =>
+        {
+            ui.snapshot.paused = *paused;
+        }
+        Event::PairingProgress { name } => ui.snapshot.pairing = name.clone(),
+        Event::TransferStarted { device, metadata } => {
+            let key = (device.clone(), metadata.transfer_id.clone());
+            if !ui
+                .incoming
+                .iter()
+                .any(|t| t.device == *device && t.transfer_id == metadata.transfer_id)
+            {
+                ui.incoming
+                    .push_back(crate::outbox::Transfer::received(device.clone(), metadata));
             }
-            Event::TransferFinished { transfer_id, .. } => {
-                ui.active_transfers.remove(transfer_id);
+            ui.active_transfers.insert(key.clone());
+            ui.receiving_until
+                .retain(|_, until| *until > std::time::Instant::now());
+            ui.receiving_until
+                .insert(key, std::time::Instant::now() + Duration::from_millis(1500));
+        }
+        Event::TransferProgress {
+            device,
+            transfer_id,
+            received,
+            ..
+        } => {
+            if let Some(t) = ui
+                .incoming
+                .iter_mut()
+                .find(|t| t.device == *device && t.transfer_id == *transfer_id)
+            {
+                t.sent = *received;
             }
-            Event::Unpaired { .. } | Event::Paired { .. } => {
-                // Metadata from a prior pairing cannot label the next identity,
-                // even while its HELLO/publication is still pending.
+        }
+        Event::TransferFinished {
+            device,
+            transfer_id,
+            path,
+            deduplicated,
+        } => {
+            ui.active_transfers
+                .remove(&(device.clone(), transfer_id.clone()));
+            if *deduplicated {
+                ui.incoming.retain(|t| {
+                    t.device != *device || t.transfer_id != *transfer_id || t.state != "sending"
+                });
+            } else if let Some(t) = ui
+                .incoming
+                .iter_mut()
+                .find(|t| t.device == *device && t.transfer_id == *transfer_id)
+            {
+                t.state = "sent".into();
+                t.sent = t.size;
+                t.finished_at = Some(crate::now_ms());
+                t.path = path.clone();
+            }
+            ui.prune_incoming();
+        }
+        Event::Unpaired { device } | Event::Paired { device } => {
+            ui.phones.remove(device);
+            ui.phone_generations.remove(device);
+            ui.clear_transfers(device);
+            if ui.snapshot.phone.device.as_ref() == Some(device) {
                 ui.snapshot.phone = crate::ui::Phone::default();
                 ui.snapshot.connected = false;
                 ui.snapshot.paused = false;
                 ui.phone_generation = None;
-                ui.clear_transfers();
             }
-            _ => {}
         }
+        _ => {}
     }
 }
 
@@ -358,36 +572,64 @@ fn emit_event(ui: &Mutex<crate::ui::State>, events: &broadcast::Sender<Event>, e
     let _ = events.send(event);
 }
 
+#[derive(Clone)]
 enum OutgoingSelection {
     Text(Clipboard),
-    Image(Id, Vec<u8>),
+    Image(FileBegin, Arc<Vec<u8>>),
 }
 impl OutgoingSelection {
     fn id(&self) -> &Id {
         match self {
             Self::Text(text) => &text.transfer_id,
-            Self::Image(id, _) => id,
+            Self::Image(begin, _) => &begin.transfer_id,
+        }
+    }
+    /// The same recipient-specific frame is validated at publication and used
+    /// by the writer. In particular, mesh clock fields count toward JSON size.
+    fn first_frame(&self, mesh: bool) -> Message {
+        match self {
+            Self::Text(text) => {
+                let mut text = text.clone();
+                if !mesh {
+                    text.hlc = None;
+                    text.source_device = None;
+                }
+                Message::Clipboard(text)
+            }
+            Self::Image(begin, _) => {
+                let mut begin = begin.clone();
+                if !mesh {
+                    begin.hlc = None;
+                    begin.source_device = None;
+                }
+                Message::FileBegin(begin)
+            }
         }
     }
 }
+#[derive(Clone)]
 struct AutomaticWrite {
     target: ClipboardTarget,
+    connection: u64,
     selection: OutgoingSelection,
 }
 enum WriterWork {
     Frame(Message),
     Automatic(AutomaticWrite),
+    File(FileWrite),
 }
 /// Authority is checked at the first accepted byte, including after a socket
 /// returned Pending. Once a frame starts, keep completing the in-flight operation.
-struct OfferWriter<'a, W> {
+struct DeliveryWriter<'a, W> {
     core: &'a Core,
     writer: &'a mut W,
     target: ClipboardTarget,
+    operation_id: Id,
+    connection: u64,
     started: bool,
     canceled: bool,
 }
-impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for OfferWriter<'_, W> {
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for DeliveryWriter<'_, W> {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -399,11 +641,14 @@ impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for OfferWriter<'_,
         }
         let sessions = this.core.sessions.lock().expect("sessions");
         let automatic = this.core.automatic.lock().expect("automatic clipboard");
-        if this
-            .core
-            .automatic_target_locked(&sessions, &automatic)
-            .as_ref()
-            != Some(&this.target)
+        if sessions
+            .sessions
+            .get(&this.target.device)
+            .is_none_or(|s| s.id != this.connection)
+            || automatic.latest.get(&this.target.device) != Some(&this.operation_id)
+            || !this
+                .core
+                .automatic_target_current_locked(&sessions, &this.target)
         {
             this.canceled = true;
             return std::task::Poll::Ready(Err(std::io::Error::new(
@@ -460,33 +705,41 @@ async fn transmit_automatic<W: tokio::io::AsyncWrite + Unpin>(
     work: AutomaticWrite,
     priority: &mut mpsc::Receiver<Message>,
     normal: &mut mpsc::Receiver<Message>,
+    mut text: Option<&mut mpsc::Receiver<AutomaticWrite>>,
     reports: Option<&mpsc::Sender<WriteReport>>,
 ) -> Result<bool> {
-    let mut writer = OfferWriter {
+    let mut writer = DeliveryWriter {
         core,
         writer,
         target: work.target,
+        operation_id: work.selection.id().clone(),
+        connection: work.connection,
         started: false,
         canceled: false,
     };
+    let frame = work
+        .selection
+        .first_frame(core.mesh_link(&writer.target.device, writer.connection));
     let result = async {
         match work.selection {
-            OutgoingSelection::Text(text) => send(&mut writer, &Message::Clipboard(text)).await?,
-            OutgoingSelection::Image(id, bytes) => {
-                let begin = FileBegin {
-                    transfer_id: id.clone(),
-                    file_name: "clipboard.png".into(),
-                    mime: "image/png".into(),
-                    size: bytes.len() as u64,
-                    sha256: Hash::new(hex::encode(Sha256::digest(&bytes)))?,
-                    kind: FileKind::ClipboardImage,
-                    created_at: crate::now_ms(),
-                    source_media_id: None,
-                };
-                send(&mut writer, &Message::FileBegin(begin)).await?;
+            OutgoingSelection::Text(_) => send(&mut writer, &frame).await?,
+            OutgoingSelection::Image(begin, bytes) => {
+                let id = begin.transfer_id;
+                send(&mut writer, &frame).await?;
                 for (index, chunk) in bytes.chunks(CHUNK_SIZE).enumerate() {
                     // Receipts and heartbeats stay prompt between image frames.
                     send_pending_messages(&mut *writer.writer, priority, normal, reports).await?;
+                    if let Some(text) = &mut text {
+                        send_pending_clipboard_text(
+                            core,
+                            &mut *writer.writer,
+                            priority,
+                            normal,
+                            text,
+                            reports,
+                        )
+                        .await?;
+                    }
                     send(
                         &mut writer,
                         &Message::FileChunk(FileChunk {
@@ -504,35 +757,172 @@ async fn transmit_automatic<W: tokio::io::AsyncWrite + Unpin>(
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    if !writer.started
-        && (writer.canceled || core.automatic_target().as_ref() != Some(&writer.target))
-    {
+    if !writer.started && (writer.canceled || !core.automatic_recipient_current(&writer.target)) {
         return Ok(false);
     }
     result?;
     Ok(true)
 }
+async fn send_pending_clipboard_text<W: tokio::io::AsyncWrite + Unpin>(
+    core: &Core,
+    writer: &mut W,
+    priority: &mut mpsc::Receiver<Message>,
+    normal: &mut mpsc::Receiver<Message>,
+    text: &mut mpsc::Receiver<AutomaticWrite>,
+    reports: Option<&mpsc::Sender<WriteReport>>,
+) -> Result<()> {
+    if let Ok(work) = text.try_recv() {
+        ensure!(
+            matches!(work.selection, OutgoingSelection::Text(_)),
+            "image on text lane"
+        );
+        let id = work.selection.id().clone();
+        // Box the recursive edge: this invocation can only emit one text frame.
+        let sent = Box::pin(transmit_automatic(
+            core, writer, work, priority, normal, None, reports,
+        ))
+        .await?;
+        if let Some(reports) = reports {
+            reports
+                .send(if sent {
+                    WriteReport::Sent {
+                        id,
+                        at: Instant::now(),
+                    }
+                } else {
+                    WriteReport::Canceled(id)
+                })
+                .await?;
+        }
+    }
+    Ok(())
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClipboardTarget {
     pub device: Id,
     pub connection: u64,
-    pub generation: u64,
+    pub binding: u64,
+    pub policy: u64,
+    pub config_epoch: u64,
+}
+/// Frozen recipients of a physical clipboard offer. Later connections are never
+/// added; a revoked recipient can be skipped without suppressing another one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipboardOffer {
+    revision: u64,
+
+    observed: bool,
+    recipients: Vec<ClipboardRecipient>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClipboardRecipient {
+    target: ClipboardTarget,
+    text: bool,
+    image: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClipboardFormat {
+    Text,
+    Image,
+}
+impl ClipboardOffer {
+    /// Plan only from observation-time recipients, capabilities and image policy.
+    /// Availability may narrow the payloads; send-time checks may remove targets.
+    pub(crate) fn payload_plans(
+        &self,
+        text: bool,
+        image: bool,
+    ) -> Vec<(ClipboardTarget, ClipboardFormat)> {
+        self.recipients
+            .iter()
+            .filter_map(|recipient| {
+                let format = if image && recipient.image {
+                    ClipboardFormat::Image
+                } else if text && recipient.text {
+                    ClipboardFormat::Text
+                } else {
+                    return None;
+                };
+                Some((recipient.target.clone(), format))
+            })
+            .collect()
+    }
+}
+#[cfg(all(test, target_os = "linux"))]
+impl ClipboardOffer {
+    pub(crate) fn test_offer() -> Self {
+        Self {
+            revision: 0,
+
+            observed: false,
+            recipients: vec![ClipboardRecipient {
+                target: ClipboardTarget {
+                    device: Id::from_bytes([1; 16]),
+                    connection: 1,
+                    binding: 0,
+                    policy: 0,
+                    config_epoch: 0,
+                },
+                text: true,
+                image: true,
+            }],
+        }
+    }
 }
 #[derive(Default)]
-struct AutomaticClipboard {
-    generation: u64,
-    selection: Option<(ClipboardTarget, OutgoingSelection)>,
+struct ClipboardDelivery {
+    selections: HashMap<Id, AutomaticWrite>,
+    in_flight: HashMap<(Id, bool), AutomaticWrite>,
+    latest: HashMap<Id, Id>,
 }
-impl AutomaticClipboard {
+impl ClipboardDelivery {
     fn invalidate(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
-        self.selection = None;
+        self.latest.clear();
+        self.selections.clear();
+        self.in_flight.clear();
+    }
+    fn invalidate_peer(&mut self, device: &Id) {
+        self.latest.remove(device);
+        self.selections.remove(device);
+        self.in_flight.retain(|(peer, _), _| peer != device);
+    }
+    fn replace_link(&mut self, device: &Id, connection: u64) {
+        // Replacement retains the captured recipient and operation; ordinary
+        // disconnect still invalidates both maps through invalidate_peer.
+        for text in [false, true] {
+            if let Some(work) = self.in_flight.remove(&(device.clone(), text))
+                && self.latest.get(device) == Some(work.selection.id())
+            {
+                self.selections.entry(device.clone()).or_insert(work);
+            }
+        }
+        if let Some(work) = self.selections.get_mut(device) {
+            work.connection = connection;
+        }
+    }
+    fn receipt(&mut self, device: &Id, connection: u64, id: &Id) {
+        self.in_flight.retain(|(peer, _), work| {
+            !(peer == device && work.connection == connection && work.selection.id() == id)
+        });
+    }
+}
+struct ApplicationMessage {
+    message: Message,
+    refusal: Option<NackCode>,
+}
+impl From<Message> for ApplicationMessage {
+    fn from(message: Message) -> Self {
+        Self {
+            message,
+            refusal: None,
+        }
     }
 }
 struct ReadyState {
     store: Store,
     allow_recovery: bool,
     action_scope: Option<ActionScope>,
+    buffered: Vec<Message>,
 }
 struct Session {
     device: Id,
@@ -540,20 +930,40 @@ struct Session {
     close: watch::Sender<Option<CloseReason>>,
     wake: Arc<Notify>,
     paused: bool,
+    capabilities: Vec<String>,
+    outbound: bool,
+    mesh: bool,
+    role: String,
+    phone: crate::ui::Phone,
 }
 #[derive(Default)]
 struct Connections {
-    session: Option<Session>,
-    unpairing: bool,
+    sessions: HashMap<Id, Session>,
+    unpairing: HashSet<Id>,
+}
+type PhoneWrite = Shared<BoxFuture<'static, std::result::Result<(), Arc<String>>>>;
+#[derive(Default)]
+struct PhoneWrites {
+    pending: HashMap<Id, u64>,
+    completion: Option<PhoneWrite>,
 }
 /// Clone the Arc<Core> into a tray/window. Commands below are async; subscribe()
 /// returns a bounded broadcast stream (lagging UI consumers must resnapshot).
 pub struct Core {
+    #[cfg(target_os = "macos")]
+    pub(crate) ui_ready: Mutex<Arc<std::sync::atomic::AtomicBool>>,
+    mesh: mesh::Mesh,
+    transports: Arc<Semaphore>,
+    ingress: Arc<Semaphore>,
+    outbound_ingress: Arc<Semaphore>,
     pub identity: Identity,
     pub paths: Paths,
     ui: Arc<Mutex<crate::ui::State>>,
-    peer_capabilities: Mutex<Vec<String>>,
-    automatic: Arc<Mutex<AutomaticClipboard>>,
+    phone_writes: Arc<Mutex<PhoneWrites>>,
+    automatic: Arc<Mutex<ClipboardDelivery>>,
+    clipboard_config_epoch: Arc<AtomicU64>,
+    outbox: crate::outbox::Outbox,
+    file_admissions: Arc<crate::work::Work>,
     config: watch::Sender<Config>,
     events: broadcast::Sender<Event>,
     store: Store,
@@ -562,31 +972,53 @@ pub struct Core {
     provisional: Arc<AtomicBool>,
     pairing_gate: Arc<tokio::sync::Mutex<()>>,
     config_gate: Arc<tokio::sync::Mutex<()>>,
-    clipboard_gate: Arc<tokio::sync::Mutex<()>>,
-    outgoing_gate: tokio::sync::Mutex<()>,
+    clipboard: clipboard_driver::Handle,
+    clipboard_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    settings_gate: tokio::sync::Mutex<()>,
+    settings_ready: Mutex<HashMap<Id, u64>>,
     next_connection: AtomicU64,
+    next_candidate: AtomicU64,
     sessions: Arc<Mutex<Connections>>,
     actions: Arc<dyn PcActions>,
     action_queue: Arc<ActionQueue>,
-    action_scope: Arc<Mutex<Option<(Id, ActionScope)>>>,
+    action_scope: Arc<Mutex<HashMap<Id, ActionScope>>>,
     action_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
     action_stop: watch::Sender<bool>,
     shutdown: watch::Sender<bool>,
     port: AtomicU16,
-    window_request: Mutex<(u64, Option<String>)>,
+    window_request: Mutex<(u64, Option<String>, bool)>,
+    pending_sends: Mutex<std::collections::VecDeque<crate::ui::window::SendRequest>>,
+    window_focus: Mutex<Option<(u64, Instant)>>,
     #[cfg(test)]
     file_write_delay: Mutex<Duration>,
+}
+impl Drop for Core {
+    fn drop(&mut self) {
+        self.action_stop.send_replace(true);
+        let (reply, _) = tokio::sync::oneshot::channel();
+        let _ = self
+            .clipboard
+            .tx
+            .send(clipboard_driver::Message::Stop(reply));
+    }
 }
 impl Core {
     pub async fn new(
         paths: Paths,
-        config: Config,
+        mut config: Config,
         actions: Arc<dyn PcActions>,
     ) -> Result<Arc<Self>> {
+        if !config.clipboard_sync_to_phone
+            && config.clipboard_mode == crate::config::ClipboardMode::Automatic
+        {
+            config.clipboard_mode = crate::config::ClipboardMode::Off;
+        }
+        config.clipboard_sync_to_phone = config.clipboard_mode != crate::config::ClipboardMode::Off;
         config.validate_with_cache(&paths.cache)?;
         paths.prepare()?;
         let store = Store::open(&paths.data.join("state.sqlite3"))?;
         let identity = Identity::load_or_create(&paths.data)?;
+        let outbox = crate::outbox::Outbox::open(store.clone(), &paths.data.join("outbox"))?;
         let admission = Arc::new(Mutex::new(Admission {
             peers: store.peers().await?,
             ..Default::default()
@@ -617,16 +1049,70 @@ impl Core {
             .expect("admission")
             .peers
             .values()
-            .next()
-            .map(|id| (id.clone(), ActionScope::new()));
-        let phone = std::fs::read(paths.data.join("phone.json"))
+            .map(|id| (id.clone(), ActionScope::new()))
+            .collect();
+        let current_metadata = |device: &Id, phone: &crate::ui::Phone| {
+            phone.device.as_ref() == Some(device)
+                && phone.pairing_generation.is_some()
+                && phone.pairing_generation == store.pairing_generation(device)
+                && admission
+                    .lock()
+                    .expect("admission")
+                    .peers
+                    .values()
+                    .any(|id| id == device)
+        };
+        #[cfg(target_os = "macos")]
+        for name in ["phone.json", "phones.json"] {
+            let path = paths.data.join(name);
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => crate::platform::private::check_path(&path)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let phone: crate::ui::Phone = std::fs::read(paths.data.join("phone.json"))
             .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .and_then(|bytes| serde_json::from_slice::<crate::ui::Phone>(&bytes).ok())
+            .filter(|phone| {
+                phone
+                    .device
+                    .as_ref()
+                    .is_some_and(|id| current_metadata(id, phone))
+            })
             .unwrap_or_default();
+        let mut phones: HashMap<Id, crate::ui::Phone> =
+            std::fs::read(paths.data.join("phones.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
+        // Validate each file independently before merging: a stale per-device
+        // entry must not shadow a current phone.json entry for the same ID.
+        phones.retain(|device, phone| current_metadata(device, phone));
+        if let Some(device) = phone.device.clone() {
+            phones.entry(device).or_insert_with(|| phone.clone());
+        }
+        let mesh = mesh::Mesh::new(store.peer_info().await?);
+        let (clipboard, clipboard_rx) = clipboard_driver::Handle::channel();
+        let (register, legacy, history) = store.clipboard_snapshot().await?;
+        let mut clipboard_state = clipboard_actor::State::load(
+            register,
+            legacy,
+            history,
+            store.clipboard_fingerprint_key.clone(),
+        );
+        clipboard_state.seed_tickets(rand::random());
         let core = Arc::new(Self {
-            peer_capabilities: Mutex::new(Vec::new()),
-            automatic: Arc::new(Mutex::new(AutomaticClipboard::default())),
+            mesh,
+            outbox,
+            transports: Arc::new(Semaphore::new(TRANSPORT_LIMIT)),
+            ingress: Arc::new(Semaphore::new(ADMISSION_LIMIT)),
+            outbound_ingress: Arc::new(Semaphore::new(OUTBOUND_ADMISSION_LIMIT)),
+            phone_writes: Arc::new(Mutex::new(PhoneWrites::default())),
+            automatic: Arc::new(Mutex::new(ClipboardDelivery::default())),
+            clipboard_config_epoch: Arc::new(AtomicU64::new(0)),
             ui: Arc::new(Mutex::new(crate::ui::State {
+                phones,
                 snapshot: crate::ui::Snapshot {
                     phone,
                     ..Default::default()
@@ -634,6 +1120,9 @@ impl Core {
                 ..Default::default()
             })),
             identity,
+            file_admissions: Arc::default(),
+            #[cfg(target_os = "macos")]
+            ui_ready: Mutex::new(Arc::new(std::sync::atomic::AtomicBool::new(false))),
             paths,
             config,
             events,
@@ -644,9 +1133,12 @@ impl Core {
             pairing_gate: Arc::new(tokio::sync::Mutex::new(())),
             config_gate: Arc::new(tokio::sync::Mutex::new(())),
             sessions: Arc::new(Mutex::new(Connections::default())),
-            clipboard_gate: Arc::new(tokio::sync::Mutex::new(())),
-            outgoing_gate: tokio::sync::Mutex::new(()),
+            clipboard,
+            clipboard_worker: Mutex::new(None),
+            settings_gate: tokio::sync::Mutex::new(()),
+            settings_ready: Mutex::new(HashMap::new()),
             next_connection: AtomicU64::new(1),
+            next_candidate: AtomicU64::new(1),
             actions,
             action_queue: action_queue.clone(),
             action_scope: Arc::new(Mutex::new(action_scope)),
@@ -654,10 +1146,13 @@ impl Core {
             action_stop,
             shutdown,
             port: AtomicU16::new(port),
-            window_request: Mutex::new((0, None)),
+            window_request: Mutex::new((0, None, false)),
+            pending_sends: Mutex::default(),
+            window_focus: Mutex::new(None),
             #[cfg(test)]
             file_write_delay: Mutex::new(Duration::ZERO),
         });
+        encode_frame(&Message::Hello(core.computer_hello()))?;
         let weak = Arc::downgrade(&core);
         let stop = core.action_stop.subscribe();
         *core.action_worker.lock().expect("actions") = Some(tokio::spawn(Box::pin(action_loop(
@@ -665,7 +1160,23 @@ impl Core {
             action_queue,
             stop,
         ))));
+        *core.clipboard_worker.lock().expect("clipboard worker") =
+            Some(tokio::spawn(clipboard_driver::run(
+                Arc::downgrade(&core),
+                core.clipboard.clone(),
+                clipboard_rx,
+                clipboard_state,
+            )));
         Ok(core)
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn ui_test_notification(&self, transient: bool) -> Result<u32> {
+        self.actions.ui_test_notification(transient).await
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn ui_test_open(&self) -> Result<()> {
+        let file = ReceivedFile::open(&self.paths.cache.join("Pneu test viewer.png"))?;
+        self.actions.open_received(&file).await
     }
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.events.subscribe()
@@ -686,35 +1197,36 @@ impl Core {
         self.sessions
             .lock()
             .expect("sessions")
-            .session
-            .as_ref()
+            .sessions
+            .values()
             .filter(|s| !s.close.is_closed() && s.close.borrow().is_none())
-            .map(|s| vec![s.device.clone()])
-            .unwrap_or_default()
+            .map(|s| s.device.clone())
+            .collect()
     }
     pub fn phone_paused(&self, device: &Id) -> Option<bool> {
         self.sessions
             .lock()
             .expect("sessions")
-            .session
-            .as_ref()
+            .sessions
+            .get(device)
             .filter(|s| &s.device == device && !s.close.is_closed() && s.close.borrow().is_none())
             .map(|s| s.paused)
     }
     fn set_phone_paused(&self, device: &Id, id: u64, paused: bool) {
         let mut state = self.sessions.lock().expect("sessions");
         if let Some(s) = state
-            .session
-            .as_mut()
+            .sessions
+            .get_mut(device)
             .filter(|s| s.id == id && &s.device == device)
         {
             let changed = s.paused != paused;
             s.paused = paused;
             if changed {
+                self.clipboard.event(ClipboardEvent::Narrow(device.clone()));
                 self.automatic
                     .lock()
                     .expect("automatic clipboard")
-                    .invalidate();
+                    .invalidate_peer(device);
             }
             self.event(Event::PhonePaused {
                 device: device.clone(),
@@ -726,8 +1238,8 @@ impl Core {
         let state = self.sessions.lock().expect("sessions");
         if store.connection_id.is_none()
             || state
-                .session
-                .as_ref()
+                .sessions
+                .get(device)
                 .is_some_and(|s| &s.device == device && Some(s.id) == store.connection_id)
         {
             self.event(event);
@@ -736,19 +1248,26 @@ impl Core {
     fn finish_connection(&self, device: &Id, id: u64) -> bool {
         let mut state = self.sessions.lock().expect("sessions");
         if state
-            .session
-            .as_ref()
+            .sessions
+            .get(device)
             .is_some_and(|s| s.id == id && &s.device == device)
         {
-            state.session = None;
+            state.sessions.remove(device);
+            self.clipboard.event(ClipboardEvent::Narrow(device.clone()));
+            self.mesh.changed.notify_waiters();
             self.automatic
                 .lock()
                 .expect("automatic clipboard")
-                .invalidate();
+                .invalidate_peer(device);
             self.event(Event::ConnectionChanged {
                 device: device.clone(),
                 connected: false,
             });
+            select_display(
+                &state,
+                &self.admission.lock().expect("admission"),
+                &mut self.ui.lock().expect("UI state"),
+            );
             true
         } else {
             false
@@ -760,7 +1279,7 @@ impl Core {
     fn connection_id_current(&self, connection_id: Option<u64>, device: &Id) -> bool {
         let state = self.sessions.lock().expect("sessions");
         connection_id.is_none()
-            || state.session.as_ref().is_some_and(|s| {
+            || state.sessions.get(device).is_some_and(|s| {
                 &s.device == device && Some(s.id) == connection_id && s.close.borrow().is_none()
             })
     }
@@ -778,12 +1297,27 @@ impl Core {
         let mut request = self.window_request.lock().expect("window request");
         request.0 = ((request.0 >> 1) + 1) * 2 + u64::from(choose_folder);
         request.1 = token;
+        request.2 = false;
+    }
+    pub fn request_add_device(&self) {
+        self.request_add_device_with_activation(None);
+    }
+    pub(crate) fn request_add_device_with_activation(&self, token: Option<String>) {
+        let mut request = self.window_request.lock().expect("window request");
+        request.0 = ((request.0 >> 1) + 1) * 2;
+        request.1 = token;
+        request.2 = true;
+    }
+    pub fn window_add_device(&self, id: u64) -> bool {
+        let request = self.window_request.lock().expect("window request");
+        request.0 == id && request.2
     }
     pub fn window_request(&self) -> u64 {
         self.window_request.lock().expect("window request").0
     }
     pub(crate) fn window_request_with_activation(&self) -> (u64, Option<String>) {
-        self.window_request.lock().expect("window request").clone()
+        let request = self.window_request.lock().expect("window request");
+        (request.0, request.1.clone())
     }
     pub async fn close_pairing_if(&self, token: Hash) {
         let _guard = self.pairing_gate.lock().await;
@@ -822,39 +1356,48 @@ impl Core {
     pub fn ui_snapshot(&self) -> crate::ui::Snapshot {
         let sessions = self.sessions.lock().expect("sessions");
         let admission = self.admission.lock().expect("admission");
-        let ui = self.ui.lock().expect("UI state");
+        let mut ui = self.ui.lock().expect("UI state");
+        select_display(&sessions, &admission, &mut ui);
         let mut snapshot = ui.snapshot.clone();
-        snapshot.device = admission.peers.values().next().cloned();
-        snapshot.paired = snapshot.device.is_some();
-        if !snapshot.paired || snapshot.phone.device != snapshot.device {
-            // Older caches without identity are untrusted presentation data.
-            // A generic label is safer than attributing the previous phone's name.
-            snapshot.phone = crate::ui::Phone {
-                device: snapshot.device.clone(),
-                name: if snapshot.paired {
-                    "Phone".into()
-                } else {
-                    String::new()
-                },
-                ..Default::default()
-            };
-            snapshot.generation = None;
-        } else {
-            snapshot.generation = ui.phone_generation;
-        }
-        let session = sessions.session.as_ref().filter(|s| {
-            snapshot.device.as_ref() == Some(&s.device)
-                && !s.close.is_closed()
-                && s.close.borrow().is_none()
-        });
-        snapshot.connected = session.is_some();
-        snapshot.paused = session.is_some_and(|s| s.paused);
-        snapshot.receiving = snapshot.connected
-            && (!ui.active_transfers.is_empty()
-                || ui
-                    .receiving_until
-                    .is_some_and(|t| t > std::time::Instant::now()));
+        snapshot.devices = self.device_snapshots(&sessions, &admission, &ui);
+        snapshot.send_targets = self.file_targets(&snapshot.devices, &sessions, &admission);
+        snapshot.transfers = self.outbox.snapshot(&snapshot.connected_devices);
+        snapshot.transfers.extend(ui.incoming.iter().cloned());
         snapshot
+    }
+    fn arrival_source(&self, device: &Id) -> crate::actions::ArrivalSource {
+        let snapshot = self.ui_snapshot();
+        crate::actions::ArrivalSource {
+            device: device.clone(),
+            name: snapshot
+                .devices
+                .iter()
+                .find(|d| &d.device == device)
+                .map(|d| d.name.clone())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| "device".into()),
+            several: snapshot.devices.len() > 1,
+        }
+    }
+    fn delivery_finished(&self, delivery: &crate::outbox::Delivery) {
+        if !self.config().notification_preview {
+            return;
+        }
+        let snapshot = self.ui_snapshot();
+        if let Some(transfer) = snapshot.transfers.iter().find(|t| {
+            t.direction == "outgoing"
+                && t.transfer_id == delivery.begin.transfer_id
+                && t.device == delivery.authority.device
+                && matches!(t.state.as_str(), "sent" | "failed")
+        }) {
+            let name = snapshot
+                .devices
+                .iter()
+                .find(|d| d.device == transfer.device)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| "device".into());
+            self.action_queue.delivery(transfer.clone(), name);
+        }
     }
     pub fn set_receive_error(&self, error: Option<crate::ui::ReceiveError>) {
         self.ui.lock().expect("UI state").snapshot.error = error;
@@ -874,8 +1417,8 @@ impl Core {
         let sessions = self.sessions.lock().expect("sessions");
         if store.connection_id.is_some()
             && sessions
-                .session
-                .as_ref()
+                .sessions
+                .get(device)
                 .is_none_or(|s| &s.device != device || Some(s.id) != store.connection_id)
         {
             return;
@@ -895,15 +1438,14 @@ impl Core {
         let sessions = self.sessions.lock().expect("sessions");
         if store.connection_id.is_none()
             || sessions
-                .session
-                .as_ref()
+                .sessions
+                .get(device)
                 .is_some_and(|s| &s.device == device && Some(s.id) == store.connection_id)
         {
-            self.ui
-                .lock()
-                .expect("UI state")
-                .active_transfers
-                .remove(id);
+            let mut ui = self.ui.lock().expect("UI state");
+            ui.active_transfers.remove(&(device.clone(), id.clone()));
+            ui.incoming
+                .retain(|t| t.device != *device || t.transfer_id != *id || t.state != "sending");
         }
     }
     fn clear_receive_error(&self, matches: impl FnOnce(&crate::ui::ReceiveError) -> bool) {
@@ -958,6 +1500,7 @@ impl Core {
         };
         uri.validate()?;
         let mut state = self.admission.lock().expect("admission");
+        state.last_unknown = None;
         state.invitation = Some(Invitation {
             uri: uri.clone(),
             token: uri.token.clone(),
@@ -988,31 +1531,70 @@ impl Core {
         expected: Option<u64>,
         remote_name: Option<String>,
     ) -> Result<bool> {
+        self.forget_pairing_generation(device, reason, expected, remote_name, None)
+            .await
+    }
+    async fn forget_pairing_generation(
+        &self,
+        device: Id,
+        reason: CloseReason,
+        expected: Option<u64>,
+        remote_name: Option<String>,
+        generation: Option<u64>,
+    ) -> Result<bool> {
+        self.forget_pairing_generation_checked(
+            device,
+            reason,
+            expected,
+            remote_name,
+            generation,
+            None,
+        )
+        .await
+    }
+    async fn forget_pairing_generation_checked(
+        &self,
+        device: Id,
+        reason: CloseReason,
+        expected: Option<u64>,
+        remote_name: Option<String>,
+        generation: Option<u64>,
+        registration: Option<mesh::LinkEpoch>,
+    ) -> Result<bool> {
         let guard = self.pairing_gate.clone().lock_owned().await;
+        if generation.is_some() && self.store.pairing_generation(&device) != generation {
+            return Ok(false);
+        }
         // A stale local command for the phone replaced by a new pairing must
         // not mark the current phone unpairing or disturb its connection.
         if !self.paired_devices().contains(&device) {
             return Ok(false);
         }
+        // Cancellation while waiting for capacity must leave trust and its
+        // action scope intact. From here through submission there is no await.
+        let reservation = self.store.reserve().await;
         {
             let mut state = self.sessions.lock().expect("sessions");
+            if registration.is_some_and(|r| self.link_epoch_locked(&device) != r) {
+                return Ok(false);
+            }
             if expected.is_some()
                 && state
-                    .session
-                    .as_ref()
+                    .sessions
+                    .get(&device)
                     .is_none_or(|s| Some(s.id) != expected || s.device != device)
             {
                 return Ok(false);
             }
-            state.unpairing = true;
+            state.unpairing.insert(device.clone());
         }
         let scope = self
             .action_scope
             .lock()
             .expect("actions")
-            .as_ref()
-            .filter(|(id, _)| *id == device)
-            .map(|(_, scope)| scope.clone());
+            .get(&device)
+            .cloned();
+        self.clipboard.event(ClipboardEvent::Revoke(device.clone()));
         if let Some(scope) = &scope {
             scope.cancelled.send_replace(true);
             self.action_queue.discard_invalid();
@@ -1023,15 +1605,15 @@ impl Core {
         let actions = self.action_scope.clone();
         let ui = self.ui.clone();
         let automatic = self.automatic.clone();
+        let clipboard = self.clipboard.clone();
         let phone_path = self.paths.data.join("phone.json");
         self.store
-            .unpair_then(device.clone(), move |persisted| {
+            .unpair_reserved(reservation, device.clone(), move |persisted| {
                 let _guard = guard;
                 let mut scope = actions.lock().expect("actions");
                 if persisted {
-                    if scope.as_ref().is_some_and(|(id, _)| *id == device) {
-                        scope.take();
-                    }
+                    clipboard.event(ClipboardEvent::BindingReset(device.clone()));
+                    scope.remove(&device);
                     admission
                         .lock()
                         .expect("admission")
@@ -1040,11 +1622,11 @@ impl Core {
                 } else {
                     // Old work remains cancelled; restored trust gets a fresh
                     // action scope and can reconnect once storage recovers.
-                    *scope = Some((device.clone(), ActionScope::new()));
+                    scope.insert(device.clone(), ActionScope::new());
                 }
                 drop(scope);
                 let mut state = sessions.lock().expect("sessions");
-                let ended = state.session.take().filter(|s| s.device == device);
+                let ended = state.sessions.remove(&device);
                 if let Some(session) = &ended {
                     session.close.send_replace(Some(if persisted {
                         reason
@@ -1052,8 +1634,11 @@ impl Core {
                         CloseReason::Error(ErrorCode::Closing)
                     }));
                 }
-                state.unpairing = false;
-                automatic.lock().expect("automatic clipboard").invalidate();
+                state.unpairing.remove(&device);
+                automatic
+                    .lock()
+                    .expect("automatic clipboard")
+                    .invalidate_peer(&device);
                 let disconnected = Event::ConnectionChanged {
                     device: device.clone(),
                     connected: false,
@@ -1061,6 +1646,11 @@ impl Core {
                 // Capture/persist the ended timestamp before Unpaired invalidates
                 // metadata authority, while preserving public Unpaired -> disconnected order.
                 update_ui_state(&ui, &disconnected);
+                select_display(
+                    &state,
+                    &admission.lock().expect("admission"),
+                    &mut ui.lock().expect("UI state"),
+                );
                 if let Some(session) = ended
                     && let Err(error) = persist_phone_generation(&ui, &phone_path, session.id)
                 {
@@ -1086,11 +1676,19 @@ impl Core {
                         message: "unpair persistence failed; pairing retained".into(),
                     });
                 }
+                select_display(
+                    &state,
+                    &admission.lock().expect("admission"),
+                    &mut ui.lock().expect("UI state"),
+                );
                 let _ = events.send(disconnected);
             })
             .await?;
         if let Some(scope) = scope {
             let _idle = scope.active.lock().await;
+        }
+        if let Err(error) = self.outbox.reconcile().await {
+            self.error(None, format!("outbox cleanup deferred: {error}"));
         }
         Ok(true)
     }
@@ -1115,10 +1713,24 @@ impl Core {
     }
     async fn persist_config(
         &self,
-        config: Config,
+        mut config: Config,
         guard: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<()> {
+        let previous = self.config();
+        if config.clipboard_mode != previous.clipboard_mode {
+            config.clipboard_sync_to_phone =
+                config.clipboard_mode != crate::config::ClipboardMode::Off;
+        } else if config.clipboard_sync_to_phone != previous.clipboard_sync_to_phone {
+            config.clipboard_mode = if config.clipboard_sync_to_phone {
+                crate::config::ClipboardMode::Automatic
+            } else {
+                crate::config::ClipboardMode::Off
+            };
+        }
         config.validate_with_cache(&self.paths.cache)?;
+        let mut hello = self.computer_hello();
+        hello.name = config.name.clone();
+        encode_frame(&Message::Hello(hello))?;
         ensure!(
             config.port == self.config().port,
             "changing the port takes effect after restarting pneud"
@@ -1127,8 +1739,11 @@ impl Core {
         let clear_error = config.save_path != self.config().save_path || !config.save_to_folder;
         let cancel_automatic = config.clipboard_sync_to_phone
             != self.config().clipboard_sync_to_phone
-            || config.clipboard_include_images != self.config().clipboard_include_images;
+            || config.clipboard_include_images != self.config().clipboard_include_images
+            || config.clipboard_mode != self.config().clipboard_mode;
         let automatic = self.automatic.clone();
+        let config_epoch = self.clipboard_config_epoch.clone();
+        let clipboard = self.clipboard.clone();
         let ui = self.ui.clone();
         let settings = self.config.clone();
         let events = self.events.clone();
@@ -1138,9 +1753,22 @@ impl Core {
                 config.save(&path)?;
                 let mut automatic = automatic.lock().expect("automatic clipboard");
                 if cancel_automatic {
+                    // Fence effects computed before this change, even if their
+                    // publication runs after the existing queue is invalidated.
+                    config_epoch.fetch_add(1, Ordering::SeqCst);
                     automatic.invalidate();
+                    clipboard.event(ClipboardEvent::Policy {
+                        allowed: Vec::new(),
+                    });
                 }
                 settings.send_replace(config);
+                clipboard.event(ClipboardEvent::Mode(
+                    if settings.borrow().clipboard_sync_to_phone {
+                        settings.borrow().clipboard_mode
+                    } else {
+                        crate::config::ClipboardMode::Off
+                    },
+                ));
                 drop(automatic);
                 if clear_error {
                     let mut ui = ui.lock().expect("UI state");
@@ -1153,129 +1781,484 @@ impl Core {
             .await
     }
     pub async fn send_clipboard(&self, device: Id, text: String) -> Result<Id> {
-        let _clipboard = self.outgoing_gate.lock().await;
-        let store = {
-            let _guard = self.pairing_gate.lock().await;
-            ensure!(
-                self.config().clipboard_sync_to_phone,
-                "clipboard sync to phone is disabled"
-            );
-            ensure!(
-                self.paired_devices().contains(&device),
-                "device is not paired"
-            );
-            ensure!(
-                self.phone_paused(&device) == Some(false),
-                "phone is disconnected or paused"
-            );
-            self.store.with_current_pairing()
-        };
-        // Clear only this admitted phone's automatic work before preparation;
-        // a replacement/new offer during the await must keep its own selection.
-        self.cancel_automatic_clipboard(&device);
-        // The store assigns the timestamp and replaces the pending value in
-        // one transaction, so concurrent IPC jobs cannot reverse their order.
-        let text = store.enqueue_clipboard(device.clone(), text).await?;
-        self.wake(&device);
-        Ok(text.transfer_id)
+        self.send_observed_formats(self.explicit_clipboard_offer_for(device)?, Some(text), None)
+            .await
     }
-    pub fn clipboard_target(&self) -> Option<(Id, u64)> {
-        if !self.config().clipboard_sync_to_phone {
-            return None;
+    pub async fn share_clipboard(&self, targets: crate::outbox::Targets) -> Result<Id> {
+        let mut offer = {
+            // Match the displayed pairing as well as the frozen offer's binding.
+            // The actor retains that binding through reading, persistence and
+            // first-byte authorization; a later pairing can never be substituted.
+            let sessions = self.sessions.lock().expect("sessions");
+            let admission = self.admission.lock().expect("admission");
+            let mut offer = self
+                .automatic_target_locked(&sessions)
+                .context("no connected clipboard recipients")?;
+            match &targets {
+                crate::outbox::Targets::Captured(captured) => offer.recipients.retain(|r| {
+                    captured.iter().any(|a| {
+                        a.device == r.target.device
+                            && a.generation == r.target.binding
+                            && admission.peers.get(&a.fingerprint) == Some(&a.device)
+                    })
+                }),
+                targets => {
+                    if let Some(ids) = targets.explicit()? {
+                        offer.recipients.retain(|r| ids.contains(&r.target.device));
+                    }
+                }
+            }
+            offer
+        };
+        ensure!(
+            !offer.recipients.is_empty(),
+            "no connected clipboard recipients"
+        );
+        offer.observed = false;
+        let id = Id::new(crate::random_hex(16))?;
+        self.clipboard
+            .share(ClipboardEvent::Share {
+                token: self.clipboard.token(),
+                id: id.clone(),
+                source: self.identity.device_id.clone(),
+                offer,
+            })
+            .await?;
+        Ok(id)
+    }
+    pub async fn set_setting(&self, key: String, value: serde_json::Value) -> Result<()> {
+        let guard = self.config_gate.clone().lock_owned().await;
+        let mut config = self.config();
+        match key.as_str() {
+            "clipboard_mode" => config.clipboard_mode = serde_json::from_value(value)?,
+            "choose_devices_each_time" => {
+                config.choose_devices_each_time = serde_json::from_value(value)?
+            }
+            "queue_offline" => config.queue_offline = serde_json::from_value(value)?,
+            "name" => config.name = serde_json::from_value(value)?,
+            "save_to_folder" => config.save_to_folder = serde_json::from_value(value)?,
+            "save_path" => config.save_path = serde_json::from_value(value)?,
+            "notification_preview" => config.notification_preview = serde_json::from_value(value)?,
+            "copy_image_to_clipboard" => {
+                config.copy_image_to_clipboard = serde_json::from_value(value)?
+            }
+            "open_in_viewer" => config.open_in_viewer = serde_json::from_value(value)?,
+            "clipboard_include_images" => {
+                config.clipboard_include_images = serde_json::from_value(value)?
+            }
+            "clipboard_sync_to_phone" => {
+                config.clipboard_sync_to_phone = serde_json::from_value(value)?
+            }
+            "cache_retention_days" => config.cache_retention_days = serde_json::from_value(value)?,
+            "max_file_bytes" => config.max_file_bytes = serde_json::from_value(value)?,
+            "port" => config.port = serde_json::from_value(value)?,
+            _ => bail!("unknown setting"),
         }
+        self.persist_config(config, guard).await
+    }
+    pub async fn rename(&self, name: String) -> Result<()> {
+        let guard = self.config_gate.clone().lock_owned().await;
+        let mut config = self.config();
+        config.name = name;
+        self.persist_config(config, guard).await
+    }
+    /// Physical connection for callers starting a new offer. Frozen offers
+    /// capture the existing action scope, which survives only mesh duplicates.
+    pub fn clipboard_target(&self) -> Option<(Id, u64)> {
+        let device = self
+            .automatic_target()?
+            .recipients
+            .first()?
+            .target
+            .device
+            .clone();
+        let connection = self
+            .sessions
+            .lock()
+            .expect("sessions")
+            .sessions
+            .get(&device)?
+            .id;
+        Some((device, connection))
+    }
+    fn clipboard_connection_scope(&self, device: &Id, connection: u64) -> u64 {
+        self.action_scope
+            .lock()
+            .expect("actions")
+            .get(device)
+            .map(|scope| scope.connection_generation.load(Ordering::SeqCst))
+            .filter(|generation| *generation != 0)
+            .unwrap_or(connection)
+    }
+    fn automatic_target_current_locked(
+        &self,
+        sessions: &Connections,
+        target: &ClipboardTarget,
+    ) -> bool {
+        target.config_epoch == self.clipboard_config_epoch.load(Ordering::SeqCst)
+            && self.config().clipboard_sync_to_phone
+            && self.config().clipboard_mode != crate::config::ClipboardMode::Off
+            && !sessions.unpairing.contains(&target.device)
+            && target.binding == self.store.pairing_generation(&target.device).unwrap_or(0)
+            && sessions.sessions.get(&target.device).is_some_and(|s| {
+                self.clipboard_connection_scope(&target.device, s.id) == target.connection
+                    && (!s.mesh
+                        || self.pair_allows(
+                            &target.device,
+                            &self.identity.device_id,
+                            &target.device,
+                            "clipboard",
+                        ))
+                    && !s.paused
+                    && !s.close.is_closed()
+                    && s.close.borrow().is_none()
+            })
+            && target.policy == self.store.settings_generation(&target.device)
+    }
+    fn automatic_recipient_current(&self, target: &ClipboardTarget) -> bool {
+        let sessions = self.sessions.lock().expect("sessions");
+        self.automatic_target_current_locked(&sessions, target)
+    }
+    fn automatic_target_locked(&self, sessions: &Connections) -> Option<ClipboardOffer> {
+        // Capture the setting values and their epoch atomically with config
+        // publication; otherwise old capabilities could acquire the new epoch.
+        let _automatic = self.automatic.lock().expect("automatic clipboard");
+        let include_images = self.config().clipboard_include_images;
+        let mut recipients: Vec<_> = sessions
+            .sessions
+            .values()
+            .map(|s| ClipboardRecipient {
+                target: ClipboardTarget {
+                    device: s.device.clone(),
+                    connection: self.clipboard_connection_scope(&s.device, s.id),
+                    binding: self.store.pairing_generation(&s.device).unwrap_or(0),
+                    policy: self.store.settings_generation(&s.device),
+                    config_epoch: self.clipboard_config_epoch.load(Ordering::SeqCst),
+                },
+                text: s.capabilities.iter().any(|c| c == "clipboard_text"),
+                image: include_images && s.capabilities.iter().any(|c| c == "clipboard_image"),
+            })
+            .filter(|r| {
+                (r.text || r.image) && self.automatic_target_current_locked(sessions, &r.target)
+            })
+            .collect();
+        recipients.sort_by(|a, b| a.target.device.as_str().cmp(b.target.device.as_str()));
+        (!recipients.is_empty()).then_some(ClipboardOffer {
+            revision: self.clipboard.token(),
+
+            observed: false,
+            recipients,
+        })
+    }
+    pub fn automatic_target(&self) -> Option<ClipboardOffer> {
+        let sessions = self.sessions.lock().expect("sessions");
+        self.automatic_target_locked(&sessions)
+    }
+    pub fn automatic_offer_current(&self, offer: &ClipboardOffer) -> bool {
+        let sessions = self.sessions.lock().expect("sessions");
+        offer
+            .recipients
+            .iter()
+            .any(|r| self.automatic_target_current_locked(&sessions, &r.target))
+    }
+    /// Freeze recipients before asynchronous clipboard reading/debouncing.
+    /// Every offer, including clear/secret/unsupported, invalidates prepared work.
+    pub fn observe_clipboard_offer(&self) -> Option<ClipboardOffer> {
+        let (offer, _) = self.observe_watched_clipboard(false);
+        offer
+    }
+    pub(crate) fn observe_watched_clipboard(&self, origin: bool) -> (Option<ClipboardOffer>, u64) {
+        self.observe_watched_clipboard_kind(origin, false, false)
+    }
+    pub(crate) fn observe_watched_clipboard_kind(
+        &self,
+        origin: bool,
+        clear: bool,
+        initial: bool,
+    ) -> (Option<ClipboardOffer>, u64) {
+        let token = self.clipboard.token();
+        // A watcher's first event describes existing content, not a new copy.
+        // Classify it for explicit sharing, but never freeze automatic recipients.
+        let offer = (!initial)
+            .then(|| self.automatic_target())
+            .flatten()
+            .map(|mut offer| {
+                offer.revision = token;
+                offer.observed = true;
+                offer
+            });
+        self.clipboard.event(ClipboardEvent::Observe {
+            token,
+            id: Id::new(crate::random_hex(16)).expect("random id"),
+            offer: offer.clone(),
+            origin,
+            clear,
+        });
+        (offer, token)
+    }
+    pub(crate) fn register_clipboard_read(&self, token: u64, cancel: Arc<AtomicBool>) {
+        let _ = self
+            .clipboard
+            .tx
+            .send(clipboard_driver::Message::ReadHandle(token, cancel));
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn retire_clipboard_observation(&self, token: u64) {
+        self.clipboard.event(ClipboardEvent::AbandonRead(token));
+    }
+    pub(crate) fn clipboard_observed(
+        &self,
+        token: u64,
+        content: Option<crate::ui::clipboard::Content>,
+        debounce: bool,
+    ) {
+        let fingerprints = content
+            .as_ref()
+            .map(clipboard_actor::hashes)
+            .unwrap_or_default();
+        self.clipboard_observed_hashes(token, content, fingerprints, debounce);
+    }
+    pub(crate) fn clipboard_observed_hashes(
+        &self,
+        token: u64,
+        content: Option<crate::ui::clipboard::Content>,
+        fingerprints: Vec<[u8; 32]>,
+        debounce: bool,
+    ) {
+        self.clipboard.event(ClipboardEvent::Read {
+            token,
+            content,
+            fingerprints,
+            debounce,
+        });
+    }
+    /// The watcher runs on its own OS thread. Classify the marker on the actor
+    /// before deciding whether the offered bytes need reading. This preserves
+    /// the marker's FIFO control ordering without coalescing confirmations.
+    pub(crate) fn clipboard_install_marker(&self, ticket: u128) -> bool {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        if self
+            .clipboard
+            .tx
+            .send(clipboard_driver::Message::InstallMarker(ticket, reply))
+            .is_err()
+        {
+            return false;
+        }
+        result.blocking_recv().unwrap_or(false)
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn clipboard_test_echo(&self, token: u64) {
+        self.clipboard.event(ClipboardEvent::TestEcho(token));
+    }
+    #[cfg(test)]
+    pub(crate) async fn clipboard_test_idle(&self) {
+        self.clipboard.barrier().await;
+    }
+    #[cfg(test)]
+    pub(crate) async fn clipboard_test_read(
+        &self,
+        token: u64,
+        content: Option<crate::ui::clipboard::Content>,
+    ) {
+        let reply = self.clipboard.waiter(token);
+        self.clipboard_observed(token, content, false);
+        let _ = reply.await;
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    async fn wait_clipboard_observation(&self) {
+        self.clipboard.barrier().await;
+    }
+    #[cfg(test)]
+    pub(crate) async fn observe_local_clipboard_offer(&self) -> Result<Option<ClipboardOffer>> {
+        let (offer, token) = self.observe_watched_clipboard(false);
+        let reply = self.clipboard.waiter(token);
+        self.clipboard_observed(token, None, false);
+        reply.await??;
+        Ok(offer)
+    }
+    pub(crate) fn set_window_focus(&self, request: u64, focused: bool) {
+        if self.window_request.lock().expect("window request").0 == request {
+            *self.window_focus.lock().expect("window focus") =
+                focused.then_some((request, Instant::now()));
+        }
+    }
+    pub(crate) fn window_focused(&self) -> bool {
+        let request = self.window_request.lock().expect("window request").0;
+        self.window_focus
+            .lock()
+            .expect("window focus")
+            .is_some_and(|(r, at)| r == request && at.elapsed() < Duration::from_secs(2))
+    }
+    fn clipboard_receive_policy(&self, peer: &Id, kind: Option<FileKind>) -> Vec<PeerSetting> {
+        let clipboard = format!("{peer}/{}/clipboard", self.identity.device_id);
+        let media = format!("{peer}/{}/automatic_media", self.identity.device_id);
+        let automatic = matches!(
+            kind,
+            Some(FileKind::Screenshot | FileKind::Photo | FileKind::Recording)
+        );
+        self.store
+            .pair_settings
+            .lock()
+            .expect("pair settings")
+            .get(peer)
+            .into_iter()
+            .flatten()
+            .filter(|field| field.key == clipboard || (automatic && field.key == media))
+            .cloned()
+            .collect()
+    }
+    fn peer_is_computer(&self, device: &Id) -> bool {
         self.sessions
             .lock()
             .expect("sessions")
-            .session
-            .as_ref()
-            .filter(|s| !s.paused && !s.close.is_closed() && s.close.borrow().is_none())
-            .map(|s| (s.device.clone(), s.id))
+            .sessions
+            .get(device)
+            .is_some_and(|s| s.role == "computer")
     }
-    pub fn clipboard_image_capable(&self) -> bool {
-        self.peer_capabilities
+    fn mesh_link(&self, device: &Id, connection: u64) -> bool {
+        self.sessions
             .lock()
-            .expect("capabilities")
-            .iter()
-            .any(|s| s == "clipboard_image")
-    }
-    fn automatic_target_locked(
-        &self,
-        sessions: &Connections,
-        automatic: &AutomaticClipboard,
-    ) -> Option<ClipboardTarget> {
-        if sessions.unpairing || !self.config().clipboard_sync_to_phone {
-            return None;
-        }
-        sessions
-            .session
-            .as_ref()
-            .filter(|s| !s.paused && !s.close.is_closed() && s.close.borrow().is_none())
-            .map(|s| ClipboardTarget {
-                device: s.device.clone(),
-                connection: s.id,
-                generation: automatic.generation,
-            })
-    }
-    pub fn automatic_target(&self) -> Option<ClipboardTarget> {
-        let sessions = self.sessions.lock().expect("sessions");
-        let automatic = self.automatic.lock().expect("automatic clipboard");
-        self.automatic_target_locked(&sessions, &automatic)
-    }
-    /// Every offer, including clear/secret/unsupported, invalidates prepared work.
-    pub fn observe_clipboard_offer(&self) -> Option<ClipboardTarget> {
-        let sessions = self.sessions.lock().expect("sessions");
-        let mut automatic = self.automatic.lock().expect("automatic clipboard");
-        automatic.invalidate();
-        self.automatic_target_locked(&sessions, &automatic)
+            .expect("sessions")
+            .sessions
+            .get(device)
+            .is_some_and(|s| s.id == connection && s.mesh)
     }
     pub fn cancel_automatic_clipboard(&self, device: &Id) {
-        let sessions = self.sessions.lock().expect("sessions");
-        if sessions
-            .session
-            .as_ref()
-            .is_some_and(|s| &s.device == device)
-        {
-            self.automatic
-                .lock()
-                .expect("automatic clipboard")
-                .invalidate();
-        }
+        self.clipboard.event(ClipboardEvent::Narrow(device.clone()));
+        self.automatic
+            .lock()
+            .expect("automatic clipboard")
+            .invalidate_peer(device);
     }
+    #[cfg(test)]
     fn take_automatic(&self, device: &Id, connection: u64) -> Option<AutomaticWrite> {
+        self.take_automatic_lanes(device, connection, true, true)
+    }
+    fn take_automatic_lanes(
+        &self,
+        device: &Id,
+        connection: u64,
+        text_free: bool,
+        file_free: bool,
+    ) -> Option<AutomaticWrite> {
         let sessions = self.sessions.lock().expect("sessions");
         let mut automatic = self.automatic.lock().expect("automatic clipboard");
-        let current = self.automatic_target_locked(&sessions, &automatic)?;
-        if &current.device != device || current.connection != connection {
+        let work = automatic.selections.get(device)?;
+        if !match work.selection {
+            OutgoingSelection::Text(_) => text_free,
+            OutgoingSelection::Image(_, _) => file_free,
+        } {
             return None;
         }
-        if automatic
-            .selection
-            .as_ref()
-            .is_none_or(|(target, _)| target != &current)
+        if sessions.sessions.get(device).is_some_and(|s| s.mesh)
+            && self
+                .settings_ready
+                .lock()
+                .expect("settings ready")
+                .get(device)
+                != Some(&connection)
         {
             return None;
         }
-        automatic
-            .selection
-            .take()
-            .map(|(target, selection)| AutomaticWrite { target, selection })
+        if work.connection != connection
+            || !self.automatic_target_current_locked(&sessions, &work.target)
+        {
+            return None;
+        }
+        let work = automatic.selections.remove(device)?;
+        automatic.in_flight.insert(
+            (
+                device.clone(),
+                matches!(work.selection, OutgoingSelection::Text(_)),
+            ),
+            work.clone(),
+        );
+        Some(work)
     }
     fn publish_automatic(
         &self,
-        target: ClipboardTarget,
-        selection: OutgoingSelection,
+        offer: ClipboardOffer,
+        text: Option<OutgoingSelection>,
+        image: Option<OutgoingSelection>,
     ) -> Result<()> {
         let sessions = self.sessions.lock().expect("sessions");
         let mut automatic = self.automatic.lock().expect("automatic clipboard");
         ensure!(
-            self.automatic_target_locked(&sessions, &automatic).as_ref() == Some(&target),
-            "clipboard offer or policy changed"
+            !offer.observed
+                || self.config().clipboard_mode == crate::config::ClipboardMode::Automatic,
+            "automatic clipboard mode changed"
         );
-        automatic.selection = Some((target.clone(), selection));
+        let mut recipients = Vec::new();
+        for recipient in offer.recipients {
+            let target = recipient.target;
+            if !self.automatic_target_current_locked(&sessions, &target) {
+                continue;
+            }
+            let session = sessions
+                .sessions
+                .get(&target.device)
+                .expect("current recipient");
+            // Reject only the representation for this recipient. A usable
+            // fallback or another recipient must survive an encoding failure.
+            let selection = [
+                (recipient.image, image.as_ref()),
+                (recipient.text, text.as_ref()),
+            ]
+            .into_iter()
+            .filter_map(|(supported, selection)| supported.then_some(selection).flatten())
+            .find(|selection| encode_frame(&selection.first_frame(session.mesh)).is_ok())
+            .cloned();
+            if let Some(selection) = selection {
+                recipients.push(target.device.clone());
+                automatic
+                    .latest
+                    .insert(target.device.clone(), selection.id().clone());
+                automatic.selections.insert(
+                    target.device.clone(),
+                    AutomaticWrite {
+                        target,
+                        connection: session.id,
+                        selection,
+                    },
+                );
+            }
+        }
+        ensure!(!recipients.is_empty(), "clipboard offer or policy changed");
         drop(automatic);
         drop(sessions);
-        self.wake(&target.device);
+        for device in recipients {
+            self.wake(&device);
+        }
         Ok(())
+    }
+    fn automatic_offer_for(&self, device: Id, connection: Option<u64>) -> Result<ClipboardOffer> {
+        let mut offer = self
+            .automatic_target()
+            .context("phone is disconnected or paused")?;
+        offer.recipients.retain(|r| {
+            r.target.device == device
+                && connection.is_none_or(|c| {
+                    self.sessions
+                        .lock()
+                        .expect("sessions")
+                        .sessions
+                        .get(&device)
+                        .is_some_and(|s| s.id == c)
+                })
+        });
+        ensure!(!offer.recipients.is_empty(), "connection changed");
+        Ok(offer)
+    }
+    // The actor narrows older work for this peer when it accepts the request.
+    fn explicit_clipboard_offer_for(&self, device: Id) -> Result<ClipboardOffer> {
+        let sessions = self.sessions.lock().expect("sessions");
+        let mut offer = self
+            .automatic_target_locked(&sessions)
+            .context("phone is disconnected or paused")?;
+        offer.recipients.retain(|r| r.target.device == device);
+        ensure!(!offer.recipients.is_empty(), "connection changed");
+        Ok(offer)
     }
     pub async fn send_automatic_clipboard(
         &self,
@@ -1283,33 +2266,11 @@ impl Core {
         connection: u64,
         text: String,
     ) -> Result<Id> {
-        let target = self
-            .automatic_target()
-            .context("phone is disconnected or paused")?;
-        ensure!(
-            target.device == device && target.connection == connection,
-            "connection changed"
-        );
-        self.send_observed_clipboard(target, text).await
+        self.send_observed_clipboard(self.automatic_offer_for(device, Some(connection))?, text)
+            .await
     }
-    pub async fn send_observed_clipboard(
-        &self,
-        target: ClipboardTarget,
-        text: String,
-    ) -> Result<Id> {
-        let _clipboard = self.outgoing_gate.lock().await;
-        ensure!(
-            self.automatic_target().as_ref() == Some(&target),
-            "clipboard offer or policy changed"
-        );
-        let text = self
-            .store
-            .with_current_pairing()
-            .ephemeral_clipboard(target.device.clone(), text)
-            .await?;
-        let id = text.transfer_id.clone();
-        self.publish_automatic(target, OutgoingSelection::Text(text))?;
-        Ok(id)
+    pub async fn send_observed_clipboard(&self, offer: ClipboardOffer, text: String) -> Result<Id> {
+        self.send_observed_formats(offer, Some(text), None).await
     }
     pub async fn send_automatic_image(
         &self,
@@ -1317,62 +2278,185 @@ impl Core {
         connection: u64,
         bytes: Vec<u8>,
     ) -> Result<Id> {
-        let target = self
-            .automatic_target()
-            .context("phone is disconnected or paused")?;
-        ensure!(
-            target.device == device && target.connection == connection,
-            "connection changed"
-        );
-        self.send_observed_image(target, bytes).await
+        self.send_observed_image(self.automatic_offer_for(device, Some(connection))?, bytes)
+            .await
     }
     pub async fn send_clipboard_image(&self, device: Id, bytes: Vec<u8>) -> Result<Id> {
-        let target = self
-            .automatic_target()
-            .context("phone is disconnected or paused")?;
-        ensure!(target.device == device, "device is not connected");
-        self.send_observed_image(target, bytes).await
+        self.send_observed_formats(
+            self.explicit_clipboard_offer_for(device)?,
+            None,
+            Some(bytes),
+        )
+        .await
     }
-    pub async fn send_observed_image(&self, target: ClipboardTarget, bytes: Vec<u8>) -> Result<Id> {
-        let _clipboard = self.outgoing_gate.lock().await;
-        ensure!(
-            self.config().clipboard_include_images && self.clipboard_image_capable(),
-            "clipboard images are disabled or unsupported"
-        );
-        ensure!(
+    pub async fn send_observed_image(&self, offer: ClipboardOffer, bytes: Vec<u8>) -> Result<Id> {
+        self.send_observed_formats(offer, None, Some(bytes)).await
+    }
+    pub(crate) async fn send_observed_formats(
+        &self,
+        offer: ClipboardOffer,
+        text: Option<String>,
+        image: Option<Vec<u8>>,
+    ) -> Result<Id> {
+        use crate::ui::clipboard::Content;
+        let text = text.filter(|text| text.len() <= MAX_CLIPBOARD_BYTES && !text.contains('\0'));
+        let image = image.filter(|bytes| {
             bytes.len() <= crate::ui::clipboard::MAX_IMAGE
-                && bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-            "invalid clipboard PNG"
+                && bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        });
+        ensure!(
+            !offer
+                .payload_plans(text.is_some(), image.is_some())
+                .is_empty(),
+            "clipboard representation rejected"
         );
+        ensure!(
+            self.automatic_offer_current(&offer),
+            "clipboard offer or policy changed"
+        );
+        let content = match (text, image) {
+            (Some(text), Some(image)) => Content::Formats(text, image),
+            (Some(text), None) => Content::Text(text),
+            (None, Some(image)) => Content::Image(image),
+            _ => anyhow::bail!("clipboard representation rejected"),
+        };
+        let explicit = !offer.observed;
+        let token = self.clipboard.token();
         let id = Id::new(crate::random_hex(16))?;
-        self.publish_automatic(target, OutgoingSelection::Image(id.clone(), bytes))?;
+        let input = self.clipboard_input(Some(content.clone()))?;
+        let operation = ClipboardOperation {
+            token,
+            id: id.clone(),
+            source: self.identity.device_id.clone(),
+            key: None,
+            created_at: 0,
+            payload: None,
+            hashes: clipboard_actor::hashes(&content),
+            content: Some(content),
+            observation: offer.observed.then_some(offer.revision),
+            offer: Some(offer),
+            received: false,
+            legacy: false,
+            restore: false,
+            repair: false,
+        };
+        self.clipboard_frames(&operation, crate::now_ms())?;
+        let (reply, _) = tokio::sync::oneshot::channel();
+        let outcome = self
+            .clipboard
+            .submit(
+                operation,
+                clipboard_driver::Request {
+                    input,
+                    claim: None,
+                    store: self.store.clone(),
+                    authority: None,
+                    kind: None,
+                    policy: Vec::new(),
+                    reply,
+                },
+            )
+            .await?;
+        // Automatic observations may be classified as echoes. Explicit IPC/UI
+        // shares must not return a success ID for a superseded operation.
+        ensure!(
+            !explicit || outcome.applied,
+            "clipboard share was superseded"
+        );
         Ok(id)
+    }
+    fn clipboard_input(
+        &self,
+        content: Option<crate::ui::clipboard::Content>,
+    ) -> Result<crate::actions::ClipboardInput> {
+        use crate::{actions::ClipboardInput, ui::clipboard::Content};
+        match content.context("clipboard has no readable content")? {
+            Content::Text(text) => Ok(ClipboardInput::Text(text)),
+            Content::Image(bytes) => Ok(ClipboardInput::Bytes {
+                bytes,
+                mime: "image/png".into(),
+                cache: self.paths.cache.clone(),
+            }),
+            Content::Formats(text, png) => Ok(ClipboardInput::Formats {
+                text,
+                png,
+                cache: self.paths.cache.clone(),
+            }),
+        }
+    }
+    fn clipboard_frames(
+        &self,
+        operation: &ClipboardOperation,
+        hlc: u64,
+    ) -> Result<(Option<OutgoingSelection>, Option<OutgoingSelection>)> {
+        use crate::ui::clipboard::Content;
+        let (text, image) = match operation.content.as_ref() {
+            Some(Content::Text(text)) => (Some(text.clone()), None),
+            Some(Content::Image(bytes)) => (None, Some(bytes.clone())),
+            Some(Content::Formats(text, bytes)) => (Some(text.clone()), Some(bytes.clone())),
+            None => (None, None),
+        };
+        let text = text.map(|text| {
+            OutgoingSelection::Text(Clipboard {
+                transfer_id: operation.id.clone(),
+                text,
+                created_at: hlc,
+                origin: ClipboardOrigin::Clipboard,
+                hlc: Some(hlc),
+                source_device: Some(self.identity.device_id.clone()),
+            })
+        });
+        let image = image.map(|bytes| {
+            OutgoingSelection::Image(
+                FileBegin {
+                    transfer_id: operation.id.clone(),
+                    file_name: "clipboard.png".into(),
+                    mime: "image/png".into(),
+                    size: bytes.len() as u64,
+                    sha256: Hash::new(hex::encode(Sha256::digest(&bytes))).expect("SHA-256"),
+                    kind: FileKind::ClipboardImage,
+                    created_at: hlc,
+                    source_media_id: None,
+                    hlc: Some(hlc),
+                    source_device: Some(self.identity.device_id.clone()),
+                },
+                Arc::new(bytes),
+            )
+        });
+        if let Some(offer) = &operation.offer {
+            let sessions = self.sessions.lock().expect("sessions");
+            ensure!(
+                offer.recipients.iter().any(|r| {
+                    let mesh = sessions
+                        .sessions
+                        .get(&r.target.device)
+                        .is_some_and(|s| s.mesh);
+                    (r.text
+                        && text
+                            .as_ref()
+                            .is_some_and(|t| encode_frame(&t.first_frame(mesh)).is_ok()))
+                        || (r.image
+                            && image
+                                .as_ref()
+                                .is_some_and(|i| encode_frame(&i.first_frame(mesh)).is_ok()))
+                }),
+                "clipboard representation rejected"
+            );
+        }
+        Ok((text, image))
     }
     /// Explicit IPC discard is authorized against the current pairing first.
     pub async fn discard_clipboard(&self, device: Id) -> Result<()> {
-        let _clipboard = self.outgoing_gate.lock().await;
-        let store = {
-            let _guard = self.pairing_gate.lock().await;
-            ensure!(
-                self.paired_devices().contains(&device),
-                "device is not paired"
-            );
-            self.store.with_current_pairing()
-        };
-        store.discard_outgoing(device.clone()).await?;
+        ensure!(
+            self.paired_devices().contains(&device),
+            "device is not paired"
+        );
         self.cancel_automatic_clipboard(&device);
         self.wake(&device);
         Ok(())
     }
     fn wake(&self, device: &Id) {
-        if let Some(s) = self
-            .sessions
-            .lock()
-            .expect("sessions")
-            .session
-            .as_ref()
-            .filter(|s| &s.device == device)
-        {
+        if let Some(s) = self.sessions.lock().expect("sessions").sessions.get(device) {
             s.wake.notify_one();
         }
     }
@@ -1387,9 +2471,19 @@ impl Core {
         self.action_stop.send_replace(true);
     }
     pub async fn shutdown_actions(&self) -> Result<()> {
+        self.action_stop.send_replace(true);
+        self.file_admissions.drain().await;
+        self.clipboard.stop().await;
+        let clipboard_task = self
+            .clipboard_worker
+            .lock()
+            .expect("clipboard worker")
+            .take();
+        if let Some(task) = clipboard_task {
+            let _ = task.await;
+        }
         let task = self.action_worker.lock().expect("actions").take();
         if let Some(task) = task {
-            self.action_stop.send_replace(true);
             let _ = task.await;
         }
         self.actions.shutdown().await
@@ -1400,22 +2494,33 @@ impl Core {
         let listener = Arc::new(listener);
         self.port
             .store(listener.local_addr()?.port(), Ordering::SeqCst);
+        #[cfg(test)]
+        eprintln!(
+            "test Core serving PID={} port={} directory={} mDNS={advertise}",
+            std::process::id(),
+            self.bound_port(),
+            self.paths.data.display()
+        );
         let mut mdns = if advertise {
             self.optional(Advertisement::new(&self), "mDNS advertisement")
         } else {
             None
         };
-        let semaphore = Arc::new(Semaphore::new(16));
+        let semaphore = self.ingress.clone();
+        let transports = self.transports.clone();
+        let supervisor = mesh::Task::spawn(self.clone().mesh_supervise());
         let mut tasks = JoinSet::new();
         let mut shutdown = self.shutdown.subscribe();
         let mut prune = tokio::time::interval(Duration::from_secs(3600));
         let mut discovery = tokio::time::interval(Duration::from_secs(60));
+        let mut recovery_tick = tokio::time::interval(Duration::from_secs(1));
         loop {
             if *shutdown.borrow() {
                 break;
             }
             tokio::select! {
                 _ = shutdown.changed() => break,
+                _ = recovery_tick.tick() => {if let Err(error)=self.outbox.retry_recovery().await {self.error(None,format!("outbox recovery deferred: {error}"));}},
                 _ = discovery.tick(), if advertise => {
                     match crate::discovery::candidates() {
                         Ok(addresses) if mdns.as_ref().is_none_or(|m| m.addresses != addresses) => {
@@ -1430,9 +2535,9 @@ impl Core {
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
                 accepted = listener.accept() => {
                     let (stream,_) = accepted?;
-                    if let Ok(permit) = semaphore.clone().try_acquire_owned() {
+                    if let (Ok(permit), Ok(transport)) = (semaphore.clone().try_acquire_owned(), transports.clone().try_acquire_owned()) {
                         let core = self.clone();
-                        tasks.spawn(Box::pin(async move { let _permit = permit; let mut stop = core.shutdown.subscribe(); if *stop.borrow() { return; } let outcome = tokio::select! { biased; _ = stop.changed() => Ok(()), outcome = Box::pin(core.clone().connection(stream)) => outcome }; if let Err(e) = outcome { let reason = if let Some(protocol) = e.downcast_ref::<ProtocolError>() { format!("protocol {:?}",decode_code(protocol)) } else if let Some(io) = e.downcast_ref::<std::io::Error>() { format!("transport {:?}",io.kind()) } else { "transport or local state failure".into() }; core.error(None,format!("connection closed: {reason}")); } }));
+                        tasks.spawn(Box::pin(async move { let _transport = transport; let mut stop = core.shutdown.subscribe(); if *stop.borrow() { return; } let outcome = tokio::select! { biased; _ = stop.changed() => Ok(()), outcome = Box::pin(core.clone().connection(stream, permit)) => outcome }; if let Err(e) = outcome { let reason = if let Some(protocol) = e.downcast_ref::<ProtocolError>() { format!("protocol {:?}",decode_code(protocol)) } else if let Some(io) = e.downcast_ref::<std::io::Error>() { format!("transport {:?}",io.kind()) } else { "transport or local state failure".into() }; core.error(None,format!("connection closed: {reason}")); } }));
                     }
                 }
             }
@@ -1440,21 +2545,32 @@ impl Core {
         drop(mdns);
         let ended = {
             let state = self.sessions.lock().expect("sessions");
-            state.session.as_ref().map(|session| {
-                session
-                    .close
-                    .send_replace(Some(CloseReason::Error(ErrorCode::Closing)));
-                (session.device.clone(), session.id)
-            })
+            state
+                .sessions
+                .values()
+                .map(|session| {
+                    session
+                        .close
+                        .send_replace(Some(CloseReason::Error(ErrorCode::Closing)));
+                    (session.device.clone(), session.id)
+                })
+                .collect::<Vec<_>>()
         };
-        if let Some((device, id)) = ended
-            && self.finish_connection(&device, id)
-        {
-            self.optional(self.persist_phone(id).await, "shutdown last-seen metadata");
+        for (device, id) in ended {
+            if self.finish_connection(&device, id) {
+                self.optional(self.persist_phone(id).await, "shutdown last-seen metadata");
+            }
         }
         while tasks.join_next().await.is_some() {}
-        self.store.drain().await;
+        supervisor.await??;
         self.shutdown_actions().await?;
+        self.store.drain().await;
+        #[cfg(test)]
+        eprintln!(
+            "test Core stopped PID={} port={}",
+            std::process::id(),
+            self.bound_port()
+        );
         Ok(())
     }
     fn optional<T>(&self, result: Result<T>, operation: &str) -> Option<T> {
@@ -1481,8 +2597,17 @@ impl Core {
             })
             .await
     }
-    async fn connection(self: Arc<Self>, stream: TcpStream) -> Result<()> {
+    async fn connection(
+        self: Arc<Self>,
+        stream: TcpStream,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<()> {
         Box::pin(async move {
+            // Capture before TLS/HELLO without waiting behind lifecycle disk
+            // work. Registration rechecks this authority under the pairing gate.
+            let mut captured = self.store.with_current_pairing();
+            let registrations = self.link_epochs();
+            let candidate = self.next_candidate.fetch_add(1, Ordering::SeqCst);
             stream.set_nodelay(true)?;
             let verifier = Arc::new(ClientVerifier::new(
                 self.admission.clone(),
@@ -1495,7 +2620,7 @@ impl Core {
                 TlsAcceptor::from(Arc::new(config)).accept(stream),
             )
             .await;
-            let mut tls = handshake??;
+            let mut tls: TlsStream<TcpStream> = handshake??.into();
             let fp = certificate_fingerprint(
                 tls.get_ref()
                     .1
@@ -1518,31 +2643,67 @@ impl Core {
                 .await?;
                 return Ok(());
             }
-            let hello = match read_handshake(&mut tls).await? {
+            let mut hello = match read_handshake(&mut tls).await? {
                 Message::Hello(h) => h,
-                Message::Error(_) => return Ok(()),
+                Message::Error(error) => {
+                    if error.code == ErrorCode::VersionMismatch {
+                        let device = self
+                            .admission
+                            .lock()
+                            .expect("admission")
+                            .peers
+                            .get(&fp)
+                            .cloned();
+                        if let Some(device) = device
+                            && let Some(generation) = captured.pairing_generation(&device)
+                        {
+                            self.set_link_problem_if(
+                                &device,
+                                generation,
+                                registrations.get(&device).copied().unwrap_or_default(),
+                                Some(mesh::LinkProblem::UpdateRequired),
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
                 _ => {
                     send_error(&mut tls, ErrorCode::UnexpectedMessage).await?;
                     return Ok(());
                 }
             };
+            if hello.device_id == self.identity.device_id {
+                send_error(&mut tls, ErrorCode::Unauthorized).await?;
+                return Ok(());
+            }
             if hello.version != 1 {
+                // A certificate alone cannot label a claimed identity. Bind the
+                // authenticated fingerprint and captured generation first.
+                if self.admission.lock().expect("admission").peers.get(&fp)
+                    == Some(&hello.device_id)
+                    && let Some(generation) = captured.pairing_generation(&hello.device_id)
+                {
+                    self.set_link_problem_if(
+                        &hello.device_id,
+                        generation,
+                        registrations
+                            .get(&hello.device_id)
+                            .copied()
+                            .unwrap_or_default(),
+                        Some(mesh::LinkProblem::UpdateRequired),
+                    );
+                }
                 send_error(&mut tls, ErrorCode::VersionMismatch).await?;
                 return Ok(());
             }
+            if hello.capabilities.iter().any(|c| c == "mesh") && hello.role.is_none() {
+                send_error(&mut tls, ErrorCode::MalformedMessage).await?;
+                return Ok(());
+            }
+            normalize_legacy_hello(&mut hello, false);
             crate::transport::send(
                 &mut tls,
-                &Message::Hello(Hello {
-                    version: 1,
-                    device_id: self.identity.device_id.clone(),
-                    name: self.config().name,
-                    capabilities: vec![
-                        "files".into(),
-                        "clipboard_text".into(),
-                        "clipboard_image".into(),
-                    ],
-                    paused: None,
-                }),
+                &Message::Hello(self.computer_hello()),
                 Duration::from_secs(10),
             )
             .await?;
@@ -1571,7 +2732,12 @@ impl Core {
                 self.event(Event::PairingProgress {
                     name: Some(hello.name.clone()),
                 });
-                let result = self.finish_pairing(&hello.device_id, &fp, &token).await;
+                let result = self
+                    .finish_pairing_hello(&hello.device_id, &fp, &token, Some(hello.clone()))
+                    .await;
+                if let Ok(store) = &result {
+                    captured = store.clone();
+                }
                 self.event(Event::PairingProgress { name: None });
                 let accepted = result.is_ok();
                 let reply = Message::PairResult(PairResult {
@@ -1583,93 +2749,295 @@ impl Core {
                     crate::transport::close(&mut tls, &[reply]).await?;
                     return Ok(());
                 }
+                if hello.role == Some(DeviceRole::Computer)
+                    && hello.capabilities.iter().any(|c| c == "mesh")
+                {
+                    self.event(Event::ComputerPaired {
+                        device: hello.device_id.clone(),
+                        name: hello.name.clone(),
+                    });
+                }
                 crate::transport::send(&mut tls, &reply, Duration::from_secs(10)).await?;
             }
-            // Explicit unpairing could occur while HELLO/pairing was underway.
-            if self.admission.lock().expect("admission").peers.get(&fp) != Some(&hello.device_id) {
-                send_error(&mut tls, ErrorCode::Unauthorized).await?;
-                return Ok(());
-            }
-            if *self.shutdown.borrow() {
-                send_error(&mut tls, ErrorCode::Closing).await?;
-                return Ok(());
-            }
             verifier.release_provisional();
-            let (close_tx, close_rx) = watch::channel(None);
-            let wake = Arc::new(Notify::new());
-            // Fail fast while unpair persistence is pending, then serialize the
-            // binding recheck and generation capture with pair/unpair callbacks.
-            if self.sessions.lock().expect("sessions").unpairing {
-                send_error(&mut tls, ErrorCode::Unauthorized).await?;
-                return Ok(());
-            }
-            let (registered, mut store, action_scope, connection_id) = {
-                let _guard = self.pairing_gate.lock().await;
-                // Registration and generation-scoped events share this mutex.
-                let mut state = self.sessions.lock().expect("sessions");
-                // Allocate in admission order, rather than TLS-handshake order.
-                let connection_id = self.next_connection.fetch_add(1, Ordering::SeqCst);
-                let scope = self
-                    .action_scope
-                    .lock()
-                    .expect("actions")
-                    .as_ref()
-                    .filter(|(device, _)| *device == hello.device_id)
-                    .map(|(_, scope)| scope.clone());
-                let registered = if state.unpairing
-                    || self.admission.lock().expect("admission").peers.get(&fp)
-                        != Some(&hello.device_id)
-                {
-                    false
-                } else {
-                    if let Some(scope) = &scope {
+            self.clone()
+                .register_buffered(
+                    tls,
+                    hello,
+                    fp,
+                    peer_address,
+                    permit,
+                    captured,
+                    false,
+                    allow_recovery,
+                    Vec::new(),
+                    Some(candidate),
+                )
+                .await
+        })
+        .await
+    }
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    async fn register(
+        self: Arc<Self>,
+        tls: TlsStream<TcpStream>,
+        hello: Hello,
+        fp: Hash,
+        peer_address: SocketAddr,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        captured: Store,
+        outbound: bool,
+        allow_recovery: bool,
+    ) -> Result<()> {
+        self.register_buffered(
+            tls,
+            hello,
+            fp,
+            peer_address,
+            permit,
+            captured,
+            outbound,
+            allow_recovery,
+            Vec::new(),
+            None,
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn register_buffered(
+        self: Arc<Self>,
+        mut tls: TlsStream<TcpStream>,
+        mut hello: Hello,
+        fp: Hash,
+        peer_address: SocketAddr,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        captured: Store,
+        outbound: bool,
+        allow_recovery: bool,
+        buffered: Vec<Message>,
+        started: Option<u64>,
+    ) -> Result<()> {
+        if hello.device_id == self.identity.device_id {
+            send_error(&mut tls, ErrorCode::Unauthorized).await?;
+            return Ok(());
+        }
+        if hello.capabilities.iter().any(|c| c == "mesh") && hello.role.is_none() {
+            send_error(&mut tls, ErrorCode::MalformedMessage).await?;
+            return Ok(());
+        }
+        normalize_legacy_hello(&mut hello, outbound);
+        // Explicit unpairing could occur while HELLO/pairing was underway.
+        if self.admission.lock().expect("admission").peers.get(&fp) != Some(&hello.device_id) {
+            send_error(&mut tls, ErrorCode::Unauthorized).await?;
+            return Ok(());
+        }
+        if *self.shutdown.borrow() {
+            send_error(&mut tls, ErrorCode::Closing).await?;
+            return Ok(());
+        }
+        let (close_tx, mut close_rx) = watch::channel(None);
+        let wake = Arc::new(Notify::new());
+        // Fail fast while unpair persistence is pending, then serialize the
+        // binding recheck and generation capture with pair/unpair callbacks.
+        if self
+            .sessions
+            .lock()
+            .expect("sessions")
+            .unpairing
+            .contains(&hello.device_id)
+        {
+            send_error(&mut tls, ErrorCode::Unauthorized).await?;
+            return Ok(());
+        }
+        let (registration_error, mut store, action_scope, connection_id) = {
+            let _guard = self.pairing_gate.lock().await;
+            // Registration and generation-scoped events share this mutex.
+            let mut state = self.sessions.lock().expect("sessions");
+            // Allocate in admission order, rather than TLS-handshake order.
+            let connection_id = self.next_connection.fetch_add(1, Ordering::SeqCst);
+            let scope = self
+                .action_scope
+                .lock()
+                .expect("actions")
+                .get(&hello.device_id)
+                .cloned();
+            let registration_error = if state.unpairing.contains(&hello.device_id)
+                || captured.pairing_generation(&hello.device_id)
+                    != self.store.pairing_generation(&hello.device_id)
+                || self.admission.lock().expect("admission").peers.get(&fp)
+                    != Some(&hello.device_id)
+            {
+                Some(ErrorCode::Unauthorized)
+            } else if started.is_some_and(|started| {
+                scope.as_ref().is_some_and(|scope| {
+                    scope.candidate_generation.load(Ordering::SeqCst) > started
+                })
+            }) && !state
+                .sessions
+                .get(&hello.device_id)
+                .is_some_and(|previous| {
+                    previous.mesh
+                        && hello.capabilities.iter().any(|c| c == "mesh")
+                        && previous.outbound != outbound
+                })
+            {
+                // A newer candidate already registered (possibly disconnected).
+                // Only live opposite-direction mesh duplicates still need the
+                // deterministic dialer ranking below.
+                Some(ErrorCode::ConnectionReplaced)
+            } else if state.sessions.len() >= SESSION_LIMIT
+                && !state.sessions.contains_key(&hello.device_id)
+            {
+                Some(ErrorCode::Busy)
+            } else if state
+                .sessions
+                .get(&hello.device_id)
+                .is_some_and(|previous| {
+                    previous.mesh
+                        && hello.capabilities.iter().any(|c| c == "mesh")
+                        && previous.outbound != outbound
+                        && previous.outbound
+                            == (self.identity.device_id.as_str() < hello.device_id.as_str())
+                })
+            {
+                Some(ErrorCode::ConnectionReplaced)
+            } else {
+                self.record_link_registration(&hello.device_id, connection_id);
+                let duplicate_mesh = state.sessions.get(&hello.device_id).is_some_and(|s| s.mesh)
+                    && hello.capabilities.iter().any(|c| c == "mesh");
+                if let Some(scope) = &scope {
+                    if let Some(candidate) = started {
+                        scope
+                            .candidate_generation
+                            .fetch_max(candidate, Ordering::SeqCst);
+                    }
+                    scope
+                        .registration_generation
+                        .store(connection_id, Ordering::SeqCst);
+                    if !duplicate_mesh {
                         scope
                             .connection_generation
                             .store(connection_id, Ordering::SeqCst);
+                        scope.generation_changed.send_replace(connection_id);
                         self.action_queue.discard_invalid();
                     }
-                    if let Some(previous) = state.session.take() {
-                        previous
-                            .close
-                            .send_replace(Some(CloseReason::Error(ErrorCode::ConnectionReplaced)));
-                    }
-                    state.session = Some(Session {
+                }
+                if let Some(previous) = state.sessions.remove(&hello.device_id) {
+                    previous
+                        .close
+                        .send_replace(Some(CloseReason::Error(ErrorCode::ConnectionReplaced)));
+                }
+                state.sessions.insert(
+                    hello.device_id.clone(),
+                    Session {
+                        role: if hello.role == Some(DeviceRole::Computer) {
+                            "computer"
+                        } else {
+                            "phone"
+                        }
+                        .into(),
+                        outbound,
+                        mesh: hello.capabilities.iter().any(|c| c == "mesh"),
                         device: hello.device_id.clone(),
                         id: connection_id,
                         close: close_tx.clone(),
                         wake: wake.clone(),
                         paused: hello.paused.unwrap_or(false),
-                    });
-                    self.automatic
-                        .lock()
-                        .expect("automatic clipboard")
-                        .invalidate();
-                    self.publish_phone(&state, connection_id, &hello, peer_address.ip());
-                    self.event(Event::PhonePaused {
-                        device: hello.device_id.clone(),
-                        paused: hello.paused.unwrap_or(false),
-                    });
-                    self.event(Event::ConnectionChanged {
-                        device: hello.device_id.clone(),
-                        connected: true,
-                    });
-                    true
-                };
-                (
-                    registered,
-                    self.store.with_current_pairing(),
-                    scope,
-                    connection_id,
-                )
+                        capabilities: hello.capabilities.clone(),
+                        phone: crate::ui::Phone {
+                            device: Some(hello.device_id.clone()),
+                            pairing_generation: self.store.pairing_generation(&hello.device_id),
+                            name: hello.name.clone(),
+                            route: crate::ui::route(peer_address.ip()).into(),
+                            last_seen: crate::now_ms(),
+                        },
+                    },
+                );
+                {
+                    let mut automatic = self.automatic.lock().expect("automatic clipboard");
+                    if duplicate_mesh {
+                        automatic.replace_link(&hello.device_id, connection_id);
+                    } else {
+                        automatic.invalidate_peer(&hello.device_id);
+                    }
+                }
+                self.outbox.note(
+                    hello.device_id.clone(),
+                    self.store
+                        .pairing_generation(&hello.device_id)
+                        .expect("paired generation"),
+                    hello.capabilities.iter().any(|c| c == "files"),
+                );
+                self.publish_phone(&state, connection_id, &hello, peer_address.ip());
+                self.event(Event::PhonePaused {
+                    device: hello.device_id.clone(),
+                    paused: hello.paused.unwrap_or(false),
+                });
+                self.event(Event::ConnectionChanged {
+                    device: hello.device_id.clone(),
+                    connected: true,
+                });
+                None
             };
-            if !registered {
-                send_error(&mut tls, ErrorCode::Unauthorized).await?;
-                return Ok(());
+            (registration_error, captured, scope, connection_id)
+        };
+        if let Some(code) = registration_error {
+            send_error(&mut tls, code).await?;
+            return Ok(());
+        }
+        if let Some(generation) = store.pairing_generation(&hello.device_id) {
+            self.set_link_problem(&hello.device_id, generation, None);
+        }
+        let _registration = mesh::Registration {
+            core: self.clone(),
+            device: hello.device_id.clone(),
+            id: connection_id,
+        };
+        // Retain ingress and total transport permits through publication.
+        // A replaced socket must not wait for the blocking pool or disk.
+        let _metadata = action_scope.as_ref().map(|scope| {
+            let store = store.clone();
+            let hello = hello.clone();
+            let current = scope.registration_generation.clone();
+            mesh::Task::spawn(async move {
+                while current.load(Ordering::SeqCst) == connection_id {
+                    if store
+                        .remember_peer_hello(
+                            hello.clone(),
+                            current.clone(),
+                            connection_id,
+                            outbound,
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Ok(())
+            })
+        });
+        let phone_persistence = self.persist_phone(connection_id);
+        let persisted = tokio::select! { biased;
+            _ = close_rx.changed() => false,
+            result = phone_persistence => {
+                self.optional(result, "phone metadata");
+                true
             }
-            self.optional(self.persist_phone(connection_id).await, "phone metadata");
-            store.connection_id = Some(connection_id);
-            let result = self
-                .clone()
+        };
+        store.connection_id = Some(connection_id);
+        store.action_connection_id = action_scope
+            .as_ref()
+            .map(|scope| scope.connection_generation.load(Ordering::SeqCst));
+        store.mesh = hello.capabilities.iter().any(|c| c == "mesh");
+        store.local_device = Some(self.identity.device_id.clone());
+        let result = if persisted {
+            // The task's total transport permit remains held through READY
+            // and teardown. Only the bounded ingress reserve is released.
+            drop(permit);
+            self.clone()
                 .ready(
                     tls,
                     &hello,
@@ -1678,22 +3046,27 @@ impl Core {
                         store,
                         allow_recovery,
                         action_scope,
+                        buffered,
                     },
+                    outbound,
                     close_tx,
                     close_rx,
                 )
-                .await;
-            let current = self.finish_connection(&hello.device_id, connection_id);
-            if current {
-                self.optional(
-                    self.persist_phone(connection_id).await,
-                    "last-seen metadata",
-                );
-            }
-            drop(verifier);
-            if current { result } else { Ok(()) }
-        })
-        .await
+                .await
+        } else {
+            let reason = close_rx
+                .borrow()
+                .unwrap_or(CloseReason::Error(ErrorCode::Closing));
+            close_transport(&mut tls, reason).await
+        };
+        let current = self.finish_connection(&hello.device_id, connection_id);
+        if current {
+            self.optional(
+                self.persist_phone(connection_id).await,
+                "last-seen metadata",
+            );
+        }
+        if current { result } else { Ok(()) }
     }
     fn publish_phone(
         &self,
@@ -1702,44 +3075,129 @@ impl Core {
         hello: &Hello,
         address: std::net::IpAddr,
     ) -> bool {
-        if !state
-            .session
-            .as_ref()
-            .is_some_and(|s| s.id == connection && s.device == hello.device_id)
+        if state
+            .sessions
+            .get(&hello.device_id)
+            .is_none_or(|s| s.id != connection)
         {
             return false;
         }
+        let admission = self.admission.lock().expect("admission");
         let mut ui = self.ui.lock().expect("UI state");
-        ui.phone_generation = Some(connection);
-        ui.snapshot.phone = crate::ui::Phone {
-            device: Some(hello.device_id.clone()),
-            name: hello.name.clone(),
-            route: crate::ui::route(address).into(),
-            last_seen: crate::now_ms(),
-        };
-        *self.peer_capabilities.lock().expect("capabilities") = hello.capabilities.clone();
+        ui.phone_generations
+            .insert(hello.device_id.clone(), connection);
+        ui.phones.insert(
+            hello.device_id.clone(),
+            crate::ui::Phone {
+                device: Some(hello.device_id.clone()),
+                pairing_generation: self.store.pairing_generation(&hello.device_id),
+                name: hello.name.clone(),
+                route: crate::ui::route(address).into(),
+                last_seen: crate::now_ms(),
+            },
+        );
+        select_display(state, &admission, &mut ui);
         true
     }
-    async fn persist_phone(&self, connection: u64) -> Result<()> {
-        let sessions = self.sessions.clone();
-        let ui = self.ui.clone();
-        let path = self.paths.data.join("phone.json");
-        self.store
-            .blocking(move |_| {
-                let state = sessions.lock().expect("sessions");
-                if state.session.as_ref().is_none_or(|s| s.id == connection) {
-                    persist_phone_generation(&ui, &path, connection)?;
+    fn persist_phone(
+        &self,
+        connection: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        // Lifecycle publication already happened. Schedule its follow-up before
+        // returning a future, and coalesce storms instead of queuing one job per
+        // canceled connection. The writer still rechecks generation at the disk
+        // boundary; each device retains only its latest pending generation.
+        let device = self
+            .ui
+            .lock()
+            .expect("UI state")
+            .phone_generations
+            .iter()
+            .find_map(|(device, id)| (*id == connection).then(|| device.clone()));
+        let completion = device.map(|device| {
+            let mut writes = self.phone_writes.lock().expect("phone writes");
+            writes.pending.insert(device, connection);
+            if let Some(completion) = &writes.completion {
+                return completion.clone();
+            }
+            let pending = self.phone_writes.clone();
+            let ui = self.ui.clone();
+            let path = self.paths.data.join("phone.json");
+            let job = self.store.start_completion(move |_store| {
+                let mut outcome = Ok(());
+                loop {
+                    let batch = {
+                        let mut writes = pending.lock().expect("phone writes");
+                        if writes.pending.is_empty() {
+                            writes.completion.take();
+                            return outcome;
+                        }
+                        std::mem::take(&mut writes.pending)
+                    };
+                    for generation in batch.into_values() {
+                        #[cfg(test)]
+                        if let Err(error) = _store.fault("persist_phone") {
+                            outcome = Err(error);
+                            continue;
+                        }
+
+                        if let Err(error) = persist_phone_generation(&ui, &path, generation) {
+                            outcome = Err(error);
+                        }
+                    }
                 }
-                Ok(())
-            })
-            .await
+            });
+            let completion = async move {
+                job.await
+                    .map_err(|error| Arc::new(error.to_string()))?
+                    .map_err(|error| Arc::new(error.to_string()))
+            }
+            .boxed()
+            .shared();
+            writes.completion = Some(completion.clone());
+            completion
+        });
+        async move {
+            if let Some(completion) = completion {
+                return completion
+                    .await
+                    .map_err(|error| anyhow::Error::msg((*error).clone()));
+            }
+            Ok(())
+        }
     }
+    #[cfg(test)]
     async fn finish_pairing(
         &self,
         device: &Id,
         fp: &Hash,
         token: &Hash,
     ) -> std::result::Result<(), PairCode> {
+        self.finish_pairing_captured(device, fp, token)
+            .await
+            .map(|_| ())
+    }
+    #[cfg(test)]
+    async fn finish_pairing_captured(
+        &self,
+        device: &Id,
+        fp: &Hash,
+        token: &Hash,
+    ) -> std::result::Result<Store, PairCode> {
+        self.finish_pairing_hello(device, fp, token, None).await
+    }
+    async fn finish_pairing_hello(
+        &self,
+        device: &Id,
+        fp: &Hash,
+        token: &Hash,
+        hello: Option<Hello>,
+    ) -> std::result::Result<Store, PairCode> {
+        // PAIR_REQUEST carries only a token; its remote ID comes from HELLO.
+        // Refuse it before consuming the invitation or allocating a binding.
+        if device == &self.identity.device_id {
+            return Err(PairCode::InvalidToken);
+        }
         let guard = self.pairing_gate.clone().lock_owned().await;
         {
             let state = self.admission.lock().expect("admission");
@@ -1757,6 +3215,42 @@ impl Core {
                 return Err(PairCode::InvalidToken);
             }
         }
+        let hello = hello.map(|mut hello| {
+            normalize_legacy_hello(&mut hello, false);
+            hello
+        });
+        self.persist_pairing_hello(device, fp, guard, true, hello, None)
+            .await
+            .map_err(|_| PairCode::StorageFailed)
+    }
+    #[cfg(test)]
+    async fn persist_pairing(
+        &self,
+        device: &Id,
+        fp: &Hash,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+        consume_invitation: bool,
+    ) -> Result<Store> {
+        self.persist_pairing_hello(device, fp, guard, consume_invitation, None, None)
+            .await
+    }
+    async fn persist_pairing_hello(
+        &self,
+        device: &Id,
+        fp: &Hash,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+        consume_invitation: bool,
+        hello: Option<Hello>,
+        installed: Option<Arc<AtomicU64>>,
+    ) -> Result<Store> {
+        ensure!(
+            device != &self.identity.device_id,
+            "remote claimed local device ID"
+        );
+        let captured = self.store.for_next_pairing(device);
+        let installed_generation = captured
+            .pairing_generation(device)
+            .context("missing install generation")?;
         let admission = self.admission.clone();
         let events = self.events.clone();
         let actions = self.action_scope.clone();
@@ -1764,51 +3258,61 @@ impl Core {
         let sessions = self.sessions.clone();
         let ui = self.ui.clone();
         let automatic = self.automatic.clone();
+        let clipboard = self.clipboard.clone();
         let device = device.clone();
         let fp = fp.clone();
         let invitation_changes = self.invitation_changes.clone();
         self.store
-            .pair_then(device.clone(), fp.clone(), move || {
+            .pair_then_hello(device.clone(), fp.clone(), hello, move || {
                 let _guard = guard;
                 let mut connections = sessions.lock().expect("sessions");
-                connections.unpairing = false;
-                automatic.lock().expect("automatic clipboard").invalidate();
-                if let Some(old) = connections.session.take() {
+                connections.unpairing.remove(&device);
+                automatic
+                    .lock()
+                    .expect("automatic clipboard")
+                    .invalidate_peer(&device);
+                if let Some(old) = connections.sessions.remove(&device) {
                     old.close
                         .send_replace(Some(CloseReason::Error(ErrorCode::Unauthorized)));
                 }
+                clipboard.event(ClipboardEvent::BindingReset(device.clone()));
                 let mut scopes = actions.lock().expect("actions");
-                if let Some((_, old)) = scopes.take() {
+                if let Some(old) = scopes.insert(device.clone(), ActionScope::new()) {
                     old.cancelled.send_replace(true);
                 }
                 pending.discard_invalid();
-                *scopes = Some((device.clone(), ActionScope::new()));
                 let mut state = admission.lock().expect("admission");
-                for old in state.peers.values() {
-                    emit_event(
-                        &ui,
-                        &events,
-                        Event::Unpaired {
-                            device: old.clone(),
-                        },
-                    );
-                }
-                state.peers.clear();
+                state.peers.retain(|_, id| *id != device);
                 state.peers.insert(fp, device.clone());
-                state.invitation = None;
+                // The attempt owns this marker. Publish in the uncancelable
+                // commit callback so retry cannot mistake its own install for
+                // a newer local decision, even if its waiter disappears.
+                if let Some(installed) = installed {
+                    installed.store(installed_generation, Ordering::SeqCst);
+                }
+                if consume_invitation {
+                    state.invitation = None;
+                }
                 invitation_changes.send_modify(|r| *r = r.wrapping_add(1));
                 drop(state);
                 emit_event(&ui, &events, Event::Paired { device });
+                select_display(
+                    &connections,
+                    &admission.lock().expect("admission"),
+                    &mut ui.lock().expect("UI state"),
+                );
             })
-            .await
-            .map_err(|_| PairCode::StorageFailed)
+            .await?;
+        Ok(captured)
     }
+    #[allow(clippy::too_many_arguments)]
     async fn ready(
         self: Arc<Self>,
         tls: TlsStream<TcpStream>,
         hello: &Hello,
         wake: Arc<Notify>,
         state: ReadyState,
+        outbound: bool,
         close_tx: watch::Sender<Option<CloseReason>>,
         mut close: watch::Receiver<Option<CloseReason>>,
     ) -> Result<()> {
@@ -1818,29 +3322,48 @@ impl Core {
             store,
             allow_recovery,
             action_scope,
+            buffered,
         } = state;
         let mut config = self.config.subscribe();
-        let (mut reader, mut writer) = tokio::io::split(tls);
+        let mut settings_changes=store.settings_changed.subscribe();
+        let (mut reader, writer) = tokio::io::split(tls);
+        let activity = Arc::new(Mutex::new(Instant::now()));
+        let mut writer = crate::transport::ActivityWriter { writer, sent: activity.clone() };
         let (write_tx, write_rx) = mpsc::channel::<Message>(32);
         let (priority_tx, priority_rx) = mpsc::channel::<Message>(8);
         let (automatic_tx, automatic_rx) = mpsc::channel::<AutomaticWrite>(1);
+        let (automatic_text_tx, automatic_text_rx) = mpsc::channel::<AutomaticWrite>(1);
+        let (outbox_tx, outbox_rx) = mpsc::channel::<FileWrite>(1);
         let (reports_tx, mut reports_rx) = mpsc::channel::<WriteReport>(4);
         let (read_tx, mut read_rx) = mpsc::channel::<Message>(8);
-        let (file_tx, file_rx) = mpsc::channel::<Message>(4);
+        let (file_tx, file_rx) = mpsc::channel::<ApplicationMessage>(4);
         let (text_tx, mut text_rx) = mpsc::channel::<Message>(2);
         let writer_core = self.clone();
         let writer_close = close.clone();
         let writer_task = tokio::spawn(Box::pin(async move {
             writer_loop(writer_core, &mut writer, WriterQueues {
-                normal: write_rx, priority: priority_rx, automatic: automatic_rx,
+                normal: write_rx, priority: priority_rx, automatic: automatic_rx, text: automatic_text_rx, files: outbox_rx,
                 reports: reports_tx, close: writer_close,
             }).await
         }));
         let reader_signal = close_tx.clone();
+        let ping=Arc::new(Mutex::new(None));
+        let heartbeat_task=tokio::spawn(crate::transport::heartbeat(outbound,activity,priority_tx.clone(),ping.clone(),close_tx.clone()));
         let mut reader_close = close.clone();
+        let readiness = Arc::new(Notify::new());
+        let needs_evidence = !outbound && hello.role == Some(DeviceRole::Computer);
+        let _readiness = needs_evidence.then(|| self.persist_readiness(
+            store.clone(), hello.device_id.clone(), Some(readiness.clone()),
+        ));
         let reader_task = tokio::spawn(Box::pin(async move {
+            for message in buffered {
+                if !enqueue(&read_tx, message, &mut reader_close, None).await? { return Ok(()); }
+            }
             loop {
-                let frame = tokio::select! {biased;_=reader_close.changed()=>return Ok(()),frame=tokio::time::timeout(Duration::from_secs(180),read_frame(&mut reader))=>frame};
+                let frame=tokio::select! {biased;
+                    _=reader_close.changed()=>return Ok(()),
+                    frame=read_ready_frame(&mut reader,outbound)=>frame,
+                };
                 let message = match frame {
                     Ok(Ok(Some(message))) => message,
                     Ok(Ok(None)) => return Ok(()),
@@ -1855,7 +3378,18 @@ impl Core {
                 };
                 let ended = matches!(message, Message::Error(_));
                 let queued = match message {
+                    Message::Pong(p) if outbound => {
+                        {
+                            let mut outstanding=ping.lock().expect("heartbeat");
+                            ensure!(outstanding.as_ref().is_some_and(|(nonce, _)| *nonce == p.nonce), "unsolicited PONG");
+                            *outstanding = None;
+                        }
+                        true
+                    }
                     Message::Ping(p) => {
+                        // Only the dialer's READY-loop traffic proves it has
+                        // persisted trust. PONG on a pairing link does not.
+                        if needs_evidence { readiness.notify_one(); }
                         enqueue(&priority_tx, Message::Pong(p), &mut reader_close, None).await?
                     }
                     m => enqueue(&read_tx, m, &mut reader_close, None).await?,
@@ -1923,23 +3457,80 @@ impl Core {
         }));
         let mut workers = ConnectionTasks {
             reader: reader_task,
+            heartbeat: heartbeat_task,
             writer: writer_task,
             file: file_task,
             text: text_task,
         };
         let mut writer_finished = false;
-        let mut applications_finished = false;
+        let mut file_pending: Option<crate::outbox::Delivery> = None;
+        let mut file_preparations = JoinSet::new();
+        let mut file_poll = Instant::now();
+        let generation = store.pairing_generation(&hello.device_id).context("pairing changed")?;
+        let mut recovery = None;
         let mut pending: Option<PendingOutgoing> = None;
-        let mut retry_at: Option<Instant> = None;
-        let mut query_outgoing = true;
+        let mut text_pending: Option<PendingOutgoing> = None;
         let mut recovered_pairing = !allow_recovery;
-        let mut outgoing_query = None;
+        let mut settings_pending: Option<PendingOutgoing> = None;
+        let mut settings_snapshot: Option<PeerSettings> = None;
+        let mut settings_confirmed: Option<Vec<PeerSetting>> = None;
+        let mut settings_received = !store.mesh;
+        let mut settings_retry: Option<Instant> = None;
         let result:Result<()>=async {
+            if let Err(error)=self.initialize_settings(&store,hello).await {
+                self.error(Some(hello.device_id.clone()),format!("settings initialization deferred: {error}"));
+                settings_retry=Some(Instant::now()+Duration::from_secs(60));
+            }
             loop {
                 if close.borrow().is_some() || !self.connection_current(&store, &hello.device_id) {break;}
-                if pending.is_none()
-                    && let Some(work) = self.take_automatic(&hello.device_id, store.connection_id.expect("connection id")) {
+                if store.mesh {
+                    let fields=self.store.pair_settings.lock().expect("pair settings").get(&hello.device_id).cloned().unwrap_or_default();
+                    if settings_pending.is_none() && settings_retry.is_none_or(|at|at<=Instant::now()) && settings_confirmed.as_ref()!=Some(&fields) {
+                        match store.settings_outgoing(self.identity.device_id.clone(),hello.device_id.clone(),hello.role==Some(DeviceRole::Phone)).await {
+                            Ok(snapshot)=>{
+                                if !enqueue(&write_tx,Message::PeerSettings(snapshot.clone()),&mut close,Some(Instant::now()+Duration::from_secs(60))).await? {break;}
+                                settings_pending=Some(PendingOutgoing::queued(snapshot.transfer_id.clone()));
+                                settings_snapshot=Some(snapshot);
+                                settings_retry=None;
+                            },
+                            Err(error)=>{self.error(Some(hello.device_id.clone()),format!("settings persistence failed: {error}"));settings_retry=Some(Instant::now()+Duration::from_secs(60));},
+                        }
+                    }
+                    let synchronized=settings_received && settings_pending.is_none() && settings_confirmed.as_ref()==Some(&fields);
+                    self.publish_settings_ready(&store, &hello.device_id, synchronized);
+                }
+                if file_pending.is_some() && !self.outbox.current(file_pending.as_ref().expect("pending file")) {break;}
+                if pending.is_none() && self.outbox.has_work(&hello.device_id) && Instant::now()>=file_poll && self.content_ready(&store,&hello.device_id)
+                    && hello.capabilities.iter().any(|c|c=="files") {
+                    file_poll=Instant::now()+Duration::from_secs(1);
+                    recovery.get_or_insert_with(||self.arm_file_recovery(hello.device_id.clone(),generation,store.connection_id.expect("connection id")));
+                    let claim_core=self.clone();let claim_store=store.clone();let claim_device=hello.device_id.clone();
+                    match self.outbox.claim_while(hello.device_id.clone(),generation,store.connection_id.expect("connection id"),move ||claim_core.connection_current(&claim_store,&claim_device)).await {
+                        Ok(Some(delivery))=>{
+                            let id=delivery.begin.transfer_id.clone();
+                            // Hashing belongs to a preparation job. The transport
+                            // writer continues servicing heartbeat and text.
+                            let core=self.clone();let preparing=delivery.clone();let connection=store.connection_id.expect("connection id");let mesh=store.mesh;
+                            file_preparations.spawn(async move {
+                                match core.outbox.reader(preparing.clone()).await {
+                                    Ok(file)=>Ok(FileWrite {delivery:preparing,connection,mesh,file:Some(file)}),
+                                    Err(error)=>{
+                                        if let Err(storage)=core.outbox.fail(preparing.clone(),error.to_string()).await {core.error(None,format!("outbox failure persistence deferred: {storage}"));}
+                                        core.delivery_finished(&preparing);Err(error)
+                                    }
+                                }
+                            });
+                            file_pending=Some(delivery);pending=Some(PendingOutgoing::queued(id));
+                        },
+                        Ok(None)=>{},
+                        Err(error)=>{self.error(Some(hello.device_id.clone()),format!("outbox storage deferred: {error}"));file_poll=Instant::now()+Duration::from_secs(60);},
+                    }
+                }
+                if file_poll<=Instant::now() {file_poll=Instant::now()+Duration::from_secs(1);}
+                if self.content_ready(&store,&hello.device_id)
+                    && let Some(work) = self.take_automatic_lanes(&hello.device_id, store.connection_id.expect("connection id"),text_pending.is_none(),pending.is_none()) {
                     let id = work.selection.id().clone();
+                    let is_text=matches!(work.selection,OutgoingSelection::Text(_));
                     let supported = match &work.selection {
                         OutgoingSelection::Text(_) => hello.capabilities.iter().any(|c|c=="clipboard_text"),
                         OutgoingSelection::Image(_, _) => self.config().clipboard_include_images && hello.capabilities.iter().any(|c|c=="clipboard_image"),
@@ -1948,63 +3539,89 @@ impl Core {
                         let deadline = Instant::now()+Duration::from_secs(60);
                         let queued = tokio::select! { biased;
                             _=close.changed()=>false,
-                            sent=tokio::time::timeout_at(deadline, automatic_tx.send(work))=>{sent??;true},
+                            sent=tokio::time::timeout_at(deadline, async {if is_text {automatic_text_tx.send(work).await} else {automatic_tx.send(work).await}})=>{sent??;true},
                         };
                         if !queued {break;}
-                        pending=Some(PendingOutgoing::queued(-1,id));
+                        if is_text {text_pending=Some(PendingOutgoing::queued(id));} else {pending=Some(PendingOutgoing::queued(id));}
                     }
                 }
-                if outgoing_query.is_none() && query_outgoing && pending.is_none()
-                    && self.phone_paused(&hello.device_id)==Some(false)
-                    && self.config().clipboard_sync_to_phone
-                    && hello.capabilities.iter().any(|c|c=="clipboard_text") {
-                    let store = store.clone();
-                    let device = hello.device_id.clone();
-                    outgoing_query = Some(Box::pin(async move { store.first_outgoing(device).await }));
-                    query_outgoing = false;
-                }
-                let receipt_deadline=pending.as_ref().and_then(|p|p.deadline).unwrap_or_else(||Instant::now()+Duration::from_secs(86400));
+                let content_deadline=pending.as_ref().and_then(|p|p.deadline).into_iter().chain(text_pending.as_ref().and_then(|p|p.deadline)).min();
+                let settings_deadline=settings_pending.as_ref().and_then(|p|p.deadline);
+                let receipt_deadline=content_deadline.into_iter().chain(settings_deadline).min().unwrap_or_else(||Instant::now()+Duration::from_secs(86400));
                 tokio::select! {
                     biased;
                     _=close.changed()=>break,
                     Some(report)=reports_rx.recv()=>{
                         match report {
                             WriteReport::Canceled(id) => {
-                                if pending.as_ref().is_some_and(|p| p.seq == -1 && p.id == id) { pending=None;query_outgoing=true; }
+                                if pending.as_ref().is_some_and(|p| p.id == id) { pending=None; }
+                                if text_pending.as_ref().is_some_and(|p| p.id == id) { text_pending=None; }
                             }
                             WriteReport::Sent { id, at } => {
                                 if let Some(pending) = pending.as_mut() { pending.sent(&id, at); }
+                                if let Some(pending) = settings_pending.as_mut() { pending.sent(&id, at); }
+                                if let Some(pending) = text_pending.as_mut() { pending.sent(&id, at); }
                             }
                         }
+                    },
+                    prepared=file_preparations.join_next(),if !file_preparations.is_empty()=>{
+                        let work=prepared.context("file preparation missing")???;
+                        if !enqueue(&outbox_tx,work,&mut close,Some(Instant::now()+Duration::from_secs(60))).await? {break;}
                     },
                     writer=&mut workers.writer=>{writer_finished=true;if close.borrow().is_none() {writer??;}break;},
-                    _=tokio::time::sleep_until(receipt_deadline),if pending.as_ref().is_some_and(|p|p.deadline.is_some())=>{let _=close_tx.send(Some(CloseReason::Error(ErrorCode::Timeout)));bail!("outgoing receipt timeout");},
-                    _=wake.notified()=>query_outgoing=true,
-                    _=config.changed()=>query_outgoing=true,
-                    _=retry_timer(retry_at),if !query_outgoing=>{retry_at=None;query_outgoing=true;},
-                    outgoing=async { outgoing_query.as_mut().expect("outgoing query").await },if outgoing_query.is_some()=>{
-                        outgoing_query=None;retry_at=None;
-                        if pending.is_some() || self.phone_paused(&hello.device_id)!=Some(false) || !self.config().clipboard_sync_to_phone {query_outgoing=true;continue;}
-                        if query_outgoing { continue; }
-                        if let Some((seq,text,next))=outgoing? {
-                            if next as u64>crate::now_ms() {retry_at=Some(Instant::now()+Duration::from_millis((next as u64).saturating_sub(crate::now_ms())));}
-                            else {
-                                if !enqueue(&write_tx,Message::Clipboard(text.clone()),&mut close,Some(Instant::now()+Duration::from_secs(60))).await? {break;}
-                                pending=Some(PendingOutgoing::queued(seq,text.transfer_id));
-                            }
-                        }
-                    },
+                    _=tokio::time::sleep_until(receipt_deadline),if content_deadline.is_some() || settings_deadline.is_some()=>{let _=close_tx.send(Some(CloseReason::Error(ErrorCode::Timeout)));bail!("outgoing receipt timeout");},
+                    _=retry_timer(settings_retry),if settings_retry.is_some()=>{settings_retry=None;},
+                    _=tokio::time::sleep_until(file_poll),if pending.is_none()=>{},
+                    _=wake.notified()=>{file_poll=Instant::now();},
+                    _=config.changed()=>{},
+                    _=settings_changes.changed()=>{},
                     message=read_rx.recv()=>{
                         let Some(message)=message else {break;};
                         if !self.connection_current(&store, &hello.device_id) {break;}
+                        let message = match self.validate_clipboard_message(&store, &hello.device_id, message).await {
+                            Ok(message) => message,
+                            Err(error) => {
+                                self.error(Some(hello.device_id.clone()), error.to_string());
+                                close_tx.send_replace(Some(CloseReason::Error(ErrorCode::MalformedMessage)));
+                                break;
+                            }
+                        };
+                        let stamp = match &message {
+                            Message::Clipboard(text) => text.hlc,
+                            Message::FileBegin(begin) => begin.hlc,
+                            _ => None,
+                        };
+                        let mut refusal = None;
+                        if let Some(hlc) = stamp && let Err(error) = store.observe_hlc(hello.device_id.clone(),hlc).await {
+                            self.error(Some(hello.device_id.clone()),format!("clipboard clock persistence failed: {error}"));
+                            if let Message::Clipboard(text) = &message {
+                                if !enqueue(&write_tx,nack(text.transfer_id.clone(),NackCode::StorageFailed),&mut close,Some(receipt_deadline)).await? {break;}
+                                continue;
+                            }
+                            refusal = Some(NackCode::StorageFailed);
+                        }
                         match message {
-                            Message::Error(_)=>break,
-                            Message::Status(status)=>{self.set_phone_paused(&hello.device_id,store.connection_id.expect("connection id"),status.paused);query_outgoing=true;},
+                            Message::Error(error)=>{
+                                if let Some(problem) = match error.code {
+                                    ErrorCode::VersionMismatch => Some(mesh::LinkProblem::UpdateRequired),
+                                    ErrorCode::Unauthorized => Some(mesh::LinkProblem::Unauthorized),
+                                    _ => None,
+                                } && let Some(generation) = store.pairing_generation(&hello.device_id) {
+                                    let sessions = self.sessions.lock().expect("sessions");
+                                    if sessions.sessions.get(&hello.device_id).is_some_and(|s| Some(s.id) == store.connection_id) {
+                                        self.set_link_problem(&hello.device_id, generation, Some(problem));
+                                    }
+                                }
+                                if outbound && error.code == ErrorCode::Unauthorized {
+                                    self.forget_pairing(hello.device_id.clone(), CloseReason::Error(ErrorCode::Closing), store.connection_id, Some(hello.name.clone())).await?;
+                                }
+                                break;
+                            },
+                            Message::Status(status)=>{self.set_phone_paused(&hello.device_id,store.connection_id.expect("connection id"),status.paused);},
                             Message::Unpair(_)=>{
-                                workers.file.abort(); workers.text.abort();
-                                let _ = (&mut workers.file).await;
-                                let _ = (&mut workers.text).await;
-                                applications_finished = true;
+                                // Admission precedes worker teardown too. The
+                                // pairing epoch fences any in-flight commit;
+                                // common teardown below joins both workers.
                                 self.forget_pairing(hello.device_id.clone(), CloseReason::Error(ErrorCode::Closing), store.connection_id, Some(hello.name.clone())).await?;
                                 break;
                             },
@@ -2014,19 +3631,79 @@ impl Core {
                                 recovered_pairing=true;
                                 if !enqueue(&write_tx,Message::PairResult(PairResult {accepted:true,code:None,message:None}),&mut close,Some(receipt_deadline.min(Instant::now()+Duration::from_secs(60)))).await? {break;}
                             },
+                            Message::PeerSettings(snapshot) if store.mesh=>{
+                                let result={
+                                    let _gate=self.settings_gate.lock().await;
+                                    match store.settings_merge(self.identity.device_id.clone(),hello.device_id.clone(),hello.role==Some(DeviceRole::Phone),snapshot.clone()).await {
+                                        Ok((deduplicated,fields))=>{
+                                            let mut incoming=snapshot.settings.clone();incoming.sort_by(|a,b|a.key.cmp(&b.key));
+                                            if fields!=incoming {settings_confirmed=None;}
+                                            Ok(deduplicated)
+                                        },Err(error)=>Err(error),
+                                    }
+                                };
+                                let response=match result {
+                                    Ok(deduplicated)=>{settings_received=true;Message::Ack(Ack {transfer_id:snapshot.transfer_id,deduplicated})},
+                                    Err(error) if error.is::<crate::store::SettingsUnexpected>()=>{close_tx.send_replace(Some(CloseReason::Error(ErrorCode::UnexpectedMessage)));break;},
+                                    Err(error) if error.is::<crate::store::SettingsMalformed>()=>{close_tx.send_replace(Some(CloseReason::Error(ErrorCode::MalformedMessage)));break;},
+                                    Err(error)=>{settings_received=false;nack(snapshot.transfer_id,crate::store::save_failure_code(&error))},
+                                };
+                                if !enqueue(&write_tx,response,&mut close,Some(receipt_deadline.min(Instant::now()+Duration::from_secs(60)))).await? {break;}
+                            },
                             Message::Ack(ack)=>{
-                                let Some(PendingOutgoing {seq,id,deadline})=pending.take() else {bail!("unsolicited ACK");};let deadline=deadline.unwrap_or_else(||Instant::now()+Duration::from_secs(120));ensure!(id==ack.transfer_id,"wrong ACK ID");
-                                if seq >= 0 { tokio::time::timeout_at(deadline,store.outgoing_receipt(hello.device_id.clone(),seq,false,true)).await??; }
-                                self.connection_event(&store,&hello.device_id,Event::ClipboardSent {device:hello.device_id.clone(),transfer_id:id});query_outgoing=true;
+                                if settings_pending.as_ref().is_some_and(|p|p.id==ack.transfer_id) {
+                                    let deadline=settings_pending.take().and_then(|p|p.deadline).unwrap_or_else(||Instant::now()+Duration::from_secs(120));
+                                    match tokio::time::timeout_at(deadline,store.settings_ack(hello.device_id.clone(),ack.transfer_id)).await.map_err(anyhow::Error::from).and_then(|result|result) {
+                                        Ok(())=>settings_confirmed=Some(settings_snapshot.take().context("missing settings snapshot")?.settings),
+                                        Err(error)=>{
+                                            settings_snapshot=None;settings_confirmed=None;
+                                            settings_retry=Some(Instant::now()+Duration::from_secs(60));
+                                            self.error(Some(hello.device_id.clone()),format!("settings ACK persistence deferred: {error}"));
+                                        },
+                                    }
+                                    continue;
+                                }
+                                if text_pending.as_ref().is_some_and(|p|p.id==ack.transfer_id) {
+                                    let id=text_pending.take().unwrap().id;
+                                    self.automatic.lock().expect("automatic clipboard").receipt(&hello.device_id,store.connection_id.expect("connection id"),&id);
+                                    self.connection_event(&store,&hello.device_id,Event::ClipboardSent {device:hello.device_id.clone(),transfer_id:id});continue;
+                                }
+                                ensure!(pending.as_ref().is_some_and(|p|p.id==ack.transfer_id),"wrong or unsolicited ACK ID");
+                                let id=pending.take().unwrap().id;
+                                if let Some(delivery)=file_pending.take() {
+                                    if let Err(error)=self.outbox.receipt(delivery.clone(),None).await {self.error(Some(hello.device_id.clone()),format!("file ACK persistence deferred: {error}"));break;}
+                                    self.delivery_finished(&delivery);
+                                    let _=self.events.send(Event::ConfigChanged);continue;
+                                }
+                                self.automatic.lock().expect("automatic clipboard").receipt(&hello.device_id,store.connection_id.expect("connection id"),&id);
+                                self.connection_event(&store,&hello.device_id,Event::ClipboardSent {device:hello.device_id.clone(),transfer_id:id});
                             },
                             Message::Nack(nack)=>{
-                                let Some(PendingOutgoing {seq,id,deadline})=pending.take() else {bail!("unsolicited NACK");};let deadline=deadline.unwrap_or_else(||Instant::now()+Duration::from_secs(120));ensure!(id==nack.transfer_id,"wrong NACK ID");
-                                let blocked=!nack.retryable || matches!(nack.code,NackCode::HashMismatch|NackCode::SizeMismatch);
-                                if seq >= 0 { tokio::time::timeout_at(deadline,store.outgoing_receipt(hello.device_id.clone(),seq,blocked,false)).await??; }
-                                query_outgoing=true;
+                                if settings_pending.as_ref().is_some_and(|p|p.id==nack.transfer_id) {
+                                    settings_pending=None;
+                                    settings_snapshot=None;
+                                    settings_confirmed=None;
+                                    settings_retry=Some(Instant::now()+Duration::from_secs(60));
+                                    self.error(Some(hello.device_id.clone()),format!("settings synchronization rejected: {:?}",nack.code));
+                                    continue;
+                                }
+                                if text_pending.as_ref().is_some_and(|p|p.id==nack.transfer_id) {
+                                    let id=text_pending.take().unwrap().id;
+                                    self.automatic.lock().expect("automatic clipboard").receipt(&hello.device_id,store.connection_id.expect("connection id"),&id);
+                                    self.error(Some(hello.device_id.clone()),format!("clipboard delivery rejected: {:?}",nack.code));continue;
+                                }
+                                ensure!(pending.as_ref().is_some_and(|p|p.id==nack.transfer_id),"wrong or unsolicited NACK ID");
+                                let id=pending.take().unwrap().id;
+                                if let Some(delivery)=file_pending.take() {
+                                    if let Err(error)=self.outbox.receipt(delivery.clone(),Some(nack.code)).await {self.error(Some(hello.device_id.clone()),format!("file NACK persistence deferred: {error}"));break;}
+                                    self.delivery_finished(&delivery);
+                                    let _=self.events.send(Event::ConfigChanged);continue;
+                                }
+                                self.automatic.lock().expect("automatic clipboard").receipt(&hello.device_id,store.connection_id.expect("connection id"),&id);
+
                                 self.error(Some(hello.device_id.clone()),format!("clipboard delivery rejected: {:?}",nack.code));
                             },
-                            m @ (Message::FileBegin(_)|Message::FileChunk(_)|Message::FileEnd(_))=>{if !enqueue(&file_tx,m,&mut close,pending.as_ref().and_then(|p|p.deadline)).await? {break;}},
+                            m @ (Message::FileBegin(_)|Message::FileChunk(_)|Message::FileEnd(_))=>{if !enqueue(&file_tx,ApplicationMessage { message: m, refusal },&mut close,pending.as_ref().and_then(|p|p.deadline)).await? {break;}},
                             m @ Message::Clipboard(_)=>{if !enqueue(&text_tx,m,&mut close,pending.as_ref().and_then(|p|p.deadline)).await? {break;}},
                             _=>bail!("unexpected READY frame"),
                         }
@@ -2040,17 +3717,19 @@ impl Core {
             let _ = close_tx.send(Some(CloseReason::Error(processing_error_code(error))));
         }
         workers.reader.abort();
+        workers.heartbeat.abort();
+        let _=(&mut workers.heartbeat).await;
         workers.file.abort();
         workers.text.abort();
         let _ = (&mut workers.reader).await;
-        if !applications_finished {
-            let _ = (&mut workers.file).await;
-            let _ = (&mut workers.text).await;
-        }
+        let _ = (&mut workers.file).await;
+        let _ = (&mut workers.text).await;
         drop(file_tx);
         drop(text_tx);
         drop(write_tx);
         drop(automatic_tx);
+        drop(automatic_text_tx);
+        drop(outbox_tx);
         if !writer_finished
             && tokio::time::timeout(Duration::from_secs(2), &mut workers.writer)
                 .await
@@ -2059,16 +3738,57 @@ impl Core {
             workers.writer.abort();
             let _ = (&mut workers.writer).await;
         }
+        file_preparations.abort_all();
+        while file_preparations.join_next().await.is_some() {}
+        drop(recovery);
+        if let Err(error)=self.outbox.retry_recovery().await {self.error(Some(hello.device_id.clone()),format!("outbox recovery deferred: {error}"));}
         result
 
         }).await
+    }
+    async fn validate_clipboard_message(
+        &self,
+        store: &Store,
+        device: &Id,
+        mut message: Message,
+    ) -> Result<Message> {
+        let fields = match &mut message {
+            Message::Clipboard(c) => Some((&mut c.hlc, &mut c.source_device, true)),
+            Message::FileBegin(f) => Some((
+                &mut f.hlc,
+                &mut f.source_device,
+                f.kind == FileKind::ClipboardImage,
+            )),
+            _ => None,
+        };
+        if let Some((hlc, source, required)) = fields {
+            if store.mesh {
+                ensure!(
+                    !required || hlc.is_some(),
+                    "unstamped mesh clipboard operation"
+                );
+                if let Some(hlc) = *hlc {
+                    ensure!(
+                        source.as_ref() == Some(device),
+                        "clipboard source differs from authenticated peer"
+                    );
+                    crate::store::validate_stamp(hlc, crate::now_ms())?;
+                }
+            } else {
+                // Negotiation selects legacy semantics even if optional fields
+                // happen to be supplied by an older or misconfigured endpoint.
+                *hlc = None;
+                *source = None;
+            }
+        }
+        Ok(message)
     }
     async fn file_loop(
         self: Arc<Self>,
         store: Store,
         action_scope: Option<ActionScope>,
         device: Id,
-        mut messages: mpsc::Receiver<Message>,
+        mut messages: mpsc::Receiver<impl Into<ApplicationMessage> + Send>,
         writer: mpsc::Sender<Message>,
         close: watch::Sender<Option<CloseReason>>,
     ) -> Result<()> {
@@ -2086,7 +3806,8 @@ impl Core {
                     let Some(message) = message else {
                         break;
                     };
-                    let deadline = if matches!(message, Message::FileEnd(_)) {
+                    let message: ApplicationMessage = message.into();
+                    let deadline = if matches!(message.message, Message::FileEnd(_)) {
                         Instant::now() + Duration::from_secs(120)
                     } else if incoming.is_some() {
                         deadline
@@ -2116,7 +3837,7 @@ impl Core {
             if let Some(mut state) = incoming {
                 state.file.take();
                 if let Some(stage) = state.stage.take() {
-                    store.discard_stage(stage).await?;
+                    self.optional(store.discard_stage(stage).await, "staging cleanup");
                 }
             }
             result
@@ -2128,10 +3849,11 @@ impl Core {
         store: &Store,
         action_scope: Option<&ActionScope>,
         device: &Id,
-        message: Message,
+        message: impl Into<ApplicationMessage> + Send,
         incoming: &mut Option<Incoming>,
         tx: &mpsc::Sender<Message>,
     ) -> Result<()> {
+        let ApplicationMessage { message, refusal } = message.into();
         Box::pin(async move {
             match message {
                 Message::FileBegin(begin) => {
@@ -2147,6 +3869,7 @@ impl Core {
                         receipt: None,
                         save_error: None,
                         deduplicated: false,
+                        admission: FileAdmission::New,
                         storage_kind: if config.save_to_folder
                             && begin.kind != FileKind::ClipboardImage
                         {
@@ -2160,14 +3883,35 @@ impl Core {
                         .receipt(device.clone(), begin.transfer_id.clone())
                         .await
                     {
-                        Ok(Some((meta, _))) if meta == Metadata::File(begin.clone()) => {
-                            state.deduplicated = true;
+                        Ok(Some((meta, complete))) => {
+                            if meta == Metadata::File(begin.clone()) && complete {
+                                state.admission = FileAdmission::RetainedReplay;
+                                state.deduplicated = true;
+                            } else {
+                                state.admission = FileAdmission::RetainedConflict;
+                                state.receipt = Some(NackCode::IdConflict);
+                            }
                         }
-                        Ok(Some(_)) => state.receipt = Some(NackCode::IdConflict),
-                        Ok(None) if begin.size <= state.config.max_file_bytes => {
-                            self.prepare_incoming(store, &mut state).await
+                        Err(_) => state.receipt = Some(NackCode::StorageFailed),
+                        Ok(None) => {
+                            if let Some(code) = refusal {
+                                state.receipt = Some(code);
+                            } else if store.mesh
+                                && !store
+                                    .pair_settings
+                                    .lock()
+                                    .expect("pair settings")
+                                    .contains_key(device)
+                            {
+                                state.receipt = Some(NackCode::StorageFailed);
+                            } else if !self.incoming_kind_allowed(store, device, begin.kind) {
+                                state.receipt = Some(NackCode::UnsupportedKind);
+                            } else if begin.size <= state.config.max_file_bytes {
+                                self.prepare_incoming(store, &mut state).await;
+                            } else {
+                                state.receipt = Some(NackCode::StorageFailed);
+                            }
                         }
-                        _ => state.receipt = Some(NackCode::StorageFailed),
                     }
                     self.connection_event(
                         store,
@@ -2257,7 +4001,12 @@ impl Core {
                         "END without matching BEGIN"
                     );
                     let state = incoming.as_mut().expect("checked incoming");
-                    if state.received != state.begin.size {
+                    if state.admission == FileAdmission::New
+                        && !self.incoming_kind_allowed(store, device, state.begin.kind)
+                    {
+                        state.receipt = Some(NackCode::UnsupportedKind);
+                    }
+                    if state.admission == FileAdmission::New && state.received != state.begin.size {
                         state.receipt = Some(NackCode::SizeMismatch);
                     }
                     let verified = if state.receipt.is_none() && !state.deduplicated {
@@ -2382,7 +4131,7 @@ impl Core {
                     }
                     state.file.take();
                     if let Some(stage) = state.stage.take() {
-                        store.discard_stage(stage).await?;
+                        self.optional(store.discard_stage(stage).await, "staging cleanup");
                     }
                     if let Some(code) = state.receipt {
                         self.finish_transfer_activity(store, device, &end.transfer_id);
@@ -2432,6 +4181,7 @@ impl Core {
                         // Enqueue completed-file effects before publishing ACK, so
                         // a sender closing immediately after ACK cannot abort this
                         // worker between receipt publication and action admission.
+
                         if !state.deduplicated
                             && let Some(file) = received_file
                             && let Some(scope) = action_scope
@@ -2482,6 +4232,7 @@ impl Core {
                                 device: device.clone(),
                                 transfer_id: end.transfer_id,
                                 path: state.destination.clone(),
+
                                 deduplicated: state.deduplicated,
                             },
                         );
@@ -2489,12 +4240,63 @@ impl Core {
                     incoming.take();
                 }
                 Message::Clipboard(text) => {
+                    let receipt = if store.mesh {
+                        match store
+                            .receipt(device.clone(), text.transfer_id.clone())
+                            .await
+                        {
+                            Ok(receipt) => receipt,
+                            Err(error) => {
+                                self.error(
+                                    Some(device.clone()),
+                                    format!("clipboard receipt lookup failed: {error}"),
+                                );
+                                tx.send(nack(text.transfer_id, NackCode::StorageFailed))
+                                    .await?;
+                                return Ok(());
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some((metadata, complete)) = receipt {
+                        tx.send(
+                            if metadata != crate::store::Metadata::Text(store.text_receipt(&text)) {
+                                nack(text.transfer_id, NackCode::IdConflict)
+                            } else if complete {
+                                Message::Ack(Ack {
+                                    transfer_id: text.transfer_id,
+                                    deduplicated: true,
+                                })
+                            } else {
+                                nack(text.transfer_id, NackCode::StorageFailed)
+                            },
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    if store.mesh
+                        && !store
+                            .pair_settings
+                            .lock()
+                            .expect("pair settings")
+                            .contains_key(device)
+                    {
+                        tx.send(nack(text.transfer_id, NackCode::StorageFailed))
+                            .await?;
+                        return Ok(());
+                    }
+                    if store.mesh
+                        && !self.pair_allows(device, device, &self.identity.device_id, "clipboard")
+                    {
+                        tx.send(nack(text.transfer_id, NackCode::UnsupportedKind))
+                            .await?;
+                        return Ok(());
+                    }
                     let Some(scope) = action_scope else {
                         return Ok(());
                     };
                     let origin = ActionOrigin::captured(store, device);
-                    // One clipboard action at a time, including connection replacement.
-                    let clipboard_application = self.clipboard_gate.clone().lock_owned().await;
                     if !scope.allows(&origin) {
                         return Ok(());
                     }
@@ -2507,7 +4309,12 @@ impl Core {
                             .await?;
                             return Ok(());
                         }
+                        Ok(Some(claim)) => claim,
                         Err(error) => {
+                            self.error(
+                                Some(device.clone()),
+                                format!("clipboard admission failed: {error}"),
+                            );
                             tx.send(nack(
                                 text.transfer_id,
                                 crate::store::save_failure_code(&error),
@@ -2515,37 +4322,78 @@ impl Core {
                             .await?;
                             return Ok(());
                         }
-                        Ok(Some(claim)) => claim,
                     };
-                    let Some(copied) = scope
-                        .effect(&origin, || self.actions.clipboard_text(&text.text))
-                        .await
-                    else {
-                        claim.discard().await?;
+                    let token = self.clipboard.token();
+                    let content = crate::ui::clipboard::Content::Text(text.text.clone());
+                    let operation = ClipboardOperation {
+                        token,
+                        id: text.transfer_id.clone(),
+                        source: device.clone(),
+                        key: text.hlc.map(|hlc| clipboard_actor::Key {
+                            hlc,
+                            source: device.clone(),
+                        }),
+                        created_at: text.created_at,
+                        payload: None,
+                        hashes: clipboard_actor::hashes(&content),
+                        content: Some(content),
+                        offer: None,
+                        received: true,
+                        legacy: text.hlc.is_none(),
+                        restore: false,
+                        repair: false,
+                        observation: None,
+                    };
+                    let (reply, _) = tokio::sync::oneshot::channel();
+                    let outcome = self
+                        .clipboard
+                        .submit(
+                            operation,
+                            clipboard_driver::Request {
+                                input: crate::actions::ClipboardInput::Text(text.text.clone()),
+                                claim: Some(claim),
+                                store: store.clone(),
+                                authority: Some((scope.clone(), origin.clone())),
+                                kind: None,
+                                policy: self.clipboard_receive_policy(device, None),
+                                reply,
+                            },
+                        )
+                        .await;
+                    if !scope.allows(&origin) {
                         return Ok(());
-                    };
-                    if copied.is_err() {
-                        claim.discard().await?;
-                        self.action_queue
-                            .receipt(scope, origin, ReceiptNotice::TextFailed);
-                        // Failed clipboard writes retain no pending receipt/barrier.
-                        tx.send(nack(text.transfer_id, NackCode::ClipboardUnavailable))
+                    }
+                    if store.mesh
+                        && !self.pair_allows(device, device, &self.identity.device_id, "clipboard")
+                    {
+                        tx.send(nack(text.transfer_id, NackCode::UnsupportedKind))
                             .await?;
                         return Ok(());
                     }
-                    if !scope.allows(&origin) {
-                        claim.discard().await?;
-                        return Ok(());
-                    }
-                    if let Err(error) = claim.finalize(clipboard_application).await {
-                        tx.send(nack(
-                            text.transfer_id,
-                            crate::store::save_failure_code(&error),
-                        ))
-                        .await?;
-                        return Ok(());
-                    }
-                    if self.config().notification_preview {
+                    let outcome = match outcome {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            let storage = error.is::<crate::store::ClipboardStorageFailure>();
+                            if !storage {
+                                self.action_queue
+                                    .receipt(scope, origin, ReceiptNotice::TextFailed);
+                            }
+                            tx.send(nack(
+                                text.transfer_id,
+                                if storage {
+                                    NackCode::StorageFailed
+                                } else {
+                                    NackCode::ClipboardUnavailable
+                                },
+                            ))
+                            .await?;
+                            return Ok(());
+                        }
+                    };
+                    if outcome.applied
+                        && self.config().notification_preview
+                        && !self.peer_is_computer(device)
+                    {
                         self.action_queue.receipt(
                             scope,
                             origin,
@@ -2554,18 +4402,20 @@ impl Core {
                     }
                     tx.send(Message::Ack(Ack {
                         transfer_id: text.transfer_id.clone(),
-                        deduplicated: false,
+                        deduplicated: outcome.deduplicated,
                     }))
                     .await?;
-                    self.connection_event(
-                        store,
-                        device,
-                        Event::ClipboardReceived {
-                            device: device.clone(),
-                            transfer_id: text.transfer_id,
-                            origin: text.origin,
-                        },
-                    );
+                    if outcome.applied {
+                        self.connection_event(
+                            store,
+                            device,
+                            Event::ClipboardReceived {
+                                device: device.clone(),
+                                transfer_id: text.transfer_id,
+                                origin: text.origin,
+                            },
+                        );
+                    }
                 }
                 _ => bail!("unexpected application message"),
             }
@@ -2712,6 +4562,7 @@ impl Core {
         // Scope is the one captured at session admission, never looked up again
         // by device ID. Enqueue cannot wait for any optional desktop action.
         let error_device = origin.device.clone();
+        let file = file.with_source(self.arrival_source(&origin.device));
         if !self.action_queue.push(ActionJob {
             scope: scope.clone(),
             origin,
@@ -2732,9 +4583,9 @@ impl Core {
         if matches!(action, DesktopAction::CopyFailed) {
             if let Some(Err(error)) = job
                 .scope
-                .effect(&job.origin, || {
+                .notification(&job.origin, || {
                     self.actions
-                        .notify_image_failure(&job.file, &job.metadata, job.saved())
+                        .begin_notify_image_failure(&job.file, &job.metadata, job.saved())
                 })
                 .await
             {
@@ -2752,8 +4603,8 @@ impl Core {
             }
             if let Some(Err(error)) = job
                 .scope
-                .effect(&job.origin, || {
-                    self.actions.notify_file_at(
+                .notification(&job.origin, || {
+                    self.actions.begin_notify_file_at(
                         &job.file,
                         &metadata,
                         job.saved(),
@@ -2779,28 +4630,76 @@ impl Core {
             );
             let _ = job
                 .scope
-                .effect(&job.origin, || {
+                .notification(&job.origin, || {
                     self.actions
-                        .notify_image_failure(&job.file, &job.metadata, job.saved())
+                        .begin_notify_image_failure(&job.file, &job.metadata, job.saved())
                 })
                 .await;
             return;
         }
         let copied = if image && (explicit || job.config.copy_image_to_clipboard) {
-            match job
-                .scope
-                .effect(&job.origin, || {
-                    self.actions
-                        .clipboard_received(&job.file, &job.metadata.mime)
-                })
+            if !job.scope.allows(&job.origin) || (job.origin.mesh && job.metadata.hlc.is_none()) {
+                return;
+            }
+            let mut store = self.store.with_current_pairing();
+            store.mesh = job.origin.mesh;
+            let token = self.clipboard.token();
+            let operation = ClipboardOperation {
+                token,
+                id: job.metadata.transfer_id.clone(),
+                source: job.origin.device.clone(),
+                key: job.metadata.hlc.map(|hlc| clipboard_actor::Key {
+                    hlc,
+                    source: job.origin.device.clone(),
+                }),
+                created_at: job.metadata.created_at,
+                payload: None,
+                hashes: vec![
+                    hex::decode(job.metadata.sha256.as_str())
+                        .expect("SHA-256")
+                        .try_into()
+                        .expect("SHA-256 length"),
+                ],
+                content: None,
+                offer: None,
+                received: true,
+                legacy: !job.origin.mesh,
+                restore: false,
+                repair: false,
+                observation: None,
+            };
+            let (reply, _) = tokio::sync::oneshot::channel();
+            match self
+                .clipboard
+                .submit(
+                    operation,
+                    clipboard_driver::Request {
+                        input: crate::actions::ClipboardInput::Image(
+                            job.file.clone(),
+                            job.metadata.mime.clone(),
+                        ),
+                        claim: None,
+                        store,
+                        authority: Some((job.scope.clone(), job.origin.clone())),
+                        kind: Some(job.metadata.kind),
+                        policy: self
+                            .clipboard_receive_policy(&job.origin.device, Some(job.metadata.kind)),
+                        reply,
+                    },
+                )
                 .await
             {
-                Some(Ok(())) => true,
-                None => false,
-                Some(Err(e)) => {
+                Ok(outcome) => {
+                    if !outcome.applied {
+                        return;
+                    }
+                    self.actions.record_clipboard_copy(&job.file).await;
+                    true
+                }
+                Err(error) => {
                     self.error(
                         Some(job.origin.device.clone()),
-                        format!("image clipboard unavailable: {e}"),
+                        format!("image clipboard unavailable: {error}"),
                     );
                     false
                 }
@@ -2815,9 +4714,9 @@ impl Core {
         {
             let _ = job
                 .scope
-                .effect(&job.origin, || {
+                .notification(&job.origin, || {
                     self.actions
-                        .notify_image_failure(&job.file, &job.metadata, job.saved())
+                        .begin_notify_image_failure(&job.file, &job.metadata, job.saved())
                 })
                 .await;
         }
@@ -2826,9 +4725,9 @@ impl Core {
             && job.config.notification_preview
             && let Some(Err(e)) = job
                 .scope
-                .effect(&job.origin, || {
+                .notification(&job.origin, || {
                     self.actions
-                        .notify_copied_received(&job.file, &job.metadata.mime)
+                        .begin_notify_copied_received(&job.file, &job.metadata.mime)
                 })
                 .await
         {
@@ -2878,10 +4777,11 @@ async fn run_receipt_notice(core: &Core, job: &ReceiptJob, stop: &mut watch::Rec
     if *stop.borrow() {
         return;
     }
-    let effect = job.scope.effect(&job.origin, || async {
+    let source = core.arrival_source(&job.origin.device);
+    let effect = job.scope.notification(&job.origin, || async {
         match &job.notice {
-            ReceiptNotice::Text(text) => core.actions.notify_text(text).await,
-            ReceiptNotice::TextFailed => core.actions.notify_text_failure().await,
+            ReceiptNotice::Text(text) => core.actions.begin_notify_text_from(text, &source).await,
+            ReceiptNotice::TextFailed => core.actions.begin_notify_text_failure_from(&source).await,
             ReceiptNotice::SaveFailed {
                 metadata,
                 code,
@@ -2889,7 +4789,7 @@ async fn run_receipt_notice(core: &Core, job: &ReceiptJob, stop: &mut watch::Rec
                 folder,
             } => {
                 core.actions
-                    .notify_save_failure(metadata, *code, *destination, folder)
+                    .begin_notify_save_failure_from(metadata, *code, *destination, folder, &source)
                     .await
             }
         }
@@ -3034,6 +4934,16 @@ async fn action_loop(
                     run_action(&core, &job, &mut stop, action, image).await;
                 }
                 NotificationJob::Receipt(job) => run_receipt_notice(&core, &job, &mut stop).await,
+                NotificationJob::Delivery(transfer, name) => {
+                    if core.config().notification_preview {
+                        tokio::select! { biased;
+                            _ = stop.changed() => {},
+                            result = tokio::time::timeout(Duration::from_secs(5), core.actions.notify_delivery(&transfer, &name)) => {
+                                if !matches!(result, Ok(Ok(()))) { core.error(Some(transfer.device), "send notification unavailable"); }
+                            }
+                        }
+                    }
+                },
             }
             continue;
         }
@@ -3051,6 +4961,7 @@ async fn action_loop(
 }
 // Cancellation (for example a server error) must close both TLS halves too.
 struct ConnectionTasks {
+    heartbeat: tokio::task::JoinHandle<()>,
     reader: tokio::task::JoinHandle<Result<()>>,
     writer: tokio::task::JoinHandle<Result<()>>,
     file: tokio::task::JoinHandle<Result<()>>,
@@ -3058,6 +4969,7 @@ struct ConnectionTasks {
 }
 impl Drop for ConnectionTasks {
     fn drop(&mut self) {
+        self.heartbeat.abort();
         self.reader.abort();
         self.writer.abort();
         self.file.abort();
@@ -3065,19 +4977,14 @@ impl Drop for ConnectionTasks {
     }
 }
 // Transmission is governed by frame write/flush deadlines. Receipt time starts
-// only after the last frame is flushed, including durable text operations.
+// only after the last frame is flushed.
 struct PendingOutgoing {
-    seq: i64,
     id: Id,
     deadline: Option<Instant>,
 }
 impl PendingOutgoing {
-    fn queued(seq: i64, id: Id) -> Self {
-        Self {
-            seq,
-            id,
-            deadline: None,
-        }
+    fn queued(id: Id) -> Self {
+        Self { id, deadline: None }
     }
     fn sent(&mut self, id: &Id, at: Instant) {
         if self.id == *id && self.deadline.is_none() {
@@ -3093,6 +5000,7 @@ enum WriteReport {
 fn frame_receipt_id(message: &Message) -> Option<Id> {
     match message {
         Message::Clipboard(text) => Some(text.transfer_id.clone()),
+        Message::PeerSettings(snapshot) => Some(snapshot.transfer_id.clone()),
         Message::FileEnd(end) => Some(end.transfer_id.clone()),
         _ => None,
     }
@@ -3111,6 +5019,8 @@ struct WriterQueues {
     normal: mpsc::Receiver<Message>,
     priority: mpsc::Receiver<Message>,
     automatic: mpsc::Receiver<AutomaticWrite>,
+    text: mpsc::Receiver<AutomaticWrite>,
+    files: mpsc::Receiver<FileWrite>,
     reports: mpsc::Sender<WriteReport>,
     close: watch::Receiver<Option<CloseReason>>,
 }
@@ -3120,7 +5030,7 @@ async fn writer_loop<W: tokio::io::AsyncWrite + Unpin>(
     queues: WriterQueues,
 ) -> Result<()> {
     Box::pin(async move {
-    let WriterQueues { normal: mut write_rx, priority: mut priority_rx, automatic: mut automatic_rx, reports: reports_tx, close: mut writer_close } = queues;
+    let WriterQueues { normal: mut write_rx, priority: mut priority_rx, automatic: mut automatic_rx, text: mut text_rx, files: mut files_rx, reports: reports_tx, close: mut writer_close } = queues;
             loop {
                 let reason = *writer_close.borrow();
                 if let Some(reason) = reason {
@@ -3130,16 +5040,28 @@ async fn writer_loop<W: tokio::io::AsyncWrite + Unpin>(
                     _=writer_close.changed()=>{let reason=writer_close.borrow().unwrap_or(CloseReason::Error(ErrorCode::Closing));return close_transport(writer,reason).await;},
                     message=priority_rx.recv()=>message.map(WriterWork::Frame),
                     message=write_rx.recv()=>message.map(WriterWork::Frame),
+                    text=text_rx.recv()=>text.map(WriterWork::Automatic),
+                    file=files_rx.recv()=>file.map(WriterWork::File),
                     automatic=automatic_rx.recv()=>automatic.map(WriterWork::Automatic),
                 };
                 let Some(work) = work else { break; };
                 let message = match work {
                     WriterWork::Frame(message) => message,
+                    WriterWork::File(work)=>{
+                        let id=work.delivery.begin.transfer_id.clone();
+                        let result=tokio::select! {biased;_=writer_close.changed()=>None,result=transmit_file(&core,writer,work,&mut priority_rx,&mut write_rx,&mut text_rx,&reports_tx)=>Some(result)};
+                        match result {
+                            Some(Ok(()))=>{let _=reports_tx.send(WriteReport::Sent{id,at:Instant::now()}).await;},
+                            Some(Err(error))=>{core.error(None,format!("file send interrupted: {error}"));return crate::transport::close(writer,&[]).await;},
+                            None=>return crate::transport::close(writer,&[]).await,
+                        }
+                        continue;
+                    },
                     WriterWork::Automatic(work) => {
                         let id = work.selection.id().clone();
                         let sent = tokio::select! { biased;
                             _ = writer_close.changed() => None,
-                            sent = transmit_automatic(&core, writer, work, &mut priority_rx, &mut write_rx, Some(&reports_tx)) => Some(sent),
+                            sent = transmit_automatic(&core, writer, work, &mut priority_rx, &mut write_rx, Some(&mut text_rx), Some(&reports_tx)) => Some(sent),
                         };
                         match sent {
                             Some(Ok(false)) => { let _ = reports_tx.send(WriteReport::Canceled(id)).await; }
@@ -3170,6 +5092,12 @@ async fn writer_loop<W: tokio::io::AsyncWrite + Unpin>(
     }).await
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileAdmission {
+    New,
+    RetainedReplay,
+    RetainedConflict,
+}
 struct Incoming {
     begin: FileBegin,
     received: u64,
@@ -3181,6 +5109,7 @@ struct Incoming {
     save_error: Option<NackCode>,
     storage_kind: crate::ui::ReceiveDestination,
     deduplicated: bool,
+    admission: FileAdmission,
     config: Config,
 }
 impl Incoming {
@@ -3202,6 +5131,19 @@ async fn close_transport<W: tokio::io::AsyncWrite + Unpin>(
     crate::transport::close(writer, &messages).await
 }
 
+/// Only the acceptor has a receive-idle deadline. An actively transmitting
+/// dialer can receive nothing until END; its PING/PONG and receipt timers own
+/// liveness independently of this cancellation-safe, retained frame read.
+async fn read_ready_frame<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    outbound: bool,
+) -> std::result::Result<pneu_proto::Result<Option<Message>>, tokio::time::error::Elapsed> {
+    if outbound {
+        Ok(read_frame(reader).await)
+    } else {
+        tokio::time::timeout(Duration::from_secs(180), read_frame(reader)).await
+    }
+}
 async fn read_handshake(tls: &mut TlsStream<TcpStream>) -> Result<Message> {
     match tokio::time::timeout(Duration::from_secs(10), read_frame(tls)).await {
         Ok(Ok(Some(m))) => Ok(m),
@@ -3250,9 +5192,9 @@ async fn retry_timer(deadline: Option<Instant>) {
 }
 /// Bounded queues propagate backpressure to TCP instead of rejecting frames.
 /// Waiting for capacity must still honor connection closure and receipt timers.
-async fn enqueue(
-    tx: &mpsc::Sender<Message>,
-    message: Message,
+async fn enqueue<T>(
+    tx: &mpsc::Sender<T>,
+    message: T,
     close: &mut watch::Receiver<Option<CloseReason>>,
     deadline: Option<Instant>,
 ) -> Result<bool> {
@@ -3263,7 +5205,7 @@ async fn enqueue(
         tokio::select! { biased;
             _ = close.changed() => Ok(false),
             sent = tx.send(message) => {
-                sent.context("connection queue closed")?;
+                sent.map_err(|_| anyhow::anyhow!("connection queue closed"))?;
                 Ok(true)
             }
         }
@@ -3356,11 +5298,413 @@ fn processing_error_code(error: &anyhow::Error) -> ErrorCode {
 
 #[cfg(test)]
 mod tests {
+    #[derive(Default)]
+    struct BoundaryActions {
+        clipboard: Mutex<String>,
+        notices: Mutex<Vec<String>>,
+        noticed: Notify,
+        prepared: Notify,
+        release: Notify,
+        delay: AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl PcActions for BoundaryActions {
+        async fn notify_text(&self, text: &str) -> Result<()> {
+            self.notices.lock().unwrap().push(text.into());
+            self.noticed.notify_one();
+            Ok(())
+        }
+        async fn clipboard_text(&self, text: &str) -> Result<()> {
+            *self.clipboard.lock().unwrap() = text.into();
+            Ok(())
+        }
+        async fn prepare_clipboard(
+            &self,
+            input: crate::actions::ClipboardInput,
+            _ticket: u128,
+        ) -> Result<crate::actions::PreparedClipboard> {
+            if self.delay.load(Ordering::SeqCst) {
+                self.prepared.notify_one();
+                self.release.notified().await;
+            }
+            crate::actions::PreparedClipboard::immediate(input)
+        }
+        async fn clipboard_image(&self, _: &std::path::Path, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn notify(&self, _: &std::path::Path, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn open(&self, _: &std::path::Path) -> Result<()> {
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn explicit_clipboard_share_rejects_an_unapplied_actor_outcome() -> Result<()> {
+        let (_dir, core, peer) = fixture(Arc::new(NoActions)).await?;
+        let _session = admit_ui_test_phone(&core, &peer, 1)?;
+        core.shutdown_actions().await?;
+        let mut core = Arc::try_unwrap(core)
+            .ok()
+            .expect("fixture holds no other strong Core refs");
+        let (handle, mut inbox) = clipboard_driver::Handle::channel();
+        core.clipboard = handle;
+        // An actor may finish a superseded share successfully for deduplication,
+        // while reporting that it never applied that operation.
+        let actor = tokio::spawn(async move {
+            let Some(clipboard_driver::Message::Submit(_, request, _permit)) = inbox.recv().await
+            else {
+                panic!("expected clipboard submission");
+            };
+            let _ = request.reply.send(Ok(clipboard_driver::Outcome {
+                applied: false,
+                deduplicated: true,
+            }));
+        });
+        let result = core.send_clipboard(peer, "superseded share".into()).await;
+        actor.await?;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "clipboard share was superseded"
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn unapplied_stale_text_and_replays_never_report_a_copy_success() -> Result<()> {
+        for mesh in [false, true] {
+            let actions = Arc::new(BoundaryActions::default());
+            let (_dir, core, peer) = fixture(actions.clone()).await?;
+            core.store
+                .settings_fields(core.identity.device_id.clone(), peer.clone(), true)
+                .await?;
+            let mut store = core.store.with_current_pairing();
+            store.mesh = mesh;
+            store.local_device = Some(core.identity.device_id.clone());
+            let mut events = core.subscribe();
+            let (tx, mut rx) = mpsc::channel(8);
+            let winner = Clipboard {
+                transfer_id: Id::from_bytes([10; 16]),
+                text: "winner".into(),
+                created_at: 200,
+                origin: ClipboardOrigin::Clipboard,
+                hlc: mesh.then_some(200),
+                source_device: mesh.then_some(peer.clone()),
+            };
+            let stale = Clipboard {
+                transfer_id: Id::from_bytes([20; 16]),
+                text: "rejected stale".into(),
+                created_at: 100,
+                hlc: mesh.then_some(100),
+                ..winner.clone()
+            };
+            for (index, text) in [winner.clone(), stale, winner.clone()]
+                .into_iter()
+                .enumerate()
+            {
+                core.receive_test(&store, &peer, Message::Clipboard(text), &mut None, &tx)
+                    .await?;
+                let response = rx.recv().await;
+                assert!(
+                    matches!(response, Some(Message::Ack(Ack { deduplicated, .. })) if deduplicated == (index != 0)),
+                    "mesh={mesh} index={index}: {response:?}"
+                );
+                if index == 0 {
+                    tokio::time::timeout(Duration::from_secs(3), actions.noticed.notified())
+                        .await?;
+                }
+            }
+            core.shutdown_actions().await?;
+            assert_eq!(&*actions.clipboard.lock().unwrap(), "winner");
+            assert_eq!(&*actions.notices.lock().unwrap(), &["winner"]);
+            let received = std::iter::from_fn(|| events.try_recv().ok())
+                .filter_map(|event| match event {
+                    Event::ClipboardReceived { transfer_id, .. } => Some(transfer_id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(received, vec![winner.transfer_id]);
+            let (register, legacy, _) = core.store.clipboard_snapshot().await?;
+            if mesh {
+                assert_eq!(register.unwrap().hlc, 200);
+            } else {
+                assert_eq!(legacy.get(&peer), Some(&200));
+            }
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn retained_file_replays_and_conflicts_precede_disabled_direction_at_begin_and_end()
+    -> Result<()> {
+        for kind in [FileKind::ClipboardImage, FileKind::Screenshot] {
+            let (_dir, core, peer) = fixture(Arc::new(NoActions)).await?;
+            let local = core.identity.device_id.clone();
+            core.store
+                .settings_fields(local.clone(), peer.clone(), true)
+                .await?;
+            let mut store = core.store.with_current_pairing();
+            store.mesh = true;
+            store.local_device = Some(local.clone());
+            let bytes = b"\x89PNG\r\n\x1a\nretained";
+            let mut begin = test_begin(bytes);
+            begin.kind = kind;
+            begin.hlc = Some(crate::now_ms());
+            begin.source_device = Some(peer.clone());
+            let (tx, mut rx) = mpsc::channel(8);
+            let frames = |begin: FileBegin| {
+                vec![
+                    Message::FileBegin(begin.clone()),
+                    Message::FileChunk(FileChunk {
+                        transfer_id: begin.transfer_id.clone(),
+                        offset: 0,
+                        data: bytes.to_vec(),
+                    }),
+                    Message::FileEnd(FileEnd {
+                        transfer_id: begin.transfer_id,
+                    }),
+                ]
+            };
+            let mut incoming = None;
+            for frame in frames(begin.clone()) {
+                core.receive_test(&store, &peer, frame, &mut incoming, &tx)
+                    .await?;
+            }
+            assert!(matches!(
+                rx.recv().await,
+                Some(Message::Ack(Ack {
+                    deduplicated: false,
+                    ..
+                }))
+            ));
+            let feature = if kind == FileKind::ClipboardImage {
+                "clipboard"
+            } else {
+                "automatic_media"
+            };
+            core.store
+                .settings_edit(
+                    local.clone(),
+                    peer.clone(),
+                    true,
+                    format!("{peer}/{local}/{feature}"),
+                    false,
+                )
+                .await?;
+            for conflict in [false, true] {
+                let mut replay = begin.clone();
+                if conflict {
+                    replay.file_name = "conflict.png".into();
+                }
+                // END deliberately has no chunks: it cannot replace a retained
+                // replay/conflict result with direction or size policy.
+                core.receive_test(
+                    &store,
+                    &peer,
+                    Message::FileBegin(replay.clone()),
+                    &mut incoming,
+                    &tx,
+                )
+                .await?;
+                core.receive_test(
+                    &store,
+                    &peer,
+                    Message::FileEnd(FileEnd {
+                        transfer_id: replay.transfer_id,
+                    }),
+                    &mut incoming,
+                    &tx,
+                )
+                .await?;
+                let reply = rx.recv().await.unwrap();
+                if conflict {
+                    assert!(matches!(
+                        reply,
+                        Message::Nack(Nack {
+                            code: NackCode::IdConflict,
+                            ..
+                        })
+                    ));
+                } else {
+                    assert!(matches!(
+                        reply,
+                        Message::Ack(Ack {
+                            deduplicated: true,
+                            ..
+                        })
+                    ));
+                }
+            }
+            let mut new = begin;
+            new.transfer_id = Id::from_bytes(rand::random());
+            for frame in frames(new) {
+                core.receive_test(&store, &peer, frame, &mut incoming, &tx)
+                    .await?;
+            }
+            assert!(matches!(
+                rx.recv().await,
+                Some(Message::Nack(Nack {
+                    code: NackCode::UnsupportedKind,
+                    ..
+                }))
+            ));
+            core.shutdown_actions().await?;
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn watcher_observation_cancels_prepared_remote_write_and_later_winner_converges()
+    -> Result<()> {
+        let actions = Arc::new(BoundaryActions::default());
+        actions.delay.store(true, Ordering::SeqCst);
+        let (_dir, core, device) = fixture(actions.clone()).await?;
+        let text = Clipboard {
+            transfer_id: Id::from_bytes(rand::random()),
+            text: "older remote".into(),
+            hlc: Some(crate::now_ms()),
+            source_device: Some(device.clone()),
+            created_at: 1,
+            origin: ClipboardOrigin::Clipboard,
+        };
+        let (tx, mut rx) = mpsc::channel(4);
+        let c = core.clone();
+        let d = device.clone();
+        let t = tx.clone();
+        let task = tokio::spawn(async move {
+            c.receive_test(&c.store, &d, Message::Clipboard(text), &mut None, &t)
+                .await
+        });
+        actions.prepared.notified().await;
+        // The physical local selection and watcher event happen while the remote
+        // effect still holds the global clipboard mutex and prepares its helper.
+        *actions.clipboard.lock().unwrap() = "new local".into();
+        core.observe_local_clipboard_offer().await?;
+        actions.release.notify_one();
+        task.await??;
+        assert_eq!(&*actions.clipboard.lock().unwrap(), "new local");
+        assert!(matches!(
+            rx.recv().await,
+            Some(Message::Ack(Ack {
+                deduplicated: true,
+                ..
+            }))
+        ));
+        let seen: String = core
+            .store
+            .call(|c| Ok(c.query_row("SELECT last_seen FROM mesh_clock", [], |r| r.get(0))?))
+            .await?;
+        actions.delay.store(false, Ordering::SeqCst);
+        core.receive_test(
+            &core.store,
+            &device,
+            Message::Clipboard(Clipboard {
+                transfer_id: Id::from_bytes(rand::random()),
+                text: "next winner".into(),
+                hlc: Some(seen.parse::<u64>()? + 1),
+                source_device: Some(device.clone()),
+                created_at: 2,
+                origin: ClipboardOrigin::Clipboard,
+            }),
+            &mut None,
+            &tx,
+        )
+        .await?;
+        assert!(matches!(
+            rx.recv().await,
+            Some(Message::Ack(Ack {
+                deduplicated: false,
+                ..
+            }))
+        ));
+        assert_eq!(&*actions.clipboard.lock().unwrap(), "next winner");
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn legacy_effect_stamp_is_allocated_after_helper_prep_and_already_observed_mesh_clock()
+    -> Result<()> {
+        let actions = Arc::new(BoundaryActions::default());
+        actions.delay.store(true, Ordering::SeqCst);
+        let (_dir, core, device) = fixture(actions.clone()).await?;
+        let (tx, mut rx) = mpsc::channel(4);
+        let c = core.clone();
+        let d = device.clone();
+        let task = tokio::spawn(async move {
+            c.receive_test(
+                &c.store,
+                &d,
+                Message::Clipboard(Clipboard {
+                    transfer_id: Id::from_bytes(rand::random()),
+                    text: "legacy now".into(),
+                    hlc: None,
+                    source_device: None,
+                    created_at: 1,
+                    origin: ClipboardOrigin::Clipboard,
+                }),
+                &mut None,
+                &tx,
+            )
+            .await
+        });
+        actions.prepared.notified().await;
+        let observed = crate::now_ms() + 500;
+        core.store.observe_hlc(device.clone(), observed).await?;
+        actions.release.notify_one();
+        task.await??;
+        assert!(matches!(
+            rx.recv().await,
+            Some(Message::Ack(Ack {
+                deduplicated: false,
+                ..
+            }))
+        ));
+        assert!(
+            !core.store.stamp_eligible(observed, device).await?,
+            "an already observed mesh operation can overwrite the later legacy effect"
+        );
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn persisted_disable_cannot_resurrect_unsent_clipboard_after_reenable() -> Result<()> {
+        let (_dir, core, peer) = fixture(Arc::new(NoActions)).await?;
+        let _link = admit_ui_test_phone(&core, &peer, 1)?;
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&peer)
+            .unwrap()
+            .mesh = true;
+        let local = core.identity.device_id.clone();
+        core.store
+            .settings_fields(local.clone(), peer.clone(), true)
+            .await?;
+        let offer = core.observe_clipboard_offer().unwrap();
+        core.send_observed_clipboard(offer.clone(), "must be dropped".into())
+            .await?;
+        let key = format!("{local}/{peer}/clipboard");
+        // Store continuations stand in for an incoming merge or an IPC caller
+        // canceled after admission: neither can rely on Core's post-await cleanup.
+        core.store
+            .settings_edit(local.clone(), peer.clone(), true, key.clone(), false)
+            .await?;
+        core.store
+            .settings_edit(local, peer.clone(), true, key, true)
+            .await?;
+        assert!(!core.automatic_offer_current(&offer));
+        assert!(
+            core.take_automatic(&peer, 1).is_none(),
+            "disabled unsent text was paused and later replayed"
+        );
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+
     #[test]
     fn receipt_notices_share_bounded_queue_and_revocation_rules() {
         let queue = ActionQueue::default();
         let scope = ActionScope::new();
         let origin = ActionOrigin {
+            mesh: false,
             device: Id::new("a".repeat(32)).unwrap(),
             connection_id: Some(0),
         };
@@ -3384,6 +5728,7 @@ mod tests {
         queue.receipt(&scope, origin.clone(), ReceiptNotice::TextFailed);
         assert!(queue.pending.lock().unwrap().notifications.is_empty());
         let origin = ActionOrigin {
+            mesh: false,
             connection_id: Some(1),
             ..origin
         };
@@ -3403,12 +5748,7 @@ mod tests {
             incoming: &mut Option<Incoming>,
             tx: &mpsc::Sender<Message>,
         ) -> Result<()> {
-            let scope = self
-                .action_scope
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|(_, scope)| scope.clone());
+            let scope = self.action_scope.lock().unwrap().get(device).cloned();
             self.receive(store, scope.as_ref(), device, message, incoming, tx)
                 .await
         }
@@ -3420,15 +5760,37 @@ mod tests {
             writer: mpsc::Sender<Message>,
             close: watch::Sender<Option<CloseReason>>,
         ) -> Result<()> {
-            let scope = self
-                .action_scope
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|(_, scope)| scope.clone());
+            let scope = self.action_scope.lock().unwrap().get(&device).cloned();
             self.file_loop(store, scope, device, messages, writer, close)
                 .await
         }
+    }
+    #[tokio::test]
+    async fn settings_readiness_is_scoped_to_current_connection_and_peer() -> Result<()> {
+        let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
+        let other = Id::from_bytes([99; 16]);
+        let _other_link = admit_ui_test_phone(&core, &other, 7)?;
+        let _old_link = admit_ui_test_phone(&core, &device, 1)?;
+        let mut old = core.store.with_current_pairing();
+        old.mesh = true;
+        old.connection_id = Some(1);
+        core.publish_settings_ready(&old, &device, false);
+        assert!(!core.content_ready(&old, &device));
+        let _new_link = admit_ui_test_phone(&core, &device, 2)?;
+        let mut current = old.clone();
+        current.connection_id = Some(2);
+        core.publish_settings_ready(&current, &device, true);
+        for ready in [true, false] {
+            core.publish_settings_ready(&old, &device, ready);
+            assert!(core.content_ready(&current, &device));
+            assert!(!core.content_ready(&old, &device));
+            assert_eq!(core.settings_ready.lock().unwrap().get(&other), Some(&7));
+        }
+        core.publish_settings_ready(&current, &device, false);
+        assert!(!core.content_ready(&current, &device));
+        current.connection_id = None;
+        assert!(!core.content_ready(&current, &device));
+        core.shutdown_actions().await
     }
     fn admit_ui_test_phone(
         core: &Core,
@@ -3436,23 +5798,49 @@ mod tests {
         id: u64,
     ) -> Result<watch::Receiver<Option<CloseReason>>> {
         let (close, receiver) = watch::channel(None);
+        core.settings_ready
+            .lock()
+            .unwrap()
+            .insert(device.clone(), id);
+        core.admission
+            .lock()
+            .unwrap()
+            .peers
+            .retain(|_, id| id != device);
         core.admission
             .lock()
             .unwrap()
             .peers
             .insert(Hash::new(crate::random_hex(32))?, device.clone());
+        core.action_scope
+            .lock()
+            .unwrap()
+            .entry(device.clone())
+            .or_insert_with(ActionScope::new)
+            .connection_generation
+            .store(id, Ordering::SeqCst);
         let mut state = core.sessions.lock().unwrap();
-        state.session = Some(Session {
-            device: device.clone(),
-            id,
-            close,
-            wake: Arc::new(Notify::new()),
-            paused: false,
-        });
+        state.sessions.insert(
+            device.clone(),
+            Session {
+                outbound: false,
+                mesh: false,
+                role: "phone".into(),
+                device: device.clone(),
+                id,
+                close,
+                wake: Arc::new(Notify::new()),
+                paused: false,
+                capabilities: vec!["clipboard_text".into(), "clipboard_image".into()],
+                phone: crate::ui::Phone::default(),
+            },
+        );
         core.publish_phone(
             &state,
             id,
             &Hello {
+                role: None,
+                addresses: None,
                 version: 1,
                 device_id: device.clone(),
                 name: format!("Phone {id}"),
@@ -3561,6 +5949,48 @@ mod tests {
             }))
         }
     }
+    #[tokio::test]
+    async fn notification_ack_releases_the_authority_gate_and_revocation_cancels_wait() -> Result<()>
+    {
+        let scope = ActionScope::new();
+        let origin = ActionOrigin {
+            mesh: false,
+            device: Id::new("11".repeat(16))?,
+            connection_id: Some(0),
+        };
+        let issued = Arc::new(tokio::sync::Notify::new());
+        let alive = Arc::new(AtomicU64::new(1));
+        let task = {
+            let scope = scope.clone();
+            let origin = origin.clone();
+            let issued = issued.clone();
+            let alive = alive.clone();
+            tokio::spawn(async move {
+                scope
+                    .notification(&origin, || async move {
+                        let lifetime = ViewerLifetime(alive);
+                        issued.notify_one();
+                        Ok(Box::pin(async move {
+                            let _lifetime = lifetime;
+                            std::future::pending().await
+                        }) as crate::ui::portal::Interaction)
+                    })
+                    .await
+            })
+        };
+        issued.notified().await;
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            scope.effect(&origin, || async { 42 }),
+        )
+        .await?
+        .unwrap();
+        assert_eq!(alive.load(Ordering::SeqCst), 1);
+        scope.cancelled.send_replace(true);
+        assert!(task.await?.is_none());
+        assert_eq!(alive.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
     #[tokio::test(start_paused = true)]
     async fn viewer_wait_releases_gate_is_bounded_and_cancels_on_revocation_and_shutdown()
     -> Result<()> {
@@ -3570,14 +6000,14 @@ mod tests {
             .action_scope
             .lock()
             .unwrap()
-            .as_ref()
+            .get(&device)
             .unwrap()
-            .1
             .clone();
         let job = ActionJob {
             file: ReceivedFile::from_file(dir.path().join("file"), tempfile::tempfile()?)?,
             scope: scope.clone(),
             origin: ActionOrigin {
+                mesh: false,
                 device,
                 connection_id: Some(0),
             },
@@ -3622,6 +6052,7 @@ mod tests {
         );
         let current = ActionJob {
             origin: ActionOrigin {
+                mesh: false,
                 connection_id: Some(1),
                 ..job.origin.clone()
             },
@@ -3638,6 +6069,7 @@ mod tests {
         let current = ActionJob {
             scope: ActionScope::new(),
             origin: ActionOrigin {
+                mesh: false,
                 connection_id: None,
                 ..current.origin.clone()
             },
@@ -3658,9 +6090,8 @@ mod tests {
             .action_scope
             .lock()
             .unwrap()
-            .as_ref()
+            .get(&device)
             .unwrap()
-            .1
             .clone();
         let path = dir.path().join("image.png");
         std::fs::write(&path, b"\x89PNG\r\n\x1a\n")?;
@@ -3668,6 +6099,7 @@ mod tests {
             file: ReceivedFile::open(&path)?,
             scope,
             origin: ActionOrigin {
+                mesh: false,
                 device,
                 connection_id: None,
             },
@@ -3750,29 +6182,24 @@ mod tests {
     }
     #[tokio::test(start_paused = true)]
     async fn receipt_deadline_begins_after_last_frame_flush_for_all_outgoing_kinds() -> Result<()> {
-        for (image, durable) in [(true, false), (false, false), (false, true)] {
+        for image in [false, true] {
             let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
             let close = admit_ui_test_phone(&core, &device, 1)?;
             core.toggle_setting(crate::ui::Toggle::IncludeImages)
                 .await?;
             let work = test_automatic_work(&core, &device, image).await?;
             let id = work.selection.id().clone();
-            let mut pending = PendingOutgoing::queued(if durable { 1 } else { -1 }, id.clone());
-            let (normal_tx, normal) = mpsc::channel(4);
+            let mut pending = PendingOutgoing::queued(id.clone());
+            let (_normal_tx, normal) = mpsc::channel(4);
             let (_priority_tx, priority) = mpsc::channel(4);
             let (automatic_tx, automatic) = mpsc::channel(1);
+            let (_text_tx, text) = mpsc::channel(1);
+            let (_files_tx, files) = mpsc::channel(1);
             let (reports, mut rx) = mpsc::channel(4);
-            if durable {
-                let OutgoingSelection::Text(text) = work.selection else {
-                    unreachable!()
-                };
-                normal_tx.send(Message::Clipboard(text)).await?;
-            } else {
-                automatic_tx
-                    .send(work)
-                    .await
-                    .map_err(|_| anyhow::anyhow!("writer queue"))?;
-            }
+            automatic_tx
+                .send(work)
+                .await
+                .map_err(|_| anyhow::anyhow!("writer queue"))?;
             let bytes = Arc::new(Mutex::new(Vec::new()));
             let output = bytes.clone();
             let writer_core = core.clone();
@@ -3788,6 +6215,8 @@ mod tests {
                         normal,
                         priority,
                         automatic,
+                        text,
+                        files,
                         reports,
                         close,
                     },
@@ -3852,6 +6281,8 @@ mod tests {
                 let (normal_tx, normal) = mpsc::channel(4);
                 let (_priority_tx, priority) = mpsc::channel(4);
                 let (automatic_tx, automatic) = mpsc::channel(1);
+                let (_text_tx, text) = mpsc::channel(1);
+                let (_files_tx, files) = mpsc::channel(1);
                 let (canceled, mut cancellations) = mpsc::channel(1);
                 let ping = Message::Ping(Ping {
                     nonce: Nonce::new("a".repeat(16))?,
@@ -3876,6 +6307,8 @@ mod tests {
                             normal,
                             priority,
                             automatic,
+                            text,
+                            files,
                             reports: canceled,
                             close,
                         },
@@ -3975,6 +6408,7 @@ mod tests {
                     &mut priority,
                     &mut normal,
                     None,
+                    None,
                 )
                 .await
             }));
@@ -4014,7 +6448,7 @@ mod tests {
         assert!(core.ui_snapshot().receiving);
         assert!(core.finish_connection(&device, 2));
         assert!(!core.ui_snapshot().receiving);
-        assert!(core.ui.lock().unwrap().receiving_until.is_none());
+        assert!(core.ui.lock().unwrap().receiving_until.is_empty());
         core.shutdown_actions().await?;
         Ok(())
     }
@@ -4144,6 +6578,7 @@ mod tests {
             let old = core.ui_snapshot();
             assert_eq!(old.phone.device, old.device);
             assert_eq!(old.generation, Some(generation - 1));
+            core.unpair_device(old.device.clone().unwrap()).await?;
             let invitation = core
                 .start_pairing_with_addresses(vec!["127.0.0.1:47821".into()])
                 .await?;
@@ -4201,40 +6636,168 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
-    async fn cached_phone_metadata_is_bound_to_identity_after_restart() -> Result<()> {
-        for cache in ["matching", "different", "legacy"] {
+    async fn cached_phone_metadata_is_bound_to_identity_and_pairing_after_restart() -> Result<()> {
+        for filename in ["phone.json", "phones.json"] {
+            for cache in ["matching", "different", "legacy", "unversioned", "revoked"] {
+                let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
+                let _connection = admit_ui_test_phone(&core, &device, 1)?;
+                core.persist_phone(1).await?;
+                let paths = core.paths.clone();
+                let config = core.config();
+                core.shutdown_actions().await?;
+                drop(core);
+                let other = if filename == "phone.json" {
+                    "phones.json"
+                } else {
+                    "phone.json"
+                };
+                std::fs::remove_file(paths.data.join(other))?;
+                let file = paths.data.join(filename);
+                let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&file)?)?;
+                let phone = if filename == "phones.json" {
+                    &mut value[device.as_str()]
+                } else {
+                    &mut value
+                };
+                if cache == "legacy" {
+                    phone.as_object_mut().unwrap().remove("device");
+                }
+                if cache == "different" {
+                    phone["device"] = serde_json::to_value(Id::from_bytes([9; 16]))?;
+                }
+                if cache == "unversioned" {
+                    phone.as_object_mut().unwrap().remove("pairing_generation");
+                }
+                if cache == "revoked" {
+                    phone["pairing_generation"] = serde_json::json!(0);
+                }
+                crate::config::atomic_private(&file, &serde_json::to_vec(&value)?)?;
+                let restarted = Core::new(paths, config, Arc::new(NoActions)).await?;
+                let snapshot = restarted.ui_snapshot();
+                restarted.shutdown_actions().await?;
+                assert_eq!(snapshot.device, Some(device));
+                assert_eq!(snapshot.phone.device, snapshot.device);
+                assert_eq!(
+                    snapshot.phone.name,
+                    if cache == "matching" {
+                        "Phone 1"
+                    } else {
+                        "Phone"
+                    },
+                    "{filename}: {cache}"
+                );
+                assert_eq!(snapshot.phone.last_seen != 0, cache == "matching");
+                assert_eq!(snapshot.phone.route.is_empty(), cache != "matching");
+                assert!(snapshot.generation.is_none());
+                assert!(snapshot.paired && !snapshot.connected && !snapshot.paused);
+            }
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn current_phone_cache_survives_a_revoked_entry_in_the_other_file() -> Result<()> {
+        for stale_file in ["phone.json", "phones.json"] {
             let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
-            let _connection = admit_ui_test_phone(&core, &device, 1)?;
+            let _old = admit_ui_test_phone(&core, &device, 1)?;
+            core.persist_phone(1).await?;
+            let path = core.paths.data.join(stale_file);
+            let stale = std::fs::read(&path)?;
+            let invitation = core
+                .start_pairing_with_addresses(vec!["127.0.0.1:47821".into()])
+                .await?;
+            core.finish_pairing(
+                &device,
+                &Hash::new(crate::random_hex(32))?,
+                &invitation.token,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            let _current = admit_ui_test_phone(&core, &device, 2)?;
+            core.persist_phone(2).await?;
+            let paths = core.paths.clone();
+            let config = core.config();
+            core.store.drain().await;
+            core.shutdown_actions().await?;
+            drop(core);
+            crate::config::atomic_private(&path, &stale)?;
+            let restarted = Core::new(paths, config, Arc::new(NoActions)).await?;
+            let snapshot = restarted.ui_snapshot();
+            restarted.shutdown_actions().await?;
+            assert_eq!(snapshot.phone.name, "Phone 2", "stale {stale_file}");
+            assert!(snapshot.phone.last_seen > 0);
+            assert!(!snapshot.phone.route.is_empty());
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn repaired_pairing_does_not_restore_revoked_metadata_after_restart() -> Result<()> {
+        revoked_metadata_restart(false, true).await
+    }
+    #[tokio::test]
+    async fn unpaired_device_does_not_restore_metadata_after_restart() -> Result<()> {
+        revoked_metadata_restart(true, false).await
+    }
+    #[tokio::test]
+    async fn unpair_then_pair_does_not_restore_revoked_metadata_after_restart() -> Result<()> {
+        revoked_metadata_restart(true, true).await
+    }
+    async fn revoked_metadata_restart(unpair: bool, repair: bool) -> Result<()> {
+        for cache in ["phone.json", "phones.json", "both"] {
+            let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
+            let connection = admit_ui_test_phone(&core, &device, 1)?;
+            core.persist_phone(1).await?;
+            assert!(core.finish_connection(&device, 1));
             core.persist_phone(1).await?;
             let paths = core.paths.clone();
             let config = core.config();
+            // Keep the old bytes, modelling a crash after the trust transaction
+            // commits but before any cache invalidation/write can finish.
+            let old_phone = std::fs::read(paths.data.join("phone.json"))?;
+            let old_phones = std::fs::read(paths.data.join("phones.json"))?;
+            if unpair {
+                core.unpair_device(device.clone()).await?;
+            }
+            if repair {
+                let invitation = core
+                    .start_pairing_with_addresses(vec!["127.0.0.1:47821".into()])
+                    .await?;
+                core.finish_pairing(
+                    &device,
+                    &Hash::new(crate::random_hex(32))?,
+                    &invitation.token,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                assert_eq!(core.ui_snapshot().phone.name, "Phone");
+            }
+            core.store.drain().await;
             core.shutdown_actions().await?;
+            drop(connection);
             drop(core);
-            let file = paths.data.join("phone.json");
-            let mut phone: serde_json::Value = serde_json::from_slice(&std::fs::read(&file)?)?;
-            if cache == "legacy" {
-                phone.as_object_mut().unwrap().remove("device");
+            for (file, bytes) in [("phone.json", old_phone), ("phones.json", old_phones)] {
+                if cache == "both" || cache == file {
+                    crate::config::atomic_private(&paths.data.join(file), &bytes)?;
+                } else {
+                    std::fs::remove_file(paths.data.join(file))?;
+                }
             }
-            if cache == "different" {
-                phone["device"] = serde_json::to_value(Id::from_bytes([9; 16]))?;
-            }
-            crate::config::atomic_private(&file, &serde_json::to_vec(&phone)?)?;
             let restarted = Core::new(paths, config, Arc::new(NoActions)).await?;
             let snapshot = restarted.ui_snapshot();
-            assert_eq!(snapshot.device, Some(device));
-            assert_eq!(snapshot.phone.device, snapshot.device);
+            let caches_empty = restarted.ui.lock().unwrap().phones.is_empty();
+            restarted.shutdown_actions().await?;
+            assert!(
+                caches_empty,
+                "revoked entry loaded from {cache}, unpair={unpair}"
+            );
             assert_eq!(
                 snapshot.phone.name,
-                if cache == "matching" {
-                    "Phone 1"
-                } else {
-                    "Phone"
-                }
+                if repair { "Phone" } else { "" },
+                "cache={cache}"
             );
-            assert_eq!(snapshot.phone.last_seen != 0, cache == "matching");
-            assert!(snapshot.generation.is_none());
-            assert!(snapshot.paired && !snapshot.connected && !snapshot.paused);
-            restarted.shutdown_actions().await?;
+            assert_eq!(snapshot.phone.last_seen, 0);
+            assert!(snapshot.phone.route.is_empty());
+            assert_eq!(snapshot.device, repair.then_some(device));
+            assert!(!snapshot.connected);
         }
         Ok(())
     }
@@ -4312,6 +6875,7 @@ mod tests {
         core.shutdown_actions().await?;
         Ok(())
     }
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn failed_cache_arrivals_and_recovery_use_actual_destination() -> Result<()> {
         use crate::ui::{ReceiveDestination as D, ReceiveError};
@@ -4394,6 +6958,161 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    async fn sweep_activity_is_per_device_and_disconnect_reconnect_scoped() -> Result<()> {
+        let (_dir, core, a) = fixture(Arc::new(NoActions)).await?;
+        let b = Id::from_bytes([2; 16]);
+        let _a = admit_ui_test_phone(&core, &a, 1)?;
+        let _b = admit_ui_test_phone(&core, &b, 2)?;
+        let transfer = test_begin(b"same ID, different senders");
+        core.event(Event::TransferStarted {
+            device: b.clone(),
+            metadata: transfer.clone(),
+        });
+        assert!(
+            !core.ui_snapshot().receiving,
+            "B must not show Receiving from A"
+        );
+        let before_start = std::time::Instant::now();
+        core.event(Event::TransferStarted {
+            device: a.clone(),
+            metadata: transfer.clone(),
+        });
+        let after_start = std::time::Instant::now();
+        let until =
+            core.ui.lock().unwrap().receiving_until[&(a.clone(), transfer.transfer_id.clone())];
+        let hold = Duration::from_millis(1500);
+        assert!(
+            (before_start + hold..=after_start + hold).contains(&until),
+            "receiving presentation must retain its 1500 ms hold"
+        );
+        assert_eq!(core.ui.lock().unwrap().active_transfers.len(), 2);
+        core.event(Event::TransferFinished {
+            device: a.clone(),
+            transfer_id: transfer.transfer_id.clone(),
+            path: None,
+
+            deduplicated: false,
+        });
+        // Expire A's presentation hold explicitly; this test checks per-device
+        // activity ownership, not how quickly the host schedules a sleep.
+        *core
+            .ui
+            .lock()
+            .unwrap()
+            .receiving_until
+            .get_mut(&(a.clone(), transfer.transfer_id.clone()))
+            .unwrap() = std::time::Instant::now() - Duration::from_secs(1);
+        assert!(
+            !core.ui_snapshot().receiving,
+            "B's equal ID must remain independent"
+        );
+        let _replacement = admit_ui_test_phone(&core, &a, 3)?;
+        assert_eq!(
+            core.ui.lock().unwrap().active_transfers.len(),
+            1,
+            "A reconnect must preserve B activity"
+        );
+        assert!(core.finish_connection(&b, 2));
+        assert!(
+            core.ui.lock().unwrap().active_transfers.is_empty(),
+            "secondary disconnect must remove its own unfinished receive"
+        );
+        assert!(!core.ui_snapshot().receiving);
+        let _b_reconnected = admit_ui_test_phone(&core, &b, 4)?;
+        core.event(Event::TransferStarted {
+            device: b.clone(),
+            metadata: transfer,
+        });
+        assert!(core.finish_connection(&a, 3));
+        let snapshot = core.ui_snapshot();
+        assert_eq!(snapshot.device, Some(b.clone()));
+        assert_eq!(snapshot.phone.name, "Phone 4");
+        assert!(snapshot.receiving);
+        assert_eq!(snapshot.status(), "Receiving from Phone 4…");
+        assert!(core.finish_connection(&b, 4));
+        assert!(core.ui.lock().unwrap().active_transfers.is_empty());
+        assert!(!core.ui_snapshot().receiving);
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn sweep_display_prefers_lowest_connected_peer_and_keeps_it() -> Result<()> {
+        let (_dir, core, a) = fixture(Arc::new(NoActions)).await?;
+        let b = Id::from_bytes([2; 16]);
+        let c = Id::from_bytes([3; 16]);
+        let _a = admit_ui_test_phone(&core, &a, 1)?;
+        let _c = admit_ui_test_phone(&core, &c, 2)?;
+        let _b = admit_ui_test_phone(&core, &b, 3)?;
+        assert_eq!(core.ui_snapshot().device, Some(a.clone()));
+        assert!(core.finish_connection(&a, 1));
+        assert_eq!(core.ui_snapshot().device, Some(b.clone()));
+        let _a_again = admit_ui_test_phone(&core, &a, 4)?;
+        assert_eq!(
+            core.ui_snapshot().device,
+            Some(b.clone()),
+            "a live displayed peer stays selected"
+        );
+        core.set_phone_paused(&b, 3, true);
+        let snapshot = core.ui_snapshot();
+        assert_eq!(snapshot.phone.name, "Phone 3");
+        assert_eq!(snapshot.generation, Some(3));
+        assert!(snapshot.connected && snapshot.paused);
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn sweep_display_switch_persists_ended_peer_metadata_across_restart() -> Result<()> {
+        for shutdown in [false, true] {
+            let (_dir, core, a) = fixture(Arc::new(NoActions)).await?;
+            let b = Id::from_bytes([2; 16]);
+            core.store
+                .pair(b.clone(), Hash::new(crate::random_hex(32))?)
+                .await?;
+            let _a = admit_ui_test_phone(&core, &a, 1)?;
+            let _b = admit_ui_test_phone(&core, &b, 2)?;
+            core.ui.lock().unwrap().snapshot.phone.last_seen = 1;
+            core.persist_phone(1).await?;
+            assert_eq!(core.ui_snapshot().device, Some(a.clone()));
+            if shutdown {
+                // Use the production serve shutdown path with both sessions live.
+                core.request_shutdown();
+                core.clone()
+                    .serve(TcpListener::bind("127.0.0.1:0").await?, false)
+                    .await?;
+            } else {
+                assert!(core.finish_connection(&a, 1));
+                core.persist_phone(1).await?;
+                let snapshot = core.ui_snapshot();
+                assert_eq!(snapshot.device, Some(b.clone()));
+                assert_eq!(snapshot.phone.device, snapshot.device);
+                assert_eq!(snapshot.phone.name, "Phone 2");
+                assert!(snapshot.connected);
+                let disk: crate::ui::Phone =
+                    serde_json::from_slice(&std::fs::read(core.paths.data.join("phone.json"))?)?;
+                assert_eq!(disk.device, snapshot.device);
+                assert_eq!(disk.name, snapshot.phone.name);
+                assert!(core.finish_connection(&b, 2));
+                core.persist_phone(2).await?;
+            }
+            let paths = core.paths.clone();
+            let config = core.config();
+            core.store.drain().await;
+            core.shutdown_actions().await?;
+            drop(core);
+            let core = Core::new(paths, config, Arc::new(NoActions)).await?;
+            core.unpair_device(b).await?;
+            let snapshot = core.ui_snapshot();
+            assert_eq!(snapshot.device, Some(a));
+            assert_eq!(snapshot.phone.name, "Phone 1");
+            assert!(
+                snapshot.phone.last_seen > 1,
+                "A final last seen must survive B staying connected and restart"
+            );
+            core.shutdown_actions().await?;
+        }
+        Ok(())
+    }
+    #[tokio::test]
     async fn final_phone_metadata_persists_only_for_latest_generation() -> Result<()> {
         let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
         let _old = admit_ui_test_phone(&core, &device, 1)?;
@@ -4414,10 +7133,17 @@ mod tests {
         assert_eq!(std::fs::read(&path)?, before);
         core.unpair_device(device).await?;
         assert!(core.ui.lock().unwrap().phone_generation.is_none());
+        let unpaired = std::fs::read(&path)?;
         core.persist_phone(2).await?;
         assert_eq!(
-            serde_json::from_slice::<crate::ui::Phone>(&std::fs::read(path)?)?.name,
-            "Phone 2"
+            std::fs::read(&path)?,
+            unpaired,
+            "revoked metadata cannot overwrite the unpaired snapshot"
+        );
+        assert!(
+            serde_json::from_slice::<crate::ui::Phone>(&unpaired)?
+                .device
+                .is_none()
         );
         core.shutdown_actions().await?;
         Ok(())
@@ -4427,14 +7153,24 @@ mod tests {
         let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
         core.admission.lock().unwrap().peers = core.store.peers().await?;
         let (close, _rx) = watch::channel(None);
-        core.sessions.lock().unwrap().session = Some(Session {
-            device: device.clone(),
-            id: 2,
-            close,
-            wake: Arc::new(Notify::new()),
-            paused: false,
-        });
+        core.sessions.lock().unwrap().sessions.insert(
+            device.clone(),
+            Session {
+                outbound: false,
+                mesh: false,
+                role: "phone".into(),
+                device: device.clone(),
+                id: 2,
+                close,
+                wake: Arc::new(Notify::new()),
+                paused: false,
+                capabilities: vec!["clipboard_text".into(), "clipboard_image".into()],
+                phone: crate::ui::Phone::default(),
+            },
+        );
         let current = Hello {
+            role: None,
+            addresses: None,
             version: pneu_proto::PROTOCOL_VERSION,
             device_id: device.clone(),
             name: "Current phone".into(),
@@ -4457,29 +7193,973 @@ mod tests {
         assert_eq!(before, std::fs::read(core.paths.data.join("phone.json"))?);
         assert_eq!(core.ui_snapshot().phone.name, "Current phone");
         assert_eq!(core.ui_snapshot().phone.route, "Tailscale");
-        assert!(core.clipboard_image_capable());
+        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+            .await?;
+        assert!(
+            !core
+                .automatic_target()
+                .unwrap()
+                .payload_plans(false, true)
+                .is_empty()
+        );
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    async fn automatic_wire(core: &Core, work: AutomaticWrite) -> Result<Vec<Message>> {
+        let (_priority_tx, mut priority) = mpsc::channel(1);
+        let (_normal_tx, mut normal) = mpsc::channel(1);
+        let mut bytes = Vec::new();
+        assert!(
+            transmit_automatic(
+                core,
+                &mut bytes,
+                work,
+                &mut priority,
+                &mut normal,
+                None,
+                None
+            )
+            .await?
+        );
+        let mut wire = bytes.as_slice();
+        let mut messages = Vec::new();
+        while let Some(message) = read_frame(&mut wire).await? {
+            messages.push(message);
+        }
+        Ok(messages)
+    }
+    #[tokio::test]
+    async fn encoded_clipboard_rejected_before_automatic_publication() -> Result<()> {
+        let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
+        let _link = admit_ui_test_phone(&core, &device, 1)?;
+        for mesh in [false, true] {
+            core.sessions
+                .lock()
+                .unwrap()
+                .sessions
+                .get_mut(&device)
+                .unwrap()
+                .mesh = mesh;
+            let result = core
+                .send_observed_clipboard(
+                    core.observe_clipboard_offer().unwrap(),
+                    "\u{1}".repeat(11_000),
+                )
+                .await;
+            assert!(
+                result.is_err(),
+                "oversized JSON was accepted for mesh={mesh}"
+            );
+            assert!(core.automatic.lock().unwrap().selections.is_empty());
+            assert_eq!(core.connected_devices(), vec![device.clone()]);
+        }
+        core.shutdown_actions().await
+    }
+    #[tokio::test]
+    async fn encoded_clipboard_failure_is_per_recipient_and_keeps_valid_image() -> Result<()> {
+        let (_dir, core, text_peer) = fixture(Arc::new(NoActions)).await?;
+        let image_peer = Id::from_bytes([2; 16]);
+        let _text = admit_ui_test_phone(&core, &text_peer, 1)?;
+        let _image = admit_ui_test_phone(&core, &image_peer, 2)?;
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&text_peer)
+            .unwrap()
+            .capabilities = vec!["clipboard_text".into()];
+        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+            .await?;
+        core.send_observed_formats(
+            core.observe_clipboard_offer().unwrap(),
+            Some("\u{1}".repeat(11_000)),
+            Some(b"\x89PNG\r\n\x1a\nimage".to_vec()),
+        )
+        .await?;
+        assert!(
+            core.take_automatic(&text_peer, 1).is_none(),
+            "invalid text was published"
+        );
+        let wire = automatic_wire(&core, core.take_automatic(&image_peer, 2).unwrap()).await?;
+        assert!(matches!(&wire[0], Message::FileBegin(_)));
+        assert_eq!(core.connected_devices().len(), 2);
+        core.shutdown_actions().await
+    }
+    #[tokio::test]
+    async fn encoded_mesh_header_limit_rejects_only_mesh_recipient() -> Result<()> {
+        let (_dir, core, mesh_peer) = fixture(Arc::new(NoActions)).await?;
+        let legacy_peer = Id::from_bytes([2; 16]);
+        let _mesh = admit_ui_test_phone(&core, &mesh_peer, 1)?;
+        let _legacy = admit_ui_test_phone(&core, &legacy_peer, 2)?;
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&mesh_peer)
+            .unwrap()
+            .mesh = true;
+        let mut wire = Clipboard {
+            transfer_id: Id::from_bytes([0; 16]),
+            text: "\u{1}".repeat(10_800),
+            created_at: crate::now_ms(),
+            origin: ClipboardOrigin::Clipboard,
+            hlc: None,
+            source_device: None,
+        };
+        let remaining = MAX_CONTROL_PAYLOAD - serde_json::to_vec(&wire)?.len();
+        wire.text.push_str(&"x".repeat(remaining));
+        encode_frame(&Message::Clipboard(wire.clone()))?;
+        let offer = core.observe_clipboard_offer().unwrap();
+        core.send_observed_clipboard(offer, wire.text.clone())
+            .await?;
+        assert!(core.take_automatic(&mesh_peer, 1).is_none());
+        let messages = automatic_wire(&core, core.take_automatic(&legacy_peer, 2).unwrap()).await?;
+        assert!(
+            matches!(&messages[0],Message::Clipboard(text) if text.text==wire.text && text.hlc.is_none())
+        );
+        assert_eq!(core.connected_devices().len(), 2);
+        core.shutdown_actions().await
+    }
+    #[tokio::test]
+    async fn hello_and_status_bounds_are_validated_before_publication() -> Result<()> {
+        let (_dir, core, _peer) = fixture(Arc::new(NoActions)).await?;
+        let mut config = core.config();
+        config.name = "\u{1}".repeat(128);
+        core.update_config(config.clone()).await?;
+        let mut hello = core.computer_hello();
+        hello.addresses = Some(
+            ['a', 'b', 'c']
+                .map(|last| {
+                    format!(
+                        "{}.{}.{}.{}:65535",
+                        "a".repeat(63),
+                        "b".repeat(63),
+                        "c".repeat(63),
+                        last.to_string().repeat(61)
+                    )
+                })
+                .to_vec(),
+        );
+        let message = Message::Hello(hello.clone());
+        let encoded = encode_frame(&message)?;
+        assert_eq!(read_frame(&mut encoded.as_slice()).await?, Some(message));
+        config.name.push('x');
+        assert!(core.update_config(config).await.is_err());
+        assert_eq!(core.config().name, hello.name);
+        hello.addresses.as_mut().unwrap()[0] = format!("{}:65535", "x".repeat(254));
+        assert!(encode_frame(&Message::Hello(hello)).is_err());
+        for paused in [false, true] {
+            let message = Message::Status(Status { paused });
+            let encoded = encode_frame(&message)?;
+            assert_eq!(read_frame(&mut encoded.as_slice()).await?, Some(message));
+        }
+        core.shutdown_actions().await
+    }
+    #[tokio::test]
+    async fn encoded_image_begin_rejected_before_automatic_publication() -> Result<()> {
+        let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
+        let _link = admit_ui_test_phone(&core, &device, 1)?;
+        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+            .await?;
+        let offer = core.observe_clipboard_offer().unwrap();
+        core.store
+            .call(|c| {
+                c.execute("UPDATE mesh_clock SET last_seen=?", [u64::MAX.to_string()])?;
+                Ok(())
+            })
+            .await?;
+        assert!(
+            core.send_observed_image(offer, b"\x89PNG\r\n\x1a\nimage".to_vec())
+                .await
+                .is_err()
+        );
+        assert!(
+            core.automatic.lock().unwrap().selections.is_empty(),
+            "invalid BEGIN was published"
+        );
+        core.shutdown_actions().await
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn automatic_formats_ignore_paused_image_peer() -> Result<()> {
+        let (_dir, core, text_peer) = fixture(Arc::new(NoActions)).await?;
+        let image_peer = Id::from_bytes([2; 16]);
+        let _text = admit_ui_test_phone(&core, &text_peer, 1)?;
+        let _image = admit_ui_test_phone(&core, &image_peer, 2)?;
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&text_peer)
+            .unwrap()
+            .capabilities = vec!["clipboard_text".into()];
+        core.set_phone_paused(&image_peer, 2, true);
+        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+            .await?;
+        crate::ui::clipboard::tests::deliver_offer(
+            &core,
+            &[
+                ("image/png", b"\x89PNG\r\n\x1a\nimage"),
+                ("text/plain", b"fallback"),
+            ],
+        )
+        .await?;
+        let work = core
+            .take_automatic(&text_peer, 1)
+            .expect("text peer must receive fallback");
+        assert!(
+            matches!(automatic_wire(&core, work).await?.as_slice(), [Message::Clipboard(c)] if c.text == "fallback")
+        );
+        assert!(core.take_automatic(&image_peer, 2).is_none());
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn automatic_formats_deliver_best_format_to_each_peer() -> Result<()> {
+        let (_dir, core, image_peer) = fixture(Arc::new(NoActions)).await?;
+        let text_peer = Id::from_bytes([2; 16]);
+        let _image = admit_ui_test_phone(&core, &image_peer, 1)?;
+        let _text = admit_ui_test_phone(&core, &text_peer, 2)?;
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&text_peer)
+            .unwrap()
+            .capabilities = vec!["clipboard_text".into()];
+        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+            .await?;
+        let requested = crate::ui::clipboard::tests::deliver_offer(
+            &core,
+            &[
+                ("image/png", b"\x89PNG\r\n\x1a\nimage"),
+                ("text/plain", b"fallback"),
+            ],
+        )
+        .await?;
+        let image = core
+            .take_automatic(&image_peer, 1)
+            .expect("image recipient");
+        let image_wire = automatic_wire(&core, image).await?;
+        assert!(
+            matches!(image_wire.as_slice(), [Message::FileBegin(begin), Message::FileChunk(chunk), Message::FileEnd(end)]
+            if begin.mime == "image/png" && begin.kind == FileKind::ClipboardImage
+                && begin.transfer_id == end.transfer_id && chunk.data == b"\x89PNG\r\n\x1a\nimage")
+        );
+        let text = core.take_automatic(&text_peer, 2).expect("text recipient");
+        assert!(
+            matches!(automatic_wire(&core, text).await?.as_slice(), [Message::Clipboard(c)] if c.text == "fallback")
+        );
+        assert!(requested.iter().any(|m| m == "image/png"));
+        assert!(requested.iter().any(|m| m == "text/plain"));
         core.shutdown_actions().await?;
         Ok(())
     }
     #[tokio::test]
-    async fn production_ui_policy_cleanup_preserves_explicit_outbox() -> Result<()> {
+    async fn mesh_fanout_formats_share_one_stamp_and_legacy_wire_uses_hlc() -> Result<()> {
+        let (_dir, core, image_peer) = fixture(Arc::new(NoActions)).await?;
+        let text_peer = Id::from_bytes([2; 16]);
+        let legacy_peer = Id::from_bytes([3; 16]);
+        let _a = admit_ui_test_phone(&core, &image_peer, 1)?;
+        let _b = admit_ui_test_phone(&core, &text_peer, 2)?;
+        let _c = admit_ui_test_phone(&core, &legacy_peer, 3)?;
+        {
+            let mut sessions = core.sessions.lock().unwrap();
+            sessions.sessions.get_mut(&image_peer).unwrap().mesh = true;
+            let text = sessions.sessions.get_mut(&text_peer).unwrap();
+            text.mesh = true;
+            text.capabilities = vec!["clipboard_text".into()];
+            sessions
+                .sessions
+                .get_mut(&legacy_peer)
+                .unwrap()
+                .capabilities = vec!["clipboard_text".into()];
+        }
+        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+            .await?;
+        let offer = core.observe_clipboard_offer().unwrap();
+        core.send_observed_formats(
+            offer,
+            Some("fallback".into()),
+            Some(b"\x89PNG\r\n\x1a\nimage".to_vec()),
+        )
+        .await?;
+        let image = automatic_wire(&core, core.take_automatic(&image_peer, 1).unwrap()).await?;
+        let text = automatic_wire(&core, core.take_automatic(&text_peer, 2).unwrap()).await?;
+        let legacy = automatic_wire(&core, core.take_automatic(&legacy_peer, 3).unwrap()).await?;
+        let Message::FileBegin(image) = &image[0] else {
+            panic!("image")
+        };
+        let Message::Clipboard(text) = &text[0] else {
+            panic!("text")
+        };
+        let Message::Clipboard(legacy) = &legacy[0] else {
+            panic!("legacy")
+        };
+        assert_eq!(image.hlc, text.hlc);
+        assert!(text.hlc.is_some());
+        assert_eq!(image.source_device, text.source_device);
+        assert_eq!(text.source_device.as_ref(), Some(&core.identity.device_id));
+        assert_eq!(image.transfer_id, text.transfer_id);
+        assert_eq!(text.transfer_id, legacy.transfer_id);
+        assert_eq!(image.created_at, text.created_at);
+        assert_eq!(text.created_at, legacy.created_at);
+        assert!(legacy.hlc.is_none() && legacy.source_device.is_none());
+        assert_eq!(legacy.created_at, text.hlc.unwrap());
+        let hlc: String = core
+            .store
+            .call(|c| {
+                Ok(c.query_row(
+                    "SELECT last_seen FROM mesh_clock WHERE singleton=1",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .await?;
+        assert_eq!(hlc, text.hlc.unwrap().to_string());
+        core.shutdown_actions().await
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn automatic_formats_validate_independently_before_recipient_preference() -> Result<()> {
         let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
-        let fp = Hash::new(crate::random_hex(32))?;
-        core.admission
+        let _connection = admit_ui_test_phone(&core, &device, 1)?;
+        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+            .await?;
+        let png = b"\x89PNG\r\n\x1a\nvalid image".to_vec();
+        for bytes in [
+            b"invalid PNG".to_vec(),
+            vec![1; crate::ui::clipboard::MAX_IMAGE + 1],
+        ] {
+            core.send_observed_formats(
+                core.observe_clipboard_offer().unwrap(),
+                Some("fallback".into()),
+                Some(bytes),
+            )
+            .await?;
+            let work = core.take_automatic(&device, 1).expect("text fallback");
+            assert!(
+                matches!(automatic_wire(&core, work).await?.as_slice(), [Message::Clipboard(c)] if c.text == "fallback")
+            );
+        }
+        // An unusable text representation must not block the image for one
+        // peer merely because a different frozen recipient needs text.
+        let text_peer = Id::from_bytes([2; 16]);
+        let _text = admit_ui_test_phone(&core, &text_peer, 2)?;
+        core.sessions
             .lock()
             .unwrap()
-            .peers
-            .insert(fp, device.clone());
-        let (close, _receiver) = watch::channel(None);
-        core.sessions.lock().unwrap().session = Some(Session {
-            device: device.clone(),
-            id: 7,
-            close,
-            wake: Arc::new(Notify::new()),
-            paused: false,
+            .sessions
+            .get_mut(&text_peer)
+            .unwrap()
+            .capabilities = vec!["clipboard_text".into()];
+        for text in ["bad\0text".to_owned(), "t".repeat(MAX_CLIPBOARD_BYTES + 1)] {
+            core.send_observed_formats(
+                core.observe_clipboard_offer().unwrap(),
+                Some(text),
+                Some(png.clone()),
+            )
+            .await?;
+            let work = core
+                .take_automatic(&device, 1)
+                .expect("valid image survives invalid text");
+            assert!(matches!(
+                automatic_wire(&core, work).await?.as_slice(),
+                [
+                    Message::FileBegin(_),
+                    Message::FileChunk(_),
+                    Message::FileEnd(_)
+                ]
+            ));
+            assert!(core.take_automatic(&text_peer, 2).is_none());
+        }
+        core.set_phone_paused(&text_peer, 2, true);
+        let requested = crate::ui::clipboard::tests::deliver_offer(
+            &core,
+            &[("text/plain", b"fallback"), ("image/png", b"invalid PNG")],
+        )
+        .await?;
+        assert_eq!(requested, ["text/plain", "image/png"]);
+        let work = core
+            .take_automatic(&device, 1)
+            .expect("image-capable recipient falls back");
+        assert!(
+            matches!(automatic_wire(&core, work).await?.as_slice(), [Message::Clipboard(c)] if c.text == "fallback")
+        );
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn failed_local_clock_commit_keeps_remote_effects_fenced_until_recovery() -> Result<()> {
+        let (_dir, core, _device) = fixture(Arc::new(NoActions)).await?;
+        core.store.call(|c| {
+            c.execute_batch("CREATE TRIGGER reject_clock BEFORE UPDATE ON mesh_clock BEGIN SELECT RAISE(ABORT,'injected clock failure'); END;")?;
+            Ok(())
+        }).await?;
+        let mut events = core.subscribe();
+        let delivery = tokio::spawn({
+            let core = core.clone();
+            async move {
+                crate::ui::clipboard::tests::deliver_offer(&core, &[("text/plain", b"local")]).await
+            }
         });
-        let explicit = core
-            .send_clipboard(device.clone(), "explicit".into())
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Event::Error { message, .. } = events.recv().await?
+                    && message.starts_with("clipboard clock unavailable:")
+                {
+                    return Ok::<_, anyhow::Error>(());
+                }
+            }
+        })
+        .await??;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), core.wait_clipboard_observation())
+                .await
+                .is_err()
+        );
+        core.store
+            .call(|c| {
+                c.execute_batch("DROP TRIGGER reject_clock;")?;
+                Ok(())
+            })
+            .await?;
+        // The original watcher operation must recover without a second copy.
+        tokio::time::timeout(Duration::from_secs(2), delivery).await???;
+        tokio::time::timeout(Duration::from_secs(1), core.wait_clipboard_observation()).await?;
+        core.shutdown_actions().await
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn watcher_classification_is_independent_of_paused_disabled_and_offline_policy()
+    -> Result<()> {
+        for policy in [
+            "connected",
+            "disabled",
+            "paused",
+            "pair_send_off",
+            "offline",
+        ] {
+            let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
+            let _connection = admit_ui_test_phone(&core, &device, 1)?;
+            match policy {
+                "disabled" => {
+                    core.toggle_setting(crate::ui::Toggle::Clipboard).await?;
+                }
+                "paused" => core.set_phone_paused(&device, 1, true),
+                "offline" => {
+                    core.sessions.lock().unwrap().sessions.clear();
+                }
+                "pair_send_off" => {
+                    core.sessions
+                        .lock()
+                        .unwrap()
+                        .sessions
+                        .get_mut(&device)
+                        .unwrap()
+                        .mesh = true;
+                    core.store
+                        .settings_fields(core.identity.device_id.clone(), device.clone(), true)
+                        .await?;
+                    core.store
+                        .settings_edit(
+                            core.identity.device_id.clone(),
+                            device.clone(),
+                            true,
+                            format!("{}/{device}/clipboard", core.identity.device_id),
+                            false,
+                        )
+                        .await?;
+                }
+                _ => {}
+            }
+            assert_eq!(
+                core.automatic_target().is_some(),
+                policy == "connected",
+                "{policy}"
+            );
+            let echo = Arc::new(crate::ui::clipboard::EchoGuard::default());
+            echo.remember(b"received text");
+            let before: String = core
+                .store
+                .call(|c| Ok(c.query_row("SELECT last_seen FROM mesh_clock", [], |r| r.get(0))?))
+                .await?;
+            crate::ui::clipboard::tests::deliver_fixture_offer(
+                &core,
+                &[("text/plain", b"received text")],
+                echo,
+                None,
+                || {},
+            )
+            .await?;
+            let after: String = core
+                .store
+                .call(|c| Ok(c.query_row("SELECT last_seen FROM mesh_clock", [], |r| r.get(0))?))
+                .await?;
+            assert_eq!(before, after, "echo stamped with {policy}");
+            assert!(core.automatic.lock().unwrap().selections.is_empty());
+            // The image completed before this filtered local selection, but its
+            // deferred effect may capture the revision only after reading ends.
+            let older_image = crate::now_ms();
+            core.store.observe_hlc(device.clone(), older_image).await?;
+            crate::ui::clipboard::tests::deliver_offer(
+                &core,
+                &[
+                    ("text/plain", b"secret"),
+                    ("x-kde-passwordManagerHint", b"secret"),
+                ],
+            )
+            .await?;
+            assert!(
+                !core
+                    .store
+                    .stamp_eligible(older_image, device.clone())
+                    .await?,
+                "deferred image overwrites filtered local content with {policy}"
+            );
+            assert!(core.automatic.lock().unwrap().selections.is_empty());
+            core.shutdown_actions().await?;
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn automatic_formats_image_only_text_recipients_are_silent() -> Result<()> {
+        let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
+        let _connection = admit_ui_test_phone(&core, &device, 1)?;
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&device)
+            .unwrap()
+            .capabilities = vec!["clipboard_text".into()];
+        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+            .await?;
+        let mut events = core.subscribe();
+        let requested = crate::ui::clipboard::tests::deliver_offer(
+            &core,
+            &[("image/png", b"\x89PNG\r\n\x1a\nimage")],
+        )
+        .await?;
+        assert_eq!(
+            requested,
+            ["image/png"],
+            "read for echo classification even without image recipients"
+        );
+        assert!(core.take_automatic(&device, 1).is_none());
+        assert!(
+            core.send_observed_image(
+                core.observe_clipboard_offer().unwrap(),
+                b"\x89PNG\r\n\x1a\nimage".to_vec()
+            )
+            .await
+            .is_err()
+        );
+        assert!(core.take_automatic(&device, 1).is_none());
+        assert!(core.automatic.lock().unwrap().selections.is_empty());
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, Event::ClipboardSent { .. }),
+                "unsupported offer reported as sent"
+            );
+        }
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn automatic_formats_sensitive_policy_gates_every_representation() -> Result<()> {
+        let (_dir, core, image_peer) = fixture(Arc::new(NoActions)).await?;
+        let text_peer = Id::from_bytes([2; 16]);
+        let _image = admit_ui_test_phone(&core, &image_peer, 1)?;
+        let _text = admit_ui_test_phone(&core, &text_peer, 2)?;
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&text_peer)
+            .unwrap()
+            .capabilities = vec!["clipboard_text".into()];
+        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+            .await?;
+        for marker in [
+            "application/x-keepassxc-secret",
+            crate::ui::clipboard::ORIGIN_MIME,
+            "x-kde-passwordManagerHint",
+        ] {
+            let requested = crate::ui::clipboard::tests::deliver_offer(
+                &core,
+                &[
+                    ("image/png", b"\x89PNG\r\n\x1a\nimage"),
+                    ("text/plain", b"secret text"),
+                    (marker, b" secret\0 "),
+                ],
+            )
+            .await?;
+            if marker == "x-kde-passwordManagerHint" {
+                assert_eq!(
+                    requested.len(),
+                    3,
+                    "marker and both formats should be requested"
+                );
+            } else {
+                assert!(requested.is_empty(), "sensitive MIME gates every read");
+            }
+            assert!(core.take_automatic(&image_peer, 1).is_none());
+            assert!(core.take_automatic(&text_peer, 2).is_none());
+        }
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn automatic_formats_image_policy_and_text_aliases_follow_frozen_offer() -> Result<()> {
+        let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
+        let _connection = admit_ui_test_phone(&core, &device, 1)?;
+        // Images default off: a dual-capability recipient still gets offered text.
+        for mime in ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"] {
+            let requested = crate::ui::clipboard::tests::deliver_offer(
+                &core,
+                &[("image/png", b"\x89PNG\r\n\x1a\nimage"), (mime, b"text")],
+            )
+            .await?;
+            assert_eq!(requested, vec![mime, "image/png"]);
+            let work = core
+                .take_automatic(&device, 1)
+                .expect("text with images disabled");
+            assert!(matches!(work.selection, OutgoingSelection::Text(c) if c.text == "text"));
+        }
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&device)
+            .unwrap()
+            .capabilities = vec!["files".into(), "future_feature".into()];
+        assert!(
+            core.observe_clipboard_offer().is_none(),
+            "general file support cannot receive clipboard payloads"
+        );
+        assert_eq!(
+            crate::ui::clipboard::tests::deliver_offer(&core, &[("text/plain", b"text")]).await?,
+            ["text/plain"]
+        );
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn automatic_formats_resuming_or_connecting_cannot_expand_frozen_recipients() -> Result<()>
+    {
+        let (_dir, core, text_peer) = fixture(Arc::new(NoActions)).await?;
+        let image_peer = Id::from_bytes([2; 16]);
+        let late_peer = Id::from_bytes([3; 16]);
+        let _text = admit_ui_test_phone(&core, &text_peer, 1)?;
+        let _image = admit_ui_test_phone(&core, &image_peer, 2)?;
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&text_peer)
+            .unwrap()
+            .capabilities = vec!["clipboard_text".into()];
+        core.set_phone_paused(&image_peer, 2, true);
+        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+            .await?;
+        let mut late_connection = None;
+        let requested = crate::ui::clipboard::tests::deliver_offer_after_observation(
+            &core,
+            &[
+                ("image/png", b"\x89PNG\r\n\x1a\nimage"),
+                ("text/plain", b"frozen text"),
+            ],
+            || {
+                core.set_phone_paused(&image_peer, 2, false);
+                late_connection = Some(admit_ui_test_phone(&core, &late_peer, 3).unwrap());
+                // Even a capability gained on the original session cannot expand its plan.
+                core.sessions
+                    .lock()
+                    .unwrap()
+                    .sessions
+                    .get_mut(&text_peer)
+                    .unwrap()
+                    .capabilities
+                    .push("clipboard_image".into());
+            },
+        )
+        .await?;
+        assert_eq!(requested, vec!["text/plain", "image/png"]);
+        let work = core
+            .take_automatic(&text_peer, 1)
+            .expect("original text recipient");
+        assert!(matches!(work.selection, OutgoingSelection::Text(c) if c.text == "frozen text"));
+        assert!(core.take_automatic(&image_peer, 2).is_none());
+        assert!(core.take_automatic(&late_peer, 3).is_none());
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn automatic_formats_send_rechecks_only_remove_frozen_recipients() -> Result<()> {
+        let (_dir, core, image_peer) = fixture(Arc::new(NoActions)).await?;
+        let text_peer = Id::from_bytes([2; 16]);
+        let _image = admit_ui_test_phone(&core, &image_peer, 1)?;
+        let _text = admit_ui_test_phone(&core, &text_peer, 2)?;
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&text_peer)
+            .unwrap()
+            .capabilities = vec!["clipboard_text".into()];
+        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+            .await?;
+        let offer = core.observe_clipboard_offer().unwrap();
+        core.set_phone_paused(&image_peer, 1, true);
+        core.send_observed_formats(
+            offer,
+            Some("remaining text".into()),
+            Some(b"\x89PNG\r\n\x1a\nimage".to_vec()),
+        )
+        .await?;
+        assert!(core.take_automatic(&image_peer, 1).is_none());
+        let work = core
+            .take_automatic(&text_peer, 2)
+            .expect("still eligible text recipient");
+        assert!(
+            matches!(automatic_wire(&core, work).await?.as_slice(), [Message::Clipboard(c)] if c.text == "remaining text")
+        );
+        // Re-enabling a policy cannot authorize an offer observed before it changed.
+        let stale = core.observe_clipboard_offer().unwrap();
+        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+            .await?;
+        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+            .await?;
+        assert!(
+            core.send_observed_formats(
+                stale,
+                Some("stale text".into()),
+                Some(b"\x89PNG\r\n\x1a\nimage".to_vec())
+            )
+            .await
+            .is_err()
+        );
+        assert!(core.take_automatic(&text_peer, 2).is_none());
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn explicit_clipboard_sends_supersede_older_reads_only_for_their_peer() -> Result<()> {
+        for mesh in [false, true] {
+            for image in [false, true] {
+                let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
+                core.toggle_setting(crate::ui::Toggle::IncludeImages)
+                    .await?;
+                let _link = admit_ui_test_phone(&core, &device, 1)?;
+                core.sessions
+                    .lock()
+                    .unwrap()
+                    .sessions
+                    .get_mut(&device)
+                    .unwrap()
+                    .mesh = mesh;
+                let other = Id::from_bytes([7; 16]);
+                let _other_link = admit_ui_test_phone(&core, &other, 2)?;
+                let old_read = core.observe_clipboard_offer().unwrap();
+                let explicit = async {
+                    if image {
+                        core.send_clipboard_image(
+                            device.clone(),
+                            b"\x89PNG\r\n\x1a\nexplicit".to_vec(),
+                        )
+                        .await
+                    } else {
+                        core.send_clipboard(device.clone(), "explicit".into()).await
+                    }
+                };
+                tokio::pin!(explicit);
+                assert!(futures_util::poll!(&mut explicit).is_pending());
+                // Simulate completion of a watcher read/debounce captured before
+                // the manual send. It may still publish to an unaffected peer.
+                core.send_observed_formats(
+                    old_read,
+                    Some("older watcher".into()),
+                    Some(b"\x89PNG\r\n\x1a\nold".to_vec()),
+                )
+                .await?;
+                let explicit = explicit.await?;
+                let other_work = core
+                    .take_automatic(&other, 2)
+                    .expect("other peer retained offer");
+                assert_ne!(other_work.selection.id(), &explicit);
+                core.settings_ready.lock().unwrap().remove(&device);
+                if mesh {
+                    assert!(core.take_automatic(&device, 1).is_none());
+                }
+                core.settings_ready
+                    .lock()
+                    .unwrap()
+                    .insert(device.clone(), 1);
+                assert_eq!(
+                    core.take_automatic(&device, 1).unwrap().selection.id(),
+                    &explicit
+                );
+                // A newer watcher offer supersedes queued manual work for every peer.
+                let fresh = core.observe_clipboard_offer().unwrap();
+                let id = core
+                    .send_observed_clipboard(fresh, "new watcher".into())
+                    .await?;
+                assert_eq!(core.take_automatic(&device, 1).unwrap().selection.id(), &id);
+                assert!(core.store.first_outgoing(device.clone()).await?.is_none());
+                core.shutdown_actions().await?;
+            }
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn explicit_clipboard_sends_cancel_queued_manual_and_automatic_writes() -> Result<()> {
+        for mesh in [false, true] {
+            for old_kind in 0..3 {
+                for new_image in [false, true] {
+                    let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
+                    core.toggle_setting(crate::ui::Toggle::IncludeImages)
+                        .await?;
+                    let _link = admit_ui_test_phone(&core, &device, 1)?;
+                    core.sessions
+                        .lock()
+                        .unwrap()
+                        .sessions
+                        .get_mut(&device)
+                        .unwrap()
+                        .mesh = mesh;
+                    let old = match old_kind {
+                        0 => test_automatic_work(&core, &device, false).await?,
+                        1 => {
+                            core.send_clipboard_image(
+                                device.clone(),
+                                b"\x89PNG\r\n\x1a\nold manual".to_vec(),
+                            )
+                            .await?;
+                            core.take_automatic(&device, 1).unwrap()
+                        }
+                        _ => {
+                            core.send_clipboard(device.clone(), "old manual".into())
+                                .await?;
+                            core.take_automatic(&device, 1).unwrap()
+                        }
+                    };
+                    let newest = if new_image {
+                        core.send_clipboard_image(
+                            device.clone(),
+                            b"\x89PNG\r\n\x1a\nnew manual".to_vec(),
+                        )
+                        .await?
+                    } else {
+                        core.send_clipboard(device.clone(), "new manual".into())
+                            .await?
+                    };
+                    let (_priority, mut priority_rx) = mpsc::channel(1);
+                    let (_normal, mut normal_rx) = mpsc::channel(1);
+                    let mut bytes = Vec::new();
+                    assert!(
+                        !transmit_automatic(
+                            &core,
+                            &mut bytes,
+                            old,
+                            &mut priority_rx,
+                            &mut normal_rx,
+                            None,
+                            None
+                        )
+                        .await?
+                    );
+                    assert!(
+                        bytes.is_empty(),
+                        "superseded work crossed first-byte boundary"
+                    );
+                    assert_eq!(
+                        core.take_automatic(&device, 1).unwrap().selection.id(),
+                        &newest
+                    );
+                    core.shutdown_actions().await?;
+                }
+            }
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn legacy_pairing_hints_are_normalized_before_initial_persistence() -> Result<()> {
+        let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
+        let invitation = core
+            .start_pairing_with_addresses(vec!["127.0.0.1:47821".into()])
+            .await?;
+        let hello = Hello {
+            version: 1,
+            device_id: device.clone(),
+            name: "Legacy phone".into(),
+            role: Some(DeviceRole::Computer),
+            addresses: Some(vec!["192.0.2.99:47821".into()]),
+            capabilities: vec!["clipboard_text".into()],
+            paused: None,
+        };
+        core.finish_pairing_hello(
+            &device,
+            &Hash::new(crate::random_hex(32))?,
+            &invitation.token,
+            Some(hello.clone()),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("pairing rejected: {e:?}"))?;
+        // No register/PAIR_RESULT is needed to establish the safe durable state.
+        let peer = core
+            .store
+            .peer_info()
+            .await?
+            .into_iter()
+            .find(|p| p.id == device)
+            .unwrap();
+        assert_eq!(peer.role, "phone");
+        assert!(peer.addresses.is_empty());
+        // Simulate historical poisoned metadata; a normal legacy HELLO update
+        // clears it, and never installs the newly supplied hints.
+        let id = device.clone();
+        core.store
+            .call(move |c| {
+                c.execute(
+                    "UPDATE peers SET role='computer',addresses='[\"192.0.2.1:47821\"]' WHERE id=?",
+                    [id.as_str()],
+                )?;
+                Ok(())
+            })
+            .await?;
+        core.store
+            .remember_peer_hello(hello.clone(), Arc::new(AtomicU64::new(1)), 1, false)
+            .await?;
+        let peer = core
+            .store
+            .peer_info()
+            .await?
+            .into_iter()
+            .find(|p| p.id == device)
+            .unwrap();
+        assert_eq!(peer.role, "phone");
+        assert!(peer.addresses.is_empty());
+        // The outbound role comes from the chosen route, never from HELLO.
+        let mut outbound = hello;
+        outbound.role = Some(DeviceRole::Phone);
+        normalize_legacy_hello(&mut outbound, true);
+        assert_eq!(outbound.role, Some(DeviceRole::Computer));
+        assert!(outbound.addresses.is_none());
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn production_ui_policy_cleanup_discards_pending_clipboard() -> Result<()> {
+        let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
+        let _link = admit_ui_test_phone(&core, &device, 7)?;
+        core.send_clipboard(device.clone(), "explicit".into())
             .await?;
         for event in [
             Event::PhonePaused {
@@ -4502,30 +8182,32 @@ mod tests {
                 core.finish_connection(&device, 7);
             }
             crate::ui::runtime::clipboard_policy_event(&core, &event);
-            assert_eq!(
-                core.store
-                    .first_outgoing(device.clone())
-                    .await?
-                    .unwrap()
-                    .1
-                    .transfer_id,
-                explicit
-            );
+            assert!(core.take_automatic(&device, 7).is_none());
+            assert!(core.store.first_outgoing(device.clone()).await?.is_none());
         }
         core.shutdown_actions().await?;
         Ok(())
     }
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn clipboard_observation_ignores_paused_offers_during_slow_reads() -> Result<()> {
         let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
         let (close, _receiver) = watch::channel(None);
-        core.sessions.lock().unwrap().session = Some(Session {
-            device: device.clone(),
-            id: 7,
-            close,
-            wake: Arc::new(Notify::new()),
-            paused: false,
-        });
+        core.sessions.lock().unwrap().sessions.insert(
+            device.clone(),
+            Session {
+                outbound: false,
+                mesh: false,
+                role: "phone".into(),
+                device: device.clone(),
+                id: 7,
+                close,
+                wake: Arc::new(Notify::new()),
+                paused: false,
+                capabilities: vec!["clipboard_text".into(), "clipboard_image".into()],
+                phone: crate::ui::Phone::default(),
+            },
+        );
         crate::ui::clipboard::tests::delayed_source_pause_resume(&core, |paused| {
             core.set_phone_paused(&device, 7, paused)
         })
@@ -4646,77 +8328,6 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), server).await???;
         outcome
     }
-    #[tokio::test]
-    async fn clipboard_retry_overdue_during_file_backpressure_is_delivered_without_another_wake()
-    -> Result<()> {
-        let (dir, core, _) = fixture(Arc::new(NoActions)).await?;
-        *core.file_write_delay.lock().expect("file write delay") = Duration::from_millis(50);
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let address = listener.local_addr()?.to_string();
-        let server = tokio::spawn(core.clone().serve(listener, false));
-        let phone = crate::client::Phone::new(dir.path().join("phone"))?;
-        let invitation = core.start_pairing_with_addresses(vec![address]).await?;
-        let original = phone.pair(&invitation).await?;
-        let text = phone.text("retry after rejection".into(), ClipboardOrigin::Clipboard)?;
-        core.store
-            .enqueue(phone.identity.device_id.clone(), text.clone())
-            .await?;
-        core.store
-            .call(|c| {
-                c.execute(
-                    "UPDATE outgoing SET retry_at=?",
-                    [(crate::now_ms() + 500) as i64],
-                )?;
-                Ok(())
-            })
-            .await?;
-        drop(original);
-        let mut connection = phone.reconnect().await?;
-        // Let READY schedule the persisted retry before filling its dispatch
-        // queues. No enqueue/status/config event wakes it during the transfer.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let bytes = vec![0xa5; 8 * 1024 * 1024];
-        let begin = test_begin(&bytes);
-        let outcome: Result<()> = async {
-            connection.write(&Message::FileBegin(begin.clone())).await?;
-            for (index, data) in bytes.chunks(CHUNK_SIZE).enumerate() {
-                connection
-                    .write(&Message::FileChunk(FileChunk {
-                        transfer_id: begin.transfer_id.clone(),
-                        offset: (index * CHUNK_SIZE) as u64,
-                        data: data.to_vec(),
-                    }))
-                    .await?;
-            }
-            connection
-                .write(&Message::FileEnd(FileEnd {
-                    transfer_id: begin.transfer_id.clone(),
-                }))
-                .await?;
-            let (mut retried, mut saved) = (false, false);
-            while !retried || !saved {
-                match connection.read(Duration::from_secs(4)).await? {
-                    Message::Clipboard(delivery) if delivery == text => {
-                        connection
-                            .write(&Message::Ack(Ack {
-                                transfer_id: delivery.transfer_id,
-                                deduplicated: false,
-                            }))
-                            .await?;
-                        retried = true;
-                    }
-                    Message::Ack(ack) if ack.transfer_id == begin.transfer_id => saved = true,
-                    _ => bail!("unexpected frame during retry"),
-                }
-            }
-            Ok(())
-        }
-        .await;
-        drop(connection);
-        core.request_shutdown();
-        tokio::time::timeout(Duration::from_secs(5), server).await???;
-        outcome
-    }
     #[tokio::test(start_paused = true)]
     async fn overdue_retry_fires_after_a_blocked_dispatch_without_spinning_when_idle() -> Result<()>
     {
@@ -4749,6 +8360,196 @@ mod tests {
         Ok(())
     }
     struct NoActions;
+    // Drop releases every submitted closure, including on an assertion failure.
+    async fn occupy_store(store: &Store) -> Vec<std::sync::mpsc::Sender<()>> {
+        let mut releases = Vec::new();
+        for _ in 0..crate::work::BLOCKING_LIMIT {
+            let (release, blocked) = std::sync::mpsc::channel();
+            let mut job = Box::pin(store.blocking(move |_| {
+                let _ = blocked.recv();
+                Ok(())
+            }));
+            assert!(futures_util::poll!(job.as_mut()).is_pending());
+            drop(job);
+            releases.push(release);
+        }
+        releases
+    }
+    #[tokio::test]
+    async fn canceled_metadata_wait_after_connection_change_preserves_latest_snapshot() -> Result<()>
+    {
+        let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
+        let _first = admit_ui_test_phone(&core, &device, 1)?;
+        core.persist_phone(1).await?;
+        let releases = occupy_store(&core.store).await;
+        let _replacement = admit_ui_test_phone(&core, &device, 2)?;
+        let mut persistence = Box::pin(core.persist_phone(2));
+        let _ = futures_util::poll!(persistence.as_mut());
+        drop(persistence);
+        drop(releases);
+        core.store.drain().await;
+        let saved: crate::ui::Phone =
+            serde_json::from_slice(&std::fs::read(core.paths.data.join("phone.json"))?)?;
+        core.shutdown_actions().await?;
+        assert_eq!(
+            saved.name, "Phone 2",
+            "connection mutation lost its metadata follow-up"
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn canceled_unpair_waiting_for_capacity_keeps_pairing_usable() -> Result<()> {
+        for remote in [false, true] {
+            let (dir, core, _) = fixture(Arc::new(NoActions)).await?;
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?.to_string();
+            let server = tokio::spawn(core.clone().serve(listener, false));
+            let phone = crate::client::Phone::new(dir.path().join("phone"))?;
+            let invitation = core.start_pairing_with_addresses(vec![address]).await?;
+            let mut original = phone.pair(&invitation).await?;
+            let ping = Message::Ping(Ping {
+                nonce: Nonce::new("f".repeat(16))?,
+            });
+            original.write(&ping).await?;
+            original.read(Duration::from_secs(2)).await?;
+            let device = phone.identity.device_id.clone();
+            let scope = core.action_scope.lock().unwrap()[&device].clone();
+            let connection = core.sessions.lock().unwrap().sessions[&device].id;
+            // Hold every admission permit explicitly. Polling and dropping
+            // blocking jobs can leave a free slot when unrelated setup work
+            // already holds capacity; a pending future may then be post-admission.
+            let mut releases = Vec::new();
+            for _ in 0..crate::work::BLOCKING_LIMIT {
+                releases.push(core.store.reserve().await);
+            }
+            assert_eq!(core.store.admitted_jobs(), crate::work::BLOCKING_LIMIT);
+            let mut unpair = Box::pin(core.forget_pairing(
+                device.clone(),
+                CloseReason::Unpair,
+                remote.then_some(connection),
+                remote.then(|| "Phone".into()),
+            ));
+            assert!(futures_util::poll!(unpair.as_mut()).is_pending());
+            drop(unpair);
+            drop(releases);
+            core.store.drain().await;
+            let consistent = !core.sessions.lock().unwrap().unpairing.contains(&device)
+                && !*scope.cancelled.borrow();
+            let binding = core
+                .store
+                .peers()
+                .await?
+                .get(&phone.identity.fingerprint)
+                .cloned();
+            let reconnect = if consistent {
+                Some(phone.reconnect().await)
+            } else {
+                None
+            };
+            core.request_shutdown();
+            tokio::time::timeout(Duration::from_secs(3), server).await???;
+            assert!(consistent, "cancelled admission stranded lifecycle state");
+            assert_eq!(binding, Some(device));
+            reconnect.context("reconnect skipped")??;
+        }
+        Ok(())
+    }
+    struct SaturatingText {
+        store: Mutex<Option<Store>>,
+        releases: Mutex<Vec<std::sync::mpsc::Sender<()>>>,
+        value: Mutex<String>,
+        writes: AtomicU64,
+    }
+    #[async_trait::async_trait]
+    impl PcActions for SaturatingText {
+        async fn clipboard_text(&self, text: &str) -> Result<()> {
+            *self.value.lock().unwrap() = text.into();
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            let store = self.store.lock().unwrap().take();
+            if let Some(store) = store {
+                *self.releases.lock().unwrap() = occupy_store(&store).await;
+            }
+            Ok(())
+        }
+        async fn clipboard_image(&self, _: &std::path::Path, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn notify(&self, _: &std::path::Path, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn open(&self, _: &std::path::Path) -> Result<()> {
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn disconnect_after_text_apply_with_saturated_capacity_records_and_deduplicates()
+    -> Result<()> {
+        let actions = Arc::new(SaturatingText {
+            store: Mutex::new(None),
+            releases: Mutex::new(Vec::new()),
+            value: Mutex::new(String::new()),
+            writes: AtomicU64::new(0),
+        });
+        let (dir, core, _) = fixture(actions.clone()).await?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?.to_string();
+        let server = tokio::spawn(core.clone().serve(listener, false));
+        let phone = crate::client::Phone::new(dir.path().join("phone"))?;
+        let invitation = core.start_pairing_with_addresses(vec![address]).await?;
+        let mut original = phone.pair(&invitation).await?;
+        original
+            .write(&Message::Ping(Ping {
+                nonce: Nonce::new("f".repeat(16))?,
+            }))
+            .await?;
+        original.read(Duration::from_secs(2)).await?;
+        let device = phone.identity.device_id.clone();
+        let scope = core.action_scope.lock().unwrap()[&device].clone();
+        let connection = core.sessions.lock().unwrap().sessions[&device].id;
+        let mut store = core.store.with_current_pairing();
+        store.connection_id = Some(connection);
+        let text = phone.text("already applied".into(), ClipboardOrigin::Clipboard)?;
+        *actions.store.lock().unwrap() = Some(core.store.clone());
+        let (tx, _rx) = mpsc::channel(4);
+        let mut incoming = None;
+        let mut receive = Box::pin(core.receive(
+            &store,
+            Some(&scope),
+            &device,
+            Message::Clipboard(text.clone()),
+            &mut incoming,
+            &tx,
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let _ = futures_util::poll!(receive.as_mut());
+                if actions.writes.load(Ordering::SeqCst) != 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        // Model the READY worker abort immediately after the successful OS write.
+        drop(receive);
+        core.finish_connection(&device, connection);
+        actions.releases.lock().unwrap().clear();
+        core.store.drain().await;
+        let recorded = core.store.receipt(device, text.transfer_id.clone()).await?;
+        *actions.value.lock().unwrap() = "newer local clipboard".into();
+        let mut replacement = phone.reconnect().await?;
+        let replay = replacement.send_text(text).await?;
+        core.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(3), server).await???;
+        assert!(
+            recorded.is_some_and(|(_, complete)| complete),
+            "applied text lost its durable history"
+        );
+        assert!(replay.deduplicated);
+        assert_eq!(actions.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(*actions.value.lock().unwrap(), "newer local clipboard");
+        Ok(())
+    }
     struct CountingActions(AtomicU64);
     #[async_trait::async_trait]
     impl PcActions for CountingActions {
@@ -4910,7 +8711,7 @@ mod tests {
             if !moved_after_begin && rustix::process::geteuid().as_raw() == 0 {
                 continue;
             }
-            let dir = tempfile::tempdir()?;
+            let dir = crate::test_support::scratch()?;
             let blocked = dir.path().join("blocked");
             let cache = if moved_after_begin {
                 dir.path().join("cache")
@@ -5167,6 +8968,7 @@ mod tests {
             save_error: None,
             storage_kind: crate::ui::ReceiveDestination::Cache,
             deduplicated: false,
+            admission: FileAdmission::New,
             config: core.config(),
         };
         core.prepare_incoming(&core.store, &mut state).await;
@@ -5204,9 +9006,10 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(3), server).await???;
         Ok(())
     }
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn disk_full_on_flush_nacks_and_retains_cache_without_receipt() -> Result<()> {
-        let dir = tempfile::tempdir()?;
+        let dir = crate::test_support::scratch()?;
         let core = Core::new(
             Paths {
                 data: dir.path().join("data"),
@@ -5227,6 +9030,8 @@ mod tests {
             .await?;
         let bytes = b"original bytes";
         let begin = FileBegin {
+            hlc: None,
+            source_device: None,
             transfer_id: Id::new(crate::random_hex(16))?,
             file_name: "file.bin".into(),
             mime: "application/octet-stream".into(),
@@ -5344,7 +9149,7 @@ mod tests {
         Ok(())
     }
     async fn fixture(actions: Arc<dyn PcActions>) -> Result<(tempfile::TempDir, Arc<Core>, Id)> {
-        let dir = tempfile::tempdir()?;
+        let dir = crate::test_support::scratch()?;
         let core = Core::new(
             Paths {
                 data: dir.path().join("data"),
@@ -5363,11 +9168,16 @@ mod tests {
         core.store
             .pair(device.clone(), Hash::new(crate::random_hex(32))?)
             .await?;
-        *core.action_scope.lock().unwrap() = Some((device.clone(), ActionScope::new()));
+        core.action_scope
+            .lock()
+            .unwrap()
+            .insert(device.clone(), ActionScope::new());
         Ok((dir, core, device))
     }
     fn test_begin(bytes: &[u8]) -> FileBegin {
         FileBegin {
+            hlc: None,
+            source_device: None,
             transfer_id: Id::new(crate::random_hex(16)).unwrap(),
             file_name: "file.bin".into(),
             mime: "application/octet-stream".into(),
@@ -5378,6 +9188,7 @@ mod tests {
             source_media_id: None,
         }
     }
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn canceled_chunk_flush_retains_cleanup_ownership() -> Result<()> {
         use std::io::Read;
@@ -5480,6 +9291,8 @@ mod tests {
                     &text_core.store,
                     &text_device,
                     Message::Clipboard(Clipboard {
+                        hlc: None,
+                        source_device: None,
                         transfer_id: Id::new(crate::random_hex(16))?,
                         text: "blocked".into(),
                         created_at: 0,
@@ -5517,7 +9330,10 @@ mod tests {
         core.shutdown_actions().await?;
         assert!(result.is_err());
         assert!(matches!(code, Some(CloseReason::Error(ErrorCode::Timeout))));
-        assert!(text_still_blocked);
+        assert!(
+            !text_still_blocked,
+            "actor must time out the blocked helper independently"
+        );
         assert!(
             std::fs::read_dir(core.config().save_path)?.all(|e| e.is_ok_and(|e| e.path().is_dir()))
         );
@@ -5530,9 +9346,10 @@ mod tests {
         let mut config = core.config();
         config.notification_preview = false;
         core.update_config(config).await?;
-        let application = core.clipboard_gate.lock().await;
         let begin = test_begin(b"file");
         let text = Clipboard {
+            hlc: None,
+            source_device: None,
             transfer_id: begin.transfer_id.clone(),
             text: "must not apply".into(),
             created_at: 1,
@@ -5542,7 +9359,7 @@ mod tests {
         let peer = device.clone();
         let (tx, mut rx) = mpsc::channel(8);
         let text_tx = tx.clone();
-        let waiting = tokio::spawn(async move {
+        let waiting = async move {
             held.receive_test(
                 &held.store,
                 &peer,
@@ -5551,7 +9368,7 @@ mod tests {
                 &text_tx,
             )
             .await
-        });
+        };
         tokio::task::yield_now().await;
         let mut incoming = None;
         for message in [
@@ -5569,8 +9386,7 @@ mod tests {
                 .await?;
         }
         assert!(matches!(rx.recv().await, Some(Message::Ack(_))));
-        drop(application);
-        waiting.await??;
+        waiting.await?;
         assert!(matches!(
             rx.recv().await,
             Some(Message::Nack(Nack {
@@ -5594,22 +9410,31 @@ mod tests {
             .action_scope
             .lock()
             .unwrap()
-            .as_ref()
+            .get(&device)
             .unwrap()
-            .1
             .clone();
         scope.connection_generation.store(1, Ordering::SeqCst);
         let (close, _closed) = watch::channel(None);
-        core.sessions.lock().unwrap().session = Some(Session {
-            device: device.clone(),
-            id: 1,
-            close,
-            wake: Arc::new(Notify::new()),
-            paused: false,
-        });
+        core.sessions.lock().unwrap().sessions.insert(
+            device.clone(),
+            Session {
+                outbound: false,
+                mesh: false,
+                role: "phone".into(),
+                device: device.clone(),
+                id: 1,
+                close,
+                wake: Arc::new(Notify::new()),
+                paused: false,
+                capabilities: vec!["clipboard_text".into(), "clipboard_image".into()],
+                phone: crate::ui::Phone::default(),
+            },
+        );
         let mut store = core.store.with_current_pairing();
         store.connection_id = Some(1);
         let text = Clipboard {
+            hlc: None,
+            source_device: None,
             transfer_id: Id::new(crate::random_hex(16))?,
             text: "admitted text".into(),
             created_at: 1,
@@ -5645,7 +9470,7 @@ mod tests {
                 .await
         });
         tokio::time::timeout(Duration::from_secs(2), async {
-            while core.clipboard_gate.try_lock().is_ok() {
+            while core.store.admitted_jobs() < 2 {
                 tokio::task::yield_now().await;
             }
         })
@@ -5693,12 +9518,19 @@ mod tests {
             .action_scope
             .lock()
             .unwrap()
-            .as_ref()
+            .get(&device)
             .unwrap()
-            .1
             .clone();
         let mut old_store = core.store.with_current_pairing();
-        old_store.connection_id = Some(core.sessions.lock().unwrap().session.as_ref().unwrap().id);
+        old_store.connection_id = Some(
+            core.sessions
+                .lock()
+                .unwrap()
+                .sessions
+                .get(&device)
+                .unwrap()
+                .id,
+        );
         let text = phone.text("replayed operation".into(), ClipboardOrigin::Clipboard)?;
         let (entered, wait) = tokio::sync::oneshot::channel();
         let (release, blocked) = std::sync::mpsc::channel();
@@ -5732,7 +9564,7 @@ mod tests {
                 .await
         });
         tokio::time::timeout(Duration::from_secs(2), async {
-            while core.clipboard_gate.try_lock().is_ok() {
+            while core.store.admitted_jobs() < 2 {
                 tokio::task::yield_now().await;
             }
         })
@@ -5787,24 +9619,32 @@ mod tests {
             .action_scope
             .lock()
             .unwrap()
-            .as_ref()
+            .get(&device)
             .unwrap()
-            .1
             .clone();
         let (close, _closed) = watch::channel(None);
-        core.sessions.lock().unwrap().session = Some(Session {
-            device: device.clone(),
-            id: 1,
-            close,
-            wake: Arc::new(Notify::new()),
-            paused: false,
-        });
+        core.sessions.lock().unwrap().sessions.insert(
+            device.clone(),
+            Session {
+                outbound: false,
+                mesh: false,
+                role: "phone".into(),
+                device: device.clone(),
+                id: 1,
+                close,
+                wake: Arc::new(Notify::new()),
+                paused: false,
+                capabilities: vec!["clipboard_text".into(), "clipboard_image".into()],
+                phone: crate::ui::Phone::default(),
+            },
+        );
         scope.connection_generation.store(1, Ordering::SeqCst);
         let job = ActionJob {
             file: ReceivedFile::from_file(dir.path().join("image.png"), tempfile::tempfile()?)?,
             scope: scope.clone(),
             origin: ActionOrigin {
-                device,
+                mesh: false,
+                device: device.clone(),
                 connection_id: Some(1),
             },
             path: dir.path().join("image.png"),
@@ -5829,7 +9669,13 @@ mod tests {
                 .await
         });
         tokio::task::yield_now().await;
-        core.sessions.lock().unwrap().session.as_mut().unwrap().id = 2;
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&device)
+            .unwrap()
+            .id = 2;
         scope.connection_generation.store(2, Ordering::SeqCst);
         drop(active);
         worker.await?;
@@ -5850,6 +9696,7 @@ mod tests {
         assert_eq!(actions.0.load(Ordering::SeqCst), 0);
         let current = ActionJob {
             origin: ActionOrigin {
+                mesh: false,
                 connection_id: Some(2),
                 ..job.origin.clone()
             },
@@ -5873,9 +9720,8 @@ mod tests {
             .action_scope
             .lock()
             .unwrap()
-            .as_ref()
+            .get(&device)
             .unwrap()
-            .1
             .clone();
         let (entered, wait) = tokio::sync::oneshot::channel();
         let (release, blocked) = std::sync::mpsc::channel();
@@ -5899,6 +9745,8 @@ mod tests {
                     Some(&worker_scope),
                     &device,
                     Message::Clipboard(Clipboard {
+                        hlc: None,
+                        source_device: None,
                         transfer_id: Id::new(crate::random_hex(16))?,
                         text: "revoked".into(),
                         created_at: 1,
@@ -6052,7 +9900,8 @@ mod tests {
     async fn unpair_confirmation_for_replaced_phone_cannot_remove_current_binding() -> Result<()> {
         let (_dir, core, displayed) = fixture(Arc::new(NoActions)).await?;
         core.admission.lock().unwrap().peers = core.store.peers().await?;
-        // The window captured displayed before the CLI paired another device.
+        // The window captured displayed before it was unpaired elsewhere.
+        core.unpair_device(displayed.clone()).await?;
         let invitation = core
             .start_pairing_with_addresses(vec!["127.0.0.1:47821".into()])
             .await?;
@@ -6065,18 +9914,24 @@ mod tests {
             .action_scope
             .lock()
             .unwrap()
-            .as_ref()
+            .get(&replacement)
             .unwrap()
-            .1
             .clone();
         let mut events = core.subscribe();
         core.unpair_device(displayed).await?;
-        assert_eq!(core.paired_devices(), vec![replacement]);
+        assert_eq!(core.paired_devices(), vec![replacement.clone()]);
         assert_eq!(
             core.store.peers().await?,
             core.admission.lock().unwrap().peers
         );
-        assert!(!core.sessions.lock().unwrap().unpairing);
+        assert!(
+            !core
+                .sessions
+                .lock()
+                .unwrap()
+                .unpairing
+                .contains(&replacement)
+        );
         assert!(!*scope.cancelled.borrow());
         assert!(events.try_recv().is_err());
         core.shutdown_actions().await?;
@@ -6088,7 +9943,10 @@ mod tests {
         let peers = core.store.peers().await?;
         core.admission.lock().unwrap().peers = peers;
         let admitted = ActionScope::new();
-        *core.action_scope.lock().unwrap() = Some((device.clone(), admitted.clone()));
+        core.action_scope
+            .lock()
+            .unwrap()
+            .insert(device.clone(), admitted.clone());
         let invitation = core
             .start_pairing_with_addresses(vec!["127.0.0.1:47821".into()])
             .await?;
@@ -6104,9 +9962,8 @@ mod tests {
             .action_scope
             .lock()
             .unwrap()
-            .as_ref()
+            .get(&device)
             .unwrap()
-            .1
             .clone();
         assert!(!*replacement.cancelled.borrow());
         for kind in [FileKind::Screenshot, FileKind::ClipboardImage] {
@@ -6134,24 +9991,9 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
-    async fn concurrent_clipboard_ipc_assigns_timestamps_in_commit_order() -> Result<()> {
+    async fn concurrent_clipboard_ipc_reports_supersession_and_keeps_commit_order() -> Result<()> {
         let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
-        let peers = core.store.peers().await?;
-        core.admission.lock().unwrap().peers = peers;
-        let (close, _closed) = watch::channel(None);
-        core.sessions.lock().unwrap().session = Some(Session {
-            device: device.clone(),
-            id: 1,
-            close,
-            wake: Arc::new(Notify::new()),
-            paused: false,
-        });
-        core.store.call(|c| {
-            c.execute_batch("CREATE TEMP TABLE enqueues(id TEXT,created_at INTEGER);
-                CREATE TEMP TRIGGER record_enqueue AFTER INSERT ON outgoing BEGIN
-                INSERT INTO enqueues VALUES (json_extract(NEW.payload,'$.transfer_id'),json_extract(NEW.payload,'$.created_at')); END;")?;
-            Ok(())
-        }).await?;
+        let _link = admit_ui_test_phone(&core, &device, 1)?;
         let mut requests = JoinSet::new();
         for n in 0..32 {
             let core = core.clone();
@@ -6159,25 +10001,31 @@ mod tests {
             requests.spawn(async move { core.send_clipboard(device, format!("text {n}")).await });
         }
         let mut ids = Vec::new();
+        let mut cancelled = 0;
         while let Some(result) = requests.join_next().await {
-            ids.push(result??);
+            match result? {
+                Ok(id) => ids.push(id),
+                Err(error) => {
+                    assert_eq!(error.to_string(), "clipboard operation cancelled");
+                    cancelled += 1;
+                }
+            }
         }
-        let timestamps = core
-            .store
-            .call(|c| {
-                let mut q = c.prepare("SELECT id,created_at FROM enqueues ORDER BY rowid")?;
-                Ok(q.query_map([], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?)
-            })
-            .await?;
-        assert_eq!(timestamps.len(), 32);
-        assert!(timestamps.windows(2).all(|w| w[0].1 < w[1].1));
-        let latest = core.store.first_outgoing(device).await?.unwrap().1;
-        assert_eq!(latest.transfer_id.as_str(), timestamps.last().unwrap().0);
-        assert_eq!(latest.created_at, timestamps.last().unwrap().1);
+        assert!(!ids.is_empty(), "at least the final request must publish");
+        assert_eq!(ids.len() + cancelled, 32);
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            ids.len()
+        );
+        let wire = automatic_wire(&core, core.take_automatic(&device, 1).unwrap()).await?;
+        let Message::Clipboard(latest) = &wire[0] else {
+            panic!("expected clipboard");
+        };
+        let (register, _, _) = core.store.clipboard_snapshot().await?;
+        assert_eq!(latest.created_at, register.unwrap().hlc);
+        assert!(latest.hlc.is_none());
         assert!(ids.contains(&latest.transfer_id));
+        assert!(core.store.first_outgoing(device).await?.is_none());
         core.shutdown_actions().await?;
         Ok(())
     }
@@ -6210,9 +10058,8 @@ mod tests {
                 .action_scope
                 .lock()
                 .unwrap()
-                .as_ref()
+                .get(&device)
                 .unwrap()
-                .1
                 .clone();
             let epoch = core.store.with_current_pairing();
             core.store
@@ -6241,7 +10088,9 @@ mod tests {
             let unpair_core = core.clone();
             let peer = device.clone();
             let task = tokio::spawn(async move { unpair_core.unpair_device(peer).await });
-            while !core.sessions.lock().unwrap().unpairing || core.store.active_jobs() < 2 {
+            while !core.sessions.lock().unwrap().unpairing.contains(&device)
+                || core.store.active_jobs() < 2
+            {
                 tokio::task::yield_now().await;
             }
             if cancel {
@@ -6256,7 +10105,7 @@ mod tests {
             }
             core.store.drain().await;
             assert!(!core.ui_snapshot().receiving);
-            assert!(core.ui.lock().unwrap().receiving_until.is_none());
+            assert!(core.ui.lock().unwrap().receiving_until.is_empty());
             let phone_metadata: crate::ui::Phone =
                 serde_json::from_slice(&std::fs::read(core.paths.data.join("phone.json"))?)?;
             assert_eq!(phone_metadata.last_seen, core.ui_snapshot().phone.last_seen);
@@ -6275,8 +10124,8 @@ mod tests {
                 phone.directory.join("binding.json").exists(),
                 "failed unpair told phone to forget trust"
             );
-            assert!(!core.sessions.lock().unwrap().unpairing);
-            assert!(core.sessions.lock().unwrap().session.is_none());
+            assert!(!core.sessions.lock().unwrap().unpairing.contains(&device));
+            assert!(core.sessions.lock().unwrap().sessions.is_empty());
             assert_eq!(core.paired_devices(), vec![device.clone()]);
             assert_eq!(
                 core.store.peers().await?.get(&phone.identity.fingerprint),
@@ -6291,9 +10140,8 @@ mod tests {
                 .action_scope
                 .lock()
                 .unwrap()
-                .as_ref()
+                .get(&device)
                 .unwrap()
-                .1
                 .clone();
             assert!(!*fresh.cancelled.borrow());
             assert!(!Arc::ptr_eq(&old.active, &fresh.active));
@@ -6337,15 +10185,26 @@ mod tests {
             let bindings = core.store.peers().await?;
             core.admission.lock().unwrap().peers = bindings.clone();
             let scope = ActionScope::new();
-            *core.action_scope.lock().unwrap() = Some((device.clone(), scope.clone()));
+            core.action_scope
+                .lock()
+                .unwrap()
+                .insert(device.clone(), scope.clone());
             let (close, closed) = watch::channel(None);
-            core.sessions.lock().unwrap().session = Some(Session {
-                device: device.clone(),
-                id: 1,
-                close,
-                wake: Arc::new(Notify::new()),
-                paused: false,
-            });
+            core.sessions.lock().unwrap().sessions.insert(
+                device.clone(),
+                Session {
+                    outbound: false,
+                    mesh: false,
+                    role: "phone".into(),
+                    device: device.clone(),
+                    id: 1,
+                    close,
+                    wake: Arc::new(Notify::new()),
+                    paused: false,
+                    capabilities: vec!["clipboard_text".into(), "clipboard_image".into()],
+                    phone: crate::ui::Phone::default(),
+                },
+            );
             let invitation = core
                 .start_pairing_with_addresses(vec!["127.0.0.1:47821".into()])
                 .await?;
@@ -6406,16 +10265,28 @@ mod tests {
                     .token,
                 invitation.token
             );
-            assert!(!core.sessions.lock().unwrap().unpairing);
+            assert!(!core.sessions.lock().unwrap().unpairing.contains(&device));
             assert_eq!(
-                core.sessions.lock().unwrap().session.as_ref().unwrap().id,
+                core.sessions
+                    .lock()
+                    .unwrap()
+                    .sessions
+                    .get(&device)
+                    .unwrap()
+                    .id,
                 1
             );
             assert!(closed.borrow().is_none());
             assert!(!*scope.cancelled.borrow());
             assert!(Arc::ptr_eq(
                 &scope.active,
-                &core.action_scope.lock().unwrap().as_ref().unwrap().1.active
+                &core
+                    .action_scope
+                    .lock()
+                    .unwrap()
+                    .get(&device)
+                    .unwrap()
+                    .active
             ));
             assert!(epoch.first_outgoing(device.clone()).await.is_ok());
             core.store
@@ -6434,6 +10305,43 @@ mod tests {
         }
         Ok(())
     }
+    #[tokio::test]
+    async fn inviter_restart_after_binding_commit_invalidates_unconsumed_memory_token() -> Result<()>
+    {
+        let (_dir, core, _device) = fixture(Arc::new(NoActions)).await?;
+        let invitation = core
+            .start_pairing_with_addresses(vec!["127.0.0.1:47821".into()])
+            .await?;
+        let device = Id::new(crate::random_hex(16))?;
+        let fp = Hash::new(crate::random_hex(32))?;
+        // Model process death after SQLite commit, before Core's infallible
+        // callback consumes the memory-only invitation and publishes admission.
+        core.store
+            .pair_then(device.clone(), fp.clone(), || {})
+            .await?;
+        assert!(core.admission.lock().unwrap().invitation.is_some());
+        assert!(!core.paired_devices().contains(&device));
+        let paths = core.paths.clone();
+        let config = core.config();
+        core.shutdown_actions().await?;
+        core.store.drain().await;
+        drop(core);
+        let core = Core::new(paths, config, Arc::new(NoActions)).await?;
+        assert_eq!(core.store.peers().await?.get(&fp), Some(&device));
+        assert!(core.paired_devices().contains(&device));
+        assert!(core.admission.lock().unwrap().invitation.is_none());
+        let other = Id::new(crate::random_hex(16))?;
+        let other_fp = Hash::new(crate::random_hex(32))?;
+        assert!(matches!(
+            core.finish_pairing(&other, &other_fp, &invitation.token)
+                .await,
+            Err(PairCode::PairingClosed)
+        ));
+        assert_eq!(core.paired_devices().len(), 2); // fixture binding plus the committed peer
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn canceled_pairing_still_finishes_admission_and_consumes_invitation() -> Result<()> {
         let (_dir, core, _device) = fixture(Arc::new(NoActions)).await?;
@@ -6477,7 +10385,7 @@ mod tests {
     }
     #[tokio::test]
     async fn pairing_failure_order_and_one_time_consumption() -> Result<()> {
-        let dir = tempfile::tempdir()?;
+        let dir = crate::test_support::scratch()?;
         let paths = Paths {
             data: dir.path().join("data"),
             cache: dir.path().join("cache"),
@@ -6539,6 +10447,181 @@ mod tests {
         assert!(core.admission.lock().unwrap().invitation.is_none());
         assert_eq!(core.paired_devices(), vec![device]);
         Ok(())
+    }
+    #[test]
+    fn canceled_phone_cache_writes_keep_their_blocking_capacity() -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
+            let (entered, wait) = tokio::sync::oneshot::channel();
+            let (release, blocking) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = entered.send(());
+                let _ = blocking.recv();
+            });
+            wait.await?;
+            let mut maximum = 0;
+            for id in 1..=200 {
+                let _connection = admit_ui_test_phone(&core, &device, id)?;
+                // Poll once, then cancel exactly as a replaced connection does.
+                let mut write = Box::pin(core.persist_phone(id));
+                assert!(futures_util::poll!(write.as_mut()).is_pending());
+                drop(write);
+                maximum = maximum.max(core.store.active_jobs());
+            }
+            release.send(())?;
+            blocker.await?;
+            core.persist_phone(200).await?;
+            core.store.drain().await;
+            let phones: HashMap<Id, crate::ui::Phone> =
+                serde_json::from_slice(&std::fs::read(core.paths.data.join("phones.json"))?)?;
+            core.shutdown_actions().await?;
+            assert!(maximum <= crate::work::BLOCKING_LIMIT);
+            assert_eq!(phones[&device].name, "Phone 200");
+            Ok(())
+        })
+    }
+    #[test]
+    fn reconnect_storm_bounds_store_jobs_and_preserves_other_device_progress() -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let (dir, core, other) = fixture(Arc::new(NoActions)).await?;
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            let server = tokio::spawn(core.clone().serve(listener, false));
+            let phone = crate::client::Phone::new(dir.path().join("phone"))?;
+            let invitation = core.start_pairing_with_addresses(vec![address.to_string()]).await?;
+            let mut initial = phone.pair(&invitation).await?;
+            let ping = Ping { nonce: Nonce::new("d".repeat(16))? };
+            initial.write(&Message::Ping(ping.clone())).await?;
+            assert_eq!(initial.read(Duration::from_secs(2)).await?, Message::Pong(ping));
+            core.store.drain().await;
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(crate::tls::client_config(
+                &phone.identity, core.identity.fingerprint.clone(),
+            )?));
+            let (entered, wait) = tokio::sync::oneshot::channel();
+            let (release, blocking) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = entered.send(());
+                let _ = blocking.recv();
+            });
+            wait.await?;
+            let mut release = Some(release);
+            let mut operation = None;
+            let mut progress = None;
+            let mut latest = None;
+            let mut maximum = 0;
+            let mut maximum_admitted = 0;
+            let outcome: Result<()> = async {
+                for index in 0..240 {
+                    if index == 100 {
+                        let store = core.store.clone();
+                        let device = other.clone();
+                        operation = Some(tokio::spawn(async move {
+                            store.enqueue_clipboard(device, "another device".into()).await
+                        }));
+                    }
+                    if index == 200 {
+                        // Keep the producer running after release while an
+                        // independent timer checks the other device's progress.
+                        release.take().unwrap().send(())?;
+                        let mut operation = operation.take().unwrap();
+                        progress = Some(tokio::spawn(async move {
+                            let result = tokio::time::timeout(Duration::from_secs(2), &mut operation).await;
+                            if result.is_err() {
+                                operation.abort();
+                                let _ = operation.await;
+                            }
+                            result
+                        }));
+                    }
+                    let mut events = core.subscribe();
+                    let stream = TcpStream::connect(address).await?;
+                    let mut tls = connector.connect(
+                        rustls::pki_types::ServerName::try_from("pneu.local")?, stream,
+                    ).await?;
+                    write_frame(&mut tls, &Message::Hello(Hello {
+                        role: Some(DeviceRole::Computer),
+                        addresses: Some(vec![format!("127.0.0.1:{}", 10000 + index)]),
+                        version: 1,
+                        device_id: phone.identity.device_id.clone(),
+                        name: format!("Reconnect {index}"),
+                        capabilities: vec!["clipboard_text".into()],
+                        paused: Some(false),
+                    })).await?;
+                    ensure!(matches!(read_frame(&mut tls).await?, Some(Message::Hello(_))), "HELLO");
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while !matches!(events.recv().await?, Event::ConnectionChanged { device, connected: true } if device == phone.identity.device_id) {}
+                        Ok::<_, anyhow::Error>(())
+                    }).await??;
+                    // Let the connection submit its metadata before sampling.
+                    tokio::task::yield_now().await;
+                    if index < 200 {
+                        maximum = maximum.max(core.store.active_jobs());
+                        maximum_admitted = maximum_admitted.max(core.store.admitted_jobs());
+                        assert!(core.phone_writes.lock().unwrap().pending.len() <= 1,
+                            "reconnect metadata did not coalesce per peer");
+                    }
+                    latest = Some(tls);
+                }
+                Ok(())
+            }.await;
+            if let Some(release) = release {
+                let _ = release.send(());
+            }
+            blocker.await?;
+            if let Some(operation) = operation {
+                operation.await??;
+            }
+            let progress = match progress {
+                Some(progress) => Some(progress.await?),
+                None => None,
+            };
+            let ready = tokio::time::timeout(Duration::from_secs(2), async {
+                let latest = latest.as_mut().context("latest connection")?;
+                let ping = Ping { nonce: Nonce::new("e".repeat(16))? };
+                write_frame(latest, &Message::Ping(ping.clone())).await?;
+                ensure!(read_frame(latest).await? == Some(Message::Pong(ping)), "latest READY");
+                Ok(())
+            }).await;
+            core.store.drain().await;
+            let saved: Result<(String, String)> = core.store.call(move |c| {
+                Ok(c.query_row("SELECT name,addresses FROM peers WHERE id=?", [phone.identity.device_id.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))?)
+            }).await;
+            let cache: Result<crate::ui::Phone> = (|| {
+                Ok(serde_json::from_slice(&std::fs::read(core.paths.data.join("phone.json"))?)?)
+            })();
+            core.request_shutdown();
+            let stopped = tokio::time::timeout(Duration::from_secs(5), server).await;
+            drop((initial, latest));
+            outcome?;
+            let progress = progress.context("other device progress")?;
+            let operation = progress.context("other device stalled")?;
+            operation??;
+            ready??;
+            stopped???;
+            assert!(maximum_admitted <= crate::work::BLOCKING_LIMIT,
+                "reconnects retained {maximum_admitted} normal admissions");
+            // One coalesced, uncancelable metadata continuation can coexist
+            // with the 16 normal admissions while the blocking pool is stalled.
+            assert!(maximum <= crate::work::BLOCKING_LIMIT + 1,
+                "reconnects queued {maximum} blocking jobs");
+            // This fixture does not negotiate mesh: its optional routing/role
+            // fields must not become dial authority or learned hints.
+            assert_eq!(saved?, ("Reconnect 239".into(), "[]".into()));
+            assert_eq!(cache?.name, "Reconnect 239");
+            let final_cache: crate::ui::Phone = serde_json::from_slice(&std::fs::read(core.paths.data.join("phone.json"))?)?;
+            assert_eq!(final_cache.last_seen, core.ui_snapshot().phone.last_seen);
+            Ok(())
+        })
     }
     #[tokio::test]
     async fn status_traffic_reuses_one_blocked_outgoing_query() -> Result<()> {
@@ -6625,8 +10708,9 @@ mod tests {
         wait.await?;
         let unpair_core = core.clone();
         let device = phone.identity.device_id.clone();
-        let unpair = tokio::spawn(async move { unpair_core.unpair_device(device).await });
-        while !core.sessions.lock().unwrap().unpairing {
+        let unpair_device = device.clone();
+        let unpair = tokio::spawn(async move { unpair_core.unpair_device(unpair_device).await });
+        while !core.sessions.lock().unwrap().unpairing.contains(&device) {
             tokio::task::yield_now().await;
         }
         let still_connected = core.phone_paused(&phone.identity.device_id) == Some(false);
@@ -6708,13 +10792,19 @@ mod tests {
                 .await
         });
         tokio::task::yield_now().await;
-        core.sessions.lock().unwrap().session.as_mut().unwrap().id = 2;
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&device)
+            .unwrap()
+            .id = 2;
         drop(guard);
         assert!(!task.await??);
         assert!(events.try_recv().is_err());
         assert_eq!(core.phone_paused(&device), Some(false));
         assert!(!core.store.peers().await?.is_empty());
-        assert!(!core.sessions.lock().unwrap().unpairing);
+        assert!(!core.sessions.lock().unwrap().unpairing.contains(&device));
         assert!(
             !core
                 .forget_pairing(
@@ -6766,7 +10856,9 @@ mod tests {
                     )
                     .await
             });
-            while !core.sessions.lock().unwrap().unpairing || core.store.active_jobs() < 2 {
+            while !core.sessions.lock().unwrap().unpairing.contains(&device)
+                || core.store.active_jobs() < 2
+            {
                 tokio::task::yield_now().await;
             }
             if mode == "cancelled" {
@@ -6816,17 +10908,30 @@ mod tests {
             .lock()
             .unwrap()
             .peers
+            .retain(|_, id| *id != device);
+        core.admission
+            .lock()
+            .unwrap()
+            .peers
             .insert(Hash::new(crate::random_hex(32))?, device.clone());
-        core.sessions.lock().unwrap().session = Some(Session {
-            device: device.clone(),
-            id: 2,
-            close,
-            wake: Arc::new(Notify::new()),
-            paused: false,
-        });
+        core.sessions.lock().unwrap().sessions.insert(
+            device.clone(),
+            Session {
+                outbound: false,
+                mesh: false,
+                role: "phone".into(),
+                device: device.clone(),
+                id: 2,
+                close,
+                wake: Arc::new(Notify::new()),
+                paused: false,
+                capabilities: vec!["clipboard_text".into(), "clipboard_image".into()],
+                phone: crate::ui::Phone::default(),
+            },
+        );
         let mut events = core.subscribe();
         core.unpair_device(Id::new(crate::random_hex(16))?).await?;
-        assert!(!core.sessions.lock().unwrap().unpairing);
+        assert!(!core.sessions.lock().unwrap().unpairing.contains(&device));
         let mut old = core.store.clone();
         old.connection_id = Some(1);
         core.connection_event(
@@ -6893,7 +10998,10 @@ mod tests {
         let actions = Arc::new(TimeoutImageActions::default());
         let (dir, core, device) = fixture(actions.clone()).await?;
         let scope = ActionScope::new();
-        *core.action_scope.lock().unwrap() = Some((device.clone(), scope.clone()));
+        core.action_scope
+            .lock()
+            .unwrap()
+            .insert(device.clone(), scope.clone());
         let mut config = core.config();
         config.open_in_viewer = true;
         config.copy_image_to_clipboard = true;
@@ -6923,6 +11031,1270 @@ mod tests {
             &*actions.opened.lock().unwrap(),
             &[dir.path().join("latest.png")]
         );
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn legacy_incoming_clock_and_ids_are_independent_between_peers() -> Result<()> {
+        let actions = Arc::new(CountingActions(AtomicU64::new(0)));
+        let (_dir, core, a) = fixture(actions.clone()).await?;
+        let b = Id::from_bytes([2; 16]);
+        core.store
+            .pair(b.clone(), Hash::new(crate::random_hex(32))?)
+            .await?;
+        core.action_scope
+            .lock()
+            .unwrap()
+            .insert(b.clone(), ActionScope::new());
+        let shared = Id::from_bytes([3; 16]);
+        let (tx, mut rx) = mpsc::channel(8);
+        for (device, timestamp, value) in [(&a, 100, "from A"), (&b, 1, "from B")] {
+            core.receive_test(
+                &core.store,
+                device,
+                Message::Clipboard(Clipboard {
+                    hlc: None,
+                    source_device: None,
+                    transfer_id: shared.clone(),
+                    text: value.into(),
+                    created_at: timestamp,
+                    origin: ClipboardOrigin::Clipboard,
+                }),
+                &mut None,
+                &tx,
+            )
+            .await?;
+            assert!(matches!(
+                rx.recv().await,
+                Some(Message::Ack(Ack {
+                    deduplicated: false,
+                    ..
+                }))
+            ));
+        }
+        assert_eq!(actions.0.load(Ordering::SeqCst), 2);
+        core.receive_test(
+            &core.store,
+            &a,
+            Message::Clipboard(Clipboard {
+                hlc: None,
+                source_device: None,
+                transfer_id: Id::from_bytes([4; 16]),
+                text: "stale A".into(),
+                created_at: 99,
+                origin: ClipboardOrigin::Clipboard,
+            }),
+            &mut None,
+            &tx,
+        )
+        .await?;
+        assert!(matches!(
+            rx.recv().await,
+            Some(Message::Ack(Ack {
+                deduplicated: true,
+                ..
+            }))
+        ));
+        assert_eq!(actions.0.load(Ordering::SeqCst), 2);
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[tokio::test(start_paused = true)]
+    async fn ready_receive_idle_deadline_belongs_only_to_acceptor() -> Result<()> {
+        let (mut dialer_writer, mut dialer_reader) = tokio::io::duplex(1024);
+        let (_acceptor_writer, mut acceptor_reader) = tokio::io::duplex(1024);
+        let dialer = tokio::spawn(async move { read_ready_frame(&mut dialer_reader, true).await });
+        let acceptor =
+            tokio::spawn(async move { read_ready_frame(&mut acceptor_reader, false).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(181)).await;
+        assert!(acceptor.await?.is_err());
+        assert!(
+            !dialer.is_finished(),
+            "transmitting dialer relies on PONG/receipt deadlines"
+        );
+        let ping = Message::Ping(Ping {
+            nonce: Nonce::new(crate::random_hex(8))?,
+        });
+        write_frame(&mut dialer_writer, &ping).await?;
+        assert_eq!(dialer.await???, Some(ping));
+        Ok(())
+    }
+    async fn file_test_peer(core: &Core, device: &Id) -> Result<crate::outbox::Authority> {
+        let peer = core
+            .store
+            .peer_info()
+            .await?
+            .into_iter()
+            .find(|p| &p.id == device)
+            .unwrap();
+        Ok(crate::outbox::Authority {
+            device: device.clone(),
+            generation: peer.generation,
+            fingerprint: peer.fingerprint,
+        })
+    }
+    async fn file_recipient_fixture() -> Result<(
+        tempfile::TempDir,
+        Arc<Core>,
+        Id,
+        Id,
+        watch::Receiver<Option<CloseReason>>,
+    )> {
+        let (dir, core, connected) = fixture(Arc::new(NoActions)).await?;
+        let close = admit_ui_test_phone(&core, &connected, 1)?;
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&connected)
+            .unwrap()
+            .capabilities
+            .push("files".into());
+        let offline = Id::from_bytes([89; 16]);
+        core.store
+            .pair(offline.clone(), Hash::new("ab".repeat(32))?)
+            .await?;
+        core.outbox.note(
+            offline.clone(),
+            core.store.pairing_generation(&offline).unwrap(),
+            true,
+        );
+        core.admission.lock().unwrap().peers = core.store.peers().await?;
+        Ok((dir, core, connected, offline, close))
+    }
+
+    #[tokio::test]
+    async fn desktop_handoff_rejections_notify_even_when_the_cli_cannot_show_errors() -> Result<()>
+    {
+        #[derive(Default)]
+        struct Notices(Mutex<Vec<String>>);
+        #[async_trait::async_trait]
+        impl PcActions for Notices {
+            async fn clipboard_text(&self, _: &str) -> Result<()> {
+                panic!("no real clipboard");
+            }
+            async fn clipboard_image(&self, _: &std::path::Path, _: &str) -> Result<()> {
+                panic!("no real clipboard");
+            }
+            async fn notify(&self, _: &std::path::Path, _: &str) -> Result<()> {
+                panic!("no received files");
+            }
+            async fn open(&self, _: &std::path::Path) -> Result<()> {
+                panic!("no viewer");
+            }
+            async fn notify_send_admission_failure(&self, reason: &str) -> Result<()> {
+                self.0.lock().unwrap().push(reason.into());
+                Ok(())
+            }
+        }
+        let notices = Arc::new(Notices::default());
+        let (_dir, core, _) = fixture(notices.clone()).await?;
+        for n in 0..16 {
+            core.present_send_error(format!("pending {n}"))?;
+        }
+        #[cfg(target_os = "macos")]
+        core.ui_ready
+            .lock()
+            .unwrap()
+            .store(true, std::sync::atomic::Ordering::Release);
+        let (listener, _owner) = crate::ipc::bind(&core.paths.socket)?;
+        let (stop, stopped) = watch::channel(false);
+        let ipc = tokio::spawn(crate::ipc::serve(core.clone(), listener, stopped));
+        let command = crate::ipc::desktop_send_command(&[core
+            .paths
+            .data
+            .join("missing.txt")
+            .to_string_lossy()
+            .into_owned()]);
+        let error = crate::ipc::request(&core.paths.socket, command)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("send window is busy"));
+        assert_eq!(*notices.0.lock().unwrap(), vec!["send window is busy"]);
+        assert_eq!(
+            core.pending_sends.lock().unwrap().len(),
+            16,
+            "never discard earlier selections"
+        );
+        for command in [
+            crate::ipc::Command::SendFiles {
+                paths: Vec::new(),
+                targets: crate::outbox::Targets::All("all".into()),
+                request_id: None,
+            },
+            crate::ipc::Command::SendClipboard {
+                targets: crate::outbox::Targets::All("all".into()),
+            },
+        ] {
+            assert!(
+                crate::ipc::request(&core.paths.socket, command)
+                    .await
+                    .is_err()
+            );
+        }
+        let failures = notices.0.lock().unwrap().clone();
+        assert_eq!(failures.len(), 3);
+        assert!(failures[1].contains("choose 1 to 128 files"));
+        assert!(failures[2].contains("no connected clipboard recipients"));
+        stop.send(true)?;
+        ipc.await??;
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn desktop_explicit_targets_preserve_rejections_and_admit_eligible_siblings() -> Result<()>
+    {
+        use crate::outbox::Targets;
+        for case in ["unknown", "unpaired", "unsupported", "offline"] {
+            let (dir, core, connected, offline, _close) = file_recipient_fixture().await?;
+            let other = if case == "unknown" {
+                Id::from_bytes([90; 16])
+            } else {
+                offline.clone()
+            };
+            if case == "unpaired" {
+                core.store.unpair_then(other.clone(), |_| {}).await?;
+                core.admission.lock().unwrap().peers = core.store.peers().await?;
+            } else if case == "unsupported" {
+                core.outbox.note(
+                    other.clone(),
+                    core.store.pairing_generation(&other).unwrap(),
+                    false,
+                );
+            }
+            core.set_setting("choose_devices_each_time".into(), true.into())
+                .await?;
+            let source = dir.path().join("explicit.txt");
+            std::fs::write(&source, b"selected bytes")?;
+            let (listener, _owner) = crate::ipc::bind(&core.paths.socket)?;
+            let (stop, stopped) = watch::channel(false);
+            let ipc = tokio::spawn(crate::ipc::serve(core.clone(), listener, stopped));
+            for queue in [false, true] {
+                core.set_setting("queue_offline".into(), queue.into())
+                    .await?;
+                let args = vec![
+                    "--request-id".into(),
+                    format!("{case}-{queue}"),
+                    "--to".into(),
+                    connected.as_str().into(),
+                    "--to".into(),
+                    other.as_str().into(),
+                    source.to_string_lossy().into_owned(),
+                ];
+                assert!(matches!(
+                    crate::ipc::desktop_send_command(&args),
+                    crate::ipc::Command::SendFiles {
+                        targets: Targets::Devices(_),
+                        ..
+                    }
+                ));
+                let reply = crate::ipc::request(
+                    &core.paths.socket,
+                    crate::ipc::desktop_send_command(&args),
+                )
+                .await?;
+                assert!(
+                    core.pending_send().is_none(),
+                    "--to must bypass even the one-recipient picker"
+                );
+                assert!(
+                    core.window_request() > 0,
+                    "Recent remains visible for feedback"
+                );
+                let rejected = reply["rejected"].as_array().context("CLI rejected list")?;
+                if case == "offline" {
+                    assert!(
+                        rejected.is_empty(),
+                        "explicit offline choices override queue_offline"
+                    );
+                } else {
+                    assert_eq!(rejected.len(), 1, "{case}, queue={queue}");
+                    assert_eq!(rejected[0]["device"], serde_json::json!(other));
+                    assert_eq!(
+                        rejected[0]["reason"],
+                        if case == "unsupported" {
+                            "Update this device to receive files"
+                        } else {
+                            "Device is not paired"
+                        }
+                    );
+                }
+                core.file_admissions.drain().await;
+                let operation: Id = serde_json::from_value(reply["operation"].clone())?;
+                let status = core.operation_status(operation.clone()).await?;
+                assert_eq!(status["state"], "admitted");
+                assert_eq!(status["accepted"].as_array().unwrap().len(), 1);
+                assert_eq!(status["rejected"], reply["rejected"]);
+                let rows = core.ui_snapshot().transfers;
+                assert!(rows.iter().any(|r| r.operation == operation
+                    && r.device == connected
+                    && r.state == "queued"));
+                assert!(rows.iter().any(|r| r.operation == operation
+                    && r.device == other
+                    && r.state
+                        == if case == "offline" {
+                            "waiting_for_device"
+                        } else {
+                            "failed"
+                        }));
+                let retry = crate::ipc::request(
+                    &core.paths.socket,
+                    crate::ipc::desktop_send_command(&args),
+                )
+                .await?;
+                assert_eq!(retry["operation"], reply["operation"]);
+                assert_eq!(retry["rejected"], reply["rejected"]);
+                core.cancel_transfer(operation, None).await?;
+            }
+            stop.send(true)?;
+            ipc.await??;
+            core.shutdown_actions().await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn desktop_file_handoffs_follow_picker_queue_rules_and_freeze_authority() -> Result<()> {
+        use crate::outbox::Targets;
+        let (dir, core, connected, _offline, _close) = file_recipient_fixture().await?;
+        let source = dir.path().join("report.txt");
+        std::fs::write(&source, b"selected")?;
+        for (ask, queue, count) in [(false, false, 1), (false, true, 2), (true, false, 2)] {
+            core.set_setting("choose_devices_each_time".into(), ask.into())
+                .await?;
+            core.set_setting("queue_offline".into(), queue.into())
+                .await?;
+            let reply = core.present_files(
+                vec![source.clone()],
+                Targets::All("all".into()),
+                Some("desktop-test".into()),
+            )?;
+            assert!(core.window_request() > 0);
+            let request = core.pending_send().unwrap();
+            assert_eq!(request.id, reply["request"]);
+            assert_eq!(request.targets.len(), count);
+            assert!(!request.targeted);
+            assert_eq!(request.paths, Some(vec![source.clone()]));
+            assert!(
+                core.ui_snapshot().transfers.is_empty(),
+                "handoff never admits before picker"
+            );
+            core.acknowledge_send("stale-ack");
+            assert!(core.pending_send().is_some());
+            core.acknowledge_send(&request.id);
+            assert!(core.pending_send().is_none());
+        }
+        core.present_files(vec![source.clone()], Targets::All("all".into()), None)?;
+        let request = core.pending_send().unwrap();
+        let old = request
+            .targets
+            .iter()
+            .find(|t| t.device == connected)
+            .unwrap()
+            .clone();
+        // No new pairing may be substituted between Dolphin click and Send.
+        core.store
+            .pair(connected.clone(), Hash::new("cd".repeat(32))?)
+            .await?;
+        core.admission.lock().unwrap().peers = core.store.peers().await?;
+        let reply = core
+            .send_files(vec![source], Targets::Captured(vec![old]))
+            .await?;
+        core.file_admissions.drain().await;
+        let operation = serde_json::from_value(reply["operation"].clone())?;
+        let result = core.operation_status(operation).await?;
+        assert_eq!(result["state"], "failed");
+        assert!(result["accepted"].as_array().unwrap().is_empty());
+        assert!(
+            result["rejected"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["reason"] == "Pairing changed")
+        );
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn desktop_cli_exits_before_admission_but_window_recent_keeps_failures() -> Result<()> {
+        use crate::ipc::Command;
+        use crate::outbox::Targets;
+        let (dir, core, connected, _, _close) = file_recipient_fixture().await?;
+        #[cfg(target_os = "macos")]
+        core.ui_ready
+            .lock()
+            .unwrap()
+            .store(true, std::sync::atomic::Ordering::Release);
+        let (listener, _owner) = crate::ipc::bind(&core.paths.socket)?;
+        let (stop, stopped) = watch::channel(false);
+        let ipc = tokio::spawn(crate::ipc::serve(core.clone(), listener, stopped));
+        let path = dir.path().join("missing.pdf");
+        let reply = crate::ipc::request(
+            &core.paths.socket,
+            crate::ipc::desktop_send_command(&[path.to_string_lossy().into_owned()]),
+        )
+        .await?;
+        let request = core.pending_send().unwrap();
+        assert_eq!(reply["request"], request.id);
+        assert!(core.ui_snapshot().transfers.is_empty());
+        // This is the window's admission, after the CLI has disconnected.
+        let reply = crate::ipc::request(
+            &core.paths.socket,
+            Command::SendFiles {
+                paths: request.paths.unwrap(),
+                targets: Targets::Captured(request.targets),
+                request_id: Some(request.id.clone()),
+            },
+        )
+        .await?;
+        crate::ipc::request(
+            &core.paths.socket,
+            Command::AcknowledgeSend {
+                request: request.id,
+            },
+        )
+        .await?;
+        core.file_admissions.drain().await;
+        let operation: Id = serde_json::from_value(reply["operation"].clone())?;
+        let rows = core.ui_snapshot().transfers;
+        let failed = rows.iter().find(|t| t.operation == operation).unwrap();
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.file_name, "missing.pdf");
+        assert!(failed.error.is_some());
+        // A file that disappears after the picker is equally visible.
+        let authority = file_test_peer(&core, &connected).await?;
+        std::fs::write(&path, b"selected")?;
+        core.present_files(vec![path.clone()], Targets::Captured(vec![authority]), None)?;
+        let request = core.pending_send().unwrap();
+        std::fs::remove_file(path)?;
+        let reply = core
+            .send_files_request(
+                request.paths.unwrap(),
+                Targets::Captured(request.targets),
+                Some(request.id),
+            )
+            .await?;
+        core.file_admissions.drain().await;
+        let operation: Id = serde_json::from_value(reply["operation"].clone())?;
+        assert!(
+            core.ui_snapshot()
+                .transfers
+                .iter()
+                .any(|t| t.operation == operation && t.state == "failed" && t.error.is_some())
+        );
+        stop.send(true)?;
+        ipc.await??;
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn captured_file_and_clipboard_commands_reject_replacement_pairings() -> Result<()> {
+        use crate::outbox::Targets;
+        let (dir, core, connected, offline, _close) = file_recipient_fixture().await?;
+        let old = file_test_peer(&core, &connected).await?;
+        let sibling = file_test_peer(&core, &offline).await?;
+        core.store
+            .pair(connected.clone(), Hash::new("cd".repeat(32))?)
+            .await?;
+        core.admission.lock().unwrap().peers = core.store.peers().await?;
+        let current = file_test_peer(&core, &connected).await?;
+        assert_ne!(old.generation, current.generation);
+        let source = dir.path().join("selected.txt");
+        std::fs::write(&source, b"old menu selection")?;
+        for mut stale in [old.clone(), current.clone()] {
+            if stale.generation == current.generation {
+                stale.fingerprint = old.fingerprint.clone();
+            }
+            assert!(
+                core.share_clipboard(Targets::Captured(vec![stale.clone()]))
+                    .await
+                    .is_err()
+            );
+            let reply = core
+                .send_files(
+                    vec![source.clone()],
+                    Targets::Captured(vec![stale, sibling.clone()]),
+                )
+                .await?;
+            core.file_admissions.drain().await;
+            let operation: Id = serde_json::from_value(reply["operation"].clone())?;
+            let status = core.operation_status(operation.clone()).await?;
+            assert_eq!(status["accepted"].as_array().unwrap().len(), 1);
+            assert_eq!(status["rejected"][0]["device"], connected.as_str());
+            let rows = core.ui_snapshot().transfers;
+            assert!(rows.iter().any(|t| t.operation == operation
+                && t.device == offline
+                && t.state == "waiting_for_device"));
+            assert!(
+                !rows.iter().any(|t| t.operation == operation
+                    && t.device == connected
+                    && t.state != "failed")
+            );
+            assert!(
+                core.retry_transfer(operation.clone(), connected.clone())
+                    .await
+                    .is_err()
+            );
+            core.cancel_transfer(operation, Some(offline.clone()))
+                .await?;
+        }
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ipc_admits_128_long_paths_from_cli_and_picker() -> Result<()> {
+        use crate::ipc::Command;
+        use crate::outbox::Targets;
+        let (dir, core, connected, _, _close) = file_recipient_fixture().await?;
+        let mut parent = dir.path().to_owned();
+        for n in 0..6 {
+            parent.push(format!("{n}{}", "p".repeat(100)));
+        }
+        std::fs::create_dir_all(&parent)?;
+        let source = parent.join("report.txt");
+        std::fs::write(&source, b"long path")?;
+        let authority = file_test_peer(&core, &connected).await?;
+        let (listener, _owner) = crate::ipc::bind(&core.paths.socket)?;
+        let (stop, stopped) = watch::channel(false);
+        let ipc = tokio::spawn(crate::ipc::serve(core.clone(), listener, stopped));
+        let mut args = vec!["--to".into(), connected.as_str().into()];
+        args.extend(vec![source.to_string_lossy().into_owned(); 128]);
+        let commands = [
+            crate::ipc::send_command(&args)?,
+            Command::SendFiles {
+                paths: vec![source; 128],
+                targets: Targets::Captured(vec![authority]),
+                request_id: None,
+            },
+        ];
+        for command in commands {
+            assert!(serde_json::to_vec(&command)?.len() > 65_536);
+            let result = crate::ipc::request(&core.paths.socket, command).await?;
+            let operation: Id = serde_json::from_value(result["operation"].clone())?;
+            // Admission stages 128 durable files. Its tracked completion, not
+            // disk speed under parallel tests, is the IPC frame-size barrier.
+            core.file_admissions.drain().await;
+            let result = crate::ipc::request(
+                &core.paths.socket,
+                Command::OperationStatus {
+                    operation: operation.clone(),
+                },
+            )
+            .await?;
+            assert_eq!(result["state"], "admitted");
+            assert_eq!(result["accepted"].as_array().unwrap().len(), 128);
+            assert!(result["rejected"].as_array().unwrap().is_empty());
+            core.cancel_transfer(operation, None).await?;
+        }
+        stop.send(true)?;
+        ipc.await??;
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn named_file_recipient_sets_match_cli_and_ipc_selection_semantics() -> Result<()> {
+        use crate::outbox::{Authority, Targets};
+        let (dir, core, connected, offline, _close) = file_recipient_fixture().await?;
+        let source = dir.path().join("selection.txt");
+        std::fs::write(&source, b"recipient selection")?;
+        let captured = file_test_peer(&core, &offline).await?;
+        for queue in [false, true] {
+            core.set_setting("queue_offline".into(), queue.into())
+                .await?;
+            let variants = vec![
+                (
+                    crate::ipc::send_command(&[source.to_string_lossy().into_owned()])?,
+                    if queue {
+                        vec![connected.clone(), offline.clone()]
+                    } else {
+                        vec![connected.clone()]
+                    },
+                ),
+                (
+                    crate::ipc::send_command(&[
+                        "--to".into(),
+                        offline.as_str().into(),
+                        source.to_string_lossy().into_owned(),
+                    ])?,
+                    vec![offline.clone()],
+                ),
+                (
+                    serde_json::from_value(
+                        serde_json::json!({"command":"send_files","paths":[source],"targets":"all"}),
+                    )?,
+                    if queue {
+                        vec![connected.clone(), offline.clone()]
+                    } else {
+                        vec![connected.clone()]
+                    },
+                ),
+                (
+                    crate::ipc::Command::SendFiles {
+                        paths: vec![source.clone()],
+                        targets: Targets::Devices(vec![offline.clone()]),
+                        request_id: None,
+                    },
+                    vec![offline.clone()],
+                ),
+                (
+                    crate::ipc::Command::SendFiles {
+                        paths: vec![source.clone()],
+                        targets: Targets::Captured(vec![Authority {
+                            device: captured.device.clone(),
+                            generation: captured.generation,
+                            fingerprint: captured.fingerprint.clone(),
+                        }]),
+                        request_id: None,
+                    },
+                    vec![offline.clone()],
+                ),
+            ];
+            for (command, expected) in variants {
+                let crate::ipc::Command::SendFiles {
+                    paths,
+                    targets,
+                    request_id,
+                } = command
+                else {
+                    unreachable!()
+                };
+                let reply = core.send_files_request(paths, targets, request_id).await?;
+                core.file_admissions.drain().await;
+                let operation: Id = serde_json::from_value(reply["operation"].clone())?;
+                let rows: Vec<_> = core
+                    .ui_snapshot()
+                    .transfers
+                    .into_iter()
+                    .filter(|t| t.operation == operation)
+                    .collect();
+                assert_eq!(rows.len(), expected.len());
+                for row in rows {
+                    assert!(expected.contains(&row.device));
+                    assert_eq!(
+                        row.state,
+                        if row.device == offline {
+                            "waiting_for_device"
+                        } else {
+                            "queued"
+                        }
+                    );
+                }
+            }
+        }
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn full_file_recipient_is_rejected_in_status_and_recent_without_blocking_sibling()
+    -> Result<()> {
+        use crate::outbox::{PEER_DELIVERIES, Targets};
+        let (dir, core, connected, offline, _close) = file_recipient_fixture().await?;
+        let source = dir.path().join("queued.txt");
+        std::fs::write(&source, b"pending")?;
+        let peer = file_test_peer(&core, &offline).await?;
+        for _ in 0..PEER_DELIVERIES {
+            core.outbox
+                .admit(
+                    Id::from_bytes([90; 16]),
+                    source.clone(),
+                    vec![peer.clone()],
+                    100,
+                )
+                .await?;
+        }
+        core.set_setting("queue_offline".into(), true.into())
+            .await?;
+        let source = dir.path().join("report.pdf");
+        std::fs::write(&source, b"new artifact")?;
+        for only_full in [false, true] {
+            let targets = if only_full {
+                Targets::Devices(vec![offline.clone()])
+            } else {
+                Targets::All("all".into())
+            };
+            let reply = core.send_files(vec![source.clone()], targets).await?;
+            core.file_admissions.drain().await;
+            let operation: Id = serde_json::from_value(reply["operation"].clone())?;
+            let status = core.operation_status(operation.clone()).await?;
+            assert_eq!(
+                status["state"],
+                if only_full { "failed" } else { "admitted" }
+            );
+            assert_eq!(
+                status["accepted"].as_array().unwrap().len(),
+                usize::from(!only_full)
+            );
+            assert_eq!(
+                status["rejected"],
+                serde_json::json!([{"path":source,"device":offline,"reason":"device outbox is full"}])
+            );
+            let rows: Vec<_> = core
+                .ui_snapshot()
+                .transfers
+                .into_iter()
+                .filter(|t| t.operation == operation)
+                .collect();
+            assert_eq!(rows.len(), if only_full { 1 } else { 2 });
+            let rejected = rows.iter().find(|t| t.device == offline).unwrap();
+            assert_eq!(rejected.state, "failed");
+            assert_eq!(rejected.file_name, "report.pdf");
+            assert!(rejected.path.is_none());
+            assert_eq!(rejected.error.as_deref(), Some("device outbox is full"));
+            if !only_full {
+                assert_eq!(
+                    rows.iter().find(|t| t.device == connected).unwrap().state,
+                    "queued"
+                );
+            }
+        }
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn file_replacement_during_claim_handoff_recovers_after_waiter_is_cancelled() -> Result<()>
+    {
+        let (dir, core, device) = fixture(Arc::new(NoActions)).await?;
+        let _old = admit_ui_test_phone(&core, &device, 1)?;
+        let authority = file_test_peer(&core, &device).await?;
+        let source = dir.path().join("source");
+        std::fs::write(&source, b"claimed bytes")?;
+        let operation = Id::from_bytes([80; 16]);
+        let id = core
+            .outbox
+            .admit(operation, source, vec![authority.clone()], 100)
+            .await?;
+        let (entered, wait) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        *core.outbox.claim_barrier.lock().unwrap() = Some((entered, blocked));
+        let sender = core.clone();
+        let peer = device.clone();
+        let generation = authority.generation;
+        let old = tokio::spawn(async move {
+            // Armed before claim, including cancellation after its durable commit.
+            let _recovery = sender.arm_file_recovery(peer.clone(), generation, 1);
+            sender.outbox.claim(peer, generation, 1).await
+        });
+        wait.await?;
+        let _replacement = admit_ui_test_phone(&core, &device, 2)?;
+        old.abort();
+        assert!(old.await.unwrap_err().is_cancelled());
+        release.send(())?;
+        core.store.drain().await;
+        let next = core
+            .outbox
+            .claim(device.clone(), generation, 2)
+            .await?
+            .unwrap();
+        assert_eq!(next.begin.transfer_id, id);
+        core.outbox.retry_recovery().await?;
+        assert!(core.outbox.current(&next));
+        assert_eq!(core.ui_snapshot().transfers[0].state, "sending");
+        core.outbox.receipt(next, None).await?;
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn file_staged_hash_verification_does_not_occupy_transport_writer() -> Result<()> {
+        let (dir, core, device) = fixture(Arc::new(NoActions)).await?;
+        let close = admit_ui_test_phone(&core, &device, 1)?;
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&device)
+            .unwrap()
+            .capabilities
+            .push("files".into());
+        let authority = file_test_peer(&core, &device).await?;
+        let source = dir.path().join("source.png");
+        std::fs::write(&source, b"verified bytes")?;
+        core.outbox
+            .admit(
+                Id::from_bytes([80; 16]),
+                source,
+                vec![authority.clone()],
+                100,
+            )
+            .await?;
+        let delivery = core
+            .outbox
+            .claim(device, authority.generation, 1)
+            .await?
+            .unwrap();
+        let legacy_stamp = delivery.begin.hlc.expect("origin image stamp");
+        let (entered, wait) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        *core.outbox.reader_barrier.lock().unwrap() = Some((entered, blocked));
+        let outbox = core.outbox.clone();
+        let captured = delivery.clone();
+        let preparing = tokio::spawn(async move { outbox.reader(captured).await });
+        wait.await?;
+        let (_normal, normal) = mpsc::channel(4);
+        let (priority_tx, priority) = mpsc::channel(4);
+        let (_automatic, automatic) = mpsc::channel(1);
+        let (_text, text) = mpsc::channel(1);
+        let (files_tx, files) = mpsc::channel(1);
+        let (reports, mut received) = mpsc::channel(4);
+        let (mut stream, mut wire) = tokio::io::duplex(4096);
+        let sender = core.clone();
+        let writer = tokio::spawn(async move {
+            writer_loop(
+                sender,
+                &mut stream,
+                WriterQueues {
+                    normal,
+                    priority,
+                    automatic,
+                    text,
+                    files,
+                    reports,
+                    close,
+                },
+            )
+            .await
+        });
+        let pong = Message::Pong(Ping {
+            nonce: Nonce::new("0123456789abcdef")?,
+        });
+        priority_tx.send(pong.clone()).await?;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), read_frame(&mut wire)).await??,
+            Some(pong)
+        );
+        // The verifier is still blocked, yet heartbeat already reached the peer.
+        assert!(!preparing.is_finished());
+        release.send(())?;
+        files_tx
+            .send(FileWrite {
+                delivery,
+                connection: 1,
+                mesh: false,
+                file: Some(preparing.await??),
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("writer stopped"))?;
+        assert!(matches!(
+            read_frame(&mut wire).await?,
+            Some(Message::FileBegin(begin)) if begin.hlc.is_none() && begin.source_device.is_none() && begin.created_at == legacy_stamp
+        ));
+        assert!(matches!(
+            read_frame(&mut wire).await?,
+            Some(Message::FileChunk(_))
+        ));
+        assert!(matches!(
+            read_frame(&mut wire).await?,
+            Some(Message::FileEnd(_))
+        ));
+        assert!(matches!(
+            received.recv().await,
+            Some(WriteReport::Sent { .. })
+        ));
+        writer.abort();
+        let _ = writer.await;
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn file_ipc_returns_operation_before_staging_and_lost_client_retry_is_idempotent()
+    -> Result<()> {
+        let (dir, core, device) = fixture(Arc::new(NoActions)).await?;
+        let _close = admit_ui_test_phone(&core, &device, 1)?;
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&device)
+            .unwrap()
+            .capabilities
+            .push("files".into());
+        let peers = core.store.peers().await?;
+        core.admission.lock().unwrap().peers = peers;
+        let path = dir.path().join("slow-source");
+        std::fs::write(&path, b"slow disk")?;
+        let (entered, wait) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let hook = Arc::new(Mutex::new(Some((entered, blocked))));
+        *core.outbox.source_hook.lock().unwrap() = Some(Arc::new(move |_| {
+            let (entered, release) = hook.lock().unwrap().take().unwrap();
+            let _ = entered.send(());
+            let _ = release.recv_timeout(Duration::from_secs(10));
+        }));
+        let (listener, _socket) = crate::ipc::bind(&core.paths.socket)?;
+        let (stop, rx) = watch::channel(false);
+        let ipc = tokio::spawn(crate::ipc::serve(core.clone(), listener, rx));
+        let command = || crate::ipc::Command::SendFiles {
+            paths: vec![path.clone()],
+            targets: crate::outbox::Targets::All("all".into()),
+            request_id: Some("slow-request".into()),
+        };
+        let first = tokio::time::timeout(
+            Duration::from_secs(1),
+            crate::ipc::request(&core.paths.socket, command()),
+        )
+        .await??;
+        assert!(
+            core.window_request() > 0,
+            "untargeted IPC opens Recent before staging can fail"
+        );
+        wait.await?;
+        let operation: Id = serde_json::from_value(first["operation"].clone())?;
+        assert_eq!(
+            core.operation_status(operation.clone()).await?["state"],
+            "staging"
+        );
+        assert!(
+            core.ui_snapshot()
+                .transfers
+                .iter()
+                .any(|t| t.operation == operation && t.state == "staging")
+        );
+        let retry = crate::ipc::request(&core.paths.socket, command()).await?;
+        assert_eq!(retry, first);
+        release.send(())?;
+        core.file_admissions.drain().await;
+        let status = core.operation_status(operation.clone()).await?;
+        assert_eq!(status["state"], "admitted");
+        assert_eq!(status["accepted"].as_array().unwrap().len(), 1);
+        let retry = crate::ipc::request(&core.paths.socket, command()).await?;
+        assert_eq!(retry, first);
+        assert_eq!(
+            core.ui_snapshot()
+                .transfers
+                .iter()
+                .filter(|t| t.operation == operation)
+                .count(),
+            1
+        );
+        stop.send(true)?;
+        ipc.await??;
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+    fn held_clipboard_publication(core: &Core) -> OutgoingSelection {
+        OutgoingSelection::Text(Clipboard {
+            transfer_id: Id::from_bytes([70; 16]),
+            text: "already computed publication".into(),
+            origin: ClipboardOrigin::Clipboard,
+            created_at: 10,
+            hlc: Some(10),
+            source_device: Some(core.identity.device_id.clone()),
+        })
+    }
+
+    #[tokio::test]
+    async fn late_publication_and_first_byte_are_fenced_by_config_changes() -> Result<()> {
+        for key in [
+            "clipboard_mode",
+            "clipboard_sync_to_phone",
+            "clipboard_include_images",
+        ] {
+            let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
+            let _link = admit_ui_test_phone(&core, &device, 1)?;
+            core.set_setting("clipboard_include_images".into(), true.into())
+                .await?;
+            let mut held = core.automatic_target().unwrap();
+            held.observed = true;
+            let selection = held_clipboard_publication(&core);
+            // Hold one computed Publish effect, with a sibling already queued.
+            core.publish_automatic(held.clone(), Some(selection.clone()), None)?;
+            let work = core.take_automatic(&device, 1).unwrap();
+            let value = if key == "clipboard_mode" {
+                serde_json::json!("manual")
+            } else {
+                false.into()
+            };
+            core.set_setting(key.into(), value).await?;
+            assert!(
+                core.publish_automatic(held.clone(), Some(selection.clone()), None)
+                    .is_err(),
+                "{key}"
+            );
+            assert!(
+                core.automatic.lock().unwrap().selections.is_empty(),
+                "{key}"
+            );
+            // A first-byte writer already holding work also rejects it.
+            let (_priority, mut priority) = mpsc::channel(1);
+            let (_normal, mut normal) = mpsc::channel(1);
+            let mut bytes = Vec::new();
+            assert!(
+                !transmit_automatic(
+                    &core,
+                    &mut bytes,
+                    work,
+                    &mut priority,
+                    &mut normal,
+                    None,
+                    None
+                )
+                .await?
+            );
+            assert!(bytes.is_empty());
+            let restored = if key == "clipboard_mode" {
+                serde_json::json!("automatic")
+            } else {
+                true.into()
+            };
+            core.set_setting(key.into(), restored).await?;
+            assert!(
+                core.publish_automatic(held, Some(selection.clone()), None)
+                    .is_err(),
+                "re-enable {key}"
+            );
+            // Current offers still publish after re-enable.
+            core.publish_automatic(core.automatic_target().unwrap(), Some(selection), None)?;
+            core.shutdown_actions().await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_mode_rejects_observed_publication_but_accepts_explicit_share() -> Result<()> {
+        let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
+        let _link = admit_ui_test_phone(&core, &device, 1)?;
+        core.set_setting("clipboard_mode".into(), serde_json::json!("manual"))
+            .await?;
+        let mut offer = core.automatic_target().unwrap();
+        let selection = held_clipboard_publication(&core);
+        offer.observed = true;
+        assert!(
+            core.publish_automatic(offer.clone(), Some(selection.clone()), None)
+                .is_err()
+        );
+        offer.observed = false;
+        core.publish_automatic(offer, Some(selection), None)?;
+        assert!(core.take_automatic(&device, 1).is_some());
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pair_send_disable_fences_a_precomputed_publication_even_after_reenable() -> Result<()>
+    {
+        let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
+        let _link = admit_ui_test_phone(&core, &device, 1)?;
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&device)
+            .unwrap()
+            .mesh = true;
+        let local = core.identity.device_id.clone();
+        core.store
+            .settings_fields(local.clone(), device.clone(), true)
+            .await?;
+        let mut held = core.automatic_target().unwrap();
+        held.observed = true;
+        let selection = held_clipboard_publication(&core);
+        for enabled in [false, true] {
+            core.store
+                .settings_edit(
+                    local.clone(),
+                    device.clone(),
+                    true,
+                    format!("{local}/{device}/clipboard"),
+                    enabled,
+                )
+                .await?;
+            assert!(
+                core.publish_automatic(held.clone(), Some(selection.clone()), None)
+                    .is_err()
+            );
+            assert!(core.automatic.lock().unwrap().selections.is_empty());
+        }
+        core.publish_automatic(core.automatic_target().unwrap(), Some(selection), None)?;
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_staging_stops_remaining_paths_without_failed_recent_rows() -> Result<()> {
+        for per_device in [false, true] {
+            let (dir, core, device) = fixture(Arc::new(NoActions)).await?;
+            let _link = admit_ui_test_phone(&core, &device, 1)?;
+            core.sessions
+                .lock()
+                .unwrap()
+                .sessions
+                .get_mut(&device)
+                .unwrap()
+                .capabilities
+                .push("files".into());
+            let peers = core.store.peers().await?;
+            core.admission.lock().unwrap().peers = peers;
+            let source = dir.path().join("staging-source");
+            std::fs::write(&source, b"cancel during open")?;
+            let paths = std::iter::once(source)
+                .chain((0..127).map(|n| dir.path().join(format!("never-open-{n}"))))
+                .collect();
+            let (entered, wait) = tokio::sync::oneshot::channel();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let barrier = Arc::new(Mutex::new(Some((entered, blocked))));
+            *core.outbox.source_hook.lock().unwrap() = Some(Arc::new(move |_| {
+                let (entered, release) = barrier.lock().unwrap().take().unwrap();
+                let _ = entered.send(());
+                release.recv_timeout(Duration::from_secs(10)).unwrap();
+            }));
+            let reply = core
+                .send_files(paths, crate::outbox::Targets::All("all".into()))
+                .await?;
+            wait.await?;
+            let operation: Id = serde_json::from_value(reply["operation"].clone())?;
+            core.cancel_transfer(operation.clone(), per_device.then_some(device))
+                .await?;
+            assert_eq!(
+                core.operation_status(operation.clone()).await?["state"],
+                "cancelled"
+            );
+            release.send(())?;
+            tokio::time::timeout(Duration::from_secs(5), core.file_admissions.drain()).await?;
+            let status = core.operation_status(operation.clone()).await?;
+            assert_eq!(status["state"], "cancelled");
+            assert_eq!(status["rejected"], serde_json::json!([]));
+            assert_eq!(status["accepted"], serde_json::json!([]));
+            assert!(
+                core.ui_snapshot()
+                    .transfers
+                    .iter()
+                    .all(|r| r.operation != operation)
+            );
+            assert_eq!(
+                std::fs::read_dir(dir.path().join("data/outbox"))?.count(),
+                0
+            );
+            core.shutdown_actions().await?;
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn artifact_transfer_commands_preserve_artifact_scope_through_ipc_dispatch() -> Result<()>
+    {
+        use crate::ipc::Command;
+        let (dir, core, device) = fixture(Arc::new(NoActions)).await?;
+        let _link = admit_ui_test_phone(&core, &device, 1)?;
+        core.sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&device)
+            .unwrap()
+            .capabilities
+            .push("files".into());
+        let authority = file_test_peer(&core, &device).await?;
+        let operation = Id::from_bytes([80; 16]);
+        let source = dir.path().join("source");
+        std::fs::write(&source, b"artifact IPC")?;
+        let a = core
+            .outbox
+            .admit(
+                operation.clone(),
+                source.clone(),
+                vec![authority.clone()],
+                100,
+            )
+            .await?;
+        let b = core
+            .outbox
+            .admit(operation.clone(), source, vec![authority.clone()], 100)
+            .await?;
+        let failed = core
+            .outbox
+            .claim(device.clone(), authority.generation, 1)
+            .await?
+            .unwrap();
+        core.outbox.fail(failed, "injected failure".into()).await?;
+        let sibling = core
+            .outbox
+            .claim(device.clone(), authority.generation, 1)
+            .await?
+            .unwrap();
+        assert_eq!(sibling.begin.transfer_id, b);
+        let (listener, _socket) = crate::ipc::bind(&core.paths.socket)?;
+        let (stop, rx) = watch::channel(false);
+        let ipc = tokio::spawn(crate::ipc::serve(core.clone(), listener, rx));
+        crate::ipc::request(
+            &core.paths.socket,
+            Command::RetryTransfer {
+                operation: operation.clone(),
+                artifact: Some(a.clone()),
+                device: device.clone(),
+            },
+        )
+        .await?;
+        assert!(core.outbox.current(&sibling));
+        assert!(
+            core.ui_snapshot()
+                .transfers
+                .iter()
+                .any(|r| r.transfer_id == a && r.state == "queued")
+        );
+        crate::ipc::request(
+            &core.paths.socket,
+            Command::CancelTransfer {
+                operation: operation.clone(),
+                artifact: Some(a.clone()),
+                device: Some(device.clone()),
+            },
+        )
+        .await?;
+        assert!(core.outbox.current(&sibling));
+        crate::ipc::request(
+            &core.paths.socket,
+            Command::DismissTransfer {
+                operation: operation.clone(),
+                artifact: Some(a.clone()),
+            },
+        )
+        .await?;
+        let status = crate::ipc::request(&core.paths.socket, Command::Status).await?;
+        let rows = status["transfers"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["transfer_id"], serde_json::json!(b));
+        for command in [
+            Command::DismissTransfer {
+                operation: operation.clone(),
+                artifact: Some(Id::from_bytes([99; 16])),
+            },
+            Command::CancelTransfer {
+                operation: operation.clone(),
+                artifact: Some(Id::from_bytes([99; 16])),
+                device: None,
+            },
+            // Validate artifact membership before looking up even an unknown device.
+            Command::RetryTransfer {
+                operation: operation.clone(),
+                artifact: Some(Id::from_bytes([99; 16])),
+                device: Id::from_bytes([99; 16]),
+            },
+        ] {
+            let error = crate::ipc::request(&core.paths.socket, command)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("artifact does not belong to operation"),
+                "{error}"
+            );
+            assert!(core.outbox.current(&sibling));
+        }
+        // An older client's omitted artifact retains batch cancellation.
+        let legacy: Command = serde_json::from_value(
+            serde_json::json!({"command":"cancel_transfer", "operation":operation}),
+        )?;
+        crate::ipc::request(&core.paths.socket, legacy).await?;
+        assert!(!core.outbox.current(&sibling));
+        stop.send(true)?;
+        ipc.await??;
         core.shutdown_actions().await?;
         Ok(())
     }

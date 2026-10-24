@@ -5,6 +5,7 @@ Uses Python/OpenSSL's normal TLS client-certificate verification. Supply the pho
 public Keystore leaf as --client-ca. Never logs pairing tokens or user bytes.
 """
 import argparse
+import base64
 import hashlib
 import json
 import socket
@@ -16,6 +17,12 @@ import sys
 import threading
 
 parser = argparse.ArgumentParser()
+parser.add_argument('--receive-files', action='store_true')
+parser.add_argument('--hello-version',type=int,default=1)
+parser.add_argument('--incompatible-capabilities',action='store_true')
+parser.add_argument('--version-mismatch',action='store_true')
+parser.add_argument('--receive-progress-delay',type=float,default=0)
+parser.add_argument('--mesh', action='store_true')
 parser.add_argument('--cert', required=True)
 parser.add_argument('--key', required=True)
 parser.add_argument('--client-ca', required=True)
@@ -25,6 +32,7 @@ parser.add_argument('--drop-first-pair-result', action='store_true')
 parser.add_argument('--reject-first-pair-result', action='store_true')
 parser.add_argument('--pair-drop-seconds',type=float,default=3)
 parser.add_argument('--early-clipboard',action='store_true')
+parser.add_argument('--recovery-files',action='store_true')
 parser.add_argument('--witness-port',type=int)
 parser.add_argument('--tls12-only',action='store_true')
 parser.add_argument('--hello-drip',action='store_true')
@@ -54,6 +62,30 @@ records_lock = threading.Lock()
 fixture_expiry = None
 text_dropped=False
 release_text=threading.Event()
+receive_ack_dropped=False
+receive_metadata={}
+receive_payloads={
+    'photo': base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aWQAAAABJRU5ErkJggg=='),
+    'pdf': b'%PDF-1.4\nPneu received PDF fixture\n%%EOF\n',
+}
+
+def send_received_file(stream, name):
+    assert args.receive_files and name in receive_payloads
+    if name not in receive_metadata:
+        data=receive_payloads[name]
+        receive_metadata[name]=dict(transfer_id=('1' if name=='photo' else '2')*32,
+            file_name='Pneu received fixture.'+('png' if name=='photo' else 'pdf'),
+            mime='image/png' if name=='photo' else 'application/pdf',size=len(data),
+            sha256=hashlib.sha256(data).hexdigest(),kind='photo' if name=='photo' else 'file',created_at=int(time.time()*1000))
+        if args.mesh and name=='photo':receive_metadata[name].update(hlc=int(time.time()*1000),source_device='d'*32)
+    meta=receive_metadata[name];data=receive_payloads[name]
+    send(stream,0x10,**meta)
+    chunk=bytes([0x11])+bytes.fromhex(meta['transfer_id'])+struct.pack('>Q',0)+data
+    with write_lock:stream.sendall(struct.pack('>I',len(chunk))+chunk)
+    if args.receive_progress_delay:time.sleep(args.receive_progress_delay)
+    send(stream,0x12,transfer_id=meta['transfer_id'])
+    event('SENT_TO_PHONE',transfer_id=meta['transfer_id'],kind=meta['kind'])
+
 
 def witness_server():
     # Synthetic fixture control/evidence only; never used by the production app.
@@ -65,6 +97,9 @@ def witness_server():
                 connection.settimeout(2)
                 request=json.loads(connection.makefile('rb').readline(4096))
                 if request.get('close_text'):release_text.set()
+                if request.get('receive_file'):
+                    assert current is not None, 'Phone must be connected'
+                    send_received_file(current,request['receive_file'])
                 if 'expires' in request:
                     fixture_expiry=request['expires'];event('INVITATION',expires=fixture_expiry)
                 with records_lock:response=json.dumps(records).encode()+b'\n'
@@ -118,10 +153,24 @@ def exact(stream, length):
         output.extend(chunk)
     return bytes(output)
 
-def send(stream, kind, **payload):
-    data = bytes([kind]) + json.dumps(payload).encode()
+def send(stream, wire_type, **payload):
+    data = bytes([wire_type]) + json.dumps(payload).encode()
     with write_lock:
         stream.sendall(struct.pack('>I', len(data)) + data)
+
+def recovery_file(stream, ident, file_kind, finish=True):
+    data=b'recovery file bytes'
+    fields=dict(transfer_id=ident*32,file_name='Recovery '+ident+'.bin',mime='image/png' if file_kind=='clipboard_image' else 'application/octet-stream',size=len(data),sha256=hashlib.sha256(data).hexdigest(),kind=file_kind,created_at=1000)
+    if args.mesh and file_kind=='clipboard_image':fields.update(hlc=1000,source_device='d'*32)
+    send(stream,0x10,**fields)
+    chunk=bytes([0x11])+bytes.fromhex(ident*32)+struct.pack('>Q',0)+data[:5]
+    with write_lock:stream.sendall(struct.pack('>I',len(chunk))+chunk)
+    if finish:recovery_tail(stream,ident)
+
+def recovery_tail(stream,ident):
+    chunk=bytes([0x11])+bytes.fromhex(ident*32)+struct.pack('>Q',5)+b'recovery file bytes'[5:]
+    with write_lock:stream.sendall(struct.pack('>I',len(chunk))+chunk)
+    send(stream,0x12,transfer_id=ident*32)
 
 with socket.create_server(('0.0.0.0', args.port)) as listener:
     print('READY', args.port, flush=True)
@@ -163,6 +212,8 @@ with socket.create_server(('0.0.0.0', args.port)) as listener:
                     payload = json.loads(body)
                     if kind == 1:
                         time.sleep(args.hello_delay)
+                        if args.version_mismatch:
+                            event('VERSION_MISMATCH');send(stream,127,code='version_mismatch',supported_version=2);break
                         if args.unauthorized_hello:
                             event('UNAUTHORIZED');send(stream,127,code='unauthorized');break
                         if args.hello_drip:
@@ -170,9 +221,19 @@ with socket.create_server(('0.0.0.0', args.port)) as listener:
                             for byte in struct.pack('>I',len(encoded))+encoded:
                                 stream.send(bytes([byte]));time.sleep(.5)
                         else:
-                            send(stream, 1, version=1, device_id='d' * 32, name='Test PC', capabilities=['clipboard_text'] if args.no_files else ['files','clipboard_text','clipboard_image'])
+                            send(stream, 1, version=args.hello_version, device_id='d' * 32, name='Test PC', capabilities=(['future_feature'] if args.incompatible_capabilities else ['clipboard_text'] if args.no_files else ['files','clipboard_text','clipboard_image'])+(['mesh'] if args.mesh else []),**({'role':'computer'} if args.mesh else {}))
                             if args.early_clipboard and bound:send(stream,0x20,transfer_id='0'*32,text='Recovery clipboard fixture',created_at=1000,origin='clipboard')
-                        event('HELLO',device_id=payload['device_id'],client_fp=hashlib.sha256(stream.getpeercert(binary_form=True)).hexdigest())
+                            if args.recovery_files and bound:
+                                send(stream,4,nonce='9'*16)
+                                send(stream,6,paused=False)
+                                if args.mesh:
+                                    phone=payload['device_id'];pc='d'*32
+                                    send(stream,0x21,transfer_id='4'*32,settings=[dict(key=key,enabled=True,hlc=1000,writer_device=pc) for key in (phone+'/'+pc+'/clipboard',pc+'/'+phone+'/clipboard',phone+'/'+pc+'/automatic_media')])
+                                send(stream,0x20,transfer_id='5'*32,text='Recovery clipboard',created_at=1000,origin='clipboard',**(dict(hlc=1000,source_device='d'*32) if args.mesh else {}))
+                                recovery_file(stream,'6','file')
+                                recovery_file(stream,'7','clipboard_image')
+                                recovery_file(stream,'8','clipboard_image',finish=False)
+                        event('HELLO',device_id=payload['device_id'],client_fp=hashlib.sha256(stream.getpeercert(binary_form=True)).hexdigest(),capabilities=payload['capabilities'])
                         if args.ready_close:time.sleep(.5);break
                     elif kind == 2:
                         # Synthetic harness invitation only; never use this for real pairing.
@@ -194,12 +255,15 @@ with socket.create_server(('0.0.0.0', args.port)) as listener:
                             for byte in struct.pack('>I',len(encoded))+encoded:
                                 stream.send(bytes([byte]));time.sleep(.5)
                         else:send(stream, 3, accepted=True)
+                        if args.recovery_files and pair_count>1:recovery_tail(stream,'8')
                         print('PAIR accepted', flush=True)
                         if args.unpair_after_pair_result:
                             time.sleep(1);send(stream,7);event('REMOTE_UNPAIR');break
                     elif kind == 4:
                         send(stream, 5, nonce=payload['nonce'])
                         print('PING/PONG', flush=True)
+                    elif kind == 5:
+                        event('PHONE_PONG',nonce=payload['nonce'])
                     elif kind == 6:
                         event('STATUS',paused=payload['paused'])
                     elif kind == 7:
@@ -254,10 +318,18 @@ with socket.create_server(('0.0.0.0', args.port)) as listener:
                         event('TEXT',transfer_id=payload['transfer_id'],created_at=payload['created_at'],origin=payload.get('origin','clipboard'),sha256=hashlib.sha256(payload['text'].encode()).hexdigest())
                         if payload['text']=='Share text fixture' and last_clip is None:
                             send_clipboard(stream)
+                    elif kind == 0x21:
+                        assert args.mesh
+                        send(stream,0x13,transfer_id=payload['transfer_id'],deduplicated=False)
+                        send(stream,0x21,transfer_id='3'*32,settings=payload['settings'])
                     elif kind == 0x13:
+                        if args.receive_files and payload['transfer_id']=='1'*32 and not receive_ack_dropped:
+                            receive_ack_dropped=True
+                            event('DROPPED_FILE_ACK',transfer_id=payload['transfer_id'])
+                            break
                         event('PHONE_ACK',transfer_id=payload['transfer_id'],deduplicated=payload['deduplicated'])
                     elif kind == 0x14:
-                        event('PHONE_NACK',code=payload['code'])
+                        event('PHONE_NACK',transfer_id=payload['transfer_id'],code=payload['code'],retryable=payload['retryable'])
                     elif kind == 127:
                         print('ERROR', payload['code'], flush=True)
                         break

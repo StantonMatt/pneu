@@ -1,0 +1,1059 @@
+// The Pneu window: main page, device pages, Add Device, Pairing Code and
+// Settings, with in-window popups. Rust drives everything through `Ui`.
+import { Palette } from "std-widgets.slint";
+import { Pneu, Tone, Icons, WindowFocus } from "theme.slint";
+import {
+    PneuButton, ButtonKind, IconButton, Card, Row, Divider, SectionLabel, Tile, GhostTile,
+    PneuSpinner, ProgressBar, SwitchRow, Segmented, Segment, Checkbox, Header, NavRow, QrCard,
+    TextField, Interaction
+} from "components.slint";
+import { Link, LinkState, LinkTile, Tube } from "link.slint";
+
+export { WindowFocus, Tone, Tube, LinkState, LinkTile }
+
+export enum Page { main, device, add, code, settings, scan }
+export enum Dialog { none, unpair, rename, picker, message, details }
+export enum CodeState { showing, expired, offline, pairing, paired }
+export enum ScanState { requesting, scanning, denied, unavailable, failed }
+
+export struct DeviceItem {
+    id: string,
+    name: string,
+    phone: bool,
+    tone: Tone,
+    status: string,
+    status-tone: Tone,
+    // Below zero when nothing is moving.
+    progress: float,
+    connected: bool,
+}
+
+export struct RecentItem {
+    id: string,
+    batch: bool,
+    title: string,
+    detail: string,
+    detail-tone: Tone,
+    picture: bool,
+    clipboard: bool,
+    progress: float,
+    can-cancel: bool,
+    can-retry: bool,
+    can-open: bool,
+    can-details: bool,
+    can-dismiss: bool,
+}
+
+export struct RecipientItem {
+    item: string, device: string, name: string, phone: bool, tone: Tone,
+    detail: string, progress: float, can-stop: bool, can-retry: bool,
+}
+
+export struct SettingItem { key: string, label: string, sub: string, on: bool }
+
+export struct PickItem {
+    id: string,
+    name: string,
+    phone: bool,
+    tone: Tone,
+    connected: bool,
+    eligible: bool,
+    status: string,
+    checked: bool,
+}
+
+// tile: 0 none, 1 computer, 2 phone, 3 error
+export struct Message { title: string, text: string, tile: int, primary: string, secondary: string, action: string }
+
+export struct Summary { title: string, detail: string, link: LinkState }
+
+export struct DropItem { name: string, enabled: bool }
+export struct DropGeometry { x: float, y: float, width: float, height: float, scroll: float }
+
+export global Ui {
+    in-out property <bool> drop-active;
+    in-out property <int> drop-hover: -1;
+    in-out property <[DropItem]> drop-items;
+    in property <bool> is-mac: false;
+    in property <bool> login-enabled;
+    in property <bool> login-busy;
+    in property <string> login-error;
+    in property <bool> login-pending;
+    in property <bool> camera-available: false;
+    in property <image> camera-preview;
+    in property <ScanState> scan-state;
+    callback login(bool);
+    callback system-settings(string);
+    callback scan-qr();
+    in-out property <int> navigation-revision;
+    in property <int> device-revision: -1;
+    in-out property <Page> page;
+    in-out property <string> device-id;
+    in-out property <int> add-tab;
+    in-out property <Dialog> dialog;
+
+    in property <string> error;
+    in property <Summary> summary;
+    in property <[DeviceItem]> devices;
+    in property <[RecentItem]> recent;
+    in property <bool> manual-clipboard;
+    in property <bool> motion: true;
+
+    in property <DeviceItem> device;
+    in property <Summary> device-summary;
+    in property <string> device-action;
+    in property <[SettingItem]> device-settings;
+    in property <string> device-note;
+
+    in property <bool> first-run;
+    in property <image> qr;
+    in property <bool> network: true;
+    in property <string> pairing;
+    in property <string> paired;
+    in property <string> offer;
+
+    in property <image> code-qr;
+    in property <CodeState> code-state;
+    in property <string> code-error;
+    in property <string> code-expires;
+    in property <string> code-link;
+
+    in property <int> clipboard-mode;
+    in property <bool> include-images;
+    in property <bool> choose-each-time;
+    in property <bool> queue-offline;
+    in property <bool> save-to-folder;
+    in property <string> folder;
+    in property <bool> notifications;
+    in property <bool> copy-images;
+    in property <bool> viewer;
+    in property <string> name;
+
+    in-out property <string> unpair-id;
+    in-out property <string> unpair-name;
+    in-out property <string> rename-text;
+    in property <string> picker-title;
+    in-out property <[PickItem]> picks;
+    in-out property <int> picker-count;
+    in property <Message> message;
+    in property <string> details-title;
+    in property <[RecipientItem]> recipients;
+
+    callback navigated();
+    callback close();
+    // "" sends to every connected device (or asks, with Choose devices each time).
+    callback send-files(string);
+    callback send-clipboard();
+    callback cancel-item(string);
+    callback retry-item(string);
+    callback open-item(string);
+    callback dismiss-item(string);
+    callback details-item(string);
+    callback recipient-action(string, string, bool);
+    pure callback valid-name(string) -> bool;
+    callback set-peer(string, bool);
+    callback unpair(string);
+    callback choose-folder();
+    callback set-mode(int);
+    callback set-flag(string, bool);
+    callback rename(string);
+    callback new-code();
+    callback show-code();
+    callback paste-link(string);
+    callback scanned-link(string);
+    // Add Device reads the clipboard once for a link from another computer.
+    callback probed(string);
+    callback offer-pair();
+    callback offer-dismiss();
+    callback message-action(string, bool);
+    callback picker-send();
+    callback picker-cancel();
+}
+
+component Banner inherits Rectangle {
+    in property <string> text;
+    border-radius: 10px; background: Pneu.danger-soft;
+    border-color: Pneu.banner-border; border-width: 1px;
+    accessible-role: AccessibleRole.text;
+    accessible-label: text;
+    HorizontalLayout {
+        padding-top: 10px; padding-bottom: 10px; padding-left: 12px; padding-right: 12px; spacing: 8px;
+        Image { accessible-role: none; source: Icons.error; colorize: #DA4453; width: 16px; height: 16px; }
+        Text { text: root.text; color: Pneu.text; wrap: word-wrap; }
+    }
+}
+
+component LinkCard inherits Card {
+    in property <Summary> summary;
+    in property <bool> motion;
+    in property <length> text-line;
+    in property <length> title-line;
+    VerticalLayout {
+        padding-top: 16px; padding-bottom: 14px; padding-left: 14px; padding-right: 14px; spacing: 0px;
+        Link { state: root.summary.link; motion: root.motion; }
+        Rectangle { height: 12px; }
+        Text {
+            text: root.summary.title; font-size: Pneu.title-size; font-weight: 700; color: Pneu.text;
+            overflow: elide; max-height: root.title-line; horizontal-alignment: center;
+        }
+        if root.summary.detail != "": Text {
+            text: root.summary.detail; color: Pneu.text2;
+            overflow: elide; max-height: root.text-line; horizontal-alignment: center;
+        }
+        @children
+    }
+}
+
+component DeviceRow inherits NavRow {
+    in property <DeviceItem> item;
+    accessible-label: item.name + ", " + item.status;
+    min-height: 56px;
+    HorizontalLayout {
+        padding-top: 10px; padding-bottom: 10px; padding-left: 12px; padding-right: 12px; spacing: 12px;
+        VerticalLayout { alignment: center; Tile { icon: root.item.phone ? Icons.smartphone : Icons.computer; tone: root.item.tone; } }
+        VerticalLayout {
+            alignment: center; spacing: 0px; horizontal-stretch: 1;
+            Text { text: root.item.name; font-weight: 600; color: Pneu.text; overflow: elide; }
+            Text {
+                text: root.item.status; font-size: Pneu.label-size; overflow: elide;
+                color: root.item.status-tone == Tone.warn ? Pneu.warn : root.item.status-tone == Tone.danger ? Pneu.danger
+                    : root.item.status-tone == Tone.accent ? Pneu.accent-text : Pneu.text2;
+            }
+            if root.item.progress >= 0: VerticalLayout {
+                padding-top: 5px;
+                ProgressBar { value: root.item.progress; }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            Image { accessible-role: none; width: 16px; height: 16px; source: Icons.chevron-right; colorize: Pneu.text2; }
+        }
+    }
+}
+
+component RecentRow inherits NavRow {
+    in property <RecentItem> item;
+    callback cancel();
+    callback retry();
+    callback dismiss();
+    enabled: item.can-open || item.can-details;
+    accessible-label: item.title + ", " + item.detail;
+    min-height: 56px;
+    HorizontalLayout {
+        padding-top: 10px; padding-bottom: 10px; padding-left: 12px; padding-right: 12px; spacing: 12px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 36px; height: 36px; border-radius: 8px; background: Pneu.button;
+                Image { accessible-role: none;
+                    x: 9px; y: 9px; width: 18px; height: 18px; colorize: Pneu.text2;
+                    source: root.item.clipboard ? Icons.paste : root.item.picture ? Icons.picture : Icons.file;
+                }
+            }
+        }
+        VerticalLayout {
+            alignment: center; spacing: 0px; horizontal-stretch: 1;
+            Text { text: root.item.title; color: Pneu.text; overflow: elide; }
+            Text {
+                text: root.item.detail; font-size: Pneu.label-size; overflow: elide;
+                color: root.item.detail-tone == Tone.danger ? Pneu.danger : root.item.detail-tone == Tone.accent ? Pneu.accent-text : Pneu.text2;
+            }
+            if root.item.progress >= 0: VerticalLayout {
+                padding-top: 5px;
+                ProgressBar { value: root.item.progress; }
+            }
+        }
+        if root.item.can-retry: VerticalLayout {
+            alignment: center;
+            IconButton { icon: Icons.refresh; label: "Retry"; clicked => { root.retry(); } }
+        }
+        if root.item.can-cancel: VerticalLayout {
+            alignment: center;
+            IconButton { icon: Icons.close; label: root.item.batch ? "Cancel batch" : "Cancel"; clicked => { root.cancel(); } }
+        }
+        if root.item.can-dismiss: VerticalLayout {
+            alignment: center;
+            IconButton { icon: Icons.close; label: root.item.batch ? "Remove batch" : "Remove"; clicked => { root.dismiss(); } }
+        }
+    }
+}
+
+component Done inherits VerticalLayout {
+    in property <string> name;
+    alignment: center; spacing: 14px;
+    HorizontalLayout {
+        alignment: center;
+        Rectangle {
+            width: 56px; height: 56px; border-radius: 16px; background: Pneu.accent;
+            Image { accessible-role: none; x: 12px; y: 12px; width: 32px; height: 32px; source: Icons.check; colorize: white; }
+        }
+    }
+    Text {
+        text: "Paired with " + root.name; font-weight: 600; color: Pneu.text;
+        horizontal-alignment: center; overflow: elide;
+    }
+}
+
+component Busy inherits VerticalLayout {
+    in property <string> text;
+    in property <bool> motion;
+    alignment: center; spacing: 16px;
+    HorizontalLayout { alignment: center; PneuSpinner { motion: root.motion; } }
+    Text { text: root.text; color: Pneu.text; horizontal-alignment: center; overflow: elide; }
+}
+
+component Notice inherits VerticalLayout {
+    in property <image> icon;
+    in property <string> text;
+    alignment: center; spacing: 16px;
+    HorizontalLayout { alignment: center; Image { accessible-role: none; source: root.icon; colorize: Pneu.text2; width: 44px; height: 44px; } }
+    Text { text: root.text; color: Pneu.text; horizontal-alignment: center; wrap: word-wrap; }
+}
+
+component PopupCard inherits Rectangle {
+    in property <length> card-width: 320px;
+    in property <length> limit;
+    background: Pneu.dim;
+    TouchArea {}
+    Card {
+        x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+        width: min(root.card-width, root.width - 32px);
+        height: max(0px, min(body.preferred-height, root.limit));
+        drop-shadow-blur: 28px; drop-shadow-offset-y: 8px; drop-shadow-color: Pneu.dark ? #000000B3 : #14161A33;
+        body := VerticalLayout {
+            padding: 20px; spacing: 0px;
+            @children
+        }
+    }
+}
+
+export component PneuWindow inherits Window {
+    title: "Pneu";
+    out property <DropGeometry> drop-geometry: {
+        x: drop-list.absolute-position.x / 1px, y: drop-list.absolute-position.y / 1px,
+        width: drop-list.width / 1px, height: drop-list.height / 1px, scroll: drop-list.viewport-y / 1px
+    };
+    icon: @image-url("../../../assets/pneu.svg");
+    background: Palette.background;
+    // Keep the last real QR size across invitation/pairing transitions.
+    private property <int> last-qr-size: 292;
+    changed qr => { if root.qr.width > 0 { root.last-qr-size = root.qr.width; } }
+    private property <image> qr: Ui.page == Page.code ? Ui.code-qr : Ui.qr;
+    private property <length> qr-card-height: last-qr-size * 1px + 28px;
+    private property <length> pairing-height: qr-card-height + 12px + caption.preferred-height;
+    private property <length> window-width: max(400px, last-qr-size * 1px + 60px);
+    private property <length> max-window-height: 720px;
+    private property <bool> copied;
+    private property <bool> device-ready: Ui.device.id == Ui.device-id && Ui.device-id != "" && Ui.device-revision == Ui.navigation-revision;
+    private property <bool> modal-open: Ui.dialog != Dialog.none;
+    changed modal-open => { Interaction.modal-open = root.modal-open; }
+    min-width: window-width; max-width: window-width;
+    out property <length> content-height: min(body.preferred-height, max-window-height);
+    min-height: content-height;
+    max-height: content-height;
+
+    caption := Text { text: "Scan with Pneu on your phone"; visible: false; accessible-role: none; }
+    title-line := Text { text: "Ag"; font-size: Pneu.title-size; font-weight: 700; visible: false; accessible-role: none; }
+    text-line := Text { text: "Ag"; visible: false; accessible-role: none; }
+    // The platform clipboard is reached through an off-screen text field.
+    clipboard := TextInput { visible: false; single-line: true; accessible-role: none; }
+
+    public function go(page: Page) {
+        Ui.dialog = Dialog.none;
+        Ui.page = page;
+        flick.viewport-y = 0;
+        Ui.navigated();
+        keys.focus();
+    }
+    public function open-device(id: string) {
+        Ui.device-id = id;
+        root.go(Page.device);
+    }
+    public function open-add(tab: int) {
+        Ui.add-tab = tab;
+        root.go(Page.add);
+    }
+    public function open-code() {
+        root.go(Page.code);
+        Ui.show-code();
+    }
+    public function back() {
+        if Ui.page == Page.code || Ui.page == Page.scan { root.open-add(1); }
+        else if Ui.page == Page.add && Ui.first-run { root.close-window(); }
+        else if Ui.page != Page.main { root.go(Page.main); }
+        else { root.close-window(); }
+    }
+    function close-window() {
+        Ui.dialog = Dialog.none;
+        Ui.close();
+    }
+    public function prepare-unpair() {
+        if !root.device-ready { return; }
+        Ui.unpair-id = Ui.device-id;
+        Ui.unpair-name = Ui.device.name;
+        Ui.dialog = Dialog.unpair;
+    }
+    public function submit-unpair() {
+        Ui.dialog = Dialog.none;
+        Ui.unpair(Ui.unpair-id);
+        keys.focus();
+    }
+    function dismiss() {
+        if Ui.dialog == Dialog.message {
+            Ui.message-action(Ui.message.action, Ui.message.secondary == "");
+        } else if Ui.dialog == Dialog.picker {
+            Ui.picker-cancel();
+        }
+        Ui.dialog = Dialog.none;
+        keys.focus();
+    }
+    function copy-link() {
+        clipboard.text = Ui.code-link;
+        clipboard.select-all();
+        clipboard.copy();
+        clipboard.text = "";
+        root.copied = true;
+        copied-timer.running = true;
+    }
+    function paste-link() {
+        clipboard.text = "";
+        clipboard.paste();
+        Ui.paste-link(clipboard.text);
+        clipboard.text = "";
+    }
+    public function probe-clipboard() {
+        clipboard.text = "";
+        clipboard.paste();
+        Ui.probed(clipboard.text);
+        clipboard.text = "";
+    }
+    copied-timer := Timer {
+        interval: 2s; running: false;
+        triggered => { root.copied = false; self.running = false; }
+    }
+
+    forward-focus: keys;
+    keys := FocusScope {
+        focus-gained(reason) => { WindowFocus.changed(true); }
+        focus-lost(reason) => { if reason == FocusReason.window-activation { WindowFocus.changed(false); } }
+        focus-on-tab-navigation: false;
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                if Ui.drop-active { Ui.drop-active = false; return accept; }
+                if Ui.dialog != Dialog.none { root.dismiss(); } else { root.back(); }
+                return accept;
+            }
+            return reject;
+        }
+        flick := Flickable {
+            viewport-height: max(self.height, body.preferred-height);
+            viewport-width: self.width;
+            body := VerticalLayout {
+                width: flick.width;
+                padding: 16px; spacing: 12px;
+                if Ui.error != "": Banner { text: Ui.error; }
+
+                // ---- Main page ----
+                if Ui.page == Page.main: VerticalLayout {
+                    spacing: 12px;
+                    LinkCard {
+                        summary: Ui.summary; motion: Ui.motion;
+                        text-line: text-line.preferred-height; title-line: title-line.preferred-height;
+                        HorizontalLayout {
+                            padding-top: 14px; spacing: 8px;
+                            PneuButton {
+                                text: "Send Files…"; icon: Icons.upload; kind: ButtonKind.tonal; wide: true;
+                                clicked => { Ui.send-files(""); }
+                            }
+                            if Ui.manual-clipboard: PneuButton {
+                                text: "Send Clipboard"; icon: Icons.send-clipboard; kind: ButtonKind.tonal; wide: true;
+                                clicked => { Ui.send-clipboard(); }
+                            }
+                        }
+                    }
+                    VerticalLayout {
+                        spacing: 6px;
+                        SectionLabel { text: "Devices"; }
+                        Card {
+                            VerticalLayout {
+                                for item[i] in Ui.devices: VerticalLayout {
+                                    if i > 0: Divider {}
+                                    DeviceRow { item: item; clicked => { root.open-device(item.id); } }
+                                }
+                                if Ui.devices.length > 0: Divider {}
+                                NavRow {
+                                    accessible-label: "Add Device…";
+                                    min-height: 56px;
+                                    clicked => { root.open-add(0); }
+                                    HorizontalLayout {
+                                        padding-top: 10px; padding-bottom: 10px; padding-left: 12px; padding-right: 12px; spacing: 12px;
+                                        GhostTile {}
+                                        Text { text: "Add Device…"; font-weight: 600; color: Pneu.accent-text; vertical-alignment: center; horizontal-stretch: 1; }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if Ui.recent.length > 0: VerticalLayout {
+                        spacing: 6px;
+                        SectionLabel { text: "Recent"; }
+                        Card {
+                            VerticalLayout {
+                                for item[i] in Ui.recent: VerticalLayout {
+                                    if i > 0: Divider {}
+                                    RecentRow {
+                                        item: item;
+                                        clicked => { if item.can-open { Ui.open-item(item.id); } else if item.can-details { Ui.details-item(item.id); } }
+                                        cancel => { Ui.cancel-item(item.id); }
+                                        retry => { Ui.retry-item(item.id); }
+                                dismiss => { Ui.dismiss-item(item.id); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Card {
+                        NavRow {
+                            accessible-label: "Settings";
+                            clicked => { root.go(Page.settings); }
+                            Row {
+                                padding-top: 12px; padding-bottom: 12px;
+                                VerticalLayout { alignment: center; Image { accessible-role: none; width: 18px; height: 18px; source: Icons.settings; colorize: Pneu.text2; } }
+                                Text { text: "Settings"; color: Pneu.text; vertical-alignment: center; horizontal-stretch: 1; }
+                                VerticalLayout { alignment: center; Image { accessible-role: none; width: 16px; height: 16px; source: Icons.chevron-right; colorize: Pneu.text2; } }
+                            }
+                        }
+                    }
+                }
+
+                // ---- Device page ----
+                if Ui.page == Page.device: VerticalLayout {
+                    spacing: 12px;
+                    Header { title: Ui.device.name; go-back => { root.back(); } }
+                    LinkCard {
+                        summary: Ui.device-summary; motion: Ui.motion;
+                        text-line: text-line.preferred-height; title-line: title-line.preferred-height;
+                        HorizontalLayout {
+                            padding-top: 14px;
+                            if Ui.device-action == "send": PneuButton { enabled: root.device-ready;
+                                text: "Send Files…"; icon: Icons.upload; kind: ButtonKind.tonal; wide: true;
+                                clicked => { Ui.send-files(Ui.device-id); }
+                            }
+                            if Ui.device-action == "pair": PneuButton { enabled: root.device-ready;
+                                text: "Pair Again…"; icon: Icons.qr-code; kind: ButtonKind.primary; wide: true;
+                                clicked => { root.open-add(Ui.device.phone ? 0 : 1); }
+                            }
+                        }
+                    }
+                    if Ui.device-settings.length > 0 || Ui.device-note != "": VerticalLayout {
+                        spacing: 6px;
+                        SectionLabel { text: "Sharing"; }
+                        Card {
+                            VerticalLayout {
+                                for setting[i] in Ui.device-settings: VerticalLayout {
+                                    if i > 0: Divider {}
+                                    SwitchRow { enabled: root.device-ready;
+                                        label: setting.label; sub: setting.sub; checked: setting.on;
+                                        toggled(on) => { Ui.set-peer(setting.key, on); }
+                                    }
+                                }
+                                if Ui.device-note != "": Row {
+                                    Text { text: Ui.device-note; color: Pneu.text2; wrap: word-wrap; }
+                                }
+                            }
+                        }
+                    }
+                    Card {
+                        PneuButton { enabled: root.device-ready; text: "Unpair…"; kind: ButtonKind.row; clicked => { root.prepare-unpair(); } }
+                    }
+                }
+
+                // ---- Add Device ----
+                if Ui.page == Page.add: VerticalLayout {
+                    spacing: 12px;
+                    if !Ui.first-run: Header { title: "Add Device"; go-back => { root.back(); } }
+                    Segmented {
+                        items: [{ label: "Phone", icon: Icons.smartphone }, { label: "Computer", icon: Icons.computer }];
+                        selected: Ui.add-tab;
+                        select(i) => { Ui.add-tab = i; Ui.navigated(); }
+                    }
+                    if Ui.paired != "": Done { height: root.pairing-height; name: Ui.paired; }
+                    if Ui.paired == "" && Ui.pairing != "": Busy {
+                        height: root.pairing-height; motion: Ui.motion; text: "Pairing with " + Ui.pairing + "…";
+                    }
+                    if Ui.paired == "" && Ui.pairing == "" && Ui.add-tab == 0: VerticalLayout {
+                        spacing: 12px;
+                        if Ui.network && Ui.qr.width > 0: HorizontalLayout { alignment: center; QrCard { qr: Ui.qr; } }
+                        if Ui.network && Ui.qr.width > 0: Text { text: caption.text; color: Pneu.text; horizontal-alignment: center; }
+                        if Ui.network && Ui.qr.width == 0: Rectangle { height: root.pairing-height; }
+                        if !Ui.network: Notice {
+                            height: root.pairing-height; icon: Icons.no-network; text: "Connect this PC to a network to pair";
+                        }
+                    }
+                    if Ui.paired == "" && Ui.pairing == "" && Ui.add-tab == 1: VerticalLayout {
+                        spacing: 12px;
+                        if Ui.offer != "": Card {
+                            border-width: 1.5px; border-color: Pneu.accent;
+                            VerticalLayout {
+                                padding-top: 16px; padding-bottom: 14px; padding-left: 14px; padding-right: 14px; spacing: 0px;
+                                Link { state: { self-tone: Tone.neutral, tiles: [{ phone: false, tone: Tone.neutral, more: 0, slot: 0 }], slots: 1, tube: Tube.idle, capsule: 0 }; motion: Ui.motion; }
+                                Rectangle { height: 12px; }
+                                Text {
+                                    text: "Pair with " + Ui.offer + "?"; font-size: Pneu.title-size; font-weight: 700; color: Pneu.text;
+                                    horizontal-alignment: center; overflow: elide;
+                                }
+                                Text { text: "Link on the clipboard"; color: Pneu.text2; horizontal-alignment: center; }
+                                HorizontalLayout {
+                                    padding-top: 14px; spacing: 8px; alignment: center;
+                                    PneuButton { text: "Not Now"; clicked => { Ui.offer-dismiss(); } }
+                                    PneuButton { text: "Pair"; kind: ButtonKind.primary; clicked => { Ui.offer-pair(); } }
+                                }
+                            }
+                        }
+                        Card {
+                            VerticalLayout {
+                                NavRow {
+                                    accessible-label: "Show Pairing Code";
+                                    accessible-description: "For the other computer to use";
+                                    min-height: 56px;
+                                    clicked => { root.open-code(); }
+                                    HorizontalLayout {
+                                        padding-top: 10px; padding-bottom: 10px; padding-left: 12px; padding-right: 12px; spacing: 12px;
+                                        VerticalLayout { alignment: center; Tile { icon: Icons.qr-code; tone: Tone.accent; } }
+                                        VerticalLayout {
+                                            alignment: center; horizontal-stretch: 1;
+                                            Text { text: "Show Pairing Code"; font-weight: 600; color: Pneu.text; overflow: elide; }
+                                            Text { text: "For the other computer to use"; font-size: Pneu.label-size; color: Pneu.text2; overflow: elide; }
+                                        }
+                                        VerticalLayout { alignment: center; Image { accessible-role: none; width: 16px; height: 16px; source: Icons.chevron-right; colorize: Pneu.text2; } }
+                                    }
+                                }
+                                if Ui.offer == "": Divider {}
+                                if Ui.offer == "": NavRow {
+                                    accessible-label: "Paste Link";
+                                    accessible-description: "Copied from the other computer";
+                                    min-height: 56px;
+                                    clicked => { root.paste-link(); }
+                                    HorizontalLayout {
+                                        padding-top: 10px; padding-bottom: 10px; padding-left: 12px; padding-right: 12px; spacing: 12px;
+                                        VerticalLayout { alignment: center; Tile { icon: Icons.paste; tone: Tone.accent; } }
+                                        VerticalLayout {
+                                            alignment: center; horizontal-stretch: 1;
+                                            Text { text: "Paste Link"; font-weight: 600; color: Pneu.text; overflow: elide; }
+                                            Text { text: "Copied from the other computer"; font-size: Pneu.label-size; color: Pneu.text2; overflow: elide; }
+                                        }
+                                        VerticalLayout { alignment: center; Image { accessible-role: none; width: 16px; height: 16px; source: Icons.chevron-right; colorize: Pneu.text2; } }
+                                    }
+                                }
+                                if Ui.is-mac && Ui.camera-available: Divider {}
+                                if Ui.is-mac && Ui.camera-available: NavRow {
+                                    accessible-label: "Scan QR Code"; min-height: 56px;
+                                    accessible-description: "On the other computer's screen";
+                                    clicked => { root.go(Page.scan); Ui.scan-qr(); }
+                                    HorizontalLayout {
+                                        padding-top: 10px; padding-bottom: 10px; padding-left: 12px; padding-right: 12px; spacing: 12px;
+                                        VerticalLayout { alignment: center; Tile { icon: Icons.camera; tone: Tone.accent; } }
+                                        VerticalLayout {
+                                            alignment: center; horizontal-stretch: 1;
+                                            Text { text: "Scan QR Code"; font-weight: 600; color: Pneu.text; overflow: elide; }
+                                            Text { text: "On the other computer's screen"; font-size: Pneu.label-size; color: Pneu.text2; overflow: elide; }
+                                        }
+                                        VerticalLayout { alignment: center; Image { accessible-role: none; width: 16px; height: 16px; source: Icons.chevron-right; colorize: Pneu.text2; } }
+                                    }
+                                }
+
+                            }
+                        }
+                    }
+                }
+
+                if Ui.is-mac && Ui.page == Page.scan: VerticalLayout {
+                    spacing: 12px;
+                    Header { title: "Scan QR Code"; go-back => { root.back(); } }
+                    if Ui.paired != "": Done { height: root.pairing-height; name: Ui.paired; }
+                    if Ui.paired == "" && (Ui.scan-state == ScanState.requesting || Ui.scan-state == ScanState.scanning): VerticalLayout {
+                        spacing: 12px;
+                        Rectangle {
+                            height: 250px;
+                            background: #16181C; border-radius: 10px; clip: true;
+                            Image { source: Ui.camera-preview; width: parent.width; height: parent.height; image-fit: cover; accessible-role: none; }
+                            // The viewfinder is decorative; the whole frame is decoded.
+                            Image {
+                                x: (parent.width - 150px) / 2; y: (parent.height - 150px) / 2;
+                                width: 150px; height: 150px; source: Icons.scan-corners; accessible-role: none;
+                            }
+                        }
+                        Text { text: "Show the other computer's code to the camera"; color: Pneu.text; horizontal-alignment: center; wrap: word-wrap; }
+                    }
+                    if Ui.paired == "" && Ui.scan-state == ScanState.denied: VerticalLayout {
+                        height: root.pairing-height; alignment: center; spacing: 16px;
+                        Notice { icon: Icons.camera-off; text: "Pneu can't use the camera"; }
+                        HorizontalLayout { alignment: center;
+                            PneuButton { text: "Open System Settings"; clicked => { Ui.system-settings("camera"); } }
+                        }
+                    }
+                    if Ui.paired == "" && (Ui.scan-state == ScanState.unavailable || Ui.scan-state == ScanState.failed): VerticalLayout {
+                        height: root.pairing-height; alignment: center; spacing: 16px;
+                        Notice { icon: Icons.camera-off; text: Ui.scan-state == ScanState.unavailable ? "No camera available" : "Pneu can't use the camera"; }
+                        HorizontalLayout { alignment: center;
+                            PneuButton { text: "Try Again"; clicked => { Ui.scan-qr(); } }
+                        }
+                    }
+                }
+
+                // ---- Pairing Code ----
+                if Ui.page == Page.code: VerticalLayout {
+                    spacing: 12px;
+                    Header { title: "Pairing Code"; go-back => { root.back(); } }
+                    if Ui.code-state == CodeState.showing && Ui.code-link == "": Rectangle { height: root.pairing-height; }
+                    if Ui.code-state == CodeState.showing && Ui.code-link != "": VerticalLayout {
+                        spacing: 12px;
+                        HorizontalLayout { alignment: center; QrCard { qr: Ui.code-qr; } }
+                        Text { text: "Scan it or paste the link on the other computer"; color: Pneu.text; horizontal-alignment: center; wrap: word-wrap; }
+                        HorizontalLayout {
+                            alignment: center;
+                            PneuButton {
+                                text: root.copied ? "Copied" : "Copy Link"; icon: root.copied ? Icons.check : Icons.copy;
+                                kind: ButtonKind.tonal;
+                                clicked => { root.copy-link(); }
+                            }
+                        }
+                        Text { text: Ui.code-expires; font-size: Pneu.label-size; color: Pneu.text2; horizontal-alignment: center; }
+                    }
+                    if Ui.code-state == CodeState.expired: VerticalLayout {
+                        height: root.pairing-height; alignment: center; spacing: 16px;
+                        HorizontalLayout { alignment: center; Image { accessible-role: none; source: Icons.schedule; colorize: Pneu.text2; width: 44px; height: 44px; } }
+                        Text { text: "This code expired"; color: Pneu.text; horizontal-alignment: center; }
+                        HorizontalLayout {
+                            alignment: center;
+                            PneuButton { text: "New Code"; kind: ButtonKind.primary; clicked => { Ui.new-code(); } }
+                        }
+                    }
+                    if Ui.code-state == CodeState.offline: VerticalLayout {
+                        height: root.pairing-height; alignment: center; spacing: 16px;
+                        Notice { icon: Icons.no-network; text: Ui.code-error != "" ? Ui.code-error : "Connect this PC to a network to pair"; }
+                        HorizontalLayout { alignment: center;
+                            PneuButton { text: "Try Again"; clicked => { Ui.show-code(); } }
+                        }
+                    }
+                    if Ui.code-state == CodeState.pairing: Busy {
+                        height: root.pairing-height; motion: Ui.motion; text: "Pairing with " + Ui.pairing + "…";
+                    }
+                    if Ui.code-state == CodeState.paired: Done { height: root.pairing-height; name: Ui.paired; }
+                }
+
+                // ---- Settings ----
+                if Ui.page == Page.settings: VerticalLayout {
+                    spacing: 12px;
+                    Header { title: "Settings"; go-back => { root.back(); } }
+                    VerticalLayout {
+                        spacing: 6px;
+                        SectionLabel { text: "Clipboard"; }
+                        Card {
+                            VerticalLayout {
+                                VerticalLayout {
+                                    padding-top: 12px; padding-bottom: 12px; padding-left: 14px; padding-right: 14px; spacing: 8px;
+                                    Text { text: "Share clipboard"; color: Pneu.text; }
+                                    Segmented {
+                                        accessible-label: "Share clipboard";
+                                        items: [{ label: "Automatically" }, { label: "Manually" }, { label: "Off" }];
+                                        selected: Ui.clipboard-mode;
+                                        select(i) => { Ui.set-mode(i); }
+                                    }
+                                }
+                                Divider {}
+                                SwitchRow {
+                                    label: "Include images"; checked: Ui.include-images; enabled: Ui.clipboard-mode != 2;
+                                    toggled(on) => { Ui.set-flag("clipboard_include_images", on); }
+                                }
+                            }
+                        }
+                    }
+                    VerticalLayout {
+                        spacing: 6px;
+                        SectionLabel { text: "Sending"; }
+                        Card {
+                            VerticalLayout {
+                                SwitchRow {
+                                    label: "Choose devices each time"; checked: Ui.choose-each-time;
+                                    toggled(on) => { Ui.set-flag("choose_devices_each_time", on); }
+                                }
+                                Divider {}
+                                SwitchRow {
+                                    label: "Queue for offline devices"; checked: Ui.queue-offline;
+                                    toggled(on) => { Ui.set-flag("queue_offline", on); }
+                                }
+                            }
+                        }
+                    }
+                    VerticalLayout {
+                        spacing: 6px;
+                        SectionLabel { text: "Received files"; }
+                        Card {
+                            VerticalLayout {
+                                SwitchRow {
+                                    label: "Save to folder"; checked: Ui.save-to-folder;
+                                    toggled(on) => { Ui.set-flag("save_to_folder", on); }
+                                }
+                                Divider {}
+                                Row {
+                                    VerticalLayout {
+                                        horizontal-stretch: 1; spacing: 2px;
+                                        Text { text: "Save to"; font-size: Pneu.label-size; color: Pneu.text2; }
+                                        Text { text: Ui.folder; color: Pneu.text; overflow: elide; }
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        PneuButton { text: "Change…"; clicked => { Ui.choose-folder(); } }
+                                    }
+                                }
+                                Divider {}
+                                SwitchRow {
+                                    label: "Show notifications"; checked: Ui.notifications;
+                                    toggled(on) => { Ui.set-flag("notification_preview", on); }
+                                }
+                                Divider {}
+                                SwitchRow {
+                                    label: "Copy images to clipboard"; checked: Ui.copy-images;
+                                    toggled(on) => { Ui.set-flag("copy_image_to_clipboard", on); }
+                                }
+                                Divider {}
+                                SwitchRow {
+                                    label: Ui.is-mac ? "Open in Preview" : "Open in image viewer"; checked: Ui.viewer;
+                                    toggled(on) => { Ui.set-flag("open_in_viewer", on); }
+                                }
+                            }
+                        }
+                    }
+                    VerticalLayout {
+                        spacing: 6px;
+                        SectionLabel { text: Ui.is-mac ? "This Mac" : "This computer"; }
+                        Card {
+                            Row {
+                                VerticalLayout {
+                                    horizontal-stretch: 1; spacing: 2px;
+                                    Text { text: "Name"; font-size: Pneu.label-size; color: Pneu.text2; }
+                                    Text { text: Ui.name; color: Pneu.text; overflow: elide; }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    PneuButton {
+                                        text: "Rename…";
+                                        clicked => { Ui.rename-text = Ui.name; Ui.dialog = Dialog.rename; }
+                                    }
+                                }
+                            }
+                        }
+                        if Ui.is-mac: Card {
+                            VerticalLayout {
+                                SwitchRow {label: "Open at login"; checked: Ui.login-enabled; enabled: !Ui.login-busy; toggled(on) => {Ui.login(on);} }
+                                if Ui.login-error != "": Row { Text {text: Ui.login-error; color: Pneu.danger; wrap: word-wrap;} }
+                                if Ui.login-pending || Ui.login-error != "": Row {
+                                    PneuButton {text: "Open System Settings"; clicked => {Ui.system-settings("login");} }
+                                }
+                            }
+                        }
+
+                    }
+                }
+            }
+        }
+        // A thin scrollbar appears only when the page is taller than the window.
+        if flick.viewport-height > flick.height + 1px: Rectangle {
+            x: parent.width - 6px; width: 3px; border-radius: 1.5px;
+            height: max(24px, flick.height * flick.height / flick.viewport-height);
+            y: (flick.height - self.height) * (-flick.viewport-y / (flick.viewport-height - flick.height));
+            background: Pneu.text2; opacity: 0.35;
+        }
+
+        drop-overlay := Rectangle {
+            visible: Ui.is-mac && Ui.drop-active;
+            x: 0; y: 0; width: root.width; height: root.height;
+            background: Pneu.dim;
+            TouchArea {}
+            Rectangle {
+                x: 16px; y: 16px; width: parent.width - 32px;
+                height: min(parent.height - 32px, Ui.drop-items.length * 56px + 24px);
+                background: Pneu.card; border-color: Pneu.card-border; border-width: 1px; border-radius: 10px;
+                drop-list := Flickable {
+                    x: 12px; y: 12px; width: parent.width - 24px; height: parent.height - 24px;
+                    viewport-height: Ui.drop-items.length * 56px;
+                    for item[index] in Ui.drop-items: Rectangle {
+                        y: index * 56px; width: drop-list.width; height: 56px;
+                        border-radius: 8px;
+                        background: Ui.drop-hover == index && item.enabled ? Pneu.accent-soft : transparent;
+                        border-color: Ui.drop-hover == index && item.enabled ? Pneu.accent : transparent; border-width: 1px;
+                        Text { x: 12px; width: parent.width - 24px; height: parent.height; text: item.name;
+                            color: item.enabled ? Pneu.text : Pneu.text2; overflow: elide; vertical-alignment: center; }
+                    }
+                }
+            }
+        }
+
+        // ---- Popups ----
+        if Ui.dialog == Dialog.unpair: PopupCard {
+            limit: root.height - 32px;
+            Text {
+                text: "Unpair " + Ui.unpair-name + "?";
+                font-size: Pneu.title-size; font-weight: 700; color: Pneu.text;
+                overflow: elide;
+            }
+            Rectangle { height: 20px; }
+            HorizontalLayout {
+                spacing: 8px; alignment: end;
+                PneuButton { dialog-control: true; text: "Cancel"; autofocus: true; clicked => { root.dismiss(); } }
+                PneuButton { dialog-control: true; text: "Unpair"; kind: ButtonKind.danger; clicked => { root.submit-unpair(); } }
+            }
+        }
+        if Ui.dialog == Dialog.rename: PopupCard {
+            limit: root.height - 32px;
+            Text { text: Ui.is-mac ? "Rename This Mac" : "Rename this computer"; font-size: Pneu.title-size; font-weight: 700; color: Pneu.text; }
+            Rectangle { height: 14px; }
+            TextField {
+                text <=> Ui.rename-text;
+                label: "Computer name";
+                accepted => { if Ui.valid-name(Ui.rename-text) { Ui.dialog = Dialog.none; Ui.rename(Ui.rename-text); keys.focus(); } }
+                autofocus: true;
+            }
+            Rectangle { height: 20px; }
+            HorizontalLayout {
+                spacing: 8px; alignment: end;
+                PneuButton { dialog-control: true; text: "Cancel"; clicked => { root.dismiss(); } }
+                PneuButton { dialog-control: true;
+                    text: "Rename"; kind: ButtonKind.primary;
+                    enabled: Ui.valid-name(Ui.rename-text);
+                    clicked => { if Ui.valid-name(Ui.rename-text) { Ui.dialog = Dialog.none; Ui.rename(Ui.rename-text); keys.focus(); } }
+                }
+            }
+        }
+        if Ui.dialog == Dialog.picker: PopupCard {
+            card-width: 352px;
+            limit: root.height - 32px;
+            Text { text: Ui.picker-title; font-size: Pneu.title-size; font-weight: 700; color: Pneu.text; overflow: elide; }
+            Rectangle { height: 10px; }
+            Rectangle {
+                height: min(picker-list.preferred-height, max(56px, root.height - 200px));
+                picker-flick := Flickable {
+                    viewport-height: picker-list.preferred-height;
+                    picker-list := VerticalLayout {
+                        width: picker-flick.width;
+                        for pick[i] in Ui.picks: VerticalLayout {
+                            if i > 0: Divider { inset: 8px; }
+                            NavRow { dialog-control: true;
+                                enabled: pick.eligible;
+                                accessible-role: checkbox;
+                                accessible-checked: pick.checked;
+                                accessible-label: pick.name;
+                                accessible-description: pick.status;
+                                clicked => {
+                                    if !pick.eligible { return; }
+                                    Ui.picker-count += pick.checked ? -1 : 1;
+                                    Ui.picks[i].checked = !pick.checked;
+                                }
+                                HorizontalLayout {
+                                    padding-top: 8px; padding-bottom: 8px; padding-left: 8px; padding-right: 8px; spacing: 12px;
+                                    opacity: pick.eligible ? 1 : 0.45;
+                                    VerticalLayout { alignment: center; Tile { icon: pick.phone ? Icons.smartphone : Icons.computer; tone: pick.tone; } }
+                                    VerticalLayout {
+                                        alignment: center; horizontal-stretch: 1;
+                                        Text { text: pick.name; font-weight: 600; color: Pneu.text; overflow: elide; }
+                                        Text {
+                                            text: pick.eligible && !pick.connected && pick.checked ? "Sends when connected" : pick.status;
+                                            font-size: Pneu.label-size; color: Pneu.text2; overflow: elide;
+                                        }
+                                    }
+                                    VerticalLayout { alignment: center; Checkbox { checked: pick.checked; enabled: pick.eligible; } }
+                                }
+                            }
+                        }
+                    }
+                }
+                if picker-flick.viewport-height > picker-flick.height + 1px: Rectangle {
+                    x: parent.width + 9px; width: 3px; border-radius: 1.5px;
+                    height: max(24px, picker-flick.height * picker-flick.height / picker-flick.viewport-height);
+                    y: (picker-flick.height - self.height) * (-picker-flick.viewport-y / (picker-flick.viewport-height - picker-flick.height));
+                    background: Pneu.text2; opacity: 0.35;
+                }
+            }
+            Rectangle { height: 18px; }
+            HorizontalLayout {
+                spacing: 8px; alignment: end;
+                PneuButton { dialog-control: true; text: "Cancel"; autofocus: true; clicked => { root.dismiss(); } }
+                PneuButton { dialog-control: true;
+                    text: "Send"; kind: ButtonKind.primary;
+                    enabled: Ui.picker-count > 0;
+                    clicked => { Ui.dialog = Dialog.none; Ui.picker-send(); keys.focus(); }
+                }
+            }
+        }
+        if Ui.dialog == Dialog.message: PopupCard {
+            card-width: 352px;
+            limit: root.height - 32px;
+            if Ui.message.tile != 0: HorizontalLayout {
+                padding-bottom: 12px; alignment: start;
+                Tile {
+                    size: 44px; icon-size: 22px;
+                    icon: Ui.message.tile == 3 ? Icons.error : Ui.message.tile == 2 ? Icons.smartphone : Icons.computer;
+                    tone: Ui.message.tile == 3 ? Tone.danger : Tone.accent;
+                }
+            }
+            Text { text: Ui.message.title; font-size: Pneu.title-size; font-weight: 700; color: Pneu.text; wrap: word-wrap; }
+            if Ui.message.text != "": Rectangle { height: 6px; }
+            if Ui.message.text != "": Text { text: Ui.message.text; color: Pneu.text2; wrap: word-wrap; }
+            Rectangle { height: 18px; }
+            HorizontalLayout {
+                spacing: 8px; alignment: end;
+                if Ui.message.secondary != "": PneuButton { dialog-control: true;
+                    text: Ui.message.secondary;
+                    autofocus: true;
+                    clicked => { Ui.dialog = Dialog.none; Ui.message-action(Ui.message.action, false); keys.focus(); }
+                }
+                PneuButton { dialog-control: true;
+                    text: Ui.message.primary; kind: ButtonKind.primary;
+                    autofocus: Ui.message.secondary == "";
+                    clicked => { Ui.dialog = Dialog.none; Ui.message-action(Ui.message.action, true); keys.focus(); }
+                }
+            }
+        }
+
+        if Ui.dialog == Dialog.details: PopupCard {
+            card-width: 352px; limit: root.height - 32px;
+            Text { text: Ui.details-title; font-size: Pneu.title-size; font-weight: 700; color: Pneu.text; overflow: elide; }
+            Rectangle { height: 10px; }
+            Rectangle {
+                height: min(details-list.preferred-height, max(56px, root.height - 170px));
+                Flickable {
+                    viewport-height: details-list.preferred-height;
+                    details-list := VerticalLayout {
+                        for recipient[i] in Ui.recipients: VerticalLayout {
+                            if i > 0: Divider { inset: 8px; }
+                            HorizontalLayout {
+                                padding: 8px; spacing: 12px;
+                                VerticalLayout { alignment: center; Tile { icon: recipient.phone ? Icons.smartphone : Icons.computer; tone: recipient.tone; } }
+                                VerticalLayout {
+                                    alignment: center; horizontal-stretch: 1;
+                                    Text { text: recipient.name; font-weight: 600; color: Pneu.text; overflow: elide; }
+                                    Text { text: recipient.detail; font-size: Pneu.label-size; color: recipient.tone == Tone.danger ? Pneu.danger : Pneu.text2; wrap: word-wrap; }
+                                    if recipient.progress >= 0: ProgressBar { value: recipient.progress; }
+                                }
+                                if recipient.can-retry: VerticalLayout { alignment: center;
+                                    IconButton { dialog-control: true; icon: Icons.refresh; label: "Retry sending to " + recipient.name;
+                                        clicked => { Ui.recipient-action(recipient.item, recipient.device, true); } }
+                                }
+                                if recipient.can-stop: VerticalLayout { alignment: center;
+                                    IconButton { dialog-control: true; icon: Icons.close; label: "Stop sending to " + recipient.name;
+                                        clicked => { Ui.recipient-action(recipient.item, recipient.device, false); } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Rectangle { height: 18px; }
+            HorizontalLayout { alignment: end;
+                PneuButton { dialog-control: true; text: "Close"; autofocus: true; clicked => { root.dismiss(); } }
+            }
+        }
+
+    }
+}

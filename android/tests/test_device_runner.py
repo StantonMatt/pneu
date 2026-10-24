@@ -1,4 +1,5 @@
 """Focused host-only checks; run with PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests."""
+import ast
 import contextlib
 import importlib.util
 import io
@@ -36,6 +37,89 @@ class DeviceRunnerTest(unittest.TestCase):
         runner.logs.clear()
         runner.keys.clear()
 
+    def test_fresh_certificate_waits_for_verifier_clock_not_host_clock(self):
+        # A fresh host leaf can be a second in the future on Android. The
+        # verifier's clock must cross notBefore before a peer is started.
+        clocks = [subprocess.CompletedProcess([], 0, stdout=str(value)) for value in (99, 99, 100)]
+        with patch.object(runner, 'run', side_effect=clocks) as command, \
+             patch.object(runner.time, 'monotonic', return_value=0), \
+             patch.object(runner.time, 'time', return_value=1000), \
+             patch.object(runner.time, 'sleep') as sleep:
+            runner.await_certificate_valid_on_device(100)
+        self.assertEqual(command.call_count, 3)
+        self.assertTrue(all(call.args[0] == ['adb', 'shell', 'date', '+%s'] for call in command.call_args_list))
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_certificate_clock_wait_is_bounded_and_does_not_delay_valid_leaf(self):
+        for clock, expires in ((99, True), (100, False), (101, False)):
+            with self.subTest(clock=clock), \
+                 patch.object(runner, 'run', return_value=subprocess.CompletedProcess([], 0, stdout=str(clock))), \
+                 patch.object(runner.time, 'monotonic', side_effect=[0, 5]), \
+                 patch.object(runner.time, 'sleep') as sleep:
+                if expires:
+                    with self.assertRaisesRegex(TimeoutError, 'not yet valid'):
+                        runner.await_certificate_valid_on_device(100)
+                else:
+                    runner.await_certificate_valid_on_device(100)
+                sleep.assert_not_called()
+
+    def test_cold_offline_text_waits_for_rejection_without_requiring_a_queue_row(self):
+        response = subprocess.CompletedProcess([], 0, stdout='')
+        marker = 'cold-text-test-marker'
+        def command(cmd, **kwargs):
+            if cmd[-1] == 'files/cold-share.json':
+                return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({'text': 'cold text'}))
+            if 'logcat' in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout=marker + '\nshare_rejected: no_recipient\n')
+            return response
+        with patch.object(runner, 'restore'), patch.object(runner, 'instrument') as instrument, \
+             patch.object(runner, 'run', side_effect=command), \
+             patch.object(runner.subprocess, 'run', return_value=response), \
+             patch.object(runner, 'snapshot_rows', return_value=[]), \
+             patch('uuid.uuid4', return_value=Mock(hex='test-marker')), \
+             patch.object(runner.time, 'sleep'), \
+             patch.object(runner.time, 'monotonic', side_effect=[0, 0, 13]):
+            runner.cold_share('text', 'prepare', 'verify')
+        self.assertEqual(instrument.call_count, 2)
+        evidence = json.loads((self.scratch / 'cold-text-evidence.json').read_text())
+        self.assertEqual(evidence['rejection'], 'no_recipient')
+        self.assertEqual(evidence['witnessed_rows_before_instrumentation'], [])
+
+    def test_empty_cold_text_queue_without_this_attempts_completion_is_not_success(self):
+        response = subprocess.CompletedProcess([], 0, stdout='')
+        def command(cmd, **kwargs):
+            if cmd[-1] == 'files/cold-share.json':
+                return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({'text': 'cold text'}))
+            if 'logcat' in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout='old-marker\nshare_rejected: no_recipient\n')
+            return response
+        with patch.object(runner, 'restore'), patch.object(runner, 'instrument') as instrument, \
+             patch.object(runner, 'run', side_effect=command), \
+             patch.object(runner.subprocess, 'run', return_value=response), \
+             patch.object(runner, 'snapshot_rows', return_value=[]), \
+             patch('uuid.uuid4', return_value=Mock(hex='test-marker')), \
+             patch.object(runner.time, 'sleep'), \
+             patch.object(runner.time, 'monotonic', side_effect=[0, 0, 13]):
+            with self.assertRaisesRegex(AssertionError, 'did not finish with no_recipient'):
+                runner.cold_share('text', 'prepare', 'verify')
+        instrument.assert_called_once_with('cold-text-prepare', 'prepare', ['-e', 'mode', 'text'])
+
+    def test_cold_file_witnesses_still_require_the_expected_delivery_count(self):
+        for mode, count in (('single', 1), ('multiple', 2)):
+            with self.subTest(mode=mode):
+                response = subprocess.CompletedProcess([], 0, stdout='')
+                data = json.dumps({'uri': 'content://fixture', 'text': 'unused'})
+                def command(cmd, **kwargs):
+                    return subprocess.CompletedProcess(cmd, 0, stdout=data if cmd[-1] == 'files/cold-share.json' else '')
+                with patch.object(runner, 'restore'), patch.object(runner, 'instrument') as instrument, \
+                     patch.object(runner, 'run', side_effect=command), \
+                     patch.object(runner.subprocess, 'run', return_value=response), \
+                     patch.object(runner, 'snapshot_rows', return_value=[['file', 'waiting', 1, 'hash']] * count):
+                    runner.cold_share(mode, 'prepare', 'verify')
+                self.assertEqual(instrument.call_count, 2)
+                evidence = json.loads((self.scratch / ('cold-' + mode + '-evidence.json')).read_text())
+                self.assertEqual(count, len(evidence['witnessed_rows_before_instrumentation']))
+
     def test_failure_continues_and_summary_preserves_successful_runs(self):
         order = []
         def failing():
@@ -63,13 +147,16 @@ class DeviceRunnerTest(unittest.TestCase):
         cases = [runner.DeviceCase('broken-class', 'FirstTest', lambda test: runner.instrument('broken-class', test)),
                  runner.DeviceCase('later-class', 'SecondTest', lambda test: runner.instrument('later-class', test))]
         responses = [subprocess.CompletedProcess([], 0, 'FAILURES!!!\n', ''),
+                     subprocess.CompletedProcess([], 0, 'crash evidence\n', ''),
                      subprocess.CompletedProcess([], 0, 'OK (1 test)\n', '')]
         with patch.dict(runner.SUITES, {'same-suite': cases}, clear=True), \
              patch.object(runner, 'install'), patch.object(runner, 'cleanup'), \
              patch.object(runner.subprocess, 'run', side_effect=responses) as commands, \
              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             self.assertFalse(runner.run_suites(['same-suite'], self.scratch))
-        self.assertEqual(commands.call_count, 2)
+        self.assertEqual(commands.call_count, 3)
+        self.assertIn('logcat', commands.call_args_list[1].args[0])
+        self.assertEqual((self.scratch / 'same-suite/broken-class-logcat.log').read_text(), 'crash evidence\n')
         self.assertEqual(self.case_cleanup.call_args_list[0].args[1], True)
         self.assertEqual(self.case_cleanup.call_args_list[1].args[1], False)
         data = json.loads((self.scratch / 'results.json').read_text())
@@ -228,7 +315,7 @@ class DeviceRunnerTest(unittest.TestCase):
         sdk = self.scratch / 'sdk'
         adb = sdk / 'platform-tools/adb'
         adb.parent.mkdir(parents=True)
-        adb.write_text('#!/bin/sh\nexit 1\n')
+        adb.write_text('#!/bin/sh\nif [ "$3" = emu ]; then echo pneu-test; exit 0; fi\nexit 1\n')
         adb.chmod(0o700)
         evidence = self.scratch / 'evidence'
         env = dict(os.environ, ANDROID_HOME=str(sdk), PYTHONDONTWRITEBYTECODE='1')
@@ -252,7 +339,7 @@ class DeviceCoverageTest(unittest.TestCase):
             # Tests are ordinary top-level Kotlin classes with JUnit annotations.
             # Ignore comments so examples cannot appear as executable tests.
             text = re.sub(r'/\*.*?\*/|//[^\n]*', '', text, flags=re.S)
-            classes = list(re.finditer(r'^\s*(?:(?:internal|open|abstract)\s+)*class\s+(\w+)', text, re.M))
+            classes = list(re.finditer(r'^(?:(?:internal|open|abstract)\s+)*class\s+(\w+)', text, re.M))
             seen = 0
             for index, match in enumerate(classes):
                 end = classes[index + 1].start() if index + 1 < len(classes) else len(text)
@@ -278,6 +365,17 @@ class DeviceCoverageTest(unittest.TestCase):
         missing = {(cls, method) for cls, names in methods.items() for method in names} - selected
         self.assertFalse(missing, 'Full runner omits: ' + ', '.join(cls + '#' + method for cls, method in sorted(missing)))
 
+    def test_host_fixture_scripts_parse_before_device_execution(self):
+        for script in (Path(runner.root) / 'tools').glob('*.py'):
+            with self.subTest(script=script.name):
+                ast.parse(script.read_text(),filename=str(script))
+
+    def test_inventory_keeps_methods_after_local_helper_in_owning_test_class(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source=Path(directory) / 'Example.kt'
+            source.write_text('class Example {\n    @Test fun first() {}\n    class Helper {}\n    @Test fun second() {}\n}\n')
+            self.assertEqual(self.methods(Path(directory)), {'Example': {'first','second'}})
+
     def test_full_runner_selects_every_android_test_class_and_method(self):
         methods = self.methods(Path(runner.root) / 'app/src/androidTest')
         self.assertTrue(methods)
@@ -292,3 +390,58 @@ class DeviceCoverageTest(unittest.TestCase):
         methods['ConnectionFaultDeviceTest'].add('unselectedNewPeerScenario')
         with self.assertRaisesRegex(AssertionError, 'ConnectionFaultDeviceTest#unselectedNewPeerScenario'):
             self.assert_coverage(methods, runner.selected_device_tests())
+
+
+class EmulatorAuthorityTest(unittest.TestCase):
+    def test_every_adb_call_requires_the_verified_serial_and_environment(self):
+        serial = 'emulator-5580'
+        def suite(*_):
+            subprocess.run(['/sdk/adb', '-s', serial, 'shell', 'true'])
+            for command in (['/sdk/adb', 'shell', 'true'], ['/sdk/adb', '-s', 'real-phone', 'shell', 'true'], ['/sdk/adb', '-s', 'emulator-5554', 'shell', 'true']):
+                with self.assertRaisesRegex(RuntimeError, 'verified emulator'):
+                    subprocess.run(command)
+            os.environ['ANDROID_SERIAL'] = 'real-phone'
+            with self.assertRaisesRegex(RuntimeError, 'ANDROID_SERIAL changed'):
+                subprocess.run(['/sdk/adb', '-s', serial, 'shell', 'true'])
+            os.environ['ANDROID_SERIAL'] = serial
+            return True
+        with tempfile.TemporaryDirectory() as scratch, patch.dict(os.environ), \
+             patch.object(sys, 'argv', ['runner', 'local', '--serial', serial, '--scratch', scratch]), \
+             patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout='pneu-test\nOK\n')) as command, \
+             patch.object(runner, 'run_suites', side_effect=suite), patch.object(runner, 'cleanup'):
+            self.assertEqual(0, runner.main())
+            self.assertEqual(2, command.call_count)
+
+    def test_wrong_avd_is_rejected_before_install_or_cleanup(self):
+        with patch.dict(os.environ), patch.object(sys, 'argv', ['runner', '--serial', 'emulator-5580']), \
+             patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout='other-avd\nOK\n')) as command, \
+             patch.object(runner, 'run_suites') as suites, patch.object(runner, 'cleanup') as cleanup:
+            with self.assertRaises(SystemExit) as result:
+                runner.main()
+            self.assertEqual(2, result.exception.code)
+            self.assertEqual(1, command.call_count)
+            suites.assert_not_called();cleanup.assert_not_called()
+
+    def test_default_invocation_runs_all_suites_and_named_reruns_preserve_inventory(self):
+        original = {name: list(cases) for name, cases in runner.SUITES.items()}
+        for arguments in ([], ['local', '--cases', 'MultiComputerReviewDeviceTest']):
+            with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as scratch, \
+                 patch.dict(os.environ), patch.object(sys, 'argv', ['runner', '--serial', 'emulator-5580', '--scratch', scratch, *arguments]), \
+                 patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout='pneu-test\nOK\n')), \
+                 patch.object(runner, 'run_suites', return_value=True) as suites, patch.object(runner, 'cleanup'):
+                self.assertEqual(0, runner.main())
+                selected, _, cases = suites.call_args.args
+                if arguments:
+                    self.assertEqual(['local'], selected)
+                    self.assertEqual(['MultiComputerReviewDeviceTest'], [case.name for case in cases['local']])
+                else:
+                    self.assertEqual(list(original), selected)
+                    self.assertIsNone(cases)
+                self.assertEqual(original, runner.SUITES)
+
+    def test_real_phone_serial_is_rejected_before_any_command(self):
+        with patch.object(sys, 'argv', ['runner', 'local', '--serial', 'real-phone']), patch.object(subprocess, 'run') as command:
+            with self.assertRaises(SystemExit) as result:
+                runner.main()
+            self.assertEqual(2, result.exception.code)
+            command.assert_not_called()

@@ -34,21 +34,25 @@ class TwentyFirstPairingDeviceTest {
         ActivityScenario.launch<MainActivity>(Intent(c,MainActivity::class.java).setAction(Intent.ACTION_VIEW).setData(Uri.parse(raw))).use {scenario->
             compose.waitUntil(10000) {visible("Pair with Retry PC?")}
             compose.onNodeWithText("Pair").performClick()
-            compose.waitUntil(20000) {visible("Can't reach your PC") && visible("Try again")}
-            assertNull(app.preferences.read().pending);assertNull(app.preferences.read().peer)
+            try {compose.waitUntil(20000) {visible("Can't reach your computer") && visible("Try again")}}
+            finally {
+                val link=app.connection.state.value
+                i.sendStatus(0,android.os.Bundle().apply {putString("stream","Pair-rejection feedback: status=${link.status}, pairing=${link.pairing}, pending=${app.connection.attempt.value?.invitation!=null}, peers=${app.prefs.value.devices.size}\n")})
+            }
+            assertNull(app.connection.attempt.value?.invitation);assertNull(app.preferences.read().peer)
             assertEquals(1,PeerFixture.evidence().count {it.asJsonObject["event"].asString=="PAIR_REJECTED"})
             scenario.recreate()
-            compose.waitUntil(10000) {visible("Can't reach your PC") && visible("Try again")}
+            compose.waitUntil(10000) {visible("Can't reach your computer") && visible("Try again")}
             compose.onNodeWithText("Try again").performClick()
             compose.waitUntil(5000) {visible("Pair with Retry PC?")}
             // Re-presenting the invitation is not permission to send another request.
-            delay(300);assertNull(app.preferences.read().pending)
+            delay(300);assertNull(app.connection.attempt.value?.invitation)
             assertEquals(1,PeerFixture.evidence().count {it.asJsonObject["event"].asString=="PAIR_REJECTED"})
             assertEquals(0,PeerFixture.evidence().count {it.asJsonObject["event"].asString=="PAIR"})
             compose.onNodeWithText("Pair").performClick()
-            compose.waitUntil(5000) {app.prefs.value.pending==invitation || app.prefs.value.peer?.pin==invitation.fingerprint}
+            compose.waitUntil(5000) {app.connection.attempt.value?.invitation==invitation || app.prefs.value.peer?.pin==invitation.fingerprint}
             withTimeout(20000) {while(app.preferences.read().peer?.pin!=invitation.fingerprint || !app.connection.connected)delay(50)}
-            assertNull(app.preferences.read().pending)
+            assertNull(app.connection.attempt.value?.invitation)
             assertEquals(1,PeerFixture.evidence().count {it.asJsonObject["event"].asString=="PAIR"})
         }
     }

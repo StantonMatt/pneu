@@ -1,7 +1,7 @@
 package io.github.stantonmatt.pneu.data;
 import androidx.annotation.NonNull;
 import androidx.room.*;
-@Entity(tableName="receipts", primaryKeys={"peerId","transferId"})
+@Entity(tableName="receipts", primaryKeys={"peerId","transferId"}, indices={@Index(value={"peerId","origin"})})
 public class Receipt {
     @NonNull public String peerId="";
     @NonNull public String transferId="";
@@ -9,4 +9,6 @@ public class Receipt {
     @NonNull public String origin="clipboard";
     @NonNull public String state="pending";
     public long createdAt;
+    @NonNull @ColumnInfo(defaultValue="''") public String hlc="";
+    @NonNull @ColumnInfo(defaultValue="''") public String sourceDevice="";
 }

@@ -229,8 +229,13 @@ one-day default retention.
 `PcActions` isolates OS integration from protocol tests. Production uses zbus
 notifications with the approved text, actions, urgency and transient hints.
 File notifications use `x-kde-urls` for Plasma thumbnails; explicit clipboard
-images use a bounded inline image preview. Open/default and Show
-in folder actions are supported; Show uses FileManager1.ShowItems. Arrivals within
+images use a bounded inline image preview. Notification Open/default uses only
+its retained receive descriptor, including after the pathname is replaced or
+removed. Show in folder navigates the recorded pathname with FileManager1.ShowItems.
+Recent Open (both received and sent files) opens the current regular file at the
+recorded path, rejecting symlinks in every component. Its opened descriptor goes
+to the portal without an outbox size quota; edits and replacements are allowed.
+Recent is a navigation shortcut, not an identity guarantee. Arrivals within
 four seconds replace the notification with every item URL, latest first. Both
 the gap and 30-second lifetime use transfer arrival times, so action-queue
 delays cannot change grouping; clipboard debounce likewise uses offer arrival.

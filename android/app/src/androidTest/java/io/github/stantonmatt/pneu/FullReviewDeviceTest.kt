@@ -38,7 +38,7 @@ class FullReviewDeviceTest {
     private suspend fun seed(pin:String="a".repeat(64),name:String="Old") {
         val raw=invitation(pin,name)
         assertTrue(app.requestPairing(raw,app.preferences.flow.first().peer?.pin))
-        assertTrue(app.installBinding(Invitation.parse(raw),"d".repeat(32)))
+        assertTrue(DeviceFixture.installApprovedBinding(app,Invitation.parse(raw),"d".repeat(32)))
     }
     @Before fun setup()=runBlocking<Unit> {
         DeviceFixture.reset()
@@ -69,14 +69,14 @@ class FullReviewDeviceTest {
         try {received.receive(old.pcId,incoming(900),old);fail("Accepted obsolete session")}
         catch(_:java.io.IOException) {}
         assertFalse(app.enqueue(Outgoing().apply {mediaId=randomId();transferId=randomId()},old))
-        try {ManualEntries.text(app,"Old clipboard or shared text","clipboard",old);fail("Retargeted old text")}
+        try {DeviceFixture.text(app,"Old clipboard or shared text","clipboard",old);fail("Retargeted old text")}
         catch(e:ShareFailure) {assertEquals("binding_mismatch",e.reason)}
     }
     @Test(timeout=30000) fun defaultFileAdmissionPrecedesEvenMimeLookupAndSamePcRepairRevokesIt()=runBlocking<Unit> {
         val old=app.preferences.flow.first()
         val worker=async(Dispatchers.IO) {runCatching {ManualEntries.file(app,uri("slow-type"),"file")}}
         assertTrue(withContext(Dispatchers.IO) {control("entered").getBoolean("entered")})
-        app.forgetBinding();seed() // same pin and PC id, different phone identity
+        app.forgetBinding();seed() // same pin and PC id, new binding generation
         control("release");assertTrue(worker.await().isFailure);assertTrue(app.queue.pending().isEmpty())
         assertFalse(app.loseBinding(old.peer,old.deviceId));app.forgetBinding(old.peer,old.deviceId)
         assertNotNull(app.preferences.flow.first().peer)
@@ -107,6 +107,9 @@ class FullReviewDeviceTest {
     }
     private fun key(uri:Uri,video:Boolean)="external_primary:${MediaStore.getVersion(c,"external_primary")}:${if(video)"video" else "images"}:${ContentUris.parseId(uri)}"
     @Test(timeout=30000) fun publicationAndMovesAreDetectedForEveryWatchedFolderWithoutBacklogOrDuplicates()=runBlocking<Unit> {
+        DeviceFixture.connectLocalPeer(app)
+        val firstFrame=CompletableDeferred<Unit>()
+        app.connection.beforeFirstFrame={firstFrame.complete(Unit);awaitCancellation()}
         val old=insert(false,"Pictures/Pneu review/")
         app.preferences.toggle("photos",true);app.preferences.toggle("recordings",true)
         val observer=ScreenshotObserver(app);observer.scanOnce();observer.scanOnce()
@@ -114,7 +117,11 @@ class FullReviewDeviceTest {
             val source=insert(video,if(video)"Movies/Pneu review/" else "Pictures/Pneu review/")
             observer.scanOnce();assertNull(app.queue.find(key(source,video)))
             c.contentResolver.update(source,ContentValues().apply {put("relative_path",folder);put("is_pending",0)},null,null)
-            observer.scanOnce();val row=app.queue.find(key(source,video))!!
+            observer.scanOnce()
+            // The first image may publish its one permitted JPEG/new ID before
+            // the sender parks. Later rows wait behind it and cannot be prepared.
+            if(folder=="Pictures/Screenshots/")withTimeout(5000) {firstFrame.await()}
+            val row=app.queue.find(key(source,video))!!
             assertEquals("waiting",row.state)
             val transfer=row.transferId
             c.contentResolver.update(source,ContentValues().apply {put("_display_name","Moved_again_${System.nanoTime()}.${if(video)"mp4" else "png"}")},null,null)

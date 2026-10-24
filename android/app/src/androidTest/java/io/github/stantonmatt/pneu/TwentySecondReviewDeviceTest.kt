@@ -46,7 +46,7 @@ class TwentySecondReviewDeviceTest {
         c.contentResolver.update(uri,ContentValues().apply {put("is_pending",0)},null,null)
         return uri
     }
-    @Test(timeout=30000) fun offlineScreenshotsObeyQueueWhileOnlyMeteredMobileOffWaitsForWifi()=runBlocking<Unit> {
+    @Test(timeout=30000) fun offlineScreenshotsRequireExplicitQueueAndRetainRecipientWhenEnabled()=runBlocking<Unit> {
         var network=Connectivity.NONE
         val observer=ScreenshotObserver(app,connectivity={network})
         observer.scanOnce();observer.scanOnce()
@@ -55,10 +55,15 @@ class TwentySecondReviewDeviceTest {
             network=route;app.preferences.toggle("queue",queue);app.preferences.toggle("mobile",mobile)
             val uri=screenshot();observer.scanOnce()
             val key="external_primary:${MediaStore.getVersion(c,"external_primary")}:images:${ContentUris.parseId(uri)}"
-            val row=app.queue.find(key) ?: error("Observer did not record $route queue=$queue mobile=$mobile")
-            val expected=if(queue || (route==Connectivity.METERED && !mobile)) "waiting" else "skipped"
-            assertEquals("$route queue=$queue mobile=$mobile",expected,row.state)
-            assertEquals(expected=="waiting",File(row.path).isFile)
+            if(queue) {
+                val row=app.queue.find(key) ?: error("Explicit offline queue lost its recipient: $route mobile=$mobile")
+                assertEquals("waiting",row.state);assertTrue(File(row.path).isFile)
+                assertEquals(app.preferences.read().peer!!.deviceId,row.peerId)
+                assertEquals(app.preferences.read().peer!!.generation,row.bindingGeneration)
+            } else {
+                assertNull("No connected recipient and offline queue disabled",app.queue.find(key))
+                assertEquals("Skipped sources retain only dedupe",1,app.queue.seen(key))
+            }
         }
     }
     private val colors=listOf(Color.RED,Color.GREEN,Color.BLUE,Color.YELLOW)

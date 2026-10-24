@@ -17,11 +17,14 @@ import re
 import shutil
 import shlex
 import socket
+import ssl
 import sqlite3
 import subprocess
 import threading
 import time
 import traceback
+import sys
+import uuid
 import urllib.parse
 import xml.etree.ElementTree as ET
 
@@ -83,6 +86,9 @@ def instrument(name, test, extras=(), seconds=150):
         # Retry only explicit automation interference, never app crashes/assertions.
         interference = any(s in output for s in ['UiAutomation not connected', 'already registered!'])
         if not interference or attempt:
+            logcat = subprocess.run([*adb, 'logcat', '-d', '-t', '2000'], timeout=30,
+                                    capture_output=True, text=True)
+            (scratch / (name + '-logcat.log')).write_text(logcat.stdout + logcat.stderr)
             raise AssertionError(name)
         (scratch / (name + '-interference.log')).write_text(output)
         time.sleep(2)
@@ -152,7 +158,21 @@ def cert(stem):
          '-nodes', '-keyout', str(key), '-out', str(pem), '-days', '2', '-subj', '/CN=' + stem],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     der = run(['openssl', 'x509', '-in', str(pem), '-outform', 'DER'], capture_output=True).stdout
+    # The host and emulator can straddle a whole-second boundary. Do not start
+    # a TLS fixture until this freshly issued leaf is valid on the verifier's
+    # clock; production validity checks and rejection expectations stay intact.
+    validity = run(['openssl', 'x509', '-in', str(pem), '-startdate', '-noout'],
+                   capture_output=True, text=True).stdout.strip()
+    await_certificate_valid_on_device(ssl.cert_time_to_seconds(validity.removeprefix('notBefore=')))
     return pem, key, hashlib.sha256(der).hexdigest()
+
+
+def await_certificate_valid_on_device(not_before):
+    deadline = time.monotonic() + 5
+    while int(run([*adb, 'shell', 'date', '+%s'], capture_output=True, text=True).stdout.strip()) < not_before:
+        if time.monotonic() >= deadline:
+            raise TimeoutError('Fixture certificate is not yet valid on the emulator clock')
+        time.sleep(.05)
 
 
 def identity(name):
@@ -201,7 +221,11 @@ def authenticated(rows, digest):
 
 
 LOCAL_TESTS = (
-    'DeviceFixtureDeviceTest', 'MainActivityTest', 'CoreDeviceTest', 'V2ScreensDeviceTest',
+    'Sweep4RegressionDeviceTest',
+    'ReceiveStorageDeviceTest', 'DeviceScreensDeviceTest', 'Sweep3RegressionDeviceTest', 'OperationFeedbackDeviceTest',
+    'AdmissionFenceDeviceTest', 'MergeRegressionDeviceTest',
+    'PairingAttemptDeviceTest',
+    'Sweep2RegressionDeviceTest', 'MultiComputerReviewDeviceTest', 'DeviceFixtureDeviceTest', 'MainActivityTest', 'CoreDeviceTest', 'V2ScreensDeviceTest',
     'FullReviewDeviceTest', 'SecondReviewDeviceTest', 'AdvisoryDeviceTest',
     'FourthReviewStorageDeviceTest', 'FifthReviewStorageDeviceTest',
     'FifthReviewUiDeviceTest', 'SixthReviewStorageDeviceTest', 'SeventhReviewStorageDeviceTest',
@@ -222,6 +246,8 @@ def local_case(test):
         screenshots('files/fifth-review-screens', 'screens')
         if test == 'V2ScreensDeviceTest':
             screenshots('files/v2-screens', 'screens')
+        if test == 'DeviceScreensDeviceTest':
+            screenshots('files/device-screens', 'device-screens')
         if test == 'SixteenthRecentDeviceTest':
             hierarchy = subprocess.run([*adb, 'exec-out', 'run-as', package, 'cat', 'cache/sixteenth-recent.xml'],
                                        capture_output=True, timeout=15)
@@ -265,6 +291,16 @@ def snapshot_rows():
         for suffix in ('', '-wal', '-shm'):
             Path(str(db) + suffix).unlink(missing_ok=True)
 
+def pairing_process(phase, prepare, verify):
+    restore()
+    instrument('pairing-process-' + phase + '-prepare', prepare, ['-e', 'phase', phase])
+    for name in (package, package + '.test'):
+        run([*adb, 'shell', 'am', 'force-stop', name])
+    pids = subprocess.run([*adb, 'shell', 'pidof', package], capture_output=True, text=True, timeout=15)
+    assert not pids.stdout.strip(), 'Pairing process must be dead before recovery verification'
+    instrument('pairing-process-' + phase + '-verify', verify)
+
+
 def cold_share(mode, prepare, verify):
     restore()
     instrument('cold-' + mode + '-prepare', prepare, ['-e', 'mode', mode])
@@ -281,17 +317,35 @@ def cold_share(mode, prepare, verify):
     else:
         command = ['am', 'start', '-n', package + '.test/' + package + '.FixtureCallerActivity', '--esal', 'uris',
                    'content://' + package + '.test.sources/image,content://' + package + '.test.sources/third-image', '--ez', 'newTask', 'true']
+    marker = 'cold-text-' + uuid.uuid4().hex if mode == 'text' else None
+    if marker:
+        run([*adb, 'shell', 'log', '-p', 'i', '-t', 'PneuFixture', marker])
     run([*adb, 'shell', shlex.join(command)], stdout=subprocess.DEVNULL)
     deadline = time.monotonic() + 12
-    expected = 2 if mode == 'multiple' else 1
-    while time.monotonic() < deadline:
+    if mode == 'text':
+        # Text has connected-only recipients. Witness completion before starting
+        # verification instrumentation; an empty queue alone could be too early.
+        while time.monotonic() < deadline:
+            log = run([*adb, 'logcat', '-d', '-s', 'PneuFixture:I', 'Pneu:W', '*:S'], capture_output=True, text=True).stdout
+            if marker in log and 'share_rejected: no_recipient' in log.rsplit(marker, 1)[1]:
+                break
+            time.sleep(.1)
+        else:
+            raise AssertionError('Cold offline text did not finish with no_recipient')
         rows = snapshot_rows()
-        if len(rows) == expected:
-            break
-        time.sleep(.1)
+        assert not rows, rows
+        evidence = dict(mode=mode, no_target_pid_before_send=True, rejection='no_recipient',
+                        witnessed_rows_before_instrumentation=rows)
     else:
-        raise AssertionError('No queue row after cold ' + mode + ' SEND')
-    evidence = dict(mode=mode, no_target_pid_before_send=True, witnessed_rows_before_instrumentation=rows)
+        expected = 2 if mode == 'multiple' else 1
+        while time.monotonic() < deadline:
+            rows = snapshot_rows()
+            if len(rows) == expected:
+                break
+            time.sleep(.1)
+        else:
+            raise AssertionError('No queue row after cold ' + mode + ' SEND')
+        evidence = dict(mode=mode, no_target_pid_before_send=True, witnessed_rows_before_instrumentation=rows)
     (scratch / ('cold-' + mode + '-evidence.json')).write_text(json.dumps(evidence, indent=2) + '\n')
     instrument('cold-' + mode + '-verify', verify)
 
@@ -372,6 +426,44 @@ class SilentTls:
             reader.join(timeout=2)
 
 
+def receive_files(test, mesh=False):
+    name='receive-mesh' if mesh else 'receive-legacy'
+    ca, digest = identity(name)
+    server = cert(name + '-pc')
+    # MediaStore writes/reads of app-owned receive rows must need no broad grants.
+    for permission in ('READ_MEDIA_IMAGES', 'READ_MEDIA_VIDEO'):
+        run([*adb, 'shell', 'pm', 'revoke', package, 'android.permission.' + permission])
+    flags=['--receive-files','--receive-progress-delay','1.5'] + (['--mesh'] if mesh else [])
+    try:
+        with peer(name, server, ca, flags, witness=True) as (extras, events, _):
+            instrument(name, test, extras, 180)
+            rows=records(events)
+            authenticated(rows,digest)
+            assert count(rows,'DROPPED_FILE_ACK')==1, rows
+            acks=[r for r in rows if r['event']=='PHONE_ACK' and r['transfer_id']=='1'*32]
+            assert len(acks)==1 and acks[0]['deduplicated'], rows
+            assert any(r['event']=='PHONE_ACK' and r['transfer_id']=='2'*32 and not r['deduplicated'] for r in rows), rows
+            assert all('files' in r['capabilities'] and 'clipboard_image' in r['capabilities'] for r in rows if r['event']=='HELLO'), rows
+            assert count(rows,'FILE')==0, 'Received content must never be sent back'
+    finally:
+        restore()
+
+
+def recovery_files(test, mesh=False):
+    name='recovery-files-mesh' if mesh else 'recovery-files-legacy'
+    ca,digest=identity(name)
+    server=cert(name+'-pc')
+    flags=['--recovery-files','--drop-first-pair-result']+(['--mesh'] if mesh else [])
+    with peer(name,server,ca,flags,witness=True) as (extras,events,_):
+        instrument(name,test,extras,120)
+        rows=records(events);authenticated(rows,digest)
+        assert count(rows,'PAIR')==3,rows
+        nacks=[r for r in rows if r['event']=='PHONE_NACK']
+        assert len(nacks)==6 and all(r['code']=='storage_failed' and r['retryable'] for r in nacks),rows
+        assert {r['transfer_id'] for r in nacks}=={c*32 for c in '678'},rows
+        assert count(rows,'PHONE_PONG')==2,rows
+
+
 def feature_suite(name, test):
     ca, digest = identity(name)
     server = cert(name + '-pc')
@@ -428,11 +520,16 @@ def connection_case(name, test, flags):
             texts = [r for r in rows if r['event'] == 'TEXT']
             assert len(texts) == 4 and len({r['transfer_id'] for r in texts}) == 4, rows
         else:
+            # Pair once without a consent/redial phase. Cleanup recovery and
+            # mobile resume each reconnect without reinstalling the binding.
             assert count(rows, 'HELLO') == 3 and count(rows, 'PAIR') == count(rows, 'FILE') == 1, rows
             assert count(rows, 'TEXT') == 0, rows
 
 
 FAULT_CASES = [
+    ('hello-version', 'incompatibleComputerRequiresUpdateAndKeepsPairing', ('--hello-version','2'), None),
+    ('hello-capabilities', 'incompatibleComputerRequiresUpdateAndKeepsPairing', ('--incompatible-capabilities',), None),
+    ('version-mismatch', 'incompatibleComputerRequiresUpdateAndKeepsPairing', ('--version-mismatch',), None),
     ('completion-write-recovery', 'failedCompletionAndFallbackWritesRecoverBothLanesWithoutSpinning', (), None),
     ('ineligible-backoff', 'repeatedlyIneligibleSelectionBacksOffAndDoesNotStarveSibling', (), None),
     ('discard-writer-waiters', 'discardedWriterWaitersNeverEmitAndDoNotResetEitherLane', (), None),
@@ -730,8 +827,13 @@ def cleanup():
 
 SUITES = {
     'local': [DeviceCase(test, test, local_case) for test in LOCAL_TESTS] +
-             [DeviceCase('permission-denials', 'FourthReviewUiDeviceTest', permission_denials)],
+             [DeviceCase('permission-denials', 'FourthReviewUiDeviceTest', permission_denials),
+              DeviceCase('pairing-preview-restore', 'Sweep3PairingRestoreDeviceTest', permission_denials)],
     'cold': [DeviceCase('fresh-pairing', 'SixteenthFreshPairingDeviceTest', fresh_pairing)] +
+            [DeviceCase('pairing-process-' + phase,
+                        ('PairingProcessDeviceTest#prepareBeforeProcessDeath', 'PairingProcessDeviceTest#verifyAfterProcessDeath'),
+                        lambda prepare, verify, phase=phase: pairing_process(phase, prepare, verify))
+             for phase in ('before-install', 'after-install')] +
             [DeviceCase('cold-' + mode,
                         ('ThirteenthReviewDeviceTest#prepareColdShare', 'ThirteenthReviewDeviceTest#verifyColdShareAndCleanUp'),
                         lambda prepare, verify, mode=mode: cold_share(mode, prepare, verify))
@@ -746,6 +848,10 @@ SUITES = {
                                ('address-fallback', 'RoundTwoTlsDeviceTest'),
                                ('tls12', 'TlsDeviceTest#rejectedHandshake'),
                                ('invalid-proof', 'TlsDeviceTest#rejectedHandshake')]],
+    'receive': [DeviceCase('recovery-files-legacy','RecoveryFilesDeviceTest',recovery_files,identity=True),
+                DeviceCase('recovery-files-mesh','RecoveryFilesDeviceTest',lambda test: recovery_files(test,mesh=True),identity=True),
+                DeviceCase('receive-legacy', 'ReceiveFilesDeviceTest', receive_files, identity=True),
+                DeviceCase('receive-mesh', 'ReceiveFilesDeviceTest', lambda test: receive_files(test, mesh=True), identity=True)],
     'features': [DeviceCase('features', 'FeaturesDeviceTest', lambda test: feature_suite('features', test), identity=True)],
     'policy': [DeviceCase('policy', 'PolicyDeviceTest', lambda test: feature_suite('policy', test), identity=True)],
     'upload': [DeviceCase('long-upload', 'ConnectionFaultDeviceTest#progressingUploadBeyondThreeMinutesReachesVerifiedPeerAck', upload, identity=True)],
@@ -794,7 +900,7 @@ def cleanup_case(markers, failed):
         raise RuntimeError('; '.join(errors))
 
 
-def run_suites(selected, base_scratch):
+def run_suites(selected, base_scratch, selected_cases=None):
     """Continue after each independent case and each suite; never mask failure."""
     global scratch, current_suite, current_case
     suite_results = []
@@ -807,7 +913,7 @@ def run_suites(selected, base_scratch):
         print('SUITE ' + current_suite, flush=True)
         try:
             install()
-            for current_case in SUITES[current_suite]:
+            for current_case in (selected_cases or SUITES)[current_suite]:
                 print('CASE ' + current_case.name, flush=True)
                 current_case.executed = set()
                 markers = case_resources()
@@ -853,11 +959,34 @@ def run_suites(selected, base_scratch):
     return all(summary['status'] == 'passed' for summary in suite_results)
 
 
-if __name__ == '__main__':
+@contextmanager
+def emulator_commands(serial):
+    """Guard every adb call, including helpers that call subprocess directly."""
+    if not re.fullmatch(r'emulator-\d+', serial):
+        raise ValueError('Only an emulator serial is permitted')
+    original_run = subprocess.run
+    def emulator_only(command, *positional, **kwargs):
+        if isinstance(command, (list, tuple)) and command and Path(str(command[0])).name == 'adb':
+            if len(command) < 3 or command[1] != '-s' or command[2] != serial:
+                raise RuntimeError('Every adb command must explicitly target the verified emulator')
+            if os.environ.get('ANDROID_SERIAL') != serial:
+                raise RuntimeError('ANDROID_SERIAL changed during the emulator run')
+        return original_run(command, *positional, **kwargs)
+    os.environ['ANDROID_SERIAL'] = serial
+    subprocess.run = emulator_only
+    try:
+        yield
+    finally:
+        subprocess.run = original_run
+
+
+def main():
+    global args, adb
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('suites', nargs='*', help='Suite names (default: all): ' + ', '.join(SUITES))
     parser.add_argument('--scratch', type=Path, default=Path.home() / '.cache/agent-scratch/pneu' / ('device-' + time.strftime('%Y%m%d-%H%M%S')))
-    parser.add_argument('--serial', default='emulator-5554')
+    parser.add_argument('--serial', default=os.environ.get('ANDROID_SERIAL', 'emulator-5554'))
+    parser.add_argument('--cases', help='Comma-separated existing case names to rerun')
     parser.add_argument('--daemon', type=Path, default=Path.home() / '.cache/agent-scratch/pneu/android10-target/debug/pneud')
     args = parser.parse_args()
     selected = list(dict.fromkeys(args.suites or SUITES))
@@ -866,13 +995,34 @@ if __name__ == '__main__':
         parser.error('Unknown suites: ' + ', '.join(sorted(unknown)))
     if 'all' in selected:
         selected = list(SUITES)
+    if not re.fullmatch(r'emulator-\d+', args.serial):
+        parser.error('Only an emulator serial is permitted')
+    if args.cases:
+        cases = set(args.cases.split(','))
+        known = {case.name for suite in selected for case in SUITES[suite]}
+        if cases - known:
+            parser.error('Unknown cases: ' + ', '.join(sorted(cases - known)))
+        # Do not mutate the canonical inventory; repeated main() calls stay safe.
+        selected_cases = {suite: [case for case in SUITES[suite] if case.name in cases] for suite in selected}
+        selected = [suite for suite in selected if selected_cases[suite]]
+    else:
+        selected_cases = None
     os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
+    sys.dont_write_bytecode = True
     adb = [str(Path(os.environ.get('ANDROID_HOME', str(Path.home() / 'Android/Sdk'))) / 'platform-tools/adb'), '-s', args.serial]
-    base_scratch = args.scratch.resolve()
-    base_scratch.mkdir(parents=True, exist_ok=True)
-    try:
-        success = run_suites(selected, base_scratch)
-    finally:
-        # Includes interruption: normal per-suite cleanup runs in run_suites too.
-        cleanup()
-    raise SystemExit(0 if success else 1)
+    with emulator_commands(args.serial):
+        avd = run([*adb, 'emu', 'avd', 'name'], capture_output=True, text=True).stdout.splitlines()
+        if not avd or avd[0].strip() != 'pneu-test':
+            parser.error('Only the pneu-test AVD is permitted')
+        base_scratch = args.scratch.resolve()
+        base_scratch.mkdir(parents=True, exist_ok=True)
+        try:
+            success = run_suites(selected, base_scratch, selected_cases)
+        finally:
+            # Includes interruption: per-suite cleanup runs in run_suites too.
+            cleanup()
+    return 0 if success else 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

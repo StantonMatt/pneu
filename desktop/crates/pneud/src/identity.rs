@@ -36,8 +36,11 @@ impl Identity {
                 key: key.serialize_der(),
                 device_id: Id::new(crate::random_hex(16))?,
             };
-            crate::config::atomic_private(&path, &serde_json::to_vec(&stored)?)?;
-            stored
+            if crate::config::atomic_private_new(&path, &serde_json::to_vec(&stored)?)? {
+                stored
+            } else {
+                serde_json::from_slice(&crate::storage::read_bounded(&path, 65536)?)?
+            }
         };
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
@@ -48,5 +51,29 @@ impl Identity {
             device_id: stored.device_id,
             fingerprint,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn concurrent_first_start_loads_one_durable_identity() -> Result<()> {
+        let dir = crate::test_support::scratch()?;
+        let identities = std::thread::scope(|scope| {
+            (0..8)
+                .map(|_| scope.spawn(|| Identity::load_or_create(dir.path())))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .collect::<Result<Vec<_>>>()
+        })?;
+        let winner = Identity::load_or_create(dir.path())?;
+        for identity in identities {
+            assert_eq!(identity.device_id, winner.device_id);
+            assert_eq!(identity.fingerprint, winner.fingerprint);
+        }
+        assert_eq!(fs::read_dir(dir.path())?.count(), 1);
+        Ok(())
     }
 }

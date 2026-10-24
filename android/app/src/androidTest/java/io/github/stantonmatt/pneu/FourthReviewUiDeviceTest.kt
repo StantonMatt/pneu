@@ -63,13 +63,13 @@ class FourthReviewUiDeviceTest {
         val code=old.replace("Trusted%20PC","New%20PC").replace("a".repeat(64),"c".repeat(64))
         try {
             c.startActivity(Intent(Intent.ACTION_VIEW,Uri.parse(code),c,MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
-            assertTrue(visible("Replace Trusted PC with New PC?"));assertNull(app.preferences.flow.first().pending)
+            assertTrue(visible("Add New PC?"));assertNull(app.connection.attempt.value?.invitation)
             device.findObject(UiSelector().text("Open settings")).click()
-            assertTrue(device.wait(Until.hasObject(By.pkg("com.android.settings")),4000));assertNull(app.preferences.flow.first().pending)
+            assertTrue(device.wait(Until.hasObject(By.pkg("com.android.settings")),4000));assertNull(app.connection.attempt.value?.invitation)
             grant(Manifest.permission.ACCESS_LOCAL_NETWORK);device.pressBack()
-            withTimeout(7000) {while(app.preferences.flow.first().pending!=Invitation.parse(code))delay(30)}
+            withTimeout(7000) {while(app.connection.attempt.value?.invitation!=Invitation.parse(code))delay(30)}
             assertEquals("Trusted PC",app.preferences.flow.first().peer!!.name)
-            app.cancelPairing();app.prefs.first {it.pending==null};app.connection.state.update {it.copy(pairing="")};launch("pair")
+            app.cancelPairing();DeviceFixture.awaitPrefs(app) {app.connection.attempt.value?.invitation==null};app.connection.state.update {it.copy(pairing="")};launch("pair")
             assertTrue(visible("Camera access is off"));assertTrue(visible("Open settings"))
             device.findObject(UiSelector().text("Open settings")).click();assertTrue(device.wait(Until.hasObject(By.pkg("com.android.settings")),4000));device.pressBack()
             // Photos request only images, and a grant from Settings completes the intended toggle.

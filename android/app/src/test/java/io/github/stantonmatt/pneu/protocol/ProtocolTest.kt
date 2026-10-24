@@ -8,6 +8,19 @@ import java.io.*
 class ProtocolTest {
     private val vectors=JsonParser.parseReader(InputStreamReader(javaClass.getResourceAsStream("/v1.json")!!)).asJsonObject
     private fun decode(hex: String)=Protocol.read(ByteArrayInputStream(hex.unhex()))
+    @Test fun chunkMustFitWithinMaximumFileSizeOnReadAndWrite() {
+        val id="01".repeat(16)
+        for(size in listOf(1, CHUNK_SIZE)) {
+            val valid=Frame.Chunk(id,MAX_FILE-size,ByteArray(size))
+            val bytes=ByteArrayOutputStream();Protocol.write(bytes,valid)
+            assertEquals(valid.offset,(Protocol.read(ByteArrayInputStream(bytes.toByteArray())) as Frame.Chunk).offset)
+            val invalid=valid.copy(offset=valid.offset+1)
+            assertTrue(runCatching {Protocol.write(ByteArrayOutputStream(),invalid)}.isFailure)
+            val raw=ByteArrayOutputStream()
+            DataOutputStream(raw).apply {writeInt(25+size);writeByte(17);write(id.unhex());writeLong(invalid.offset);write(invalid.data)}
+            assertTrue(runCatching {Protocol.read(ByteArrayInputStream(raw.toByteArray()))}.isFailure)
+        }
+    }
     @Test fun everyValidFrameAndEncoderRoundTrip() {
         for(entry in vectors["frames"].asJsonArray) {
             val v=entry.asJsonObject; val decoded=v["decoded"].asJsonObject

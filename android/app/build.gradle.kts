@@ -18,10 +18,12 @@ android {
         targetSdk {
             version = release(37)
         }
-        versionCode = 4
-        versionName = "2.0.2"
+        versionCode = 5
+        versionName = "2.1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
+
+    testOptions.unitTests.isIncludeAndroidResources = true
 
     buildFeatures {
         compose = true
@@ -65,6 +67,7 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
 
     testImplementation(libs.junit)
+    testImplementation("org.robolectric:robolectric:4.16")
     testImplementation(libs.kotlinx.coroutines.test)
 
     androidTestImplementation(platform(libs.androidx.compose.bom))

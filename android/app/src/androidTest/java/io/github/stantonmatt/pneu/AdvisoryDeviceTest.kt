@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Instrumentation
 import android.app.NotificationManager
 import android.content.*
+import androidx.datastore.preferences.core.edit
 import android.content.pm.ShortcutManager
 import android.graphics.Bitmap
 import android.net.Uri
@@ -35,9 +36,18 @@ class AdvisoryDeviceTest {
     private suspend fun seed(pin:String="a".repeat(64)) {
         val raw=uri(pin);assertTrue(app.requestPairing(raw,null));assertTrue(app.installBinding(Invitation.parse(raw),"d".repeat(32)))
     }
-    private fun launch(extra:String="home") {context.startActivity(Intent(context,MainActivity::class.java).putExtra(extra,true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK));Thread.sleep(650)}
+    private fun awaitUi(selector:BySelector,label:String) {
+        assertTrue(label,device.wait(Until.hasObject(selector.pkg(context.packageName)),5000))
+    }
+    private fun launch(extra:String="home") {
+        context.startActivity(Intent(context,MainActivity::class.java).putExtra(extra,true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
+        if(extra=="permissions")awaitUi(By.text(context.getString(R.string.perm_notifications)),"Permissions page")
+        else awaitUi(By.desc("Settings"),"Home toolbar")
+    }
     private fun caller(uri:String,grant:Boolean=true,action:String=Intent.ACTION_SEND) {
-        context.startActivity(Intent().setComponent(ComponentName(context.packageName+".test",FixtureCallerActivity::class.java.name)).putExtra("uri",uri).putExtra("grant",grant).putExtra("action",action).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));Thread.sleep(400)
+        // A new request must run onCreate, even while the previous caller/task
+        // is finishing. NEW_TASK alone can deliver it to that old root instead.
+        context.startActivity(Intent().setComponent(ComponentName(context.packageName+".test",FixtureCallerActivity::class.java.name)).putExtra("uri",uri).putExtra("grant",grant).putExtra("action",action).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_MULTIPLE_TASK));Thread.sleep(400)
     }
     private fun image(folder:String="Pictures/Screenshots/"):Uri {
         val source=context.contentResolver.insert(MediaStore.Images.Media.getContentUri("external_primary"),ContentValues().apply {
@@ -63,26 +73,28 @@ class AdvisoryDeviceTest {
     @Test(timeout=45000) fun externalPairingRequiresOwnConfirmationAndPreservesOldTrust()=runBlocking {
         seed();val old=app.preferences.flow.first().peer
         context.startActivity(Intent(Intent.ACTION_VIEW,Uri.parse(uri(name="New%20PC")),context,MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
-        val title=device.findObject(UiSelector().text("Replace Trusted PC with New PC?"));assertTrue(title.waitForExists(5000))
-        val screen=File(context.filesDir,"advisory-screens/replace-confirmation.png").apply {parentFile!!.mkdirs()}
+        val title=device.findObject(UiSelector().text("Pair with New PC?"));assertTrue(title.waitForExists(5000))
+        val screen=File(context.filesDir,"advisory-screens/pair-confirmation.png").apply {parentFile!!.mkdirs()}
         instrumentation.uiAutomation.takeScreenshot().let {bitmap->screen.outputStream().use {bitmap.compress(Bitmap.CompressFormat.PNG,100,it)};bitmap.recycle()}
-        delay(700);assertEquals(old,app.preferences.flow.first().peer);assertNull(app.preferences.flow.first().pending)
-        device.findObject(UiSelector().text("Cancel")).click();assertNull(app.preferences.flow.first().pending)
+        delay(700);assertEquals(old,app.preferences.flow.first().peer);assertNull(app.connection.attempt.value?.invitation)
+        device.findObject(UiSelector().text("Cancel")).click();assertNull(app.connection.attempt.value?.invitation)
     }
     @Test(timeout=45000) fun cancelledAndSupersededResultsCannotCommitOrDeleteOldQueue()=runBlocking {
-        seed();val old=app.preferences.flow.first().peer;val queued=ManualEntries.text(app,"Keep old queue","share")
+        seed();val old=app.preferences.flow.first().peer;val queued=DeviceFixture.text(app,"Keep old queue","share")
         val first=uri(pin="c".repeat(64),name="First");app.requestPairing(first,old!!.pin)
         app.cancelPairing();assertFalse(app.installBinding(Invitation.parse(first),"e".repeat(32)))
         assertEquals(old,app.preferences.flow.first().peer);assertNotNull(app.queue.find(queued.mediaId))
-        app.requestPairing(first,old.pin);val second=uri(pin="f".repeat(64),name="Second");app.requestPairing(second,old.pin)
-        assertFalse(app.installBinding(Invitation.parse(first),"e".repeat(32)));assertEquals(Invitation.parse(second),app.preferences.flow.first().pending)
+        app.requestPairing(first,old.pin);app.cancelPairing();val second=uri(pin="f".repeat(64),name="Second");app.requestPairing(second,old.pin)
+        assertFalse(app.installBinding(Invitation.parse(first),"e".repeat(32)));assertEquals(Invitation.parse(second),app.connection.attempt.value?.invitation)
     }
-    @Test(timeout=45000) fun durableReplacementJournalBlocksDeliveryUntilCleanup()=runBlocking {
-        seed();val row=ManualEntries.text(app,"Retained until durable replacement","share")
+    @Test(timeout=45000) fun durablePeerRepairJournalBlocksOnlyThatRecipientUntilCleanup()=runBlocking {
+        seed();val row=DeviceFixture.text(app,"Retained until durable replacement","share")
         val next=uri(pin="c".repeat(64));app.requestPairing(next,app.preferences.flow.first().peer!!.pin)
-        assertTrue(app.preferences.paired(Invitation.parse(next),"e".repeat(32),Invitation.parse(next)))
-        assertNotNull(app.queue.find(row.mediaId));assertTrue(app.preferences.flow.first().deliveryReset)
-        app.reconcileDelivery();assertNull(app.queue.find(row.mediaId));assertFalse(app.preferences.flow.first().deliveryReset)
+        app.preferences.store.edit {p->PeerRegistry.write(p,PeerRegistry.read(p).map {it.copy(pairingLost=true)})}
+        assertTrue(app.preferences.paired(Invitation.parse(next),"d".repeat(32),replacement=ConfirmedBinding.from(app.preferences.read())))
+        app.cancelPairing()
+        assertNotNull(app.queue.find(row.mediaId));assertEquals(setOf("d".repeat(32)),app.preferences.read().resetPeers)
+        app.reconcileDelivery();assertNull(app.queue.find(row.mediaId));assertTrue(app.preferences.read().resetPeers.isEmpty())
     }
     @Test(timeout=45000) fun separateCallerUsesReadableMediaButCannotUsePrivateUris()=runBlocking {
         seed();val source=image("Pictures/Pneu advisory/");val before=app.queue.nextOrder()
@@ -96,7 +108,7 @@ class AdvisoryDeviceTest {
         assertTrue(app.queue.pending().all {it.kind=="file"})
     }
     @Test(timeout=45000) fun multipleSharedTextsKeepLatestUnsentItem()=runBlocking<Unit> {
-        seed();app.preferences.toggle("wifi",false)
+        seed();DeviceFixture.connectLocalPeer(app)
         val before=app.queue.nextOrder()
         context.startActivity(Intent(context,ShareActivity::class.java).setAction(Intent.ACTION_SEND_MULTIPLE).setType("text/plain")
             .putCharSequenceArrayListExtra(Intent.EXTRA_TEXT,arrayListOf<CharSequence>("First shared text","Latest shared text")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
@@ -115,9 +127,9 @@ class AdvisoryDeviceTest {
         assertEquals(1,results.count {it.isFailure});val p=app.preferences.flow.first();assertTrue(p.wifi || p.tailscale)
     }
     @Test(timeout=45000) fun latestTextSupersedesFailedOlderTextAndOldTimestampHasNoBarrier()=runBlocking {
-        seed();val first=ManualEntries.text(app,"Old pending","clipboard")
+        seed();val first=DeviceFixture.text(app,"Old pending","clipboard")
         app.queue.find(first.mediaId)!!.also {it.state="failed";it.error="clipboard_unavailable";app.queue.update(it)}
-        val second=ManualEntries.text(app,"Latest pending","clipboard");assertEquals(listOf(second.mediaId),app.queue.pending().map {it.mediaId});assertEquals("superseded",app.queue.find(first.mediaId)!!.state);app.retry(first.mediaId);assertEquals("superseded",app.queue.find(first.mediaId)!!.state)
+        val second=DeviceFixture.text(app,"Latest pending","clipboard");assertEquals(listOf(second.mediaId),app.queue.pending().map {it.mediaId});assertEquals("superseded",app.queue.find(first.mediaId)!!.state);app.retry(first.mediaId);assertEquals("superseded",app.queue.find(first.mediaId)!!.state)
         fun incoming(id:String,time:Long,text:String)=json("transfer_id" to id.repeat(32),"created_at" to time,"text" to text,"origin" to "clipboard")
         val blocked=Receipt().apply {peerId="d".repeat(32);transferId="1".repeat(32);hash=sha256("Older OS failure".toByteArray());createdAt=1;state="pending"};app.queue.insertReceipt(blocked)
         assertEquals(Type.ACK,app.clipboard.receive("d".repeat(32),incoming("2",20,"New PC text")).type)
@@ -139,7 +151,7 @@ class AdvisoryDeviceTest {
         assertEquals(receivedHash,app.preferences.flow.first().lastReceivedHash)
     }
     @Test(timeout=45000) fun retryRevisionRejectsEveryStaleCompletionAndError()=runBlocking {
-        seed();val row=ManualEntries.text(app,"Retry reset","share");val stale=app.queue.find(row.mediaId)!!
+        seed();val row=DeviceFixture.text(app,"Retry reset","share");val stale=app.queue.find(row.mediaId)!!
         app.retry(row.mediaId);stale.state="failed";stale.mismatches=99;stale.nextAttempt=Long.MAX_VALUE
         assertFalse(app.updateDelivery(stale));stale.state="sent";assertFalse(app.updateDelivery(stale));assertEquals(0,app.queue.find(row.mediaId)!!.mismatches);assertEquals(0L,app.queue.find(row.mediaId)!!.nextAttempt)
     }
@@ -154,7 +166,7 @@ class AdvisoryDeviceTest {
         assertEquals(1,root.listFiles().orEmpty().count {it.extension=="bin"})
     }
     @Test(timeout=45000) fun completeCollectionCheckpointsIgnoreClocksAndSkipPrePairMedia()=runBlocking {
-        val old=image();seed();val oldGeneration=context.contentResolver.query(old,arrayOf("generation_added"),null,null,null)!!.use {it.moveToFirst();it.getLong(0)};assertTrue(app.preferences.flow.first().imageGeneration>oldGeneration);val scope=CoroutineScope(SupervisorJob()+Dispatchers.IO)
+        val old=image();seed();DeviceFixture.connectLocalPeer(app);val oldGeneration=context.contentResolver.query(old,arrayOf("generation_added"),null,null,null)!!.use {it.moveToFirst();it.getLong(0)};assertTrue(app.preferences.flow.first().imageGeneration>oldGeneration);val scope=CoroutineScope(SupervisorJob()+Dispatchers.IO)
         val observer=ScreenshotObserver(app) {video->!video};observer.scanOnce();observer.start(scope)
         try {
             val before=app.preferences.flow.first().videoGeneration
@@ -178,13 +190,22 @@ class AdvisoryDeviceTest {
     @Test(timeout=45000) fun toolbarAndExternalHomeNavigationAgreeAndQueueCountIsComplete()=runBlocking {
         seed();repeat(60) {app.enqueueFixture(Outgoing().apply {mediaId=randomId();transferId=randomId();kind="file";fileName="Fixture"})}
         withTimeout(5000) {app.waitingCount.first {it==60}};launch()
-        device.findObject(UiSelector().description("Settings")).click();assertTrue(device.findObject(UiSelector().text("Settings")).waitForExists(4000));delay(350)
+        device.findObject(UiSelector().description("Settings")).click()
+        assertTrue("Home left",device.wait(Until.gone(By.desc("Settings")),5000))
+        awaitUi(By.text("Settings"),"Settings toolbar")
         val scroll=UiScrollable(UiSelector().scrollable(true));scroll.scrollTextIntoView("Permissions and battery")
-        device.findObject(UiSelector().text("Permissions and battery")).click();device.findObject(UiSelector().description("Back")).click()
-        assertTrue(device.findObject(UiSelector().text("Settings")).waitForExists(3000))
+        device.findObject(UiSelector().text("Permissions and battery")).click()
+        awaitUi(By.text(context.getString(R.string.perm_notifications)),"Permissions page entered")
+        assertTrue("Settings list left",device.wait(Until.gone(By.text(context.getString(R.string.pref_name))),5000))
+        device.findObject(UiSelector().description("Back")).click()
+        // Permissions may itself contain Settings action buttons, and both
+        // screens retain Back during the cross-fade. Wait for that page to leave.
+        assertTrue("Permissions page left",device.wait(Until.gone(By.text(context.getString(R.string.perm_notifications))),5000))
+        awaitUi(By.text("Settings"),"Returned to Settings")
         context.startActivity(Intent(context,MainActivity::class.java).putExtra("home",true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-        assertTrue(device.findObject(UiSelector().text("Pneu")).waitForExists(3000))
-        device.findObject(UiSelector().description("Settings")).click();assertTrue(device.findObject(UiSelector().text("Settings")).waitForExists(4000));delay(350);UiScrollable(UiSelector().scrollable(true)).scrollTextIntoView("Unpair")
+        awaitUi(By.desc("Settings"),"External Home navigation")
+        assertTrue("Settings toolbar left",device.wait(Until.gone(By.text("Settings")),5000))
+        DeviceFixture.openDevice(instrumentation,"Trusted PC");UiScrollable(UiSelector().scrollable(true)).let {if(it.exists())it.scrollTextIntoView("Unpair")}
         device.findObject(UiSelector().text("Unpair")).click();assertTrue(device.findObject(UiSelector().textContains("60")).waitForExists(3000))
     }
     @Test(timeout=45000) fun permanentFailureRemainsVisibleOnMobile()=runBlocking<Unit> {
@@ -270,7 +291,7 @@ class AdvisoryDeviceTest {
         seed();val evidence=context.getSharedPreferences("service_evidence",Context.MODE_PRIVATE)
         evidence.edit().putLong("kill",100).putLong("acknowledged",0).putBoolean("running",false).commit()
         app.preferences.toggle("neverSleeping",true);app.prefs.first {it.neverSleeping};context.health();withTimeout(3000) {app.prefs.first {!it.neverSleeping}}
-        assertTrue(ServiceEvidence.killed(context));app.preferences.setLong("lastConnected",Long.MAX_VALUE);assertTrue(ServiceEvidence.killed(context))
+        assertTrue(ServiceEvidence.killed(context));assertTrue(app.preferences.connected(DeliveryBinding.from(app.preferences.read())!!,Endpoint.parse("192.0.2.1:47821"),Long.MAX_VALUE));assertTrue(ServiceEvidence.killed(context))
         ServiceEvidence.acknowledge(context);assertFalse(ServiceEvidence.killed(context))
     }
 }

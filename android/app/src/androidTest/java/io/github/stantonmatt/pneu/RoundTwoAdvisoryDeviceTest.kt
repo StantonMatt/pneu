@@ -100,6 +100,7 @@ class RoundTwoAdvisoryDeviceTest {
         val timestamps=List(20) {app.newTextTimestamp()};assertTrue(timestamps.zipWithNext().all {(a,b)->b>a})
     }
     @Test(timeout=20000) fun observerRetriesStartupCleanupBeforeScanningAndStopsCleanly()=runBlocking<Unit> {
+        DeviceFixture.connectLocalPeer(app)
         val failed=AtomicBoolean(true);val calls=AtomicInteger();val baseline=app.prefs.value.imageGeneration
         val observer=ScreenshotObserver(app,cleanup={calls.incrementAndGet();if(failed.get())throw IOException("Synthetic Room cleanup failure");app.staging.cleanup()})
         val uri=c.contentResolver.insert(MediaStore.Images.Media.getContentUri("external_primary"),ContentValues().apply {

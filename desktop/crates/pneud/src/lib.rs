@@ -1,12 +1,19 @@
 pub mod actions;
 pub mod client;
+mod clipboard_fingerprint;
 pub mod config;
 pub mod core;
 mod discovery;
+mod file_recipients;
 pub mod identity;
 pub mod ipc;
+pub mod macos_removal;
+mod platform;
 mod storage;
 mod store;
+pub use store::outbox;
+#[cfg(test)]
+mod test_support;
 pub mod tls;
 mod transport;
 pub mod ui;
@@ -27,3 +34,6 @@ pub fn now_ms() -> u64 {
         .expect("clock before epoch")
         .as_millis() as u64
 }
+
+#[cfg(target_os = "macos")]
+pub use platform::macos_login;

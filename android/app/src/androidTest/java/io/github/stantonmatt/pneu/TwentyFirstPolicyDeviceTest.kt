@@ -88,6 +88,7 @@ class TwentyFirstPolicyDeviceTest {
         } finally {c.contentResolver.call(provider,"release",null,null);capture.cancelAndJoin()}
     }
     @Test(timeout=25000) fun startupBaselineCompletesBeforeMidCopyPolicyFixtureCreatesMedia()=runBlocking<Unit> {
+        DeviceFixture.connectLocalPeer(app)
         val baseline=CompletableDeferred<Unit>();val release=CompletableDeferred<Unit>()
         val created=CompletableDeferred<Unit>();val baselines=AtomicInteger()
         val scope=CoroutineScope(SupervisorJob()+Dispatchers.IO)
@@ -133,6 +134,7 @@ class TwentyFirstPolicyDeviceTest {
         }
     }
     @Test(timeout=20000) fun settingChangedDuringObserverCopyDropsNormallyAndRescanCapturesTheSameMedia()=runBlocking<Unit> {
+        DeviceFixture.connectLocalPeer(app)
         val observer=ScreenshotObserver(app)
         observer.scanOnce();observer.scanOnce()
         val entered=CountDownLatch(1);val release=CountDownLatch(1);val first=AtomicBoolean(true)

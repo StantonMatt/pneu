@@ -24,9 +24,9 @@ import androidx.compose.ui.unit.dp
     val interaction=remember {MutableInteractionSource()};val pressed by interaction.collectIsPressedAsState();val c=LocalPneuColors.current
     return pneuFocusRing(interaction,enabled=enabled).clickable(interactionSource=interaction,indication=null,enabled=enabled,onClick=onClick).drawWithContent {drawContent();if(pressed)drawRect(c.text.copy(alpha=.06f))}
 }
-@Composable fun Modifier.pneuToggle(checked:Boolean,enabled:Boolean,onChange:(Boolean)->Unit):Modifier {
+@Composable fun Modifier.pneuToggle(checked:Boolean,enabled:Boolean,role:Role=Role.Switch,onChange:(Boolean)->Unit):Modifier {
     val interaction=remember {MutableInteractionSource()};val pressed by interaction.collectIsPressedAsState();val c=LocalPneuColors.current
-    return pneuFocusRing(interaction,enabled=enabled).toggleable(checked,interactionSource=interaction,indication=null,enabled=enabled,role=Role.Switch,onValueChange=onChange).drawWithContent {drawContent();if(pressed)drawRect(c.text.copy(alpha=.06f))}
+    return pneuFocusRing(interaction,enabled=enabled).toggleable(checked,interactionSource=interaction,indication=null,enabled=enabled,role=role,onValueChange=onChange).drawWithContent {drawContent();if(pressed)drawRect(c.text.copy(alpha=.06f))}
 }
 
 /** Join separately animated Recent rows into one card without internal borders. */

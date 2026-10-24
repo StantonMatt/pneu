@@ -188,6 +188,8 @@ impl Phone {
                 let sent = crate::transport::send(
                     &mut tls,
                     &Message::Hello(Hello {
+                        role: None,
+                        addresses: None,
                         version: 1,
                         device_id: self.identity.device_id.clone(),
                         name: "Pneu simulator".into(),
@@ -209,6 +211,19 @@ impl Phone {
                     }
                 };
                 sent?;
+                if pc.device_id == self.identity.device_id {
+                    crate::transport::send(
+                        &mut tls,
+                        &Message::Error(ErrorMessage {
+                            code: ErrorCode::Unauthorized,
+                            message: Some("remote claimed local device ID".into()),
+                            supported_version: None,
+                        }),
+                        Duration::from_secs(10),
+                    )
+                    .await?;
+                    bail!("remote claimed local device ID");
+                }
                 ensure!(pc.version == 1, "PC version mismatch");
                 if let Some(expected) = expected_id {
                     ensure!(*expected == pc.device_id, "PC device binding mismatch");
@@ -266,6 +281,8 @@ impl Phone {
             hash.update(&buf[..n]);
         }
         let begin = FileBegin {
+            hlc: None,
+            source_device: None,
             transfer_id: Id::new(crate::random_hex(16))?,
             file_name: path
                 .file_name()
@@ -285,6 +302,8 @@ impl Phone {
     }
     pub fn text(&self, text: String, origin: ClipboardOrigin) -> Result<Clipboard> {
         let mut text = Clipboard {
+            hlc: None,
+            source_device: None,
             transfer_id: Id::new(crate::random_hex(16))?,
             text,
             created_at: crate::now_ms(),
@@ -293,6 +312,9 @@ impl Phone {
         encode_frame(&Message::Clipboard(text.clone()))?;
         // Independent simulator commands share this small persistent clock.
         // Lock a separate file so atomic replacement cannot change the lock inode.
+        #[cfg(target_os = "macos")]
+        let lock = crate::platform::private::open(&self.directory.join("clipboard-clock.lock"))?;
+        #[cfg(not(target_os = "macos"))]
         let lock = std::fs::File::from(rustix::fs::open(
             self.directory.join("clipboard-clock.lock"),
             rustix::fs::OFlags::CREATE
@@ -315,6 +337,9 @@ impl Phone {
             text.created_at <= MAX_TIMESTAMP,
             "clipboard clock exhausted"
         );
+        // The persisted clock can add timestamp digits; validate the final
+        // representation before committing it or reporting preparation success.
+        encode_frame(&Message::Clipboard(text.clone()))?;
         atomic_private(&clock, &serde_json::to_vec(&text.created_at)?)?;
         Ok(text)
     }
@@ -388,11 +413,13 @@ impl PhoneConnection {
         }
     }
     pub async fn send_status(&mut self, paused: bool) -> Result<()> {
+        let message = Message::Status(Status { paused });
+        encode_frame(&message)?;
         atomic_private(
             &self.directory.join("paused.json"),
             &serde_json::to_vec(&paused)?,
         )?;
-        self.write(&Message::Status(Status { paused })).await
+        self.write(&message).await
     }
     pub async fn unpair(&mut self) -> Result<()> {
         forget_peer(&self.directory)?;
@@ -607,13 +634,109 @@ mod tests {
     use tokio::{net::TcpListener, task::JoinHandle};
     use tokio_rustls::TlsAcceptor;
 
-    #[derive(Clone, Copy)]
+    #[tokio::test]
+    async fn own_device_id_outbound_simulator_hello_rejected_without_binding() -> Result<()> {
+        for known in [false, true] {
+            let dir = crate::test_support::scratch()?;
+            let phone = Phone::new(dir.path().join("phone"))?;
+            let pc = Identity::load_or_create(&dir.path().join("pc"))?;
+            let admission = Arc::new(Mutex::new(Admission::default()));
+            admission.lock().unwrap().peers.insert(
+                phone.identity.fingerprint.clone(),
+                phone.identity.device_id.clone(),
+            );
+            let config = crate::tls::server_config(
+                &pc,
+                Arc::new(ClientVerifier::new(
+                    admission,
+                    Arc::new(AtomicBool::new(false)),
+                )),
+            )?;
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?.to_string();
+            let local = phone.identity.device_id.clone();
+            let server = async {
+                let (tcp, _) = listener.accept().await?;
+                let mut tls = TlsAcceptor::from(Arc::new(config)).accept(tcp).await?;
+                assert!(matches!(
+                    read_frame(&mut tls).await?,
+                    Some(Message::Hello(_))
+                ));
+                write_frame(
+                    &mut tls,
+                    &Message::Hello(Hello {
+                        version: 1,
+                        device_id: local,
+                        name: "forged PC".into(),
+                        role: None,
+                        addresses: None,
+                        paused: None,
+                        capabilities: vec!["clipboard_text".into()],
+                    }),
+                )
+                .await?;
+                assert!(
+                    matches!(read_frame(&mut tls).await?, Some(Message::Error(e)) if e.code == ErrorCode::Unauthorized)
+                );
+                Ok::<_, anyhow::Error>(())
+            };
+            let addresses = [address];
+            let client = phone.connect(
+                &addresses,
+                pc.fingerprint,
+                known.then_some(&phone.identity.device_id),
+            );
+            let (server, client) = tokio::join!(server, client);
+            server?;
+            assert!(
+                client
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("remote claimed local device ID")
+            );
+            assert!(!phone.directory.join("binding.json").exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn text_encoding_uses_final_timestamp_before_clock_commit() -> Result<()> {
+        let dir = crate::test_support::scratch()?;
+        let phone = Phone::new(dir.path().join("phone"))?;
+        let clock = phone.directory.join("clipboard-clock.json");
+        atomic_private(&clock, &serde_json::to_vec(&(MAX_TIMESTAMP - 1))?)?;
+        let mut text = Clipboard {
+            hlc: None,
+            source_device: None,
+            transfer_id: Id::from_bytes([1; 16]),
+            text: "\u{1}".repeat(10_800),
+            created_at: crate::now_ms(),
+            origin: ClipboardOrigin::Clipboard,
+        };
+        let remaining = MAX_CONTROL_PAYLOAD - serde_json::to_vec(&text)?.len();
+        text.text.push_str(&"x".repeat(remaining));
+        encode_frame(&Message::Clipboard(text.clone()))?;
+        assert!(
+            phone.text(text.text, ClipboardOrigin::Clipboard).is_err(),
+            "timestamp growth escaped encoded-size validation"
+        );
+        assert_eq!(
+            std::fs::read(&clock)?,
+            serde_json::to_vec(&(MAX_TIMESTAMP - 1))?
+        );
+        Ok(())
+    }
+    #[derive(Clone)]
     enum Scenario {
         ReceiptChallenge,
         IdleReceipt,
         Listen,
         Deadline,
-        PingFlood,
+        PingFlood(
+            Arc<tokio::sync::Notify>,
+            tokio::sync::mpsc::UnboundedSender<()>,
+        ),
         ClipboardOrder,
         PausedClipboard,
     }
@@ -649,6 +772,8 @@ mod tests {
             crate::transport::send(
                 &mut tls,
                 &Message::Hello(Hello {
+                    role: None,
+                    addresses: None,
                     version: 1,
                     device_id: pc.device_id,
                     name: "Mock PC".into(),
@@ -682,35 +807,38 @@ mod tests {
                 );
                 return Ok(());
             }
-            if matches!(scenario, Scenario::PingFlood) {
-                let until = Instant::now() + Duration::from_millis(100);
-                while Instant::now() < until {
+            if let Scenario::PingFlood(ticks, pongs) = scenario {
+                loop {
+                    tokio::select! {
+                        _ = ticks.notified() => {},
+                        frame = read_frame(&mut tls) => {
+                            ensure!(frame?.is_none(), "client should close after the fixed deadline");
+                            return Ok(());
+                        }
+                    }
                     let nonce = Nonce::new(crate::random_hex(8))?;
-                    if crate::transport::send(
+                    crate::transport::send(
                         &mut tls,
                         &Message::Ping(Ping {
                             nonce: nonce.clone(),
                         }),
-                        Duration::from_secs(1),
+                        Duration::from_secs(10),
                     )
-                    .await
-                    .is_err()
-                    {
-                        return Ok(());
-                    }
+                    .await?;
                     match read_frame(&mut tls).await {
                         Ok(Some(Message::Pong(p))) => {
-                            ensure!(p.nonce == nonce, "matching flood PONG")
+                            ensure!(p.nonce == nonce, "matching flood PONG");
+                            pongs.send(())?;
                         }
-                        Ok(None) | Err(_) => return Ok(()),
                         _ => bail!("expected flood PONG"),
                     }
                 }
-                bail!("continuous PING bypassed read deadline");
             }
             if matches!(scenario, Scenario::ClipboardOrder) {
                 for (timestamp, deduplicated) in [(2, false), (1, true), (3, false), (3, true)] {
                     let text = Clipboard {
+                        hlc: None,
+                        source_device: None,
                         transfer_id: Id::new(crate::random_hex(16))?,
                         text: "private".into(),
                         created_at: timestamp,
@@ -732,6 +860,8 @@ mod tests {
             }
             if matches!(scenario, Scenario::PausedClipboard) {
                 let text = Clipboard {
+                    hlc: None,
+                    source_device: None,
                     transfer_id: id,
                     text: "private".into(),
                     created_at: 9,
@@ -823,8 +953,11 @@ mod tests {
         for scenario in [Scenario::ReceiptChallenge, Scenario::IdleReceipt] {
             let directory = tempfile::tempdir()?;
             let id = Id::new(crate::random_hex(16))?;
-            let (mut connection, pc) = mock_pc(directory.path(), scenario, id.clone()).await?;
+            let (mut connection, pc) =
+                mock_pc(directory.path(), scenario.clone(), id.clone()).await?;
             let text = Clipboard {
+                hlc: None,
+                source_device: None,
                 transfer_id: id.clone(),
                 text: "private text".into(),
                 created_at: 0,
@@ -916,17 +1049,41 @@ mod tests {
     #[tokio::test]
     async fn continuous_ping_traffic_does_not_extend_fixed_read_deadline() -> Result<()> {
         let directory = tempfile::tempdir()?;
+        let ticks = Arc::new(tokio::sync::Notify::new());
+        let (pongs, mut observed) = tokio::sync::mpsc::unbounded_channel();
         let (mut connection, pc) = mock_pc(
             directory.path(),
-            Scenario::PingFlood,
+            Scenario::PingFlood(ticks.clone(), pongs),
             Id::new(crate::random_hex(16))?,
         )
         .await?;
-        let started = Instant::now();
-        assert!(connection.read(Duration::from_millis(20)).await.is_err());
-        assert!(started.elapsed() < Duration::from_millis(90));
+        let mut read = Box::pin(connection.read(Duration::from_secs(60)));
+        assert!(futures_util::poll!(read.as_mut()).is_pending());
+        for _ in 0..3 {
+            ticks.notify_one();
+            // Complete each real TLS PING/PONG before moving the clock. No
+            // scheduling-speed assumption or virtual-time kernel I/O timeout.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::select! {
+                    result = &mut read => bail!("read ended before its deadline: {result:?}"),
+                    pong = observed.recv() => pong.context("mock PC stopped"),
+                }
+            })
+            .await??;
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(20)).await;
+            tokio::time::resume();
+        }
+        // Darwin's timer driver may need another runtime turn after resume.
+        // Await a bounded wake instead of assuming one manual poll has already
+        // processed the timer. A renewed 60-second deadline still fails here.
+        let result = tokio::time::timeout(Duration::from_secs(1), read.as_mut())
+            .await
+            .context("PING traffic extended the original read deadline")?;
+        assert_eq!(result.unwrap_err().to_string(), "PC read deadline");
+        drop(read);
         connection.close().await?;
-        tokio::time::timeout(Duration::from_secs(2), pc).await???;
+        tokio::time::timeout(Duration::from_secs(10), pc).await???;
         Ok(())
     }
     #[tokio::test]

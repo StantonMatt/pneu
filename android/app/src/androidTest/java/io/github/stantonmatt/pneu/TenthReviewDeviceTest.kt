@@ -58,6 +58,7 @@ class TenthReviewDeviceTest {
         app.preferences.beforeRead={};assertNotNull(app.preferences.read().peer)
     }
     @Test(timeout=25000) fun observerRetriesAfterFiveSecondReadDeadlineAndAdmitsFreshMedia()=runBlocking<Unit> {
+        DeviceFixture.connectLocalPeer(app)
         val first=AtomicBoolean(true);val entered=CompletableDeferred<Unit>();val recovered=CompletableDeferred<Unit>()
         app.preferences.beforeRead={if(first.compareAndSet(true,false)) {entered.complete(Unit);awaitCancellation()}}
         observer=ScreenshotObserver(app,latest={video->recovered.complete(Unit);MediaCatalog.latest(c,video)})

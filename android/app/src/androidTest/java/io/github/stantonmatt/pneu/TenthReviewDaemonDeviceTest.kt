@@ -44,7 +44,7 @@ class TenthReviewDaemonDeviceTest {
         val rejections=java.util.concurrent.atomic.AtomicInteger()
         app.connection.onUnauthorized={assertNotNull(app.prefs.value.peer);assertFalse(app.prefs.value.pairingLost);rejections.incrementAndGet()}
         app.connection.start(scope)
-        val lost=withTimeout(50000) {app.preferences.flow.first {it.pairingLost && it.peer==null && !it.deliveryReset}}
+        val lost=withTimeout(50000) {app.preferences.flow.first {it.pairingLost && it.devices.all {peer->peer.pairingLost} && it.resetPeers.isEmpty()}}
         assertEquals(invitation.name,lost.lostPcName);assertEquals("Pairing lost",app.connection.state.value.status)
         assertEquals(3,rejections.get())
         i.sendStatus(0,android.os.Bundle().apply {putString("stream","Received exactly ${rejections.get()} pinned ERROR unauthorized frames; retained trust until the third\n")})
@@ -53,6 +53,6 @@ class TenthReviewDaemonDeviceTest {
         val device=androidx.test.uiautomator.UiDevice.getInstance(i)
         assertTrue(device.wait(androidx.test.uiautomator.Until.hasObject(androidx.test.uiautomator.By.text("Pairing lost")),5000))
         assertTrue(device.hasObject(androidx.test.uiautomator.By.text("${invitation.name} doesn't recognize this phone")))
-        assertNotEquals(paired.deviceId,lost.deviceId);assertNull(lost.pending)
+        assertEquals(paired.deviceId,lost.deviceId);assertEquals(paired.tlsAlias,lost.tlsAlias);assertNull(app.connection.attempt.value?.invitation)
     }
 }
