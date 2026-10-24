@@ -1665,6 +1665,15 @@ async fn automatic_actions_coalesce_without_backpressuring_files_and_keep_explic
     h.actions
         .block_image
         .store(true, std::sync::atomic::Ordering::SeqCst);
+    // This test holds the first preparation while 70 durable transfers finish.
+    // Exercise coalescing independently of the clipboard actor's deadline.
+    // A blocking task prevents Tokio's paused clock from auto-advancing during
+    // real socket/file I/O. Dropping clock_release also releases it on failure.
+    let (clock_release, clock_held) = std::sync::mpsc::channel::<()>();
+    let clock_task = tokio::task::spawn_blocking(move || {
+        let _ = clock_held.recv();
+    });
+    tokio::time::pause();
     let bytes = b"\x89PNG\r\n\x1a\nimage".to_vec();
     for index in 0..67 {
         let bytes = [bytes.as_slice(), format!("0-{index}").as_bytes()].concat();
@@ -1703,6 +1712,9 @@ async fn automatic_actions_coalesce_without_backpressuring_files_and_keep_explic
         .store(false, std::sync::atomic::Ordering::SeqCst);
     h.actions.image_release.notify_one();
     h.wait_images(5).await?;
+    tokio::time::resume();
+    drop(clock_release);
+    clock_task.await?;
     tokio::time::timeout(Duration::from_secs(3), async {
         while h.actions.opens.lock().unwrap().is_empty() {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1720,7 +1732,8 @@ async fn automatic_actions_coalesce_without_backpressuring_files_and_keep_explic
             .file_name()
             .unwrap()
             .to_string_lossy()
-            .ends_with("automatic-0.png")
+            .ends_with("automatic-0.png"),
+        "unexpected first copy: {images:?}"
     );
     for index in 0..3 {
         assert!(images.iter().any(|p| {

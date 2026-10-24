@@ -11576,7 +11576,9 @@ mod tests {
             assert!(serde_json::to_vec(&command)?.len() > 65_536);
             let result = crate::ipc::request(&core.paths.socket, command).await?;
             let operation: Id = serde_json::from_value(result["operation"].clone())?;
-            tokio::time::timeout(Duration::from_secs(10), core.file_admissions.drain()).await?;
+            // Admission stages 128 durable files. Its tracked completion, not
+            // disk speed under parallel tests, is the IPC frame-size barrier.
+            core.file_admissions.drain().await;
             let result = crate::ipc::request(
                 &core.paths.socket,
                 Command::OperationStatus {
@@ -11584,6 +11586,7 @@ mod tests {
                 },
             )
             .await?;
+            assert_eq!(result["state"], "admitted");
             assert_eq!(result["accepted"].as_array().unwrap().len(), 128);
             assert!(result["rejected"].as_array().unwrap().is_empty());
             core.cancel_transfer(operation, None).await?;
