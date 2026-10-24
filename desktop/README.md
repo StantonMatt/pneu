@@ -1,13 +1,20 @@
 # Pneu desktop core
 
-`pneud` is the PC daemon; `pneu-sim` exercises the phone transport before Android
-is available. The wire contract is `../docs/PROTOCOL.md`, with the shared syntax
-and framing in `pneu-proto`. Nothing in this directory installs automatically.
+`pneud` 2.1.0 is the Linux and macOS daemon; `pneu-sim` is a legacy
+phone transport simulator. Shared syntax and framing live in `pneu-proto`;
+the [wire protocol](../docs/PROTOCOL.md) defines mesh negotiation and delivery.
+Nothing in this directory installs automatically.
+
+Linux uses KDE Plasma 6 on Wayland with a Slint/Qt window and tray. Builds need
+Rust 1.93+ and Qt 6 development tools (`QMAKE=qmake6`). On macOS 15.4+,
+`./install-macos.sh` builds and installs `Pneu.app`, with a menu bar and Slint
+window. Apple Silicon is tested; see the [macOS guide](../docs/macos.md) for
+requirements, Open at login, native clipboard, notifications and camera pairing.
+
+From the repository root on Linux:
 
 ```sh
 cd desktop
-# This workspace's dependency cache is writable in the worker sandbox.
-export CARGO_HOME="$PWD/target/cargo-home"
 export QMAKE=qmake6 # Qt 6 development tools are required for the native backend
 heavy cargo test
 heavy cargo clippy --all-targets -- -D warnings
@@ -15,15 +22,20 @@ cargo fmt --check
 heavy cargo build --release -p pneud -p pneu-sim
 ```
 
-Run `pneud run` to start the daemon and tray. An unpaired daemon opens its
-pairing window automatically; tray activation or `pneud window` opens the same
-window later. `pneud pair` also remains available for headless use and prints the URI,
+Run `pneud run` to start the daemon and tray/menu bar. Tray activation or
+`pneud window` opens the desktop window. Use **Add Device… → Phone** to show a
+QR for the phone. **Add Device… → Computer** offers **Show Pairing Code** and
+**Paste Link**, plus **Scan QR Code** on a Mac with a camera. Each computer can
+pair with several computers and phones; adding one device preserves the others.
+
+`pneud pair` remains available for headless use and prints the URI,
 expiry in UTC milliseconds, and a terminal QR. Treat the URI as a secret; the
 service never logs it. An invitation expires after five minutes. Reuse, TLS admission
 and pairing completion share one predicate: both wall-clock and monotonic expiry
-must remain in the future. `pneud
-close-pairing` also invalidates it. The CLI and window share a pairing invitation
-with at most three interface addresses, selected in three rounds:
+must remain in the future. `pneud close-pairing` also invalidates it. The CLI and
+window share a pairing invitation
+with at most three interface addresses. Linux selects them in three rounds
+(Mac interface selection is described in the [macOS guide](../docs/macos.md#discovery-and-host-metadata)):
 
 1. One best address per eligible interface: IPv4 if present, otherwise IPv6 with
    global, non-temporary addresses preferred. Interfaces are ordered Tailscale
@@ -44,8 +56,27 @@ pneu-sim --state /absolute/path/to/phone-state send-file capture.png screenshot 
 pneu-sim --state /absolute/path/to/phone-state clipboard 'hello'
 pneu-sim --state /absolute/path/to/phone-state listen 120
 pneud status
-pneud clipboard PHONE_DEVICE_ID 'hello from the PC'
+pneud clipboard DEVICE_ID 'hello from the PC'
 ```
+
+For desktop-to-desktop CLI pairing, `pneud join` reads the invitation from
+standard input. Use `join-status ATTEMPT`, `join-confirm ATTEMPT` and
+`join-cancel ATTEMPT` to follow or resolve the returned attempt. Transfer the
+link through a trusted channel; do not put real invitation secrets in shell history.
+
+Send files from **Send Files…**, Dolphin's **Send with Pneu**, the Mac menu bar,
+or the CLI:
+
+```sh
+pneud send --to DEVICE_ID /absolute/path/to/file
+pneud send --to FIRST_DEVICE_ID --to SECOND_DEVICE_ID /absolute/path/to/file
+pneud operation-status OPERATION_ID
+```
+
+Without `--to`, `pneud send FILE...` follows the desktop's recipient-picker and
+offline-queue settings. Explicit targets can queue while offline. Files are
+snapshotted into a durable per-recipient outbox, with frozen pairing identities;
+reconnects retry the same bytes and IDs. Clipboard sends require live sessions.
 
 The simulator persists its identity, PC binding, pending pairing attempt, pause
 state and last assigned clipboard timestamp. Text timestamps increase across
@@ -59,7 +90,7 @@ originate idle PINGs, and validate PONGs; clipboard diagnostics include IDs only
 share` marks shared text, and `send-file PATH file MIME` sends an ordinary file.
 It checks the PC's advertised clipboard-image capability before sending that kind.
 
-`install.sh` builds the release daemon (through `heavy` when available), installs it into
+`install.sh` on Linux builds the release daemon (through `heavy` when available), installs it into
 `~/.local/bin`, installs the app/tray icons and desktop entry, writes the systemd user unit, and reenables it for `graphical-session.target`.
 An active graphical session starts/restarts the daemon immediately, including
 reinstalls; otherwise it starts with the next graphical session. Run it only
@@ -83,7 +114,8 @@ integration tests. The executable binds dual-stack `[::]:47821` by default.
   `close_pairing_if(token)` invalidates only the invitation the window displayed;
   `close_pairing()` closes pairing unconditionally.
 - `unpair_device(Id)` refuses new registration, durably removes the certificate
-  binding, receipts and queued text, then sends best-effort UNPAIR and closes.
+  binding, receipts and pending deliveries for that device, then sends best-effort
+  UNPAIR and closes.
   Persistence failure closes without UNPAIR and retains trust for retry/reconnect.
   Saved user files remain.
 - `config()` returns the current configuration. `update_config(Config)` validates,
@@ -91,11 +123,14 @@ integration tests. The executable binds dual-stack `[::]:47821` by default.
   "changing the port takes effect after restarting pneud"; edit the configuration
   file and restart for a new port. `pneud reload` applies other edited settings.
   The configured port is available to IPC immediately after Core construction.
-- `send_clipboard(Id, String)` retains only the latest pending PC-to-phone text
-  and returns its operation ID. Delivery waits for the receiving HELLO capability
-  and honors the sync toggle. New unsent text replaces older pending text;
-  in-flight text can finish awaiting its receipt. `discard_clipboard(Id)` drops
-  the latest pending text. Text is last-writer-wins by `created_at` at the receiver.
+- `send_clipboard(Id, String)` sends text to that device's current authenticated
+  session and returns its operation ID. `share_clipboard(Targets)` reads the
+  current selection for selected connected devices. Neither is a durable offline
+  clipboard queue. `discard_clipboard(Id)` drops pending clipboard work for that
+  peer. Mesh clipboard ordering uses the device-wide `(hlc, source_device)` register.
+- `peer_settings(Id)` reads synced directional switches; `set_peer_setting(...)`
+  persists an edit and schedules synchronization. Pair switches cover each
+  clipboard direction and phone-to-computer automatic media. All start enabled.
 - `paired_devices()` and `connected_devices()` return device IDs. `subscribe()` returns a bounded Tokio
   broadcast receiver for `Event`: connection changes, transfer start/progress/
   finish, received/sent clipboard operation IDs, config changes and errors.
@@ -104,68 +139,55 @@ integration tests. The executable binds dual-stack `[::]:47821` by default.
 - `request_shutdown()` stops the server; await `serve` to join connection workers.
   `shutdown_actions()` can also explicitly close desktop integrations.
 
-The CLI's owner-only `$XDG_RUNTIME_DIR/pneud.sock` accepts bounded newline JSON
-`ipc::Command` requests. Rust UI code can call `Core` directly; it does not need
-IPC. The ksni tray runs in the daemon and remains optional: the transport works
-without a StatusNotifier host. A single supervised `pneud ui-window` child runs
-Slint's native Qt event loop and communicates through owner-only IPC (`UiStatus`,
-`ShowWindow`, `ClosePairingIf`). This isolates window/backend failures from the
-transport. The window uses native Breeze widgets, an error-correction-M QR with
-five-minute refresh, and the XDG portal folder chooser. UI snapshots read the phone
-ID, metadata, connection generation and status together; UiStatus and Status never
-combine separate phone reads. Cached metadata carries its device ID. A replaced
-pairing or legacy/mismatched cache displays “Phone” until current metadata arrives.
-Core owns one invitation
-shared by CLI and window; owner-only IPC subscriptions immediately update the QR
-when CLI pairing replaces it. Closing hides the window and invalidates its
-displayed token if still active; the next request raises it.
+The CLI uses bounded newline JSON `ipc::Command` requests on an owner-only,
+uid-checked Unix socket. Linux uses `$XDG_RUNTIME_DIR/pneud.sock`; Mac paths are
+listed in the [macOS guide](../docs/macos.md#paths-and-overrides). Rust callers can use `Core`
+directly. A supervised `pneud ui-window` child keeps window/backend failures
+separate from transport. Linux uses Slint/Qt and the XDG portal; macOS uses
+Slint/winit and native AppKit integration. Closing the window leaves transfers
+running. Core owns one short-lived invitation shared by CLI and window.
 
-The Wayland data-control watcher observes only CLIPBOARD offers. It skips password
-markers, Pneu's origin MIME and recent content hashes, debounces 300 ms, and sends
-only to the exact connected, unpaused phone. Observation captures policy before
-queuing data reads to a separate reader with one pending offer. New selections
-cancel earlier reads, including slow password markers; shutdown joins both
-threads. `send_automatic_clipboard` and
-`send_automatic_image` share an ephemeral latest-only selection slot. Automatic
-text persists only its monotonic timestamp, never its contents; every new offer, disconnect, pause
-or changing sync/image policy invalidates pending automatic selections, including
-content already prepared in Core or queued to the writer. Automatic work retains
-its session/offer token until the writer accepts its first byte; later offer/policy
-changes drop unsent work, while a begun frame or image finishes as in-flight.
-Selection removal checks ownership atomically. Explicit IPC sends retain their durable outbox. Include Images defaults off, requires
-the peer's `clipboard_image` capability, and sends PNG up to 10 MiB. General PC
-file sending remains outside this API.
+The clipboard actor owns observation, ordering, echo suppression and frozen
+recipients. Linux observes Wayland CLIPBOARD offers; macOS observes NSPasteboard.
+Reads and OS effects run outside the actor. Password/sensitive markers suppress
+sharing, and received content is not automatically forwarded. Disconnect or a
+policy change invalidates unsent work; an already-started frame may finish.
+Text and images are connected-only, including explicit sends. Automatic clipboard
+sharing defaults on; **Include images** defaults off and requires the receiver's
+`clipboard_image` capability. Outgoing clipboard images are bounded to 10 MiB.
+See the [main README](../README.md#settings) for the current settings and defaults.
 
-Tray SVGs are bundled and installed. The default ARGB fallback uses kdeglobals'
+On Linux, tray SVGs are bundled and installed. The default ARGB fallback uses kdeglobals'
 active Plasma desktop theme palette (or the window scheme for adaptive themes), refreshed by KGlobalSettings
 `notifyChange` and periodically as a fallback. `PNEU_TRAY_NAMED_ICONS=1` enables
 the named-icon spike; `PNEU_KDEGLOBALS` selects an isolated color configuration.
 
 ## Durability, tasks and desktop actions
 
-The PC pairs with one phone. Accepting a valid invitation replaces the old pin,
-binding, dedupe and pending text while preserving saved files. Newest authenticated
-connection wins; a connection ID suppresses stale events from the old socket.
-Unpair marks the lifecycle before closing/forgetting, so replacement cannot slip
-in while trust is being removed. Pairing epochs cancel queued and running desktop
-actions and the viewer debounce.
+Trust, receipts, settings and queued deliveries belong to individual peers.
+Unpairing or replacing one binding leaves the other peers intact and preserves
+saved user files. Per-peer binding and connection generations reject stale
+work; mesh links resolve simultaneous computer dials deterministically.
 
 SQLite uses WAL, `synchronous=FULL`, owner-only files and foreign-key cascades.
-It stores the single binding, completed file receipts, one failed-save cache
-reference per transfer (metadata and path, never a success receipt), clipboard timestamp and
-64 recent text IDs (hash, timestamp, origin), latest outgoing text, and ever-used
-staging folders. There are no pending inbound text barriers or delivery leases.
+It stores peer bindings, file receipts, pair settings and their synchronization
+state, clipboard clocks/hashed history, outgoing file operations, failed-save
+cache references and previously used staging folders. Clipboard payloads are
+never a durable offline outbox. Desktop file snapshots are bounded to 2 GiB and
+256 pending deliveries globally, 1 GiB and 128 deliveries per peer, with a
+64 MiB free-space reserve.
+
 Calls use one connection mutex in Tokio's blocking pool. Shutdown drains tracked
 blocking work and cancellation cleanup. Streaming transfers never buffer a whole
 file. Bounded reader, writer, file and text queues await capacity, applying TCP
 backpressure. Once read, PING schedules PONG ahead of queued outgoing frames;
 a storage stall can delay reading until the peer's PONG deadline. All writes
 flush within their deadlines. Idle file workers have no transfer deadline.
-One outgoing DB query survives select iterations instead of spawning jobs for
-each status/config event. One provisional pairing connection and sixteen total
-connections (including unknown clients and in-flight TLS handshakes) are admitted;
-unknown pairing admission is limited to once per second.
-PC initiates no periodic PINGs. Cache pruning runs hourly. Successful retries
+The daemon allows sixteen established peer sessions, with separate headroom for
+sixteen inbound and four outbound candidate handshakes (36 transport slots in
+total). Unknown pairing admission is limited to once per second.
+The dialer drives periodic PINGs; the acceptor answers them. Cache pruning runs
+hourly. Successful retries
 retire failed-save previews by reopening without following links and checking
 recorded device, inode, size and nanosecond modification/change times, relative
 to the original directory handle. The evidence holds no file descriptors, so
@@ -217,16 +239,17 @@ still deduplicate file replays permanently until unpair, and no recovery path
 inspects or deletes uncertain user files. Metadata conflicts NACK after draining.
 Capacity checks enforce configured size and a 16 MiB free-space reserve.
 
-Text application uses a last-applied timestamp and 64 recent IDs per peer.
-Identical recent replays and stale/equal timestamps ACK as deduplicated without
-changing the clipboard. Newer text applies then commits its small history;
-OS denial retains nothing and NACKs `clipboard_unavailable`. A sender may retry,
-drop or supersede it. A crash before history commit may repeat an application.
-There is no FIFO or pending-operation barrier. No clipboard contents appear in
-events or logs. Completed file IDs have no expiry; cached files expire with a
+Mesh clipboard text and image effects share one persisted device-wide ordering
+register. Recent operation fingerprints suppress replays and clipboard-manager
+echoes; legacy connections retain timestamp ordering. OS denial NACKs
+`clipboard_unavailable`; a crash after an OS effect but before its receipt is
+committed can repeat that effect. Events and logs contain no clipboard payloads.
+Completed file IDs have no expiry until unpair; cached files expire with a
 one-day default retention.
 
-`PcActions` isolates OS integration from protocol tests. Production uses zbus
+`PcActions` isolates OS integration from protocol tests. The following desktop
+actions describe Linux; see the [macOS guide](../docs/macos.md) for native
+equivalents and their limits. Linux uses zbus
 notifications with the approved text, actions, urgency and transient hints.
 File notifications use `x-kde-urls` for Plasma thumbnails; explicit clipboard
 images use a bounded inline image preview. Notification Open/default uses only
@@ -253,8 +276,8 @@ responses run in separately tracked tasks. Notification buttons also issue reque
 without waiting for interaction in the signal loop. Each consumer permits eight
 outstanding interactions and ignores further opens until capacity is available.
 Shutdown cancels and joins these waits; viewer waits also cancel when their pairing
-scope or connection generation is revoked. Unpair confirmation retains the phone
-ID and name displayed when it opened, so pairing a replacement cannot retarget it.
+scope or connection generation is revoked. Unpair confirmation retains the device
+ID and name displayed when it opened, so another pairing cannot retarget it.
 Portal URI failures/acceptance timeouts use a
 bounded `xdg-open` fallback. The folder chooser reports portal failures
 and treats cancellation as no selection. Clipboard bytes and previews use the same received-file descriptor,
@@ -289,9 +312,9 @@ images remain saved/ACKed and emit a clipboard-action error. Text is protocol-bo
 after its READY reply; shutdown kills and reaps it. Optional clipboard and
 notification failures cannot select an older image for the debounced viewer:
 the newest eligible image wins independently of those actions' timeouts.
-Echo hashes replace the previous successful selection only after the helper's
-READY response, including hashes for converted image formats; failed clipboard
-writes preserve the previous guard.
+Clipboard installation is confirmed through the watcher and the actor's origin
+ticket. Recent keyed content fingerprints also suppress echoes after helper
+replacement; failed writes do not claim a successful clipboard installation.
 
 Manual clipboard verification uses the same Wayland library:
 
@@ -305,97 +328,28 @@ to the real compositor socket, because its runtime directory is temporary.
 
 ## Specification decisions
 
-PROTOCOL.md takes precedence over PLAN.md's older "deduplicated by media ID"
-shorthand: identity is `(authenticated sender device_id, transfer_id)`, with all
-known decoded metadata included in equality. Inbound text reserves its ID against
-file commits before touching the clipboard, then finalizes its bounded hashed
-history after success. Failed/cancelled effects release the claim; startup drops
-unfinished claims. Notification/viewer failures never
-undo a durable file receipt; clipboard text OS denial produces a retryable NACK.
+The [protocol](../docs/PROTOCOL.md) takes precedence over the original v1
+[plan](../docs/PLAN.md). Operation identity is
+`(authenticated sender device_id, transfer_id)`. Mesh is negotiated only when
+both HELLOs advertise `mesh`; legacy-compatible connections keep v1 wire
+behaviour. A feature requiring an update does not revoke trust or discard queues.
 
-Unpairing cannot revoke a TLS handshake already in flight by pin deletion alone:
-the daemon rechecks its binding while registering READY and refuses registration
-while unpairing. Local and remote unpair remove trust/dedupe transactionally,
-signal closure only after persistence succeeds, and preserve completed user files.
-Failure closes without UNPAIR, preserving both sides' binding. A durable pairing
-generation changes with each committed pair/unpair. Sessions and local commands
-capture it before scheduling work; one transaction helper rejects revoked file,
-text, outgoing and receipt writes, including reuse of the same device ID. READY
-registration captures the generation and action scope under the pairing gate;
-connection work never looks up a later scope by device ID. Unpair/re-pair discard
-pending automatic work and cancel the admitted action scope. One scope helper
-checks cancellation and the captured connection generation immediately before each
-clipboard text/image, notification or viewer side effect, after acquiring the
-action mutex and after storage or earlier-action awaits. Replaced sessions cannot
-initiate delayed desktop actions. Only admission of a newer connection advances
-that generation; an ordinary disconnect preserves completed-transfer actions and
-admitted clipboard text history. Completed-file actions are queued before ACK so
-an immediate sender disconnect cannot interrupt their admission. Failed unpair
-persistence retains trust, clears the admission latch and restores a fresh action
-scope even if its caller was cancelled; failed replacement preserves the old
-connection, action scope and invitation. Outgoing clipboard timestamps are
-assigned inside the enqueue transaction, and replacement retains only the greater
-`created_at` so concurrent IPC requests cannot overwrite newer pending text.
+Local and remote unpair remove trust and dedupe state transactionally before
+best-effort UNPAIR/closure. Persistence failure retains the binding for retry.
+Sessions and queued actions retain their captured peer generation, so replacement
+or unpair cannot retarget them. Ordinary disconnect preserves completed-file
+actions; clipboard deliveries cannot migrate into a new session.
 
-UI folder changes and tray toggles use field-specific Core mutations under the
-config lock. A portal folder request runs alongside window status/QR polling and
-is closed when the Pneu window closes. Open Folder falls back to `xdg-open` when
-the portal is absent or fails. Ordinary image copy-failure notifications retain
-the received descriptor for their Open action. Window icons are recolored from
-the actual window palette, including custom schemes. Production Tokio workers
-and the window IPC thread use 8 MiB stacks; connection/session/action/UI futures
-are boxed at task boundaries to reduce nested async stack usage.
+Pair settings use stamped registers and full-state snapshots. Offline edits
+remain pending until the peer connects. Settings synchronize before new content;
+file deliveries blocked by a disabled direction wait, while unsent clipboard
+text is dropped. Desktop settings receipts retain a rolling window of 4096
+snapshots per sender; eviction permits safe re-merging rather than imposing a
+lifetime quota.
 
-Failed-save retention follows DESIGN.md's cache-preview requirement despite
-PROTOCOL.md's older no-retained-copy sentence. Repeated failures retain one copy
-and perform desktop effects only on its first placement; a successful retry
-retires the cached copy after committing the folder receipt.
-
-Shutdown claim cleanup captures plain data rather than another RAII claim, so a
-canceled blocking task cannot recursively schedule its own cleanup. A debugger
-capture of the parallel-test overflow identified that recursion; a queued-cleanup
-runtime-shutdown regression exercises it with one occupied blocking worker.
-
-Phone freshness is persisted on disconnect and orderly shutdown with generation
-checks, including unpair failure/cancellation callbacks. Session replacement and
-all pairing/session endings reset both active transfers and receiving grace.
-Folder recovery clears only the resolved folder's error; listener recovery clears
-only port errors. Transfer progress does not drive SVG rendering or tray updates:
-the tray refreshes icons on theme changes or five-second timer deadlines, and the
-window caches rendered icons until its theme configuration changes.
-
-Outgoing receipt timers start on the writer's flushed text frame or FILE_END
-completion, never while queued or streaming image chunks. Frame write/flush
-progress remains bounded separately. The store explicitly releases its flock
-when the final Store owner ends: a concurrent child between fork and exec cannot
-prolong ownership merely by inheriting a CLOEXEC descriptor.
-
-Notification activation on Wayland uses the notification server's
-`ActivationToken(id, token)` signal immediately preceding `ActionInvoked`.
-One ordered signal stream associates the credential with that notification;
-pending credentials expire after thirty seconds and are consumed once. Their
-bounded cache is independent of notification target lifetimes. Each fresh token
-is accepted for a live action mapping, including repeated clicks on a retained
-notification. Missing, closed and already-used tokens are never inherited by a
-later action. Open and Open Link pass `activation_token` to portal requests;
-Show in Folder passes the token as FileManager1's startup ID.
-The URI fallback passes both `XDG_ACTIVATION_TOKEN` and `DESKTOP_STARTUP_ID` in
-the child environment, clearing inherited startup credentials when absent.
-Pair Phone uses a fresh supervised UI child when a token is present. The daemon
-kills and reaps its old UI child, then supplies the startup environment and
-request revision to the new child. Transient dialogs reset; settings and pairing
-state remain in the daemon. Winit reads `XDG_ACTIVATION_TOKEN` before
-`PneuWindow::new()` and applies it once through Slint's creation hook; Qt consumes
-the fresh process's startup token. The child recognizes its initial window
-revision without hiding/remapping the window.
-
-Choose Folder uses plain FileChooser and may open behind other windows.
-
-Tray Open Folder has no notification credential. ksni 0.3.6 exposes neither an
-activation token nor a Wayland seat/input serial in its menu callback (only the
-tray state). This headless daemon owns no Wayland input surface, so requesting
-an `xdg_activation_v1` token on a separate connection cannot establish the user
-interaction needed to bypass KWin's focus prevention. Tray launches remain
-best-effort portal/xdg-open launches without a token until the tray host/library
-supports forwarding one; opening a previously open Dolphin window from the tray
-is therefore not guaranteed to raise it.
+Linux folder changes and tray toggles use field-specific Core mutations under
+the configuration lock. Portal requests bind to their issuing bus owner and
+close on cancellation. Notification activation tokens are consumed for their
+associated action; missing tokens are not inherited from an earlier action.
+Tray launches have no activation token and remain subject to KWin focus
+prevention. Choose Folder may also open behind other windows.
