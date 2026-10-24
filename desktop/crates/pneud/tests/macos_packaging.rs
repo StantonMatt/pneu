@@ -224,6 +224,9 @@ fn bundle_contract_layout_and_signing() -> Result<()> {
     let calls = s.calls()?;
     assert!(calls.contains("heavy cargo build --locked -p pneud --release"));
     assert!(calls.contains("codesign --force --sign - --options runtime"));
+    assert!(calls.contains("--entitlements packaging/macos/Pneu.entitlements"));
+    let entitlements = fs::read_to_string(s.root.join("packaging/macos/Pneu.entitlements"))?;
+    assert!(entitlements.contains("<key>com.apple.security.device.camera</key><true/>"));
     assert!(calls.contains("codesign --verify --strict"));
     assert!(!calls.contains("launchctl"));
     assert!(!calls.contains("login-item"));

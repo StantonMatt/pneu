@@ -4,7 +4,8 @@ Pneu runs on macOS 15.4 or later. The headless `pneud run` daemon owns Core,
 TLS transport, pairing, file admission, receipt storage and the clipboard actor.
 One supervised `pneud ui-window` child hosts the native menu bar, notifications,
 file pickers and shared Slint window using winit. Closing the window keeps the
-menu bar and transfers running. Camera QR scanning is a later slice.
+menu bar and transfers running. Add Device → Computer also offers Scan QR Code
+when AVFoundation discovers a camera.
 
 ## Install
 
@@ -78,7 +79,7 @@ Use `--profile release` for an optimized build. Packaging creates `AppIcon.icns`
 with `iconutil` from `assets/macos/AppIcon.iconset`, copies `assets/macos/menubar-*.png`
 images (including Retina variants) into `Resources/menubar/pneu-tray-*.png`, lints
 the Info.plist and daemon template (`Resources/daemon.plist.in`), signs ad-hoc
-with the hardened runtime, and verifies the signature. The executable renders
+with the hardened runtime and camera entitlement, and verifies the signature. The executable renders
 the session plist with its current absolute bundle path and explicit Pneu paths.
 If designer icons are absent the builder reports a temporary SVG-derived icon.
 Ad-hoc signing provides no Developer ID or notarization.
@@ -336,9 +337,42 @@ Native drag callbacks capture the complete file selection, recipient authorities
 and NSDraggingInfo coordinates as one gesture, without inferring gesture boundaries
 from winit's path-only events. Drop hit-testing uses the rendered, clipped and scrolled
 Slint target list and frozen authorities. An unknown location or offline target
-is rejected. Camera scanning has an opt-in `Ui.camera-available` / `Ui.scan-qr`
-hook for the later camera page. System Settings links are available for Camera,
+is rejected. System Settings links are available for Camera,
 Notifications, Clipboard and Login Items.
+
+## Camera pairing
+
+Add Device → Computer discovers built-in and external video cameras without
+requesting access; discovery is refreshed on entry and while the Computer rows
+are visible. Scan QR Code requests macOS camera access only when opened.
+NotDetermined waits for the system prompt; Denied and Restricted show
+`Pneu can't use the camera` with Open System Settings → Privacy & Security →
+Camera. Granting access there while the page is visible resumes capture.
+Disconnected, busy or failed cameras stop capture and offer Try Again.
+
+AVCaptureSession runs exclusively in the UI child on a serial session queue.
+A separate serial output queue discards late frames, supplies a mirrored Slint
+software-rendered preview at at most 10 fps, and runs a QR-only Vision request
+at most every 300 ms. Frames are bounded to 1280×720 and held only in memory in
+a single replaceable mailbox. Vision sees the original, unmirrored image.
+Other QR destinations are ignored. The first bounded `pneu://pair` payload stops
+the session before entering the ordinary Paste Link callback and Join IPC;
+confirmation, own-code, expiry and already-paired behavior are shared.
+
+Navigation, window close/hide, application hide, minimization, errors and quit
+invalidate the scan generation and stop capture. Permission callbacks and frames
+from older generations cannot restart a camera or navigate. Hiding/minimization
+is checked against native window/application visibility every 100 ms. A new
+session waits behind the previous session's stop; shutdown drains queued stops.
+Camera images and scanned payloads are never logged or written by the scanner.
+
+Linux-runnable tests cover authorization/availability mapping, payload admission,
+generation fencing, and handoff through the existing Join confirmation/errors.
+The native `vision_decodes_generated_still_through_capture_decoder` test generates
+a QR image and runs the same Vision decoder without opening a camera. Private
+`PNEU_UI_TEST` controls include `add-computer`, `scan-qr`, `scan-back`,
+`assert-camera-available`, `assert-camera-preview`, `assert-camera-denied` and
+`assert-camera-stopped`; production sessions reject these controls.
 
 ## Native verification and private acceptance
 

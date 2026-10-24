@@ -2,6 +2,8 @@
 #[cfg(target_os = "linux")]
 pub(crate) mod activation;
 #[cfg(any(target_os = "macos", test))]
+mod camera;
+#[cfg(any(target_os = "macos", test))]
 #[path = "macos/bridge.rs"]
 pub(crate) mod child_bridge;
 #[cfg(any(target_os = "macos", test))]

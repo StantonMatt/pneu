@@ -19,12 +19,26 @@ use std::{
 
 slint::slint! {
     export {
-        PneuWindow, Ui, WindowFocus, Page, Dialog, CodeState, DeviceItem, RecentItem, SettingItem,
+        PneuWindow, Ui, WindowFocus, Page, Dialog, CodeState, ScanState, DeviceItem, RecentItem, SettingItem,
         PickItem, RecipientItem, Message, Summary, Tone, Tube, LinkState, LinkTile, DropItem, DropGeometry
     } from "../../ui/window.slint";
 }
 
 pub(crate) use super::send_request::SendRequest;
+
+fn is_pairing_page(page: Page) -> bool {
+    matches!(page, Page::Add | Page::Code | Page::Scan)
+}
+
+/// Keep Scan active until the worker can navigate and preview the decoded link
+/// in one action. Native capture is already stopped by the caller.
+#[cfg(any(target_os = "macos", test))]
+pub(super) fn scanned_pairing(window: &PneuWindow, payload: String) {
+    if window.global::<Ui>().get_page() != Page::Scan {
+        return;
+    }
+    window.global::<Ui>().invoke_scanned_link(payload.into());
+}
 
 /// Presentation adapters for the typed daemon snapshot.
 pub(crate) mod contract {
@@ -207,6 +221,7 @@ enum Action {
     ShowCode,
     NewCode,
     PasteLink(String),
+    ScannedLink(String),
     Probed(String),
     OfferPair,
     OfferDismiss,
@@ -1076,6 +1091,8 @@ pub fn run(paths: Paths) -> Result<()> {
     connect(&window, &commands, &view);
     let c = commands.clone();
     window.window().on_close_requested(move || {
+        #[cfg(target_os = "macos")]
+        super::macos::camera::close();
         let _ = c.send(Action::Close);
         slint::CloseRequestResponse::KeepWindowShown
     });
@@ -1087,6 +1104,7 @@ pub fn run(paths: Paths) -> Result<()> {
         super::macos::native::install(&window, paths.cache.clone(), move |action| {
             let _ = commands.send(Action::Native(action));
         })?;
+        super::macos::camera::install(&window);
         install_drop(&window, &view, &commands_for_drop);
     }
     let weak = window.as_weak();
@@ -1150,12 +1168,13 @@ pub fn run(paths: Paths) -> Result<()> {
             let _ = slint::quit_event_loop();
         }
     });
-    slint::run_event_loop_until_quit()?;
+    let event_loop_result = slint::run_event_loop_until_quit();
     #[cfg(target_os = "macos")]
     super::macos::native::cleanup();
     drop(window);
     drop(commands);
     let _ = worker.join();
+    event_loop_result?;
     Ok(())
 }
 
@@ -1393,7 +1412,21 @@ fn connect(
             let _ = c.send(action(value.into()));
         }
     };
-    ui.on_close(send(|| Action::Close));
+    let close = send(|| Action::Close);
+    ui.on_close(move || {
+        #[cfg(target_os = "macos")]
+        super::macos::camera::close();
+        close();
+    });
+    #[cfg(target_os = "macos")]
+    {
+        let weak = window.as_weak();
+        ui.on_scan_qr(move || {
+            if let Some(window) = weak.upgrade() {
+                super::macos::camera::open(&window);
+            }
+        });
+    }
     ui.on_choose_folder(send(|| Action::Folder));
     ui.on_send_clipboard(send(|| Action::SendClipboard));
     ui.on_show_code(send(|| Action::ShowCode));
@@ -1420,6 +1453,7 @@ fn connect(
         let _ = c.send(Action::Login(on));
     });
     ui.on_paste_link(with(Action::PasteLink));
+    ui.on_scanned_link(with(Action::ScannedLink));
     ui.on_probed(with(Action::Probed));
     let c = commands.clone();
     ui.on_set_peer(move |key, on| {
@@ -1465,6 +1499,8 @@ fn connect(
             targets: current.targets.clone(),
         };
         drop(current);
+        #[cfg(target_os = "macos")]
+        super::macos::camera::navigated(&window);
         let _ = c.send(Action::Navigated);
     });
 }
@@ -1748,7 +1784,7 @@ impl Worker {
         match action {
             Action::Scoped(_, _) => unreachable!("nested UI action"),
             Action::Close => {}
-            Action::Navigated => self.navigated().await,
+            Action::Navigated => self.navigated(true).await,
             Action::Folder => {
                 if self.folder_job.is_none() {
                     self.folder_origin = Some(self.view());
@@ -2081,6 +2117,7 @@ impl Worker {
             Action::ShowCode => self.show_code(false).await,
             Action::NewCode => self.show_code(true).await,
             Action::PasteLink(text) => self.paste(text, false).await,
+            Action::ScannedLink(text) => self.scan(text).await,
             Action::Probed(text) => {
                 if self.join.is_none() && self.dismissed_offer.as_deref() != Some(text.trim()) {
                     self.paste(text, true).await;
@@ -2108,7 +2145,7 @@ impl Worker {
         }
     }
 
-    async fn navigated(&mut self) {
+    async fn navigated(&mut self, probe_clipboard: bool) {
         let view = self.view();
         self.pushed = None;
         self.action_error.clear();
@@ -2121,14 +2158,13 @@ impl Worker {
             self.paired = None;
         }
         let previous = std::mem::replace(&mut self.last_view, view.clone());
-        let pairing_pages = |v: &View| matches!(v.page, Page::Add | Page::Code);
-        if pairing_pages(&view) && !pairing_pages(&previous) {
+        if is_pairing_page(view.page) && !is_pairing_page(previous.page) {
             self.known = self.device_ids();
             self.lost = self.lost_ids();
             self.paired = None;
             self.probed = false;
         }
-        if view.page == Page::Add && !self.probed {
+        if probe_clipboard && view.page == Page::Add && !self.probed {
             // A usable link from another computer on the clipboard is offered at once.
             self.probed = true;
             self.ui(|w| w.invoke_probe_clipboard());
@@ -2414,7 +2450,51 @@ impl Worker {
         });
     }
 
+    async fn scan(&mut self, text: String) {
+        if self.origin.page != Page::Scan {
+            return;
+        }
+        // Await the UI navigation inside this action: the worker must not
+        // refresh Add Device and start a clipboard preview before this Join.
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let view = self.view.clone();
+        self.ui(move |w| {
+            if send.is_closed() {
+                return;
+            }
+            w.invoke_open_add(1);
+            let _ = send.send(view.lock().expect("window view").clone());
+        });
+        let Ok(Ok(destination)) = tokio::time::timeout(Duration::from_secs(5), receive).await
+        else {
+            return;
+        };
+        if self.view() != destination {
+            return;
+        }
+        self.origin = destination;
+        // Scanning supersedes even a restored clipboard preview. JoinCancel
+        // only abandons the local attempt; it never unpairs the other device.
+        self.restored_join = false;
+        self.navigated(false).await;
+        self.probed = true;
+        self.live_pairing_link = self.snapshot.pairing_clipboard.clone();
+        self.live_pairing_revision = self.snapshot.pairing_clipboard_revision;
+        if self.current() {
+            self.paste(text, false).await;
+        }
+    }
+
     async fn paste(&mut self, text: String, offer: bool) {
+        if !offer
+            && self.join.as_ref().is_some_and(|j| j.offer && !j.confirmed)
+            && let Some(join) = self.join.take()
+        {
+            self.cancel_join(&join).await;
+            if !self.current() {
+                return;
+            }
+        }
         let text = text.trim().to_owned();
         if !text.starts_with("pneu://pair") || text.len() > 8193 {
             if !offer {
@@ -2770,6 +2850,8 @@ impl Worker {
         // Close is a window-lifetime action. Hide before awaiting cancellation;
         // navigation may have advanced since the worker's last status frame.
         let _ = self.weak.upgrade_in_event_loop(|w| {
+            #[cfg(target_os = "macos")]
+            super::macos::camera::close();
             w.global::<Ui>().set_dialog(Dialog::None);
             let _ = w.hide();
         });
@@ -2898,8 +2980,7 @@ impl Worker {
         }
         let view = self.view();
         if first_run
-            && view.page != Page::Add
-            && view.page != Page::Code
+            && !is_pairing_page(view.page)
             && self.paired.is_none()
             && !(cfg!(target_os = "macos") && view.page == Page::Settings)
         {
@@ -3017,9 +3098,9 @@ impl Worker {
         }
         self.poll_join().await;
 
-        // A device that appears (or recovers from a lost pairing) while Add
-        // Device or Pairing Code shows was just paired: check, then its page.
-        if matches!(view.page, Page::Add | Page::Code)
+        // A device that appears (or recovers from a lost pairing) while a
+        // pairing page shows was just paired: check, then its page.
+        if is_pairing_page(view.page)
             && self.join.is_none()
             && self.current()
             && self.paired.is_none()
@@ -3034,6 +3115,10 @@ impl Worker {
                 device: Some(peer.id.clone()),
                 at: Instant::now(),
             });
+            #[cfg(target_os = "macos")]
+            if view.page == Page::Scan {
+                self.ui(|_| super::macos::camera::close());
+            }
         }
         if self
             .paired
@@ -3994,8 +4079,515 @@ mod tests {
         state(&mut worker, two(), vec![]);
         (worker, rx)
     }
+    // Production runs the UI event loop alongside the IPC worker. Headless
+    // tests pump that loop while an action awaits a navigation acknowledgement.
+    async fn act_with_ui(worker: &mut Worker, action: Action) {
+        tokio::select! {
+            _ = worker.act(action) => {},
+            _ = async {
+                loop {
+                    flush_ui();
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            } => unreachable!(),
+        }
+        flush_ui();
+    }
+
     fn status_value(worker: &Worker) -> Value {
         json!({"snapshot":worker.snapshot, "config":Config::default(), "window_request":0, "invitation":null})
+    }
+    #[tokio::test]
+    async fn first_run_scan_survives_refresh_and_requires_confirmation() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::first_run_scan_survives_refresh_and_requires_confirmation",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        for confirm in [false, true] {
+            let window = PneuWindow::new()?;
+            let dir = tempfile::tempdir()?;
+            let (mut worker, mut actions) = model_worker(&window, dir.path());
+            state(&mut worker, vec![], vec![]);
+            let mock = mock_ipc(&worker.paths.socket, |command| {
+                let reply = match command["command"].as_str() {
+                    Some("join") => {
+                        json!({"state":"confirmation", "attempt":"first-scan", "name":"Other Mac"})
+                    }
+                    Some("join_confirm") => json!({"state":"pairing"}),
+                    Some("join_status") => json!({"state":"paired", "device":id(2)}),
+                    _ => Value::Null,
+                };
+                (true, reply)
+            })?;
+            let visible = AtomicBool::new(true);
+            // The initial empty status opens Add Device without a back header.
+            worker.refresh(status_value(&worker), &visible).await?;
+            flush_ui();
+            assert_eq!(worker.view().page, Page::Add);
+            while let Ok(action) = actions.try_recv() {
+                act_with_ui(&mut worker, action).await;
+            }
+            window.invoke_open_add(1);
+            while let Ok(action) = actions.try_recv() {
+                act_with_ui(&mut worker, action).await;
+            }
+            // Exercise navigation only: no native camera is installed or opened.
+            window.invoke_go(Page::Scan);
+            while let Ok(action) = actions.try_recv() {
+                act_with_ui(&mut worker, action).await;
+            }
+            let scan_view = worker.view();
+            for scan_state in [
+                ScanState::Requesting,
+                ScanState::Scanning,
+                ScanState::Denied,
+            ] {
+                window.global::<Ui>().set_scan_state(scan_state);
+                for _ in 0..3 {
+                    worker.refresh(status_value(&worker), &visible).await?;
+                    flush_ui();
+                    assert!(window.global::<Ui>().get_first_run());
+                    assert_eq!(worker.view(), scan_view);
+                    assert_eq!(window.global::<Ui>().get_scan_state(), scan_state);
+                    assert_eq!(window.global::<Ui>().get_dialog(), Dialog::None);
+                }
+            }
+            scanned_pairing(&window, sample_uri());
+            while let Ok(action) = actions.try_recv() {
+                act_with_ui(&mut worker, action).await;
+            }
+            worker.refresh(status_value(&worker), &visible).await?;
+            flush_ui();
+            assert_eq!(worker.view().page, Page::Add);
+            assert_eq!(worker.view().add_tab, 1);
+            assert_eq!(window.global::<Ui>().get_dialog(), Dialog::Message);
+            let message = window.global::<Ui>().get_message();
+            assert_eq!(message.title, "Pair with Other Mac?");
+            assert_eq!(message.secondary, "Cancel");
+            assert_eq!(message.primary, "Pair");
+            assert!(!worker.join.as_ref().unwrap().confirmed);
+            assert!(
+                !mock
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["command"] == "join_confirm")
+            );
+            // Match the confirmation buttons: dismiss the popup and submit its choice.
+            window.global::<Ui>().set_dialog(Dialog::None);
+            window
+                .global::<Ui>()
+                .invoke_message_action(message.action, confirm);
+            while let Ok(action) = actions.try_recv() {
+                act_with_ui(&mut worker, action).await;
+            }
+            if confirm {
+                assert!(worker.join.as_ref().unwrap().confirmed);
+                state(
+                    &mut worker,
+                    vec![device(2, "Other Mac", false, "connected", 0)],
+                    vec![],
+                );
+                worker.refresh(status_value(&worker), &visible).await?;
+                flush_ui();
+                assert_eq!(window.global::<Ui>().get_paired(), "Other Mac");
+                assert!(!window.global::<Ui>().get_first_run());
+                assert_eq!(
+                    worker.paired.as_ref().unwrap().device.as_deref(),
+                    Some(id(2).as_str())
+                );
+                worker.paired.as_mut().unwrap().at = Instant::now() - Duration::from_secs(2);
+                worker.refresh(status_value(&worker), &visible).await?;
+                flush_ui();
+                while let Ok(action) = actions.try_recv() {
+                    act_with_ui(&mut worker, action).await;
+                }
+                worker.refresh(status_value(&worker), &visible).await?;
+                flush_ui();
+                assert_eq!(worker.view().page, Page::Device);
+                assert_eq!(worker.view().device, id(2).as_str());
+                assert!(worker.join.is_none());
+                assert!(worker.paired.is_none());
+                assert!(!worker.journal_path().exists());
+            } else {
+                worker.refresh(status_value(&worker), &visible).await?;
+                flush_ui();
+                assert_eq!(worker.view().page, Page::Add);
+                assert_eq!(worker.view().add_tab, 1);
+                assert_eq!(window.global::<Ui>().get_dialog(), Dialog::None);
+                assert!(worker.join.is_none());
+                assert!(worker.paired.is_none());
+                assert!(!worker.journal_path().exists());
+            }
+            let requests = mock.requests.lock().unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|r| r["command"] == "join_confirm")
+                    .count(),
+                usize::from(confirm)
+            );
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|r| r["command"] == "join_cancel")
+                    .count(),
+                usize::from(!confirm)
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_preserves_pairing_baseline_until_leaving_pairing_pages() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::scan_preserves_pairing_baseline_until_leaving_pairing_pages",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        state(
+            &mut worker,
+            vec![device(1, "Phone", true, "pairing_lost", 0)],
+            vec![],
+        );
+        window.invoke_open_add(1);
+        while let Ok(action) = actions.try_recv() {
+            worker.act(action).await;
+        }
+        let known = worker.device_ids();
+        let lost = worker.lost_ids();
+        assert_eq!(worker.known, known);
+        assert_eq!(worker.lost, lost);
+        assert!(worker.probed);
+        // A peer appears while Scan is open. Returning to Add must not absorb
+        // that peer into the baseline and hide the pairing-success transition.
+        window.invoke_go(Page::Scan);
+        while let Ok(action) = actions.try_recv() {
+            worker.act(action).await;
+        }
+        state(
+            &mut worker,
+            vec![
+                device(1, "Phone", true, "connected", 0),
+                device(2, "Other Mac", false, "connected", 0),
+            ],
+            vec![],
+        );
+        window.invoke_back();
+        while let Ok(action) = actions.try_recv() {
+            worker.act(action).await;
+        }
+        assert_eq!(worker.view().page, Page::Add);
+        assert_eq!(worker.view().add_tab, 1);
+        assert_eq!(worker.known, known);
+        assert_eq!(worker.lost, lost);
+        assert!(worker.probed);
+        worker
+            .refresh(status_value(&worker), &AtomicBool::new(true))
+            .await?;
+        assert!(worker.paired.is_some());
+        // A fresh entry, including direct entry to Scan, resets all baselines.
+        window.invoke_go(Page::Main);
+        while let Ok(action) = actions.try_recv() {
+            worker.act(action).await;
+        }
+        window.invoke_go(Page::Scan);
+        while let Ok(action) = actions.try_recv() {
+            worker.act(action).await;
+        }
+        assert_eq!(worker.known, worker.device_ids());
+        assert_eq!(worker.lost, worker.lost_ids());
+        assert!(worker.lost.is_empty());
+        assert!(worker.paired.is_none());
+        assert!(!worker.probed);
+        // Newly paired peers are also recognized while Scan itself is open.
+        worker
+            .snapshot
+            .devices
+            .push(device(3, "Office PC", false, "connected", 0));
+        worker
+            .refresh(status_value(&worker), &AtomicBool::new(true))
+            .await?;
+        flush_ui();
+        assert_eq!(
+            worker.paired.as_ref().unwrap().device.as_deref(),
+            Some(id(3).as_str())
+        );
+        assert_eq!(window.global::<Ui>().get_paired(), "Office PC");
+        worker.paired.as_mut().unwrap().at = Instant::now() - Duration::from_secs(2);
+        worker
+            .refresh(status_value(&worker), &AtomicBool::new(true))
+            .await?;
+        flush_ui();
+        assert_eq!(worker.view().page, Page::Device);
+        assert_eq!(worker.view().device, id(3).as_str());
+        Ok(())
+    }
+
+    // Model Core's single join slot, so a missing preview cancellation rejects
+    // the explicit link just as it does in production.
+    fn mock_join_slot(path: &Path, clipboard: String) -> Result<MockIpc> {
+        let mut active = None;
+        mock_ipc(path, move |command| match command["command"].as_str() {
+            Some("join") => {
+                if active.is_some() {
+                    return (false, json!("pairing in progress"));
+                }
+                let (attempt, name) = if command["uri"] == clipboard {
+                    ("clipboard-preview", "Clipboard Mac")
+                } else {
+                    ("scan-preview", "Scanned Mac")
+                };
+                active = Some(attempt);
+                (
+                    true,
+                    json!({"state":"confirmation", "attempt":attempt, "name":name}),
+                )
+            }
+            Some("join_cancel") => {
+                assert_eq!(command["attempt"], active.unwrap());
+                active = None;
+                (true, Value::Null)
+            }
+            other => panic!("unexpected pairing command: {other:?}"),
+        })
+    }
+
+    async fn check_clipboard_handoff(preview: bool, scan: bool) -> Result<()> {
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        let mut clipboard = pneu_proto::PairingUri::parse(&sample_uri())?;
+        clipboard.name = "Clipboard Mac".into();
+        clipboard.token = pneu_proto::Hash::new("ef".repeat(32))?;
+        let clipboard = clipboard.build()?;
+        let mock = mock_join_slot(&worker.paths.socket, clipboard.clone())?;
+        window.invoke_open_add(1);
+        while let Ok(action) = actions.try_recv() {
+            act_with_ui(&mut worker, action).await;
+        }
+        worker.snapshot.pairing_clipboard = Some(clipboard);
+        worker.snapshot.pairing_clipboard_revision = 1;
+        let visible = AtomicBool::new(true);
+        if preview {
+            worker.refresh(status_value(&worker), &visible).await?;
+            flush_ui();
+            assert_eq!(window.global::<Ui>().get_offer(), "Clipboard Mac");
+            assert!(worker.join.as_ref().unwrap().offer);
+        }
+        if scan {
+            // Retain an offer across navigation as can happen during restart
+            // recovery. The scan action itself must cancel this preview.
+            worker.restored_join = preview;
+            window.invoke_go(Page::Scan);
+            while let Ok(action) = actions.try_recv() {
+                act_with_ui(&mut worker, action).await;
+            }
+            for _ in 0..4 {
+                worker.refresh(status_value(&worker), &visible).await?;
+                flush_ui();
+            }
+            assert_eq!(worker.join.is_some(), preview);
+            window
+                .global::<Ui>()
+                .on_probed(|_| panic!("scan handoff must not probe the clipboard"));
+            scanned_pairing(&window, sample_uri());
+            // Admission queues exactly one action, and leaves Scan active until
+            // that action can navigate and Join without a worker refresh.
+            assert_eq!(worker.view().page, Page::Scan);
+        } else {
+            window.global::<Ui>().invoke_paste_link(sample_uri().into());
+        }
+        for _ in 0..4 {
+            worker.refresh(status_value(&worker), &visible).await?;
+            flush_ui();
+        }
+        let action = actions.try_recv()?;
+        assert!(matches!(&action, Action::Scoped(_, action) if matches!(
+            (&**action, scan), (Action::ScannedLink(_), true) | (Action::PasteLink(_), false)
+        )));
+        assert!(actions.try_recv().is_err());
+        act_with_ui(&mut worker, action).await;
+        // Match the real worker: refresh after every action, including the
+        // navigation notification generated inside the atomic scan action.
+        loop {
+            for _ in 0..4 {
+                worker.refresh(status_value(&worker), &visible).await?;
+                flush_ui();
+                assert_eq!(worker.join.as_ref().unwrap().attempt, "scan-preview");
+                assert_eq!(worker.view().page, Page::Add);
+                assert_eq!(worker.view().add_tab, 1);
+                assert_eq!(window.global::<Ui>().get_dialog(), Dialog::Message);
+                assert_eq!(
+                    window.global::<Ui>().get_message().title,
+                    "Pair with Scanned Mac?"
+                );
+                assert!(window.global::<Ui>().get_offer().is_empty());
+                assert!(!worker.join.as_ref().unwrap().confirmed);
+            }
+            let Ok(action) = actions.try_recv() else {
+                break;
+            };
+            assert!(
+                matches!(&action, Action::Scoped(_, action) if matches!(**action, Action::Navigated))
+            );
+            act_with_ui(&mut worker, action).await;
+        }
+        let commands = mock
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r["command"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            commands,
+            if preview {
+                vec!["join", "join_cancel", "join"]
+            } else {
+                vec!["join"]
+            }
+        );
+        worker.release().await;
+        assert!(!worker.journal_path().exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_wins_over_clipboard_across_refreshes() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::scan_wins_over_clipboard_across_refreshes",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        check_clipboard_handoff(false, true).await
+    }
+
+    #[tokio::test]
+    async fn scan_cancels_existing_clipboard_preview_across_refreshes() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::scan_cancels_existing_clipboard_preview_across_refreshes",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        check_clipboard_handoff(true, true).await
+    }
+
+    #[tokio::test]
+    async fn explicit_paste_supersedes_clipboard_preview() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::explicit_paste_supersedes_clipboard_preview",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        check_clipboard_handoff(true, false).await
+    }
+
+    #[tokio::test]
+    async fn scanned_links_use_paste_validation_confirmation_and_navigation_fences() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::scanned_links_use_paste_validation_confirmation_and_navigation_fences",
+            &[],
+        ).await? { return Ok(()); }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut rx) = model_worker(&window, dir.path());
+        let response = Arc::new(Mutex::new("confirmation"));
+        let reply_state = response.clone();
+        let mock = mock_ipc(&worker.paths.socket, move |_| {
+            (
+                true,
+                json!({"state":*reply_state.lock().unwrap(), "attempt":"scan-preview", "name":"Other Mac"}),
+            )
+        })?;
+        for state in [
+            "confirmation",
+            "own_code",
+            "expired",
+            "already_paired",
+            "garbled",
+        ] {
+            *response.lock().unwrap() = state;
+            window.invoke_go(Page::Scan);
+            while let Ok(action) = rx.try_recv() {
+                act_with_ui(&mut worker, action).await;
+            }
+            scanned_pairing(&window, sample_uri());
+            assert_eq!(window.global::<Ui>().get_page(), Page::Scan);
+            while let Ok(action) = rx.try_recv() {
+                act_with_ui(&mut worker, action).await;
+            }
+            flush_ui();
+            assert_eq!(window.global::<Ui>().get_dialog(), Dialog::Message);
+            let message = window.global::<Ui>().get_message();
+            match state {
+                "confirmation" => {
+                    assert_eq!(message.title, "Pair with Other Mac?");
+                    assert_eq!(message.secondary, "Cancel");
+                    assert_eq!(message.primary, "Pair");
+                    assert!(!worker.join.as_ref().unwrap().confirmed);
+                    window
+                        .global::<Ui>()
+                        .invoke_message_action(message.action, false);
+                    while let Ok(action) = rx.try_recv() {
+                        act_with_ui(&mut worker, action).await;
+                    }
+                    assert!(worker.join.is_none());
+                }
+                "own_code" => assert!(message.title.ends_with("own code")),
+                "expired" => assert_eq!(message.title, "This code expired"),
+                "already_paired" => assert_eq!(message.title, "Already paired with Other Mac"),
+                "garbled" => assert_eq!(message.title, "This pairing link is incomplete"),
+                _ => unreachable!(),
+            }
+        }
+        let before = mock.requests.lock().unwrap().len();
+        window.invoke_go(Page::Scan);
+        while let Ok(action) = rx.try_recv() {
+            act_with_ui(&mut worker, action).await;
+        }
+        scanned_pairing(&window, sample_uri());
+        // A newer user choice also fences out an already queued decoded link.
+        window.invoke_go(Page::Settings);
+        scanned_pairing(&window, sample_uri());
+        while let Ok(action) = rx.try_recv() {
+            act_with_ui(&mut worker, action).await;
+        }
+        assert_eq!(worker.view().page, Page::Settings);
+        assert_eq!(mock.requests.lock().unwrap().len(), before);
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(
+            requests.iter().filter(|r| r["command"] == "join").count(),
+            5
+        );
+        assert!(!requests.iter().any(|r| r["command"] == "join_confirm"));
+        Ok(())
     }
     #[tokio::test]
     async fn status_failures_keep_the_window_alive_and_clear_after_recovery() -> Result<()> {
@@ -6005,6 +6597,76 @@ mod tests {
                         "",
                         "OK",
                     )
+                },
+            ),
+            scene(
+                "49-add-computer-camera",
+                |w| state(w, Vec::new(), Vec::new()),
+                |w| {
+                    go(Page::Add, 0, 1)(w);
+                    w.global::<Ui>().set_is_mac(true);
+                    w.global::<Ui>().set_camera_available(true);
+                },
+            ),
+            scene(
+                "50-scan-preview",
+                |w| state(w, Vec::new(), Vec::new()),
+                |w| {
+                    go(Page::Scan, 0, 1)(w);
+                    w.global::<Ui>().set_is_mac(true);
+                    w.global::<Ui>().set_scan_state(ScanState::Scanning);
+                    w.global::<Ui>()
+                        .set_camera_preview(slint::Image::from_rgba8(
+                            qr_pixels(&sample_uri()).unwrap(),
+                        ));
+                },
+            ),
+            scene(
+                "51-scan-denied",
+                |w| state(w, Vec::new(), Vec::new()),
+                |w| {
+                    go(Page::Scan, 0, 1)(w);
+                    w.global::<Ui>().set_is_mac(true);
+                    w.global::<Ui>().set_scan_state(ScanState::Denied);
+                },
+            ),
+            scene(
+                "52-scan-unavailable",
+                |w| state(w, Vec::new(), Vec::new()),
+                |w| {
+                    go(Page::Scan, 0, 1)(w);
+                    w.global::<Ui>().set_is_mac(true);
+                    w.global::<Ui>().set_scan_state(ScanState::Unavailable);
+                },
+            ),
+            scene(
+                "53-scan-failed",
+                |w| state(w, Vec::new(), Vec::new()),
+                |w| {
+                    go(Page::Scan, 0, 1)(w);
+                    w.global::<Ui>().set_is_mac(true);
+                    w.global::<Ui>().set_scan_state(ScanState::Failed);
+                },
+            ),
+            scene(
+                "54-scan-paired",
+                |w| {
+                    state(
+                        w,
+                        vec![device(2, "Other Mac", false, "connected", 0)],
+                        Vec::new(),
+                    );
+                    w.paired = Some(Paired {
+                        origin: w.view(),
+                        name: "Other Mac".into(),
+                        device: Some(id(2).as_str().into()),
+                        at: Instant::now(),
+                    });
+                },
+                |w| {
+                    go(Page::Scan, 0, 1)(w);
+                    w.global::<Ui>().set_is_mac(true);
+                    w.global::<Ui>().set_scan_state(ScanState::Scanning);
                 },
             ),
         ]

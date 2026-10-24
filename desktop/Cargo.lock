@@ -3306,6 +3306,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "block2 0.6.2",
+ "cc",
  "chrono",
  "futures-util",
  "hex",

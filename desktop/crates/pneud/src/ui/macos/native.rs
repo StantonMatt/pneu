@@ -109,6 +109,7 @@ define_class!(
         }
         #[unsafe(method(quit:))]
         fn quit(&self, _sender: &AnyObject) {
+            super::camera::close();
             STATE.with(|s| { if let Some(child) = s.borrow().as_ref().and_then(|s| s.child.as_ref()) { child.action(0, String::new(), "quit".into()); } });
         }
         #[unsafe(method(closeWindow:))]
@@ -725,6 +726,41 @@ pub(crate) fn activate(window: &PneuWindow) {
         });
     }
 }
+/// Slint's visibility flag alone does not cover Hide Pneu or minimization.
+pub(crate) fn camera_window_visible(window: &PneuWindow) -> bool {
+    if !installed() || !window.window().is_visible() {
+        return false;
+    }
+    autoreleasepool(|_| unsafe {
+        let app: Retained<AnyObject> = msg_send![class!(NSApplication), sharedApplication];
+        let hidden: Bool = msg_send![&*app, isHidden];
+        if hidden.as_bool() {
+            return false;
+        }
+        use slint::winit_030::{
+            WinitWindowAccessor,
+            winit::raw_window_handle::{HasWindowHandle, RawWindowHandle},
+        };
+        window
+            .window()
+            .with_winit_window(|w| {
+                let Ok(handle) = w.window_handle() else {
+                    return false;
+                };
+                let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+                    return false;
+                };
+                let view = &*handle.ns_view.as_ptr().cast::<AnyObject>();
+                let native: Option<Retained<AnyObject>> = msg_send![view, window];
+                native.is_some_and(|native| {
+                    let visible: Bool = msg_send![&*native, isVisible];
+                    let minimized: Bool = msg_send![&*native, isMiniaturized];
+                    visible.as_bool() && !minimized.as_bool()
+                })
+            })
+            .unwrap_or(false)
+    })
+}
 pub(crate) fn twelve_hour_clock() -> bool {
     TWELVE_HOUR_CLOCK.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -1242,6 +1278,7 @@ pub(crate) fn cancel(id: u64) {
     }
 }
 pub(crate) fn cleanup() {
+    super::camera::cleanup();
     super::drag::cleanup();
     let state = STATE.with(|s| s.borrow_mut().take());
     if let Some(mut state) = state {
@@ -1433,6 +1470,41 @@ fn test_control(action: &str) -> Result<()> {
         )?);
     }
     match action {
+        "add-computer"
+        | "scan-qr"
+        | "scan-back"
+        | "assert-camera-available"
+        | "assert-camera-preview"
+        | "assert-camera-denied" => {
+            use crate::ui::window::{Page, ScanState, Ui};
+            let window = STATE
+                .with(|s| s.borrow().as_ref().and_then(|s| s.window.upgrade()))
+                .context("window unavailable")?;
+            let ui = window.global::<Ui>();
+            match action {
+                "add-computer" => window.invoke_open_add(1),
+                "scan-qr" => {
+                    ensure!(ui.get_camera_available(), "Scan QR Code row is unavailable");
+                    window.invoke_go(Page::Scan);
+                    ui.invoke_scan_qr();
+                }
+                "scan-back" => window.invoke_back(),
+                "assert-camera-available" => {
+                    ensure!(ui.get_camera_available(), "camera was not discovered")
+                }
+                "assert-camera-preview" => ensure!(
+                    ui.get_camera_preview().size().width > 0,
+                    "no camera frame displayed"
+                ),
+                "assert-camera-denied" => ensure!(
+                    ui.get_scan_state() == ScanState::Denied,
+                    "camera permission is not denied"
+                ),
+                _ => unreachable!(),
+            }
+            Ok(())
+        }
+        "assert-camera-stopped" => super::camera::assert_stopped(),
         "open-from-menu" => {
             let menu = STATE
                 .with(|s| s.borrow().as_ref().map(|s| s.native.menu.clone()))

@@ -76,8 +76,8 @@ for image in assets/macos/menubar-*.png; do
     name=${image##*/}
     cp "$image" "$app/Contents/Resources/menubar/pneu-tray-${name#menubar-}"
 done
-plutil -lint "$app/Contents/Info.plist" "$agent"
-codesign --force --sign - --options runtime "$app"
+plutil -lint "$app/Contents/Info.plist" "$agent" packaging/macos/Pneu.entitlements
+codesign --force --sign - --options runtime --entitlements packaging/macos/Pneu.entitlements "$app"
 codesign --verify --strict --verbose=2 "$app"
 # Publish only after validation; never recursively remove a caller-selected path.
 if [[ -e "$out/Pneu.app" || -L "$out/Pneu.app" ]]; then

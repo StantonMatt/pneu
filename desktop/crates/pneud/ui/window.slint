@@ -11,9 +11,10 @@ import { Link, LinkState, LinkTile, Tube } from "link.slint";
 
 export { WindowFocus, Tone, Tube, LinkState, LinkTile }
 
-export enum Page { main, device, add, code, settings }
+export enum Page { main, device, add, code, settings, scan }
 export enum Dialog { none, unpair, rename, picker, message, details }
 export enum CodeState { showing, expired, offline, pairing, paired }
+export enum ScanState { requesting, scanning, denied, unavailable, failed }
 
 export struct DeviceItem {
     id: string,
@@ -79,9 +80,10 @@ export global Ui {
     in property <string> login-error;
     in property <bool> login-pending;
     in property <bool> camera-available: false;
+    in property <image> camera-preview;
+    in property <ScanState> scan-state;
     callback login(bool);
     callback system-settings(string);
-    // The camera worker enables this row and supplies the scanning page.
     callback scan-qr();
     in-out property <int> navigation-revision;
     in property <int> device-revision: -1;
@@ -158,6 +160,7 @@ export global Ui {
     callback new-code();
     callback show-code();
     callback paste-link(string);
+    callback scanned-link(string);
     // Add Device reads the clipboard once for a link from another computer.
     callback probed(string);
     callback offer-pair();
@@ -375,7 +378,7 @@ export component PneuWindow inherits Window {
         Ui.show-code();
     }
     public function back() {
-        if Ui.page == Page.code { root.open-add(1); }
+        if Ui.page == Page.code || Ui.page == Page.scan { root.open-add(1); }
         else if Ui.page == Page.add && Ui.first-run { root.close-window(); }
         else if Ui.page != Page.main { root.go(Page.main); }
         else { root.close-window(); }
@@ -645,18 +648,55 @@ export component PneuWindow inherits Window {
                                 if Ui.is-mac && Ui.camera-available: Divider {}
                                 if Ui.is-mac && Ui.camera-available: NavRow {
                                     accessible-label: "Scan QR Code"; min-height: 56px;
-                                    clicked => { Ui.scan-qr(); }
-                                    Row {
-                                        Tile { icon: Icons.qr-code; tone: Tone.accent; }
+                                    accessible-description: "On the other computer's screen";
+                                    clicked => { root.go(Page.scan); Ui.scan-qr(); }
+                                    HorizontalLayout {
+                                        padding-top: 10px; padding-bottom: 10px; padding-left: 12px; padding-right: 12px; spacing: 12px;
+                                        VerticalLayout { alignment: center; Tile { icon: Icons.camera; tone: Tone.accent; } }
                                         VerticalLayout {
-                                            horizontal-stretch: 1;
-                                            Text { text: "Scan QR Code"; font-weight: 600; color: Pneu.text; }
-                                            Text { text: "On the other computer's screen"; font-size: Pneu.label-size; color: Pneu.text2; }
+                                            alignment: center; horizontal-stretch: 1;
+                                            Text { text: "Scan QR Code"; font-weight: 600; color: Pneu.text; overflow: elide; }
+                                            Text { text: "On the other computer's screen"; font-size: Pneu.label-size; color: Pneu.text2; overflow: elide; }
                                         }
+                                        VerticalLayout { alignment: center; Image { accessible-role: none; width: 16px; height: 16px; source: Icons.chevron-right; colorize: Pneu.text2; } }
                                     }
                                 }
 
                             }
+                        }
+                    }
+                }
+
+                if Ui.is-mac && Ui.page == Page.scan: VerticalLayout {
+                    spacing: 12px;
+                    Header { title: "Scan QR Code"; go-back => { root.back(); } }
+                    if Ui.paired != "": Done { height: root.pairing-height; name: Ui.paired; }
+                    if Ui.paired == "" && (Ui.scan-state == ScanState.requesting || Ui.scan-state == ScanState.scanning): VerticalLayout {
+                        spacing: 12px;
+                        Rectangle {
+                            height: 250px;
+                            background: #16181C; border-radius: 10px; clip: true;
+                            Image { source: Ui.camera-preview; width: parent.width; height: parent.height; image-fit: cover; accessible-role: none; }
+                            // The viewfinder is decorative; the whole frame is decoded.
+                            Image {
+                                x: (parent.width - 150px) / 2; y: (parent.height - 150px) / 2;
+                                width: 150px; height: 150px; source: Icons.scan-corners; accessible-role: none;
+                            }
+                        }
+                        Text { text: "Show the other computer's code to the camera"; color: Pneu.text; horizontal-alignment: center; wrap: word-wrap; }
+                    }
+                    if Ui.paired == "" && Ui.scan-state == ScanState.denied: VerticalLayout {
+                        height: root.pairing-height; alignment: center; spacing: 16px;
+                        Notice { icon: Icons.camera-off; text: "Pneu can't use the camera"; }
+                        HorizontalLayout { alignment: center;
+                            PneuButton { text: "Open System Settings"; clicked => { Ui.system-settings("camera"); } }
+                        }
+                    }
+                    if Ui.paired == "" && (Ui.scan-state == ScanState.unavailable || Ui.scan-state == ScanState.failed): VerticalLayout {
+                        height: root.pairing-height; alignment: center; spacing: 16px;
+                        Notice { icon: Icons.camera-off; text: Ui.scan-state == ScanState.unavailable ? "No camera available" : "Pneu can't use the camera"; }
+                        HorizontalLayout { alignment: center;
+                            PneuButton { text: "Try Again"; clicked => { Ui.scan-qr(); } }
                         }
                     }
                 }
