@@ -45,6 +45,17 @@ static NSArray<AVCaptureDevice *> *cameras(void) {
         mediaType:AVMediaTypeVideo position:AVCaptureDevicePositionUnspecified].devices;
 }
 
+// Cameras may ignore the session preset (the MacBook Air camera runs at 1080p),
+// so have the output scale frames, keeping their shape, to fit 1280x720.
+static NSDictionary *frameSettings(AVCaptureDevice *device) {
+    CMVideoDimensions size = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription);
+    double width = MAX(size.width, 1), height = MAX(size.height, 1);
+    double scale = MIN(1.0, MIN(1280.0 / width, 720.0 / height));
+    return @{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+             (id)kCVPixelBufferWidthKey: @(MAX(2, (int)(width * scale) & ~1)),
+             (id)kCVPixelBufferHeightKey: @(MAX(2, (int)(height * scale) & ~1))};
+}
+
 bool pneu_camera_available(void) {
     @autoreleasepool { return cameras().count > 0; }
 }
@@ -135,6 +146,7 @@ void pneu_camera_request_authorization(uint64_t generation, PneuCameraEvent call
         [self.session addInput:input];
         [self.session addOutput:self.output];
         [self.session commitConfiguration];
+        self.output.videoSettings = frameSettings(device);
         __weak PneuCamera *weakSelf = self;
         for (NSNotificationName name in @[AVCaptureSessionRuntimeErrorNotification,
                                            AVCaptureSessionWasInterruptedNotification,

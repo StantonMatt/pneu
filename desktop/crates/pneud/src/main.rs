@@ -187,7 +187,7 @@ async fn run(paths: Paths) -> Result<()> {
         let port = config.port;
         let core = Core::new(paths, config, actions.clone()).await?;
         let (stop, rx) = tokio::sync::watch::channel(false);
-        let ipc = tokio::spawn(Box::pin(ipc::serve(core.clone(), ipc_listener, rx)));
+        let mut ipc = tokio::spawn(Box::pin(ipc::serve(core.clone(), ipc_listener, rx)));
         let ui = tokio::spawn(Box::pin(pneud::ui::runtime::run(core.clone(),actions.clone(),stop.subscribe())));
         let signals_core=core.clone();
         let signals=tokio::spawn(Box::pin(async move {
@@ -209,9 +209,26 @@ async fn run(paths: Paths) -> Result<()> {
                 }
             };
             core.clone().serve(listener,true).await
-        }.await;
+        };
+        tokio::pin!(serving);
+        let mut ipc_finished=false;
+        let serving=tokio::select! {
+            biased;
+            _=core.wait_shutdown()=>serving.await,
+            result=&mut ipc=>{
+                ipc_finished=true;
+                core.request_shutdown();
+                let _=serving.await;
+                Err(match result {
+                    Ok(Ok(()))=>anyhow::anyhow!("IPC server stopped unexpectedly"),
+                    Ok(Err(error))=>error.context("IPC server failed"),
+                    Err(error)=>anyhow::Error::new(error).context("IPC server task failed"),
+                })
+            },
+            result=&mut serving=>result,
+        };
         let _=stop.send(true);
-        let _=ipc.await;
+        if !ipc_finished { let _=ipc.await; }
         let _=ui.await;
         signals.abort();let _=signals.await;
         core.shutdown_actions().await?;

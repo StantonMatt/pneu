@@ -302,8 +302,17 @@ pub async fn serve(
             _ = stop.changed() => break,
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
             accepted = listener.accept() => {
-                let (stream,_) = accepted?;
-                ensure!(stream.peer_cred()?.uid() == rustix::process::getuid().as_raw(),"foreign IPC owner");
+                let (stream,_) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        eprintln!("pneud: IPC accept failed: {error}");
+                        tokio::select! {
+                            _ = stop.changed() => break,
+                            _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+                        }
+                        continue;
+                    }
+                };
                 if tasks.len() < 16 { let core = core.clone(); tasks.spawn(Box::pin(async move { let _ = handle(core,stream).await; })); }
             }
         }
@@ -334,6 +343,10 @@ async fn line(
     }
 }
 async fn handle(core: Arc<Core>, stream: UnixStream) -> Result<()> {
+    ensure!(
+        stream.peer_cred()?.uid() == rustix::process::getuid().as_raw(),
+        "foreign IPC owner"
+    );
     Box::pin(async move {
 
     let mut stream = BufReader::new(stream);
@@ -636,6 +649,66 @@ fn parse_send_command(args: &[String], validate_files: bool) -> Result<Command> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NoActions;
+    #[async_trait::async_trait]
+    impl crate::actions::PcActions for NoActions {
+        async fn clipboard_text(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn clipboard_image(&self, _: &Path, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn notify(&self, _: &Path, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn open(&self, _: &Path) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnected_client_queued_before_accept_does_not_stop_server() -> Result<()> {
+        let dir = crate::test_support::scratch()?;
+        let paths = crate::Paths {
+            data: dir.path().join("data"),
+            cache: dir.path().join("cache"),
+            config: dir.path().join("config/config.toml"),
+            socket: dir.path().join("ipc.sock"),
+        };
+        let core = Core::new(
+            paths.clone(),
+            Config {
+                save_path: dir.path().join("saved"),
+                ..Config::default()
+            },
+            Arc::new(NoActions),
+        )
+        .await?;
+        let (listener, _owner) = bind(&paths.socket)?;
+        // The server has not been polled yet. Darwin's peer_cred() fails with
+        // ENOTCONN when it later accepts this already disconnected client.
+        drop(UnixStream::connect(&paths.socket).await?);
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(serve(core.clone(), listener, rx));
+        let status = tokio::time::timeout(
+            Duration::from_secs(2),
+            request(&paths.socket, Command::Status),
+        )
+        .await;
+        let running = !server.is_finished();
+        let _ = stop.send(true);
+        let stopped = tokio::time::timeout(Duration::from_secs(2), server).await??;
+        core.shutdown_actions().await?;
+        assert!(
+            running,
+            "IPC server exited: {stopped:?}; Status: {status:?}"
+        );
+        let status = status??;
+        assert!(status["devices"].is_array(), "Status reply: {status}");
+        stopped
+    }
+
     #[test]
     fn unavailable_desktop_preserves_send_parser_errors() {
         for args in [vec![], vec!["--to".into()], vec!["--unknown".into()]] {
