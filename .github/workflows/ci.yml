@@ -1,0 +1,102 @@
+name: CI
+
+"on":
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux desktop
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: desktop
+    env:
+      QMAKE: qmake6
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Qt 6 and native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential pkg-config qt6-base-dev qt6-base-dev-tools qmake6 \
+            libwayland-dev libxkbcommon-dev libudev-dev
+          qmake6 -query QT_VERSION
+      - name: Install the workspace Rust toolchain
+        run: |
+          rust_version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["rust-version"])')
+          rustup toolchain install "$rust_version" --profile minimal
+          rustup default "$rust_version"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: desktop
+          save-if: ${{ github.event_name == 'push' }}
+      # Window tests use their own offscreen children. The real Wayland clipboard
+      # harness requires --run-headless and is already opt-in; no tests are filtered.
+      - name: Test the desktop workspace
+        run: cargo test --locked
+
+  macos:
+    name: macOS desktop
+    # The standard macos-15 label is Apple Silicon (arm64).
+    runs-on: macos-15
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: desktop
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "15.4"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the workspace Rust toolchain
+        run: |
+          test "$(uname -m)" = arm64
+          rust_version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["rust-version"])')
+          rustup toolchain install "$rust_version" --profile minimal
+          rustup default "$rust_version"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: desktop
+          save-if: ${{ github.event_name == 'push' }}
+      - name: Test the desktop workspace
+        run: |
+          ulimit -n 4096
+          mkdir -p "$HOME/.cache/pneu-ci/tmp"
+          TMPDIR=$(cd "$HOME/.cache/pneu-ci/tmp" && pwd -P)
+          export TMPDIR
+          cargo test --locked
+
+  android:
+    name: Android unit tests and lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+        with:
+          packages: platform-tools platforms;android-37.2 build-tools;37.0.0
+      - uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+      - name: Run debug checks without release signing
+        run: ./gradlew --no-daemon testDebugUnitTest lintDebug

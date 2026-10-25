@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- GitHub Pages serves this page at any missing path, so resolve links from the site root. -->
+<base href="/pneu/">
+<title>Page not found · Pneu</title>
+<meta name="robots" content="noindex">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#F2F3F6" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="assets/pneu-mark.svg" type="image/svg+xml">
+<link rel="icon" href="assets/icon-32.png" type="image/png" sizes="32x32">
+<style>
+/* Inter 3.19, SIL Open Font License 1.1: fonts/LICENSE.txt */
+@font-face{font-family:"Inter";font-style:normal;font-weight:400;font-display:swap;src:url(fonts/inter-400.woff2) format("woff2")}
+@font-face{font-family:"Inter";font-style:normal;font-weight:600;font-display:swap;src:url(fonts/inter-600.woff2) format("woff2")}
+
+:root{
+  color-scheme:light dark;
+  --bg:#F2F3F6; --surface:#FFFFFF; --hairline:transparent;
+  --text:#0D0F14;
+  --accent:#4F5BFF; --onAccent:#FFFFFF; --accentText:#3D47E0;
+  --font:"Inter",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --ease:cubic-bezier(.2,0,0,1);
+}
+@media (prefers-color-scheme:dark){
+  :root{--bg:#000000; --surface:#141519; --hairline:rgba(255,255,255,.06); --text:#F3F4F6; --accentText:#9AA3FF}
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+body{margin:0;min-height:100vh;min-height:100dvh;display:grid;place-items:center;padding:16px;background:var(--bg);color:var(--text);font:400 16px/1.5 var(--font);-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
+:focus-visible{outline:2px solid var(--accentText);outline-offset:3px;border-radius:6px}
+main{width:100%;max-width:400px;padding:40px 24px 32px;border-radius:24px;background:var(--surface);box-shadow:inset 0 0 0 1px var(--hairline);text-align:center}
+img{display:block;width:64px;height:64px;margin:0 auto 20px}
+h1{margin:0;font-weight:600;font-size:24px;line-height:30px;letter-spacing:-.02em}
+.btn{display:inline-flex;align-items:center;justify-content:center;height:48px;margin-top:24px;padding:0 20px;border-radius:14px;
+  font:600 15px/20px var(--font);text-decoration:none;background:var(--accent);color:var(--onAccent);transition:transform .12s var(--ease)}
+.btn:active{transform:scale(.97)}
+@media (prefers-reduced-motion:reduce){.btn{transition:none}}
+</style>
+</head>
+<body>
+<main>
+  <img src="assets/pneu.svg" alt="" width="64" height="64">
+  <h1>Page not found</h1>
+  <a class="btn" href="./">Go to Pneu</a>
+</main>
+</body>
+</html>
