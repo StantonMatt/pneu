@@ -1,9 +1,9 @@
+use crate::platform::fs as platform_fs;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::Write,
-    os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
 };
 
@@ -128,7 +128,7 @@ impl Config {
             c.save(path)?;
             c
         };
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        platform_fs::set_private_file(path)?;
         if config.name == "Pneu PC" {
             config.name = machine_hostname();
             config.save(path)?;
@@ -158,7 +158,7 @@ fn resolve_folder(path: &Path, links: &mut usize) -> Result<PathBuf> {
     let mut components = path.components();
     while let Some(component) = components.next() {
         match component {
-            Component::RootDir => resolved.push("/"),
+            Component::RootDir | Component::Prefix(_) => resolved.push(component.as_os_str()),
             Component::CurDir => {}
             Component::ParentDir => {
                 resolved.pop();
@@ -182,7 +182,6 @@ fn resolve_folder(path: &Path, links: &mut usize) -> Result<PathBuf> {
                     Err(error) => return Err(error.into()),
                 }
             }
-            Component::Prefix(_) => anyhow::bail!("unsupported folder prefix"),
         }
     }
     Ok(resolved)
@@ -190,9 +189,7 @@ fn resolve_folder(path: &Path, links: &mut usize) -> Result<PathBuf> {
 use crate::platform::machine_hostname;
 pub fn private_dir(path: &Path) -> Result<()> {
     let folder = crate::storage::Folder::open_private(path)?;
-    folder
-        .file
-        .set_permissions(fs::Permissions::from_mode(0o700))?;
+    platform_fs::set_private_directory(&folder.file)?;
     folder.file.sync_all()?;
     Ok(())
 }
@@ -241,35 +238,16 @@ fn publish_private_in(
         crate::random_hex(16)
     );
     let name = tmp.as_str();
-    let mut file = fs::File::from(rustix::fs::openat(
-        &*folder.file,
-        name,
-        rustix::fs::OFlags::WRONLY
-            | rustix::fs::OFlags::CREATE
-            | rustix::fs::OFlags::EXCL
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::from_raw_mode(0o600),
-    )?);
+    let mut file = platform_fs::create_private_at(&folder.file, name, platform_fs::Access::Write)?;
     let result = (|| {
         crate::platform::private::created(&file)?;
         before_write()?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        if replace {
-            rustix::fs::renameat(&*folder.file, name, &*folder.file, destination)?;
-        } else {
-            match rustix::fs::renameat_with(
-                &*folder.file,
-                name,
-                &*folder.file,
-                destination,
-                rustix::fs::RenameFlags::NOREPLACE,
-            ) {
-                Ok(()) => {}
-                Err(rustix::io::Errno::EXIST) => return Ok(false),
-                Err(error) => return Err(error.into()),
-            }
+        match platform_fs::rename(&folder.file, name, &folder.file, destination, replace) {
+            Ok(()) => {}
+            Err(error) if !replace && platform_fs::is_exists(&error) => return Ok(false),
+            Err(error) => return Err(error),
         }
         folder.file.sync_all()?;
         Ok(true)
@@ -280,12 +258,12 @@ fn publish_private_in(
     result
 }
 pub fn sync_parent(path: &Path) -> Result<()> {
-    fs::File::open(path.parent().context("no parent")?)?.sync_all()?;
-    Ok(())
+    platform_fs::sync_parent(path)
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     #[test]
     fn unresolvable_folder_errors_do_not_reject_settings() -> Result<()> {
         let dir = tempfile::tempdir()?;

@@ -229,13 +229,12 @@ pub fn bind(path: &Path) -> Result<(UnixListener, SocketOwner)> {
     let folder = crate::storage::Folder::open(path.parent().context("socket parent")?, false)?;
     let name = path.file_name().context("socket name")?;
     let lock_path = path.with_extension("lock");
-    let lock = std::fs::File::from(rustix::fs::openat(
-        &*folder.file,
+    let lock = crate::platform::fs::open_lock_at(
+        &folder.file,
         lock_path.file_name().context("lock name")?,
-        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(0o600),
-    )?);
-    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+    )?;
+    lock.try_lock()
+        .map_err(crate::platform::fs::lock_error)
         .context("another daemon owns the runtime socket")?;
     // Linux has no bindat; /proc anchors both bind and stale-socket probing to
     // the retained parent instead of resolving a mutable directory pathname.

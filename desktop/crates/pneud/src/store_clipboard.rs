@@ -213,7 +213,7 @@ impl Store {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     fn fingerprint(n: u8) -> Fingerprint {
@@ -335,9 +335,10 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod privacy_tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     #[tokio::test]
     async fn fingerprint_key_is_private_stable_outside_db_and_defeats_dictionary() -> Result<()> {
         let dir = crate::test_support::scratch()?;

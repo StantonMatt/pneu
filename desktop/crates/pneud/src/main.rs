@@ -24,6 +24,7 @@ fn main() -> Result<()> {
     if args.first().is_some_and(|s| s == "login-item") {
         return pneud::macos_login::cli(&args[1..]);
     }
+    #[cfg(unix)]
     if args.first().is_some_and(|s| s == "uninstall-owned") {
         return pneud::macos_removal::cli(&args[1..]);
     }

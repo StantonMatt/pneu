@@ -1,3 +1,4 @@
+use crate::platform::fs as platform_fs;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::{
@@ -67,14 +68,7 @@ impl ReceivedFile {
         )
     }
     pub fn open(path: &Path) -> Result<Self> {
-        let file = std::fs::File::from(rustix::fs::open(
-            path,
-            rustix::fs::OFlags::RDONLY
-                | rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::NONBLOCK
-                | rustix::fs::OFlags::CLOEXEC,
-            rustix::fs::Mode::empty(),
-        )?);
+        let file = platform_fs::open_read(path)?;
         Self::from_file(path.to_owned(), file)
     }
     pub fn path(&self) -> &Path {
@@ -82,29 +76,13 @@ impl ReceivedFile {
     }
     #[cfg(target_os = "linux")]
     fn viewer_descriptor(&self) -> Result<std::fs::File> {
-        use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
-        // dup/try_clone shares the streaming cursor (usually at EOF). Reopen
-        // through our still-owned descriptor, never through the received path,
-        // to give each portal launch a read-only cursor starting at byte zero.
-        let descriptor = std::fs::File::from(rustix::fs::open(
-            format!("/proc/self/fd/{}", self.file.as_raw_fd()),
-            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC,
-            rustix::fs::Mode::empty(),
-        )?);
-        let original = self.file.metadata()?;
-        let opened = descriptor.metadata()?;
-        anyhow::ensure!(
-            opened.is_file() && (opened.dev(), opened.ino()) == (original.dev(), original.ino()),
-            "viewer descriptor changed identity"
-        );
-        Ok(descriptor)
+        platform_fs::viewer_descriptor(&self.file)
     }
     #[cfg(target_os = "macos")]
     pub(crate) fn viewer_descriptor(&self) -> Result<std::fs::File> {
         Ok(self.file.try_clone()?)
     }
     pub fn read_bounded(&self, limit: usize) -> Result<Vec<u8>> {
-        use std::os::unix::fs::FileExt;
         anyhow::ensure!(
             self.file.metadata()?.len() <= limit as u64,
             "input exceeds bounded read limit"
@@ -113,7 +91,7 @@ impl ReceivedFile {
         let mut buffer = [0; 8192];
         while bytes.len() <= limit {
             let cap = buffer.len().min(limit + 1 - bytes.len());
-            let n = self.file.read_at(&mut buffer[..cap], bytes.len() as u64)?;
+            let n = platform_fs::read_at(&self.file, &mut buffer[..cap], bytes.len() as u64)?;
             if n == 0 {
                 break;
             }
@@ -123,9 +101,8 @@ impl ReceivedFile {
         Ok(bytes)
     }
     pub(crate) fn is_image(&self, mime: &str) -> Result<bool> {
-        use std::os::unix::fs::FileExt;
         let mut header = [0; 32];
-        let n = self.file.read_at(&mut header, 0)?;
+        let n = platform_fs::read_at(&self.file, &mut header, 0)?;
         let bytes = &header[..n];
         Ok(match mime {
             "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
@@ -138,57 +115,9 @@ impl ReceivedFile {
     }
 }
 
-/// Private, anonymous backing for normalized clipboard bytes. Keep a fallback
-/// for cache filesystems that do not implement O_TMPFILE.
-fn clipboard_file(cache: &Path) -> Result<std::fs::File> {
-    use rustix::fs::{Mode, OFlags};
-    let directory = rustix::fs::open(
-        cache,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?;
-    #[cfg(target_os = "macos")]
-    {
-        let directory = std::fs::File::from(directory);
-        crate::platform::private::check(&directory)?;
-        unlinked_clipboard_file(&directory)
-    }
-    #[cfg(target_os = "linux")]
-    match rustix::fs::openat(
-        &directory,
-        ".",
-        OFlags::TMPFILE | OFlags::RDWR | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    ) {
-        Ok(file) => Ok(file.into()),
-        Err(rustix::io::Errno::OPNOTSUPP | rustix::io::Errno::ISDIR | rustix::io::Errno::NOENT) => {
-            unlinked_clipboard_file(&directory)
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-fn unlinked_clipboard_file(directory: &impl std::os::fd::AsFd) -> Result<std::fs::File> {
-    use rustix::fs::{AtFlags, Mode, OFlags};
-    for _ in 0..128 {
-        let name = format!(".pneu-clipboard-{}", crate::random_hex(16));
-        match rustix::fs::openat(
-            directory,
-            &name,
-            OFlags::CREATE | OFlags::EXCL | OFlags::RDWR | OFlags::CLOEXEC,
-            Mode::RUSR | Mode::WUSR,
-        ) {
-            Ok(file) => {
-                rustix::fs::unlinkat(directory, &name, AtFlags::empty())?;
-                let file = std::fs::File::from(file);
-                crate::platform::private::created(&file)?;
-                return Ok(file);
-            }
-            Err(rustix::io::Errno::EXIST) => continue,
-            Err(error) => return Err(error.into()),
-        }
-    }
-    anyhow::bail!("could not allocate anonymous clipboard file")
-}
+use platform_fs::clipboard_file;
+#[cfg(test)]
+use platform_fs::unlinked_clipboard_file;
 
 /// Data-bearing inputs stay anchored while preparation runs outside the actor.
 #[derive(Clone, Debug)]

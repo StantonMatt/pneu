@@ -1,14 +1,10 @@
 //! Private clipboard fingerprints: HMAC-SHA256 over a representation's SHA-256.
 //! Prehashing lets the bounded watcher/helper report representations without
 //! handing plaintext to the actor. No unkeyed digest is persisted by the actor.
+use crate::platform::fs as platform_fs;
 use anyhow::{Context, Result, ensure};
 use ring::hmac;
-use std::{
-    fs,
-    io::Read,
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
-    path::Path,
-};
+use std::{io::Read, path::Path};
 
 #[derive(Clone)]
 pub(crate) struct FingerprintKey([u8; 32]);
@@ -19,11 +15,7 @@ impl Default for FingerprintKey {
 }
 impl FingerprintKey {
     pub(crate) fn load_or_create(path: &Path) -> Result<Self> {
-        let flags = rustix::fs::OFlags::NOFOLLOW.bits() as i32;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(flags)
-            .open(path);
+        let file = platform_fs::open_secret(path);
         let mut file = match file {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -38,9 +30,7 @@ impl FingerprintKey {
         crate::platform::private::check(&file)?;
         let meta = file.metadata()?;
         ensure!(
-            meta.is_file()
-                && meta.mode() & 0o777 == 0o600
-                && meta.uid() == rustix::process::geteuid().as_raw(),
+            platform_fs::is_private_file(&meta),
             "clipboard fingerprint key must be an owned 0600 regular file"
         );
         if meta.len() != 32 {
@@ -65,10 +55,10 @@ impl FingerprintKey {
             ".pneu-{}-",
             path.file_name().context("key name")?.to_string_lossy()
         );
-        for entry in rustix::fs::Dir::read_from(&*folder.file)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Ok(name_str) = name.to_str() else {
+        for entry in platform_fs::entries(&folder.file)? {
+            let name = entry?;
+            let name = name.as_os_str();
+            let Some(name_str) = name.to_str() else {
                 continue;
             };
             let Some(random) = name_str
@@ -80,24 +70,15 @@ impl FingerprintKey {
             if random.len() != 32 || !random.bytes().all(|b| b.is_ascii_hexdigit()) {
                 continue;
             }
-            let file = match rustix::fs::openat(
-                &*folder.file,
-                name,
-                rustix::fs::OFlags::RDONLY
-                    | rustix::fs::OFlags::NOFOLLOW
-                    | rustix::fs::OFlags::NONBLOCK
-                    | rustix::fs::OFlags::CLOEXEC,
-                rustix::fs::Mode::empty(),
-            ) {
-                Ok(fd) => fs::File::from(fd),
-                Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOENT) => continue,
-                Err(error) => return Err(error.into()),
+            let file = match platform_fs::open_read_at(&folder.file, name) {
+                Ok(file) => file,
+                Err(error) if platform_fs::is_link(&error) || platform_fs::is_missing(&error) => {
+                    continue;
+                }
+                Err(error) => return Err(error),
             };
             let meta = file.metadata()?;
-            if meta.is_file()
-                && meta.uid() == rustix::process::geteuid().as_raw()
-                && meta.mode() & 0o777 == 0o600
-            {
+            if platform_fs::is_private_file(&meta) {
                 crate::platform::private::check(&file)?;
                 crate::storage::remove_file(&folder.file, name, &file)?;
             }

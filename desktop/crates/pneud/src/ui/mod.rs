@@ -10,6 +10,7 @@ pub(crate) mod child_bridge;
 pub(crate) mod child_channel;
 #[cfg(any(target_os = "macos", test))]
 mod child_supervision;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[cfg_attr(target_os = "macos", path = "macos/clipboard.rs")]
 pub mod clipboard;
 #[cfg(any(target_os = "macos", test))]

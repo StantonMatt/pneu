@@ -1,133 +1,15 @@
 //! Descriptor-relative receive storage. Pathnames are display/recovery hints;
 //! live staging, placement and deletion stay anchored to opened directories.
 use anyhow::{Context, Result, ensure};
-use rustix::fs::{AtFlags, Mode, OFlags};
 use std::{
     fs::File,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
-/// Reject links in every path component and open nonblocking before checking
-/// type, so FIFOs and device nodes cannot hang a local IPC worker.
-/// Callers apply their own size policy after opening the descriptor.
-pub(crate) fn open_regular_file(path: &Path) -> Result<File> {
-    ensure!(path.is_absolute(), "file paths must be absolute");
-    let mut directory = File::from(rustix::fs::open(
-        "/",
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?);
-    let mut components = path.components().peekable();
-    let file = loop {
-        let component = components.next().context("file name")?;
-        use std::path::Component;
-        let name = match component {
-            Component::RootDir | Component::CurDir => continue,
-            Component::ParentDir => std::ffi::OsStr::new(".."),
-            Component::Normal(name) => name,
-            Component::Prefix(_) => anyhow::bail!("unsupported file prefix"),
-        };
-        if components.peek().is_none() {
-            ensure!(matches!(component, Component::Normal(_)), "file name");
-            break File::from(rustix::fs::openat(
-                &directory,
-                name,
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-                Mode::empty(),
-            )?);
-        }
-        // Resolve .. from the already opened directory. Do not normalize it
-        // lexically: link/../file must still reject the link.
-        directory = File::from(rustix::fs::openat(
-            &directory,
-            name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?);
-    };
-    let meta = file.metadata()?;
-    ensure!(meta.is_file(), "only regular files can be opened");
-    Ok(file)
-}
-#[derive(Clone, Debug)]
-pub(crate) struct Folder {
-    pub file: Arc<File>,
-}
-impl Folder {
-    pub fn open(path: &Path, create: bool) -> Result<Self> {
-        Self::open_with_mode(path, create, 0o777)
-    }
-    pub fn open_private(path: &Path) -> Result<Self> {
-        Self::open_with_mode(path, true, 0o700)
-    }
-    fn open_with_mode(path: &Path, create: bool, mode: u32) -> Result<Self> {
-        ensure!(path.is_absolute(), "folder must be absolute");
-        let mut current = File::from(rustix::fs::open(
-            "/",
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?);
-        for component in path.components() {
-            match component {
-                Component::RootDir => continue,
-                Component::Normal(name) => {
-                    let flags =
-                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-                    let next = match rustix::fs::openat(&current, name, flags, Mode::empty()) {
-                        Ok(fd) => fd,
-                        Err(rustix::io::Errno::NOENT) if create => {
-                            let created = match rustix::fs::mkdirat(
-                                &current,
-                                name,
-                                Mode::from_raw_mode(mode as _),
-                            ) {
-                                Ok(()) => true,
-                                Err(rustix::io::Errno::EXIST) => false,
-                                Err(e) => return Err(e.into()),
-                            };
-                            // Durably link each new ancestor before a later file ACK.
-                            current.sync_all()?;
-                            let fd = rustix::fs::openat(&current, name, flags, Mode::empty())?;
-                            if mode == 0o700 {
-                                let file = File::from(fd);
-                                if created {
-                                    crate::platform::private::created(&file)?;
-                                } else {
-                                    crate::platform::private::check(&file)?;
-                                }
-                                rustix::fs::fsync(&file)?;
-                                file.into()
-                            } else {
-                                fd
-                            }
-                        }
-                        Err(e) => return Err(e.into()),
-                    };
-                    current = File::from(next);
-                }
-                _ => anyhow::bail!("unsafe folder component"),
-            }
-        }
-        if mode == 0o700 {
-            crate::platform::private::check(&current)?;
-        }
-        Ok(Self {
-            file: Arc::new(current),
-        })
-    }
-    pub fn path(&self) -> Result<PathBuf> {
-        crate::platform::directory_path(&self.file)
-    }
-    pub fn space(&self) -> Result<u64> {
-        let s = rustix::fs::fstatvfs(&*self.file)?;
-        Ok((s.f_bavail as u64).saturating_mul(s.f_frsize as u64))
-    }
-    pub fn identity(&self) -> Result<(u64, u64)> {
-        let s = rustix::fs::fstat(&*self.file)?;
-        Ok((s.st_dev as u64, s.st_ino))
-    }
-}
+use crate::platform::fs;
+pub(crate) use fs::{Folder, open_regular_file, remove_directory, remove_file};
+
 pub(crate) const STAGING_DIR: &str = ".pneu-staging";
 pub(crate) const CACHE_PREFIX: &str = ".pneu-cache-";
 const NAME_MAX: usize = 255;
@@ -175,19 +57,14 @@ fn numbered_name(name: &str, number: usize) -> String {
 /// Startup-only sweep. Never called while a transfer owns a live stage.
 pub(crate) fn clean_staging(folder: &Folder) -> Result<()> {
     clean_legacy_staging(folder)?;
-    match rustix::fs::openat(
-        &*folder.file,
-        STAGING_DIR,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
+    match fs::open_directory_at(&folder.file, STAGING_DIR) {
         Ok(fd) => {
-            let directory = owned_staging(File::from(fd))?;
+            let directory = owned_staging(fd)?;
             wipe(&directory.file)?;
             directory.file.sync_all()?;
         }
-        Err(rustix::io::Errno::NOENT) => {}
-        Err(e) => return Err(e.into()),
+        Err(error) if fs::is_missing(&error) => {}
+        Err(e) => return Err(e),
     }
     Ok(())
 }
@@ -195,31 +72,29 @@ pub(crate) fn clean_staging(folder: &Folder) -> Result<()> {
 /// crashed before journal registration. Reserved names alone are insufficient:
 /// require an owned private directory, and never follow symlinks.
 pub(crate) fn clean_legacy_staging(folder: &Folder) -> Result<()> {
-    for entry in rustix::fs::Dir::read_from(&*folder.file)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let bytes = name.to_bytes();
+    for entry in fs::entries(&folder.file)? {
+        let name = entry?;
+        let name = name.as_os_str();
+        let bytes = name.as_encoded_bytes();
         let Some(suffix) = bytes.strip_prefix(b".pneu-stage-") else {
             continue;
         };
         if suffix.len() != 32 || !suffix.iter().all(u8::is_ascii_hexdigit) {
             continue;
         }
-        let fd = match rustix::fs::openat(
-            &*folder.file,
-            name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) {
+        let fd = match fs::open_directory_at(&folder.file, name) {
             Ok(fd) => fd,
-            Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR | rustix::io::Errno::NOENT) => {
+            Err(error)
+                if fs::is_link(&error)
+                    || fs::is_not_directory(&error)
+                    || fs::is_missing(&error) =>
+            {
                 continue;
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e),
         };
-        let directory = File::from(fd);
-        let stat = rustix::fs::fstat(&directory)?;
-        if stat.st_uid != rustix::process::geteuid().as_raw() || stat.st_mode & 0o777 != 0o700 {
+        let directory = fd;
+        if !fs::is_private_directory(&directory)? {
             continue;
         }
         crate::platform::private::check(&directory)?;
@@ -230,21 +105,15 @@ pub(crate) fn clean_legacy_staging(folder: &Folder) -> Result<()> {
     Ok(())
 }
 pub(crate) fn staging_directory(folder: &Folder) -> Result<Folder> {
-    let created = match rustix::fs::mkdirat(&*folder.file, STAGING_DIR, Mode::from_raw_mode(0o700))
-    {
+    let created = match fs::create_private_directory_at(&folder.file, STAGING_DIR) {
         Ok(()) => {
             folder.file.sync_all()?;
             true
         }
-        Err(rustix::io::Errno::EXIST) => false,
-        Err(e) => return Err(e.into()),
+        Err(error) if fs::is_exists(&error) => false,
+        Err(e) => return Err(e),
     };
-    let file = File::from(rustix::fs::openat(
-        &*folder.file,
-        STAGING_DIR,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?);
+    let file = fs::open_directory_at(&folder.file, STAGING_DIR)?;
     if created {
         crate::platform::private::created(&file)?;
     }
@@ -252,9 +121,8 @@ pub(crate) fn staging_directory(folder: &Folder) -> Result<Folder> {
 }
 fn owned_staging(file: File) -> Result<Folder> {
     crate::platform::private::check(&file)?;
-    let stat = rustix::fs::fstat(&file)?;
     ensure!(
-        stat.st_uid == rustix::process::geteuid().as_raw() && stat.st_mode & 0o077 == 0,
+        fs::is_owned_private(&file)?,
         "staging directory is not owned and private"
     );
     // Existing roots are opened and checked, never chmodded during cleanup or
@@ -265,32 +133,26 @@ fn owned_staging(file: File) -> Result<Folder> {
 }
 
 pub(crate) fn wipe(directory: &File) -> Result<()> {
-    for entry in rustix::fs::Dir::read_from(directory)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+    for entry in fs::entries(directory)? {
+        let name = entry?;
+        let name = name.as_os_str();
+        if name.as_encoded_bytes() == b"." || name.as_encoded_bytes() == b".." {
             continue;
         }
-        let stat = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)?;
-        if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
-            let child = File::from(rustix::fs::openat(
-                directory,
-                name,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )?);
+        if fs::is_directory_at(directory, name)? {
+            let child = fs::open_directory_at(directory, name)?;
             crate::platform::private::check(&child)?;
             wipe(&child)?;
             // The tree is daemon-owned, but still never follow swapped entries.
-            let own = rustix::fs::fstat(&child)?;
-            let named = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)?;
+            let own = fs::identity(&child)?;
+            let named = fs::identity_at(directory, name)?;
             ensure!(
-                (own.st_dev, own.st_ino) == (named.st_dev, named.st_ino),
+                own == named,
                 "staging directory was replaced during cleanup"
             );
-            unlink(directory, name, AtFlags::REMOVEDIR)?;
+            fs::unlink_directory(directory, name)?;
         } else {
-            let file = crate::platform::metadata_file(directory, name)?;
+            let file = fs::metadata_file(directory, name)?;
             if file.metadata()?.is_file() {
                 crate::platform::private::check(&file)?;
             }
@@ -325,15 +187,10 @@ impl Stage {
     ) -> Result<Self> {
         ensure!(
             folder.space()? >= size.saturating_add(16 * 1024 * 1024),
-            std::io::Error::from_raw_os_error(rustix::io::Errno::NOSPC.raw_os_error())
+            fs::no_space()
         );
         let name = crate::random_hex(16);
-        let file = File::from(rustix::fs::openat(
-            &*directory.file,
-            &name,
-            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_raw_mode(0o600),
-        )?);
+        let file = fs::create_private_at(&directory.file, &name, fs::Access::ReadWrite)?;
         crate::platform::private::created(&file)?;
         Ok(Self(Arc::new(StageInner {
             folder,
@@ -355,7 +212,7 @@ impl Stage {
                 .expect("placed name")
                 .clone()
                 .context("file has not been placed")?,
-            identity: FileIdentity::read(&self.0.file)?,
+            identity: fs::Version::read_regular(&self.0.file)?,
         })
     }
     pub fn destination_path(&self) -> Result<PathBuf> {
@@ -379,16 +236,9 @@ impl Stage {
     pub fn place(&self) -> Result<()> {
         let mut placed_name = self.0.placed_name.lock().expect("placed name");
         ensure!(placed_name.is_none(), "file has already been placed");
-        let before = rustix::fs::fstat(&self.0.file)?;
-        let named = rustix::fs::statat(
-            &*self.0.directory.file,
-            &self.0.name,
-            AtFlags::SYMLINK_NOFOLLOW,
-        )?;
-        ensure!(
-            (before.st_dev, before.st_ino) == (named.st_dev, named.st_ino),
-            "staging file was replaced"
-        );
+        let before = fs::identity(&self.0.file)?;
+        let named = fs::identity_at(&self.0.directory.file, &self.0.name)?;
+        ensure!(before == named, "staging file was replaced");
         // Only the no-replace rename decides whether a name is free. Every
         // contender is relative to the retained folder FD, including fallback.
         for attempt in 1..=NAME_ATTEMPTS + 16 {
@@ -410,30 +260,26 @@ impl Stage {
                     safe_basename(basename, NAME_MAX - namespace.len() - prefix.len())
                 )
             };
-            match rustix::fs::renameat_with(
-                &*self.0.directory.file,
+            match fs::rename(
+                &self.0.directory.file,
                 &self.0.name,
-                &*self.0.folder.file,
+                &self.0.folder.file,
                 &candidate,
-                rustix::fs::RenameFlags::NOREPLACE,
+                false,
             ) {
                 Ok(()) => {
                     *placed_name = Some(candidate);
                     break;
                 }
-                Err(rustix::io::Errno::EXIST) => continue,
-                Err(error) => return Err(error.into()),
+                Err(error) if fs::is_exists(&error) => continue,
+                Err(error) => return Err(error),
             }
         }
         let destination = placed_name
             .as_ref()
             .context("no available destination name")?;
-        let placed =
-            rustix::fs::statat(&*self.0.folder.file, destination, AtFlags::SYMLINK_NOFOLLOW)?;
-        ensure!(
-            (before.st_dev, before.st_ino) == (placed.st_dev, placed.st_ino),
-            "placed file was replaced"
-        );
+        let placed = fs::identity_at(&self.0.folder.file, destination)?;
+        ensure!(before == placed, "placed file was replaced");
         self.0.folder.file.sync_all()?;
         Ok(())
     }
@@ -469,66 +315,13 @@ impl Drop for StageInner {
         let _ = clean();
     }
 }
-/// Unlink only the entry still naming our retained inode, relative to its
-/// original directory. Retaining the file FD prevents inode-number reuse.
-pub(crate) fn remove_file(
-    parent: &File,
-    name: impl rustix::path::Arg + Clone,
-    file: &File,
-) -> Result<()> {
-    remove_owned(parent, name, file, AtFlags::empty())
-}
-pub(crate) fn remove_directory(
-    parent: &File,
-    name: impl rustix::path::Arg + Clone,
-    directory: &File,
-) -> Result<()> {
-    remove_owned(parent, name, directory, AtFlags::REMOVEDIR)
-}
-fn remove_owned(
-    parent: &File,
-    name: impl rustix::path::Arg + Clone,
-    file: &File,
-    flags: AtFlags,
-) -> Result<()> {
-    let own = rustix::fs::fstat(file)?;
-    match rustix::fs::statat(parent, name.clone(), AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(named) if (own.st_dev, own.st_ino) == (named.st_dev, named.st_ino) => {
-            unlink(parent, name, flags)
-        }
-        Ok(_) | Err(rustix::io::Errno::NOENT) => Ok(()),
-        Err(e) => Err(e.into()),
-    }
-}
 /// Recorded ownership evidence without an open file that could pin unlinked
 /// cache blocks. Keep only the directory anchor; reopen without following links
 /// and verify identity and unchanged metadata when retirement is requested.
 pub(crate) struct OwnedFile {
     folder: Folder,
     name: String,
-    identity: FileIdentity,
-}
-#[derive(PartialEq, Eq)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-    size: u64,
-    modified: (i64, i64),
-    changed: (i64, i64),
-}
-impl FileIdentity {
-    fn read(file: &File) -> Result<Self> {
-        use std::os::unix::fs::MetadataExt;
-        let meta = file.metadata()?;
-        ensure!(meta.is_file(), "placed file must be regular");
-        Ok(Self {
-            device: meta.dev(),
-            inode: meta.ino(),
-            size: meta.len(),
-            modified: (meta.mtime(), meta.mtime_nsec()),
-            changed: (meta.ctime(), meta.ctime_nsec()),
-        })
-    }
+    identity: fs::Version,
 }
 impl OwnedFile {
     /// A journal path is reusable only while it names the original directory
@@ -544,17 +337,12 @@ impl OwnedFile {
         Ok(self.open_matching()?.is_some())
     }
     fn open_matching(&self) -> Result<Option<File>> {
-        let file = match rustix::fs::openat(
-            &*self.folder.file,
-            &self.name,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) {
-            Ok(fd) => File::from(fd),
-            Err(rustix::io::Errno::NOENT | rustix::io::Errno::LOOP) => return Ok(None),
-            Err(e) => return Err(e.into()),
+        let file = match fs::open_read_at(&self.folder.file, &self.name) {
+            Ok(file) => file,
+            Err(error) if fs::is_missing(&error) || fs::is_link(&error) => return Ok(None),
+            Err(e) => return Err(e),
         };
-        Ok((FileIdentity::read(&file)? == self.identity).then_some(file))
+        Ok((fs::Version::read_regular(&file)? == self.identity).then_some(file))
     }
     pub fn remove(self) -> Result<()> {
         let Some(file) = self.open_matching()? else {
@@ -570,21 +358,16 @@ impl OwnedFile {
 /// Retention policy selects old regular cache files, then anchors its checks and
 /// deletion to opened descriptors. This is also the restart orphan sweep.
 pub(crate) fn prune_cache(folder: &Folder, cutoff: std::time::SystemTime) -> Result<()> {
-    for entry in rustix::fs::Dir::read_from(&*folder.file)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if !name.to_bytes().starts_with(CACHE_PREFIX.as_bytes()) {
+    for entry in fs::entries(&folder.file)? {
+        let name = entry?;
+        let name = name.as_os_str();
+        if !name.as_encoded_bytes().starts_with(CACHE_PREFIX.as_bytes()) {
             continue;
         }
-        let file = match rustix::fs::openat(
-            &*folder.file,
-            name,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) {
-            Ok(fd) => File::from(fd),
-            Err(rustix::io::Errno::NOENT | rustix::io::Errno::LOOP) => continue,
-            Err(e) => return Err(e.into()),
+        let file = match fs::open_read_at(&folder.file, name) {
+            Ok(file) => file,
+            Err(error) if fs::is_missing(&error) || fs::is_link(&error) => continue,
+            Err(e) => return Err(e),
         };
         let meta = file.metadata()?;
         if meta.is_file() && meta.modified()? < cutoff {
@@ -594,12 +377,6 @@ pub(crate) fn prune_cache(folder: &Folder, cutoff: std::time::SystemTime) -> Res
     }
     folder.file.sync_all()?;
     Ok(())
-}
-pub(crate) fn unlink(dir: &File, name: impl rustix::path::Arg, flags: AtFlags) -> Result<()> {
-    match rustix::fs::unlinkat(dir, name, flags) {
-        Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
-        Err(e) => Err(e).context("relative cleanup"),
-    }
 }
 /// Evidence from the receive stream, bound to the exact declared metadata.
 /// Commit never reads the file contents again; it checks the on-disk length.
@@ -630,11 +407,7 @@ impl VerifiedFile {
 /// A descriptor-bound size check plus a hard read cap also covers growth after
 /// stat. Used for peer-derived images and persisted control/identity JSON.
 pub(crate) fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
-    let file = File::from(rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?);
+    let file = fs::open_read(path)?;
     crate::platform::private::check(&file)?;
     let meta = file.metadata()?;
     ensure!(
@@ -650,7 +423,7 @@ fn read_limited(reader: impl std::io::Read, limit: usize) -> Result<Vec<u8>> {
     ensure!(bytes.len() <= limit, "input grew beyond bounded read limit");
     Ok(bytes)
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::io::Read;

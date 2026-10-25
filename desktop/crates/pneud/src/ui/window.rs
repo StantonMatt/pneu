@@ -2677,18 +2677,9 @@ impl Worker {
         use std::io::Read;
         let path = self.journal_path();
         let folder = crate::storage::Folder::open(path.parent()?, false).ok()?;
-        let file = rustix::fs::openat(
-            &*folder.file,
-            path.file_name()?,
-            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
-            rustix::fs::Mode::empty(),
-        )
-        .ok()?;
+        let file = crate::platform::fs::open_journal_at(&folder.file, path.file_name()?).ok()?;
         let mut bytes = Vec::new();
-        std::fs::File::from(file)
-            .take(32769)
-            .read_to_end(&mut bytes)
-            .ok()?;
+        file.take(32769).read_to_end(&mut bytes).ok()?;
         if bytes.len() > 32768 {
             return None;
         }
@@ -3532,7 +3523,7 @@ async fn choose_files_on(
         .collect::<Result<Vec<_>>>()
         .map(Some)
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     #[test]

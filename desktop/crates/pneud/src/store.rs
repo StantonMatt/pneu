@@ -14,9 +14,6 @@ use pneu_proto::{Clipboard, ClipboardOrigin, FileBegin, Hash, Id, NackCode};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -126,7 +123,7 @@ pub struct Store {
     pub(crate) local_device: Option<Id>,
     generations: Arc<Mutex<HashMap<Id, u64>>>,
     peer_generations: Option<HashMap<Id, u64>>,
-    staging_ready: Arc<Mutex<HashSet<(u64, u64)>>>,
+    staging_ready: Arc<Mutex<HashSet<crate::platform::fs::Identity>>>,
     // Nonpersistent, bounded metadata proof for failed-save previews (no file FDs). A restart or
     // eviction deliberately leaves retirement to normal cache pruning.
     cache_owners: Arc<Mutex<HashMap<(Id, Id), CacheOwner>>>,
@@ -145,7 +142,7 @@ struct PeerWriteBarrier {
 struct StoreOwnership(fs::File);
 impl Drop for StoreOwnership {
     fn drop(&mut self) {
-        let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
+        let _ = self.0.unlock();
     }
 }
 /// Immutable authority captured before scheduling work, never refreshed by a
@@ -462,18 +459,9 @@ impl Store {
             !path.exists() || !fs::symlink_metadata(path)?.file_type().is_symlink(),
             "database is a symlink"
         );
-        #[cfg(target_os = "macos")]
-        let lock = crate::platform::private::open(&path.with_extension("lock"))?;
-        #[cfg(not(target_os = "macos"))]
-        let lock = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-            .open(path.with_extension("lock"))?;
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        let lock = crate::platform::fs::open_store_lock(&path.with_extension("lock"))?;
+        lock.try_lock()
+            .map_err(crate::platform::fs::lock_error)
             .context("data store is already owned by another daemon")?;
         #[cfg(target_os = "macos")]
         {
@@ -493,7 +481,7 @@ impl Store {
             }
         }
         let mut conn = Connection::open(path)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        crate::platform::fs::set_private_file(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;")?;
         let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         ensure!(version <= 3, "unsupported store schema version {version}");
@@ -1254,9 +1242,7 @@ impl Store {
                     }
                     // Missing volumes/never-created folders stay deferred. If
                     // they appear, sweep before creating the first live stage.
-                    Err(e)
-                        if e.downcast_ref::<rustix::io::Errno>()
-                            == Some(&rustix::io::Errno::NOENT) => {}
+                    Err(e) if crate::platform::fs::is_missing(&e) => {}
                     Err(e) => failures.push((path, e.to_string())),
                 }
             }
@@ -1328,7 +1314,7 @@ impl Store {
                     // moved into the cache during a transfer cannot become a save.
                     ensure!(
                         !crate::config::save_folder_overlaps_cache(&stage.0.folder.path()?, cache),
-                        rustix::io::Errno::ACCESS
+                        crate::platform::fs::permission_denied()
                     );
                 }
                 store.check_file_setting(tx, &device, begin.kind)?;
@@ -1686,7 +1672,7 @@ fn receipt_row(c: &Connection, device: &str, id: &str) -> Result<Option<(Metadat
     row.map(|(m, complete)| Ok((serde_json::from_str(&m)?, complete)))
         .transpose()
 }
-/// Preserve OS causes through anyhow contexts, including rustix filesystem errors.
+/// Preserve OS causes through anyhow contexts, including platform filesystem errors.
 pub(crate) fn save_failure_code(error: &anyhow::Error) -> NackCode {
     for cause in error.chain() {
         if cause.downcast_ref::<settings::SettingDisabled>().is_some() {
@@ -1695,31 +1681,14 @@ pub(crate) fn save_failure_code(error: &anyhow::Error) -> NackCode {
         if cause.downcast_ref::<ReceiptConflict>().is_some() {
             return NackCode::IdConflict;
         }
-        let errno = cause
-            .downcast_ref::<std::io::Error>()
-            .and_then(|e| e.raw_os_error())
-            .or_else(|| {
-                cause
-                    .downcast_ref::<rustix::io::Errno>()
-                    .map(|e| e.raw_os_error())
-            });
-        if let Some(errno) = errno {
-            match rustix::io::Errno::from_raw_os_error(errno) {
-                rustix::io::Errno::NOSPC | rustix::io::Errno::DQUOT => return NackCode::DiskFull,
-                rustix::io::Errno::ACCESS
-                | rustix::io::Errno::ROFS
-                | rustix::io::Errno::PERM
-                | rustix::io::Errno::NOENT
-                | rustix::io::Errno::NOTDIR
-                | rustix::io::Errno::EXIST => return NackCode::NotWritable,
-                _ => {}
-            }
+        if let Some(code) = crate::platform::fs::storage_failure(cause) {
+            return code;
         }
     }
     NackCode::StorageFailed
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::io::Write;

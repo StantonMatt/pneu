@@ -35,23 +35,3 @@ pub(crate) fn machine_hostname() -> String {
         .to_string_lossy()
         .into_owned()
 }
-pub(crate) fn directory_path(file: &std::fs::File) -> Result<PathBuf> {
-    use std::os::fd::AsRawFd;
-    let path = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
-    ensure!(
-        !path.as_os_str().as_encoded_bytes().ends_with(b" (deleted)"),
-        "folder was deleted"
-    );
-    Ok(path)
-}
-pub(crate) fn metadata_file(
-    directory: &std::fs::File,
-    name: impl rustix::path::Arg,
-) -> Result<std::fs::File, rustix::io::Errno> {
-    Ok(std::fs::File::from(rustix::fs::openat(
-        directory,
-        name,
-        rustix::fs::OFlags::PATH | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-    )?))
-}

@@ -1,9 +1,5 @@
 use super::*;
-use std::{
-    ffi::{CStr, OsStr},
-    fs::File,
-    os::{fd::AsRawFd, unix::ffi::OsStrExt},
-};
+use std::os::unix::ffi::OsStrExt;
 
 // PNEU_* overrides are intentionally explicit, absolute paths. They let tests
 // isolate every persistent/runtime path without changing HOME or using /tmp's
@@ -82,41 +78,6 @@ pub(crate) fn machine_hostname() -> String {
                 .to_string_lossy()
                 .into_owned()
         })
-}
-pub(crate) fn directory_path(file: &File) -> Result<PathBuf> {
-    let mut bytes = [0u8; libc::PATH_MAX as usize];
-    // F_GETPATH is display/recovery only. Mutations continue to use openat fds.
-    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, bytes.as_mut_ptr()) };
-    ensure!(result != -1, std::io::Error::last_os_error());
-    let path = PathBuf::from(OsStr::from_bytes(
-        unsafe { CStr::from_ptr(bytes.as_ptr().cast()) }.to_bytes(),
-    ));
-    let reopened = crate::storage::Folder::open(&path, false)?;
-    use std::os::unix::fs::MetadataExt;
-    let own = file.metadata()?;
-    let named = reopened.file.metadata()?;
-    ensure!(
-        (own.dev(), own.ino()) == (named.dev(), named.ino()),
-        "folder was deleted or replaced"
-    );
-    Ok(path)
-}
-pub(crate) fn metadata_file(
-    directory: &File,
-    name: impl rustix::path::Arg,
-) -> Result<File, rustix::io::Errno> {
-    // O_SYMLINK opens the final symlink itself; never its target. O_EVTONLY
-    // avoids data access/side effects. Darwin cannot open socket vnodes this
-    // way; unexpected sockets in a private staging tree fail cleanup closed.
-    let flags = rustix::fs::OFlags::from_bits_retain(
-        (libc::O_EVTONLY | libc::O_SYMLINK | libc::O_CLOEXEC) as _,
-    );
-    Ok(File::from(rustix::fs::openat(
-        directory,
-        name,
-        flags,
-        rustix::fs::Mode::empty(),
-    )?))
 }
 
 #[cfg(test)]

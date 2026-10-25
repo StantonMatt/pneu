@@ -1,11 +1,8 @@
 //! Durable origin-only file queue: immutable bytes, frozen recipient authority.
 use super::*;
+use crate::platform::fs as platform_fs;
 use pneu_proto::{FileKind, Message};
-use rustix::fs::{Mode, OFlags};
-use std::{
-    fs::File,
-    io::{Read, Write},
-};
+use std::io::{Read, Write};
 
 pub const GLOBAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const PEER_BYTES: u64 = 1024 * 1024 * 1024;
@@ -262,12 +259,7 @@ impl Outbox {
                 .to_str()
                 .is_some_and(|s| Id::new(s.to_owned()).is_ok() && !retained.contains(s))
             {
-                let file = File::from(rustix::fs::openat(
-                    &*outbox.folder.file,
-                    name.as_os_str(),
-                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )?);
+                let file = platform_fs::open_read_at(&outbox.folder.file, name.as_os_str())?;
                 crate::platform::private::check(&file)?;
                 if file.metadata()?.is_file() {
                     crate::storage::remove_file(&outbox.folder.file, name.as_os_str(), &file)?;
@@ -546,7 +538,7 @@ impl Outbox {
                 })?)
             } else { None };
             let id=Id::new(crate::random_hex(16))?;
-            let mut staged=File::from(rustix::fs::openat(&*this.folder.file,id.as_str(),OFlags::RDWR|OFlags::CREATE|OFlags::EXCL|OFlags::NOFOLLOW|OFlags::CLOEXEC,Mode::from_raw_mode(0o600))?);
+            let mut staged=platform_fs::create_private_at(&this.folder.file, id.as_str(), platform_fs::Access::ReadWrite)?;
             crate::platform::private::created(&staged)?;
             let result=(|| {
                 #[cfg(test)]
@@ -554,7 +546,7 @@ impl Outbox {
                 let mut hash=Sha256::new();let mut copied=0u64;let mut buffer=vec![0; pneu_proto::CHUNK_SIZE];
                 loop {ensure!(!this.admission_cancelled(&operation),"operation cancelled");let n=source.read(&mut buffer)?;if n==0 {break;} copied+=n as u64;ensure!(copied<=size,"source grew while staging");ensure!(this.folder.space()?.saturating_sub(n as u64)>=this.reserve,"outbox disk reserve");staged.write_all(&buffer[..n])?;hash.update(&buffer[..n]);}
                 ensure!(copied==size,"source changed while staging");
-                staged.set_permissions(fs::Permissions::from_mode(0o400))?;staged.sync_all()?;this.folder.file.sync_all()?;
+                platform_fs::set_read_only(&staged)?;staged.sync_all()?;this.folder.file.sync_all()?;
                 let begin=FileBegin{transfer_id:id.clone(),file_name:path.file_name().and_then(|s|s.to_str()).context("file name must be UTF-8")?.to_owned(),mime:mime(&path).into(),size,sha256:Hash::new(hex::encode(hash.finalize()))?,kind:FileKind::File,created_at:stamp.as_ref().map_or_else(crate::now_ms, |s| s.created_at),source_media_id:None,hlc:stamp.as_ref().map(|s| s.hlc),source_device:stamp.map(|s| s.source_device)};
                 pneu_proto::encode_frame(&Message::FileBegin(begin.clone()))?;
                 this.store.locked(|c| {let tx=c.transaction()?;
@@ -621,12 +613,8 @@ impl Outbox {
         let this = self.clone();
         self.file_io(move || {
             ensure!(this.current(&delivery), "file delivery cancelled");
-            let mut file = File::from(rustix::fs::openat(
-                &*this.folder.file,
-                delivery.begin.transfer_id.as_str(),
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-                Mode::empty(),
-            )?);
+            let mut file =
+                platform_fs::open_read_at(&this.folder.file, delivery.begin.transfer_id.as_str())?;
             crate::platform::private::check(&file)?;
             ensure!(
                 file.metadata()?.is_file() && file.metadata()?.len() == delivery.begin.size,
@@ -752,19 +740,14 @@ impl Outbox {
     fn collect(&self) -> Result<()> {
         let ids=self.store.locked(|c|{let mut q=c.prepare("SELECT id FROM outbox_artifacts a WHERE staged=1 AND NOT EXISTS(SELECT 1 FROM outbox_deliveries d WHERE d.artifact=a.id AND state NOT IN ('sent','cancelled'))")?;Ok(q.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)})?;
         for id in ids {
-            match rustix::fs::openat(
-                &*self.folder.file,
-                id.as_str(),
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-                Mode::empty(),
-            ) {
+            match platform_fs::open_read_at(&self.folder.file, id.as_str()) {
                 Ok(fd) => {
-                    let file = File::from(fd);
+                    let file = fd;
                     crate::platform::private::check(&file)?;
                     crate::storage::remove_file(&self.folder.file, id.as_str(), &file)?
                 }
-                Err(rustix::io::Errno::NOENT) => {}
-                Err(e) => return Err(e.into()),
+                Err(error) if platform_fs::is_missing(&error) => {}
+                Err(e) => return Err(e),
             }
             self.folder.file.sync_all()?;
             self.store.locked(|c| {
@@ -854,7 +837,7 @@ fn mime(path: &Path) -> &'static str {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     pub(super) fn id(n: u8) -> Id {
@@ -1264,7 +1247,7 @@ mod tests {
 mod operations;
 pub use operations::AdmissionOperation;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod regression_tests {
     use super::tests::{fixture, id};
     use super::*;

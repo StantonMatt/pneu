@@ -62,7 +62,7 @@ pub(super) fn remove_socket(
 ) -> Result<()> {
     match rustix::fs::statat(&*folder.file, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(named) if (own.st_dev, own.st_ino) == (named.st_dev, named.st_ino) => {
-            crate::storage::unlink(&folder.file, name, AtFlags::empty())
+            crate::platform::fs::unlink_file(&folder.file, name)
         }
         Ok(_) | Err(rustix::io::Errno::NOENT) => Ok(()),
         Err(e) => Err(e.into()),
@@ -110,7 +110,8 @@ pub fn bind(path: &Path) -> Result<(UnixListener, SocketOwner)> {
             && meta.mode() & 0o077 == 0,
         "unsafe runtime lock"
     );
-    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+    lock.try_lock()
+        .map_err(crate::platform::fs::lock_error)
         .context("another daemon owns the runtime socket")?;
     verify_parent(&folder, parent)?;
     match rustix::fs::statat(&*folder.file, name, AtFlags::SYMLINK_NOFOLLOW) {
