@@ -26,12 +26,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install Qt 6 and native build dependencies
+      - name: Install Qt 6 and native build/test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             build-essential pkg-config qt6-base-dev qt6-base-dev-tools qmake6 \
-            libwayland-dev libxkbcommon-dev libudev-dev
+            libfontconfig-dev libwayland-dev libxkbcommon-dev libudev-dev \
+            dbus-daemon
           qmake6 -query QT_VERSION
       - name: Install the workspace Rust toolchain
         run: |
