@@ -9,8 +9,32 @@ Run commands below from `android/` with `ANDROID_HOME=$HOME/Android/Sdk`.
 $ANDROID_HOME/platform-tools/adb -s emulator-5554 install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
+## Release builds
+
+Release signing reads `~/.local/share/android-release-keys/pneu/keystore.properties`
+with `storeFile`, `storePassword`, `keyAlias` and `keyPassword`. Keep the keystore
+and properties outside the repository. `storeFile` may be absolute or relative
+to the properties file. Override its location with the Gradle property
+`-PPNEU_RELEASE_KEYSTORE_PROPERTIES=/absolute/path/keystore.properties` or the
+`PNEU_RELEASE_KEYSTORE_PROPERTIES` environment variable. Debug/test builds work
+without it; release packaging fails with a signing setup message if it is absent.
+
+```sh
+/home/mjstanton/.local/bin/heavy ./gradlew bundleRelease assembleRelease lintRelease
+```
+
+The signed bundle is `app/build/outputs/bundle/release/app-release.aab`; the APK
+is `app/build/outputs/apk/release/app-release.apk`. R8/minification is off until
+Gson/Room reflection rules have been validated. Play Console drafts and the
+upload checklist are in [play/](play/checklist.md).
+
 ## Architecture
 
+- `PairCamera` uses CameraX and ZXing core 3.5.4 (pure Java, Apache-2.0) for
+  on-device QR decoding, including inverted codes. It has no network access or
+  telemetry. Pneu collects and shares no data; device-to-device transfers are
+  encrypted in transit and readable only by the user’s paired devices. See
+  [Data safety](play/data-safety.md) for Google’s collection definition.
 - `protocol/`: bounded v1 framing, strict JSON, UTF-8 limits, binary chunks and
   invitation parsing. The `mesh` capability adds per-pair settings and device-wide
   clipboard ordering without changing the protocol version. Gradle copies shared
@@ -254,9 +278,9 @@ are consolidated, retaining every distinct fixture configuration and phased test
   Pending previews use staged bytes; completed automatic items open the existing
   original, while completed shares cannot reopen the sender URI.
   Persistent dedupe records are never evicted to reclaim capacity.
-- Battery-exemption and custom-trust-manager lint warnings are
-  intentional for this sideloaded pinned device connection. Unused approved
-  design assets/strings remain for consistent UI copy; dependency/style/API
+- Custom-trust-manager lint warnings are intentional for this pinned device
+  connection. Battery setup opens app settings; choose **Unrestricted** there.
+  Unused approved design assets/strings remain for consistent UI copy; dependency/style/API
   suggestions are informational. Versions remain pinned for reproducibility.
 
 ## Device test setup

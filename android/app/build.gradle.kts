@@ -1,7 +1,34 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
 }
+
+val releasePropertiesPath = providers.gradleProperty("PNEU_RELEASE_KEYSTORE_PROPERTIES")
+    .orElse(providers.environmentVariable("PNEU_RELEASE_KEYSTORE_PROPERTIES"))
+    .getOrElse("${System.getProperty("user.home")}/.local/share/android-release-keys/pneu/keystore.properties")
+val releasePropertiesFile = file(if (releasePropertiesPath.startsWith("~/"))
+    "${System.getProperty("user.home")}/${releasePropertiesPath.removePrefix("~/")}" else releasePropertiesPath)
+val releaseProperties = Properties().apply {
+    if (releasePropertiesFile.isFile) releasePropertiesFile.inputStream().use { load(it) }
+}
+val releaseStoreFile = releaseProperties.getProperty("storeFile")?.let {
+    val path = if (it.startsWith("~/")) "${System.getProperty("user.home")}/${it.removePrefix("~/")}" else it
+    releasePropertiesFile.parentFile.resolve(path)
+}
+val validateReleaseKeystore by tasks.registering {
+    doLast {
+        check(releasePropertiesFile.isFile) {
+            "Release signing requires $releasePropertiesFile. Set Gradle property or environment variable PNEU_RELEASE_KEYSTORE_PROPERTIES to an external keystore.properties file."
+        }
+        check(listOf("storeFile", "storePassword", "keyAlias", "keyPassword").all {
+            !releaseProperties.getProperty(it).isNullOrBlank()
+        }) { "Release keystore.properties must contain storeFile, storePassword, keyAlias and keyPassword." }
+        check(releaseStoreFile?.isFile == true) { "Release signing storeFile must point to an existing upload keystore." }
+    }
+}
+tasks.matching { it.name == "validateSigningRelease" }.configureEach { dependsOn(validateReleaseKeystore) }
 
 android {
     namespace = "io.github.stantonmatt.pneu"
@@ -18,9 +45,24 @@ android {
         targetSdk {
             version = release(37)
         }
-        versionCode = 5
+        versionCode = 6
         versionName = "2.1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    signingConfigs {
+        create("release") {
+            storeFile = releaseStoreFile
+            storePassword = releaseProperties.getProperty("storePassword")
+            keyAlias = releaseProperties.getProperty("keyAlias")
+            keyPassword = releaseProperties.getProperty("keyPassword")
+        }
+    }
+    buildTypes {
+        getByName("release") {
+            signingConfig = signingConfigs.getByName("release")
+            isMinifyEnabled = false
+        }
     }
 
     testOptions.unitTests.isIncludeAndroidResources = true
@@ -59,7 +101,7 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:1.5.3")
     implementation("androidx.camera:camera-view:1.5.3")
     implementation("androidx.exifinterface:exifinterface:1.4.2")
-    implementation("com.google.mlkit:barcode-scanning:17.3.0")
+    implementation(libs.zxing.core)
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.compose.material3)

@@ -6,6 +6,7 @@
 <string name="perm_notifications">Notifications</string>
 <string name="perm_photos">Photos and videos</string>
 <string name="perm_photos_limited">Limited access</string>
+<string name="perm_photos_disclosure">Sends new screenshots to your paired computers automatically, even in the background. Choose what\'s sent in Settings.</string>
 <string name="perm_battery">Unrestricted battery use</string>
 <string name="perm_never_sleeping">Never sleeping apps</string>
 <string name="perm_never_sleeping_hint">Add Pneu to the list</string>
@@ -94,6 +95,8 @@
 <string name="group_phone">This phone</string>
 <string name="pref_permissions">Permissions and battery</string>
 <string name="pref_permissions_ok">All set</string>
+<string name="pref_privacy">Privacy policy</string>
+<string name="privacy_url" translatable="false">https://github.com/StantonMatt/pneu/blob/main/PRIVACY.md</string>
 <string name="version">Version %1$s</string>
 <string name="unpair_title">Unpair from %1$s?</string>
 <string name="action_unpair">Unpair</string>
@@ -183,6 +186,7 @@
 <string name="ui_error_camera">Couldn\'t request camera access</string>
 <string name="ui_error_cancel_pairing">Couldn\'t cancel pairing</string>
 <string name="ui_error_connection">Couldn\'t start connection</string>
+<string name="ui_error_privacy">Couldn\'t open privacy policy</string>
 <string name="not_paired">Not paired</string>
 <string name="tile_mobile">Mobile data</string>
 <string name="toast_sensitive">Sensitive clipboard. Not sent.</string>

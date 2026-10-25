@@ -345,13 +345,11 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
                 }
                 val limited=context.granted(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED) && !checked.photos
                 val photoAction=PermissionPolicy.photoAction(limited,PermissionRequests.asked(context,Manifest.permission.READ_MEDIA_IMAGES),activity.shouldShowRequestPermissionRationale(Manifest.permission.READ_MEDIA_IMAGES) || activity.shouldShowRequestPermissionRationale(Manifest.permission.READ_MEDIA_VIDEO))
-                PermissionRow(resources.getString(R.string.perm_photos),R.drawable.ic_photo_library,checked.photos,resources.getString(photoAction),if(limited)resources.getString(R.string.perm_photos_limited) else if(photoAction==R.string.action_settings)resources.getString(R.string.perm_denied) else null) {
+                // Play's prominent disclosure: say what is sent automatically next to the button that requests media access.
+                PermissionRow(resources.getString(R.string.perm_photos),R.drawable.ic_photo_library,checked.photos,resources.getString(photoAction),when {checked.photos->null;limited->resources.getString(R.string.perm_photos_limited);photoAction==R.string.action_settings->resources.getString(R.string.perm_denied);else->resources.getString(R.string.perm_photos_disclosure)}) {
                     if(photoAction==R.string.action_settings)details() else request(Manifest.permission.READ_MEDIA_IMAGES,Manifest.permission.READ_MEDIA_VIDEO,Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED)
                 }
-                PermissionRow(resources.getString(R.string.perm_battery),R.drawable.ic_battery_full,checked.battery,resources.getString(R.string.action_allow)) {
-                    if(PermissionPolicy.batterySettings(checked.backgroundRestricted))details()
-                    else runCatching {context.startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,Uri.parse("package:${context.packageName}")))}.onFailure {details()}
-                }
+                PermissionRow(resources.getString(R.string.perm_battery),R.drawable.ic_battery_full,checked.battery,resources.getString(R.string.action_open_settings)) {details()}
                 if(checked.killed && (checked.sleeping || !Build.MANUFACTURER.equals("samsung",true)))PermissionRow(resources.getString(R.string.alert_killed_title),R.drawable.ic_bedtime_off,false,resources.getString(R.string.action_dismiss)) {
                     scope.launch {if(actions.run(resources.getString(R.string.ui_error_background_stop)) {withContext(Dispatchers.IO) {ServiceEvidence.acknowledge(context)}}) {recheck++;repair()}}
                 }
@@ -668,6 +666,10 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
                     SettingRow(resources.getString(R.string.pref_name),selfName(context,p),divider=false) {renaming=true}
                     ToggleRow(resources.getString(R.string.pref_quick_settings),p.quickSettings) {toggle("quickSettings",it)}
                     SettingRow(resources.getString(R.string.pref_permissions),if(health.issues.isEmpty())resources.getString(R.string.pref_permissions_ok) else resources.getQuantityString(R.plurals.pref_permissions_issues,health.issues.size,health.issues.size),error=health.issues.isNotEmpty(),click=permissions)}
+                Spacer(Modifier.height(24.dp))
+                PneuCard {
+                    SettingRow(resources.getString(R.string.pref_privacy),divider=false,external=true) {scope.launch {actions.run(resources.getString(R.string.ui_error_privacy)) {context.startActivity(Intent(Intent.ACTION_VIEW,Uri.parse(resources.getString(R.string.privacy_url))))}}}
+                }
                 Text(resources.getString(R.string.version,BuildConfig.VERSION_NAME),Modifier.fillMaxWidth().padding(24.dp),style=PneuType.caption,color=LocalPneuColors.current.text3,textAlign=TextAlign.Center)
             }
         }
@@ -682,13 +684,13 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
         PneuSwitch(checked=checked,onCheckedChange=null,enabled=enabled)
     }
 }
-@Composable private fun SettingRow(title: String,detail: String?=null,error: Boolean=false,divider:Boolean=true,click: (() -> Unit)?=null) {
+@Composable private fun SettingRow(title: String,detail: String?=null,error: Boolean=false,divider:Boolean=true,external:Boolean=false,click: (() -> Unit)?=null) {
     val c=LocalPneuColors.current
     Row(Modifier.fillMaxWidth().pneuRow(divider).then(if(click!=null)Modifier.pneuClick(onClick=click)else Modifier).heightIn(min=if(detail==null)56.dp else 68.dp).padding(horizontal=16.dp,vertical=12.dp),verticalAlignment=Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {
             Text(title,style=PneuType.body,color=if(error&&detail==null)c.danger else c.text,maxLines=1,overflow=TextOverflow.Ellipsis)
             if(detail!=null)Text(detail,style=PneuType.subhead,color=if(error)c.warn else c.text2,maxLines=1,overflow=TextOverflow.Ellipsis)
         }
-        if(click!=null && detail!=null)Symbol(R.drawable.ic_chevron_right,modifier=Modifier.size(20.dp),tint=c.text3)
+        if(click!=null && (detail!=null || external))Symbol(if(external)R.drawable.ic_open_in_new else R.drawable.ic_chevron_right,modifier=Modifier.size(20.dp),tint=c.text3)
     }
 }
