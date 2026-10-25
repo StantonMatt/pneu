@@ -27,7 +27,7 @@ pub(crate) fn check(file: &File) -> Result<()> {
         );
         darwin::check(file, false)?;
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     let _ = file;
     Ok(())
 }
@@ -35,7 +35,7 @@ pub(crate) fn check(file: &File) -> Result<()> {
 pub(crate) fn check_path(path: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     check(&crate::storage::open_regular_file(path)?)?;
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     let _ = path;
     Ok(())
 }

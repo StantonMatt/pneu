@@ -72,9 +72,7 @@ impl Phone {
     fn pending(&self) -> Result<Option<PairingUri>> {
         match crate::storage::read_bounded(&self.directory.join("pending-pairing.json"), 65536) {
             Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
-            Err(e) if e.downcast_ref::<rustix::io::Errno>() == Some(&rustix::io::Errno::NOENT) => {
-                Ok(None)
-            }
+            Err(e) if crate::platform::fs::is_missing(&e) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -312,22 +310,12 @@ impl Phone {
         encode_frame(&Message::Clipboard(text.clone()))?;
         // Independent simulator commands share this small persistent clock.
         // Lock a separate file so atomic replacement cannot change the lock inode.
-        #[cfg(target_os = "macos")]
-        let lock = crate::platform::private::open(&self.directory.join("clipboard-clock.lock"))?;
-        #[cfg(not(target_os = "macos"))]
-        let lock = std::fs::File::from(rustix::fs::open(
-            self.directory.join("clipboard-clock.lock"),
-            rustix::fs::OFlags::CREATE
-                | rustix::fs::OFlags::RDWR
-                | rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::CLOEXEC,
-            rustix::fs::Mode::from_raw_mode(0o600),
-        )?);
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)?;
+        let lock = crate::platform::fs::open_lock(&self.directory.join("clipboard-clock.lock"))?;
+        lock.lock()?;
         let clock = self.directory.join("clipboard-clock.json");
         let last: u64 = match crate::storage::read_bounded(&clock, 65536) {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
-            Err(e) if e.downcast_ref::<rustix::io::Errno>() == Some(&rustix::io::Errno::NOENT) => 0,
+            Err(e) if crate::platform::fs::is_missing(&e) => 0,
             Err(e) => return Err(e),
         };
         text.created_at = text
@@ -603,9 +591,7 @@ impl PhoneConnection {
 fn paused(directory: &Path) -> Result<bool> {
     match crate::storage::read_bounded(&directory.join("paused.json"), 65536) {
         Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
-        Err(e) if e.downcast_ref::<rustix::io::Errno>() == Some(&rustix::io::Errno::NOENT) => {
-            Ok(false)
-        }
+        Err(e) if crate::platform::fs::is_missing(&e) => Ok(false),
         Err(e) => Err(e),
     }
 }

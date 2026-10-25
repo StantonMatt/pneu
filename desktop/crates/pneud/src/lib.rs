@@ -6,7 +6,9 @@ pub mod core;
 mod discovery;
 mod file_recipients;
 pub mod identity;
+#[cfg(unix)]
 pub mod ipc;
+#[cfg(unix)]
 pub mod macos_removal;
 mod platform;
 mod storage;

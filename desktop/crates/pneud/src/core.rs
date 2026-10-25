@@ -4453,17 +4453,7 @@ impl Core {
         let input = source.clone();
         store
             .blocking(move |_| {
-                use std::os::unix::fs::FileExt;
-                let mut offset = 0;
-                let mut bytes = [0; 32768];
-                while offset < prefix {
-                    let n = (prefix - offset).min(bytes.len() as u64) as usize;
-                    input.0.file.read_exact_at(&mut bytes[..n], offset)?;
-                    destination.0.file.write_all_at(&bytes[..n], offset)?;
-                    offset += n as u64;
-                }
-                rustix::fs::seek(&destination.0.file, rustix::fs::SeekFrom::Start(prefix))?;
-                Ok(())
+                crate::platform::fs::copy_prefix(&input.0.file, &destination.0.file, prefix)
             })
             .await?;
         state.destination = Some(stage.destination_path()?);
@@ -4504,7 +4494,7 @@ impl Core {
                 if state.config.save_to_folder && state.begin.kind != FileKind::ClipboardImage {
                     ensure!(
                         !crate::config::save_folder_overlaps_cache(&folder, &self.paths.cache),
-                        rustix::io::Errno::ACCESS
+                        crate::platform::fs::permission_denied()
                     );
                 }
                 store.create_stage(folder, destination, size).await
@@ -5296,7 +5286,7 @@ fn processing_error_code(error: &anyhow::Error) -> ErrorCode {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     #[derive(Default)]
     struct BoundaryActions {

@@ -1,8 +1,8 @@
 //! One private viewer-materialization lease per supervised child. The daemon
 //! retains directory identities so a killed child is cleaned without following
 //! display paths or deleting a replacement cache directory.
+use crate::platform::fs as platform_fs;
 use anyhow::Result;
-use rustix::fs::{FlockOperation, Mode, OFlags};
 use std::{
     fs::File,
     path::{Path, PathBuf},
@@ -17,19 +17,18 @@ impl Lease {
     pub fn new(cache: &Path) -> Result<Self> {
         let root = crate::storage::Folder::open_private(&cache.join("ui-viewers"))?;
         // Serialize recovery with lease creation, including in other processes.
-        rustix::fs::flock(&*root.file, FlockOperation::LockExclusive)?;
+        root.file.lock()?;
         recover(&root)?;
         let name = crate::random_hex(16);
         let directory = crate::storage::Folder::open_private(&root.path()?.join(&name))?;
-        let lock = File::from(rustix::fs::openat(
-            &*directory.file,
+        let lock = platform_fs::create_private_at(
+            &directory.file,
             ".lease",
-            OFlags::CREATE | OFlags::EXCL | OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_raw_mode(0o600),
-        )?);
+            platform_fs::Access::ReadWrite,
+        )?;
         crate::platform::private::created(&lock)?;
-        rustix::fs::flock(&lock, FlockOperation::LockExclusive)?;
-        rustix::fs::flock(&*root.file, FlockOperation::Unlock)?;
+        lock.lock()?;
+        root.file.unlock()?;
         Ok(Self {
             root,
             directory,
@@ -42,39 +41,29 @@ impl Lease {
     }
 }
 fn recover(root: &crate::storage::Folder) -> Result<()> {
-    for entry in rustix::fs::Dir::read_from(&*root.file)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let bytes = name.to_bytes();
+    for entry in platform_fs::entries(&root.file)? {
+        let name = entry?;
+        let name = name.as_os_str();
+        let bytes = name.as_encoded_bytes();
         if bytes.len() != 32 || !bytes.iter().all(u8::is_ascii_hexdigit) {
             continue;
         }
-        let directory = match rustix::fs::openat(
-            &*root.file,
-            name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) {
-            Ok(fd) => File::from(fd),
+        let directory = match platform_fs::open_directory_at(&root.file, name) {
+            Ok(file) => file,
             Err(_) => continue,
         };
         if crate::platform::private::check(&directory).is_err() {
             continue;
         }
         // Older leases without a liveness marker cannot be proven stale.
-        let lock = match rustix::fs::openat(
-            &directory,
-            ".lease",
-            OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-            Mode::empty(),
-        ) {
-            Ok(fd) => File::from(fd),
+        let lock = match platform_fs::open_read_write_at(&directory, ".lease") {
+            Ok(file) => file,
             Err(_) => continue,
         };
         if !lock.metadata()?.is_file() || crate::platform::private::check(&lock).is_err() {
             continue;
         }
-        if rustix::fs::flock(&lock, FlockOperation::NonBlockingLockExclusive).is_err() {
+        if lock.try_lock().is_err() {
             continue;
         }
         crate::storage::wipe(&directory)?;
@@ -126,7 +115,7 @@ impl ViewerCache {
 pub(crate) struct Materials(std::collections::VecDeque<Materialization>);
 impl Materials {
     pub fn find(&mut self, source: &File, name: &str) -> Option<PathBuf> {
-        let identity = SourceIdentity::read(source).ok()?;
+        let identity = platform_fs::Version::read(source).ok()?;
         let index = self.0.iter().position(|m| {
             m.source == identity && m.name == std::ffi::OsStr::new(name) && m.present()
         })?;
@@ -149,34 +138,13 @@ pub(crate) struct Materialization {
     directory_name: String,
     name: std::ffi::OsString,
     file: File,
-    source: SourceIdentity,
-}
-#[derive(PartialEq, Eq)]
-struct SourceIdentity(u64, u64, u64, i64, i64, i64, i64);
-impl SourceIdentity {
-    fn read(file: &File) -> Result<Self> {
-        use std::os::unix::fs::MetadataExt;
-        let m = file.metadata()?;
-        Ok(Self(
-            m.dev(),
-            m.ino(),
-            m.len(),
-            m.mtime(),
-            m.mtime_nsec(),
-            m.ctime(),
-            m.ctime_nsec(),
-        ))
-    }
+    source: platform_fs::Version,
 }
 impl Materialization {
     fn present(&self) -> bool {
-        let own = rustix::fs::fstat(&self.file);
-        let named = rustix::fs::statat(
-            &*self.directory.file,
-            self.name.as_os_str(),
-            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-        );
-        matches!((own, named), (Ok(own), Ok(named)) if (own.st_dev, own.st_ino) == (named.st_dev, named.st_ino))
+        let own = platform_fs::identity(&self.file);
+        let named = platform_fs::identity_at(&self.directory.file, &self.name);
+        matches!((own, named), (Ok(own), Ok(named)) if own == named)
     }
 }
 impl Drop for Materialization {
@@ -197,39 +165,29 @@ pub(crate) fn materialize(
     cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<Materialization> {
     use anyhow::ensure;
-    use std::os::unix::{
-        ffi::OsStrExt,
-        fs::{FileExt, PermissionsExt},
-    };
     let metadata = source.metadata()?;
-    let source_identity = SourceIdentity::read(&source)?;
+    let source_identity = platform_fs::Version::read(&source)?;
     ensure!(
         metadata.is_file() && metadata.len() <= pneu_proto::MAX_FILE_SIZE,
         "invalid received descriptor"
     );
     let root = crate::storage::Folder::open_private(cache)?;
     let directory_name = crate::random_hex(16);
-    rustix::fs::mkdirat(&*root.file, &directory_name, Mode::from_raw_mode(0o700))?;
+    platform_fs::create_private_directory_at(&root.file, &directory_name)?;
     let directory = crate::storage::Folder {
-        file: std::sync::Arc::new(File::from(rustix::fs::openat(
-            &*root.file,
-            &directory_name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?)),
+        file: std::sync::Arc::new(platform_fs::open_directory_at(&root.file, &directory_name)?),
     };
     crate::platform::private::created(&directory.file)?;
     let name = Path::new(name)
         .file_name()
-        .filter(|s| !s.as_bytes().is_empty())
+        .filter(|s| !s.is_empty())
         .unwrap_or(std::ffi::OsStr::new("received-file"))
         .to_owned();
-    let destination = File::from(rustix::fs::openat(
-        &*directory.file,
+    let destination = platform_fs::create_private_at(
+        &directory.file,
         name.as_os_str(),
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(0o600),
-    )?);
+        platform_fs::Access::Write,
+    )?;
     let mut material = Materialization {
         path: directory.path()?.join(&name),
         root,
@@ -249,22 +207,20 @@ pub(crate) fn materialize(
             "viewer request cancelled"
         );
         let cap = buffer.len().min((metadata.len() - offset) as usize);
-        let read = source.read_at(&mut buffer[..cap], offset)?;
+        let read = platform_fs::read_at(&source, &mut buffer[..cap], offset)?;
         ensure!(read > 0, "received file truncated");
         material.file.write_all(&buffer[..read])?;
         offset += read as u64;
     }
     ensure!(
-        SourceIdentity::read(&source)? == material.source,
+        platform_fs::Version::read(&source)? == material.source,
         "received file changed during open"
     );
     material.file.sync_all()?;
-    material
-        .file
-        .set_permissions(std::fs::Permissions::from_mode(0o400))?;
+    platform_fs::set_read_only(&material.file)?;
     Ok(material)
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     #[test]

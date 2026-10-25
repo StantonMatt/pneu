@@ -1,5 +1,7 @@
 //! Host services used by the headless daemon. Desktop UI effects live in PcActions.
-use anyhow::{Context, Result, ensure};
+#[cfg(target_os = "macos")]
+use anyhow::ensure;
+use anyhow::{Context, Result};
 use std::{
     env,
     path::{Path, PathBuf},
@@ -13,7 +15,8 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub(crate) use macos::*;
 
-pub(crate) mod private;
+pub(crate) mod fs;
+pub(crate) use fs::private;
 
 #[cfg(any(target_os = "macos", test))]
 pub mod macos_login;

@@ -42,8 +42,7 @@ impl Identity {
                 serde_json::from_slice(&crate::storage::read_bounded(&path, 65536)?)?
             }
         };
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        crate::platform::fs::set_private_file(&path)?;
         let fingerprint = certificate_fingerprint(&stored.cert);
         Ok(Self {
             cert: stored.cert.into(),
