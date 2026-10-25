@@ -2,6 +2,8 @@
 
 Send files and share clipboard text between your phone and computers.
 
+[Download Pneu](https://stantonmatt.github.io/pneu/).
+
 Pronounced “new”, after pneumatic tubes.
 
 ## What it does
@@ -48,7 +50,9 @@ cd desktop
 
 The installer builds `pneud`, installs it into `~/.local/bin`, installs icons and a desktop entry, and enables a systemd user service tied to the graphical session. It starts or restarts the daemon immediately if that session is active.
 
-On the Mac, from the repo root:
+On the Mac, download [Pneu-macOS.zip from GitHub Releases](https://github.com/StantonMatt/pneu/releases/latest/download/Pneu-macOS.zip), unzip it and move **Pneu.app** to Applications. The app is ad-hoc signed, without notarization. If macOS blocks it, try opening it, then go to **System Settings → Privacy & Security → Open Anyway** and confirm.
+
+To build and install from source, run from the repo root:
 
 ```sh
 cd desktop
@@ -65,7 +69,7 @@ cd android
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Connect the phone with USB debugging enabled and approve its debugging prompt before sideloading. There is no Play Store release. See the [Android README](android/README.md) for SDK setup and checks.
+Connect the phone with USB debugging enabled and approve its debugging prompt before sideloading. Closed testing on Google Play is coming; [join the test](https://play.google.com/apps/testing/io.github.stantonmatt.pneu) once it is available. See the [Android README](android/README.md) for SDK setup and checks.
 
 ## First run
 
@@ -140,7 +144,7 @@ Device suites use [android/tools/run_device_tests.py](android/tools/run_device_t
 
 ## Status and limitations
 
-Personal project, version **2.1.0**. Physical acceptance was completed with a Kubuntu 26.04 PC, a MacBook Air (macOS 26.6, arm64) and a Galaxy S25+, all three paired over Tailscale. This does not establish every Wi-Fi/mobile transition, OEM background condition or battery-use scenario. The Android app is sideloaded; there is no Play Store release. The Mac app is ad-hoc signed, without Developer ID signing or notarization.
+Personal project, version **2.1.0**. Physical acceptance was completed with a Kubuntu 26.04 PC, a MacBook Air (macOS 26.6, arm64) and a Galaxy S25+, all three paired over Tailscale. This does not establish every Wi-Fi/mobile transition, OEM background condition or battery-use scenario. The Android app can be sideloaded; Google Play closed testing is coming. The Mac app is ad-hoc signed, without Developer ID signing or notarization.
 
 The phone supports up to 16 paired computers. Each link is direct: pairing a phone with two computers does not pair those computers with each other. Clipboard is connected-only, and phone clipboard sending requires a tap. Supported clipboard image formats and desktop actions have limits; a crash in the short window before a desktop file receipt is committed can leave a duplicate visible file after retry. Read the accepted behaviours in the [protocol's transfer section](docs/PROTOCOL.md#transfer-and-delivery-state-machines), the [desktop README](desktop/README.md) and the [Android README](android/README.md#accepted-behaviours).
 

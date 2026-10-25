@@ -21,7 +21,13 @@ cd "$root"
 build=(cargo build --locked -p pneud)
 if [[ "$profile" == release ]]; then
     build+=(--release)
-    if command -v heavy >/dev/null 2>&1; then heavy "${build[@]}"; else "$HOME/.local/bin/heavy" "${build[@]}"; fi
+    if command -v heavy >/dev/null 2>&1; then
+        heavy "${build[@]}"
+    elif [[ -x "$HOME/.local/bin/heavy" ]]; then
+        "$HOME/.local/bin/heavy" "${build[@]}"
+    else
+        "${build[@]}"
+    fi
 else
     "${build[@]}"
 fi
