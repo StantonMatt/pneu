@@ -338,7 +338,20 @@ class DeviceScreensDeviceTest {
         compose.onNodeWithText("Receive clipboard from computer").assertDoesNotExist()
         bothThemes("settings-top")
         compose.onNodeWithText("Version",substring=true).performScrollTo()
+        compose.onNodeWithText("Privacy policy").assertIsDisplayed()
         bothThemes("settings-bottom")
+        val opened=CompletableDeferred<Intent>()
+        val monitor=object:Instrumentation.ActivityMonitor() {
+            override fun onStartActivity(intent:Intent):Instrumentation.ActivityResult? {
+                if(intent.action!=Intent.ACTION_VIEW)return null
+                opened.complete(Intent(intent));return Instrumentation.ActivityResult(Activity.RESULT_OK,null) // Don't open the browser.
+            }
+        }
+        instrumentation.addMonitor(monitor)
+        try {
+            compose.onNodeWithText("Privacy policy").performClick()
+            assertEquals("https://github.com/StantonMatt/pneu/blob/main/PRIVACY.md",withTimeout(5000) {opened.await()}.dataString)
+        } finally {instrumentation.removeMonitor(monitor)}
     }
     @Test(timeout=30000) fun addDeviceAlreadyPaired()=runBlocking<Unit> {
         val p=prefs(pc)

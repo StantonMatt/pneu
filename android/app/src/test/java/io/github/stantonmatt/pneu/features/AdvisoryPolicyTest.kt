@@ -46,7 +46,6 @@ class AdvisoryPolicyTest {
         assertArrayEquals(bytes,output.toByteArray());assertEquals(16,calls)
     }
     @Test fun permissionCopyMatchesRepairAndLimitedGrantsRemainRequestable() {
-        assertTrue(PermissionPolicy.batterySettings(true));assertFalse(PermissionPolicy.batterySettings(false))
         assertFalse(PermissionPolicy.sleeping(true,true,true,false));assertTrue(PermissionPolicy.sleeping(true,true,false,false))
         assertEquals(R.string.action_allow_all,PermissionPolicy.photoAction(true,true,false))
         assertEquals(R.string.action_allow,PermissionPolicy.photoAction(false,true,true))

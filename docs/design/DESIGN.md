@@ -136,9 +136,9 @@ One card with these rows (leading icon 24 dp in `onSurfaceVariant`; trailing con
 | Row | Icon | Not done: trailing | Not done: supporting | Done |
 |---|---|---|---|---|
 | Notifications | `notifications` | tonal button **Allow** → `POST_NOTIFICATIONS` request | none | `check_circle` (filled, `primary`) |
-| Photos and videos | `photo_library` | **Allow** → `READ_MEDIA_IMAGES` + `READ_MEDIA_VIDEO` | none | check |
+| Photos and videos | `photo_library` | **Allow** → `READ_MEDIA_IMAGES` + `READ_MEDIA_VIDEO` | **Sends new screenshots to your paired computers automatically, even in the background. Choose what's sent in Settings.** (Play's prominent disclosure) | check |
 | …limited access granted | | **Allow all** → request again | **Limited access** | |
-| Unrestricted battery use | `battery_full` | **Allow** → `ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` | none | check |
+| Unrestricted battery use | `battery_full` | **Open settings** → app details, where the user picks Unrestricted (Play restricts the direct exemption request) | none | check |
 | Never sleeping apps | `bedtime_off` | **Open** → Samsung's Never sleeping apps list | **Add Pneu to the list** | check |
 
 - A permission denied twice can't be requested again: the button becomes **Settings** (opens `ACTION_APPLICATION_DETAILS_SETTINGS`) and the supporting text is **Turned off in settings**.
@@ -161,7 +161,7 @@ Samsung intent for the list: try the Device care "Never sleeping apps" activity 
 
 ### 3.4 Pair
 
-The Pair screen always uses the dark colour scheme (wrap it in `MaterialTheme(colorScheme = darkScheme)`), in both themes, like other camera screens. Full-screen camera preview (CameraX `PreviewView`, ML Kit barcode scanning, QR only). A transparent top app bar with a back arrow and the title **Pair with PC**, both white. A black scrim at 55 % covers everything except a 256 dp rounded square (corner 24) centred slightly above the middle, outlined in white 2 dp. Below the square, 24 dp gap, white `bodyLarge`, centred:
+The Pair screen always uses the dark colour scheme (wrap it in `MaterialTheme(colorScheme = darkScheme)`), in both themes, like other camera screens. Full-screen camera preview (CameraX `PreviewView`, ZXing core QR decoding, QR only). A transparent top app bar with a back arrow and the title **Pair with PC**, both white. A black scrim at 55 % covers everything except a 256 dp rounded square (corner 24) centred slightly above the middle, outlined in white 2 dp. Below the square, 24 dp gap, white `bodyLarge`, centred:
 
 **Scan the QR code on your PC**
 
@@ -280,6 +280,8 @@ Direct on home Wi-Fi and Tailscale when away can't both be off: turning off the 
 | Row | Behaviour |
 |---|---|
 | **Permissions and battery**, supporting **All set** or **{n} needs attention** / **{n} need attention** (plural, in `error`) | Opens Permissions and battery. |
+
+A separate card below holds **Privacy policy** with an `open_in_new` icon; it opens PRIVACY.md on GitHub.
 
 Footer: **Version {versionName}**, `bodySmall`, `onSurfaceVariant`, centred, 24 dp padding.
 
