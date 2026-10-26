@@ -698,6 +698,78 @@ mod tests {
         .await?;
         Ok(())
     }
+    async fn nonreading_batch(
+        name: &Path,
+        stalled: &mut Vec<NamedPipeClient>,
+    ) -> Result<NamedPipeClient> {
+        // Preparing sixteen large replies can take longer than the write
+        // deadline on a busy runner. Freeze that budget until every handler
+        // has started writing, without consuming any of its response.
+        tokio::time::pause();
+        let started = std::time::Instant::now();
+        let prepare = async {
+            let check = PeerCheck::own()?;
+            let open = || async {
+                loop {
+                    match ClientOptions::new().open(name) {
+                        Ok(client) => {
+                            check.server(client.as_raw_handle())?;
+                            break Ok::<_, anyhow::Error>(client);
+                        }
+                        Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
+                            // The production connector sleeps between retries;
+                            // paused time needs an untimed retry instead.
+                            tokio::task::yield_now().await;
+                        }
+                        Err(error) => break Err(error.into()),
+                    }
+                }
+            };
+            let first = stalled.len();
+            for _ in 0..16 {
+                let mut client = open().await?;
+                client.write_all(b"{\"command\":\"status\"}\n").await?;
+                stalled.push(client);
+            }
+            for client in &stalled[first..] {
+                loop {
+                    let mut available = 0;
+                    // SAFETY: live overlapped pipe handle and valid output.
+                    // Peek without draining: readiness alone can also mean EOF.
+                    unsafe {
+                        win(PeekNamedPipe(
+                            client.as_raw_handle(),
+                            null_mut(),
+                            0,
+                            null_mut(),
+                            &mut available,
+                            null_mut(),
+                        ))?;
+                    }
+                    if available > 0 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+            open().await
+        };
+        let mut prepare = std::pin::pin!(prepare);
+        let result = std::future::poll_fn(|cx| {
+            if started.elapsed() > Duration::from_secs(60) {
+                return std::task::Poll::Ready(Err(anyhow::anyhow!(
+                    "non-reading handlers did not start writing within 60 seconds"
+                )));
+            }
+            // Prevent automatic clock advancement while Windows I/O completes.
+            // The wall-clock bound above still catches a stalled setup.
+            cx.waker().wake_by_ref();
+            std::future::Future::poll(prepare.as_mut(), cx)
+        })
+        .await;
+        tokio::time::resume();
+        result
+    }
     #[tokio::test]
     async fn nonreading_clients_reclaim_instances_and_shutdown_cancels_io() -> Result<()> {
         let (_dir, name, core, listener, _owner) = fixture(true).await?;
@@ -708,14 +780,12 @@ mod tests {
         // hide Mio's pending-write leak. More than 16 total connections must
         // leave only the listener and our measurement probe alive server-side.
         for _ in 0..2 {
-            for _ in 0..16 {
-                let mut client = connect(&name).await?;
-                client.write_all(b"{\"command\":\"status\"}\n").await?;
-                stalled.push(client);
-            }
-            let overflow =
-                tokio::time::timeout(Duration::from_secs(2), request(&name, Command::Status))
-                    .await?;
+            let client = nonreading_batch(&name, &mut stalled).await?;
+            let overflow = tokio::time::timeout(
+                Duration::from_secs(2),
+                request_connected(Command::Status, async { Ok(client) }),
+            )
+            .await?;
             assert!(
                 overflow.is_err(),
                 "handler limit must reject the seventeenth active client"
