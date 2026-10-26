@@ -2489,7 +2489,7 @@ impl Core {
         self.actions.shutdown().await
     }
     /// Listener injection supports in-process ephemeral-port tests. The daemon
-    /// binds [::] (dual stack on Linux) and enables mDNS; tests disable mDNS.
+    /// uses net::listen for [::] (explicitly dual stack on Windows) and enables mDNS.
     pub async fn serve(self: Arc<Self>, listener: TcpListener, advertise: bool) -> Result<()> {
         let listener = Arc::new(listener);
         self.port
@@ -5221,16 +5221,28 @@ impl Advertisement {
         core: &Core,
         addresses: Vec<crate::discovery::InterfaceAddress>,
     ) -> Result<Self> {
+        Self::register(
+            &format!("Pneu-{}", &core.identity.device_id.as_str()[..8]),
+            core.identity.fingerprint.as_str(),
+            core.bound_port(),
+            addresses,
+        )
+    }
+    fn register(
+        instance: &str,
+        fingerprint: &str,
+        port: u16,
+        addresses: Vec<crate::discovery::InterfaceAddress>,
+    ) -> Result<Self> {
         ensure!(!addresses.is_empty(), "no reachable interface for mDNS");
-        let instance = format!("Pneu-{}", &core.identity.device_id.as_str()[..8]);
         let ips: Vec<_> = addresses.iter().map(|i| i.ip).collect();
         let mut info = mdns_sd::ServiceInfo::new(
             "_pneu._tcp.local.",
-            &instance,
+            instance,
             &format!("{instance}.local."),
             ips.as_slice(),
-            core.bound_port(),
-            [("v", "1"), ("fp", core.identity.fingerprint.as_str())].as_slice(),
+            port,
+            [("v", "1"), ("fp", fingerprint)].as_slice(),
         )?;
         info.set_interfaces(ips.iter().copied().map(mdns_sd::IfKind::Addr).collect());
         let fullname = info.get_fullname().to_owned();
@@ -12286,6 +12298,53 @@ mod tests {
         stop.send(true)?;
         ipc.await??;
         core.shutdown_actions().await?;
+        Ok(())
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_network_tests {
+    use super::*;
+    #[tokio::test]
+    #[ignore = "opt-in: requires an active LAN with multicast; run with --ignored"]
+    async fn native_mdns_advertisement_registers_and_shuts_down() -> Result<()> {
+        let listener = crate::net::listen(0).await?;
+        let advertisement = Advertisement::register(
+            &format!("Pneu-m2b-net-{}", std::process::id()),
+            &"0".repeat(64),
+            listener.local_addr()?.port(),
+            crate::discovery::candidates()?,
+        )?;
+        eprintln!(
+            "mDNS registered {} on {:?}",
+            advertisement.fullname, advertisement.addresses
+        );
+        // Register is asynchronous. Wait for the daemon's actual announcement,
+        // rather than treating queueing the command as successful registration.
+        let monitor = advertisement.daemon.monitor()?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        let mut announced = false;
+        while std::time::Instant::now() < deadline {
+            if let Ok(event) = monitor.recv_timeout(Duration::from_millis(200)) {
+                eprintln!("mDNS monitor: {event:?}");
+                match event {
+                    mdns_sd::DaemonEvent::Announce(_, _) => {
+                        announced = true;
+                        break;
+                    }
+                    mdns_sd::DaemonEvent::Error(error) => anyhow::bail!("mDNS: {error}"),
+                    _ => {}
+                }
+            }
+        }
+        assert!(announced, "mDNS did not announce on the VM's candidates");
+        let status = advertisement
+            .daemon
+            .shutdown()?
+            .recv_timeout(Duration::from_secs(3))?;
+        assert_eq!(status, mdns_sd::DaemonStatus::Shutdown);
+        eprintln!("mDNS shutdown: {status:?}");
+        drop(advertisement);
         Ok(())
     }
 }

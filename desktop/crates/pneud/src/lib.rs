@@ -12,6 +12,7 @@ pub mod identity;
 pub mod ipc;
 #[cfg(unix)]
 pub mod macos_removal;
+pub mod net;
 mod platform;
 mod storage;
 mod store;

@@ -199,7 +199,7 @@ async fn run(paths: Paths) -> Result<()> {
         let mut notified=false;
         let serving=async {
             let listener=loop {
-                match tokio::net::TcpListener::bind(("::",port)).await {
+                match pneud::net::listen(port).await {
                     Ok(listener)=>{core.clear_port_error();break listener;},
                     Err(error) if error.kind()==std::io::ErrorKind::AddrInUse=>{
                         core.set_receive_error(Some(pneud::ui::ReceiveError::Port(port)));
