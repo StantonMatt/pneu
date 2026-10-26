@@ -1279,7 +1279,7 @@ impl Drop for Registration {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use async_trait::async_trait;
@@ -2404,6 +2404,7 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    #[cfg(unix)]
     async fn dial_failures_keep_bindings_expose_ipc_states_and_back_off() -> Result<()> {
         for (failure, state) in [
             ("hello_version", "update_required"),

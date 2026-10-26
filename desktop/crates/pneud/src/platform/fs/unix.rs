@@ -401,10 +401,11 @@ pub(crate) fn is_directory_at(parent: &File, name: impl AsRef<OsStr>) -> Result<
     let stat = rustix::fs::statat(parent, name.as_ref(), AtFlags::SYMLINK_NOFOLLOW)?;
     Ok(stat.st_mode & libc::S_IFMT == libc::S_IFDIR)
 }
-pub(crate) fn is_private_file(meta: &std::fs::Metadata) -> bool {
-    meta.is_file()
+pub(crate) fn is_private_file(file: &File) -> Result<bool> {
+    let meta = file.metadata()?;
+    Ok(meta.is_file()
         && meta.uid() == rustix::process::geteuid().as_raw()
-        && meta.mode() & 0o777 == 0o600
+        && meta.mode() & 0o777 == 0o600)
 }
 pub(crate) fn is_private_directory(file: &File) -> Result<bool> {
     let stat = rustix::fs::fstat(file)?;

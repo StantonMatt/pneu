@@ -253,8 +253,8 @@ impl Outbox {
             Ok(q.query_map([], |r| r.get::<_, String>(0))?
                 .collect::<rusqlite::Result<HashSet<_>>>()?)
         })?;
-        for entry in fs::read_dir(outbox.folder.path()?)? {
-            let name = entry?.file_name();
+        for entry in platform_fs::entries(&outbox.folder.file)? {
+            let name = entry?;
             if name
                 .to_str()
                 .is_some_and(|s| Id::new(s.to_owned()).is_ok() && !retained.contains(s))
@@ -837,7 +837,7 @@ fn mime(path: &Path) -> &'static str {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     pub(super) fn id(n: u8) -> Id {
@@ -1195,6 +1195,7 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    #[cfg(unix)]
     async fn caps_reserve_symlinks_and_failed_admission_are_enforced() -> Result<()> {
         let (dir, q, peers, source) = fixture().await?;
         let mut constrained = q.clone();
@@ -1274,6 +1275,7 @@ mod regression_tests {
         Ok(())
     }
     #[test]
+    #[cfg(unix)]
     fn descriptor_relative_parent_paths_reject_links_even_before_parent_component() -> Result<()> {
         let dir = crate::test_support::scratch()?;
         fs::create_dir(dir.path().join("child"))?;

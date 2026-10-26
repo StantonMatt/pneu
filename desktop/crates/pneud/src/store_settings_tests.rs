@@ -1,7 +1,7 @@
 use super::*;
 use pneu_proto::{PeerSetting, PeerSettings};
 async fn pair() -> Result<(tempfile::TempDir, Store, Id, Id)> {
-    let dir = tempfile::tempdir()?;
+    let dir = crate::test_support::scratch()?;
     let s = Store::open(&dir.path().join("state.sqlite3"))?;
     let local = Id::from_bytes([1; 16]);
     let peer = Id::from_bytes([2; 16]);
@@ -17,7 +17,7 @@ fn snapshot(settings: Vec<PeerSetting>) -> PeerSettings {
 #[tokio::test]
 async fn pair_settings_roundtrip_lww_tie_break_and_exact_pending_replay() -> Result<()> {
     let (_dir, a, local, peer) = pair().await?;
-    let dir = tempfile::tempdir()?;
+    let dir = crate::test_support::scratch()?;
     let b = Store::open(&dir.path().join("state.sqlite3"))?;
     b.pair(local.clone(), Hash::new("b".repeat(64))?).await?;
     let key = format!("{local}/{peer}/clipboard");

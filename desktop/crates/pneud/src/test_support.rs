@@ -14,6 +14,13 @@ pub(crate) fn scratch() -> anyhow::Result<tempfile::TempDir> {
     let base = cache.join("agent-scratch/pneu/tests");
     std::fs::create_dir_all(&base)?;
     let dir = tempfile::tempdir_in(base)?;
+    #[cfg(windows)]
+    {
+        // Replace only this task's empty disposable directory so the backend
+        // supplies its DACL at creation, rather than repairing an exposed ACL.
+        std::fs::remove_dir(dir.path())?;
+        pneud::config::private_dir(dir.path())?;
+    }
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::fs::PermissionsExt;

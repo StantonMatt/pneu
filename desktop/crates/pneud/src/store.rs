@@ -142,7 +142,9 @@ struct PeerWriteBarrier {
 struct StoreOwnership(fs::File);
 impl Drop for StoreOwnership {
     fn drop(&mut self) {
+        #[cfg(unix)]
         let _ = self.0.unlock();
+        // Windows owns one byte on the DB handle; closing it releases the lock.
     }
 }
 /// Immutable authority captured before scheduling work, never refreshed by a
@@ -455,33 +457,42 @@ impl Store {
         keyed_text_receipt(&self.clipboard_fingerprint_key, text)
     }
     pub fn open(path: &Path) -> Result<Self> {
-        ensure!(
-            !path.exists() || !fs::symlink_metadata(path)?.file_type().is_symlink(),
-            "database is a symlink"
-        );
-        let lock = crate::platform::fs::open_store_lock(&path.with_extension("lock"))?;
-        lock.try_lock()
-            .map_err(crate::platform::fs::lock_error)
-            .context("data store is already owned by another daemon")?;
-        #[cfg(target_os = "macos")]
-        {
-            // Precreate the database before SQLite can write secret state. New
-            // sidecars inherit from this ACL-free parent, existing ones must pass.
-            let parent =
-                crate::storage::Folder::open(path.parent().context("database parent")?, false)?;
-            crate::platform::private::check(&parent.file)?;
-            crate::platform::private::open(path)?;
-            for suffix in ["-wal", "-shm", "-journal"] {
-                let sidecar = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
-                match fs::symlink_metadata(&sidecar) {
-                    Ok(_) => crate::platform::private::check_path(&sidecar)?,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.into()),
+        #[cfg(windows)]
+        let (mut conn, lock, folder) = crate::platform::fs::open_database(path)?;
+        #[cfg(unix)]
+        let (mut conn, lock) = {
+            ensure!(
+                !path.exists() || !fs::symlink_metadata(path)?.file_type().is_symlink(),
+                "database is a symlink"
+            );
+            let lock = crate::platform::fs::open_store_lock(&path.with_extension("lock"))?;
+            lock.try_lock()
+                .map_err(crate::platform::fs::lock_error)
+                .context("data store is already owned by another daemon")?;
+            #[cfg(target_os = "macos")]
+            {
+                // Precreate the database before SQLite can write secret state. New
+                // sidecars inherit from this private parent, existing ones must pass.
+                let parent =
+                    crate::storage::Folder::open(path.parent().context("database parent")?, false)?;
+                crate::platform::private::check(&parent.file)?;
+                crate::platform::private::open(path)?;
+                for suffix in ["-wal", "-shm", "-journal"] {
+                    let sidecar = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+                    match fs::symlink_metadata(&sidecar) {
+                        Ok(_) => {
+                            #[cfg(target_os = "macos")]
+                            crate::platform::private::check_path(&sidecar)?;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
                 }
             }
-        }
-        let mut conn = Connection::open(path)?;
-        crate::platform::fs::set_private_file(path)?;
+            let conn = Connection::open(path)?;
+            crate::platform::fs::set_private_file(path)?;
+            (conn, lock)
+        };
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;")?;
         let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         ensure!(version <= 3, "unsupported store schema version {version}");
@@ -647,17 +658,23 @@ impl Store {
                 })
                 .collect::<Result<HashMap<_, _>>>()?
         };
-        crate::clipboard_fingerprint::FingerprintKey::cleanup_temporary(
-            &path.with_file_name("clipboard-fingerprint.key"),
-        )?;
-        let clipboard_fingerprint_key =
-            crate::clipboard_fingerprint::FingerprintKey::load_or_create(
+        #[cfg(unix)]
+        let clipboard_fingerprint_key = {
+            crate::clipboard_fingerprint::FingerprintKey::cleanup_temporary(
                 &path.with_file_name("clipboard-fingerprint.key"),
             )?;
+            crate::clipboard_fingerprint::FingerprintKey::load_or_create(
+                &path.with_file_name("clipboard-fingerprint.key"),
+            )?
+        };
+        #[cfg(windows)]
+        let clipboard_fingerprint_key =
+            crate::clipboard_fingerprint::FingerprintKey::load_in(&folder)?;
         clipboard::migrate_fingerprints(&tx, &clipboard_fingerprint_key)?;
         tx.commit()?;
         // Remove obsolete raw hashes from the migration WAL as well.
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        #[cfg(unix)]
         let folder = Folder::open(path.parent().context("database parent")?, false)?;
         folder.file.sync_all()?;
         Ok(Self {
@@ -724,6 +741,10 @@ impl Store {
             .into());
         }
         Ok(())
+    }
+    #[cfg(all(test, windows))]
+    pub(crate) fn test_locked<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
+        self.locked(f)
     }
     fn locked<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
         f(&mut *self
@@ -1312,10 +1333,15 @@ impl Store {
                 if let Some(cache) = &cache {
                     // Use the retained directory's current path, so a folder
                     // moved into the cache during a transfer cannot become a save.
-                    ensure!(
-                        !crate::config::save_folder_overlaps_cache(&stage.0.folder.path()?, cache),
-                        crate::platform::fs::permission_denied()
-                    );
+                    #[cfg(windows)]
+                    let overlaps = crate::platform::fs::retained_folder_overlaps_cache(
+                        &stage.0.folder,
+                        cache,
+                    )?;
+                    #[cfg(unix)]
+                    let overlaps =
+                        crate::config::save_folder_overlaps_cache(&stage.0.folder.path()?, cache);
+                    ensure!(!overlaps, crate::platform::fs::permission_denied());
                 }
                 store.check_file_setting(tx, &device, begin.kind)?;
                 stage.place()?;
@@ -1688,11 +1714,279 @@ pub(crate) fn save_failure_code(error: &anyhow::Error) -> NackCode {
     NackCode::StorageFailed
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
+    fn test_connection(path: &Path) -> Result<Connection> {
+        #[cfg(windows)]
+        crate::platform::private::open(path)?;
+        Ok(Connection::open(path)?)
+    }
+    #[test]
+    #[cfg(windows)]
+    fn sqlite_recreated_sidecar_crash_fixture() -> Result<()> {
+        let Some(path) = std::env::var_os("PNEU_TEST_SIDECAR_DB") else {
+            return Ok(());
+        };
+        let mode = std::env::var("PNEU_TEST_SIDECAR_MODE")?;
+        let path = Path::new(&path);
+        let store = Store::open(path)?;
+        store.locked(|conn| {
+            conn.execute_batch("PRAGMA journal_mode=DELETE; CREATE TABLE crash_probe(value); INSERT INTO crash_probe VALUES(1);")?;
+            assert!(!path.with_extension("sqlite3-wal").exists());
+            assert!(!path.with_extension("sqlite3-shm").exists());
+            if mode == "wal" {
+                conn.execute_batch("PRAGMA journal_mode=WAL; UPDATE crash_probe SET value=2;")?;
+                for suffix in ["-wal", "-shm"] {
+                    assert!(PathBuf::from(format!("{}{suffix}", path.display())).exists());
+                }
+            } else {
+                conn.execute_batch("BEGIN IMMEDIATE; UPDATE crash_probe SET value=2;")?;
+                assert!(PathBuf::from(format!("{}-journal", path.display())).exists());
+            }
+            Ok(())
+        })?;
+        // Simulated crash: no Connection/Store destructors or sidecar cleanup.
+        std::process::exit(0);
+    }
+    #[test]
+    #[cfg(windows)]
+    fn sqlite_recreated_wal_shm_and_journal_survive_crash_restart() -> Result<()> {
+        for mode in ["wal", "delete"] {
+            let dir = crate::test_support::scratch()?;
+            let path = dir.path().join("state.sqlite3");
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "store::tests::sqlite_recreated_sidecar_crash_fixture",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env("PNEU_TEST_SIDECAR_DB", &path)
+                .env("PNEU_TEST_SIDECAR_MODE", mode)
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "sidecar crash fixture failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let parent = Folder::open(dir.path(), false)?;
+            let suffixes: &[&str] = if mode == "wal" {
+                &["-wal", "-shm"]
+            } else {
+                &["-journal"]
+            };
+            for suffix in suffixes {
+                let sidecar = PathBuf::from(format!("{}{suffix}", path.display()));
+                assert!(sidecar.exists());
+                // Prove this is the inherited/recreated path, not our protected
+                // precreation. The contextual policy is the one that admits it.
+                assert!(crate::platform::private::check_path(&sidecar).is_err());
+                crate::platform::private::check_in(&parent.file, sidecar.file_name().unwrap())?;
+            }
+            let store = Store::open(&path)?;
+            let value: i32 = store
+                .locked(|c| Ok(c.query_row("SELECT value FROM crash_probe", [], |r| r.get(0))?))?;
+            assert_eq!(value, if mode == "wal" { 2 } else { 1 });
+            drop(store);
+            drop(Store::open(&path)?);
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn canonical_save_placement_rejects_cache_aliases() -> Result<()> {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let (dir, store, device) = fixture().await?;
+        let cache = dir.path().join("ActualCacheLongName");
+        Folder::open_private(&cache)?;
+        let mut aliases = vec![cache.clone(), dir.path().join("ACTUALCACHELONGNAME")];
+        let mapping = crate::platform::fs::TestDrive::new(&cache)?;
+        aliases.push(mapping.path());
+        let input: Vec<_> = cache.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut short = vec![0u16; 32768];
+        // SAFETY: terminated input and sized output buffers.
+        let len = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(
+                input.as_ptr(),
+                short.as_mut_ptr(),
+                short.len() as u32,
+            )
+        } as usize;
+        ensure!(
+            len > 0 && len < short.len(),
+            "cannot query short cache path"
+        );
+        let short = PathBuf::from(std::ffi::OsString::from_wide(&short[..len]));
+        if short != cache {
+            aliases.push(short);
+        }
+        for alias in aliases {
+            let staged = store
+                .create_stage(cache.clone(), ".pneu-cache-peer-file".into(), 4)
+                .await?;
+            (&staged.0.file).write_all(b"keep")?;
+            let mut meta = begin(b"keep");
+            meta.file_name = ".pneu-cache-peer-file".into();
+            let staged_path = staged.path()?;
+            let error = store
+                .commit_saved_file(device.clone(), VerifiedFile::fixture(meta), staged, alias)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                save_failure_code(&error),
+                NackCode::NotWritable,
+                "{error:#}"
+            );
+            store.drain().await;
+            assert!(!staged_path.exists());
+            assert!(!cache.join(".pneu-cache-peer-file").exists());
+        }
+        // A subst root below cache must be rejected using retained ancestry.
+        let child = cache.join("child");
+        Folder::open_private(&child)?;
+        let child_mapping = crate::platform::fs::TestDrive::new(&child)?;
+        let staged = stage(&store, child_mapping.path(), b"keep").await?;
+        let error = store
+            .commit_saved_file(
+                device.clone(),
+                VerifiedFile::fixture(begin(b"keep")),
+                staged,
+                cache.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(save_failure_code(&error), NackCode::NotWritable);
+        store.drain().await;
+        // The same path is allowed as an ordinary save outside the cache.
+        let saved = dir.path().join("saved");
+        let staged = stage(&store, saved.clone(), b"keep").await?;
+        assert!(
+            store
+                .commit_saved_file(device, VerifiedFile::fixture(begin(b"keep")), staged, cache)
+                .await?
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn provisionally_admitted_save_rejects_later_cache_placement() -> Result<()> {
+        let (dir, store, device) = fixture().await?;
+        let cache = dir.path().join("cache");
+        Folder::open_private(&cache)?;
+        let late = cache.join("late-drive-target");
+        // A task-owned DOS drive exists, but its target is unavailable until
+        // after config admission. No global drive mapping is changed.
+        let mut mapping = crate::platform::fs::TestDrive::new(&late)?;
+        let config = crate::Config {
+            save_path: mapping.path(),
+            save_to_folder: true,
+            ..crate::Config::default()
+        };
+        config.validate_with_cache(&cache)?;
+        assert!(Folder::open(&config.save_path, false).is_err());
+        Folder::open_private(&late)?;
+        let error = config.validate_with_cache(&cache).unwrap_err();
+        assert!(error.to_string().contains("save folder must not be"));
+        // Keep a completed fallback entry for this transfer: a rejected save
+        // must neither publish a receipt nor retire/prune that cached copy.
+        let meta = begin(b"keep");
+        let cached = store
+            .create_stage(cache.clone(), ".pneu-cache-recoverable".into(), 4)
+            .await?;
+        (&cached.0.file).write_all(b"keep")?;
+        store
+            .commit_cache(device.clone(), VerifiedFile::fixture(meta.clone()), cached)
+            .await?;
+        let staged = store
+            .create_stage(config.save_path.clone(), "saved.bin".into(), 4)
+            .await?;
+        (&staged.0.file).write_all(b"keep")?;
+        let staged_path = staged.path()?;
+        // Retarget the configured drive outside cache after staging. Only the
+        // retained Folder reveals that the actual placement is still in cache.
+        let safe = dir.path().join("safe");
+        Folder::open_private(&safe)?;
+        mapping.repoint(&safe)?;
+        config.validate_with_cache(&cache)?;
+        let error = store
+            .commit_saved_file(
+                device.clone(),
+                VerifiedFile::fixture(meta.clone()),
+                staged,
+                cache.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            save_failure_code(&error),
+            NackCode::NotWritable,
+            "{error:#}"
+        );
+        store.drain().await;
+        assert!(!late.join("saved.bin").exists());
+        assert!(!safe.join("saved.bin").exists());
+        assert!(!staged_path.exists());
+        assert_eq!(
+            std::fs::read(cache.join(".pneu-cache-recoverable"))?,
+            b"keep"
+        );
+        assert!(
+            store
+                .locked(|c| receipt_row(c, device.as_str(), meta.transfer_id.as_str()))?
+                .is_none()
+        );
+        assert!(store.locked(|c| failed_file(c, &device, &meta))?.is_some());
+        Ok(())
+    }
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn saved_and_cache_commits_handoff_readonly_received_handles() -> Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+        for fallback_cache in [false, true] {
+            let (dir, store, device) = fixture().await?;
+            let destination = dir
+                .path()
+                .join(if fallback_cache { "cache" } else { "save" });
+            Folder::open_private(&destination)?;
+            let staged = stage(&store, destination, b"received").await?;
+            // Model the writer clone held by the stream until completion.
+            let stream_writer = staged.0.file.try_clone()?;
+            let verified = VerifiedFile::fixture(begin(b"received"));
+            let committed = if fallback_cache {
+                store.commit_cache(device, verified, staged.clone()).await?
+            } else {
+                store
+                    .commit_saved_file(
+                        device,
+                        verified,
+                        staged.clone(),
+                        dir.path().join("unused-cache"),
+                    )
+                    .await?
+            };
+            assert!(committed);
+            let received = crate::actions::ReceivedFile::from_file(
+                staged.destination_path()?,
+                staged.0.file.try_clone()?,
+            )?;
+            drop(stream_writer);
+            drop(staged);
+            store.drain().await;
+            let reader = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .open(received.path())?;
+            assert_eq!(reader.metadata()?.len(), 8);
+            assert_eq!(received.read_bounded(8)?, b"received");
+        }
+        Ok(())
+    }
     fn begin(bytes: &[u8]) -> FileBegin {
         FileBegin {
             hlc: None,
@@ -1724,6 +2018,7 @@ mod tests {
     // The verbatim released startup can fail before wrapping its raw flock in
     // StoreOwnership. A concurrent test's fork may then inherit that lock until
     // exec. Run this historical code alone so process exit releases every FD.
+    #[cfg(unix)]
     async fn released_startup(path: &Path, expected: &str) -> Result<()> {
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -1748,6 +2043,7 @@ mod tests {
         Ok(())
     }
     #[test]
+    #[cfg(unix)]
     fn released_startup_fixture() -> Result<()> {
         let Some(path) = std::env::var_os("PNEU_TEST_RELEASED_STORE") else {
             return Ok(());
@@ -1766,7 +2062,7 @@ mod tests {
     }
 
     async fn fixture() -> Result<(tempfile::TempDir, Store, Id)> {
-        let dir = tempfile::tempdir()?;
+        let dir = crate::test_support::scratch()?;
         let store = Store::open(&dir.path().join("state.sqlite3"))?;
         let device = Id::new(crate::random_hex(16))?;
         store
@@ -1798,14 +2094,14 @@ mod tests {
     }
     #[tokio::test]
     async fn legacy_pair_migrates_and_multiple_peers_survive_restart() -> Result<()> {
-        let dir = tempfile::tempdir()?;
+        let dir = crate::test_support::scratch()?;
         let path = dir.path().join("state.sqlite3");
         let first = Id::new(crate::random_hex(16))?;
         let fp = Hash::new(crate::random_hex(32))?;
         let pending = text(123);
         let file = begin(b"completed");
         {
-            let c = Connection::open(&path)?;
+            let c = test_connection(&path)?;
             c.execute_batch("CREATE TABLE peers(id TEXT PRIMARY KEY,fp TEXT UNIQUE NOT NULL);
                 CREATE TABLE pairing_epoch(singleton INTEGER PRIMARY KEY,generation INTEGER NOT NULL,last_outgoing_at INTEGER NOT NULL);
                 INSERT INTO pairing_epoch VALUES(1,7,123);
@@ -1861,14 +2157,15 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    #[cfg(unix)]
     async fn sweep_released_startup_cannot_delete_migrated_data() -> Result<()> {
-        let dir = tempfile::tempdir()?;
+        let dir = crate::test_support::scratch()?;
         let path = dir.path().join("state.sqlite3");
         // Create the original schema with the real released startup, then
         // migrate an existing pairing before adding the second device.
         released_startup(&path, "success").await?;
         let first = Id::from_bytes([1; 16]);
-        let c = Connection::open(&path)?;
+        let c = test_connection(&path)?;
         c.execute(
             "INSERT INTO peers VALUES(?,?)",
             params![first.as_str(), crate::random_hex(32)],
@@ -1917,7 +2214,7 @@ mod tests {
         }
         close_for_restart(store).await?;
         let snapshot = || -> Result<Vec<String>> {
-            let c = Connection::open(&path)?;
+            let c = test_connection(&path)?;
             let mut rows = Vec::new();
             for table in [
                 "peers",
@@ -1968,6 +2265,7 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    #[cfg(unix)]
     async fn sweep_unfenced_v1_old_startup_artifacts_recover_without_further_loss() -> Result<()> {
         let (dir, store, device) = fixture().await?;
         let file = begin(b"kept");
@@ -2057,6 +2355,7 @@ mod tests {
         close_for_restart(store).await
     }
     #[tokio::test]
+    #[cfg(unix)]
     async fn v1_migration_adds_only_established_and_preserves_downgrade_fence() -> Result<()> {
         let (dir, store, device) = fixture().await?;
         let path = dir.path().join("state.sqlite3");
@@ -2113,9 +2412,9 @@ mod tests {
 
     #[tokio::test]
     async fn failed_migration_rolls_back_schema_and_preserves_pairing() -> Result<()> {
-        let dir = tempfile::tempdir()?;
+        let dir = crate::test_support::scratch()?;
         let path = dir.path().join("state.sqlite3");
-        let c = Connection::open(&path)?;
+        let c = test_connection(&path)?;
         c.execute_batch("CREATE TABLE peers(id TEXT PRIMARY KEY,fp TEXT UNIQUE NOT NULL);
             CREATE TABLE pairing_epoch(singleton INTEGER PRIMARY KEY,generation INTEGER NOT NULL,last_outgoing_at INTEGER NOT NULL);
             INSERT INTO pairing_epoch VALUES(1,7,123);
@@ -2125,7 +2424,7 @@ mod tests {
         c.execute("INSERT INTO peers VALUES(?,?)", params![device, fp])?;
         drop(c);
         assert!(Store::open(&path).is_err());
-        let c = Connection::open(&path)?;
+        let c = test_connection(&path)?;
         let pair: (String, String) = c.query_row("SELECT id,fp FROM peers", [], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })?;
@@ -2359,6 +2658,7 @@ mod tests {
     }
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[cfg(unix)]
     async fn restart_releases_lock_even_while_concurrent_child_is_before_exec() -> Result<()> {
         use std::os::{fd::AsRawFd, unix::process::CommandExt};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2421,12 +2721,12 @@ mod tests {
     }
     #[tokio::test]
     async fn legacy_pending_text_seeds_serialized_clock_before_first_local_enqueue() -> Result<()> {
-        let dir = tempfile::tempdir()?;
+        let dir = crate::test_support::scratch()?;
         let path = dir.path().join("state.sqlite3");
         let device = Id::new(crate::random_hex(16))?;
         let future = crate::now_ms() + 100_000;
         {
-            let c = Connection::open(&path)?;
+            let c = test_connection(&path)?;
             c.execute_batch("CREATE TABLE peers(id TEXT PRIMARY KEY,fp TEXT UNIQUE NOT NULL);
                 CREATE TABLE outgoing(seq INTEGER PRIMARY KEY AUTOINCREMENT,device TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,payload TEXT NOT NULL,retry_at INTEGER NOT NULL DEFAULT 0);")?;
             c.execute(
@@ -2578,6 +2878,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn startup_sweeps_every_used_folder_even_without_receipts_or_current_config() -> Result<()>
     {
         let (dir, store, _) = fixture().await?;
@@ -2636,6 +2937,7 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    #[cfg(unix)]
     async fn cache_retry_reuses_only_unchanged_identity_and_keeps_verified_replacement()
     -> Result<()> {
         for change in [
@@ -2746,6 +3048,7 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    #[cfg(unix)]
     async fn failed_cache_retirement_requires_live_inode_and_directory_ownership() -> Result<()> {
         for replacement in [
             "none",
@@ -2846,6 +3149,7 @@ mod tests {
     }
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[cfg(unix)]
     async fn cache_evidence_never_pins_expired_files_across_pairing_lifecycles() -> Result<()> {
         use std::os::unix::fs::MetadataExt;
         for lifecycle in ["prune", "unpair", "repair"] {
@@ -2899,6 +3203,59 @@ mod tests {
         }
         Ok(())
     }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cache_version_survives_writer_close_for_reuse_and_retirement() -> Result<()> {
+        let (dir, store, device) = fixture().await?;
+        let cache = dir.path().join("cache");
+        let staged = stage(&store, cache.clone(), b"owned").await?;
+        let writer = staged.0.file.try_clone()?;
+        let meta = begin(b"owned");
+        assert!(
+            store
+                .commit_cache(
+                    device.clone(),
+                    VerifiedFile::fixture(meta.clone()),
+                    staged.clone()
+                )
+                .await?
+        );
+        let original = staged.destination_path()?;
+        // Cross the coarsest local-filesystem write-time granularity on both
+        // sides of the final writer close, including a duplicated handle.
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+        drop(staged);
+        drop(writer);
+        store.drain().await;
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+        let retry = stage(&store, cache.clone(), b"owned").await?;
+        let duplicate = retry.destination_path()?;
+        assert!(
+            !store
+                .commit_cache(device.clone(), VerifiedFile::fixture(meta.clone()), retry)
+                .await?,
+            "an untouched preview must be reused after its writers close"
+        );
+        store.drain().await;
+        assert_eq!(fs::read(&original)?, b"owned");
+        assert!(!duplicate.exists());
+        assert_eq!(fs::read_dir(&cache)?.count(), 2); // preview + staging directory
+        let saved = stage(&store, dir.path().join("saved"), b"owned").await?;
+        let saved_path = saved.destination_path()?;
+        assert!(
+            store
+                .commit_file(device.clone(), VerifiedFile::fixture(meta.clone()), saved)
+                .await?
+        );
+        store.drain().await;
+        assert!(
+            !original.exists(),
+            "a successful save must retire its preview"
+        );
+        assert_eq!(fs::read(saved_path)?, b"owned");
+        assert!(store.receipt(device, meta.transfer_id).await?.is_some());
+        Ok(())
+    }
     #[tokio::test]
     async fn cache_retirement_preserves_files_modified_since_commit() -> Result<()> {
         for change_size in [true, false] {
@@ -2912,7 +3269,7 @@ mod tests {
             if change_size {
                 fs::write(&path, b"modified by another user action")?;
             } else {
-                fs::File::open(&path)?.set_times(
+                fs::OpenOptions::new().write(true).open(&path)?.set_times(
                     fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH),
                 )?;
             }
@@ -2926,6 +3283,7 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    #[cfg(unix)]
     async fn stage_cleanup_and_drop_preserve_replaced_entries() -> Result<()> {
         for explicit in [false, true] {
             for link in [false, true] {
@@ -2953,6 +3311,9 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    // NTFS rejects directory rename while descendants are open, including
+    // NtSetInformationFile with POSIX flags. Windows tests cover that refusal.
+    #[cfg(unix)]
     async fn renamed_ready_folder_cannot_sweep_live_stages_through_deferred_alias() -> Result<()> {
         let (dir, store, device) = fixture().await?;
         let a = dir.path().join("save-a");
@@ -2982,6 +3343,9 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    // NTFS rejects directory rename while descendants are open, including
+    // NtSetInformationFile with POSIX flags. Windows tests cover that refusal.
+    #[cfg(unix)]
     async fn directory_swap_cannot_redirect_placement_or_cancellation_cleanup() -> Result<()> {
         let (dir, store, device) = fixture().await?;
         let path = dir.path().join("save");
@@ -3182,7 +3546,7 @@ mod tests {
     #[test]
     fn shutdown_drops_queued_claim_cleanup_without_recursively_rescheduling() -> Result<()> {
         use std::time::Duration;
-        let directory = tempfile::tempdir()?;
+        let directory = crate::test_support::scratch()?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .max_blocking_threads(1)
@@ -3301,7 +3665,14 @@ mod tests {
             c.execute("UPDATE receipts SET location=?", [hint])?;
             Ok(())
         }).await?;
-        fs::write(folder.join(".pneu-staging/orphan"), b"partial")?;
+        let staging = Folder::open_private(&folder.join(".pneu-staging"))?;
+        let mut orphan = crate::platform::fs::create_private_at(
+            &staging.file,
+            "orphan",
+            crate::platform::fs::Access::Write,
+        )?;
+        orphan.write_all(b"partial")?;
+        drop((orphan, staging));
         store.drain().await;
         close_for_restart(store).await?;
         let store = Store::open(&dir.path().join("state.sqlite3"))?;
@@ -3316,6 +3687,7 @@ mod tests {
         assert_eq!(obsolete, 0);
         Ok(())
     }
+    #[cfg(unix)]
     #[test]
     fn save_error_causes_survive_context() {
         for (errno, code) in [
@@ -3418,7 +3790,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "../tests/fixtures/released_store.rs"]
 mod released_store;
 

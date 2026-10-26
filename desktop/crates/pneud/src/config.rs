@@ -1,10 +1,13 @@
 use crate::platform::fs as platform_fs;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
+#[cfg(any(unix, test))]
+use std::fs;
+#[cfg(unix)]
+use std::path::Component;
 use std::{
-    fs,
     io::Write,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 
 #[derive(Clone, Debug)]
@@ -22,6 +25,10 @@ impl Paths {
         crate::platform::prepare_runtime(&self.socket)
     }
     pub fn prepare(&self) -> Result<()> {
+        #[cfg(windows)]
+        for path in [&self.data, &self.config, &self.cache, &self.socket] {
+            platform_fs::validate_path(path)?;
+        }
         for path in [&self.data, self.config.parent().context("config parent")?] {
             private_dir(path)?;
         }
@@ -89,10 +96,18 @@ impl Config {
             !self.name.is_empty() && self.name.len() <= 128 && !self.name.contains('\0'),
             "invalid PC name"
         );
+        #[cfg(windows)]
+        for path in [&self.save_path, cache] {
+            platform_fs::validate_path(path)?;
+        }
         ensure!(self.save_path.is_absolute(), "save_path must be absolute");
         ensure!(cache.is_absolute(), "cache directory must be absolute");
+        #[cfg(windows)]
+        let overlaps = platform_fs::configured_folder_overlaps_cache(&self.save_path, cache)?;
+        #[cfg(unix)]
+        let overlaps = save_folder_overlaps_cache(&self.save_path, cache);
         ensure!(
-            !save_folder_overlaps_cache(&self.save_path, cache),
+            !overlaps,
             "save folder must not be the daemon cache directory or a folder inside it"
         );
         ensure!(self.port != 0, "port must be nonzero");
@@ -103,6 +118,14 @@ impl Config {
         Ok(())
     }
     pub fn load(path: &Path) -> Result<Self> {
+        #[cfg(windows)]
+        platform_fs::validate_path(path)?;
+        #[cfg(windows)]
+        let folder = crate::storage::Folder::open(path.parent().context("config parent")?, false)
+            .context("cannot open config directory")?;
+        #[cfg(windows)]
+        let name = path.file_name().context("config name")?;
+        #[cfg(unix)]
         if path.exists() {
             ensure!(
                 fs::symlink_metadata(path)?.file_type().is_file(),
@@ -110,8 +133,15 @@ impl Config {
             );
             ensure!(fs::metadata(path)?.len() <= 65536, "config is too large");
         }
-        let mut config: Self = if path.exists() {
-            let bytes = crate::storage::read_bounded(path, 65536)?;
+        #[cfg(windows)]
+        let bytes = platform_fs::private_bytes_at(&folder.file, name, 65536)?;
+        #[cfg(unix)]
+        let bytes = if path.exists() {
+            Some(crate::storage::read_bounded(path, 65536)?)
+        } else {
+            None
+        };
+        let mut config: Self = if let Some(bytes) = bytes {
             let text = std::str::from_utf8(&bytes)?;
             let mut config: Self = toml::from_str(text)?;
             let fields: toml::Value = toml::from_str(text)?;
@@ -125,13 +155,26 @@ impl Config {
             config
         } else {
             let c = Self::default();
+            #[cfg(unix)]
             c.save(path)?;
+            #[cfg(windows)]
+            {
+                c.validate()?;
+                atomic_private_in(&folder, name, toml::to_string_pretty(&c)?.as_bytes())?;
+            }
             c
         };
+        #[cfg(unix)]
         platform_fs::set_private_file(path)?;
         if config.name == "Pneu PC" {
             config.name = machine_hostname();
+            #[cfg(unix)]
             config.save(path)?;
+            #[cfg(windows)]
+            {
+                config.validate()?;
+                atomic_private_in(&folder, name, toml::to_string_pretty(&config)?.as_bytes())?;
+            }
         }
         config.validate()?;
         Ok(config)
@@ -141,8 +184,15 @@ impl Config {
         atomic_private(path, toml::to_string_pretty(self)?.as_bytes())
     }
 }
+#[cfg(windows)]
+pub(crate) fn save_folder_overlaps_cache(save: &Path, cache: &Path) -> bool {
+    // Transfer preflight fails closed, allowing the caller's NotWritable
+    // fallback. Placement independently checks the retained Folder again.
+    platform_fs::folder_overlaps_cache(save, cache).unwrap_or(true)
+}
 // Unavailable storage remains recoverable through per-transfer errors/fallback.
 // Only successful resolution of both paths can prove an unsafe destination.
+#[cfg(unix)]
 pub(crate) fn save_folder_overlaps_cache(save: &Path, cache: &Path) -> bool {
     match (resolve_folder(save, &mut 0), resolve_folder(cache, &mut 0)) {
         (Ok(save), Ok(cache)) => save.starts_with(cache),
@@ -153,6 +203,7 @@ use crate::platform::cache_dir_from_env;
 
 // Resolve existing symlinks while retaining missing components: choosing a
 // folder that has not been created yet must enforce the same cache boundary.
+#[cfg(unix)]
 fn resolve_folder(path: &Path, links: &mut usize) -> Result<PathBuf> {
     let mut resolved = PathBuf::new();
     let mut components = path.components();
@@ -194,6 +245,8 @@ pub fn private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 pub fn atomic_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(windows)]
+    platform_fs::validate_path(path)?;
     let folder = crate::storage::Folder::open(path.parent().context("no parent")?, false)?;
     atomic_private_in(&folder, path.file_name().context("file name")?, bytes)
 }
@@ -208,6 +261,8 @@ pub(crate) fn atomic_private_in(
 /// First-writer-wins publication for durable secrets. A racing creator loads
 /// the winner instead of replacing a key another process may already use.
 pub(crate) fn atomic_private_new(path: &Path, bytes: &[u8]) -> Result<bool> {
+    #[cfg(windows)]
+    platform_fs::validate_path(path)?;
     let folder = crate::storage::Folder::open(path.parent().context("no parent")?, false)?;
     publish_private_in(
         &folder,
@@ -216,6 +271,14 @@ pub(crate) fn atomic_private_new(path: &Path, bytes: &[u8]) -> Result<bool> {
         false,
         || Ok(()),
     )
+}
+#[cfg(windows)]
+pub(crate) fn atomic_private_new_in(
+    folder: &crate::storage::Folder,
+    name: &std::ffi::OsStr,
+    bytes: &[u8],
+) -> Result<bool> {
+    publish_private_in(folder, name, bytes, false, || Ok(()))
 }
 fn publish_private_in(
     folder: &crate::storage::Folder,
@@ -228,6 +291,8 @@ fn publish_private_in(
         Path::new(destination).file_name() == Some(destination),
         "invalid file name"
     );
+    #[cfg(windows)]
+    platform_fs::validate_name(destination)?;
     let tmp = format!(
         ".pneu-{}-{}-tmp",
         destination
@@ -260,11 +325,11 @@ fn publish_private_in(
 pub fn sync_parent(path: &Path) -> Result<()> {
     platform_fs::sync_parent(path)
 }
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     #[test]
+    #[cfg(unix)]
     fn unresolvable_folder_errors_do_not_reject_settings() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let file = dir.path().join("file");
@@ -284,6 +349,7 @@ mod tests {
         Ok(())
     }
     #[test]
+    #[cfg(unix)]
     fn save_folder_validation_rejects_cache_and_resolved_descendants() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let cache = dir.path().join("cache");
@@ -373,7 +439,9 @@ mod tests {
         assert_eq!(loaded.port, legacy.port);
         let saved: Config = toml::from_str(&fs::read_to_string(&path)?)?;
         assert_eq!(saved.name, loaded.name);
-        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        assert!(platform_fs::is_private_file(&platform_fs::open_read(
+            &path
+        )?)?);
         Ok(())
     }
     #[test]
@@ -402,6 +470,7 @@ mod tests {
         Ok(())
     }
     #[test]
+    #[cfg(unix)]
     fn fingerprint_write_failure_before_payload_and_interrupted_temp_recover_on_restart()
     -> Result<()> {
         let dir = crate::test_support::scratch()?;
@@ -456,7 +525,9 @@ mod tests {
         let bytes = fs::read(&path)?;
         assert_eq!(bytes.len(), 32);
         assert!(bytes.iter().all(|b| *b == bytes[0]));
-        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        assert!(platform_fs::is_private_file(&platform_fs::open_read(
+            &path
+        )?)?);
         assert_eq!(fs::read_dir(dir.path())?.count(), 1);
         Ok(())
     }

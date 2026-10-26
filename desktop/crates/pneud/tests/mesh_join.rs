@@ -1,3 +1,4 @@
+#![cfg(unix)]
 #[path = "../src/test_support.rs"]
 mod test_support;
 use anyhow::Result;

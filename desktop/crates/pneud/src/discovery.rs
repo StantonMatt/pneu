@@ -558,3 +558,8 @@ mod tests {
         assert!(!tailscale("100.128.0.0".parse().unwrap()));
     }
 }
+
+#[cfg(windows)]
+pub(crate) fn candidates() -> Result<Vec<InterfaceAddress>> {
+    anyhow::bail!("Windows adapter discovery is not yet supported")
+}

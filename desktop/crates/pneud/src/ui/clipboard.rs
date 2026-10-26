@@ -20,7 +20,7 @@ use wl_clipboard_rs::{
 };
 
 pub const ORIGIN_MIME: &str = "application/x-pneu-origin";
-pub const MAX_IMAGE: usize = 10 * 1024 * 1024;
+pub use super::clipboard_content::MAX_IMAGE;
 const IMAGE_MIMES: [&str; 5] = [
     "image/png",
     "image/jpeg",
@@ -67,12 +67,7 @@ fn install_ticket(mimes: &[String]) -> Option<u128> {
             .and_then(|ticket| u128::from_str_radix(ticket, 16).ok())
     })
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Content {
-    Text(String),
-    Image(Vec<u8>),
-    Formats(String, Vec<u8>),
-}
+pub use super::clipboard_content::Content;
 
 #[cfg(test)]
 #[derive(Default)]
