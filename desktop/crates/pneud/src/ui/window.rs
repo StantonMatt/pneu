@@ -32,7 +32,7 @@ fn is_pairing_page(page: Page) -> bool {
 
 /// Keep Scan active until the worker can navigate and preview the decoded link
 /// in one action. Native capture is already stopped by the caller.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 pub(super) fn scanned_pairing(window: &PneuWindow, payload: String) {
     if window.global::<Ui>().get_page() != Page::Scan {
         return;
@@ -1077,9 +1077,16 @@ pub fn run(paths: Paths) -> Result<()> {
             .with_winit_event_loop_builder(builder)
             .select()?;
     }
+    #[cfg(windows)]
+    slint::BackendSelector::new()
+        .backend_name("winit".into())
+        .renderer_name("software".into())
+        .select()?;
     let window = PneuWindow::new()?;
+    #[cfg(windows)]
+    super::windows_window::install(&window);
     let visible = Arc::new(AtomicBool::new(
-        cfg!(target_os = "linux") || startup_request != 0,
+        cfg!(any(target_os = "linux", windows)) || startup_request != 0,
     ));
     let focused = Arc::new(AtomicBool::new(false));
     let view = Arc::new(Mutex::new(View::default()));
@@ -1149,8 +1156,17 @@ pub fn run(paths: Paths) -> Result<()> {
         }));
     });
     let worker = worker.context("start window IPC thread")?;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     window.show()?;
+    #[cfg(windows)]
+    {
+        let weak = window.as_weak();
+        slint::Timer::single_shot(Duration::ZERO, move || {
+            if let Some(window) = weak.upgrade() {
+                super::windows_window::activate(&window);
+            }
+        });
+    }
     #[cfg(target_os = "macos")]
     if startup_request != 0 {
         window.show()?;
@@ -1512,6 +1528,40 @@ type Chosen = (
     View,
     Option<Vec<PathBuf>>,
 );
+
+fn join_journal_path(paths: &Paths) -> PathBuf {
+    #[cfg(windows)]
+    {
+        paths.data.join("pneu-window-join.json")
+    }
+    #[cfg(not(windows))]
+    {
+        paths.socket.with_file_name("pneu-window-join.json")
+    }
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn windows_join_journal_is_a_private_file_in_the_overridden_data_namespace() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let paths = Paths {
+        data: dir.path().join("own-data"),
+        cache: dir.path().join("cache"),
+        config: dir.path().join("config/config.toml"),
+        socket: PathBuf::from(r"\\.\pipe\pneu-test-runtime"),
+    };
+    paths.prepare()?;
+    let path = join_journal_path(&paths);
+    assert_eq!(path, paths.data.join("pneu-window-join.json"));
+    crate::config::atomic_private(&path, b"journal")?;
+    assert!(path.is_file());
+    let folder = crate::storage::Folder::open(&paths.data, false)?;
+    let file = crate::platform::fs::open_journal_at(&folder.file, path.file_name().unwrap())?;
+    assert!(crate::platform::fs::is_owned_private(&file)?);
+    assert!(crate::platform::fs::is_private_directory(&folder.file)?);
+    assert_eq!(std::fs::read(path)?, b"journal");
+    Ok(())
+}
 
 struct Worker {
     paths: Paths,
@@ -2028,6 +2078,13 @@ impl Worker {
                         {
                             open_recent(file).await
                         }
+                        #[cfg(windows)]
+                        {
+                            use crate::actions::PcActions;
+                            crate::actions::DesktopActions::new(PathBuf::new())
+                                .open(file.path())
+                                .await
+                        }
                     }));
                 }
             }
@@ -2046,7 +2103,7 @@ impl Worker {
                         self.fail("Couldn't change Open at Login", error);
                     }
                 }
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", windows))]
                 let _ = enabled;
             }
             Action::SystemSettings(pane) => {
@@ -2056,7 +2113,7 @@ impl Worker {
                         let _ = super::macos::native::system_settings(&pane);
                     });
                 }
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", windows))]
                 let _ = pane;
             }
             Action::SetPeer(key, enabled) => {
@@ -2665,7 +2722,7 @@ impl Worker {
         self.message(title, text, tile, secondary, primary, action);
     }
     fn journal_path(&self) -> PathBuf {
-        self.paths.socket.with_file_name("pneu-window-join.json")
+        join_journal_path(&self.paths)
     }
     fn save_join(&self, join: &Join) -> Result<()> {
         crate::config::atomic_private(&self.journal_path(), &serde_json::to_vec(join)?)
@@ -2929,7 +2986,7 @@ impl Worker {
         let add_device = self.status["add_device"].as_bool().unwrap_or(false);
         if !self.restored_join && (current != self.request || (initial_status && add_device)) {
             self.request = current;
-            visible.store(true, Ordering::SeqCst);
+            let was_visible = visible.swap(true, Ordering::SeqCst);
             let choose_folder = current & 1 != 0;
             let preserve_send = !self.status["pending_send"].is_null()
                 && (self.picker_active || self.chooser.is_some());
@@ -2942,8 +2999,14 @@ impl Worker {
                 }
                 #[cfg(target_os = "macos")]
                 super::macos::native::activate(w);
+                #[cfg(windows)]
+                super::windows_window::activate(w);
                 if let Some(page) = requested_page {
                     w.invoke_go(page);
+                    return;
+                }
+                // A Windows tray click presents the existing page and its state.
+                if cfg!(windows) && was_visible && !choose_folder && !add_device {
                     return;
                 }
                 // Reopening starts at the top: Add Device without devices, else
@@ -3425,6 +3488,20 @@ fn recent_file(path: &Path) -> Result<crate::actions::ReceivedFile> {
 #[cfg(target_os = "macos")]
 async fn open_recent(file: crate::actions::ReceivedFile) -> Result<()> {
     super::macos::native::open_received_local(file).await
+}
+#[cfg(windows)]
+pub async fn choose_folder(current: &Path) -> Result<Option<PathBuf>> {
+    Ok(
+        super::windows_picker::choose("Choose Folder", Some(current))
+            .await?
+            .into_iter()
+            .next(),
+    )
+}
+#[cfg(windows)]
+pub async fn choose_files(title: &str) -> Result<Option<Vec<PathBuf>>> {
+    let paths = super::windows_picker::choose(title, None).await?;
+    Ok((!paths.is_empty()).then_some(paths))
 }
 #[cfg(target_os = "macos")]
 pub async fn choose_folder(current: &Path) -> Result<Option<PathBuf>> {

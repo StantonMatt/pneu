@@ -857,12 +857,17 @@ mod tests {
         server.await??;
         core.shutdown_actions().await?;
         assert!(result?["devices"].is_array());
-        assert!(
-            desktop
-                .unwrap_err()
-                .to_string()
-                .contains("not yet supported on Windows")
-        );
+        if crate::ui::runtime::require_ui(&core).is_ok() {
+            desktop?;
+            assert_ne!(core.window_request_with_activation().0, 0);
+        } else {
+            assert!(
+                desktop
+                    .unwrap_err()
+                    .to_string()
+                    .contains("interactive Windows session")
+            );
+        }
 
         // Drive the production request reader with multiple response pages and
         // verify missing final pages fail instead of returning partial state.

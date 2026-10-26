@@ -29,7 +29,7 @@ pub(crate) mod macos;
 pub(crate) mod notice_lifecycle;
 pub mod notifications;
 #[cfg_attr(target_os = "macos", path = "macos/palette.rs")]
-#[cfg(unix)]
+#[cfg_attr(windows, path = "windows_palette.rs")]
 pub mod palette;
 #[cfg(any(windows, all(unix, any(target_os = "macos", test))))]
 mod pasteboard_reader;
@@ -45,21 +45,24 @@ pub mod runtime;
 #[cfg(windows)]
 #[path = "windows_runtime.rs"]
 pub mod runtime;
-#[cfg(unix)]
 mod send_request;
 #[cfg(target_os = "linux")]
 pub mod tray;
-#[cfg(unix)]
+#[cfg(windows)]
+#[path = "windows_tray.rs"]
+pub mod tray;
 mod tray_model;
 #[cfg(all(unix, any(target_os = "macos", test)))]
 mod viewer_cache;
-#[cfg(unix)]
 pub mod window;
-#[cfg(windows)]
-#[path = "send_request.rs"]
-pub(crate) mod window;
+#[cfg(any(target_os = "linux", windows))]
+mod window_process;
 #[cfg(any(windows, test))]
 mod windows_clipboard_content;
+#[cfg(windows)]
+mod windows_picker;
+#[cfg(windows)]
+mod windows_window;
 
 use crate::Config;
 use serde::{Deserialize, Serialize};
@@ -278,7 +281,6 @@ impl Snapshot {
         }
     }
 }
-#[cfg(unix)]
 pub fn last_seen(timestamp: u64) -> String {
     use chrono::{DateTime, Local};
     let Some(time) = DateTime::from_timestamp_millis(timestamp as i64) else {
@@ -297,6 +299,20 @@ pub fn last_seen(timestamp: u64) -> String {
         "Yesterday".into()
     } else {
         time.format("%-d %b").to_string()
+    }
+}
+#[cfg(windows)]
+fn twelve_hour_clock() -> bool {
+    use windows_sys::Win32::Globalization::{GetLocaleInfoEx, LOCALE_ITIME};
+    let mut value = [0u16; 2];
+    unsafe {
+        GetLocaleInfoEx(
+            std::ptr::null(),
+            LOCALE_ITIME,
+            value.as_mut_ptr(),
+            value.len() as i32,
+        ) > 0
+            && value[0] == b'0' as u16
     }
 }
 // Plasma writes regional overrides here; fall back to the process locale.
