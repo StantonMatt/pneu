@@ -2303,6 +2303,12 @@ mod tests {
             ..
         } = cb?;
         until(|| a.connected_devices().len() == 1 && b.connected_devices().len() == 1).await?;
+        let a_is_lower = a.identity.device_id.as_str() < b.identity.device_id.as_str();
+        // Keep the lower ID's inbound socket alive until the higher ID has
+        // finished rejecting its outbound duplicate. Topology convergence alone
+        // does not prove that rejection finished: replacing the inbound socket
+        // or shutting down first can make its ERROR write fail with BrokenPipe.
+        let registration_gate = if a_is_lower { &a } else { &b }.pairing_gate.lock().await;
         let ca = a.clone();
         let fa = b.identity.fingerprint.clone();
         let old = captured_a.clone();
@@ -2318,7 +2324,15 @@ mod tests {
             cb.register(tb, hb, fb, rb, pb, captured_b, true, true)
                 .await
         });
-        let lower = if a.identity.device_id.as_str() < b.identity.device_id.as_str() {
+        let winner = if a_is_lower {
+            tokio::time::timeout(Duration::from_secs(5), wb).await???;
+            wa
+        } else {
+            tokio::time::timeout(Duration::from_secs(5), wa).await???;
+            wb
+        };
+        drop(registration_gate);
+        let lower = if a_is_lower {
             a.identity.device_id.clone()
         } else {
             b.identity.device_id.clone()
@@ -2335,6 +2349,19 @@ mod tests {
         assert_eq!(a.sessions.lock().unwrap().sessions.len(), 1);
         assert_eq!(b.sessions.lock().unwrap().sessions.len(), 1);
         assert_eq!(a.paired_devices().len(), 1);
+        // A published session can still be writing its initial settings.
+        // Finish that exchange before re-pairing closes the winning transport.
+        until(|| {
+            [(&a, &b.identity.device_id), (&b, &a.identity.device_id)]
+                .iter()
+                .all(|(core, peer)| {
+                    let sessions = core.sessions.lock().unwrap();
+                    sessions.sessions.get(peer).is_some_and(|session| {
+                        core.settings_ready.lock().unwrap().get(peer) == Some(&session.id)
+                    })
+                })
+        })
+        .await?;
         let replacement = bind(&a, &b).await?;
         assert_ne!(
             old.pairing_generation(&b.identity.device_id),
@@ -2345,12 +2372,11 @@ mod tests {
                 .await
                 .is_err()
         );
+        tokio::time::timeout(Duration::from_secs(5), winner).await???;
         a.request_shutdown();
         b.request_shutdown();
         sa.await??;
         sb.await??;
-        wa.await??;
-        wb.await??;
         Ok(())
     }
     #[tokio::test]
