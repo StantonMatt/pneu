@@ -10,6 +10,9 @@ use std::{
 use crate::platform::fs;
 pub(crate) use fs::{Folder, open_regular_file, remove_directory, remove_file};
 
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) mod windows_names;
+
 pub(crate) const STAGING_DIR: &str = ".pneu-staging";
 pub(crate) const CACHE_PREFIX: &str = ".pneu-cache-";
 const NAME_MAX: usize = 255;
@@ -38,11 +41,22 @@ pub(crate) fn safe_basename(name: &str, max: usize) -> String {
     )
 }
 
+pub(crate) fn local_name(name: &str, max: usize) -> String {
+    #[cfg(windows)]
+    {
+        windows_names::map(name, max)
+    }
+    #[cfg(unix)]
+    {
+        safe_basename(name, max)
+    }
+}
+
 pub(crate) fn cache_basename(name: &str) -> String {
     format!(
         "{CACHE_PREFIX}{}-{}",
         crate::random_hex(16),
-        safe_basename(name, 200)
+        local_name(name, 200)
     )
 }
 
@@ -185,11 +199,8 @@ impl Stage {
         destination: String,
         size: u64,
     ) -> Result<Self> {
-        // Reject an ambiguous derived/display name before staging or exposing
-        // it to a path-based desktop API. Local filename mapping is a later
-        // milestone; this slice deliberately fails closed on invalid names.
         #[cfg(windows)]
-        let destination = safe_basename(&destination, NAME_MAX);
+        let destination = local_name(&destination, NAME_MAX);
         #[cfg(windows)]
         fs::validate_name(std::ffi::OsStr::new(&destination))?;
         ensure!(
@@ -274,6 +285,7 @@ impl Stage {
                     safe_basename(basename, NAME_MAX - namespace.len() - prefix.len())
                 )
             };
+            let candidate = local_name(&candidate, NAME_MAX);
             match fs::rename(
                 &self.0.directory.file,
                 &self.0.name,
@@ -490,6 +502,125 @@ mod tests {
             assert!(!dir.path().join(second).exists());
             assert_eq!(std::fs::read(dir.path().join(name))?, b"first");
             assert_eq!(std::fs::read(dir.path().join(third))?, b"third");
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    #[test]
+    fn receive_names_are_mapped_before_staging_and_placement() -> Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::{Foundation::*, Storage::FileSystem::*};
+
+        fn only_default_stream(path: &Path) -> Result<()> {
+            let path = std::fs::canonicalize(path)?;
+            let path: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            // SAFETY: terminated path and initialized stream buffer live through
+            // enumeration; FindClose releases the successful search handle.
+            unsafe {
+                let mut stream: WIN32_FIND_STREAM_DATA = std::mem::zeroed();
+                let handle = FindFirstStreamW(
+                    path.as_ptr(),
+                    FindStreamInfoStandard,
+                    (&mut stream as *mut WIN32_FIND_STREAM_DATA).cast(),
+                    0,
+                );
+                ensure!(
+                    handle != INVALID_HANDLE_VALUE,
+                    std::io::Error::last_os_error()
+                );
+                let end = stream.cStreamName.iter().position(|c| *c == 0).unwrap();
+                let name = String::from_utf16(&stream.cStreamName[..end])?;
+                let next =
+                    FindNextStreamW(handle, (&mut stream as *mut WIN32_FIND_STREAM_DATA).cast());
+                let error = std::io::Error::last_os_error();
+                FindClose(handle);
+                assert_eq!(name, "::$DATA");
+                assert_eq!(next, 0, "unexpected alternate data stream");
+                assert_eq!(error.raw_os_error(), Some(ERROR_HANDLE_EOF as i32));
+            }
+            Ok(())
+        }
+
+        let dir = crate::test_support::scratch()?;
+        let folder = Folder::open(dir.path(), false)?;
+        let long = format!("CON.{} x", "a".repeat(249));
+        assert_eq!(long.len(), 255);
+        let expected_long = format!("_CON.{}", "a".repeat(249));
+        let cases = [
+            ("CON.txt", "_CON.txt"),
+            ("a:b.jpg", "a_b.jpg"),
+            ("notes.", "notes"),
+            ("what?.png", "what_.png"),
+            ("CON .txt", "_CON .txt"),
+            (long.as_str(), expected_long.as_str()),
+        ];
+        for (wire, expected) in cases {
+            let stage = named_stage(&folder, wire, b"received")?;
+            assert_eq!(stage.0.destination, expected);
+            assert_eq!(stage.destination_path()?.file_name().unwrap(), expected);
+            let staging = stage.0.directory.clone();
+            for (stage, expected) in [
+                (stage, expected.to_owned()),
+                (
+                    named_stage(&folder, wire, b"received")?,
+                    numbered_name(expected, 2),
+                ),
+            ] {
+                stage.place()?;
+                let path = stage.destination_path()?;
+                assert_eq!(path.file_name().unwrap(), expected.as_str());
+                assert_eq!(std::fs::read(&path)?, b"received");
+                only_default_stream(&path)?;
+            }
+            assert_eq!(fs::entries(&staging.file)?.count(), 0);
+        }
+        assert!(!dir.path().join("a").exists(), "ADS base file was created");
+        assert!(!dir.path().join("a:b.jpg").exists());
+
+        let first = named_stage(&folder, "Photo.jpg", b"first")?;
+        let second = named_stage(&folder, "photo.jpg", b"second")?;
+        first.place()?;
+        second.place()?;
+        assert_eq!(first.destination_path()?.file_name().unwrap(), "Photo.jpg");
+        assert_eq!(
+            second.destination_path()?.file_name().unwrap(),
+            "photo (2).jpg"
+        );
+        assert_eq!(std::fs::read(first.destination_path()?)?, b"first");
+        assert_eq!(std::fs::read(second.destination_path()?)?, b"second");
+        only_default_stream(&second.destination_path()?)?;
+        assert_eq!(fs::entries(&second.0.directory.file)?.count(), 0);
+
+        let cache_long = format!("{} {}", "b".repeat(199), "c".repeat(55));
+        assert_eq!(cache_long.len(), 255);
+        for wire in ["CON.txt", "a:b.jpg", "notes.", "what?.png", &cache_long] {
+            let name = cache_basename(wire);
+            assert!(windows_names::is_safe(&name), "{name}");
+            assert!(name.len() <= CACHE_PREFIX.len() + 33 + 200);
+            let stage = named_stage(&folder, &name, b"cached")?;
+            stage.place()?;
+            assert_eq!(
+                stage.destination_path()?.file_name().unwrap(),
+                name.as_str()
+            );
+            assert_eq!(std::fs::read(stage.destination_path()?)?, b"cached");
+            only_default_stream(&stage.destination_path()?)?;
+            assert_eq!(fs::entries(&stage.0.directory.file)?.count(), 0);
+        }
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn placement_preserves_win32_special_names_on_unix() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let folder = Folder::open(dir.path(), false)?;
+        for name in ["CON.txt", "a:b.jpg", "notes.", "what?.png", "CON .txt"] {
+            assert_eq!(local_name(name, NAME_MAX), name);
+            assert!(cache_basename(name).ends_with(name));
+            let stage = named_stage(&folder, name, b"unchanged")?;
+            stage.place()?;
+            assert_eq!(stage.destination_path()?, dir.path().join(name));
+            assert_eq!(std::fs::read(stage.destination_path()?)?, b"unchanged");
         }
         Ok(())
     }
