@@ -9,6 +9,12 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub(crate) use macos::candidates;
 
+#[cfg(any(windows, test))]
+#[path = "platform/windows_discovery.rs"]
+mod windows;
+#[cfg(windows)]
+pub(crate) use windows::candidates;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InterfaceAddress {
     pub name: String,
@@ -557,9 +563,4 @@ mod tests {
         assert!(tailscale("100.127.255.255".parse().unwrap()));
         assert!(!tailscale("100.128.0.0".parse().unwrap()));
     }
-}
-
-#[cfg(windows)]
-pub(crate) fn candidates() -> Result<Vec<InterfaceAddress>> {
-    anyhow::bail!("Windows adapter discovery is not yet supported")
 }

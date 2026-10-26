@@ -3332,6 +3332,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "slint",
+ "socket2",
  "subtle",
  "tempfile",
  "tokio",
