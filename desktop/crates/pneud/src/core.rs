@@ -2002,7 +2002,7 @@ impl Core {
             .tx
             .send(clipboard_driver::Message::ReadHandle(token, cancel));
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     pub(crate) fn retire_clipboard_observation(&self, token: u64) {
         self.clipboard.event(ClipboardEvent::AbandonRead(token));
     }

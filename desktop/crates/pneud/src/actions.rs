@@ -147,12 +147,21 @@ pub struct PreparedClipboard {
     input: ClipboardInput,
     #[cfg(target_os = "linux")]
     helper: Option<linux::ClipboardCandidate>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     native: Option<crate::ui::clipboard::Offer>,
     #[cfg(test)]
     pub(crate) test_exited: bool,
 }
 impl PreparedClipboard {
+    #[cfg(windows)]
+    pub(crate) fn set_install_authority(
+        &mut self,
+        authority: impl Fn() -> bool + Send + Sync + 'static,
+    ) {
+        if let Some(native) = self.native.as_mut() {
+            native.set_authority(authority);
+        }
+    }
     pub fn immediate(input: ClipboardInput) -> Result<Self> {
         use sha2::{Digest, Sha256};
         use std::io::Write;
@@ -199,7 +208,7 @@ impl PreparedClipboard {
             input,
             #[cfg(target_os = "linux")]
             helper: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             native: None,
             #[cfg(test)]
             test_exited: false,
@@ -228,7 +237,11 @@ impl PreparedClipboard {
             }
             self.helper.take();
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(windows)]
+        if let Some(native) = &mut self.native {
+            native.stop().await;
+        }
+        #[cfg(any(target_os = "macos", windows))]
         self.native.take();
     }
 }

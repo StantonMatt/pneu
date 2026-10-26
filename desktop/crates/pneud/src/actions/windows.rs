@@ -1,19 +1,62 @@
-//! Headless actions until the Windows desktop integrations are available.
+//! Native clipboard effects; other desktop integrations arrive later.
 use super::*;
+use anyhow::Context;
 
-pub struct DesktopActions;
+pub struct DesktopActions {
+    // Preparation and reaping of retired offers only. Installed writers must
+    // never hold this drain open while a replacement is being retired.
+    jobs: Arc<crate::work::Work>,
+    writers: Arc<crate::work::Work>,
+}
 impl DesktopActions {
     pub fn new(_cache: PathBuf) -> Self {
-        Self
+        Self {
+            jobs: Arc::new(crate::work::Work::default()),
+            writers: Arc::new(crate::work::Work::default()),
+        }
     }
 }
 #[async_trait]
 impl PcActions for DesktopActions {
     async fn clipboard_text(&self, _text: &str) -> Result<()> {
-        anyhow::bail!("clipboard is not yet supported on Windows")
+        anyhow::bail!("Windows clipboard writes require the clipboard actor")
     }
     async fn clipboard_image(&self, _path: &Path, _mime: &str) -> Result<()> {
-        anyhow::bail!("clipboard is not yet supported on Windows")
+        anyhow::bail!("Windows clipboard writes require the clipboard actor")
+    }
+    async fn prepare_clipboard(
+        &self,
+        input: ClipboardInput,
+        ticket: u128,
+    ) -> Result<PreparedClipboard> {
+        crate::work::blocking(self.jobs.clone(), move || {
+            let native = crate::ui::clipboard::Offer::prepare(&input, ticket)?;
+            Ok(PreparedClipboard {
+                hashes: native.hashes(),
+                marker_confirmation: true,
+                input,
+                native: Some(native),
+                #[cfg(test)]
+                test_exited: false,
+            })
+        })
+        .await?
+    }
+    async fn install_clipboard(&self, prepared: &mut PreparedClipboard) -> Result<()> {
+        prepared
+            .native
+            .as_mut()
+            .context("missing native clipboard offer")?
+            .install_tracked(self.writers.clone(), self.jobs.clone())
+            .await
+    }
+    async fn drain_clipboard(&self) {
+        self.jobs.drain().await;
+    }
+    async fn shutdown(&self) -> Result<()> {
+        self.jobs.drain().await;
+        self.writers.drain().await;
+        Ok(())
     }
     async fn notify(&self, _path: &Path, _mime: &str) -> Result<()> {
         anyhow::bail!("notifications are not yet supported on Windows")
@@ -54,6 +97,158 @@ impl PcActions for DesktopActions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    // The real worker acknowledges installation before its owner window exits.
+    // Keep that lifetime in this seam, without requiring an interactive desktop.
+    async fn install_serving(
+        actions: &DesktopActions,
+        offer: &mut PreparedClipboard,
+    ) -> Result<()> {
+        offer
+            .native
+            .as_mut()
+            .unwrap()
+            .install_worker(
+                actions.writers.clone(),
+                actions.jobs.clone(),
+                |cancel, tx| {
+                    let _ = tx.send(Ok(()));
+                    while !cancel.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                },
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn clipboard_retirement_does_not_drain_installed_predecessor() -> Result<()> {
+        for mode in [
+            "prepared",
+            "cancel",
+            "timeout",
+            "failure",
+            "drop",
+            "cancel-stop",
+        ] {
+            let actions = DesktopActions::new(PathBuf::new());
+            let mut first = actions
+                .prepare_clipboard(ClipboardInput::Text("first".into()), 1)
+                .await?;
+            install_serving(&actions, &mut first).await?;
+            let mut second = actions
+                .prepare_clipboard(ClipboardInput::Text("second".into()), 2)
+                .await?;
+            let exited = Arc::new(AtomicBool::new(mode == "prepared"));
+            let (release_cleanup, cleanup_gate) = std::sync::mpsc::channel();
+            if mode != "prepared" {
+                let completed = exited.clone();
+                let (started, ready) = tokio::sync::oneshot::channel();
+                let install = second.native.as_mut().unwrap().install_worker(
+                    actions.writers.clone(),
+                    actions.jobs.clone(),
+                    move |cancel, reply| {
+                        let _ = started.send(());
+                        if mode == "failure" {
+                            let _ = reply.send(Err(anyhow::anyhow!("failure after write")));
+                        } else {
+                            // No acknowledgement: model a contended write or
+                            // canceled installation before marker confirmation.
+                            let _reply = reply;
+                            while !cancel.load(Ordering::SeqCst) {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                        }
+                        if mode == "cancel-stop" {
+                            cleanup_gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                        }
+                        // Cleanup must finish before the driver emits Stopped.
+                        std::thread::sleep(Duration::from_millis(30));
+                        completed.store(true, Ordering::SeqCst);
+                    },
+                );
+                if mode == "failure" {
+                    assert!(install.await.is_err());
+                } else if mode == "timeout" {
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(50), install)
+                            .await
+                            .is_err()
+                    );
+                } else {
+                    tokio::select! {
+                        result = install => panic!("installation unexpectedly finished: {result:?}"),
+                        result = ready => result?,
+                    }
+                }
+            }
+            if mode == "cancel-stop" {
+                // A canceled stop must leave its handle available to Drop.
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(1), second.stop())
+                        .await
+                        .is_err()
+                );
+                release_cleanup.send(())?;
+                drop(second);
+            } else if mode == "drop" {
+                // Same cleanup path as unwinding a driver helper.
+                drop(second);
+            } else {
+                tokio::time::timeout(Duration::from_secs(2), second.stop()).await?;
+                assert!(
+                    exited.load(Ordering::SeqCst),
+                    "stop returned before cleanup: {mode}"
+                );
+                drop(second);
+            }
+            // This is the exact gate immediately before Stopped(ticket).
+            tokio::time::timeout(Duration::from_secs(2), actions.drain_clipboard()).await?;
+            assert!(
+                exited.load(Ordering::SeqCst),
+                "drain returned before cleanup: {mode}"
+            );
+            assert_eq!(actions.writers.active(), 1, "predecessor retired: {mode}");
+            let mut third = actions
+                .prepare_clipboard(ClipboardInput::Text("third".into()), 3)
+                .await?;
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                install_serving(&actions, &mut third),
+            )
+            .await??;
+            assert_eq!(actions.writers.active(), 2);
+            third.stop().await;
+            first.stop().await;
+            tokio::time::timeout(Duration::from_secs(2), actions.shutdown()).await??;
+            assert_eq!(actions.writers.active(), 0);
+            assert_eq!(actions.jobs.active(), 0);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clipboard_shutdown_waits_for_serving_writer() -> Result<()> {
+        let actions = DesktopActions::new(PathBuf::new());
+        let mut offer = actions
+            .prepare_clipboard(ClipboardInput::Text("serving".into()), 1)
+            .await?;
+        install_serving(&actions, &mut offer).await?;
+        tokio::time::timeout(Duration::from_secs(2), actions.drain_clipboard()).await?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), actions.shutdown())
+                .await
+                .is_err()
+        );
+        drop(offer);
+        tokio::time::timeout(Duration::from_secs(2), actions.shutdown()).await??;
+        assert_eq!(actions.writers.active(), 0);
+        assert_eq!(actions.jobs.active(), 0);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn all_notification_entry_points_report_unsupported() -> Result<()> {
         let dir = crate::test_support::scratch()?;
@@ -166,11 +361,23 @@ mod tests {
     #[tokio::test]
     async fn headless_actions_do_not_report_unsupported_effects_as_success() -> Result<()> {
         let actions = DesktopActions::new(PathBuf::new());
-        for result in [
-            actions.clipboard_text("test").await,
+        assert!(
+            actions
+                .clipboard_text("test")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("require the clipboard actor")
+        );
+        assert!(
             actions
                 .clipboard_image(Path::new("unused"), "image/png")
-                .await,
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("require the clipboard actor")
+        );
+        for result in [
             actions.open(Path::new("unused")).await,
             actions
                 .notify(Path::new("unused"), "application/octet-stream")

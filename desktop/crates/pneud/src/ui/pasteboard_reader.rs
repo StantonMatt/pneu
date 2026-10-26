@@ -228,6 +228,8 @@ impl<C> Drop for Change<C> {
 /// than abandoning an unkillable Cocoa thread. No payload work runs on watcher.
 pub(super) struct Reader<T> {
     child: Child,
+    #[cfg(windows)]
+    job: ReaderJob,
     result: mpsc::Receiver<Result<T>>,
     canceled: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -240,16 +242,41 @@ impl<T: Send + 'static> Reader<T> {
         cap: usize,
         decode: impl FnOnce(Vec<u8>) -> Result<T> + Send + 'static,
     ) -> Result<Self> {
+        #[cfg(unix)]
+        command.stdin(Stdio::null());
+        #[cfg(windows)]
+        command.stdin(Stdio::piped());
         let mut child = command
-            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()?;
+        #[cfg(test)]
+        eprintln!("clipboard reader PID={}", child.id());
+        #[cfg(windows)]
+        let job = match ReaderJob::assign(&child).and_then(|job| {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .context("reader stdin")?
+                .write_all(b"g")?;
+            Ok(job)
+        }) {
+            Ok(job) => job,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
         let mut stdout = child.stdout.take().context("reader stdout")?;
+        #[cfg(unix)]
         use std::os::fd::AsRawFd;
         // The decoding thread polls a nonblocking pipe so its cancellation does
         // not depend on EOF or a provider/descendant releasing the write end.
+        #[cfg(unix)]
         let fd = stdout.as_raw_fd();
+        #[cfg(unix)]
         if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } == -1 {
             let _ = child.kill();
             let _ = child.wait();
@@ -266,7 +293,40 @@ impl<T: Send + 'static> Reader<T> {
                     let mut chunk = [0; 16384];
                     loop {
                         ensure!(!stop.load(Ordering::SeqCst), "pasteboard read canceled");
-                        match stdout.read(&mut chunk) {
+                        // Peek before a Windows anonymous-pipe read: ReadFile
+                        // itself is synchronous and must never hold up cleanup.
+                        #[cfg(windows)]
+                        let available = {
+                            use std::os::windows::io::AsRawHandle;
+                            let mut available = 0;
+                            let ok = unsafe {
+                                windows_sys::Win32::System::Pipes::PeekNamedPipe(
+                                    stdout.as_raw_handle(),
+                                    std::ptr::null_mut(),
+                                    0,
+                                    std::ptr::null_mut(),
+                                    &mut available,
+                                    std::ptr::null_mut(),
+                                )
+                            };
+                            if ok == 0 {
+                                let error = std::io::Error::last_os_error();
+                                if error.raw_os_error() == Some(109) {
+                                    break;
+                                }
+                                return Err(error.into());
+                            }
+                            if available == 0 {
+                                std::thread::sleep(Duration::from_millis(5));
+                                continue;
+                            }
+                            available as usize
+                        };
+                        #[cfg(windows)]
+                        let chunk = &mut chunk[..available.min(16384)];
+                        #[cfg(unix)]
+                        let chunk = &mut chunk[..];
+                        match stdout.read(chunk) {
                             Ok(0) => break,
                             Ok(n) => {
                                 ensure!(bytes.len() + n <= cap, "pasteboard reader output limit");
@@ -293,6 +353,8 @@ impl<T: Send + 'static> Reader<T> {
         };
         Ok(Self {
             child,
+            #[cfg(windows)]
+            job,
             result,
             canceled,
             thread: Some(thread),
@@ -315,6 +377,8 @@ impl<T: Send + 'static> Reader<T> {
 impl<T> Drop for Reader<T> {
     fn drop(&mut self) {
         self.canceled.store(true, Ordering::SeqCst);
+        #[cfg(windows)]
+        self.job.terminate();
         let _ = self.child.kill();
         let _ = self.child.wait(); // reaps only our SIGKILLed process, never a read
         if let Some(thread) = self.thread.take() {
@@ -323,7 +387,58 @@ impl<T> Drop for Reader<T> {
     }
 }
 
-#[cfg(test)]
+/// The helper waits on stdin until assignment. Provider allocation and decoding
+/// are bounded by committed process memory, including allocations inside Win32.
+#[cfg(windows)]
+struct ReaderJob(windows_sys::Win32::Foundation::HANDLE);
+#[cfg(windows)]
+impl ReaderJob {
+    const MEMORY_LIMIT: usize = 384 * 1024 * 1024;
+    fn assign(child: &Child) -> Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::*;
+        let job = Self(unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) });
+        ensure!(!job.0.is_null(), "create clipboard reader job");
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        limits.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        limits.ProcessMemoryLimit = Self::MEMORY_LIMIT;
+        ensure!(
+            unsafe {
+                SetInformationJobObject(
+                    job.0,
+                    JobObjectExtendedLimitInformation,
+                    (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    std::mem::size_of_val(&limits) as u32,
+                )
+            } != 0,
+            "limit clipboard reader job"
+        );
+        ensure!(
+            unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle()) } != 0,
+            "assign clipboard reader job: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(job)
+    }
+    fn terminate(&self) {
+        unsafe {
+            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0, 1);
+        }
+    }
+}
+#[cfg(windows)]
+impl Drop for ReaderJob {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     #[derive(Debug, PartialEq, Eq)]
