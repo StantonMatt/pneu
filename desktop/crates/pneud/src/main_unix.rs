@@ -41,7 +41,6 @@ fn main() -> Result<()> {
             args.get(2).context("install ticket")?.parse()?,
         );
     }
-    #[cfg(unix)]
     if args.first().is_some_and(|s| s == "ui-window") {
         return pneud::ui::window::run(Paths::from_env()?);
     }

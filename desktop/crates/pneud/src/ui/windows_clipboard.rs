@@ -41,7 +41,7 @@ fn format(name: &str) -> Result<u32> {
     );
     Ok(id)
 }
-fn interactive() -> Result<()> {
+pub(super) fn interactive() -> Result<()> {
     let mut session = 0;
     ensure!(
         unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) } != 0 && session != 0,

@@ -11,28 +11,7 @@ use std::{
 };
 use tokio::sync::mpsc;
 
-pub const ICONS: [(&str, &str); 5] = [
-    (
-        "pneu-tray-connected",
-        include_str!("../../../../assets/pneu-tray-connected.svg"),
-    ),
-    (
-        "pneu-tray-receiving",
-        include_str!("../../../../assets/pneu-tray-receiving.svg"),
-    ),
-    (
-        "pneu-tray-disconnected",
-        include_str!("../../../../assets/pneu-tray-disconnected.svg"),
-    ),
-    (
-        "pneu-tray-paused",
-        include_str!("../../../../assets/pneu-tray-paused.svg"),
-    ),
-    (
-        "pneu-tray-error",
-        include_str!("../../../../assets/pneu-tray-error.svg"),
-    ),
-];
+pub use super::tray_model::{ICONS, render_svg};
 pub struct Tray {
     pub snapshot: Snapshot,
     pub config: Config,
@@ -413,55 +392,13 @@ fn pixmaps_for(palette: super::palette::Colors) -> Result<Vec<(String, ksni::Ico
         })
         .collect()
 }
-// Scan only the original SVG: a palette color may itself equal another source
-// token, and must never be substituted a second time. Fixed receiving indigo
-// and all other SVG content pass through unchanged.
 fn recolor_svg(svg: &str, palette: &super::palette::Colors) -> String {
-    let replacements = [
-        ("#232629", palette.foreground.as_str()),
-        ("#da4453", palette.negative.as_str()),
-        ("#f67400", palette.neutral.as_str()),
-    ];
-    let mut output = String::with_capacity(svg.len());
-    let mut remaining = svg;
-    while let Some(index) = remaining.find('#') {
-        output.push_str(&remaining[..index]);
-        remaining = &remaining[index..];
-        if let Some((color, suffix)) = replacements
-            .iter()
-            .find_map(|(token, color)| remaining.strip_prefix(token).map(|suffix| (*color, suffix)))
-        {
-            output.push_str(color);
-            remaining = suffix;
-        } else {
-            output.push('#');
-            remaining = &remaining[1..];
-        }
-    }
-    output.push_str(remaining);
-    output
-}
-pub fn render_svg(svg: &[u8], size: u32) -> Result<Vec<u8>> {
-    let tree = resvg::usvg::Tree::from_data(svg, &resvg::usvg::Options::default())?;
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(size, size)
-        .ok_or_else(|| anyhow::anyhow!("invalid icon size"))?;
-    resvg::render(
-        &tree,
-        resvg::tiny_skia::Transform::from_scale(
-            size as f32 / tree.size().width(),
-            size as f32 / tree.size().height(),
-        ),
-        &mut pixmap.as_mut(),
-    );
-    // tiny-skia pixels are premultiplied. SNI and Slint take straight-alpha bytes.
-    for pixel in pixmap.data_mut().chunks_exact_mut(4) {
-        if pixel[3] > 0 {
-            for i in 0..3 {
-                pixel[i] = (u32::from(pixel[i]) * 255 / u32::from(pixel[3])).min(255) as u8;
-            }
-        }
-    }
-    Ok(pixmap.take())
+    super::tray_model::recolor_svg(
+        svg,
+        &palette.foreground,
+        &palette.negative,
+        &palette.neutral,
+    )
 }
 
 #[cfg(test)]

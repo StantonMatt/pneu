@@ -72,3 +72,421 @@ pub(crate) fn icon(snapshot: &Snapshot, peers: &[Peer]) -> &'static str {
         "pneu-tray-disconnected"
     }
 }
+
+#[cfg(any(target_os = "linux", windows, test))]
+use anyhow::Result;
+#[cfg(any(target_os = "linux", windows, test))]
+pub const ICONS: [(&str, &str); 5] = [
+    (
+        "pneu-tray-connected",
+        include_str!("../../../../assets/pneu-tray-connected.svg"),
+    ),
+    (
+        "pneu-tray-receiving",
+        include_str!("../../../../assets/pneu-tray-receiving.svg"),
+    ),
+    (
+        "pneu-tray-disconnected",
+        include_str!("../../../../assets/pneu-tray-disconnected.svg"),
+    ),
+    (
+        "pneu-tray-paused",
+        include_str!("../../../../assets/pneu-tray-paused.svg"),
+    ),
+    (
+        "pneu-tray-error",
+        include_str!("../../../../assets/pneu-tray-error.svg"),
+    ),
+];
+// Scan only the original SVG: a palette color may itself equal another source
+// token, and must never be substituted a second time. Fixed receiving indigo
+// and all other SVG content pass through unchanged.
+#[cfg(any(target_os = "linux", windows, test))]
+pub(super) fn recolor_svg(svg: &str, foreground: &str, negative: &str, neutral: &str) -> String {
+    let replacements = [
+        ("#232629", foreground),
+        ("#da4453", negative),
+        ("#f67400", neutral),
+    ];
+    let mut output = String::with_capacity(svg.len());
+    let mut remaining = svg;
+    while let Some(index) = remaining.find('#') {
+        output.push_str(&remaining[..index]);
+        remaining = &remaining[index..];
+        if let Some((color, suffix)) = replacements
+            .iter()
+            .find_map(|(token, color)| remaining.strip_prefix(token).map(|suffix| (*color, suffix)))
+        {
+            output.push_str(color);
+            remaining = suffix;
+        } else {
+            output.push('#');
+            remaining = &remaining[1..];
+        }
+    }
+    output.push_str(remaining);
+    output
+}
+#[cfg(any(target_os = "linux", windows, test))]
+pub fn render_svg(svg: &[u8], size: u32) -> Result<Vec<u8>> {
+    let tree = resvg::usvg::Tree::from_data(svg, &resvg::usvg::Options::default())?;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(size, size)
+        .ok_or_else(|| anyhow::anyhow!("invalid icon size"))?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(
+            size as f32 / tree.size().width(),
+            size as f32 / tree.size().height(),
+        ),
+        &mut pixmap.as_mut(),
+    );
+    // tiny-skia pixels are premultiplied. SNI and Slint take straight-alpha bytes.
+    for pixel in pixmap.data_mut().chunks_exact_mut(4) {
+        if pixel[3] > 0 {
+            for i in 0..3 {
+                pixel[i] = (u32::from(pixel[i]) * 255 / u32::from(pixel[3])).min(255) as u8;
+            }
+        }
+    }
+    Ok(pixmap.take())
+}
+
+// The native Windows menu uses the same presentation projection and captured
+// authorities as ksni. Native menu IDs are never reused across rebuilds.
+#[cfg(any(windows, test))]
+#[derive(Debug)]
+pub(super) enum MenuEntry {
+    Separator,
+    Item {
+        label: String,
+        enabled: bool,
+        checked: Option<bool>,
+        command: Option<super::Command>,
+    },
+    Submenu {
+        label: String,
+        items: Vec<MenuEntry>,
+    },
+}
+#[cfg(any(windows, test))]
+pub(super) fn menu(snapshot: &Snapshot, config: &crate::Config) -> Vec<MenuEntry> {
+    use super::{
+        Command, Toggle,
+        window::{ClipboardMode, peers},
+    };
+    use MenuEntry::*;
+    fn item(label: impl Into<String>, command: Command) -> MenuEntry {
+        Item {
+            label: label.into(),
+            enabled: true,
+            checked: None,
+            command: Some(command),
+        }
+    }
+    fn toggle(toggle: Toggle, config: &crate::Config, enabled: bool) -> MenuEntry {
+        Item {
+            label: toggle.label().into(),
+            enabled,
+            checked: Some(toggle.checked(config)),
+            command: Some(Command::Toggle(toggle)),
+        }
+    }
+    let transfers = snapshot
+        .transfers
+        .iter()
+        .map(Transfer::from)
+        .collect::<Vec<_>>();
+    let peers = peers(snapshot, &transfers);
+    let mut items = vec![
+        Item {
+            label: status(snapshot, &peers, &transfers),
+            enabled: false,
+            checked: None,
+            command: None,
+        },
+        Separator,
+        item(
+            "Open Pneu",
+            Command::Window {
+                activation_token: None,
+            },
+        ),
+    ];
+    if !peers.is_empty() {
+        let recipients = |device: Option<&pneu_proto::Id>| {
+            let ids = device.map(|id| [id.clone()]);
+            crate::file_recipients::resolve(
+                &snapshot.send_targets,
+                match &ids {
+                    Some(ids) => crate::file_recipients::Selection::Explicit(ids),
+                    None => crate::file_recipients::Selection::ConnectedOnly,
+                },
+            )
+            .expect("valid tray selection")
+            .recipients
+        };
+        let mut targets = vec![
+            item(
+                "All Connected Devices…",
+                Command::SendFiles {
+                    recipients: recipients(None),
+                    targeted: false,
+                },
+            ),
+            Separator,
+        ];
+        for peer in &peers {
+            if let Ok(device) = pneu_proto::Id::new(&peer.id) {
+                let label = if peer.name.chars().count() > 40 {
+                    format!(
+                        "{}…",
+                        peer.name.chars().take(39).collect::<String>().trim_end()
+                    )
+                } else {
+                    peer.name.clone()
+                };
+                targets.push(item(
+                    format!("{label}…"),
+                    Command::SendFiles {
+                        recipients: recipients(Some(&device)),
+                        targeted: true,
+                    },
+                ));
+            }
+        }
+        items.push(Submenu {
+            label: "Send Files To".into(),
+            items: targets,
+        });
+        let value = serde_json::to_value(config).unwrap_or_default();
+        let mode = ClipboardMode::from_config(
+            Some(&value["clipboard_mode"]).filter(|v| !v.is_null()),
+            config.clipboard_sync_to_phone,
+        );
+        if mode == ClipboardMode::Manual {
+            items.push(item(
+                "Send Clipboard",
+                Command::SendClipboard(super::captured_authorities(snapshot)),
+            ));
+        }
+        items.extend([item("Open Received Files", Command::OpenFolder), Separator]);
+        let mut modes = [
+            ("Share Automatically", ClipboardMode::Automatic),
+            ("Share Manually", ClipboardMode::Manual),
+            ("Off", ClipboardMode::Off),
+        ]
+        .into_iter()
+        .map(|(label, choice)| Item {
+            label: label.into(),
+            enabled: true,
+            checked: Some(choice == mode),
+            command: Some(Command::ClipboardMode(choice.key())),
+        })
+        .collect::<Vec<_>>();
+        modes.extend([
+            Separator,
+            toggle(Toggle::IncludeImages, config, mode != ClipboardMode::Off),
+        ]);
+        items.push(Submenu {
+            label: "Clipboard".into(),
+            items: modes,
+        });
+        items.push(Submenu {
+            label: "When Files Arrive".into(),
+            items: [
+                Toggle::Save,
+                Toggle::Notifications,
+                Toggle::CopyImages,
+                Toggle::Viewer,
+            ]
+            .into_iter()
+            .map(|t| toggle(t, config, true))
+            .collect(),
+        });
+        items.push(Separator);
+    }
+    items.extend([
+        item(
+            "Add Device…",
+            Command::AddDevice {
+                activation_token: None,
+            },
+        ),
+        Separator,
+        item("Quit Pneu", Command::Quit),
+    ]);
+    items
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{Command, Toggle, window::peers};
+    use super::*;
+
+    #[test]
+    fn menu_projects_unpaired_and_paired_settings_and_captures_authority() {
+        let mut snapshot = Snapshot::default();
+        let mut config = crate::Config::default();
+        let entries = menu(&snapshot, &config);
+        assert!(
+            matches!(&entries[0], MenuEntry::Item { label, enabled: false, checked: None, command: None } if label == "No devices paired")
+        );
+        assert!(matches!(
+            entries.last(),
+            Some(MenuEntry::Item {
+                command: Some(Command::Quit),
+                ..
+            })
+        ));
+        assert!(
+            !entries
+                .iter()
+                .any(|item| matches!(item, MenuEntry::Submenu { .. }))
+        );
+        fn labels(entries: &[MenuEntry]) -> Vec<&str> {
+            entries
+                .iter()
+                .map(|entry| match entry {
+                    MenuEntry::Separator => "---",
+                    MenuEntry::Item { label, .. } | MenuEntry::Submenu { label, .. } => {
+                        label.as_str()
+                    }
+                })
+                .collect()
+        }
+        assert_eq!(
+            labels(&entries),
+            [
+                "No devices paired",
+                "---",
+                "Open Pneu",
+                "Add Device…",
+                "---",
+                "Quit Pneu"
+            ]
+        );
+        assert!(matches!(
+            entries[2],
+            MenuEntry::Item {
+                command: Some(Command::Window { .. }),
+                ..
+            }
+        ));
+        let device = pneu_proto::Id::from_bytes([1; 16]);
+        snapshot.devices.push(crate::core::mesh::DeviceSnapshot {
+            device: device.clone(),
+            name: "Phone & tablet".into(),
+            role: "phone".into(),
+            state: "connected".into(),
+            last_seen: 0,
+            dialer: None,
+            route: None,
+        });
+        snapshot.send_targets.push(crate::outbox::SendTarget {
+            device: device.clone(),
+            name: "Phone & tablet".into(),
+            generation: 7,
+            fingerprint: Some(pneu_proto::Hash::new("ab".repeat(32)).unwrap()),
+            eligible: true,
+            would_queue: false,
+            reason: None,
+        });
+        config.clipboard_mode = crate::config::ClipboardMode::Off;
+        let entries = menu(&snapshot, &config);
+        assert_eq!(
+            &labels(&entries)[1..],
+            [
+                "---",
+                "Open Pneu",
+                "Send Files To",
+                "Open Received Files",
+                "---",
+                "Clipboard",
+                "When Files Arrive",
+                "---",
+                "Add Device…",
+                "---",
+                "Quit Pneu"
+            ]
+        );
+        config.clipboard_mode = crate::config::ClipboardMode::Manual;
+        assert_eq!(
+            &labels(&menu(&snapshot, &config))[1..],
+            [
+                "---",
+                "Open Pneu",
+                "Send Files To",
+                "Send Clipboard",
+                "Open Received Files",
+                "---",
+                "Clipboard",
+                "When Files Arrive",
+                "---",
+                "Add Device…",
+                "---",
+                "Quit Pneu"
+            ]
+        );
+        let files = entries
+            .iter()
+            .find_map(|item| match item {
+                MenuEntry::Submenu { label, items } if label == "Send Files To" => Some(items),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            matches!(&files[0], MenuEntry::Item { command: Some(Command::SendFiles { recipients, targeted: false }), .. } if recipients.len() == 1 && recipients[0].generation == 7)
+        );
+        assert!(
+            matches!(&files[2], MenuEntry::Item { command: Some(Command::SendFiles { recipients, targeted: true }), .. } if recipients[0].device == device)
+        );
+        let clipboard = entries
+            .iter()
+            .find_map(|item| match item {
+                MenuEntry::Submenu { label, items } if label == "Clipboard" => Some(items),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            matches!(&clipboard[2], MenuEntry::Item { label, checked: Some(true), command: Some(Command::ClipboardMode("off")), .. } if label == "Off")
+        );
+        assert!(matches!(
+            clipboard.last(),
+            Some(MenuEntry::Item {
+                enabled: false,
+                command: Some(Command::Toggle(Toggle::IncludeImages)),
+                ..
+            })
+        ));
+        // Menu commands retain the generation they were built for; Core checks
+        // it even after a peer is removed or paired again before activation.
+        snapshot.send_targets[0].generation = 8;
+        assert!(
+            matches!(&files[2], MenuEntry::Item { command: Some(Command::SendFiles { recipients, .. }), .. } if recipients[0].generation == 7)
+        );
+    }
+
+    #[test]
+    fn shared_icon_precedence_and_rgba_sizes() -> Result<()> {
+        let mut snapshot = Snapshot::default();
+        assert_eq!(icon(&snapshot, &[]), "pneu-tray-disconnected");
+        snapshot.receiving = true;
+        snapshot.connected = true;
+        assert_eq!(icon(&snapshot, &[]), "pneu-tray-receiving");
+        snapshot.error = Some(super::super::ReceiveError::Port(53317));
+        assert_eq!(icon(&snapshot, &peers(&snapshot, &[])), "pneu-tray-error");
+        for (_, svg) in ICONS {
+            for foreground in ["#232629", "#eff0f1"] {
+                let svg = recolor_svg(svg, foreground, "#da4453", "#f67400");
+                for size in [16, 20, 24, 32] {
+                    let rgba = render_svg(svg.as_bytes(), size)?;
+                    assert_eq!(rgba.len(), (size * size * 4) as usize);
+                    assert!(rgba.chunks_exact(4).any(|p| p[3] != 0));
+                    assert!(rgba.chunks_exact(4).any(|p| p[3] == 0));
+                }
+            }
+        }
+        assert!(render_svg(ICONS[0].1.as_bytes(), 0).is_err());
+        Ok(())
+    }
+}

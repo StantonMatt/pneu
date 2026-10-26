@@ -168,11 +168,7 @@ pub async fn run(
                 && (std::env::var_os("WAYLAND_DISPLAY").is_some()
                     || std::env::var_os("DISPLAY").is_some())
             {
-                match super::activation::command(std::env::current_exe()?, startup_token)
-                    .arg("ui-window")
-                    .env("PNEU_WINDOW_REQUEST", request.to_string())
-                    .kill_on_drop(true)
-                    .spawn()
+                match super::window_process::launch(request, startup_token)
                 {
                     Ok(child) => window = Some(child),
                     Err(error) => eprintln!("pneud: window unavailable: {error}"),
