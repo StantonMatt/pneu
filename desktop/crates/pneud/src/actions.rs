@@ -1,5 +1,7 @@
 use crate::platform::fs as platform_fs;
-use anyhow::{Context, Result};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::Result;
 use async_trait::async_trait;
 use std::{
     path::{Path, PathBuf},
@@ -47,6 +49,8 @@ pub struct ReceivedFile {
 impl ReceivedFile {
     pub(crate) fn from_file(path: PathBuf, file: std::fs::File) -> Result<Self> {
         anyhow::ensure!(file.metadata()?.is_file(), "received file must be regular");
+        #[cfg(windows)]
+        let file = platform_fs::received_reader(&file)?;
         Ok(Self {
             path,
             file: Arc::new(file),
@@ -116,7 +120,7 @@ impl ReceivedFile {
 }
 
 use platform_fs::clipboard_file;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use platform_fs::unlinked_clipboard_file;
 
 /// Data-bearing inputs stay anchored while preparation runs outside the actor.

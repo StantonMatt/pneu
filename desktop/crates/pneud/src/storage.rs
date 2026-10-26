@@ -185,6 +185,13 @@ impl Stage {
         destination: String,
         size: u64,
     ) -> Result<Self> {
+        // Reject an ambiguous derived/display name before staging or exposing
+        // it to a path-based desktop API. Local filename mapping is a later
+        // milestone; this slice deliberately fails closed on invalid names.
+        #[cfg(windows)]
+        let destination = safe_basename(&destination, NAME_MAX);
+        #[cfg(windows)]
+        fs::validate_name(std::ffi::OsStr::new(&destination))?;
         ensure!(
             folder.space()? >= size.saturating_add(16 * 1024 * 1024),
             fs::no_space()
@@ -212,6 +219,9 @@ impl Stage {
                 .expect("placed name")
                 .clone()
                 .context("file has not been placed")?,
+            #[cfg(windows)]
+            identity: fs::Version::record_written(&self.0.file)?,
+            #[cfg(unix)]
             identity: fs::Version::read_regular(&self.0.file)?,
         })
     }
@@ -234,6 +244,10 @@ impl Stage {
         Ok(())
     }
     pub fn place(&self) -> Result<()> {
+        // Windows rename needs only DELETE access so frozen read-only files
+        // remain publishable. Flush data on the retained writer beforehand.
+        #[cfg(windows)]
+        self.0.file.sync_all()?;
         let mut placed_name = self.0.placed_name.lock().expect("placed name");
         ensure!(placed_name.is_none(), "file has already been placed");
         let before = fs::identity(&self.0.file)?;
@@ -423,10 +437,11 @@ fn read_limited(reader: impl std::io::Read, limit: usize) -> Result<Vec<u8>> {
     ensure!(bytes.len() <= limit, "input grew beyond bounded read limit");
     Ok(bytes)
 }
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Read;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     fn named_stage(folder: &Folder, name: &str, bytes: &[u8]) -> Result<Stage> {
         use std::io::Write;
@@ -471,6 +486,62 @@ mod tests {
             assert!(!dir.path().join(second).exists());
             assert_eq!(std::fs::read(dir.path().join(name))?, b"first");
             assert_eq!(std::fs::read(dir.path().join(third))?, b"third");
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    #[test]
+    fn placed_versions_survive_writer_close_and_preserve_later_changes() -> Result<()> {
+        let dir = crate::test_support::scratch()?;
+        let folder = Folder::open(dir.path(), false)?;
+        let mut records = Vec::new();
+        for change in ["none", "edit", "restored_mtime", "replace", "rename"] {
+            // Every placement after the first uses the collision-name branch.
+            let stage = named_stage(&folder, "preview.bin", b"owned")?;
+            let writer = stage.0.file.try_clone()?;
+            stage.place()?;
+            let path = stage.destination_path()?;
+            let ownership = stage.record_placed()?;
+            assert!(ownership.matches_path(&path)?, "before close: {change}");
+            records.push((stage, writer, path, ownership, change));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        let records: Vec<_> = records
+            .into_iter()
+            .map(|(stage, writer, path, owner, change)| {
+                drop(stage);
+                drop(writer);
+                (path, owner, change)
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        for (path, ownership, change) in records {
+            assert!(ownership.matches_path(&path)?, "after close: {change}");
+            let modified = std::fs::metadata(&path)?.modified()?;
+            match change {
+                "edit" | "restored_mtime" => {
+                    std::fs::write(&path, b"other")?; // same length
+                    if change == "restored_mtime" {
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&path)?
+                            .set_times(std::fs::FileTimes::new().set_modified(modified))?;
+                    }
+                }
+                "replace" => {
+                    std::fs::remove_file(&path)?;
+                    std::fs::write(&path, b"other")?;
+                }
+                "rename" => {
+                    let moved = path.with_extension("moved");
+                    std::fs::rename(&path, &moved)?;
+                    std::fs::rename(moved, &path)?;
+                }
+                _ => {}
+            }
+            assert_eq!(ownership.matches_path(&path)?, change == "none", "{change}");
+            ownership.remove()?;
+            assert_eq!(path.exists(), change != "none", "{change}");
         }
         Ok(())
     }
@@ -544,6 +615,7 @@ mod tests {
         Ok(())
     }
     #[test]
+    #[cfg(unix)]
     fn placement_retries_late_collisions_against_the_opened_directory() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let save = dir.path().join("save");
@@ -580,7 +652,10 @@ mod tests {
                 } else {
                     numbered_name(&name, number)
                 };
+                #[cfg(unix)]
                 std::fs::hard_link(&occupied, dir.path().join(candidate))?;
+                #[cfg(windows)]
+                std::fs::write(dir.path().join(candidate), b"keep")?;
             }
             stage.place()?;
             let path = stage.destination_path()?;
@@ -605,6 +680,7 @@ mod tests {
         Ok(())
     }
     #[test]
+    #[cfg(unix)]
     fn cache_pruning_only_removes_old_private_cache_entries_and_is_anchored() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let cache = dir.path().join("cache");
@@ -646,6 +722,7 @@ mod tests {
         Ok(())
     }
     #[test]
+    #[cfg(unix)]
     fn cleanup_and_reuse_never_chmod_existing_staging_roots() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let folder = Folder::open(dir.path(), false)?;
@@ -702,6 +779,7 @@ mod tests {
         assert_eq!(read_limited(&b"tiny"[..], 8).unwrap(), b"tiny");
     }
     #[test]
+    #[cfg(unix)]
     fn missing_ancestors_are_created_without_changing_existing_permissions() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let shared = dir.path().join("shared");

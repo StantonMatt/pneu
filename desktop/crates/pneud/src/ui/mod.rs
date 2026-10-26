@@ -1,42 +1,60 @@
 //! Desktop presentation state. The protocol core remains usable without a tray host.
 #[cfg(target_os = "linux")]
 pub(crate) mod activation;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(all(unix, any(target_os = "macos", test)))]
 mod camera;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(all(unix, any(target_os = "macos", test)))]
 #[path = "macos/bridge.rs"]
 pub(crate) mod child_bridge;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(all(unix, any(target_os = "macos", test)))]
 pub(crate) mod child_channel;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(all(unix, any(target_os = "macos", test)))]
 mod child_supervision;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[cfg_attr(target_os = "macos", path = "macos/clipboard.rs")]
 pub mod clipboard;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(windows)]
+#[path = "clipboard_content.rs"]
+pub mod clipboard;
+#[cfg(target_os = "linux")]
+mod clipboard_content;
+#[cfg(all(unix, any(target_os = "macos", test)))]
 #[path = "macos/drop_target.rs"]
 mod drop_target;
+#[cfg(unix)]
 mod interactions;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(all(unix, any(target_os = "macos", test)))]
 pub(crate) mod notice_lifecycle;
 pub mod notifications;
 #[cfg_attr(target_os = "macos", path = "macos/palette.rs")]
+#[cfg(unix)]
 pub mod palette;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(all(unix, any(target_os = "macos", test)))]
 mod pasteboard_reader;
 #[cfg_attr(target_os = "macos", path = "macos/portal.rs")]
+#[cfg(unix)]
+pub(crate) mod portal;
+#[cfg(windows)]
+#[path = "interactions.rs"]
 pub(crate) mod portal;
 #[cfg_attr(target_os = "macos", path = "macos/runtime.rs")]
+#[cfg(unix)]
 pub mod runtime;
+#[cfg(unix)]
 mod send_request;
 #[cfg(target_os = "linux")]
 pub mod tray;
+#[cfg(unix)]
 mod tray_model;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(all(unix, any(target_os = "macos", test)))]
 mod viewer_cache;
+#[cfg(unix)]
 pub mod window;
+#[cfg(windows)]
+#[path = "send_request.rs"]
+pub(crate) mod window;
 
 use crate::Config;
 use serde::{Deserialize, Serialize};
@@ -229,6 +247,7 @@ impl Snapshot {
             format!("{phone} isn't connected")
         }
     }
+    #[cfg(unix)]
     pub fn tooltip(&self) -> String {
         let mut text = self.status();
         if self.paired && !self.connected && self.error.is_none() && self.phone.last_seen != 0 {
@@ -236,6 +255,7 @@ impl Snapshot {
         }
         text
     }
+    #[cfg(unix)]
     pub fn window_status(&self) -> String {
         if self.paused && self.connected {
             "Paused on phone".into()
@@ -253,6 +273,7 @@ impl Snapshot {
         }
     }
 }
+#[cfg(unix)]
 pub fn last_seen(timestamp: u64) -> String {
     use chrono::{DateTime, Local};
     let Some(time) = DateTime::from_timestamp_millis(timestamp as i64) else {
@@ -433,7 +454,7 @@ pub enum Command {
         activation_token: Option<String>,
     },
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     #[test]
@@ -480,5 +501,13 @@ mod tests {
         for address in ["100.63.255.255", "100.128.0.1", "192.168.1.1", "::1"] {
             assert_eq!(route(address.parse().unwrap()), "Wi-Fi");
         }
+    }
+}
+
+pub(crate) fn this_computer() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "this Mac"
+    } else {
+        "this computer"
     }
 }

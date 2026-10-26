@@ -94,7 +94,7 @@ pub(crate) fn resolve(targets: &[SendTarget], selection: Selection<'_>) -> Resul
     Ok(result)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use pneu_proto::Hash;

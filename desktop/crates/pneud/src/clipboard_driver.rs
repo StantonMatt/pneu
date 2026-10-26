@@ -833,7 +833,7 @@ pub(in crate::core) async fn run(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "clipboard_driver_tests.rs"]
 mod tests;
 

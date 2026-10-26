@@ -1,9 +1,13 @@
-use anyhow::{Result, ensure};
+use anyhow::Result;
+#[cfg(unix)]
+use anyhow::ensure;
 use pneu_proto::{Hash, Id, certificate_fingerprint};
 use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path};
+#[cfg(any(unix, test))]
+use std::fs;
+use std::path::Path;
 
 #[derive(Serialize, Deserialize)]
 struct Stored {
@@ -20,29 +24,63 @@ pub struct Identity {
 }
 impl Identity {
     pub fn load_or_create(directory: &Path) -> Result<Self> {
-        crate::config::private_dir(directory)?;
-        let path = directory.join("identity.json");
-        let stored: Stored = if path.exists() {
-            ensure!(
-                !fs::symlink_metadata(&path)?.file_type().is_symlink(),
-                "identity is a symlink"
-            );
-            serde_json::from_slice(&crate::storage::read_bounded(&path, 65536)?)?
-        } else {
-            let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
-            let cert = CertificateParams::new(vec!["pneu.local".into()])?.self_signed(&key)?;
-            let stored = Stored {
-                cert: cert.der().to_vec(),
-                key: key.serialize_der(),
-                device_id: Id::new(crate::random_hex(16))?,
-            };
-            if crate::config::atomic_private_new(&path, &serde_json::to_vec(&stored)?)? {
-                stored
-            } else {
+        #[cfg(unix)]
+        let stored: Stored = {
+            crate::config::private_dir(directory)?;
+            let path = directory.join("identity.json");
+            let stored: Stored = if path.exists() {
+                ensure!(
+                    !fs::symlink_metadata(&path)?.file_type().is_symlink(),
+                    "identity is a symlink"
+                );
                 serde_json::from_slice(&crate::storage::read_bounded(&path, 65536)?)?
+            } else {
+                let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
+                let cert = CertificateParams::new(vec!["pneu.local".into()])?.self_signed(&key)?;
+                let stored = Stored {
+                    cert: cert.der().to_vec(),
+                    key: key.serialize_der(),
+                    device_id: Id::new(crate::random_hex(16))?,
+                };
+                if crate::config::atomic_private_new(&path, &serde_json::to_vec(&stored)?)? {
+                    stored
+                } else {
+                    serde_json::from_slice(&crate::storage::read_bounded(&path, 65536)?)?
+                }
+            };
+            crate::platform::fs::set_private_file(&path)?;
+            stored
+        };
+        #[cfg(windows)]
+        let stored: Stored = {
+            let folder = crate::storage::Folder::open_private(directory)?;
+            folder.file.sync_all()?;
+            let name = std::ffi::OsStr::new("identity.json");
+            if let Some(bytes) = crate::platform::fs::private_bytes_at(&folder.file, name, 65536)? {
+                serde_json::from_slice(&bytes)?
+            } else {
+                let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
+                let cert = CertificateParams::new(vec!["pneu.local".into()])?.self_signed(&key)?;
+                let candidate = Stored {
+                    cert: cert.der().to_vec(),
+                    key: key.serialize_der(),
+                    device_id: Id::new(crate::random_hex(16))?,
+                };
+                if crate::config::atomic_private_new_in(
+                    &folder,
+                    name,
+                    &serde_json::to_vec(&candidate)?,
+                )? {
+                    candidate
+                } else {
+                    let bytes = crate::platform::fs::private_bytes_at(&folder.file, name, 65536)?
+                        .ok_or_else(|| {
+                        anyhow::anyhow!("identity disappeared after publication")
+                    })?;
+                    serde_json::from_slice(&bytes)?
+                }
             }
         };
-        crate::platform::fs::set_private_file(&path)?;
         let fingerprint = certificate_fingerprint(&stored.cert);
         Ok(Self {
             cert: stored.cert.into(),

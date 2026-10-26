@@ -1,3 +1,5 @@
+#[cfg(all(test, windows))]
+extern crate self as pneud;
 pub mod actions;
 pub mod client;
 mod clipboard_fingerprint;

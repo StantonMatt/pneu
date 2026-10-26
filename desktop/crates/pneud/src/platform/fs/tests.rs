@@ -39,7 +39,7 @@ fn exclusive_private_create_preserves_existing_file_and_symlink() -> Result<()> 
     let temp = crate::test_support::scratch()?;
     let folder = Folder::open(&temp.path().canonicalize()?, false)?;
     let original = create_private_at(&folder.file, "file", Access::ReadWrite)?;
-    assert!(is_private_file(&original.metadata()?));
+    assert!(is_private_file(&original)?);
     assert!(is_exists(
         &create_private_at(&folder.file, "file", Access::Write).unwrap_err()
     ));
@@ -104,10 +104,10 @@ fn private_permissions_are_checked_without_repairing_existing_objects() -> Resul
     let folder = Folder::open(&temp.path().canonicalize()?, false)?;
     let file = create_private_at(&folder.file, "file", Access::ReadWrite)?;
     private::created(&file)?;
-    assert!(is_private_file(&file.metadata()?));
+    assert!(is_private_file(&file)?);
     assert!(is_owned_private(&file)?);
     file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
-    assert!(!is_private_file(&file.metadata()?));
+    assert!(!is_private_file(&file)?);
     assert!(!is_owned_private(&file)?);
     assert_eq!(file.metadata()?.permissions().mode() & 0o777, 0o644);
     Ok(())
@@ -115,6 +115,24 @@ fn private_permissions_are_checked_without_repairing_existing_objects() -> Resul
 
 #[test]
 fn standard_locks_interoperate_with_flock_and_release_on_close() -> Result<()> {
+    // Another test's pre_exec can fork while a lock is live, keeping its open
+    // file description alive until exec despite CLOEXEC. Isolate every close-
+    // release assertion, including the duplicate and raw flock checks below.
+    const NAME: &str =
+        "platform::fs::tests::standard_locks_interoperate_with_flock_and_release_on_close";
+    if std::env::var("PNEU_ISOLATED_LOCK_TEST").ok().as_deref() != Some(NAME) {
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", NAME, "--test-threads=1", "--nocapture"])
+            .env("PNEU_ISOLATED_LOCK_TEST", NAME)
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "isolated lock fixture failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(());
+    }
     let temp = crate::test_support::scratch()?;
     let path = temp.path().join("lock");
     let first = open_store_lock(&path)?;

@@ -132,7 +132,7 @@ impl Notice {
         let mut n = Self::new(format!(
             "{} unpaired {}",
             label(device),
-            super::window::this_computer()
+            super::this_computer()
         ));
         n.actions.push(("pair", "Add Device…"));
         n

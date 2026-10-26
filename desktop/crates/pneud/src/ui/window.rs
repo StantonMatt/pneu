@@ -3351,13 +3351,7 @@ fn sync<T: Clone + PartialEq + 'static>(model: ModelRc<T>, items: &[T]) {
 
 // Peer names are labels, not paragraphs. Keep their bytes on the wire and in
 // storage unchanged while rendering all line separators as spaces in the window.
-pub(crate) fn this_computer() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "this Mac"
-    } else {
-        "this computer"
-    }
-}
+pub(crate) use super::this_computer;
 
 pub(crate) fn display_peer_text(text: &str) -> String {
     text.chars()

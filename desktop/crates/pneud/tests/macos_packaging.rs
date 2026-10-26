@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Actual scripts with private files and mocked host tools; no user services.
 use anyhow::{Context, Result, ensure};
 use std::{

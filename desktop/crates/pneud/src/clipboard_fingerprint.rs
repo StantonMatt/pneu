@@ -14,6 +14,33 @@ impl Default for FingerprintKey {
     }
 }
 impl FingerprintKey {
+    #[cfg(windows)]
+    pub(crate) fn load_in(folder: &crate::storage::Folder) -> Result<Self> {
+        let name = std::ffi::OsStr::new("clipboard-fingerprint.key");
+        Self::cleanup_in(folder, ".pneu-clipboard-fingerprint.key-")?;
+        let mut file = match platform_fs::open_read_at(&folder.file, name) {
+            Ok(file) => file,
+            Err(e) if platform_fs::is_missing(&e) => {
+                let key = Self::default();
+                crate::config::atomic_private_in(folder, name, &key.0)?;
+                return Ok(key);
+            }
+            Err(e) => return Err(e).context("open clipboard fingerprint key"),
+        };
+        crate::platform::private::check(&file)?;
+        ensure!(
+            platform_fs::is_private_file(&file)?,
+            "clipboard fingerprint key must be private and regular"
+        );
+        if file.metadata()?.len() != 32 {
+            let key = Self::default();
+            crate::config::atomic_private_in(folder, name, &key.0)?;
+            return Ok(key);
+        }
+        let mut key = [0; 32];
+        file.read_exact(&mut key)?;
+        Ok(Self(key))
+    }
     pub(crate) fn load_or_create(path: &Path) -> Result<Self> {
         let file = platform_fs::open_secret(path);
         let mut file = match file {
@@ -30,7 +57,7 @@ impl FingerprintKey {
         crate::platform::private::check(&file)?;
         let meta = file.metadata()?;
         ensure!(
-            platform_fs::is_private_file(&meta),
+            platform_fs::is_private_file(&file)?,
             "clipboard fingerprint key must be an owned 0600 regular file"
         );
         if meta.len() != 32 {
@@ -55,6 +82,9 @@ impl FingerprintKey {
             ".pneu-{}-",
             path.file_name().context("key name")?.to_string_lossy()
         );
+        Self::cleanup_in(&folder, &prefix)
+    }
+    fn cleanup_in(folder: &crate::storage::Folder, prefix: &str) -> Result<()> {
         for entry in platform_fs::entries(&folder.file)? {
             let name = entry?;
             let name = name.as_os_str();
@@ -62,7 +92,7 @@ impl FingerprintKey {
                 continue;
             };
             let Some(random) = name_str
-                .strip_prefix(&prefix)
+                .strip_prefix(prefix)
                 .and_then(|s| s.strip_suffix("-tmp"))
             else {
                 continue;
@@ -77,8 +107,7 @@ impl FingerprintKey {
                 }
                 Err(error) => return Err(error),
             };
-            let meta = file.metadata()?;
-            if platform_fs::is_private_file(&meta) {
+            if platform_fs::is_private_file(&file)? {
                 crate::platform::private::check(&file)?;
                 crate::storage::remove_file(&folder.file, name, &file)?;
             }

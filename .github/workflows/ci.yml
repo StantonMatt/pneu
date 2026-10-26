@@ -80,6 +80,34 @@ jobs:
           export TMPDIR
           cargo test --locked
 
+  windows:
+    name: Windows filesystem and shared daemon
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the workspace Rust toolchain
+        shell: pwsh
+        run: |
+          $rustVersion = python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["rust-version"])'
+          rustup toolchain install $rustVersion --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default $rustVersion
+          exit $LASTEXITCODE
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: desktop
+          save-if: ${{ github.event_name == 'push' }}
+      # Runtime/IPC/desktop adapters await later milestones; their test targets
+      # are compile-gated. Run all currently Windows-compilable pneud targets.
+      - name: Test Windows filesystem and shared daemon
+        run: cargo test --locked -p pneud
+
   android:
     name: Android unit tests and lint
     runs-on: ubuntu-latest
