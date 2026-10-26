@@ -477,7 +477,11 @@ mod tests {
                 b"third",
             ]) {
                 stage.place()?;
-                assert_eq!(stage.destination_path()?, dir.path().join(expected));
+                // Resolved paths: the temporary directory may use an 8.3 short name on Windows.
+                assert_eq!(
+                    std::fs::canonicalize(stage.destination_path()?)?,
+                    std::fs::canonicalize(dir.path().join(expected))?
+                );
                 assert_eq!(std::fs::read(stage.destination_path()?)?, contents);
                 assert!(!stage.path()?.exists());
             }

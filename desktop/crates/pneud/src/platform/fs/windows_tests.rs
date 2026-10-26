@@ -338,7 +338,11 @@ fn ntfs_refuses_live_descendant_directory_rename_without_redirecting_handles() -
     assert!(!temp.path().join("moved").exists());
     drop(file);
     rename(&root.file, "live", &root.file, "moved", false)?;
-    assert_eq!(directory.path()?, temp.path().join("moved"));
+    // Compare resolved paths: the temporary directory may be spelled with an 8.3 short name.
+    assert_eq!(
+        std::fs::canonicalize(directory.path()?)?,
+        std::fs::canonicalize(temp.path().join("moved"))?
+    );
     Ok(())
 }
 
