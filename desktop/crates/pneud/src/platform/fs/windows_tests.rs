@@ -55,9 +55,14 @@ fn relative_rename_conflicts_even_with_open_target_and_preserves_anchor() -> Res
         &rename(&folder.file, "source", &folder.file, "target", false).unwrap_err()
     ));
     assert_eq!(std::fs::read(temp.path().join("target"))?, b"old");
-    assert!(is_exists(
-        &rename(&folder.file, "source", &folder.file, "TARGET", false).unwrap_err()
+    let error = rename(&folder.file, "source", &folder.file, "TARGET", false).unwrap_err();
+    let collision = error.chain().find_map(code).expect("Win32 collision error");
+    println!("case-insensitive no-replace rename error: {collision}");
+    assert!(matches!(
+        collision,
+        ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS
     ));
+    assert!(is_exists(&error));
     drop(held);
     let destination = Folder::open_private(&temp.path().join("destination"))?;
     std::fs::rename(temp.path().join("destination"), temp.path().join("moved"))?;
@@ -347,7 +352,7 @@ fn ntfs_refuses_live_descendant_directory_rename_without_redirecting_handles() -
 }
 
 #[test]
-fn win32_alias_names_are_rejected_before_creation() -> Result<()> {
+fn configured_win32_alias_names_stay_strict_while_receive_names_are_mapped() -> Result<()> {
     let (temp, folder) = fixture()?;
     let source = create_private_at(&folder.file, "source", Access::ReadWrite)?;
     source.sync_all()?;
@@ -371,10 +376,10 @@ fn win32_alias_names_are_rejected_before_creation() -> Result<()> {
     ] {
         let path = temp.path().join(name);
         assert!(validate_path(&path).is_err(), "{name}");
-        assert!(
-            crate::storage::Stage::create(folder.clone(), staging.clone(), name.into(), 0).is_err(),
-            "{name}"
-        );
+        let stage = crate::storage::Stage::create(folder.clone(), staging.clone(), name.into(), 0)?;
+        assert_ne!(stage.0.destination, name);
+        validate_name(OsStr::new(&stage.0.destination))?;
+        drop(stage);
         assert_eq!(entries(&staging.file)?.count(), 0);
         assert!(Folder::open_private(&path).is_err(), "{name}");
         assert!(Folder::open(&path.join("child"), true).is_err(), "{name}");
@@ -409,6 +414,7 @@ fn win32_alias_names_are_rejected_before_creation() -> Result<()> {
             "{name}"
         );
     }
+    assert!(validate_name(&OsString::from_wide(&[0xd800])).is_err());
     assert!(Folder::open_private(&temp.path().join("new/bad./child")).is_err());
     assert!(!temp.path().join("new").exists());
     assert_eq!(entries(&folder.file)?.count(), 2);

@@ -259,35 +259,11 @@ pub(crate) mod private {
 // configured path. 8.3 aliases do not change NT vs Win32 resolution; containment
 // uses directory identities below, so aliases cannot cross its boundary.
 pub(crate) fn validate_name(name: &OsStr) -> Result<()> {
-    let n: Vec<_> = name.encode_wide().collect();
     let text = name
         .to_str()
         .context("Windows paths must contain valid Unicode")?;
-    let stem = text
-        .split('.')
-        .next()
-        .unwrap_or("")
-        .trim_end_matches(' ')
-        .to_ascii_uppercase();
-    let device = matches!(
-        stem.as_str(),
-        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
-    ) || ["COM", "LPT"].iter().any(|prefix| {
-        stem.strip_prefix(prefix).is_some_and(|suffix| {
-            matches!(
-                suffix,
-                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
-            )
-        })
-    });
     ensure!(
-        !n.is_empty()
-            && n.len() <= 255
-            && !n
-                .iter()
-                .any(|c| *c < 32 || [34, 42, 47, 58, 60, 62, 63, 92, 124].contains(c))
-            && !text.ends_with(['.', ' '])
-            && !device,
+        crate::storage::windows_names::is_safe(text),
         "ambiguous Windows path component: {name:?} (trailing dots/spaces, device names and Win32 special characters are forbidden)"
     );
     Ok(())

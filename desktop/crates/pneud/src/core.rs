@@ -4,7 +4,7 @@ use crate::{
     Config, Paths,
     actions::{PcActions, ReceivedFile},
     identity::Identity,
-    storage::{Stage, VerifiedFile, cache_basename, safe_basename},
+    storage::{Stage, VerifiedFile, cache_basename, local_name},
     store::{Metadata, Store, normalize_legacy_hello},
     tls::{Admission, ClientVerifier, Invitation},
 };
@@ -4487,7 +4487,7 @@ impl Core {
                 if state.begin.kind == FileKind::ClipboardImage || !state.config.save_to_folder {
                     cache_basename(&state.begin.file_name)
                 } else {
-                    safe_basename(&state.begin.file_name, 255)
+                    local_name(&state.begin.file_name, 255)
                 };
             let size = state.begin.size;
             let stage = match async {
