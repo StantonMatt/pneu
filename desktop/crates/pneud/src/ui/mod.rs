@@ -14,7 +14,7 @@ mod child_supervision;
 #[cfg_attr(target_os = "macos", path = "macos/clipboard.rs")]
 pub mod clipboard;
 #[cfg(windows)]
-#[path = "clipboard_content.rs"]
+#[path = "windows_clipboard.rs"]
 pub mod clipboard;
 #[cfg(target_os = "linux")]
 mod clipboard_content;
@@ -31,7 +31,7 @@ pub mod notifications;
 #[cfg_attr(target_os = "macos", path = "macos/palette.rs")]
 #[cfg(unix)]
 pub mod palette;
-#[cfg(all(unix, any(target_os = "macos", test)))]
+#[cfg(any(windows, all(unix, any(target_os = "macos", test))))]
 mod pasteboard_reader;
 #[cfg_attr(target_os = "macos", path = "macos/portal.rs")]
 #[cfg(unix)]
@@ -43,11 +43,8 @@ pub(crate) mod portal;
 #[cfg(unix)]
 pub mod runtime;
 #[cfg(windows)]
-pub(crate) mod runtime {
-    pub(crate) fn require_ui(_core: &crate::Core) -> anyhow::Result<()> {
-        anyhow::bail!("desktop UI is not yet supported on Windows")
-    }
-}
+#[path = "windows_runtime.rs"]
+pub mod runtime;
 #[cfg(unix)]
 mod send_request;
 #[cfg(target_os = "linux")]
@@ -61,6 +58,8 @@ pub mod window;
 #[cfg(windows)]
 #[path = "send_request.rs"]
 pub(crate) mod window;
+#[cfg(any(windows, test))]
+mod windows_clipboard_content;
 
 use crate::Config;
 use serde::{Deserialize, Serialize};

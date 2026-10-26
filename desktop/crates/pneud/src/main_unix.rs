@@ -20,6 +20,12 @@ fn main() -> Result<()> {
         );
         return pneud::ui::clipboard::read_helper(args[1].parse()?, args[2] == "marker");
     }
+    #[cfg(windows)]
+    if args.first().is_some_and(|s| s == "clipboard-read") {
+        anyhow::ensure!(args.len() == 4, "clipboard-read expects sequence, mode and images");
+        anyhow::ensure!(matches!(args[2].as_str(), "marker" | "payload"), "invalid reader mode");
+        return pneud::ui::clipboard::read_helper(args[1].parse()?, args[2] == "marker", args[3].parse()?);
+    }
     #[cfg(target_os = "macos")]
     if args.first().is_some_and(|s| s == "login-item") {
         return pneud::macos_login::cli(&args[1..]);
@@ -194,7 +200,6 @@ async fn run(paths: Paths) -> Result<()> {
         let core = Core::new(paths, config, actions.clone()).await?;
         let (stop, rx) = tokio::sync::watch::channel(false);
         let mut ipc = tokio::spawn(Box::pin(ipc::serve(core.clone(), ipc_listener, rx)));
-        #[cfg(unix)]
         let ui = tokio::spawn(Box::pin(pneud::ui::runtime::run(core.clone(),actions.clone(),stop.subscribe())));
         let signals_core=core.clone();
         let signals=tokio::spawn(Box::pin(async move {
@@ -247,7 +252,6 @@ async fn run(paths: Paths) -> Result<()> {
         };
         let _=stop.send(true);
         if !ipc_finished { let _=ipc.await; }
-        #[cfg(unix)]
         let _=ui.await;
         signals.abort();let _=signals.await;
         core.shutdown_actions().await?;

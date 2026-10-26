@@ -410,6 +410,8 @@ impl Driver {
                     self.spawn(
                         vec![Event::Failed(ticket), Event::Stopped(ticket)],
                         async move {
+                            #[cfg(windows)]
+                            let install_authority = authority.clone();
                             let revoked = async move {
                                 if let Some(mut authority) = authority {
                                     authority.revoked().await;
@@ -448,6 +450,16 @@ impl Driver {
                                 result=authorized=>result.is_ok(),
                             };
                             if commit {
+                                #[cfg(windows)]
+                                {
+                                    let stopped = stopped.clone();
+                                    prepared.set_install_authority(move || {
+                                        !*stopped.borrow()
+                                            && install_authority
+                                                .as_ref()
+                                                .is_none_or(Authority::valid)
+                                    });
+                                }
                                 let result = tokio::select! {biased;
                                     _=stopped.changed()=>None,
                                     _=&mut revoked=>{ handle.event(Event::Revoked(token)); None },
@@ -839,6 +851,7 @@ mod tests;
 
 /// Authority is watched independently from the event loop. A blocked install
 /// future is dropped on revocation before the helper is stopped and reaped.
+#[cfg_attr(windows, derive(Clone))]
 struct Authority {
     core: Weak<Core>,
     scope: ActionScope,
