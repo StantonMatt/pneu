@@ -26,7 +26,7 @@ impl Paths {
     }
     pub fn prepare(&self) -> Result<()> {
         #[cfg(windows)]
-        for path in [&self.data, &self.config, &self.cache, &self.socket] {
+        for path in [&self.data, &self.config, &self.cache] {
             platform_fs::validate_path(path)?;
         }
         for path in [&self.data, self.config.parent().context("config parent")?] {
