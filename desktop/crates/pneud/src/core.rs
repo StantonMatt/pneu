@@ -3344,6 +3344,8 @@ impl Core {
             writer_loop(writer_core, &mut writer, WriterQueues {
                 normal: write_rx, priority: priority_rx, automatic: automatic_rx, text: automatic_text_rx, files: outbox_rx,
                 reports: reports_tx, close: writer_close,
+                #[cfg(test)]
+                before_queue_poll: None,
             }).await
         }));
         let reader_signal = close_tx.clone();
@@ -5013,6 +5015,9 @@ struct WriterQueues {
     files: mpsc::Receiver<FileWrite>,
     reports: mpsc::Sender<WriteReport>,
     close: watch::Receiver<Option<CloseReason>>,
+    // Run after the close arm polls Pending, before a queue can return None.
+    #[cfg(test)]
+    before_queue_poll: Option<Box<dyn FnOnce() + Send>>,
 }
 async fn writer_loop<W: tokio::io::AsyncWrite + Unpin>(
     core: Arc<Core>,
@@ -5020,7 +5025,10 @@ async fn writer_loop<W: tokio::io::AsyncWrite + Unpin>(
     queues: WriterQueues,
 ) -> Result<()> {
     Box::pin(async move {
-    let WriterQueues { normal: mut write_rx, priority: mut priority_rx, automatic: mut automatic_rx, text: mut text_rx, files: mut files_rx, reports: reports_tx, close: mut writer_close } = queues;
+    let WriterQueues { normal: mut write_rx, priority: mut priority_rx, automatic: mut automatic_rx, text: mut text_rx, files: mut files_rx, reports: reports_tx, close: mut writer_close,
+        #[cfg(test)]
+        mut before_queue_poll,
+    } = queues;
             loop {
                 let reason = *writer_close.borrow();
                 if let Some(reason) = reason {
@@ -5028,13 +5036,25 @@ async fn writer_loop<W: tokio::io::AsyncWrite + Unpin>(
                 }
                 let work = tokio::select! {biased;
                     _=writer_close.changed()=>{let reason=writer_close.borrow().unwrap_or(CloseReason::Error(ErrorCode::Closing));return close_transport(writer,reason).await;},
-                    message=priority_rx.recv()=>message.map(WriterWork::Frame),
+                    message=async {
+                        #[cfg(test)]
+                        if let Some(hook) = before_queue_poll.take() { hook(); }
+                        priority_rx.recv().await
+                    }=>message.map(WriterWork::Frame),
                     message=write_rx.recv()=>message.map(WriterWork::Frame),
                     text=text_rx.recv()=>text.map(WriterWork::Automatic),
                     file=files_rx.recv()=>file.map(WriterWork::File),
                     automatic=automatic_rx.recv()=>automatic.map(WriterWork::Automatic),
                 };
-                let Some(work) = work else { break; };
+                let Some(work) = work else {
+                    // The close arm may have polled Pending before teardown
+                    // published its reason and dropped the queue senders.
+                    let reason = *writer_close.borrow();
+                    if let Some(reason) = reason {
+                        return close_transport(writer, reason).await;
+                    }
+                    break;
+                };
                 let message = match work {
                     WriterWork::Frame(message) => message,
                     WriterWork::File(work)=>{
@@ -5077,6 +5097,10 @@ async fn writer_loop<W: tokio::io::AsyncWrite + Unpin>(
                     // UNPAIR to that frame; close the unusable stream promptly.
                     None => return crate::transport::close(writer, &[]).await,
                 }
+            }
+            let reason = *writer_close.borrow();
+            if let Some(reason) = reason {
+                return close_transport(writer, reason).await;
             }
             crate::transport::close(writer, &[]).await
     }).await
@@ -6148,6 +6172,120 @@ mod tests {
         );
         Ok(())
     }
+    #[tokio::test]
+    async fn writer_closed_queue_preserves_concurrent_close_reason() -> Result<()> {
+        for reason in [
+            None,
+            Some(CloseReason::Error(ErrorCode::Unauthorized)),
+            Some(CloseReason::Unpair),
+        ] {
+            let (_dir, core, _) = fixture(Arc::new(NoActions)).await?;
+            let (normal_tx, normal) = mpsc::channel(1);
+            let (priority_tx, priority) = mpsc::channel(1);
+            let (automatic_tx, automatic) = mpsc::channel(1);
+            let (text_tx, text) = mpsc::channel(1);
+            let (files_tx, files) = mpsc::channel(1);
+            let (reports, _reported) = mpsc::channel(1);
+            let (close_tx, close) = watch::channel(None);
+            let polled = Arc::new(AtomicBool::new(false));
+            let observed = polled.clone();
+            let mut bytes = Vec::new();
+            writer_loop(
+                core.clone(),
+                &mut bytes,
+                WriterQueues {
+                    normal,
+                    priority,
+                    automatic,
+                    text,
+                    files,
+                    reports,
+                    close,
+                    before_queue_poll: Some(Box::new(move || {
+                        // The biased select has already polled changed() as
+                        // Pending. Publish the reason before dropping every
+                        // sender, as READY teardown does, in this same poll.
+                        if let Some(reason) = reason {
+                            close_tx.send_replace(Some(reason));
+                        }
+                        drop((normal_tx, priority_tx, automatic_tx, text_tx, files_tx));
+                        observed.store(true, Ordering::SeqCst);
+                    })),
+                },
+            )
+            .await?;
+            core.shutdown_actions().await?;
+            assert!(polled.load(Ordering::SeqCst), "queue arm was not polled");
+            let mut wire = std::io::Cursor::new(bytes);
+            if let Some(reason) = reason {
+                assert_eq!(read_frame(&mut wire).await?, Some(reason.message()));
+                if matches!(reason, CloseReason::Unpair) {
+                    assert_eq!(
+                        read_frame(&mut wire).await?,
+                        Some(error_message(ErrorCode::Closing))
+                    );
+                }
+            }
+            assert_eq!(read_frame(&mut wire).await?, None);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn writer_canceled_partial_frame_does_not_append_close_reason() -> Result<()> {
+        use std::future::Future;
+        use std::task::Poll;
+        use tokio::io::AsyncReadExt;
+
+        for reason in [
+            CloseReason::Error(ErrorCode::Unauthorized),
+            CloseReason::Unpair,
+        ] {
+            let (_dir, core, _) = fixture(Arc::new(NoActions)).await?;
+            let (normal_tx, normal) = mpsc::channel(1);
+            let (_priority_tx, priority) = mpsc::channel(1);
+            let (_automatic_tx, automatic) = mpsc::channel(1);
+            let (_text_tx, text) = mpsc::channel(1);
+            let (_files_tx, files) = mpsc::channel(1);
+            let (reports, _reported) = mpsc::channel(1);
+            let (close_tx, close) = watch::channel(None);
+            normal_tx
+                .send(Message::Ping(Ping {
+                    nonce: Nonce::new("0123456789abcdef")?,
+                }))
+                .await?;
+            let (mut stream, mut wire) = tokio::io::duplex(1);
+            let writer = writer_loop(
+                core.clone(),
+                &mut stream,
+                WriterQueues {
+                    normal,
+                    priority,
+                    automatic,
+                    text,
+                    files,
+                    reports,
+                    close,
+                    before_queue_poll: None,
+                },
+            );
+            tokio::pin!(writer);
+            // One byte fits, so the first frame must suspend partway through.
+            std::future::poll_fn(|cx| {
+                assert!(writer.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            close_tx.send_replace(Some(reason));
+            writer.await?;
+            let mut bytes = Vec::new();
+            wire.read_to_end(&mut bytes).await?;
+            core.shutdown_actions().await?;
+            assert_eq!(bytes.len(), 1, "close reason appended to a partial frame");
+        }
+        Ok(())
+    }
+
     struct SlowFlushWriter {
         bytes: Arc<Mutex<Vec<u8>>>,
         sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
@@ -6221,6 +6359,7 @@ mod tests {
                         files,
                         reports,
                         close,
+                        before_queue_poll: None,
                     },
                 )
                 .await
@@ -6313,6 +6452,7 @@ mod tests {
                             files,
                             reports: canceled,
                             close,
+                            before_queue_poll: None,
                         },
                     )
                     .await
@@ -11859,6 +11999,7 @@ mod tests {
                     files,
                     reports,
                     close,
+                    before_queue_poll: None,
                 },
             )
             .await
