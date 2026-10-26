@@ -28,12 +28,14 @@ fn main() -> Result<()> {
     if args.first().is_some_and(|s| s == "uninstall-owned") {
         return pneud::macos_removal::cli(&args[1..]);
     }
+    #[cfg(unix)]
     if args.first().is_some_and(|s| s == "clipboard-helper") {
         return pneud::actions::clipboard_helper(
             args.get(1).context("MIME argument")?.clone(),
             args.get(2).context("install ticket")?.parse()?,
         );
     }
+    #[cfg(unix)]
     if args.first().is_some_and(|s| s == "ui-window") {
         return pneud::ui::window::run(Paths::from_env()?);
     }
@@ -170,7 +172,7 @@ async fn async_main(args: Vec<String>) -> Result<()> {
             }
             result
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         None => run(paths).await,
         Some("run") => run(paths).await,
         _ => bail!("unknown subcommand; use pneud --help"),
@@ -180,7 +182,10 @@ async fn run(paths: Paths) -> Result<()> {
     // Claim IPC before loading/recovering the data store, so a second daemon
     // cannot recover staging files owned by the running instance.
     paths.prepare_runtime()?;
+    #[cfg(unix)]
     let (ipc_listener, _instance_lock) = ipc::bind(&paths.socket)?;
+    #[cfg(windows)]
+    let (ipc_listener, _instance_lock) = ipc::bind(&paths.socket, &paths.data)?;
     async {
         paths.prepare()?;
         let config = Config::load(&paths.config)?;
@@ -189,11 +194,17 @@ async fn run(paths: Paths) -> Result<()> {
         let core = Core::new(paths, config, actions.clone()).await?;
         let (stop, rx) = tokio::sync::watch::channel(false);
         let mut ipc = tokio::spawn(Box::pin(ipc::serve(core.clone(), ipc_listener, rx)));
+        #[cfg(unix)]
         let ui = tokio::spawn(Box::pin(pneud::ui::runtime::run(core.clone(),actions.clone(),stop.subscribe())));
         let signals_core=core.clone();
         let signals=tokio::spawn(Box::pin(async move {
-            let mut terminate=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-            tokio::select! { _=tokio::signal::ctrl_c()=>{},_=terminate.recv()=>{} }
+            #[cfg(unix)]
+            {
+                let mut terminate=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+                tokio::select! { _=tokio::signal::ctrl_c()=>{},_=terminate.recv()=>{} }
+            }
+            #[cfg(windows)]
+            tokio::signal::ctrl_c().await?;
             signals_core.request_shutdown();Ok::<_,anyhow::Error>(())
         }));
         let mut notified=false;
@@ -203,7 +214,13 @@ async fn run(paths: Paths) -> Result<()> {
                     Ok(listener)=>{core.clear_port_error();break listener;},
                     Err(error) if error.kind()==std::io::ErrorKind::AddrInUse=>{
                         core.set_receive_error(Some(pneud::ui::ReceiveError::Port(port)));
-                        if !notified {notified=true;let _=actions.notice(pneud::ui::notifications::Notice::port(port),Vec::new(),None,0,None).await;}
+                        if !notified {
+                            notified=true;
+                            #[cfg(unix)]
+                            let _=actions.notice(pneud::ui::notifications::Notice::port(port),Vec::new(),None,0,None).await;
+                            #[cfg(windows)]
+                            eprintln!("pneud: receive port {port} is already in use");
+                        }
                         tokio::select! { _=core.wait_shutdown()=>return Ok(()),_=tokio::time::sleep(std::time::Duration::from_secs(30))=>{} }
                     }
                     Err(error)=>return Err(error.into()),
@@ -230,6 +247,7 @@ async fn run(paths: Paths) -> Result<()> {
         };
         let _=stop.send(true);
         if !ipc_finished { let _=ipc.await; }
+        #[cfg(unix)]
         let _=ui.await;
         signals.abort();let _=signals.await;
         core.shutdown_actions().await?;

@@ -42,6 +42,12 @@ pub(crate) mod portal;
 #[cfg_attr(target_os = "macos", path = "macos/runtime.rs")]
 #[cfg(unix)]
 pub mod runtime;
+#[cfg(windows)]
+pub(crate) mod runtime {
+    pub(crate) fn require_ui(_core: &crate::Core) -> anyhow::Result<()> {
+        anyhow::bail!("desktop UI is not yet supported on Windows")
+    }
+}
 #[cfg(unix)]
 mod send_request;
 #[cfg(target_os = "linux")]

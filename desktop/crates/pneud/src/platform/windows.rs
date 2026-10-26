@@ -1,4 +1,4 @@
-//! Windows locations. IPC is explicitly unavailable until M2b.
+//! Windows locations and the per-user named-pipe namespace.
 use super::*;
 use anyhow::Context;
 use windows_sys::Win32::UI::Shell::{FOLDERID_Downloads, FOLDERID_LocalAppData};
@@ -16,9 +16,12 @@ pub(crate) fn paths() -> Result<crate::Paths> {
     let data = override_path("PNEU_DATA_DIR", "XDG_DATA_HOME", local.join("data"));
     let config = override_path("PNEU_CONFIG_DIR", "XDG_CONFIG_HOME", local.join("config"));
     let cache = cache_dir_from_env()?;
-    let runtime = env::var_os("PNEU_RUNTIME_DIR")
+    let runtime_override = env::var_os("PNEU_RUNTIME_DIR")
         .or_else(|| env::var_os("XDG_RUNTIME_DIR"))
-        .map(PathBuf::from)
+        .map(PathBuf::from);
+    let runtime = runtime_override
+        .as_ref()
+        .cloned()
         .unwrap_or_else(|| local.join("run"));
     for path in [&data, &config, &cache, &runtime] {
         fs::validate_path(path).with_context(|| format!("invalid Pneu directory {path:?}"))?;
@@ -27,8 +30,7 @@ pub(crate) fn paths() -> Result<crate::Paths> {
         data,
         config: config.join("config.toml"),
         cache,
-        // Deliberately unusable placeholder, not a Unix-socket implementation.
-        socket: runtime.join("M2b-IPC-NOT-SUPPORTED"),
+        socket: crate::ipc::windows_pipe_name(runtime_override.as_deref())?,
     })
 }
 pub(crate) fn cache_dir_from_env() -> Result<PathBuf> {
@@ -42,7 +44,7 @@ pub(crate) fn received_files() -> PathBuf {
         .join("Pneu")
 }
 pub(crate) fn prepare_runtime(_socket: &Path) -> Result<()> {
-    anyhow::bail!("Windows IPC is not yet supported (M2b)")
+    Ok(())
 }
 pub(crate) fn machine_hostname() -> String {
     env::var("COMPUTERNAME").unwrap_or_else(|_| "Pneu PC".into())
@@ -136,7 +138,13 @@ mod tests {
                 received_files(),
                 fs::known_folder(&FOLDERID_Downloads)?.join("Pneu")
             );
-            assert!(prepare_runtime(&paths.socket).is_err());
+            prepare_runtime(&paths.socket)?;
+            assert!(
+                paths
+                    .socket
+                    .to_string_lossy()
+                    .starts_with(r"\\.\pipe\pneu-S-")
+            );
             return Ok(());
         }
         for case in ["native", "xdg", "explicit"] {

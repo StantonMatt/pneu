@@ -4,7 +4,7 @@ use crate::{Config, Core};
 use anyhow::{Context, Result, ensure};
 use pneu_proto::{Hash, Id};
 use serde::{Deserialize, Serialize};
-#[cfg(any(target_os = "linux", test))]
+#[cfg(all(unix, any(target_os = "linux", test)))]
 use std::os::unix::fs::PermissionsExt;
 use std::{path::Path, sync::Arc, time::Duration};
 // 128 PATH_MAX (4096-byte) paths, up to six JSON bytes per path byte,
@@ -14,11 +14,43 @@ pub const REQUEST_LIMIT: usize = 4 * 1024 * 1024;
 pub const RESPONSE_LIMIT: usize = 2 * 1024 * 1024;
 const RESPONSE_PAGE_BYTES: usize = 1024 * 1024;
 
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{UnixListener, UnixStream},
     task::JoinSet,
 };
+#[cfg(unix)]
+type Listener = UnixListener;
+#[cfg(unix)]
+type ServerStream = UnixStream;
+#[cfg(windows)]
+#[path = "platform/windows_ipc.rs"]
+mod windows;
+#[cfg(windows)]
+use windows::Connection as ServerStream;
+#[cfg(windows)]
+pub(crate) use windows::pipe_name as windows_pipe_name;
+#[cfg(windows)]
+pub use windows::{Listener, SocketOwner, bind};
+#[cfg(unix)]
+async fn accept(listener: &mut Listener) -> Result<ServerStream> {
+    Ok(listener.accept().await?.0)
+}
+#[cfg(windows)]
+use windows::{accept, connect};
+#[cfg(unix)]
+async fn connect(path: &Path) -> Result<UnixStream> {
+    Ok(UnixStream::connect(path).await?)
+}
+#[cfg(unix)]
+fn check_client(stream: &ServerStream) -> Result<()> {
+    ensure!(
+        stream.peer_cred()?.uid() == rustix::process::getuid().as_raw(),
+        "foreign IPC owner"
+    );
+    Ok(())
+}
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Command {
@@ -195,6 +227,7 @@ pub struct Reply {
 }
 /// Holds the instance lock and the exact socket entry created by this daemon.
 /// Shutdown must not unlink a replacement socket/file or a replaced parent.
+#[cfg(unix)]
 pub struct SocketOwner {
     _lock: std::fs::File,
     folder: crate::storage::Folder,
@@ -206,6 +239,7 @@ pub struct SocketOwner {
     #[cfg(target_os = "macos")]
     _socket_pin: std::os::unix::net::UnixListener,
 }
+#[cfg(unix)]
 impl Drop for SocketOwner {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]
@@ -281,6 +315,7 @@ pub fn bind(path: &Path) -> Result<(UnixListener, SocketOwner)> {
         },
     ))
 }
+#[cfg(unix)]
 fn bail_existing(path: &Path) -> Result<()> {
     anyhow::bail!(
         "{} already exists; another daemon may own it (remove only after proving it stale)",
@@ -289,35 +324,44 @@ fn bail_existing(path: &Path) -> Result<()> {
 }
 pub async fn serve(
     core: Arc<Core>,
-    listener: UnixListener,
+    mut listener: Listener,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let mut tasks = JoinSet::new();
-    loop {
+    let result = loop {
         if *stop.borrow() {
-            break;
+            break Ok(());
         }
         tokio::select! {
-            _ = stop.changed() => break,
+            _ = stop.changed() => break Ok(()),
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
-            accepted = listener.accept() => {
-                let (stream,_) = match accepted {
+            accepted = accept(&mut listener) => {
+                let stream = match accepted {
                     Ok(accepted) => accepted,
                     Err(error) => {
+                        // Losing the next pipe instance must stop the daemon:
+                        // continuing could surrender ownership of its name.
+                        #[cfg(windows)]
+                        break Err(error);
+                        #[cfg(unix)]
+                        {
                         eprintln!("pneud: IPC accept failed: {error}");
                         tokio::select! {
-                            _ = stop.changed() => break,
+                            _ = stop.changed() => break Ok(()),
                             _ = tokio::time::sleep(Duration::from_millis(100)) => {},
                         }
                         continue;
+                        }
                     }
                 };
                 if tasks.len() < 16 { let core = core.clone(); tasks.spawn(Box::pin(async move { let _ = handle(core,stream).await; })); }
             }
         }
-    }
+    };
+    #[cfg(windows)]
+    tasks.abort_all(); // Dropping each Connection disconnects pending I/O.
     while tasks.join_next().await.is_some() {}
-    Ok(())
+    result
 }
 async fn line(
     reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
@@ -341,11 +385,13 @@ async fn line(
         }
     }
 }
-async fn handle(core: Arc<Core>, stream: UnixStream) -> Result<()> {
-    ensure!(
-        stream.peer_cred()?.uid() == rustix::process::getuid().as_raw(),
-        "foreign IPC owner"
-    );
+async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
+    #[cfg(unix)]
+    check_client(&stream)?;
+    #[cfg(windows)]
+    let mut connection = stream;
+    #[cfg(windows)]
+    let stream = &mut connection.0;
     Box::pin(async move {
 
     let mut stream = BufReader::new(stream);
@@ -443,6 +489,15 @@ async fn handle(core: Arc<Core>, stream: UnixStream) -> Result<()> {
         Ok::<_, anyhow::Error>(())
     })
     .await??;
+    #[cfg(windows)]
+    {
+        // Mio's write_all can finish with the final write still pending. Keep
+        // the handler slot and disconnect guard until the client consumes the
+        // reply and closes; bound non-reading clients even for tiny replies.
+        let mut byte = [0; 1];
+        let _ = tokio::time::timeout(Duration::from_secs(10),
+            tokio::io::AsyncReadExt::read(&mut stream, &mut byte)).await;
+    }
     Ok(())
 
         }).await
@@ -547,15 +602,29 @@ fn append_page(value: &mut serde_json::Value, page: serde_json::Value) -> Result
     Ok(())
 }
 pub async fn request(path: &Path, command: Command) -> Result<serde_json::Value> {
+    request_connected(command, connect(path)).await
+}
+#[cfg(unix)]
+type ClientStream = UnixStream;
+#[cfg(windows)]
+type ClientStream = tokio::net::windows::named_pipe::NamedPipeClient;
+async fn request_connected(
+    command: Command,
+    connection: impl std::future::Future<Output = Result<ClientStream>>,
+) -> Result<serde_json::Value> {
     let encoded = serde_json::to_vec(&command)?;
     ensure!(
         encoded.len() < REQUEST_LIMIT,
         "IPC request exceeds the 4 MiB limit; choose fewer files"
     );
     tokio::time::timeout(Duration::from_secs(20), async {
-        let mut stream = UnixStream::connect(path)
-            .await
-            .context("connect to running pneud")?;
+        let stream = connection.await.context("connect to running pneud")?;
+        #[cfg(windows)]
+        let mut connection = windows::ClientConnection(stream);
+        #[cfg(windows)]
+        let stream = &mut connection.0;
+        #[cfg(unix)]
+        let mut stream = stream;
         stream.write_all(&encoded).await?;
         stream.write_all(b"\n").await?;
         let mut reader = BufReader::new(stream);
@@ -649,7 +718,9 @@ fn parse_send_command(args: &[String], validate_files: bool) -> Result<Command> 
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     struct NoActions;
+    #[cfg(unix)]
     #[async_trait::async_trait]
     impl crate::actions::PcActions for NoActions {
         async fn clipboard_text(&self, _: &str) -> Result<()> {
@@ -666,6 +737,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn disconnected_client_queued_before_accept_does_not_stop_server() -> Result<()> {
         let dir = crate::test_support::scratch()?;
@@ -967,6 +1039,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn request_reassembles_pages_on_one_socket_and_rejects_incomplete_replies() -> Result<()>
     {
@@ -995,6 +1068,7 @@ mod tests {
         }
         Ok(())
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn socket_owner_deletes_only_its_original_entry_and_parent() -> Result<()> {
         for replacement in ["none", "file", "symlink", "socket", "parent"] {
@@ -1050,6 +1124,7 @@ mod tests {
         }
         Ok(())
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn binding_reclaims_stale_owned_socket_but_preserves_foreign_entries() -> Result<()> {
         let dir = tempfile::tempdir()?;
