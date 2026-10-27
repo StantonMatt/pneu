@@ -7,6 +7,12 @@ use pneud::{
 use std::sync::Arc;
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(windows)]
+    if args.first().is_some_and(|a| a.eq_ignore_ascii_case("-Embedding")) {
+        // COM starts a background server even in console-subsystem dev builds.
+        // Detach this process only; never hide a caller's shared console window.
+        unsafe { windows_sys::Win32::System::Console::FreeConsole(); }
+    }
     #[cfg(target_os = "macos")]
     if args.is_empty() {
         pneud::macos_login::enter_bundle()?;
@@ -52,6 +58,8 @@ fn main() -> Result<()> {
         .block_on(async_main(args))
 }
 async fn async_main(args: Vec<String>) -> Result<()> {
+    #[cfg(windows)]
+    let args = if args.first().is_some_and(|a| a.eq_ignore_ascii_case("-Embedding")) { vec!["-Embedding".into()] } else { args };
     let paths = Paths::from_env()?;
     match args.first().map(String::as_str) {
         Some("send") => {
@@ -179,6 +187,14 @@ async fn async_main(args: Vec<String>) -> Result<()> {
         }
         #[cfg(any(target_os = "linux", windows))]
         None => run(paths).await,
+        #[cfg(windows)]
+        Some("-Embedding") => {
+            // COM may race a normal launch; a duplicate cold server exits cleanly.
+            match run(paths).await {
+                Err(error) if error.chain().any(|e| e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)) => Ok(()),
+                result => result,
+            }
+        }
         Some("run") => run(paths).await,
         _ => bail!("unknown subcommand; use pneud --help"),
     }
@@ -195,6 +211,8 @@ async fn run(paths: Paths) -> Result<()> {
         paths.prepare()?;
         let config = Config::load(&paths.config)?;
         let actions = Arc::new(DesktopActions::new(paths.cache.clone()));
+        #[cfg(windows)]
+        if let Err(error) = actions.start_notifications().await { eprintln!("pneud: notifications unavailable: {error:#}"); }
         let port = config.port;
         let core = Core::new(paths, config, actions.clone()).await?;
         let (stop, rx) = tokio::sync::watch::channel(false);
@@ -220,7 +238,6 @@ async fn run(paths: Paths) -> Result<()> {
                         core.set_receive_error(Some(pneud::ui::ReceiveError::Port(port)));
                         if !notified {
                             notified=true;
-                            #[cfg(unix)]
                             let _=actions.notice(pneud::ui::notifications::Notice::port(port),Vec::new(),None,0,None).await;
                             #[cfg(windows)]
                             eprintln!("pneud: receive port {port} is already in use");

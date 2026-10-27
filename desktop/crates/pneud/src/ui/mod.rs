@@ -25,7 +25,7 @@ mod drop_target;
 mod interactions;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
-#[cfg(all(unix, any(target_os = "macos", test)))]
+#[cfg(any(windows, all(unix, any(target_os = "macos", test))))]
 pub(crate) mod notice_lifecycle;
 pub mod notifications;
 #[cfg_attr(target_os = "macos", path = "macos/palette.rs")]
@@ -51,7 +51,7 @@ pub mod tray;
 #[cfg(windows)]
 #[path = "windows_tray.rs"]
 pub mod tray;
-mod tray_model;
+pub(crate) mod tray_model;
 #[cfg(all(unix, any(target_os = "macos", test)))]
 mod viewer_cache;
 pub mod window;
@@ -61,6 +61,8 @@ mod window_process;
 mod windows_clipboard_content;
 #[cfg(windows)]
 mod windows_picker;
+#[cfg(any(windows, test))]
+pub(crate) mod windows_toast_model;
 #[cfg(windows)]
 mod windows_window;
 
