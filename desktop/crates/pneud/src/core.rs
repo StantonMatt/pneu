@@ -2630,7 +2630,7 @@ impl Core {
             );
             if !verifier.admit(&fp) {
                 self.event(Event::Blocked {
-                    address: peer_address.ip().to_string(),
+                    address: peer_address.ip().to_canonical().to_string(),
                 });
                 crate::transport::close(
                     &mut tls,
@@ -9316,6 +9316,66 @@ mod tests {
             .insert(device.clone(), ActionScope::new());
         Ok((dir, core, device))
     }
+    #[tokio::test]
+    async fn blocked_notice_uses_canonical_peer_addresses() -> Result<()> {
+        let (dir, core, _) = fixture(Arc::new(NoActions)).await?;
+        let phone = crate::client::Phone::new(dir.path().join("unpaired-phone"))?;
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(crate::tls::client_config(
+            &phone.identity,
+            core.identity.fingerprint.clone(),
+        )?));
+        let mut events = core.subscribe();
+        for (bind, host) in [
+            ("::", "127.0.0.1"),
+            ("127.0.0.1", "127.0.0.1"),
+            ("::1", "::1"),
+        ] {
+            let listener = if bind == "::" {
+                crate::net::listen(0).await?
+            } else {
+                TcpListener::bind((bind, 0)).await?
+            };
+            let port = listener.local_addr()?.port();
+            let (client, accepted) =
+                tokio::try_join!(TcpStream::connect((host, port)), listener.accept())?;
+            let permit = core.ingress.clone().acquire_owned().await?;
+            let server = core.clone().connection(accepted.0, permit);
+            let client = connector.connect(
+                rustls::pki_types::ServerName::try_from("pneu.local")?,
+                client,
+            );
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let (server, client) = tokio::join!(server, async {
+                    let mut tls: TlsStream<TcpStream> = client.await?.into();
+                    assert!(matches!(
+                        read_handshake(&mut tls).await?,
+                        Message::Error(ErrorMessage {
+                            code: ErrorCode::Unauthorized,
+                            ..
+                        })
+                    ));
+                    Ok::<_, anyhow::Error>(())
+                });
+                server?;
+                client?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await??;
+            let Event::Blocked { address } =
+                tokio::time::timeout(Duration::from_secs(2), events.recv()).await??
+            else {
+                panic!("expected blocked event");
+            };
+            assert_eq!(address, host);
+            assert_eq!(
+                crate::ui::notifications::Notice::blocked(&address).body,
+                format!("{host} tried to connect")
+            );
+        }
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+
     fn test_begin(bytes: &[u8]) -> FileBegin {
         FileBegin {
             hlc: None,
