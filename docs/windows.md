@@ -149,6 +149,14 @@ passes foreground rights to the child. Native `IFileOpenDialog` pickers choose
 files and folders; the window fits the monitor's work area. A daemon-owned
 kill-on-close Job Object contains the window child.
 
+Files can also be sent from outside the picker. The packaged app is a share
+target, so **Share → Pneu** in Explorer (and other apps' share sheets) forwards
+the selected files to the daemon's chooser, starting the daemon if needed;
+folders are refused. Dragging files over the window shows the drop overlay:
+dropping on a device row sends there, dropping elsewhere opens the chooser. The
+window's OLE drop target is in
+[windows_drag.rs](../desktop/crates/pneud/src/ui/windows_drag.rs).
+
 Closing the window keeps transfers and the tray running. The first eligible
 close shows a silent **Pneu is still running** toast. Its private seen marker is
 written only after successful display; turning notifications off leaves it
@@ -245,5 +253,3 @@ Explorer recovery, DPI/theme changes, cold toasts, startup and updates.
   QR scanner.
 - Physical acceptance remains pending, including real LAN multicast, Tailscale
   on the Public profile, a fresh standard-user install and mixed-DPI monitors.
-- Explorer Share and dropping files on the window are
-  [in review in PR #21](https://github.com/StantonMatt/pneu/pull/21).

@@ -11,7 +11,7 @@ Pronounced “new”, after pneumatic tubes.
 Pneu connects your Android phones and Linux, Mac or Windows computers directly. Pair each phone with several computers, and pair computers with each other.
 
 - Send new phone screenshots to all connected computers automatically. Camera photos and screen recordings are optional.
-- Send files to one or all connected devices, including the phone: use **Send with Pneu** in Dolphin, **Send Files…** in the desktop window, **Send Files To** in the Mac menu bar, `pneud send --to`, or **Share → Pneu** on Android.
+- Send files to one or all connected devices, including the phone: use **Send with Pneu** in Dolphin, **Send Files…** in the desktop window, **Send Files To** in the Mac menu bar, **Share → Pneu** or dropping files on the window on Windows, `pneud send --to`, or **Share → Pneu** on Android.
 - Share clipboard text automatically between computers and from computers to the phone. Phone → computers needs a tap because Android blocks background clipboard reading.
 - Save received files, show notifications, copy supported images to the clipboard, or open images in a viewer (off by default).
 
