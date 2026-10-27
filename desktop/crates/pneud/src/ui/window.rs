@@ -192,7 +192,7 @@ enum Action {
     Close,
     #[cfg(target_os = "macos")]
     Native(super::macos::native::MenuAction),
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     DropFiles {
         files: Vec<PathBuf>,
         targets: Vec<contract::CapturedTarget>,
@@ -1083,10 +1083,12 @@ pub fn run(paths: Paths) -> Result<()> {
     slint::BackendSelector::new()
         .backend_name("winit".into())
         .renderer_name("software".into())
+        .with_winit_window_attributes_hook(|attributes| {
+            use slint::winit_030::winit::platform::windows::WindowAttributesExtWindows;
+            attributes.with_drag_and_drop(false)
+        })
         .select()?;
     let window = PneuWindow::new()?;
-    #[cfg(windows)]
-    super::windows_window::install(&window);
     let visible = Arc::new(AtomicBool::new(
         cfg!(any(target_os = "linux", windows)) || startup_request != 0,
     ));
@@ -1115,6 +1117,11 @@ pub fn run(paths: Paths) -> Result<()> {
         })?;
         super::macos::camera::install(&window);
         install_drop(&window, &view, &commands_for_drop);
+    }
+    #[cfg(windows)]
+    {
+        window.global::<Ui>().set_drop_supported(true);
+        install_drop(&window, &view, &commands);
     }
     #[cfg(windows)]
     let _login_poll = super::windows_login::install(&window);
@@ -1193,6 +1200,8 @@ pub fn run(paths: Paths) -> Result<()> {
     let event_loop_result = slint::run_event_loop_until_quit();
     #[cfg(target_os = "macos")]
     super::macos::native::cleanup();
+    #[cfg(windows)]
+    super::windows_drag::cleanup();
     drop(window);
     drop(commands);
     let _ = worker.join();
@@ -1200,12 +1209,17 @@ pub fn run(paths: Paths) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn install_drop(
     window: &PneuWindow,
     view: &Arc<Mutex<View>>,
     commands: &tokio::sync::mpsc::UnboundedSender<Action>,
 ) {
+    #[cfg(target_os = "macos")]
+    use super::macos::drag as native_drop;
+    #[cfg(windows)]
+    use super::windows_drag as native_drop;
+    #[cfg(target_os = "macos")]
     use slint::winit_030::{EventResult, WinitWindowAccessor};
     struct DropSession {
         origin: View,
@@ -1265,7 +1279,11 @@ fn install_drop(
             return false;
         };
         let ui = w.global::<Ui>();
-        if ui.get_dialog() != Dialog::None || !super::macos::native::accepts_drop() {
+        if ui.get_dialog() != Dialog::None {
+            return false;
+        }
+        #[cfg(target_os = "macos")]
+        if !super::macos::native::accepts_drop() {
             return false;
         }
         let origin = frame.lock().expect("drop frame").clone();
@@ -1318,6 +1336,10 @@ fn install_drop(
             .and_then(|s| s.hit(&w, point));
         w.global::<Ui>()
             .set_drop_hover(selected.map(|i| i as i32).unwrap_or(-1));
+        #[cfg(windows)]
+        if selected.is_none() && w.global::<Ui>().get_drop_active() {
+            return outside_drop_list(&w, point);
+        }
         selected.is_some()
     });
     let pending = session.clone();
@@ -1338,7 +1360,19 @@ fn install_drop(
         {
             return false;
         }
-        let Some(index) = session.hit(&w, point) else {
+        let index = session.hit(&w, point);
+        #[cfg(windows)]
+        if index.is_none() && outside_drop_list(&w, point) {
+            return output
+                .send(Action::DropFiles {
+                    files,
+                    targets: Vec::new(),
+                    origin: session.origin,
+                    targeted: false,
+                })
+                .is_ok();
+        }
+        let Some(index) = index else {
             return false;
         };
         let Some(targets) = session.targets.get(index).filter(|t| !t.is_empty()) else {
@@ -1375,19 +1409,38 @@ fn install_drop(
             ui.set_drop_hover(-1);
         }
     });
-    let callbacks = super::macos::drag::Callbacks {
+    let callbacks = native_drop::Callbacks {
         begin,
         hover,
         drop,
         cancel,
     };
+    #[cfg(target_os = "macos")]
     let weak = window.as_weak();
+    #[cfg(target_os = "macos")]
     window.window().on_winit_window_event(move |_, _| {
         if let Some(w) = weak.upgrade() {
-            super::macos::drag::install(&w, callbacks.clone());
+            native_drop::install(&w, callbacks.clone());
         }
         EventResult::Propagate
     });
+    // Share the existing event filter: Slint can create its HWND after show()
+    // and before the first native event, later than a zero-duration timer.
+    #[cfg(windows)]
+    super::windows_window::install(window, move |w| {
+        native_drop::install(w, callbacks.clone());
+    });
+}
+
+#[cfg(windows)]
+fn outside_drop_list(window: &PneuWindow, point: (f64, f64)) -> bool {
+    let g = window.get_drop_geometry();
+    point.0.is_finite()
+        && point.1.is_finite()
+        && !(point.0 >= g.x as f64
+            && point.1 >= g.y as f64
+            && point.0 < (g.x + g.width) as f64
+            && point.1 < (g.y + g.height) as f64)
 }
 
 #[derive(Clone)]
@@ -1895,7 +1948,7 @@ impl Worker {
                 self.picker_files.clear();
                 self.picker_targets.clear();
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             Action::DropFiles {
                 files,
                 targets,
@@ -1904,7 +1957,18 @@ impl Worker {
             } => {
                 if self.view() == origin {
                     let result = async {
-                        let targets = serde_json::from_value(serde_json::to_value(targets)?)?;
+                        let targets: Vec<crate::outbox::Authority> =
+                            serde_json::from_value(serde_json::to_value(targets)?)?;
+                        #[cfg(windows)]
+                        if targets.is_empty() {
+                            self.command(ipc::Command::PresentFiles {
+                                paths: files,
+                                targets: crate::outbox::Targets::All("all".into()),
+                                request_id: None,
+                            })
+                            .await?;
+                            return Ok::<_, anyhow::Error>(());
+                        }
                         self.command(ipc::Command::PresentPicker {
                             paths: Some(files),
                             targets,
