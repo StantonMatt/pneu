@@ -35,6 +35,7 @@ export struct RecentItem {
     detail: string,
     detail-tone: Tone,
     picture: bool,
+    video: bool,
     clipboard: bool,
     progress: float,
     can-cancel: bool,
@@ -251,7 +252,7 @@ component RecentRow inherits NavRow {
                 width: 36px; height: 36px; border-radius: 8px; background: Pneu.button;
                 Image { accessible-role: none;
                     x: 9px; y: 9px; width: 18px; height: 18px; colorize: Pneu.text2;
-                    source: root.item.clipboard ? Icons.paste : root.item.picture ? Icons.picture : Icons.file;
+                    source: root.item.clipboard ? Icons.paste : root.item.picture ? Icons.picture : root.item.video ? Icons.video : Icons.file;
                 }
             }
         }
