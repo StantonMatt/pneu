@@ -1,9 +1,6 @@
 //! Per-user Windows daemon integrations, with optional interactive presentation.
 use super::{Command, window::SendRequest};
-use crate::{
-    Core, Event,
-    actions::{DesktopActions, PcActions},
-};
+use crate::{Core, Event, actions::DesktopActions};
 use anyhow::Result;
 use std::{sync::Arc, time::Duration};
 use tokio::{
@@ -17,7 +14,7 @@ pub(crate) fn require_ui(_core: &Core) -> Result<()> {
 }
 pub async fn run(
     core: Arc<Core>,
-    actions: Arc<DesktopActions>,
+    _actions: Arc<DesktopActions>,
     mut stop: watch::Receiver<bool>,
 ) -> Result<()> {
     let interactive = require_ui(&core).is_ok();
@@ -64,6 +61,14 @@ pub async fn run(
                 Command::ChooseFolder => core.request_window(true),
                 Command::AddDevice { .. } => core.request_add_device_with_activation(None),
                 Command::Quit => core.request_shutdown(),
+                Command::OpenFolder => {
+                    let folder = core.config().save_path;
+                    jobs.spawn(async move {
+                        if let Err(error) = crate::actions::open_folder(&folder).await {
+                            eprintln!("pneud: couldn't open received files: {error:#}");
+                        }
+                    });
+                }
                 Command::SendFiles { recipients, targeted } => {
                     if let Err(error) = core.present_send(SendRequest { id: crate::random_hex(16), paths: None, targets: recipients, clipboard: false, targeted, error: None }) { eprintln!("pneud: send unavailable: {error:#}"); }
                 }
@@ -71,12 +76,11 @@ pub async fn run(
                     if let Err(error) = core.present_send(SendRequest { id: crate::random_hex(16), paths: None, targets: recipients, clipboard: true, targeted: false, error: None }) { eprintln!("pneud: send unavailable: {error:#}"); }
                 }
                 command => {
-                    let core = core.clone(); let actions = actions.clone();
+                    let core = core.clone();
                     jobs.spawn(async move {
                         let result = match command {
                             Command::Toggle(toggle) => core.toggle_setting(toggle).await,
                             Command::ClipboardMode(mode) => core.set_setting("clipboard_mode".into(), serde_json::json!(mode)).await,
-                            Command::OpenFolder => actions.open(&core.config().save_path).await,
                             Command::RetryTransfer { operation, artifact, device } => core.retry_transfer_artifact(operation, Some(artifact), device).await,
                             _ => unreachable!(),
                         };

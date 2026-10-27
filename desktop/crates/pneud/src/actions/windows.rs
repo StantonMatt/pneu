@@ -1,6 +1,16 @@
-//! Native clipboard effects; other desktop integrations arrive later.
+//! Native clipboard and Shell effects; notifications arrive later.
 use super::*;
 use anyhow::Context;
+#[path = "windows_shell.rs"]
+mod shell;
+
+pub async fn open_folder(path: &Path) -> Result<()> {
+    shell::open_folder(path.to_owned()).await?.await
+}
+
+pub async fn show_files(paths: &[PathBuf]) -> Result<()> {
+    shell::show_files(paths.to_owned()).await?.await
+}
 
 pub struct DesktopActions {
     // Preparation and reaping of retired offers only. Installed writers must
@@ -89,8 +99,18 @@ impl PcActions for DesktopActions {
     ) -> Result<()> {
         anyhow::bail!("notifications are not yet supported on Windows")
     }
-    async fn open(&self, _path: &Path) -> Result<()> {
-        anyhow::bail!("opening files is not yet supported on Windows")
+    async fn open(&self, path: &Path) -> Result<()> {
+        let file = ReceivedFile::open(path).map_err(|_| FileUnavailable)?;
+        self.open_received(&file).await
+    }
+    async fn open_received(&self, file: &ReceivedFile) -> Result<()> {
+        self.begin_open_received(file).await?.await
+    }
+    async fn begin_open_received(
+        &self,
+        file: &ReceivedFile,
+    ) -> Result<crate::ui::portal::Interaction> {
+        shell::open_received(file.clone()).await
     }
 }
 
@@ -378,7 +398,6 @@ mod tests {
                 .contains("require the clipboard actor")
         );
         for result in [
-            actions.open(Path::new("unused")).await,
             actions
                 .notify(Path::new("unused"), "application/octet-stream")
                 .await,
