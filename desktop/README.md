@@ -1,6 +1,6 @@
 # Pneu desktop core
 
-`pneud` 2.1.0 is the Linux and macOS daemon; `pneu-sim` is a legacy
+`pneud` 2.1.0 is the Linux, macOS and Windows daemon; `pneu-sim` is a legacy
 phone transport simulator. Shared syntax and framing live in `pneu-proto`;
 the [wire protocol](../docs/PROTOCOL.md) defines mesh negotiation and delivery.
 Nothing in this directory installs automatically.
@@ -10,6 +10,10 @@ Rust 1.93+ and Qt 6 development tools (`QMAKE=qmake6`). On macOS 15.4+,
 `./install-macos.sh` builds and installs `Pneu.app`, with a menu bar and Slint
 window. Apple Silicon is tested; see the [macOS guide](../docs/macos.md) for
 requirements, Open at login, native clipboard, notifications and camera pairing.
+Windows uses a native tray, clipboard and toasts with a Slint/winit window. It
+works from source and as a sideloaded MSIX; the Microsoft Store listing is coming.
+See the [Windows guide](../docs/windows.md) for the MSVC toolchain, packaging,
+StartupTask and native testing.
 
 From the repository root on Linux:
 
@@ -22,7 +26,9 @@ cargo fmt --check
 heavy cargo build --release -p pneud -p pneu-sim
 ```
 
-Run `pneud run` to start the daemon and tray/menu bar. Tray activation or
+Run `pneud run` to start the daemon and tray/menu bar. On Windows, `Pneu.exe`
+opens the window and starts the daemon if needed; `pneud.exe` is the console CLI.
+Tray activation or
 `pneud window` opens the desktop window. Use **Add Device… → Phone** to show a
 QR for the phone. **Add Device… → Computer** offers **Show Pairing Code** and
 **Paste Link**, plus **Scan QR Code** on a Mac with a camera. Each computer can
@@ -35,7 +41,7 @@ and pairing completion share one predicate: both wall-clock and monotonic expiry
 must remain in the future. `pneud close-pairing` also invalidates it. The CLI and
 window share a pairing invitation
 with at most three interface addresses. Linux selects them in three rounds
-(Mac interface selection is described in the [macOS guide](../docs/macos.md#discovery-and-host-metadata)):
+(other platforms are described in the [macOS guide](../docs/macos.md#discovery-and-host-metadata) and [Windows guide](../docs/windows.md#discovery)):
 
 1. One best address per eligible interface: IPv4 if present, otherwise IPv6 with
    global, non-temporary addresses preferred. Interfaces are ordered Tailscale
@@ -139,16 +145,19 @@ integration tests. The executable binds dual-stack `[::]:47821` by default.
 - `request_shutdown()` stops the server; await `serve` to join connection workers.
   `shutdown_actions()` can also explicitly close desktop integrations.
 
-The CLI uses bounded newline JSON `ipc::Command` requests on an owner-only,
-uid-checked Unix socket. Linux uses `$XDG_RUNTIME_DIR/pneud.sock`; Mac paths are
-listed in the [macOS guide](../docs/macos.md#paths-and-overrides). Rust callers can use `Core`
-directly. A supervised `pneud ui-window` child keeps window/backend failures
-separate from transport. Linux uses Slint/Qt and the XDG portal; macOS uses
-Slint/winit and native AppKit integration. Closing the window leaves transfers
-running. Core owns one short-lived invitation shared by CLI and window.
+The CLI uses bounded newline JSON `ipc::Command` requests. Unix sockets are
+owner-only and uid-checked; Linux uses `$XDG_RUNTIME_DIR/pneud.sock`. Windows
+uses a protected, user-SID-namespaced named pipe with peer security/session
+checks. Platform paths and boundaries are in the [macOS guide](../docs/macos.md#paths-and-overrides)
+and [Windows guide](../docs/windows.md#storage-and-ipc-security). Rust callers can
+use `Core` directly. A `pneud ui-window` child keeps window/backend failures
+separate from transport: on demand on Linux/Windows, persistently supervised on
+macOS. Linux uses Slint/Qt and the XDG portal; macOS and Windows use Slint/winit
+with native integrations. Closing the window leaves transfers running. Core owns one short-lived invitation shared by CLI and window.
 
 The clipboard actor owns observation, ordering, echo suppression and frozen
-recipients. Linux observes Wayland CLIPBOARD offers; macOS observes NSPasteboard.
+recipients. Linux observes Wayland CLIPBOARD offers; macOS observes NSPasteboard;
+Windows uses Win32 clipboard format notifications and a killable reader helper.
 Reads and OS effects run outside the actor. Password/sensitive markers suppress
 sharing, and received content is not automatically forwarded. Disconnect or a
 policy change invalidates unsent work; an already-started frame may finish.
@@ -169,7 +178,7 @@ Unpairing or replacing one binding leaves the other peers intact and preserves
 saved user files. Per-peer binding and connection generations reject stale
 work; mesh links resolve simultaneous computer dials deterministically.
 
-SQLite uses WAL, `synchronous=FULL`, owner-only files and foreign-key cascades.
+SQLite uses WAL, `synchronous=FULL`, private files and foreign-key cascades.
 It stores peer bindings, file receipts, pair settings and their synchronization
 state, clipboard clocks/hashed history, outgoing file operations, failed-save
 cache references and previously used staging folders. Clipboard payloads are
@@ -189,7 +198,7 @@ total). Unknown pairing admission is limited to once per second.
 The dialer drives periodic PINGs; the acceptor answers them. Cache pruning runs
 hourly. Successful retries
 retire failed-save previews by reopening without following links and checking
-recorded device, inode, size and nanosecond modification/change times, relative
+recorded platform file identity, size and modification/change times, relative
 to the original directory handle. The evidence holds no file descriptors, so
 pruning reclaims blocks even without a retry. Evidence is bounded to 128 entries;
 after restart or eviction, previews remain for normal retention pruning.
@@ -214,7 +223,9 @@ request even after invitation expiry. An already-bound certificate/device gets
 accepted=true without checking the old token, then the phone persists its binding.
 
 Receive files use directory handles for staging, rename and cleanup, streamed
-SHA-256, and Linux `renameat2(NOREPLACE)`. Commit order is staging file fsync,
+SHA-256, and no-replace placement through the platform filesystem layer (Unix
+`rustix::fs::renameat_with`, Windows `NtSetInformationFile`). Commit order is
+staging file fsync,
 rename without replacement, destination/new-ancestor fsync, receipt transaction,
 then ACK. Commit consumes the verified streamed count/digest and checks staged
 length; it never rehashes completed file contents or repeats the file fsync.
@@ -248,9 +259,9 @@ Completed file IDs have no expiry until unpair; cached files expire with a
 one-day default retention.
 
 `PcActions` isolates OS integration from protocol tests. The following desktop
-actions describe Linux; see the [macOS guide](../docs/macos.md) for native
-equivalents and their limits. Linux uses zbus
-notifications with the approved text, actions, urgency and transient hints.
+actions describe Linux; see the [macOS guide](../docs/macos.md) and
+[Windows guide](../docs/windows.md) for native equivalents and their limits.
+Linux uses zbus notifications with the approved text, actions, urgency and transient hints.
 File notifications use `x-kde-urls` for Plasma thumbnails; explicit clipboard
 images use a bounded inline image preview. Notification Open/default uses only
 its retained receive descriptor, including after the pathname is replaced or
@@ -328,8 +339,9 @@ to the real compositor socket, because its runtime directory is temporary.
 
 ## Specification decisions
 
-The [protocol](../docs/PROTOCOL.md) takes precedence over the original v1
-[plan](../docs/PLAN.md). Operation identity is
+The [protocol](../docs/PROTOCOL.md) defines the wire contract; the
+[plan](../docs/PLAN.md) records current scope and historical milestones.
+Operation identity is
 `(authenticated sender device_id, transfer_id)`. Mesh is negotiated only when
 both HELLOs advertise `mesh`; legacy-compatible connections keep v1 wire
 behaviour. A feature requiring an update does not revoke trust or discard queues.
