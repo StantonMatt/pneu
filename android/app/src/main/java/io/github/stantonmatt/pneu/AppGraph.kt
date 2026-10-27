@@ -93,6 +93,9 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
     val receivedFiles = ReceivedFiles(this)
     val receivedRecent get()=receivedFiles.recent
     val connection = Connections(this)
+    internal val tileInputs=combine(prefs,connection.state,connection.devices) {p,s,devices->
+        TilePolicy.inputs(p,s,devices,connection.clipboardAvailable(p))
+    }.distinctUntilChanged().shareIn(scope,SharingStarted.Eagerly,replay=1)
     fun recipients(p:Prefs,kind:String,automatic:Boolean=false,selected:Set<String>?=null):List<DeliveryBinding> {
         val online=p.devices.filter {connection.connected(it.deviceId)}.map {it.deviceId}.toSet()
         return RecipientSelection.freeze(p,online,kind,automatic,selected).filter {target->target.pcId !in online ||
@@ -394,6 +397,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
         true
     }}
     init {
+        scope.launch {tileInputs.collect {TileRefresh.request(context)}}
         scope.launch {
             PostCommit.maintain {ManualEntries.clearLegacyShortcuts(context)}
             java.io.File(context.cacheDir,"shared-recent").deleteRecursively()

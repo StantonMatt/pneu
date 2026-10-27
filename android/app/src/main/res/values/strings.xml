@@ -257,7 +257,7 @@
 <plurals name="toast_sending_items_computers"><item quantity="one">Sending %1$d items to %2$d computer</item><item quantity="other">Sending %1$d items to %2$d computers</item></plurals>
 <string name="detail_computers">%1$d computers</string>
 <string name="detail_connected_computers">%1$d of %2$d computers</string>
-<string name="tile_connected_computers">%1$d of %2$d computers connected</string>
+<string name="tile_connected_computers">%1$d of %2$d connected</string>
     <string name="delivery_stopped">Stopped</string>
     <string name="delivery_superseded">Replaced by a newer item</string>
     <string name="delivery_skipped">Skipped</string>

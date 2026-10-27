@@ -29,9 +29,11 @@
         <service android:name=".features.PneuTile" android:label="@string/tile_pneu" android:icon="@drawable/ic_stat_pneu" android:permission="android.permission.BIND_QUICK_SETTINGS_TILE" android:exported="true">
             <intent-filter><action android:name="android.service.quicksettings.action.QS_TILE"/></intent-filter>
             <meta-data android:name="android.service.quicksettings.TOGGLEABLE_TILE" android:value="true"/>
+            <meta-data android:name="android.service.quicksettings.ACTIVE_TILE" android:value="true"/>
         </service>
         <service android:name=".features.ClipboardTile" android:label="@string/tile_send_clipboard" android:icon="@drawable/ic_content_paste_go" android:permission="android.permission.BIND_QUICK_SETTINGS_TILE" android:exported="true">
             <intent-filter><action android:name="android.service.quicksettings.action.QS_TILE"/></intent-filter>
+            <meta-data android:name="android.service.quicksettings.ACTIVE_TILE" android:value="true"/>
         </service>
         <service android:name=".features.ShareAdmissionService" android:exported="false" android:stopWithTask="false" android:foregroundServiceType="connectedDevice"/>
         <service android:name=".PneuService" android:exported="false" android:foregroundServiceType="connectedDevice" android:stopWithTask="false"/>

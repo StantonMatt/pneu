@@ -207,25 +207,36 @@ class ShareActivity : ManualEntryActivity() {
     }
 }
 
+internal object TileRefresh {
+    fun request(context:Context) {
+        for(service in listOf(PneuTile::class.java,ClipboardTile::class.java)) {
+            try {TileService.requestListeningState(context,ComponentName(context,service))}
+            catch(e:SecurityException) {android.util.Log.w("PneuTile",e.javaClass.simpleName)}
+            catch(e:IllegalArgumentException) {android.util.Log.w("PneuTile",e.javaClass.simpleName)}
+        }
+    }
+}
 abstract class PneuTileBase : TileService() {
     protected val scope=CoroutineScope(SupervisorJob()+Dispatchers.Main.immediate)
     private var listening: Job?=null
+    // The graph may already be alive when a previously absent tile is added.
+    override fun onTileAdded() {super.onTileAdded();TileRefresh.request(this)}
     override fun onStartListening() {
         super.onStartListening();listening?.cancel()
-        listening=scope.launch {combine(graph.prefs,graph.connection.state,graph.connection.devices) {p,s,_->p to s}.collect {(p,s)->if(p.loaded)render(p,s) else qsTile?.apply {state=Tile.STATE_UNAVAILABLE;updateTile()}}}
+        listening=scope.launch {graph.tileInputs.collect {render(it)}}
     }
-    abstract fun render(p: Prefs,s: io.github.stantonmatt.pneu.connection.LinkState)
+    internal abstract fun render(p:TileInputs)
     override fun onStopListening() {listening?.cancel();super.onStopListening()}
     protected fun open(activity: Class<*>,p:Prefs) {val intent=if(activity==SendClipboardActivity::class.java)ManualEntries.clipboardIntent(this,p) else Intent(this,activity);startActivityAndCollapse(PendingIntent.getActivity(this,0,intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK).putExtra("home",true),PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT))}
     override fun onDestroy() {scope.cancel();super.onDestroy()}
 }
 class PneuTile : PneuTileBase() {
-    override fun render(p: Prefs,s: io.github.stantonmatt.pneu.connection.LinkState) {
-        val presentation=TilePolicy.present(p,s.connectionStatus,s.route)
+    internal override fun render(p:TileInputs) {
+        val presentation=TilePolicy.present(p)
         qsTile?.apply {
             label=this@PneuTile.getString(R.string.tile_pneu);icon=Icon.createWithResource(this@PneuTile,R.drawable.ic_stat_pneu)
             state=when {!presentation.available->Tile.STATE_UNAVAILABLE;presentation.active->Tile.STATE_ACTIVE;else->Tile.STATE_INACTIVE}
-            subtitle=if(p.devices.size>1 && presentation.active)getString(R.string.tile_connected_computers,graph.connection.devices.value.values.count {it.connectionStatus==io.github.stantonmatt.pneu.connection.ConnectionStatus.CONNECTED},p.devices.size) else presentation.subtitle?.let {getString(it)};updateTile()
+            subtitle=if(p.devices.size>1 && presentation.active)getString(R.string.tile_connected_computers,p.connectedCount,p.devices.size) else presentation.subtitle?.let {getString(it)};updateTile()
         }
     }
     override fun onClick() {super.onClick();scope.launch {UiActions.feedback(this@PneuTile).run(getString(R.string.toast_settings)) {
@@ -235,9 +246,9 @@ class PneuTile : PneuTileBase() {
     }}}
 }
 class ClipboardTile : PneuTileBase() {
-    override fun render(p: Prefs,s: io.github.stantonmatt.pneu.connection.LinkState) {
-        val presentation=TilePolicy.present(p,s.connectionStatus,s.route,clipboard=true,clipboardAvailable=graph.connection.clipboardAvailable(p))
-        qsTile?.apply {label=this@ClipboardTile.getString(R.string.tile_send_clipboard);icon=Icon.createWithResource(this@ClipboardTile,R.drawable.ic_content_paste_go);state=if(presentation.available)Tile.STATE_INACTIVE else Tile.STATE_UNAVAILABLE;subtitle=if(p.devices.size>1 && graph.connection.clipboardAvailable(p))getString(R.string.tile_connected_computers,graph.connection.devices.value.values.count {it.connectionStatus==io.github.stantonmatt.pneu.connection.ConnectionStatus.CONNECTED},p.devices.size) else presentation.subtitle?.let {getString(it)};updateTile()}
+    internal override fun render(p:TileInputs) {
+        val presentation=TilePolicy.present(p,clipboard=true)
+        qsTile?.apply {label=this@ClipboardTile.getString(R.string.tile_send_clipboard);icon=Icon.createWithResource(this@ClipboardTile,R.drawable.ic_content_paste_go);state=if(presentation.available)Tile.STATE_INACTIVE else Tile.STATE_UNAVAILABLE;subtitle=if(p.devices.size>1 && p.clipboardAvailable)getString(R.string.tile_connected_computers,p.connectedCount,p.devices.size) else presentation.subtitle?.let {getString(it)};updateTile()}
     }
     override fun onClick() {super.onClick();scope.launch {UiActions.feedback(this@ClipboardTile).run(getString(R.string.toast_settings)) {
         val p=graph.awaitPrefs();if(!p.quickSettings)return@run
