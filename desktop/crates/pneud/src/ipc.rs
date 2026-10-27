@@ -620,6 +620,22 @@ async fn request_connected(
     tokio::time::timeout(Duration::from_secs(20), async {
         let stream = connection.await.context("connect to running pneud")?;
         #[cfg(windows)]
+        if matches!(command, Command::ShowWindow { .. }) {
+            use std::os::windows::io::AsRawHandle;
+            // Only after the connection-bound owner/DACL/session checks: pass
+            // the Shell launcher's foreground rights to the existing daemon.
+            let mut pid = 0;
+            unsafe {
+                if windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId(
+                    stream.as_raw_handle(),
+                    &mut pid,
+                ) != 0
+                {
+                    windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(pid);
+                }
+            }
+        }
+        #[cfg(windows)]
         let mut connection = windows::ClientConnection(stream);
         #[cfg(windows)]
         let stream = &mut connection.0;

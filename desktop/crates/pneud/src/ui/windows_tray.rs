@@ -102,6 +102,7 @@ pub async fn start(
     }
 }
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    let session = crate::windows_package::session_message(message, w);
     if message == WM_CLOSE {
         unsafe {
             EndMenu();
@@ -109,7 +110,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
         }
         return 0;
     }
-    unsafe { DefWindowProcW(hwnd, message, w, l) }
+    session.unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, message, w, l) })
 }
 struct LoopWindow(HWND);
 impl Drop for LoopWindow {

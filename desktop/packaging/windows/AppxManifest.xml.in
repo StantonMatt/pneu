@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+ xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+ xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+ xmlns:desktop2="http://schemas.microsoft.com/appx/manifest/desktop/windows10/2"
+ xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
+ xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
+ xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+ IgnorableNamespaces="uap desktop desktop2 uap5 com rescap">
+ <Identity Name="@IDENTITY_NAME@" Publisher="@PUBLISHER@" Version="@VERSION@" ProcessorArchitecture="x64"/>
+ <Properties>
+  <DisplayName>Pneu</DisplayName><PublisherDisplayName>@PUBLISHER_DISPLAY_NAME@</PublisherDisplayName>
+  <Logo>Assets\StoreLogo.png</Logo>
+ </Properties>
+ <Resources><Resource Language="en-us"/></Resources>
+ <Dependencies><TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0"/></Dependencies>
+ <Applications><Application Id="App" Executable="Pneu.exe" EntryPoint="Windows.FullTrustApplication">
+  <uap:VisualElements DisplayName="Pneu" Description="Send files between your devices" BackgroundColor="transparent"
+   Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png"/>
+  <Extensions>
+   <desktop:Extension Category="windows.startupTask" Executable="Pneu.exe" EntryPoint="Windows.FullTrustApplication">
+    <desktop:StartupTask TaskId="PneuStartup" Enabled="true" DisplayName="Pneu"/>
+   </desktop:Extension>
+   <desktop:Extension Category="windows.toastNotificationActivation">
+    <desktop:ToastNotificationActivation ToastActivatorCLSID="9f3b5a91-4c6f-4ad1-a7d9-51e647ee32b8"/>
+   </desktop:Extension>
+   <com:Extension Category="windows.comServer"><com:ComServer>
+    <com:ExeServer Executable="Pneu.exe" DisplayName="Pneu">
+     <com:Class Id="9f3b5a91-4c6f-4ad1-a7d9-51e647ee32b8" DisplayName="Pneu"/>
+    </com:ExeServer>
+   </com:ComServer></com:Extension>
+   <uap5:Extension Category="windows.appExecutionAlias" Executable="pneud.exe" EntryPoint="Windows.FullTrustApplication">
+    <uap5:AppExecutionAlias><uap5:ExecutionAlias Alias="pneud.exe"/></uap5:AppExecutionAlias>
+   </uap5:Extension>
+  </Extensions>
+ </Application></Applications>
+ <Extensions>
+  <desktop2:Extension Category="windows.firewallRules"><desktop2:FirewallRules Executable="Pneu.exe">
+   <desktop2:Rule Direction="in" IPProtocol="TCP" Profile="all" LocalPortMin="47821" LocalPortMax="47821"/>
+   <desktop2:Rule Direction="in" IPProtocol="UDP" Profile="all" LocalPortMin="5353" LocalPortMax="5353"/>
+  </desktop2:FirewallRules></desktop2:Extension>
+  <desktop2:Extension Category="windows.firewallRules"><desktop2:FirewallRules Executable="pneud.exe">
+   <desktop2:Rule Direction="in" IPProtocol="TCP" Profile="all" LocalPortMin="47821" LocalPortMax="47821"/>
+   <desktop2:Rule Direction="in" IPProtocol="UDP" Profile="all" LocalPortMin="5353" LocalPortMax="5353"/>
+  </desktop2:FirewallRules></desktop2:Extension>
+ </Extensions>
+ <Capabilities><rescap:Capability Name="runFullTrust"/></Capabilities>
+</Package>

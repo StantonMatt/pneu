@@ -60,6 +60,8 @@ mod window_process;
 #[cfg(any(windows, test))]
 mod windows_clipboard_content;
 #[cfg(windows)]
+mod windows_login;
+#[cfg(windows)]
 mod windows_picker;
 #[cfg(any(windows, test))]
 pub(crate) mod windows_toast_model;

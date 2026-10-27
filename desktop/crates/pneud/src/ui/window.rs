@@ -1116,6 +1116,8 @@ pub fn run(paths: Paths) -> Result<()> {
         super::macos::camera::install(&window);
         install_drop(&window, &view, &commands_for_drop);
     }
+    #[cfg(windows)]
+    let _login_poll = super::windows_login::install(&window);
     let weak = window.as_weak();
     let worker = std::thread::Builder::new().name("pneu-window-ipc".into()).stack_size(8 * 1024 * 1024).spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()

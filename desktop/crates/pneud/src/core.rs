@@ -2488,6 +2488,13 @@ impl Core {
         }
         self.actions.shutdown().await
     }
+    /// After stopping and joining producers (IPC/UI), wait for detached blocking
+    /// saves too. Cancelling their async caller does not cancel Store work.
+    pub async fn finish_shutdown(&self) -> Result<()> {
+        let actions = self.shutdown_actions().await;
+        self.store.drain().await;
+        actions
+    }
     /// Listener injection supports in-process ephemeral-port tests. The daemon
     /// uses net::listen for [::] (explicitly dual stack on Windows) and enables mDNS.
     pub async fn serve(self: Arc<Self>, listener: TcpListener, advertise: bool) -> Result<()> {
@@ -2563,8 +2570,7 @@ impl Core {
         }
         while tasks.join_next().await.is_some() {}
         supervisor.await??;
-        self.shutdown_actions().await?;
-        self.store.drain().await;
+        self.finish_shutdown().await?;
         #[cfg(test)]
         eprintln!(
             "test Core stopped PID={} port={}",
@@ -10648,6 +10654,41 @@ mod tests {
         );
         assert!(core.admission.lock().unwrap().invitation.is_none());
         assert_eq!(core.paired_devices(), vec![device]);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn final_shutdown_waits_for_cancelled_callers_store_save() -> Result<()> {
+        let (_dir, core, _) = fixture(Arc::new(NoActions)).await?;
+        // Remove unrelated action waits so Pending below can only be Store work.
+        core.shutdown_actions().await?;
+        let (entered, wait) = tokio::sync::oneshot::channel();
+        let (release, blocking) = std::sync::mpsc::channel();
+        let path = core.paths.config.clone();
+        let mut config = core.config();
+        config.name = "Saved before shutdown".into();
+        let store = core.store.clone();
+        let caller = tokio::spawn(async move {
+            store
+                .blocking(move |_| {
+                    let _ = entered.send(());
+                    blocking.recv()?;
+                    config.save(&path)
+                })
+                .await
+        });
+        wait.await?;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        core.request_shutdown();
+        let mut shutdown = Box::pin(core.finish_shutdown());
+        assert!(futures_util::poll!(shutdown.as_mut()).is_pending());
+        release.send(())?;
+        shutdown.await?;
+        assert_eq!(core.store.active_jobs(), 0);
+        assert_eq!(
+            Config::load(&core.paths.config)?.name,
+            "Saved before shutdown"
+        );
         Ok(())
     }
     #[test]

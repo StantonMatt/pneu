@@ -21,6 +21,8 @@ mod test_support;
 pub mod tls;
 mod transport;
 pub mod ui;
+#[cfg(windows)]
+pub mod windows_package;
 mod work;
 pub use config::{Config, Paths};
 pub use core::{ClipboardTarget, Core, Event};
