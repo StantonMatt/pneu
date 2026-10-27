@@ -161,6 +161,10 @@ pub enum Command {
     },
     Status,
     UiStatus,
+    #[cfg(windows)]
+    WindowClosed {
+        request: u64,
+    },
     WindowFocus {
         request: u64,
         focused: bool,
@@ -455,6 +459,8 @@ async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
         Command::PeerSettings {device} => core.peer_settings(device).await?,
         Command::SetPeerSetting {device,key,enabled} => core.set_peer_setting(device,key,enabled).await?,
         Command::DiscardClipboard {device} => { core.discard_clipboard(device).await?; serde_json::Value::Null },
+        #[cfg(windows)]
+        Command::WindowClosed { request } => { core.window_closed(request); serde_json::Value::Null },
         Command::WindowFocus { request, focused } => { core.set_window_focus(request, focused); serde_json::Value::Null },
         Command::UiStatus => { let (revision, invitation) = core.pairing_status(); let snapshot = core.ui_snapshot(); let (window_request, activation_token) = core.window_request_with_activation(); serde_json::json!({"device":snapshot.device, "snapshot":snapshot, "config": core.config(), "window_request":window_request,"add_device":core.window_add_device(window_request),"activation_token":activation_token,"invitation_revision":revision,"invitation":invitation,"pending_send":core.pending_send()}) },
         Command::AddDevice => { core.request_add_device(); serde_json::Value::Null },

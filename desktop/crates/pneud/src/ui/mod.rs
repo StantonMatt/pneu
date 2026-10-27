@@ -60,6 +60,8 @@ mod window_process;
 #[cfg(any(windows, test))]
 mod windows_clipboard_content;
 #[cfg(windows)]
+mod windows_close;
+#[cfg(windows)]
 mod windows_login;
 #[cfg(windows)]
 mod windows_picker;

@@ -16,7 +16,7 @@ use windows::{
     core::w,
 };
 
-fn state(enabled: Option<bool>) -> Result<StartupTaskState> {
+pub(super) fn state(enabled: Option<bool>) -> Result<StartupTaskState> {
     let _apartment = crate::windows_package::Apartment::new()?;
     let task = StartupTask::GetAsync(&"PneuStartup".into())?.join()?;
     match enabled {
