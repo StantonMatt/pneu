@@ -167,7 +167,7 @@ impl Notice {
     /// Stays until dismissed: "Couldn't send report.pdf to MacBook Air".
     pub fn send_failed(file: &str, device: &str, reason: &str) -> Self {
         let mut n = Self::new(format!("Couldn't send {file} to {}", label(device)));
-        n.body = escape(reason);
+        n.body = escape(&send_failure_reason(device, reason));
         n.actions.push(("retry", "Retry"));
         n
     }
@@ -182,6 +182,19 @@ fn label(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_whitespace() { ' ' } else { c })
         .collect()
+}
+pub(crate) fn send_failure_reason(device: &str, reason: &str) -> String {
+    let device = label(device);
+    match reason {
+        "UnsupportedKind" | "unsupported_kind" => {
+            format!("Update Pneu on {device} to send this kind of file")
+        }
+        "DiskFull" | "disk_full" => format!("{device}'s disk is full"),
+        "NotWritable" | "not_writable" | "StorageFailed" | "storage_failed" => {
+            format!("{device} can't save files right now")
+        }
+        _ => "Something went wrong. Try again.".into(),
+    }
 }
 pub fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
@@ -337,8 +350,9 @@ mod tests {
             Notice::sent("a.png", &["MacBook Air".into()]).summary,
             "a.png sent to MacBook Air"
         );
-        let failed = Notice::send_failed("report.pdf", "MacBook Air", "MacBook Air's disk is full");
+        let failed = Notice::send_failed("report.pdf", "MacBook Air", "DiskFull");
         assert_eq!(failed.summary, "Couldn't send report.pdf to MacBook Air");
+        assert_eq!(failed.body, "MacBook Air's disk is full");
         assert_eq!(failed.actions, vec![("retry", "Retry")]);
         assert!(!failed.transient);
         assert_eq!(
@@ -348,6 +362,54 @@ mod tests {
             } else {
                 "Office-PC unpaired this computer"
             }
+        );
+    }
+    #[test]
+    fn send_failure_codes_and_legacy_stored_errors_use_plain_words() {
+        for (code, expected) in [
+            (
+                NackCode::UnsupportedKind,
+                "Update Pneu on MacBook Air to send this kind of file",
+            ),
+            (NackCode::DiskFull, "MacBook Air's disk is full"),
+            (
+                NackCode::NotWritable,
+                "MacBook Air can't save files right now",
+            ),
+            (
+                NackCode::StorageFailed,
+                "MacBook Air can't save files right now",
+            ),
+            (NackCode::HashMismatch, "Something went wrong. Try again."),
+            (NackCode::SizeMismatch, "Something went wrong. Try again."),
+            (NackCode::IdConflict, "Something went wrong. Try again."),
+            (
+                NackCode::ClipboardUnavailable,
+                "Something went wrong. Try again.",
+            ),
+        ] {
+            let wire: String = serde_json::from_value(serde_json::to_value(code).unwrap()).unwrap();
+            for reason in [wire, format!("{code:?}")] {
+                assert_eq!(send_failure_reason("MacBook Air", &reason), expected);
+                assert_eq!(
+                    Notice::send_failed("report.pdf", "MacBook Air", &reason).body,
+                    expected
+                );
+            }
+        }
+        assert_eq!(
+            send_failure_reason("MacBook Air", "UnsupportedKind"),
+            "Update Pneu on MacBook Air to send this kind of file"
+        );
+        for reason in ["", "FutureCode", "internal file path: /private/staged"] {
+            assert_eq!(
+                send_failure_reason("MacBook Air", reason),
+                "Something went wrong. Try again."
+            );
+        }
+        assert_eq!(
+            Notice::send_failed("report.pdf", "Office <PC>&\nDesk", "NotWritable").body,
+            "Office &lt;PC&gt;&amp; Desk can't save files right now"
         );
     }
     #[test]
