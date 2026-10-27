@@ -61,6 +61,114 @@ pub fn startup_activation() -> Result<bool> {
     Ok(AppInstance::GetActivatedEventArgs()?.Kind()? == ActivationKind::StartupTask)
 }
 
+/// Native share/drop inputs obey the regular-file policy of CLI sends.
+pub(crate) fn validate_send_paths(paths: &[std::path::PathBuf]) -> Result<()> {
+    ensure!(
+        !paths.is_empty() && paths.len() <= 128,
+        "choose 1 to 128 regular files"
+    );
+    for path in paths {
+        ensure!(path.is_absolute(), "file paths must be absolute");
+        let file = crate::storage::open_regular_file(path)?;
+        ensure!(
+            file.metadata()?.len() <= crate::outbox::PEER_BYTES.min(pneu_proto::MAX_FILE_SIZE),
+            "file exceeds send size limit"
+        );
+    }
+    Ok(())
+}
+/// Share activation is a short-lived client. The normal daemon owns the chooser
+/// and all transfers, including when the share sheet was the first launch.
+pub async fn share_activation(paths: &crate::Paths) -> Result<bool> {
+    use std::os::windows::{ffi::OsStringExt, process::CommandExt};
+    use windows::{
+        ApplicationModel::{
+            Activation::ShareTargetActivatedEventArgs, DataTransfer::StandardDataFormats,
+        },
+        Storage::StorageItemTypes,
+        core::{HSTRING, Interface},
+    };
+    if !packaged()? {
+        return Ok(false);
+    }
+    let _apartment = Apartment::new()?;
+    let args = AppInstance::GetActivatedEventArgs()?;
+    if args.Kind()? != ActivationKind::ShareTarget {
+        return Ok(false);
+    }
+    let operation = args
+        .cast::<ShareTargetActivatedEventArgs>()?
+        .ShareOperation()?;
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        let data = operation.Data()?;
+        ensure!(
+            data.Contains(&StandardDataFormats::StorageItems()?)?,
+            "share regular files to Pneu"
+        );
+        let items = data.GetStorageItemsAsync()?.await?;
+        ensure!(
+            (1..=128).contains(&items.Size()?),
+            "choose 1 to 128 regular files"
+        );
+        let mut files = Vec::new();
+        for item in items {
+            ensure!(
+                item.IsOfType(StorageItemTypes::File)?,
+                "folders cannot be sent; choose regular files"
+            );
+            files.push(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+                item.Path()?.as_ref(),
+            )));
+        }
+        validate_send_paths(&files)?;
+        if crate::ipc::request(&paths.socket, crate::ipc::Command::Status)
+            .await
+            .is_err()
+        {
+            std::process::Command::new(std::env::current_exe()?)
+                .arg("run")
+                .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            let mut ready = false;
+            for _ in 0..80 {
+                if crate::ipc::request(&paths.socket, crate::ipc::Command::Status)
+                    .await
+                    .is_ok()
+                {
+                    ready = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            ensure!(ready, "Pneu could not start");
+        }
+        crate::ipc::request(
+            &paths.socket,
+            crate::ipc::Command::PresentFiles {
+                paths: files,
+                targets: crate::outbox::Targets::All("all".into()),
+                request_id: None,
+            },
+        )
+        .await?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("Pneu did not respond to the share request")
+    .and_then(|result| result);
+    match result {
+        Ok(()) => operation.ReportCompleted()?,
+        Err(error) => {
+            operation.ReportError(&HSTRING::from(format!("Couldn't send files: {error}")))?;
+            return Err(error);
+        }
+    }
+    Ok(true)
+}
+
 static CORE: OnceLock<Mutex<Weak<crate::Core>>> = OnceLock::new();
 /// Also used by the tray and clipboard windows. Only the session owner waits
 /// for cleanup, so the UI threads can still join during daemon shutdown.
@@ -215,6 +323,32 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn share_and_drop_paths_require_bounded_absolute_regular_files() -> Result<()> {
+        let dir = crate::test_support::scratch()?;
+        let file = dir.path().join("file with spaces.txt");
+        std::fs::write(&file, b"native shell input")?;
+        validate_send_paths(std::slice::from_ref(&file))?;
+        validate_send_paths(&vec![file.clone(); 128])?;
+        assert!(validate_send_paths(&[]).is_err());
+        assert!(validate_send_paths(&vec![file.clone(); 129]).is_err());
+        for invalid in [
+            std::path::PathBuf::from("relative.txt"),
+            std::path::PathBuf::from(r"C:drive-relative.txt"),
+            std::path::PathBuf::from(r"\root-relative.txt"),
+            dir.path().to_path_buf(),
+            dir.path().join("missing.txt"),
+        ] {
+            assert!(validate_send_paths(&[file.clone(), invalid]).is_err());
+        }
+        // A file replaced by a directory between native selection and admission
+        // cannot pass this boundary either.
+        std::fs::remove_file(&file)?;
+        std::fs::create_dir(&file)?;
+        assert!(validate_send_paths(&[file]).is_err());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn native_session_cancel_then_close_or_end_drains_owner() -> Result<()> {
