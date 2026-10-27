@@ -2082,7 +2082,7 @@ impl Worker {
                         {
                             use crate::actions::PcActions;
                             crate::actions::DesktopActions::new(PathBuf::new())
-                                .open(file.path())
+                                .open_received(&file)
                                 .await
                         }
                     }));
