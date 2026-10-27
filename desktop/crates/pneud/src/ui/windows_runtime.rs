@@ -43,9 +43,6 @@ pub async fn run(
     let mut last_blocked = None;
     let mut jobs = tokio::task::JoinSet::new();
     let mut timer = tokio::time::interval(Duration::from_secs(1));
-    if interactive && core.paired_devices().is_empty() {
-        core.request_window(false);
-    }
     while !*stop.borrow() {
         let mut update_tray = true;
         tokio::select! {

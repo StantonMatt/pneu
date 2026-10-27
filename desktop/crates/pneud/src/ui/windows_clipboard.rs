@@ -54,6 +54,10 @@ pub(super) fn interactive() -> Result<()> {
     }
     Ok(())
 }
+unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    crate::windows_package::session_message(message, w)
+        .unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, message, w, l) })
+}
 struct Window(HWND);
 impl Window {
     fn new() -> Result<Self> {
@@ -62,7 +66,7 @@ impl Window {
             let name = wide("PneuClipboard");
             let module = GetModuleHandleW(null());
             let class = WNDCLASSW {
-                lpfnWndProc: Some(DefWindowProcW),
+                lpfnWndProc: Some(window_proc),
                 hInstance: module,
                 lpszClassName: name.as_ptr(),
                 ..std::mem::zeroed()

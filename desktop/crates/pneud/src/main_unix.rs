@@ -185,21 +185,46 @@ async fn async_main(args: Vec<String>) -> Result<()> {
             }
             result
         }
-        #[cfg(any(target_os = "linux", windows))]
-        None => run(paths).await,
+        #[cfg(target_os = "linux")]
+        None => run(paths, false).await,
+        #[cfg(windows)]
+        None => {
+            let show = GUI_LAUNCHER && !pneud::windows_package::startup_activation()?;
+            if show && ipc::request(&paths.socket, Command::ShowWindow { choose_folder: false }).await.is_ok() {
+                return Ok(());
+            }
+            // A launch can race the first instance binding its pipe. Retry only
+            // a duplicate-instance failure, never start another recovery pass.
+            match run(paths.clone(), show).await {
+                Err(error) if show && duplicate_instance(&error) => {
+                    for _ in 0..50 {
+                        if ipc::request(&paths.socket, Command::ShowWindow { choose_folder: false }).await.is_ok() { return Ok(()); }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    Err(error)
+                }
+                result => result,
+            }
+        },
         #[cfg(windows)]
         Some("-Embedding") => {
             // COM may race a normal launch; a duplicate cold server exits cleanly.
-            match run(paths).await {
+            match run(paths, false).await {
                 Err(error) if error.chain().any(|e| e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)) => Ok(()),
                 result => result,
             }
         }
-        Some("run") => run(paths).await,
+        Some("run") => run(paths, false).await,
         _ => bail!("unknown subcommand; use pneud --help"),
     }
 }
-async fn run(paths: Paths) -> Result<()> {
+#[cfg(windows)]
+fn duplicate_instance(error: &anyhow::Error) -> bool {
+    error.chain().any(|e| e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock))
+}
+async fn run(paths: Paths, show_window: bool) -> Result<()> {
+    #[cfg(not(windows))]
+    let _ = show_window;
     // Claim IPC before loading/recovering the data store, so a second daemon
     // cannot recover staging files owned by the running instance.
     paths.prepare_runtime()?;
@@ -207,7 +232,9 @@ async fn run(paths: Paths) -> Result<()> {
     let (ipc_listener, _instance_lock) = ipc::bind(&paths.socket)?;
     #[cfg(windows)]
     let (ipc_listener, _instance_lock) = ipc::bind(&paths.socket, &paths.data)?;
-    async {
+    #[cfg(windows)]
+    let mut session = None;
+    let result = async {
         paths.prepare()?;
         let config = Config::load(&paths.config)?;
         let actions = Arc::new(DesktopActions::new(paths.cache.clone()));
@@ -215,6 +242,18 @@ async fn run(paths: Paths) -> Result<()> {
         if let Err(error) = actions.start_notifications().await { eprintln!("pneud: notifications unavailable: {error:#}"); }
         let port = config.port;
         let core = Core::new(paths, config, actions.clone()).await?;
+        #[cfg(windows)]
+        {
+            match pneud::windows_package::Session::start(&core).await {
+                Ok(started) => session = Some(started),
+                Err(error) => {
+                    core.finish_shutdown().await?;
+                    return Err(error);
+                }
+            }
+        }
+        #[cfg(windows)]
+        if show_window { core.request_window(false); }
         let (stop, rx) = tokio::sync::watch::channel(false);
         let mut ipc = tokio::spawn(Box::pin(ipc::serve(core.clone(), ipc_listener, rx)));
         let ui = tokio::spawn(Box::pin(pneud::ui::runtime::run(core.clone(),actions.clone(),stop.subscribe())));
@@ -270,8 +309,18 @@ async fn run(paths: Paths) -> Result<()> {
         if !ipc_finished { let _=ipc.await; }
         let _=ui.await;
         signals.abort();let _=signals.await;
-        core.shutdown_actions().await?;
+        // IPC/UI can submit Store jobs after serve's drain, or while the
+        // receive port is occupied. Join them first, then drain every exit.
+        core.finish_shutdown().await?;
         serving
     }
-    .await
+    .await;
+    #[cfg(windows)]
+    {
+        // End-session is acknowledged only after Core/store destruction and
+        // release of the instance lock; Restart Manager can now replace us.
+        drop(_instance_lock);
+        drop(session);
+    }
+    result
 }

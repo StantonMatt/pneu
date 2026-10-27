@@ -9,6 +9,19 @@ fn override_path(native: &str, xdg: &str, fallback: PathBuf) -> PathBuf {
         .unwrap_or(fallback)
 }
 fn local() -> Result<PathBuf> {
+    // NT handle-relative I/O deliberately bypasses Win32 redirection. Resolve
+    // the real package cache first so storage validation and SQLite agree on
+    // identity, while keeping Downloads outside the package's lifetime.
+    if crate::windows_package::packaged()? {
+        let _apartment = crate::windows_package::Apartment::new()?;
+        return Ok(PathBuf::from(
+            ::windows::Storage::ApplicationData::Current()?
+                .LocalCacheFolder()?
+                .Path()?
+                .to_string(),
+        )
+        .join("Local/Pneu"));
+    }
     Ok(fs::known_folder(&FOLDERID_LocalAppData)?.join("Pneu"))
 }
 pub(crate) fn paths() -> Result<crate::Paths> {

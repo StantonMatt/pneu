@@ -1,4 +1,4 @@
-name: macOS release
+name: Desktop release
 
 "on":
   push:
@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: macos-release-${{ inputs.tag || github.ref_name }}
+  group: desktop-release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 env:
@@ -70,6 +70,50 @@ jobs:
           path: |
             ${{ runner.temp }}/pneu-release/Pneu-macOS.zip
             ${{ runner.temp }}/pneu-release/SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  windows-msix:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Validate the tag input
+        run: |
+          if ($env:RELEASE_TAG -notlike 'v*') { throw 'Expected a version tag' }
+          git check-ref-format "refs/tags/$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      - name: Check version and install the workspace Rust toolchain
+        working-directory: desktop
+        run: |
+          $version = python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($env:RELEASE_TAG -ne "v$version") { throw 'Tag must match workspace version' }
+          $rust = python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["rust-version"])'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup toolchain install $rust --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default $rust
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: desktop
+      - name: Build unsigned MSIX
+        run: desktop/packaging/windows/build-msix.ps1 -OutDir "$env:RUNNER_TEMP/pneu-msix"
+      # Unsigned packages cannot be installed. Keep these as workflow artifacts;
+      # Store identity/signing and submission are a separate release gate.
+      - name: Upload unsigned MSIX
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Pneu-Windows-unsigned
+          path: ${{ runner.temp }}/pneu-msix/*.msix
           if-no-files-found: error
           compression-level: 0
           retention-days: 7

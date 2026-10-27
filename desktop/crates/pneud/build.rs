@@ -1,4 +1,15 @@
 fn main() {
+    #[cfg(windows)]
+    {
+        println!("cargo:rerun-if-changed=../../packaging/windows/Pneu.ico");
+        winresource::WindowsResource::new()
+            .set_icon("../../packaging/windows/Pneu.ico")
+            .set("FileDescription", "Pneu")
+            .set("ProductName", "Pneu")
+            .set("OriginalFilename", "Pneu.exe")
+            .compile()
+            .expect("compile Windows icon and version resources");
+    }
     println!("cargo:rerun-if-changed=src/ui/macos/camera.m");
     #[cfg(target_os = "macos")]
     {

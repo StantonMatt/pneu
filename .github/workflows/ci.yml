@@ -106,7 +106,7 @@ jobs:
       # Runtime/IPC/desktop adapters await later milestones; their test targets
       # are compile-gated. Run all currently Windows-compilable pneud targets.
       - name: Test Windows filesystem and shared daemon
-        run: cargo test --locked -p pneud
+        run: cargo test --locked -p pneud --features windows-package
 
   android:
     name: Android unit tests and lint

@@ -75,10 +75,13 @@ export global Ui {
     in-out property <int> drop-hover: -1;
     in-out property <[DropItem]> drop-items;
     in property <bool> is-mac: false;
+    in property <bool> login-available: Ui.is-mac;
     in property <bool> login-enabled;
     in property <bool> login-busy;
     in property <string> login-error;
     in property <bool> login-pending;
+    in property <bool> login-managed;
+    in property <string> login-detail;
     in property <bool> camera-available: false;
     in property <image> camera-preview;
     in property <ScanState> scan-state;
@@ -844,11 +847,31 @@ export component PneuWindow inherits Window {
                                 }
                             }
                         }
-                        if Ui.is-mac: Card {
+                        if Ui.login-available: Card {
                             VerticalLayout {
-                                SwitchRow {label: "Open at login"; checked: Ui.login-enabled; enabled: !Ui.login-busy; toggled(on) => {Ui.login(on);} }
-                                if Ui.login-error != "": Row { Text {text: Ui.login-error; color: Pneu.danger; wrap: word-wrap;} }
-                                if Ui.login-pending || Ui.login-error != "": Row {
+                                if Ui.is-mac || (!Ui.login-pending && Ui.login-error == ""): SwitchRow {
+                                    label: "Open at login"; sub: Ui.login-detail;
+                                    checked: Ui.login-enabled; enabled: !Ui.login-busy && !Ui.login-managed;
+                                    toggled(on) => { Ui.login(on); }
+                                }
+                                if !Ui.is-mac && (Ui.login-pending || Ui.login-error != ""): Row {
+                                    VerticalLayout {
+                                        horizontal-stretch: 1; spacing: 2px;
+                                        Text { text: "Open at login"; color: Pneu.text; }
+                                        Text {
+                                            text: Ui.login-error != "" ? Ui.login-error : Ui.login-detail;
+                                            font-size: Pneu.label-size;
+                                            color: Ui.login-error != "" ? Pneu.danger : Pneu.text2;
+                                            wrap: word-wrap;
+                                        }
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        PneuButton { text: "Open Settings"; clicked => { Ui.system-settings("login"); } }
+                                    }
+                                }
+                                if Ui.is-mac && Ui.login-error != "": Row { Text {text: Ui.login-error; color: Pneu.danger; wrap: word-wrap;} }
+                                if Ui.is-mac && (Ui.login-pending || Ui.login-error != ""): Row {
                                     PneuButton {text: "Open System Settings"; clicked => {Ui.system-settings("login");} }
                                 }
                             }
