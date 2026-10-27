@@ -1140,6 +1140,8 @@ pub fn run(paths: Paths) -> Result<()> {
                         match command {
                             Some(Action::Close) => {
                                 worker.close(&visible).await;
+                                #[cfg(windows)]
+                                let _ = ipc::request(&worker.paths.socket, ipc::Command::WindowClosed { request: worker.request }).await;
                             }
                             Some(action) => worker.act(action).await,
                             None => break,

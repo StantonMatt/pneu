@@ -97,6 +97,11 @@ pub async fn run(
                 }
             },
             event = events.recv() => match event {
+                Ok(Event::WindowClosed { request }) => {
+                    if let Err(error) = super::windows_close::show(&core, &actions, request).await {
+                        eprintln!("pneud: first-close notice: {error:#}");
+                    }
+                },
                 Ok(Event::TransferProgress { .. }) => update_tray = false,
                 Ok(event) => {
                     use super::notifications::Notice;

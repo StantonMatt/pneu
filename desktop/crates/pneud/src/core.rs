@@ -49,6 +49,10 @@ use file_sender::{FileWrite, transmit_file};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
+    #[cfg(windows)]
+    WindowClosed {
+        request: u64,
+    },
     ConnectionChanged {
         device: Id,
         connected: bool,
@@ -2076,6 +2080,14 @@ impl Core {
         self.clipboard_observed(token, None, false);
         reply.await??;
         Ok(offer)
+    }
+    #[cfg(windows)]
+    pub(crate) fn window_closed(&self, request: u64) {
+        let _ = self.events.send(Event::WindowClosed { request });
+    }
+    #[cfg(windows)]
+    pub(crate) fn window_close_current(&self, request: u64) -> bool {
+        self.window_request() == request && !*self.shutdown.borrow()
     }
     pub(crate) fn set_window_focus(&self, request: u64, focused: bool) {
         if self.window_request.lock().expect("window request").0 == request {
