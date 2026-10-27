@@ -1,20 +1,20 @@
 //! Per-user Windows daemon integrations, with optional interactive presentation.
-use super::{Command, window::SendRequest};
+use super::{Command, window::SendRequest, window_process::Child};
 use crate::{Core, Event, actions::DesktopActions};
 use anyhow::Result;
 use std::{sync::Arc, time::Duration};
-use tokio::{
-    process::Child,
-    sync::{mpsc, watch},
-};
+use tokio::sync::{mpsc, watch};
 
 pub(crate) fn require_ui(_core: &Core) -> Result<()> {
+    require_ui_session()
+}
+pub(crate) fn require_ui_session() -> Result<()> {
     super::clipboard::interactive()
         .map_err(|_| anyhow::anyhow!("desktop UI requires an interactive Windows session"))
 }
 pub async fn run(
     core: Arc<Core>,
-    _actions: Arc<DesktopActions>,
+    actions: Arc<DesktopActions>,
     mut stop: watch::Receiver<bool>,
 ) -> Result<()> {
     let interactive = require_ui(&core).is_ok();
@@ -31,6 +31,7 @@ pub async fn run(
         eprintln!("pneud: tray and window unavailable: no interactive Windows session");
         None
     };
+    let mut activations = actions.take_activations();
     let mut events = core.subscribe();
     let mut watcher = if interactive {
         super::clipboard::Watch::start(core.clone()).ok()
@@ -39,6 +40,7 @@ pub async fn run(
     };
     let mut window: Option<Child> = None;
     let mut last_request = 0;
+    let mut last_blocked = None;
     let mut jobs = tokio::task::JoinSet::new();
     let mut timer = tokio::time::interval(Duration::from_secs(1));
     if interactive && core.paired_devices().is_empty() {
@@ -55,6 +57,15 @@ pub async fn run(
                 }
                 if interactive && watcher.is_none() { watcher = super::clipboard::Watch::start(core.clone()).ok(); }
             }
+            Some(activation) = async { match &mut activations { Some(rx) => rx.recv().await, None => std::future::pending().await } } => {
+                let core = core.clone(); let actions = actions.clone();
+                jobs.spawn(async move {
+                    if let Err(error) = actions.notification_action(&core, activation).await {
+                        eprintln!("pneud: notification action: {error:#}");
+                        core.request_window(false);
+                    }
+                });
+            },
             Some(_) = jobs.join_next(), if !jobs.is_empty() => {},
             Some(command) = rx.recv() => match command {
                 Command::Window { .. } => core.request_window(false),
@@ -90,7 +101,20 @@ pub async fn run(
             },
             event = events.recv() => match event {
                 Ok(Event::TransferProgress { .. }) => update_tray = false,
-                Ok(event) => clipboard_policy_event(&core, &event),
+                Ok(event) => {
+                    use super::notifications::Notice;
+                    let notice = match &event {
+                        Event::Blocked { address } if last_blocked.is_none_or(|time: std::time::Instant| time.elapsed() >= Duration::from_secs(3600)) => { last_blocked = Some(std::time::Instant::now()); Some(Notice::blocked(address)) },
+                        Event::ComputerPaired { name, .. } if !core.window_focused() => Some(Notice::paired(name)),
+                        Event::RemoteUnpaired { name } => Some(Notice::unpaired(name)),
+                        _ => None,
+                    };
+                    if let Some(notice) = notice {
+                        let actions = actions.clone();
+                        jobs.spawn(async move { let _ = actions.notice(notice, Vec::new(), None, 0, None).await; });
+                    }
+                    clipboard_policy_event(&core, &event);
+                },
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     for device in core.paired_devices() { core.cancel_automatic_clipboard(&device); }

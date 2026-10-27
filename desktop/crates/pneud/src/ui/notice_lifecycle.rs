@@ -1,6 +1,7 @@
 //! One request's state, shared by submission, cancellation and expiry callbacks.
 use std::{sync::Mutex, time::Duration};
 
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn stale_identifiers(
     identifiers: Vec<String>,
     active: impl Fn(&str) -> bool,
@@ -86,10 +87,13 @@ impl Lifecycle {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 type Completion = Box<dyn FnOnce(anyhow::Result<()>) + Send + 'static>;
 
 /// Local picker/Recent futures revoke queued native work synchronously on drop.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) struct CancelOnDrop(pub std::sync::Arc<Lifecycle>);
+#[cfg(any(target_os = "macos", test))]
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         self.0.cancel();
@@ -98,12 +102,15 @@ impl Drop for CancelOnDrop {
 
 /// A deferred native request always completes, even when dispatch/submission is
 /// rejected. Clones share one completion; the last dropped clone fails closed.
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone)]
 pub(crate) struct RequestGuard(std::sync::Arc<GuardInner>);
+#[cfg(any(target_os = "macos", test))]
 struct GuardInner {
     life: std::sync::Arc<Lifecycle>,
     completion: Mutex<Option<Completion>>,
 }
+#[cfg(any(target_os = "macos", test))]
 impl RequestGuard {
     pub fn new(
         life: std::sync::Arc<Lifecycle>,
@@ -134,6 +141,7 @@ impl RequestGuard {
         }
     }
 }
+#[cfg(any(target_os = "macos", test))]
 impl Drop for GuardInner {
     fn drop(&mut self) {
         if let Some(completion) = self.completion.get_mut().expect("UI completion").take() {

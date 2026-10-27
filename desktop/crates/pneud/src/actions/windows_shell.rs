@@ -76,6 +76,11 @@ pub(super) async fn open_received(file: ReceivedFile) -> Result<Interaction> {
     .await
 }
 
+pub(super) async fn open_url(url: String) -> Result<Interaction> {
+    let url = crate::ui::notifications::single_url(&url).context("invalid notification URL")?;
+    sta(|| Ok(()), move |()| execute(Path::new(&url))).await
+}
+
 pub(super) async fn open_folder(path: PathBuf) -> Result<Interaction> {
     sta(
         move || platform_fs::Folder::open(&path, false)?.path(),
@@ -132,6 +137,9 @@ pub(super) async fn show_files(paths: Vec<PathBuf>) -> Result<Interaction> {
                 folders.entry(parent).or_default().push(Pidl::parse(&path)?);
             }
             for (parent, items) in folders {
+                // A daemon started with SW_HIDE can otherwise create a hidden
+                // Explorer window. Give folder opening an explicit show state.
+                execute(&parent)?;
                 let folder = Pidl::parse(&parent)?;
                 let children: Vec<*const ITEMIDLIST> = items
                     .iter()
