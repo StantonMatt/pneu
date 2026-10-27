@@ -799,6 +799,7 @@ fn recent(peers: &[Peer], transfers: &[Transfer]) -> Vec<RecentItem> {
             title: first.file_name.as_str().into(),
             batch: artifact_id(first).is_none(),
             picture,
+            video: is_video(&first.file_name),
             progress: -1.0,
             ..Default::default()
         };
@@ -930,6 +931,12 @@ fn is_picture(name: &str) -> bool {
     ]
     .iter()
     .any(|ext| lower.ends_with(ext))
+}
+fn is_video(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [".mp4", ".mov", ".m4v", ".webm", ".mkv", ".3gp", ".avi"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
 }
 fn fraction(sent: u64, size: u64) -> f32 {
     if size == 0 {
@@ -3869,6 +3876,49 @@ mod tests {
         );
         assert!(items[1].can_retry && items[1].can_dismiss && items[1].detail_tone == Tone::Danger);
         assert!(items[2].picture);
+        assert!(!items[2].video);
+        assert!(!items[3].picture && !items[3].video);
+    }
+
+    #[test]
+    fn recent_classifies_file_extensions() {
+        let ps = peers(&snapshot(two()), &[]);
+        for (extensions, picture, video) in [
+            (
+                &["png", "jpg", "jpeg", "gif", "webp", "heic", "bmp", "avif"][..],
+                true,
+                false,
+            ),
+            (
+                &["mp4", "mov", "m4v", "webm", "mkv", "3gp", "avi"][..],
+                false,
+                true,
+            ),
+            (&["pdf", "txt", "mp4.bak", "png.bak"][..], false, false),
+        ] {
+            for ext in extensions {
+                for name in [
+                    format!("capture.{ext}"),
+                    format!("CAPTURE.{}", ext.to_ascii_uppercase()),
+                    format!("Capture.{}{}", ext[..1].to_ascii_uppercase(), &ext[1..]),
+                ] {
+                    for incoming in [false, true] {
+                        let mut t = transfer("kind", 1, &name, "sent", 1, 1);
+                        if incoming {
+                            t.direction = Some("incoming".into());
+                        }
+                        let items = recent(&ps, &[t]);
+                        assert_eq!(items.len(), 1);
+                        assert_eq!(items[0].picture, picture, "{name}, incoming={incoming}");
+                        assert_eq!(items[0].video, video, "{name}, incoming={incoming}");
+                    }
+                }
+            }
+        }
+        for name in ["", "capture", "capture.", "mp4", "capturemp4"] {
+            assert!(!is_picture(name), "{name}");
+            assert!(!is_video(name), "{name}");
+        }
     }
 
     #[test]
@@ -6102,6 +6152,15 @@ mod tests {
             scene(
                 "01-main-connected",
                 |w| state(w, two(), recent_items()),
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "55-main-received-video",
+                |w| {
+                    let mut list = recent_items();
+                    list[0].file_name = "Screen_Recording_20261027.MP4".into();
+                    state(w, two(), list);
+                },
                 go(Page::Main, 0, 0),
             ),
             scene(
