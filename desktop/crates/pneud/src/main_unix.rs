@@ -61,6 +61,8 @@ async fn async_main(args: Vec<String>) -> Result<()> {
     #[cfg(windows)]
     let args = if args.first().is_some_and(|a| a.eq_ignore_ascii_case("-Embedding")) { vec!["-Embedding".into()] } else { args };
     let paths = Paths::from_env()?;
+    #[cfg(windows)]
+    if GUI_LAUNCHER && args.is_empty() && pneud::windows_package::share_activation(&paths).await? { return Ok(()); }
     match args.first().map(String::as_str) {
         Some("send") => {
             let reply = ipc::request(&paths.socket, ipc::desktop_send_command(&args[1..])).await?;

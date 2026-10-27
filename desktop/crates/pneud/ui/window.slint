@@ -75,6 +75,7 @@ export global Ui {
     in-out property <int> drop-hover: -1;
     in-out property <[DropItem]> drop-items;
     in property <bool> is-mac: false;
+    in property <bool> drop-supported: Ui.is-mac;
     in property <bool> login-available: Ui.is-mac;
     in property <bool> login-enabled;
     in property <bool> login-busy;
@@ -890,7 +891,7 @@ export component PneuWindow inherits Window {
         }
 
         drop-overlay := Rectangle {
-            visible: Ui.is-mac && Ui.drop-active;
+            visible: Ui.drop-supported && Ui.drop-active;
             x: 0; y: 0; width: root.width; height: root.height;
             background: Pneu.dim;
             TouchArea {}

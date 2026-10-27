@@ -18,7 +18,7 @@ pub mod clipboard;
 pub mod clipboard;
 #[cfg(target_os = "linux")]
 mod clipboard_content;
-#[cfg(all(unix, any(target_os = "macos", test)))]
+#[cfg(any(windows, all(unix, any(target_os = "macos", test))))]
 #[path = "macos/drop_target.rs"]
 mod drop_target;
 #[cfg(unix)]
@@ -61,6 +61,8 @@ mod window_process;
 mod windows_clipboard_content;
 #[cfg(windows)]
 mod windows_close;
+#[cfg(windows)]
+mod windows_drag;
 #[cfg(windows)]
 mod windows_login;
 #[cfg(windows)]
