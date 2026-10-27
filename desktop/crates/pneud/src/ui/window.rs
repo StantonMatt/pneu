@@ -720,11 +720,13 @@ fn recipient_details(peers: &[Peer], transfers: &[Transfer], key: &str) -> Vec<R
                 "sending" => format!("Sending · {}", size_pair(t.sent, t.size)),
                 "staging" => "Preparing…".into(),
                 "queued" | "waiting_for_device" => "Waiting · not connected".into(),
-                "failed" => t
-                    .error
-                    .as_ref()
-                    .map(|reason| format!("Failed · {reason}"))
-                    .unwrap_or_else(|| "Failed".into()),
+                "failed" => format!(
+                    "Failed · {}",
+                    super::notifications::send_failure_reason(
+                        peer.map(|p| p.name.as_str()).unwrap_or("a removed device"),
+                        t.error.as_deref().unwrap_or_default(),
+                    )
+                ),
                 "sent" => t
                     .finished_at
                     .map(|at| format!("Sent · {}", super::last_seen(at)))
@@ -877,10 +879,10 @@ fn recent(peers: &[Peer], transfers: &[Transfer]) -> Vec<RecentItem> {
                     .error
                     .clone()
                     .unwrap_or_else(|| "Couldn't send this item".into()),
-                [one] => match &one.error {
-                    Some(reason) => format!("Failed on {} · {reason}", name(&one.device)),
-                    None => format!("Failed on {}", name(&one.device)),
-                },
+                [one] => super::notifications::send_failure_reason(
+                    &name(&one.device),
+                    one.error.as_deref().unwrap_or_default(),
+                ),
                 many => format!("Failed on {} devices", distinct_recipients(many)),
             }
             .into();
@@ -3781,7 +3783,7 @@ mod tests {
             transfer("done4", 1, "d.txt", "sent", 1, 1),
             transfer("gone", 1, "e.txt", "cancelled", 0, 1),
         ];
-        transfers[4].error = Some("Phone storage is full".into());
+        transfers[4].error = Some("DiskFull".into());
         let items = recent(&peers, &transfers);
         let lines: Vec<_> = items
             .iter()
@@ -3791,10 +3793,7 @@ mod tests {
             lines,
             [
                 ("report.pdf".into(), "Waiting for MacBook Air".into()),
-                (
-                    "budget.xlsx".into(),
-                    "Failed on Galaxy S25+ · Phone storage is full".into()
-                ),
+                ("budget.xlsx".into(), "Galaxy S25+'s disk is full".into()),
                 ("a.png".into(), "To Galaxy S25+".into()),
                 ("b.pdf".into(), "To 2 devices".into()),
                 ("c.txt".into(), "To Galaxy S25+".into()),
@@ -3802,6 +3801,38 @@ mod tests {
         );
         assert!(items[1].can_retry && items[1].can_dismiss && items[1].detail_tone == Tone::Danger);
         assert!(items[2].picture);
+    }
+
+    #[test]
+    fn delivery_failures_use_plain_words_in_recent_and_recipient_details() {
+        let ps = peers(&snapshot(two()), &[]);
+        for (reason, expected) in [
+            (
+                Some("UnsupportedKind"),
+                "Update Pneu on MacBook Air to send this kind of file",
+            ),
+            (Some("disk_full"), "MacBook Air's disk is full"),
+            (
+                Some("NotWritable"),
+                "MacBook Air can't save files right now",
+            ),
+            (
+                Some("StorageFailed"),
+                "MacBook Air can't save files right now",
+            ),
+            (
+                Some("unrecognized failure"),
+                "Something went wrong. Try again.",
+            ),
+            (None, "Something went wrong. Try again."),
+        ] {
+            let mut failed = transfer("operation", 2, "report.pdf", "failed", 0, 10);
+            failed.error = reason.map(str::to_owned);
+            let ts = [failed];
+            assert_eq!(recent(&ps, &ts)[0].detail, expected);
+            let details = recipient_details(&ps, &ts, &artifact_key(&ts[0]));
+            assert_eq!(details[0].detail, format!("Failed · {expected}"));
+        }
     }
 
     #[test]
@@ -6033,7 +6064,7 @@ mod tests {
                 "05-main-partly-failed",
                 |w| {
                     let mut failed = transfer("f", 1, "budget-2027.xlsx", "failed", 0, 9);
-                    failed.error = Some("Phone storage is full".into());
+                    failed.error = Some("DiskFull".into());
                     let mut list = vec![
                         transfer("w", 2, "report.pdf", "waiting_for_device", 0, 9),
                         failed,
@@ -6585,7 +6616,7 @@ mod tests {
                         ),
                         transfer("details", 4, "report.pdf", "failed", 0, 40_000_000),
                     ];
-                    transfers[3].error = Some("Device storage is full".into());
+                    transfers[3].error = Some("UnsupportedKind".into());
                     let ps = peers(&snapshot(many()), &transfers);
                     let ui = w.global::<Ui>();
                     ui.set_details_title("report.pdf".into());
