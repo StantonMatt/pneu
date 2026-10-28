@@ -22,6 +22,8 @@ slint::slint! {
         PneuWindow, Ui, WindowFocus, Page, Dialog, CodeState, ScanState, DeviceItem, RecentItem, SettingItem,
         PickItem, RecipientItem, Message, Summary, Tone, Tube, LinkState, LinkTile, DropItem, DropGeometry
     } from "../../ui/window.slint";
+    export { Palette } from "std-widgets.slint";
+    export { Pneu } from "../../ui/theme.slint";
 }
 
 pub(crate) use super::send_request::SendRequest;
@@ -5870,6 +5872,16 @@ mod tests {
         window.show()?;
         let shots = std::env::var_os("PNEU_WINDOW_SHOTS").map(PathBuf::from);
         let theme = std::env::var("PNEU_WINDOW_THEME").unwrap_or_else(|_| "default".into());
+        match theme.as_str() {
+            "light" => window
+                .global::<Palette>()
+                .set_color_scheme(slint::language::ColorScheme::Light),
+            "dark" => window
+                .global::<Palette>()
+                .set_color_scheme(slint::language::ColorScheme::Dark),
+            "default" => (),
+            _ => anyhow::bail!("unknown window theme: {theme}"),
+        }
         let mut rendered = 0;
         for scene in scenes() {
             let paths = Paths {
@@ -5927,6 +5939,61 @@ mod tests {
             surface.draw_if_needed(|renderer| {
                 renderer.render(&mut pixels, size.width as usize);
             });
+            if scene.name.starts_with("17-add-") {
+                // At the default size, the Phone page must keep its bottom
+                // padding and must not paint a scrollbar in the right gutter.
+                let right = size.width as usize - (5.0 * scale) as usize;
+                let stride = size.width as usize;
+                let rgb = |p: &slint::platform::software_renderer::PremultipliedRgbaColor| {
+                    (p.red, p.green, p.blue)
+                };
+                assert!(
+                    pixels
+                        .chunks_exact(stride)
+                        .all(|row| rgb(&row[0]) == rgb(&row[right])),
+                    "{}: unexpected scrollbar at {scale}x",
+                    scene.name
+                );
+                let bottom = (16.0 * scale) as usize;
+                assert!(
+                    pixels
+                        .chunks_exact(stride)
+                        .rev()
+                        .take(bottom)
+                        .all(|row| { row.iter().all(|pixel| rgb(pixel) == rgb(&row[0])) }),
+                    "{}: missing 16px bottom padding at {scale}x",
+                    scene.name
+                );
+            }
+            let segment_count = match scene.name {
+                "17-add-phone" => Some(2),
+                "38-settings" | "38-settings-manual" | "39-settings-off" => Some(3),
+                _ => None,
+            };
+            if let Some(count) = segment_count {
+                // Measure the painted selection, so label/font metrics cannot
+                // silently widen one segment or shift the others.
+                let fill = window.global::<Pneu>().get_accent_soft();
+                let columns: Vec<_> = pixels
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| {
+                        (p.red, p.green, p.blue) == (fill.red(), fill.green(), fill.blue())
+                    })
+                    .map(|(i, _)| i % size.width as usize)
+                    .collect();
+                let painted = columns.iter().max().context("selected segment")?
+                    - columns.iter().min().context("selected segment")?
+                    + 1;
+                let inset = if count == 3 { 28.0 } else { 0.0 };
+                let expected =
+                    (400.0 - 32.0 - inset - 4.0 - 2.0 * (count - 1) as f32) / count as f32 * scale;
+                assert!(
+                    (painted as f32 - expected).abs() <= 2.0 * scale,
+                    "{}: selection is {painted}px, expected {expected}px at {scale}x",
+                    scene.name
+                );
+            }
             rendered += 1;
             if let Some(folder) = &shots {
                 let bytes: Vec<u8> = pixels
@@ -6381,6 +6448,32 @@ mod tests {
                 go(Page::Add, 0, 0),
             ),
             scene(
+                "17-add-phone",
+                |w| state(w, two(), Vec::new()),
+                go(Page::Add, 0, 0),
+            ),
+            scene(
+                "17-add-phone-loading",
+                |w| state(w, two(), Vec::new()),
+                |w| {
+                    go(Page::Add, 0, 0)(w);
+                    w.global::<Ui>().set_qr(slint::Image::default());
+                },
+            ),
+            scene(
+                "17-add-phone-large-qr",
+                |w| state(w, two(), Vec::new()),
+                |w| {
+                    go(Page::Add, 0, 0)(w);
+                    let uri = sample_uri().replace(
+                        "MJStanton-Desktop",
+                        "A longer desktop name for checking QR layout sizing",
+                    );
+                    w.global::<Ui>()
+                        .set_qr(slint::Image::from_rgba8(qr_pixels(&uri).unwrap()));
+                },
+            ),
+            scene(
                 "18-add-phone-pairing",
                 |w| {
                     state(w, two(), Vec::new());
@@ -6615,6 +6708,14 @@ mod tests {
             scene(
                 "38-settings",
                 |w| state(w, two(), Vec::new()),
+                go(Page::Settings, 0, 0),
+            ),
+            scene(
+                "38-settings-manual",
+                |w| {
+                    state(w, two(), Vec::new());
+                    w.status["config"]["clipboard_mode"] = json!("manual");
+                },
                 go(Page::Settings, 0, 0),
             ),
             scene(

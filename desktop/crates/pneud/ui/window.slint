@@ -346,6 +346,10 @@ export component PneuWindow inherits Window {
     private property <image> qr: Ui.page == Page.code ? Ui.code-qr : Ui.qr;
     private property <length> qr-card-height: last-qr-size * 1px + 28px;
     private property <length> pairing-height: qr-card-height + 12px + caption.preferred-height;
+    // Reserve the whole Phone page from the QR and measured caption, including
+    // the outer bottom padding, even while the invitation is loading.
+    private property <length> phone-page-height: 32px + (Ui.first-run ? 0px : 30px + 12px)
+        + 30px + 12px + pairing-height;
     private property <length> window-width: max(400px, last-qr-size * 1px + 60px);
     private property <length> max-window-height: 720px;
     private property <bool> copied;
@@ -353,7 +357,8 @@ export component PneuWindow inherits Window {
     private property <bool> modal-open: Ui.dialog != Dialog.none;
     changed modal-open => { Interaction.modal-open = root.modal-open; }
     min-width: window-width; max-width: window-width;
-    out property <length> content-height: min(body.preferred-height, max-window-height);
+    out property <length> content-height: min(max(body.preferred-height,
+        Ui.page == Page.add && Ui.add-tab == 0 ? phone-page-height : 0px), max-window-height);
     min-height: content-height;
     max-height: content-height;
 
@@ -587,6 +592,7 @@ export component PneuWindow inherits Window {
                         height: root.pairing-height; motion: Ui.motion; text: "Pairing with " + Ui.pairing + "…";
                     }
                     if Ui.paired == "" && Ui.pairing == "" && Ui.add-tab == 0: VerticalLayout {
+                        height: root.pairing-height;
                         spacing: 12px;
                         if Ui.network && Ui.qr.width > 0: HorizontalLayout { alignment: center; QrCard { qr: Ui.qr; } }
                         if Ui.network && Ui.qr.width > 0: Text { text: caption.text; color: Pneu.text; horizontal-alignment: center; }
