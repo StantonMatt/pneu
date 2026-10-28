@@ -18,17 +18,19 @@ certificate on the disposable machine first. The script never creates or exports
 keys, changes trust, or installs the package. Install from an interactive Windows
 session; SSH-only deployment can fail at PLM initialization.
 
-Before Store submission, supply these Partner Center values:
+The reserved Microsoft Store product **Pneu** uses these Partner Center values:
 
-- `-IdentityName`: Package/Identity/Name.
-- `-Publisher`: Package/Identity/Publisher, including the exact CN.
-- `-PublisherDisplayName`: Package/Properties/PublisherDisplayName.
+- `-IdentityName MatthewStanton.Pneu`: Package/Identity/Name.
+- `-Publisher 'CN=68A11A39-FF28-48D5-9C3E-D4758423D785'`: Package/Identity/Publisher.
+- `-PublisherDisplayName 'Matthew Stanton'`: Package/Properties/PublisherDisplayName.
 - `-Version`: four 16-bit components, nonzero major, revision zero; defaults to
   the workspace version plus `.0`. Increase it for every submitted package.
 
-The defaults (`StantonMatt.Pneu.Dev`, `CN=Pneu Dev`, `Matthew Stanton`) are for
-local testing. The application ID is `App`; Windows derives its AUMID and family
-from the supplied identity. Keep the toast CLSID in sync with
+The Store package family name is `MatthewStanton.Pneu_6es1gykrn3d1y`; the Store
+ID is `9N48FLMGSDDV`. Pass the identity values above when building for submission.
+The script defaults (`StantonMatt.Pneu.Dev`, `CN=Pneu Dev`, `Matthew Stanton`)
+remain for local testing. The application ID is `App`; Windows derives its AUMID
+and family from the supplied identity. Keep the toast CLSID in sync with
 `src/actions/windows_toasts.rs`. Inbound rules allow TCP 47821 and UDP 5353 for
 both executables on all profiles, including Public (Tailscale).
 
@@ -47,7 +49,10 @@ update; StartupTask activation also stays in the background. Store-managed
 updates and certification must still be checked with the registered Store
 identity. Self-signed sideload tests do not establish Store approval.
 
-The release workflow retains an **unsigned** MSIX as a workflow artifact only.
-It does not attach an un-installable file to the public GitHub release, sign a
-Store package, or submit to Partner Center. Logo assets are reproducible via
+The release workflow passes the Store identity values above and retains the
+**unsigned** MSIX as the `Pneu-Windows-Store-msix` workflow artifact only. Its
+version defaults to the workspace version plus `.0` (2.2.0.0 for this release).
+Partner Center accepts unsigned packages and signs them for distribution. The
+workflow does not attach the MSIX to the public GitHub release, sign it locally,
+or submit to Partner Center. Logo assets are reproducible via
 `generate-assets.py` with Pillow; no image tooling is needed in the build job.

@@ -1,6 +1,6 @@
 # Pneu desktop core
 
-`pneud` 2.1.0 is the Linux, macOS and Windows daemon; `pneu-sim` is a legacy
+`pneud` 2.2.0 is the Linux, macOS and Windows daemon; `pneu-sim` is a legacy
 phone transport simulator. Shared syntax and framing live in `pneu-proto`;
 the [wire protocol](../docs/PROTOCOL.md) defines mesh negotiation and delivery.
 Nothing in this directory installs automatically.

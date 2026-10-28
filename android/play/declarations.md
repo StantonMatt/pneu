@@ -1,6 +1,6 @@
 # Play app-content declarations
 
-Drafts for version 2.1.0 (6), checked 2026-10-25. Paste the paragraphs matching the live form prompts. Replace video/contact placeholders before submission.
+Drafts for version 2.2.0 (7), checked 2026-10-25. Paste the paragraphs matching the live form prompts. Replace video/contact placeholders before submission.
 
 ## Photo and video permissions
 
