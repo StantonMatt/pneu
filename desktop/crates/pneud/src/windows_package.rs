@@ -101,9 +101,12 @@ pub async fn share_activation(paths: &crate::Paths) -> Result<bool> {
         .ShareOperation()?;
     let result = tokio::time::timeout(Duration::from_secs(15), async {
         let data = operation.Data()?;
+        // Image sources can advertise Bitmap for share-target filtering. Always
+        // use their original files, never a re-encoded bitmap. A bitmap-only
+        // source gets an actionable share-sheet error without starting a send.
         ensure!(
             data.Contains(&StandardDataFormats::StorageItems()?)?,
-            "share regular files to Pneu"
+            "Pneu needs original files; save the image, then share its file"
         );
         let items = data.GetStorageItemsAsync()?.await?;
         ensure!(

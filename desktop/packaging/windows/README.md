@@ -7,10 +7,23 @@ Run from a Windows Rust/MSVC development environment with the Windows SDK:
 ```
 
 This builds the GUI `Pneu.exe` and console `pneud.exe` from one entry point,
-embeds their icon and version resources, statically links the C runtime,
-indexes the logo variants, validates the manifest, and produces an
+embeds their icon, version resources and application manifest, statically links
+the C runtime, indexes the logo variants, validates the manifest, and produces an
 unsigned x64 package. The GUI binary is opt-in (`windows-package`); ordinary
 Linux/macOS builds keep the existing binary and packaging.
+
+Both executables declare PerMonitorV2 DPI awareness (`true/pm` fallback), Windows
+10/11 compatibility and `asInvoker` execution. The manifest sets awareness before
+any native windows are created; the tray inherits it and the Slint/winit child
+skips winit's process-awareness setter while retaining per-window DPI scaling.
+Common Controls v6 is not required: muda/tray-icon use USER32 menus/windows,
+muda's `common-controls-v6` feature is disabled, and pickers use `IFileOpenDialog`.
+
+The share target declares `StorageItems` and `Bitmap`, as recommended for image
+handlers in Microsoft's [Share receive guidance](https://learn.microsoft.com/windows/apps/develop/windows-integration/integrate-sharesheet-receive).
+Image sources can use Bitmap when filtering targets. Activation still reads only
+original `StorageItems` files, retaining their names and bytes; bitmap-only shares
+report an error asking the user to save the image and share its file.
 
 For sideload testing, pass `-CertificateThumbprint` for a code-signing certificate
 in CurrentUser/My whose subject exactly matches `-Publisher`. Trust the test
