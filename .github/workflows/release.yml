@@ -105,14 +105,19 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: desktop
-      - name: Build unsigned MSIX
-        run: desktop/packaging/windows/build-msix.ps1 -OutDir "$env:RUNNER_TEMP/pneu-msix"
-      # Unsigned packages cannot be installed. Keep these as workflow artifacts;
-      # Store identity/signing and submission are a separate release gate.
-      - name: Upload unsigned MSIX
+      - name: Build unsigned Store MSIX
+        run: >-
+          desktop/packaging/windows/build-msix.ps1
+          -IdentityName MatthewStanton.Pneu
+          -Publisher 'CN=68A11A39-FF28-48D5-9C3E-D4758423D785'
+          -PublisherDisplayName 'Matthew Stanton'
+          -OutDir "$env:RUNNER_TEMP/pneu-msix"
+      # Partner Center accepts unsigned packages and signs them for distribution.
+      # Keep this Store package as a workflow artifact; submission is a separate gate.
+      - name: Upload unsigned Store MSIX
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: Pneu-Windows-unsigned
+          name: Pneu-Windows-Store-msix
           path: ${{ runner.temp }}/pneu-msix/*.msix
           if-no-files-found: error
           compression-level: 0

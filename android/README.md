@@ -1,6 +1,6 @@
 # Pneu Android
 
-Kotlin/Compose app, version 2.1.0, API 34+, application ID `io.github.stantonmatt.pneu`.
+Kotlin/Compose app, version 2.2.0, API 34+, application ID `io.github.stantonmatt.pneu`.
 JDK 21, SDK 37.2, AGP 9.4.1 and the checked-in Gradle wrapper are required.
 Run commands below from `android/` with `ANDROID_HOME=$HOME/Android/Sdk`.
 

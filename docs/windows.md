@@ -218,8 +218,10 @@ restart it after a crash, hang or reboot.
 Build parameters, signing, sideload installation prerequisites, Store identity
 values and submission disclosures are in the
 [Windows packaging README](../desktop/packaging/windows/README.md). The release
-workflow retains an unsigned MSIX artifact; it does not submit to the Store.
-Received files remain outside package state and survive uninstall.
+workflow builds with that Store identity and retains the unsigned MSIX as the
+`Pneu-Windows-Store-msix` workflow artifact for Partner Center, which signs it for
+distribution. It does not publish the MSIX on GitHub Releases or submit to the
+Store. Received files remain outside package state and survive uninstall.
 
 ## Native verification
 

@@ -1,6 +1,6 @@
 # Data safety draft
 
-For version 2.1.0 (6), using ZXing core 3.5.4 for on-device QR decoding. Sources checked 2026-10-25. These are proposed Console answers for the current implementation, not a Google approval.
+For version 2.2.0 (7), using ZXing core 3.5.4 for on-device QR decoding. Sources checked 2026-10-25. These are proposed Console answers for the current implementation, not a Google approval.
 
 ## Scope and transfer content
 
