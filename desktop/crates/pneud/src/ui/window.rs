@@ -1089,14 +1089,24 @@ pub fn run(paths: Paths) -> Result<()> {
             .select()?;
     }
     #[cfg(windows)]
-    slint::BackendSelector::new()
-        .backend_name("winit".into())
-        .renderer_name("software".into())
-        .with_winit_window_attributes_hook(|attributes| {
-            use slint::winit_030::winit::platform::windows::WindowAttributesExtWindows;
-            attributes.with_drag_and_drop(false)
-        })
-        .select()?;
+    {
+        use slint::winit_030::{
+            EventLoopBuilder,
+            winit::platform::windows::{EventLoopBuilderExtWindows, WindowAttributesExtWindows},
+        };
+        let mut builder: EventLoopBuilder =
+            slint::winit_030::winit::event_loop::EventLoop::with_user_event();
+        // Both executables embed PerMonitorV2. Avoid winit's redundant process
+        // awareness calls (which Windows rejects once a manifest has set it).
+        // This leaves winit/Slint's per-window DPI handling enabled.
+        builder.with_dpi_aware(false);
+        slint::BackendSelector::new()
+            .backend_name("winit".into())
+            .renderer_name("software".into())
+            .with_winit_event_loop_builder(builder)
+            .with_winit_window_attributes_hook(|attributes| attributes.with_drag_and_drop(false))
+            .select()?;
+    }
     let window = PneuWindow::new()?;
     let visible = Arc::new(AtomicBool::new(
         cfg!(any(target_os = "linux", windows)) || startup_request != 0,

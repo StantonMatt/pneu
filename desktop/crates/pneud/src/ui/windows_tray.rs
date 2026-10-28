@@ -23,10 +23,7 @@ use windows_sys::Win32::{
         Threading::GetCurrentThreadId,
     },
     UI::{
-        HiDpi::{
-            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, GetDpiForWindow,
-            SetThreadDpiAwarenessContext,
-        },
+        HiDpi::{GetDpiForSystem, GetDpiForWindow},
         WindowsAndMessaging::*,
     },
 };
@@ -128,7 +125,6 @@ fn run(
     ready: &mut Option<Ready>,
 ) -> Result<()> {
     unsafe {
-        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let class: Vec<u16> = "PneuTrayLoop\0".encode_utf16().collect();
         let module = GetModuleHandleW(null());
         let wc = WNDCLASSW {
