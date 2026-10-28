@@ -13,6 +13,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.*
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.*
+import android.view.WindowInsetsController
 import io.github.stantonmatt.pneu.R
 import io.github.stantonmatt.pneu.Symbol
 
@@ -20,6 +21,7 @@ import io.github.stantonmatt.pneu.Symbol
     confirmButton:@Composable ()->Unit,dismissButton:(@Composable ()->Unit)?=null,
     text:(@Composable ()->Unit)?=null,destructive:Boolean=false,pairingHeader:Boolean=false,dismissible:Boolean=true) {
     val c=LocalPneuColors.current;val animate=LocalPneuMotion.current;val rise=with(androidx.compose.ui.platform.LocalDensity.current){24.dp.roundToPx()}
+    val hostView=androidx.compose.ui.platform.LocalView.current
     var entered by remember {mutableStateOf(false)}
     // The caller owns visibility. A confirmation may open a permission prompt or
     // report an error while retaining this dialog; an action is not a dismissal.
@@ -27,7 +29,13 @@ import io.github.stantonmatt.pneu.Symbol
     Dialog({if(dismissible)onDismissRequest()},properties=DialogProperties(usePlatformDefaultWidth=false,decorFitsSystemWindows=false,dismissOnBackPress=dismissible,dismissOnClickOutside=dismissible)) {
         // Supply the precise Pneu scrim rather than the platform's additional dim.
         val view=androidx.compose.ui.platform.LocalView.current
-        SideEffect {(view.parent as? DialogWindowProvider)?.window?.setDimAmount(0f)}
+        SideEffect {(view.parent as? DialogWindowProvider)?.window?.apply {
+            setDimAmount(0f)
+            // Keep the screen's status-bar icon choice, including the dark scanner.
+            hostView.windowInsetsController?.let {host->
+                insetsController?.setSystemBarsAppearance(host.systemBarsAppearance,WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS)
+            }
+        }}
         LaunchedEffect(Unit) {entered=true}
         Box(Modifier.fillMaxSize().background(c.scrim.copy(alpha=c.scrim.alpha*dim)).pointerInput(onDismissRequest,dismissible){detectTapGestures(onTap={if(dismissible)onDismissRequest()})},contentAlignment=Alignment.BottomCenter) {
             AnimatedVisibility(entered,enter=if(animate)slideInVertically(tween(PneuMotion.medium,easing=PneuMotion.easeOut)){rise}+fadeIn(tween(PneuMotion.medium)) else fadeIn(tween(PneuMotion.short))) {
