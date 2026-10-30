@@ -74,6 +74,57 @@ jobs:
           compression-level: 0
           retention-days: 7
 
+  linux:
+    # Build on the oldest supported glibc/Qt baseline, not ubuntu-latest.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: desktop
+    env:
+      QMAKE: qmake6
+    steps:
+      - name: Validate the tag input
+        working-directory: .
+        run: |
+          [[ "$RELEASE_TAG" == v* ]]
+          git check-ref-format "refs/tags/$RELEASE_TAG"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      - name: Install Qt 6 and packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential pkg-config qt6-base-dev qt6-base-dev-tools qmake6 \
+            libfontconfig-dev libwayland-dev libxkbcommon-dev libudev-dev \
+            dbus-daemon dpkg-dev
+      - name: Check version and install the workspace Rust toolchain
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          test "$RELEASE_TAG" = "v$version"
+          rust_version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["rust-version"])')
+          rustup toolchain install "$rust_version" --profile minimal
+          rustup default "$rust_version"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: desktop
+      - name: Build and package Linux downloads
+        run: |
+          cargo build --release --locked -p pneud
+          packaging/linux/build-packages.sh target/release/pneud "${RELEASE_TAG#v}" "$RUNNER_TEMP/pneu-linux"
+      - name: Upload Linux artifacts (manual dry runs publish nothing)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Pneu-Linux
+          path: |
+            ${{ runner.temp }}/pneu-linux/*.deb
+            ${{ runner.temp }}/pneu-linux/pneu-linux-x86_64.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
   windows-msix:
     runs-on: windows-latest
     timeout-minutes: 60
@@ -125,7 +176,7 @@ jobs:
 
   publish:
     if: github.event_name == 'push'
-    needs: build
+    needs: [build, linux]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -135,6 +186,10 @@ jobs:
         with:
           name: Pneu-macOS
           path: release
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: Pneu-Linux
+          path: release
       - name: Create or update the GitHub Release
         working-directory: release
         env:
@@ -142,10 +197,13 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           sha256sum --check SHA256SUMS.txt
+          assets=(Pneu-macOS.zip pneu_*_amd64.deb pneu-linux-x86_64.tar.gz)
+          sha256sum "${assets[@]}" > SHA256SUMS.txt
+          sha256sum --check SHA256SUMS.txt
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" Pneu-macOS.zip SHA256SUMS.txt --clobber
+            gh release upload "$RELEASE_TAG" "${assets[@]}" SHA256SUMS.txt --clobber
           else
-            gh release create "$RELEASE_TAG" Pneu-macOS.zip SHA256SUMS.txt \
+            gh release create "$RELEASE_TAG" "${assets[@]}" SHA256SUMS.txt \
               --verify-tag --title "Pneu $RELEASE_TAG" \
               --notes 'Downloads and installation: https://stantonmatt.github.io/pneu/'
           fi

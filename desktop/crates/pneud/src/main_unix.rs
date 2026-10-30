@@ -76,6 +76,9 @@ async fn async_main(args: Vec<String>) -> Result<()> {
             Ok(())
         }
         Some("window") => {
+            #[cfg(target_os = "linux")]
+            pneud::linux_launch::show_window(&paths).await?;
+            #[cfg(not(target_os = "linux"))]
             ipc::request(
                 &paths.socket,
                 Command::ShowWindow {

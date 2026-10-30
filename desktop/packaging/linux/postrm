@@ -1,0 +1,5 @@
+#!/bin/sh
+set -e
+if [ "$1" = purge ] && [ -z "${DPKG_ROOT:-}" ]; then
+    deb-systemd-helper --user purge pneud.service >/dev/null
+fi

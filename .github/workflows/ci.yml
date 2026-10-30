@@ -32,7 +32,7 @@ jobs:
           sudo apt-get install --no-install-recommends -y \
             build-essential pkg-config qt6-base-dev qt6-base-dev-tools qmake6 \
             libfontconfig-dev libwayland-dev libxkbcommon-dev libudev-dev \
-            dbus-daemon
+            dbus-daemon dpkg-dev lintian
           qmake6 -query QT_VERSION
       - name: Install the workspace Rust toolchain
         run: |
@@ -47,6 +47,10 @@ jobs:
       # harness requires --run-headless and is already opt-in; no tests are filtered.
       - name: Test the desktop workspace
         run: cargo test --locked
+      - name: Check Linux release packaging on the CI-built binary
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          packaging/linux/check-packages.sh target/debug/pneud "$version" "$RUNNER_TEMP/pneu-packaging"
 
   macos:
     name: macOS desktop

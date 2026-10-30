@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+if [ "$1" = configure ] && [ -z "${DPKG_ROOT:-}" ]; then
+    deb-systemd-helper --user unmask pneud.service >/dev/null || true
+    if deb-systemd-helper --quiet --user was-enabled pneud.service; then
+        deb-systemd-helper --user enable pneud.service >/dev/null
+    else
+        deb-systemd-helper --user update-state pneud.service >/dev/null
+    fi
+fi
