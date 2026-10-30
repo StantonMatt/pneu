@@ -3,7 +3,14 @@
 This document describes the current multi-device app: Android Compose screens
 and a shared Slint desktop window with Linux, macOS and Windows integrations.
 The [protocol](../PROTOCOL.md) defines wire behavior. The source links below
-provide the exact strings and layout.
+provide the exact strings and layout. The upcoming **pair once, join your setup**
+extension is specified in [Setup membership](../PROTOCOL.md#setup-membership-capability-setup)
+and its [implementation/test notes](../setup-membership.md); it supersedes the
+current direct-pair topology and Unpair descriptions below only after `setup`
+support ships. Explicit setup IDs let legacy `ask` pairs migrate into one setup
+without waiting for roster gossip; independently founded setups keep direct
+links without merging. Removing the last other member dissolves the setup;
+removal notifications cause local withdrawal without reciprocal global removals.
 
 The original v1 [mockups](mockups.html) and [icon assets](assets/) are historical
 references. Their single-phone layouts, teal/brass branding and proposed copy
