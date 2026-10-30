@@ -64,7 +64,7 @@ identity. Self-signed sideload tests do not establish Store approval.
 
 The release workflow passes the Store identity values above and retains the
 **unsigned** MSIX as the `Pneu-Windows-Store-msix` workflow artifact only. Its
-version defaults to the workspace version plus `.0` (2.2.1.0 for this release).
+version defaults to the workspace version plus `.0` (2.2.2.0 for this release).
 Partner Center accepts unsigned packages and signs them for distribution. The
 workflow does not attach the MSIX to the public GitHub release, sign it locally,
 or submit to Partner Center. Logo assets are reproducible via
