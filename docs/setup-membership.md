@@ -1,0 +1,349 @@
+# Setup membership: implementation notes and test plan
+
+The [protocol](PROTOCOL.md#members-22-decimal-34) is normative. This document
+records integration boundaries and deterministic acceptance cases for the Rust
+desktop and Kotlin Android implementations. This is a specification for later
+implementation, not a claim that current releases implement `setup`.
+
+## Scope and design choices
+
+The existing token/pin pairing state machines remain authoritative for direct
+pairing. MEMBERS is a second, explicitly scoped source of **new** bindings. It
+cannot repair a changed certificate, refresh an attempt's frozen authority, or
+reset an existing peer. Each device has one optional random 128-bit `setup_id`
+and one current roster. The ID is a correlation label, not a group key, admin,
+signature or admission authority. Pins, mutual scope consent, terminal removals,
+pin uniqueness and frozen pairing fences remain authoritative.
+
+HELLO carries local scope and an assigned ID (omitted on disabled links).
+After authority/consent: absent/absent founds, absent/S joins, S/S synchronizes,
+S/T stays direct without roster exchange. This replaces counts and exact-member
+evidence for token pairing and existing-link action/offer/Allow. No invitation
+keys or address grammar change. The stable ID travels inside pinned TLS, but a
+provisional client can see it before token validation; exclude it from invitations,
+mDNS and future relay rendezvous identifiers.
+
+For absent/absent, the lower authenticated device ID generates fresh random S,
+atomically persisting ID/self/first member. The other waits without MEMBERS;
+reconnect advertises S, the other joins atomically and reconnects. Synchronize
+only at S/S. The proposer has no later role; IDs are never derived or reused.
+One short device-wide transaction permits unassigned → S or idempotent S → S;
+first durable assignment wins concurrent S/T joins. No gate spans network/prompt
+waits. A local setup generation fences prompts, snapshots and receipts across
+assignment, dissolution and withdrawal. Mismatched MEMBERS NACKs unsupported_kind
+(false retryability), with no merge, clock observation or receipt. A stray
+snapshot cannot assign an unjoined receiver.
+
+Last-other-member removal clears ID/positive roster atomically; any retained
+active member, even without an enabled direct link, preserves the ID. Withdrawal
+also disables scoped links. Keep tombstones/deny history and high-water marks,
+never relabel/export retired state under another ID or clear its local barriers.
+There is no separate Leave setup UI in v1.
+
+A tombstone is a durable authorization barrier, not just a LWW display value.
+Within eligible membership values, use the existing tuple order. Across removal
+and introduction, terminal removal takes precedence regardless of a purported
+newer add. Otherwise concurrent additions could defeat removal. A newly
+user-confirmed *local* token attempt after removal (or freshly validated token
+on the acceptor) creates a newer member stamp and retains the removal high-water
+mark;
+no unsigned remote entry proves that fresh pairing occurred. Other devices with
+the tombstone therefore need their own fresh pairing to that same identity.
+Scoped UNPAIR and an own-key tombstone cause only local withdrawal, never a
+reciprocal global removal. A withdrawn device stops sending membership, including
+pending snapshots; peers that already deny its exact key ignore its MEMBERS.
+Historical removed pins for an ID may coexist with its current member, including
+when that ID is the sender or receiver. They never withdraw a different-pin
+current identity. Retain at most four fingerprints per ID and 64 total entries;
+never evict tombstones to make room. Reject an overflowing replacement or merge
+atomically rather than losing a resurrection barrier.
+
+Self-written reach is a separate stamped register so forwarded address refreshes
+do not masquerade as another device's membership edit or erase a removal. Its
+writer equals the subject ID. Intermediaries preserve it; in v1 an authorized
+malicious intermediary could forge this unsigned assertion. Normal TLS pin
+checks still gate application traffic. Future relay descriptors need a separate
+capability/spec; the currently required empty opaque array reserves their place.
+
+## Current implementation boundaries
+
+Source inspected at `eddff3f4341cf1cffed5c222d5f8e13bf671f6fa`:
+
+| Surface | Current behavior and required implementation |
+| --- | --- |
+| `desktop/crates/pneud/src/store.rs`, `pair_then_hello` | Increments generation, deletes/reinserts the peer, preserves settings but resets dependent delivery state. Add a transactional reconcile path; never replay a roster through this primitive. Preserve the unique fingerprint constraint. |
+| Same file, `remember_peer_hello` / `remember_route` | Keeps up to 16 routes, with last-good first. Membership supplies another authenticated control-state hint source in the HELLO category; retain last-good/invitation caches, grammar and total bounds. Do not label a forwarded hint last-good. |
+| `core.rs`, `connection`; `tls.rs`, `ClientVerifier::admit` | Unknown certificate admission fails before HELLO. Keep this boundary; learn both sides through the introducer before direct connection. No new provisional setup session. |
+| `core.rs`, `finish_pairing_hello` / READY dispatch | Token consumption, known-binding recovery and local self-ID checks already exist. Add gated MEMBERS dispatch/receipts and scoped UNPAIR local withdrawal without reciprocal tombstones or broadening recovery. A tombstoned absent binding cannot use known-certificate recovery. |
+| `mesh.rs`, join install fence and `may_revoke` | Direct attempts already capture authority once; reverse dial denial is gated by durable readiness. Introductions must respect live targets and start with no evidence. Setup links suppress destructive unauthorized handling even after evidence. READY ERROR handling in `core.rs` also needs that suppression. |
+| `pneu-proto/src/message.rs`, `pairing.rs` | Registry currently ends new control messages at `0x21`; add `0x22`, HELLO setup fields and nested validation. Keep URI and endpoint grammar unchanged. |
+| Android `data/PeerRegistry.kt` | `MAX_PEERS=16`, atomic DataStore trust writes. Match the protocol's 16 direct-peer bound; hold phone membership metadata separately from connection peers. Preserve idempotence and pin uniqueness. |
+| Android `connection/PairingAttempt.kt`, `AppGraph.kt` | Process-local attempt, scan/HELLO frozen fences, binding lock, local-only cancellation, idempotent same-pin repair and reset journal already exist. Add scope choice to the attempt without refreshing its fence. Reconcile under the binding lock; journal cross-store effects. |
+| Android `connection/ConnectionManager.kt` | Only computer HELLOs are accepted, advertises `mesh`, pinned unauthorized can drive pairing loss, settings have a separate pending receipt. Add setup gating, introduced-generation readiness, MEMBERS sender/receiver/receipt lane and recovery buffering. Do not spawn phone workers. |
+| Android `data/MeshState.kt`, `protocol/Protocol.kt`, `protocol/Invitation.kt` | Reuse exact unsigned HLC validation and atomic clock authority. Add strict nested MEMBERS/HELLO parsing, including duplicate fields; do not parse u64 through Double/Long. Keep invitation validation unchanged. |
+
+Keep terminal membership storage outside peer-cascade deletion, which currently
+removes receipts and pair settings. Extend transaction/reset intents rather than
+adding an invitation checkpoint, pairing cancel protocol or time-based trust
+expiry. Reconciliation notifications and worker publication need crash-safe
+once-only identities, scoped to the new generation.
+
+## Product boundaries requiring orchestration
+
+* The approved mockup says a removed device forgets everyone on reconnect and
+  returns to first-run. That cannot be guaranteed with pre-HELLO rejection of
+  removed pins. The protocol permits withdrawal when a tombstone reaches a
+  still-authenticated session; otherwise the removed device retains its local
+  list and receives refusals. Unscoped links and identity survive withdrawal.
+* The mockup's “Removing · waits for {device}” cannot prove completion everywhere
+  from a single intermediary ACK. Track direct ACKs conservatively; the protocol
+  deliberately adds no transitive receipt attestation. A phone cannot directly
+  obtain an ACK from another phone. Do not show all-devices-complete on inference.
+* Both migrated endpoints start `ask`, so neither sends MEMBERS automatically.
+  Product must expose an explicit **Link existing device** action: enable the
+  local scope and reconnect. A compatible enabled/ask HELLO offers one durable
+  prompt without a roster (even absent/absent); Allow refreshes HELLO and rechecks
+  compatibility before enabling. Separate IDs block the offer/Allow; disabled
+  links require explicit local opt-in. Capability negotiation grants no consent.
+* The remote setup ID is unavailable from today's URI; late detection may keep
+  a pair direct. No group-merge approval, admin prompt or new invitation key is
+  introduced.
+
+## Three-device migration walk-through
+
+A is the owner's phone, B the Linux PC, C the Mac. All three direct pairs
+already exist; after upgrade every local scope is `ask`, every setup ID absent.
+Preserve pins, binding generations, switches, queues and unrelated receipts.
+
+1. On A, choose **Link existing device** for B. A enables its local scope and
+   reconnects; the absent/absent HELLO pair gives B one prompt without a roster.
+   Allow refreshes HELLO and enables B's scope. A (the lower authenticated ID)
+   founds random S, atomically persisting self/B and S. B waits unassigned until
+   A reconnects advertising S, then joins S and reconnects. Matching S/S enables
+   synchronization; neither exports its `ask` link to C.
+2. On A, choose the same action for C. The HELLO pair is S/absent; C gets one
+   prompt, Allow refreshes compatibility and enables its scope. C adopts S in
+   the first-member transaction and reconnects. A–C synchronize only as S/S;
+   A can supply B to C and C to B without changing their B–C `ask` scopes.
+3. Explicitly link C on B (or B on C). Both already advertise S, so activation
+   passes immediately, without waiting for A's B/C roster gossip. The remote
+   gets one prompt and Allow rechecks S/S; after reconnect all scopes are enabled.
+   A roster alone never opts in an existing `ask` or disabled link.
+
+Independent A–B and C–D bootstraps instead found S and T. An A–C action sees S/T
+and keeps the direct link, with no offer or roster exchange. If these assignments
+arise while a prompt is pending, Allow reaches the same result after refreshing
+HELLO. This is the intended no-merge boundary: independently founded setups stay
+separate, with **Direct link kept; separate setups not linked**.
+
+## Cross-language JSON vectors
+
+The snapshot blocks below are literal single-line MEMBERS JSON payloads, no BOM
+or newline in the wire payload; responses and invalid nested objects are labeled
+separately. A=32 `1`s (Phone), B=32 `2`s (Office PC), C=32 `3`s
+(Laptop); pins are respectively 64 `a`s, `b`s and `c`s. Test clock is fixed at
+`1800000000100`. The authenticated sender is A, receiver B; both HELLOs advertise
+`mesh,setup`, enabled scope, and have already passed direct binding checks.
+Both are assigned S=32 `0`s; T=32 `f`s denotes a separate setup.
+B initially has only A's direct binding and its own identity. Snapshot order is
+for readability; comparison sorts entries by `(device_id, fingerprint)`, ignores
+unknown fields, compares known values and preserves address order. These test
+serialization choices are not a JSON signing/canonicalization scheme.
+
+### setup-id-compatibility
+
+These are nested `setup` HELLO objects, not MEMBERS frames. Both sides evaluate
+the same pair; after authority/consent the four ID cases below decide assignment
+or synchronization. An enabled/ask offer checks compatibility before prompting;
+Allow refreshes HELLO and rechecks. `expected` is test metadata, not a wire field.
+S/T values are deterministic test fixtures, never a recipe for founding IDs.
+
+```json
+[
+  {"stage":"A-B mutual opt-in","left":{"scope":"enabled"},"right":{"scope":"enabled"},"expected":"absent/absent: lower authenticated ID founds random S; other waits for HELLO"},
+  {"stage":"A-C mutual opt-in","left":{"scope":"enabled","setup_id":"00000000000000000000000000000000"},"right":{"scope":"enabled"},"expected":"S/absent: C joins S, reconnects before synchronization"},
+  {"stage":"C-A mutual opt-in","left":{"scope":"enabled"},"right":{"scope":"enabled","setup_id":"00000000000000000000000000000000"},"expected":"absent/S: C joins S, reconnects before synchronization"},
+  {"stage":"B-C before roster catch-up","left":{"scope":"enabled","setup_id":"00000000000000000000000000000000"},"right":{"scope":"enabled","setup_id":"00000000000000000000000000000000"},"expected":"S/S: synchronize without exact-member evidence"},
+  {"stage":"A-C separate bootstraps","left":{"scope":"ask","setup_id":"00000000000000000000000000000000"},"right":{"scope":"ask","setup_id":"ffffffffffffffffffffffffffffffff"},"expected":"S/T: keep direct; no offer or roster exchange"},
+  {"stage":"Allow after separate assignments while prompt pending","left":{"scope":"enabled","setup_id":"ffffffffffffffffffffffffffffffff"},"right":{"scope":"ask","setup_id":"00000000000000000000000000000000"},"expected":"T/S: resolve prompt; keep direct without enabling"}
+]
+```
+
+### join
+
+Install C exactly once, enabled scope, readiness zero, introducer A. B's own row
+is observation only. No settings/content move from A. Queue PEER_SETTINGS
+bootstrap for B↔C upon their later direct session.
+
+```json
+{"transfer_id":"44444444444444444444444444444444","setup_id":"00000000000000000000000000000000","members":[{"device_id":"11111111111111111111111111111111","fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","role":"phone","name":"Phone","status":"member","hlc":1800000000001,"writer_device":"11111111111111111111111111111111"},{"device_id":"22222222222222222222222222222222","fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","role":"computer","name":"Office PC","status":"member","hlc":1800000000002,"writer_device":"11111111111111111111111111111111"},{"device_id":"33333333333333333333333333333333","fingerprint":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","role":"computer","name":"Laptop","status":"member","hlc":1800000000003,"writer_device":"11111111111111111111111111111111","reach":{"addresses":["192.168.1.12:47821"],"relay":[],"hlc":1800000000004,"writer_device":"33333333333333333333333333333333"}}]}
+```
+
+### remove
+
+After join, this removes C through B's forget lifecycle and leaves a terminal
+tombstone, including when received after a newer concurrent member value.
+A relays B's original writer; writer need not equal transport sender.
+
+```json
+{"transfer_id":"55555555555555555555555555555555","setup_id":"00000000000000000000000000000000","members":[{"device_id":"11111111111111111111111111111111","fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","role":"phone","name":"Phone","status":"member","hlc":1800000000001,"writer_device":"11111111111111111111111111111111"},{"device_id":"22222222222222222222222222222222","fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","role":"computer","name":"Office PC","status":"member","hlc":1800000000002,"writer_device":"11111111111111111111111111111111"},{"device_id":"33333333333333333333333333333333","fingerprint":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","role":"computer","name":"Laptop","status":"removed","hlc":1800000000010,"writer_device":"22222222222222222222222222222222"}]}
+```
+
+### later-introduction
+
+After remove, this higher-HLC add MUST NOT recreate C, advance its binding
+generation, reset unrelated state or clear the terminal barrier. Record a new
+membership receipt (ACK false), retain/gossip removed C at stamp 1800000000010.
+Receiving remove after this vector has the same final removed outcome.
+
+```json
+{"transfer_id":"66666666666666666666666666666666","setup_id":"00000000000000000000000000000000","members":[{"device_id":"11111111111111111111111111111111","fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","role":"phone","name":"Phone","status":"member","hlc":1800000000001,"writer_device":"11111111111111111111111111111111"},{"device_id":"22222222222222222222222222222222","fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","role":"computer","name":"Office PC","status":"member","hlc":1800000000002,"writer_device":"11111111111111111111111111111111"},{"device_id":"33333333333333333333333333333333","fingerprint":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","role":"computer","name":"Laptop","status":"member","hlc":1800000000020,"writer_device":"11111111111111111111111111111111","reach":{"addresses":["192.168.1.12:47821"],"relay":[],"hlc":1800000000004,"writer_device":"33333333333333333333333333333333"}}]}
+```
+
+### reach-refresh
+
+From join state without removal, only C's independent reach changes. Preserve
+C's generation, provenance, queues, receipts and pair settings. Import the hint
+in HELLO priority after last-good, never as proof it works. From removed state
+this does not restore C or its dial worker.
+
+```json
+{"transfer_id":"77777777777777777777777777777777","setup_id":"00000000000000000000000000000000","members":[{"device_id":"11111111111111111111111111111111","fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","role":"phone","name":"Phone","status":"member","hlc":1800000000001,"writer_device":"11111111111111111111111111111111"},{"device_id":"22222222222222222222222222222222","fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","role":"computer","name":"Office PC","status":"member","hlc":1800000000002,"writer_device":"11111111111111111111111111111111"},{"device_id":"33333333333333333333333333333333","fingerprint":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","role":"computer","name":"Laptop","status":"member","hlc":1800000000003,"writer_device":"11111111111111111111111111111111","reach":{"addresses":["192.168.1.13:47821"],"relay":[],"hlc":1800000000030,"writer_device":"33333333333333333333333333333333"}}]}
+```
+
+### targeted-withdrawal
+
+From join state, A removes B, the receiver. B retains its own-key tombstone and
+deny/high-water history, clears ID/positive roster, disables scoped links and
+sends neither removals against A/C nor pending MEMBERS. Scoped UNPAIR from A
+has the same withdrawal effects without inventing a tombstone. C may receive A's removal later; before then B's receipt
+of this notification must not cause C to revoke A. Once C knows B's tombstone,
+it ignores every MEMBERS from B, even a captured in-flight removal of A.
+
+```json
+{"transfer_id":"88888888888888888888888888888888","setup_id":"00000000000000000000000000000000","members":[{"device_id":"11111111111111111111111111111111","fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","role":"phone","name":"Phone","status":"member","hlc":1800000000001,"writer_device":"11111111111111111111111111111111"},{"device_id":"22222222222222222222222222222222","fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","role":"computer","name":"Office PC","status":"removed","hlc":1800000000010,"writer_device":"11111111111111111111111111111111"},{"device_id":"33333333333333333333333333333333","fingerprint":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","role":"computer","name":"Laptop","status":"member","hlc":1800000000003,"writer_device":"11111111111111111111111111111111","reach":{"addresses":["192.168.1.12:47821"],"relay":[],"hlc":1800000000004,"writer_device":"33333333333333333333333333333333"}}]}
+```
+
+### receiver-certificate-replacement
+
+Override the default receiver identity: B has successfully replaced its local
+certificate and now uses pin 64 `d`s. A already paired directly with that new
+certificate, retaining B's old-pin removal. This full snapshot is valid at B:
+retain the `b` tombstone, preserve B's current `d` identity, and do not withdraw.
+A different-pin `member` for B remains malformed. Historical removed metadata
+need not match the current incarnation's role/name. Apply the same allowance
+when a sender includes its own old-pin tombstone beside its authenticated member.
+
+```json
+{"transfer_id":"99999999999999999999999999999999","setup_id":"00000000000000000000000000000000","members":[{"device_id":"11111111111111111111111111111111","fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","role":"phone","name":"Phone","status":"member","hlc":1800000000001,"writer_device":"11111111111111111111111111111111"},{"device_id":"22222222222222222222222222222222","fingerprint":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","role":"computer","name":"Office PC","status":"member","hlc":1800000000020,"writer_device":"11111111111111111111111111111111"},{"device_id":"22222222222222222222222222222222","fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","role":"computer","name":"Office PC","status":"removed","hlc":1800000000010,"writer_device":"11111111111111111111111111111111"},{"device_id":"33333333333333333333333333333333","fingerprint":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","role":"computer","name":"Laptop","status":"member","hlc":1800000000003,"writer_device":"11111111111111111111111111111111","reach":{"addresses":["192.168.1.12:47821"],"relay":[],"hlc":1800000000004,"writer_device":"33333333333333333333333333333333"}}]}
+```
+
+Exact wire frame prefixes for those payload bytes (length includes type):
+
+| Vector | JSON bytes | L | Four-byte length then type |
+| --- | --- | --- | --- |
+| join | 993 | 994 | `000003e222` |
+| remove | 867 | 868 | `0000036422` |
+| later-introduction | 993 | 994 | `000003e222` |
+| reach-refresh | 993 | 994 | `000003e222` |
+| targeted-withdrawal | 994 | 995 | `000003e322` |
+| receiver-certificate-replacement | 1250 | 1251 | `000004e322` |
+
+Common ACK for first join; the same receipt with true is expected on retained
+identical replay. ACK's `deduplicated` describes receipt history, not whether an
+introduction was already known or blocked by a tombstone.
+
+```json
+{"transfer_id":"44444444444444444444444444444444","deduplicated":false}
+```
+
+Unscoped/pending-consent or setup-ID-mismatch response to join (no receipt):
+
+```json
+{"transfer_id":"44444444444444444444444444444444","code":"unsupported_kind","retryable":false}
+```
+
+Capacity/transaction failure response to join:
+
+```json
+{"transfer_id":"44444444444444444444444444444444","code":"storage_failed","retryable":true}
+```
+
+These are literal invalid entry/HELLO objects usable as nested parser vectors;
+embed entry objects in a snapshot with a new transfer ID and the valid A self
+entry. Duplicate known fields MUST be detected before a map parser loses them.
+
+```json
+{"device_id":"33333333333333333333333333333333","fingerprint":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","role":"computer","name":"Laptop","status":"member","hlc":1,"hlc":2,"writer_device":"11111111111111111111111111111111"}
+```
+
+```json
+{"device_id":"33333333333333333333333333333333","fingerprint":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","role":"computer","name":"Laptop","status":"member","hlc":1e0,"writer_device":"11111111111111111111111111111111"}
+```
+
+```json
+{"scope":"enabled","setup_id":null}
+```
+
+## Required tests on both platforms
+
+Use deterministic clocks, transaction fault injection and explicit completion
+barriers. Implement codec/merge tests on JVM and Rust; add daemon integration
+and Android instrumented DataStore/Room recovery tests for lifecycle cases. Each
+row needs assertions on durable state, admission/worker effects, messages and
+unrelated peer isolation. A static codec pass is not runtime pairing proof.
+
+| Case | Setup/action | Required result |
+| --- | --- | --- |
+| Full flow | A paired with B; new C pairs with A using switch on | A exports C only after reciprocal enabled scope; C and B learn each other through A; direct B↔C eventually READY with PEER_SETTINGS defaults. Content still direct. |
+| Stale replay after removal | join → remove → join (retained and evicted receipts) | C stays removed; retained replay ACK true, evicted replay ACK false; no install, settings bootstrap or notice. |
+| Concurrent add/remove | Apply remove and later-introduction in both orders, across restart | Terminal removed result in both orders; a newer add cannot defeat removal. Competing removal stamps use tuple max. Equal tuple/different status malformed with no partial merge. |
+| Fresh re-pair | remove → fresh local token pair C → replay old remove | Local deny cleared only under frozen pairing fence; new member stamp newer; old removal at/below retained high-water ignored. A genuinely newer removal revokes again. A remote higher member alone cannot clear another device's deny. |
+| Recovery is not fresh consent | Cancelled/lost-result old attempt, known-cert recovery, HELLO after removal | Old attempts/reconnects cannot clear a tombstone or recreate a removed binding; a fresh post-removal locally confirmed token attempt can; no recovery UNPAIR or refreshed install fence. |
+| Reused ID | C exists; incoming same ID/different pin, then removed old pin with newer replacement present | Introduction cannot replace; old-key removal cannot delete replacement. No queue, generation or pin change. |
+| Historical self pins | receiver-certificate-replacement at B; replay/reorder across restart; sender also includes its own old-pin tombstone | Full snapshot accepted, exact old-key barriers retained, current identity/binding unchanged and no withdrawal. Historical role/name may differ. Different-pin member for receiver or mismatched sender member still malformed. Current-key tombstone still withdraws. |
+| Unique pin | Incoming new ID claims existing C pin, local pin, or sender pin | No second binding for the pin; local/sender impersonation malformed; other retained-ID conflict diagnosed without replacement. |
+| Self-introduction | Sender describes itself, spoofs self pin, or sends receiver member row | Matching self description only refreshes existing metadata; no installation. Spoofed sender/local identity rejects full snapshot. Receiver identity never overwritten. |
+| Unchanged roster | Replay join with same ID, new ID, reordered entries/fields and irrelevant unknown fields | No generation/reset/provenance/notice change; preserve queued files, file/text/settings receipts, pending settings, switches, readiness and last-good route. Only appropriate receipt/clock state may advance. |
+| Receipt conflict | Reuse join ID with changed C name, reach, stamp, or operation type | Retained ID conflict NACK false retryability; no partial merge. Unknown fields/order alone are equivalent; address order change conflicts. |
+| Reach authority | Direct C update; forwarded unchanged C reach; wrong reach writer; changed addresses at same reach tuple | Original self-writer maintained; wrong writer/equal-tuple conflict malformed; intermediary cannot rewrite/stamp C's reach. Phone endpoints/nonempty relay rejected. |
+| Partial knowledge | Deliver C to B, delay B to C; B dials C with no invitation open, then with one open | Pre-HELLO unauthorized/provisional refusal retries; introduced trust survives. No unsolicited PAIR_REQUEST. Deliver B to C, direct link succeeds. |
+| Unauthorized after readiness | Introduced/scoped link reaches READY, then peer sends unauthorized | Connection problem only, no trust deletion or tombstone; delayed outcomes cannot affect a replacement generation. Plain direct-link loss handling still works. |
+| Live attempt | Attempt targets C ID; unresolved invitation targets C pin; unrelated attempt targets D | Block C install by either matching key, even before HELLO; preserve fence/attempt. D unaffected. Attempt completion/cancel re-runs reconciliation without requiring a new receipt. |
+| Tombstone vs attempt | Tombstone C arrives while direct attempt targets same incarnation, or targets known different replacement pin | Same-incarnation attempt cancelled/fenced; replacement attempt not cancelled by old-key removal; no UNPAIR from cancellation. |
+| Crash before commit | Fail after each staged member/reset/receipt/clock write | No partial state/admission/success event/ACK. Durable old binding remains authoritative. |
+| Crash after commit | Kill after authoritative commit, before Room cleanup, worker publication, notice or ACK | Startup resumes intents before affected workers/content; no second generation/install or duplicated notice; eligible same-generation replay ACK true after cleanup. Apply intents to multi-peer removal and own withdrawal too; retired-generation replay never mutates/ACKs a new setup. |
+| Offline catch-up | C offline; A introduces/removes D; A later offline; B has state | B supplies full stamped state to C; no dependence on original writer online. Missing entries never delete C's local winners. |
+| Legacy | Peer lacks setup or lacks mesh, unknown capability ignored | No MEMBERS sent; old direct file/clipboard/settings behavior preserved, no trust/generation change. Setup-without-mesh/object malformed. |
+| Switch off | Dialer or inviter chooses off; other endpoint enabled | New pair stays direct; neither introduces it to other members. Unexpected scoped traffic on disabled link NACKs unsupported_kind without mutation or prompt. |
+| Migration | Upgrade to ask, explicit local action, deny/allow, restart; absent or compatible IDs | Enabled/ask HELLO gives one durable prompt without MEMBERS; both-ask sends nothing. No roster/clock/receipt import before Allow; refresh HELLO and recheck assignment, then reconnect with matching persisted IDs to synchronize. Deny/disabled never prompts automatically. |
+| Setup ID compatibility | Run setup-id-compatibility in both directions, token pairing and existing-link action/offer/Allow; disabled local scope | Absent/absent founds, absent/S joins, S/S synchronizes, S/T keeps direct with no roster. Mutual enabled scope and authority required; disabled HELLO omits ID. IDs never bypass pins, tombstones or fences. Ordinary same-ID reconnect preserves consent. |
+| Three-device full-mesh migration | A phone, B Linux PC, C Mac, all pairwise ask; run walk-through with restart/replay of prompts; delay B/C gossip | A–B founds S, A–C adopts S, B–C sees S/S without waiting for gossip. Each explicit initiation prompts the remote once; Allow rechecks IDs. All scopes end enabled without binding/queue/settings resets; ask links never supply export authority. |
+| Independent bootstraps stay separate | A–B found S, C–D found T; A–C ask action in either direction; also assign S/T while prompt pending | Block offer/Allow on S/T, disable evaluated scope, resolve prompt with Direct link kept; separate setups not linked. Preserve direct queues/settings; no cross-group roster, clock or receipt mutation. |
+| Concurrent joins to different IDs | Unassigned E races mutually enabled joins to S and T in both orders; fault before/after durable assignment | Device-wide local transaction admits exactly one ID; first durable assignment wins. Other link stays direct, no cross-group merge. No gate held over network/prompt; restart preserves assignment; mismatched late MEMBERS NACKs without effects. |
+| Founding on both ends and crash recovery | Both absent/enabled; swap lower ID and initiator; crash lower-ID proposer after assignment commit before reconnect and crash adopter before/after commit | Only lower authenticated ID generates random S; ID/self/first member atomic. Other waits unassigned without MEMBERS; restart advertises same persisted S, other adopts once and reconnects. Synchronize only at S/S; no second founding ID or repeated install. Retired IDs never reused or derived from identities/roster. |
+| MEMBERS ID mismatch | Joined S receives valid T snapshot, including retained transfer ID; unassigned device receives stray S snapshot | NACK unsupported_kind, retryable=false; no roster, clock, receipt or worker change. Report separate setups for mismatch; unassigned cannot adopt without mutually enabled founding/join context. Missing/null/invalid ID malformed. |
+| Last-member dissolution | Remove last other active member locally or via MEMBERS; repeat with another retained active member whose direct scope is ask/offline | Last removal atomically clears ID and positive roster, advances setup generation, retains all tombstones/deny/high-water marks. Another active member preserves S. Later join/founding exports no retired state and cannot resurrect denied keys; retained history still counts toward local tombstone budgets. |
+| Stale work after leave/rejoin | Capture prompt, snapshot, pending send and receipt in generation g; dissolve/withdraw and join another ID, then also retry same-ID rejoin | All g work fails generation recheck at commit/use, including same-ID work; cannot enable scope, merge, observe clocks, replay receipt or send retired state. Fresh-generation consent/work required. |
+| S5 retained-member bridge | A–B–C share S; B learns C through A while B–C stays ask; B removes A, then pairs with D in D–E setup T | C remains active in B's roster, so B retains S despite no enabled direct bindings; S/T keeps B–D direct, no C export into T. B's UI offers Remove from all devices for C even though B–C is still ask; if B removes C that way, B dissolves first; joining T carries no retired positive roster/tombstones, while local deny barriers remain. |
+| Phone–phone | A and D phones in same roster introduced through B | Both retain membership metadata/removals; neither dials/listens to the other or creates phone settings/content delivery. Desktop still serves both phones. |
+| UNPAIR/removal | A removes B; deliver scoped UNPAIR or targeted-withdrawal to B before C learns B's removal; ordinary unscoped UNPAIR; MEMBERS removal replay | A authors only B's removal. B withdraws locally without authoring/propagating removals against A/C, UNPAIR echoes or pending MEMBERS; C keeps A. Unscoped clears only that pair; replay does not restamp. Saved files unchanged. |
+| Legitimate reverse removal | B is still authorized/not withdrawn; user on B chooses Remove from all devices for A | B authors A's tombstone and gossips to C; B's scoped UNPAIR notification causes A's local withdrawal without reciprocal tombstones. C removes only A. |
+| Removed sender | C knows B's exact-key tombstone, then B sends MEMBERS removing A, including an in-flight message, receipt replay or racing local removal | Ignore before any merge/clock/receipt/worker effects and close stale session; transaction recheck fences race. A unaffected. A fresh local token pair clearing that exact deny restores normal eligibility. |
+| Own withdrawal | Current exact-key tombstone or scoped UNPAIR on authorized session; then fresh pairing/join | Clear ID/positive roster, advance setup generation, disable/forget scoped links; retain deny/high-water history, identity, unscoped links and files. No reciprocal removals, echoes or pending exports. Old-pin tombstone does not withdraw. Fresh pairing plus mutually consented assignment required; retired roster never exported under new ID. |
+| Size/cap | 17/18 active, 64/65 total, 4/5 fingerprints per ID, 16/17 local peers, union overflow, exactly 65536/65537 encoded bytes | Boundaries accepted when all other checks pass; structural array/per-ID overflow malformed, frame overflow frame_too_large before allocation, merged capacity NACK storage_failed with no partial merge/eviction. At cap, local replacement fails visibly before commit, tombstones survive restart/replay, removal still fits by replacing an entry; no resurrection through eviction. |
+| Strings/types | 128/129-byte name, Unicode byte length, NUL/unpaired surrogate, address max/grammar, duplicate ID/pin key, null/unknown enums, missing field, negative/fraction/exponent HLC | Match strict common rules on both codecs, no partial snapshot. Unknown valid object fields ignored. Unknown URI keys and relay-shaped addresses still rejected. |
+| Clocks | Exact u64 limits, now+60000 boundary/+1, rollback/restart, overflow, older forwarded writer | Exact unsigned parse; future skew rejects before any mutation; tuple tie uses device ID; old writer need not be sender/current member; clock never grants trust. |
+| Control lanes | MEMBERS and PEER_SETTINGS in flight with files/PING; lost ACK; receipt eviction; pre-install immediate snapshot | One pending per control kind, shared unique IDs, correct receipt matching, keepalive responsive; exact pending snapshot first on retry. Buffer bounded before pairing persistence; no new handshake or fence refresh. |
+| Revocation limits | A removed while B offline; C ACKs forwarded removal | B still trusts A until catch-up; C ACK proves C receipt only. UI never infers global completion or guaranteed reset of removed A. |
+
+## Implementation estimate
+
+Budget roughly **1,500–2,500 production Rust lines** plus **1,200–2,000 test
+lines** for codec/schema, durable roster/receipts/reconcile, core/mesh admission
+publication, scope migration and IPC/UI wiring. Android is roughly
+**1,700–2,800 production Kotlin lines** plus **1,300–2,200 test lines** for the
+same feature, additional DataStore/Room recovery and phone-only roster metadata.
+These are planning ranges, excluding future relay, group merging, broad visual
+redesign, native packaging and physical multi-device acceptance. The largest
+risk is lifecycle integration, not the new codec.
