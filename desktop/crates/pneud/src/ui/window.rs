@@ -29,7 +29,7 @@ slint::slint! {
 pub(crate) use super::send_request::SendRequest;
 
 /// The download page, shown as a code on Add Device → Phone (window.slint
-/// prints it without the scheme).
+/// copies it too, and prints it without the scheme).
 const DOWNLOAD_PAGE: &str = "https://stantonmatt.github.io/pneu/";
 const TAILSCALE_DOWNLOAD: &str = "https://tailscale.com/download";
 
@@ -4257,8 +4257,13 @@ mod tests {
         }
         slint::platform::update_timers_and_animations();
     }
+    // What the window last copied; tests never reach the system clipboard.
+    static COPIED: Mutex<String> = Mutex::new(String::new());
     struct Headless(std::rc::Rc<slint::platform::software_renderer::MinimalSoftwareWindow>);
     impl slint::platform::Platform for Headless {
+        fn set_clipboard_text(&self, text: &str, _: slint::platform::Clipboard) {
+            *COPIED.lock().unwrap() = text.into();
+        }
         fn new_event_loop_proxy(&self) -> Option<Box<dyn slint::platform::EventLoopProxy>> {
             Some(Box::new(TestProxy(
                 UI_EVENTS.get_or_init(Default::default).clone(),
@@ -5911,6 +5916,24 @@ mod tests {
         ui.set_download(true);
         window.invoke_open_add(0);
         assert!(!ui.get_download());
+        // The header's Back leaves Add Device straight from the download code.
+        ui.set_download(true);
+        draw();
+        key(&window, slint::platform::Key::Tab); // Back
+        key(&window, slint::platform::Key::Return);
+        assert_eq!(ui.get_page(), Page::Main);
+        assert!(!ui.get_download());
+        // The printed address copies the whole download page.
+        window.invoke_open_add(0);
+        ui.set_download(true);
+        draw();
+        key(&window, slint::platform::Key::Tab); // Back
+        key(&window, slint::platform::Key::Tab); // Phone / Computer
+        key(&window, slint::platform::Key::Tab); // stantonmatt.github.io/pneu
+        key(&window, slint::platform::Key::Return);
+        assert_eq!(*COPIED.lock().unwrap(), DOWNLOAD_PAGE);
+        assert_eq!(ui.get_page(), Page::Add);
+        assert!(ui.get_download());
 
         // Get Tailscale… asks the worker to open the page and closes the popup.
         window.invoke_go(Page::Main);
@@ -6196,8 +6219,34 @@ mod tests {
                 "{}: {height}px",
                 scene.name
             );
+            if scene.name.contains("-download") {
+                // Swapping the codes must not resize the window.
+                ui.set_download(false);
+                let pairing = window.get_content_height();
+                ui.set_download(true);
+                assert_eq!(pairing, height, "{}: pairing code height", scene.name);
+            }
             let size = slint::LogicalSize::new(400.0, height).to_physical(scale);
             surface.set_size(size);
+            if scene.name.ends_with("-copied") {
+                // Click the address, which sits just above Pairing Code.
+                let position =
+                    slint::LogicalPosition::new(200.0, height - 16.0 - 24.0 - 4.0 - 12.0);
+                let button = slint::platform::PointerEventButton::Left;
+                window
+                    .window()
+                    .dispatch_event(slint::platform::WindowEvent::PointerPressed {
+                        position,
+                        button,
+                    });
+                window
+                    .window()
+                    .dispatch_event(slint::platform::WindowEvent::PointerReleased {
+                        position,
+                        button,
+                    });
+                assert_eq!(*COPIED.lock().unwrap(), DOWNLOAD_PAGE, "{}", scene.name);
+            }
             surface.request_redraw();
             let mut pixels = vec![
                     slint::platform::software_renderer::PremultipliedRgbaColor::default();
@@ -6451,6 +6500,33 @@ mod tests {
         let waiting = transfer("w", 1, "notes.md", "waiting_for_device", 0, 9);
         state(w, vec![phone], vec![waiting]);
     }
+    fn offline_devices(w: &mut Worker) {
+        let mut list = vec![
+            transfer("w", 1, "notes.md", "waiting_for_device", 0, 9),
+            transfer("w", 2, "notes.md", "waiting_for_device", 0, 9),
+        ];
+        list.extend(recent_items()[..1].to_vec());
+        state(
+            w,
+            vec![
+                device(
+                    1,
+                    "Galaxy S25+",
+                    true,
+                    "disconnected",
+                    crate::now_ms() - 7_200_000,
+                ),
+                device(
+                    2,
+                    "MacBook Air",
+                    false,
+                    "disconnected",
+                    crate::now_ms() - 9_000_000,
+                ),
+            ],
+            list,
+        );
+    }
     fn help(w: &PneuWindow) {
         go(Page::Main, 0, 0)(w);
         w.global::<Ui>().set_dialog(Dialog::Help);
@@ -6596,34 +6672,12 @@ mod tests {
                 },
                 go(Page::Main, 0, 0),
             ),
+            scene("06-main-cant-connect", offline_devices, help),
             scene(
-                "06-main-cant-connect",
+                "06-main-cant-connect-tailscale",
                 |w| {
-                    let mut list = vec![
-                        transfer("w", 1, "notes.md", "waiting_for_device", 0, 9),
-                        transfer("w", 2, "notes.md", "waiting_for_device", 0, 9),
-                    ];
-                    list.extend(recent_items()[..1].to_vec());
-                    state(
-                        w,
-                        vec![
-                            device(
-                                1,
-                                "Galaxy S25+",
-                                true,
-                                "disconnected",
-                                crate::now_ms() - 7_200_000,
-                            ),
-                            device(
-                                2,
-                                "MacBook Air",
-                                false,
-                                "disconnected",
-                                crate::now_ms() - 9_000_000,
-                            ),
-                        ],
-                        list,
-                    );
+                    offline_devices(w);
+                    w.tailscale = Some((true, Instant::now()));
                 },
                 help,
             ),
@@ -6837,6 +6891,13 @@ mod tests {
                 "17-add-first-run-mac-download",
                 |w| state(w, Vec::new(), Vec::new()),
                 download(0, true),
+            ),
+            // Clicked after sizing; the 2 s Copied feedback outlasts the
+            // remaining scenes, so no later one shows the download code.
+            scene(
+                "17-add-phone-download-copied",
+                |w| state(w, two(), Vec::new()),
+                download(0, false),
             ),
             scene(
                 "18-add-phone-pairing",
