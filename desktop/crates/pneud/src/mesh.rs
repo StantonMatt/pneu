@@ -28,13 +28,24 @@ struct Join {
     installed_generation: Arc<AtomicU64>,
     retry_at: Option<Instant>,
     ready: Arc<AtomicBool>,
+    setup_scope: bool,
 }
+#[cfg(test)]
+type ConfirmHook = (
+    tokio::sync::oneshot::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+#[cfg(test)]
+type RequestHook = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
 #[derive(Default)]
 pub(super) struct Mesh {
     peers: Mutex<Vec<PeerInfo>>,
     join: Mutex<Option<Join>>,
     gate: tokio::sync::Mutex<()>,
-    pub(super) changed: Notify,
+    pub(super) changed: Arc<Notify>,
     links: Mutex<HashMap<Id, LinkState>>,
     connecting: Mutex<HashSet<Id>>,
     #[cfg(test)]
@@ -43,6 +54,12 @@ pub(super) struct Mesh {
     panic_dial: AtomicBool,
     #[cfg(test)]
     panic_supervisor: AtomicBool,
+    #[cfg(test)]
+    confirm_hook: Mutex<Option<ConfirmHook>>,
+    #[cfg(test)]
+    retry_hook: Mutex<Option<ConfirmHook>>,
+    #[cfg(test)]
+    request_hook: Mutex<Option<RequestHook>>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LinkProblem {
@@ -102,6 +119,35 @@ pub struct DeviceSnapshot {
     pub route: Option<String>,
 }
 impl Mesh {
+    pub(super) fn cancel_withdrawn_join(&self) {
+        if let Some(join) = self.join.lock().expect("join").as_mut()
+            && join.phase != JoinPhase::Finished
+        {
+            join.phase = JoinPhase::Finished;
+            join.state = "cancelled".into();
+        }
+    }
+    pub(super) fn cancel_removed(&self, keys: &[(Id, Hash)]) {
+        if let Some(join) = self.join.lock().expect("join").as_mut()
+            && join.phase != JoinPhase::Finished
+            && keys.iter().any(|(id, pin)| {
+                join.uri.fingerprint == *pin
+                    && join.authority.as_ref().is_none_or(|a| a.peer == *id)
+            })
+        {
+            join.phase = JoinPhase::Finished;
+            join.state = "cancelled".into();
+            self.changed.notify_waiters();
+        }
+    }
+    pub(super) fn join_scope(&self, pin: &Hash) -> bool {
+        self.join
+            .lock()
+            .expect("join")
+            .as_ref()
+            .filter(|j| j.uri.fingerprint == *pin && j.phase != JoinPhase::Finished)
+            .is_none_or(|j| j.setup_scope)
+    }
     pub(super) fn new(peers: Vec<PeerInfo>) -> Self {
         Self {
             peers: Mutex::new(peers),
@@ -133,13 +179,66 @@ impl DialCandidate {
     }
 }
 impl Core {
+    pub(super) fn setup_attempts(&self) -> Vec<(Option<Id>, Hash)> {
+        let mut targets = self
+            .setup_incoming
+            .lock()
+            .expect("setup incoming")
+            .values()
+            .map(|v| (v.peer.clone(), v.pin.clone()))
+            .collect::<Vec<_>>();
+        if let Some(join) = self
+            .mesh
+            .join
+            .lock()
+            .expect("join")
+            .as_ref()
+            .filter(|j| j.phase != JoinPhase::Finished)
+        {
+            targets.push((
+                join.authority.as_ref().map(|a| a.peer.clone()),
+                join.uri.fingerprint.clone(),
+            ));
+        }
+        targets
+    }
+    pub(super) fn computer_hello_for(
+        &self,
+        pin: &Hash,
+        expected: Option<&Id>,
+        outbound: bool,
+    ) -> Hello {
+        let mut hello = self.computer_hello();
+        let peer = expected.cloned().or_else(|| {
+            self.admission
+                .lock()
+                .expect("admission")
+                .peers
+                .get(pin)
+                .cloned()
+        });
+        let default = if if outbound {
+            self.mesh.join_scope(pin)
+        } else {
+            self.setup_invitation_scope.load(Ordering::SeqCst)
+        } {
+            SetupScope::Enabled
+        } else {
+            SetupScope::Disabled
+        };
+        if hello.capabilities.iter().any(|c| c == "setup") {
+            hello.setup = Some(self.store.setup_hello(peer.as_ref(), default));
+        }
+        hello
+    }
     pub(super) fn computer_hello(&self) -> Hello {
         let addresses = crate::discovery::pairing_candidates()
             .unwrap_or_default()
             .into_iter()
             .map(|i| SocketAddr::new(i.ip, self.bound_port()).to_string())
             .collect();
-        Hello {
+        let hello = Hello {
+            setup: Some(self.store.setup_hello(None, SetupScope::Enabled)),
             version: 1,
             device_id: self.identity.device_id.clone(),
             name: self.config().name,
@@ -151,8 +250,19 @@ impl Core {
                 "clipboard_text".into(),
                 "clipboard_image".into(),
                 "mesh".into(),
+                "setup".into(),
             ],
-        }
+        };
+        #[cfg(test)]
+        let hello = if self.setup_test_capability.load(Ordering::SeqCst) {
+            hello
+        } else {
+            let mut h = hello;
+            h.capabilities.retain(|c| c != "setup");
+            h.setup = None;
+            h
+        };
+        hello
     }
     pub(super) fn device_snapshots(
         &self,
@@ -223,7 +333,7 @@ impl Core {
         });
         devices
     }
-    fn link_problem(&self, device: &Id) -> Option<LinkProblem> {
+    pub(super) fn link_problem(&self, device: &Id) -> Option<LinkProblem> {
         self.mesh
             .links
             .lock()
@@ -340,6 +450,7 @@ impl Core {
             Ok(_) => return Ok(json!({"state":"update_required"})),
             Err(_) => return Ok(json!({"state":"garbled"})),
         };
+        let _pairing = self.pairing_gate.lock().await;
         let paired = self
             .admission
             .lock()
@@ -371,6 +482,7 @@ impl Core {
             installed_generation: Arc::new(AtomicU64::new(0)),
             retry_at: None,
             ready: Default::default(),
+            setup_scope: true,
         };
         let value = join_value(&join);
         *self.mesh.join.lock().expect("join") = Some(join);
@@ -399,20 +511,31 @@ impl Core {
         Ok(value)
     }
     pub async fn confirm_join(&self, attempt: &str) -> Result<Value> {
+        self.confirm_join_scoped(attempt, true).await
+    }
+    pub async fn confirm_join_scoped(&self, attempt: &str, enabled: bool) -> Result<Value> {
         let _guard = self.mesh.gate.lock().await;
-        let mut join = self
-            .mesh
-            .join
-            .lock()
-            .expect("join")
-            .as_ref()
+        let mut state = self.mesh.join.lock().expect("join");
+        let join = state
+            .as_mut()
             .filter(|j| j.attempt == attempt)
-            .cloned()
             .context("unknown join attempt")?;
+        #[cfg(test)]
+        if let Some((entered, release)) =
+            self.mesh.confirm_hook.lock().expect("confirm hook").take()
+        {
+            let _ = entered.send(());
+            let _ = release.recv();
+        }
         ensure!(
             join.phase != JoinPhase::Finished,
             "join cannot be confirmed"
         );
+        if join.phase == JoinPhase::Preview {
+            join.setup_scope = enabled;
+        } else {
+            ensure!(join.setup_scope == enabled, "pairing scope is frozen");
+        }
         if join.phase == JoinPhase::Preview && join.uri.expires_at <= crate::now_ms() {
             join.state = "expired".into();
             join.phase = JoinPhase::Finished;
@@ -421,8 +544,7 @@ impl Core {
             join.state = "pairing".into();
             join.retry_at = None;
         }
-        let value = join_value(&join);
-        *self.mesh.join.lock().expect("join") = Some(join);
+        let value = join_value(join);
         self.mesh.changed.notify_waiters();
         Ok(value)
     }
@@ -474,8 +596,10 @@ impl Core {
         pin: Hash,
         expected: Option<&Id>,
     ) -> Result<ComputerLink> {
-        let connector =
-            TlsConnector::from(Arc::new(crate::tls::client_config(&self.identity, pin)?));
+        let connector = TlsConnector::from(Arc::new(crate::tls::client_config(
+            &self.identity,
+            pin.clone(),
+        )?));
         let deadline = Instant::now() + DIAL_SWEEP_TIMEOUT;
         let mut mismatch = false;
         for candidate in candidates {
@@ -499,7 +623,9 @@ impl Core {
                         return Err(error.into());
                     }
                 };
-                let sent = send(&mut tls, &Message::Hello(self.computer_hello())).await;
+                let (local_hello,setup_revision)={let _gate=self.pairing_gate.lock().await;(self.computer_hello_for(&pin,expected,true),self.store.setup_state().generation)};
+                let setup_sent=local_hello.setup.clone().map(|h|(h,setup_revision));
+                let sent = send(&mut tls, &Message::Hello(local_hello)).await;
                 let mut hello = match read_handshake(&mut tls).await? {
                     Message::Hello(h) => h,
                     Message::Error(error) => return Err(crate::client::PcRejection(error).into()),
@@ -520,7 +646,7 @@ impl Core {
                     return Err(crate::client::PcRejection(ErrorMessage { code: ErrorCode::MalformedMessage, message: Some("invalid computer role".into()), supported_version: None }).into());
                 }
                 normalize_legacy_hello(&mut hello, true);
-                Ok(ComputerLink { tls, hello, remote, address: address.clone(), permit, transport })
+                Ok(ComputerLink { tls, hello, remote, address: address.clone(), permit, transport, setup_sent })
             }).await {
                 Ok(result) => result,
                 Err(_) => break,
@@ -555,6 +681,7 @@ impl Core {
             address,
             permit,
             transport: _transport,
+            setup_sent,
         } = self
             .connect_computer(
                 &join.uri.addresses,
@@ -570,9 +697,20 @@ impl Core {
             if !join.requested && join.uri.expires_at <= crate::now_ms() {
                 return Err(PairRejected("expired").into());
             }
+            #[cfg(test)]
+            {
+                let hook = self.mesh.request_hook.lock().expect("request hook").take();
+                if let Some((entered, release)) = hook {
+                    let _ = entered.send(());
+                    let _ = release.await;
+                }
+            }
             let _pairing = self.pairing_gate.lock().await;
             let mut state = self.mesh.join.lock().expect("join");
-            let current = state.as_mut().context("join disappeared")?;
+            let current = state
+                .as_mut()
+                .filter(|j| j.attempt == join.attempt && j.phase == JoinPhase::Pending)
+                .context("cancelled")?;
             if current.authority.is_none() {
                 current.authority = Some(JoinAuthority {
                     peer: hello.device_id.clone(),
@@ -620,7 +758,14 @@ impl Core {
                     | Message::FileBegin(_)
                     | Message::FileChunk(_)
                     | Message::FileEnd(_)
-                    | Message::PeerSettings(_)) => {
+                    | Message::PeerSettings(_)
+                    | Message::Members(_)) => {
+                        if matches!(m, Message::Members(_)) {
+                            ensure!(
+                                !buffered.iter().any(|m| matches!(m, Message::Members(_))),
+                                "too many buffered MEMBERS"
+                            );
+                        }
                         ensure!(buffered.len() < 8, "too much data before pairing result");
                         buffered.push(m);
                     }
@@ -634,6 +779,7 @@ impl Core {
         let gate = self.mesh.gate.lock().await;
         ensure!(self.joining(&join.attempt), "cancelled");
         let guard = self.pairing_gate.clone().lock_owned().await;
+        ensure!(self.joining(&join.attempt), "cancelled");
         let (authority, installed_generation) = self
             .mesh
             .join
@@ -676,7 +822,17 @@ impl Core {
         }
         let captured = if admission.as_ref() == Some(&hello.device_id) {
             let captured = self.store.with_current_pairing();
-            drop(guard);
+            if self.store.setup_state().withdrawn {
+                captured
+                    .setup_fresh_local_recovery(
+                        hello.device_id.clone(),
+                        self.self_member(),
+                        self.setup_publish(guard, None, None),
+                    )
+                    .await?;
+            } else {
+                drop(guard);
+            }
             captured
         } else {
             let mut initial = hello.clone();
@@ -710,7 +866,7 @@ impl Core {
         join.ready.store(true, Ordering::SeqCst);
         drop(gate);
         let _route = self.persist_working_route(captured.clone(), hello.device_id.clone(), address);
-        self.register_buffered(
+        self.register_buffered_setup(
             tls,
             hello,
             join.uri.fingerprint,
@@ -721,6 +877,7 @@ impl Core {
             false,
             buffered,
             Some(candidate),
+            setup_sent,
         )
         .await
     }
@@ -783,7 +940,14 @@ impl Core {
                     | Message::FileBegin(_)
                     | Message::FileChunk(_)
                     | Message::FileEnd(_)
-                    | Message::PeerSettings(_)) => {
+                    | Message::PeerSettings(_)
+                    | Message::Members(_)) => {
+                        if matches!(m, Message::Members(_)) {
+                            ensure!(
+                                !buffered.iter().any(|m| matches!(m, Message::Members(_))),
+                                "too many buffered MEMBERS"
+                            );
+                        }
                         ensure!(buffered.len() < 8, "too much data before READY");
                         buffered.push(m);
                     }
@@ -868,6 +1032,7 @@ impl Core {
                         address,
                         permit,
                         transport: _transport,
+                        setup_sent,
                     } = self
                         .connect_computer_candidates(
                             &addresses,
@@ -883,7 +1048,7 @@ impl Core {
                     let _route =
                         self.persist_working_route(captured.clone(), peer.id.clone(), address);
                     self.clone()
-                        .register_buffered(
+                        .register_buffered_setup(
                             tls,
                             hello,
                             peer.fingerprint.clone(),
@@ -894,6 +1059,7 @@ impl Core {
                             false,
                             buffered,
                             Some(candidate),
+                            setup_sent,
                         )
                         .await
                 };
@@ -902,12 +1068,29 @@ impl Core {
                 if self.mesh.panic_dial.swap(false, Ordering::SeqCst) {
                     panic!("injected dial failure");
                 }
-                let result = tokio::select! { biased; _ = cancelled.changed() => break, _ = revoked.changed() => break, _ = shutdown.changed() => break, result = dial => result };
+                tokio::pin!(dial);
+                let result = tokio::select! { biased;
+                    _ = cancelled.changed() => {
+                        // A lifecycle commit has already fenced this binding
+                        // and published its close reason. Let an owned READY
+                        // transport flush its final control notification before
+                        // dropping it; connecting candidates remain bounded.
+                        let _ = tokio::time::timeout(Duration::from_secs(3), &mut dial).await;
+                        break;
+                    },
+                    _ = revoked.changed() => {
+                        let _ = tokio::time::timeout(Duration::from_secs(3), &mut dial).await;
+                        break;
+                    },
+                    _ = shutdown.changed() => break,
+                    result = &mut dial => result
+                };
                 if let Err(error) = &result
                     && error
                         .downcast_ref::<crate::client::PcRejection>()
                         .is_some_and(|e| e.0.code == ErrorCode::Unauthorized)
                     && may_revoke
+                    && !self.store.setup_protected(&peer.id)
                 {
                     // Revoke only this captured generation, serialized by lifecycle admission.
                     self.forget_pairing_generation_checked(
@@ -957,7 +1140,7 @@ impl Core {
         latest
             .addresses
             .first()
-            .filter(|a| !tailscale_endpoint(a))
+            .filter(|a| latest.route_proven && !tailscale_endpoint(a))
             .cloned()
             .map(DialCandidate::current)
             .into_iter()
@@ -965,7 +1148,7 @@ impl Core {
                 latest
                     .addresses
                     .iter()
-                    .skip(1)
+                    .skip(usize::from(latest.route_proven))
                     .filter(|a| !tailscale_endpoint(a))
                     .cloned()
                     .map(DialCandidate::cached),
@@ -992,6 +1175,7 @@ impl Core {
         let mut links: Vec<Task> = Vec::new();
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         let mut stop = self.shutdown.subscribe();
+        let mut reach_refresh = Instant::now();
         loop {
             tokio::select! { biased; _ = stop.changed() => break, _ = tick.tick() => {} }
             if *stop.borrow() {
@@ -1000,6 +1184,29 @@ impl Core {
             #[cfg(test)]
             if self.mesh.panic_supervisor.swap(false, Ordering::SeqCst) {
                 panic!("injected supervisor failure");
+            }
+            if self.store.setup_state().pending_link {
+                let guard = self.pairing_gate.clone().lock_owned().await;
+                if let Err(error) = self
+                    .store
+                    .setup_discovery_tick(
+                        self.self_member(),
+                        crate::now_ms(),
+                        self.setup_publish(guard, None, None),
+                    )
+                    .await
+                {
+                    self.error(None, format!("setup discovery deferred: {error}"));
+                }
+            }
+            if self.store.setup_state().setup_id.is_some() && Instant::now() >= reach_refresh {
+                reach_refresh = Instant::now() + Duration::from_secs(30);
+                if let Err(error) = self.store.setup_refresh_self(self.self_member()).await {
+                    self.error(None, format!("setup routes unavailable: {error}"));
+                }
+            }
+            if let Err(error) = self.reconcile_setup_candidates().await {
+                self.error(None, format!("membership reconciliation deferred: {error}"));
             }
             let peers = match self.store.peer_info().await {
                 Ok(peers) => peers,
@@ -1078,17 +1285,20 @@ impl Core {
                             _ => "unreachable",
                         };
                         let _guard = self.mesh.gate.lock().await;
-                        if !self.joining(&attempt) {
+                        let mut join = self.mesh.join.lock().expect("join");
+                        let Some(pending) = join
+                            .as_mut()
+                            .filter(|j| j.attempt == attempt && j.phase == JoinPhase::Pending)
+                        else {
                             continue;
+                        };
+                        #[cfg(test)]
+                        if let Some((entered, release)) =
+                            self.mesh.retry_hook.lock().expect("retry hook").take()
+                        {
+                            let _ = entered.send(());
+                            let _ = release.recv();
                         }
-                        let mut pending = self
-                            .mesh
-                            .join
-                            .lock()
-                            .expect("join")
-                            .as_ref()
-                            .expect("join")
-                            .clone();
                         if rejected {
                             pending.phase = JoinPhase::Finished;
                             pending.state = state.into();
@@ -1110,7 +1320,6 @@ impl Core {
                                     ),
                             );
                         }
-                        *self.mesh.join.lock().expect("join") = Some(pending);
                     }
                 } else if !self.joining(&attempt.attempt) {
                     // Successful joins continue as ordinary READY workers; unpair closes them.
@@ -1162,7 +1371,7 @@ impl Core {
     }
 }
 fn join_value(join: &Join) -> Value {
-    json!({"attempt":join.attempt,"state":join.state,"name":join.uri.name,"fingerprint":join.uri.fingerprint,"role":"computer"})
+    json!({"attempt":join.attempt,"state":join.state,"name":join.uri.name,"fingerprint":join.uri.fingerprint,"role":"computer","setup_enabled":join.setup_scope})
 }
 fn join_error(error: &anyhow::Error) -> &'static str {
     if let Some(rejected) = error.downcast_ref::<PairRejected>() {
@@ -1237,6 +1446,7 @@ struct ComputerLink {
     address: String,
     permit: tokio::sync::OwnedSemaphorePermit,
     transport: tokio::sync::OwnedSemaphorePermit,
+    setup_sent: Option<(SetupHello, u64)>,
 }
 struct Connecting {
     core: Arc<Core>,
@@ -1282,6 +1492,7 @@ impl Drop for Registration {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::store::members::SetupFence;
     use async_trait::async_trait;
     struct Mock;
     #[async_trait]
@@ -1314,6 +1525,8 @@ mod tests {
             ..Config::default()
         };
         let core = Core::new(paths, config, Arc::new(Mock)).await?;
+        // These protocol mocks implement mesh/PEER_SETTINGS, not membership.
+        core.setup_test_capability.store(false, Ordering::SeqCst);
         eprintln!(
             "mock Core PID={} port={} directory={} (no mDNS)",
             std::process::id(),
@@ -1642,6 +1855,7 @@ mod tests {
             la = TcpListener::bind("127.0.0.1:0").await?;
             config.port = la.local_addr()?.port();
             a = Core::new(paths, config, Arc::new(Mock)).await?;
+            a.setup_test_capability.store(false, Ordering::SeqCst);
         }
         a.shutdown_actions().await?;
         b.shutdown_actions().await
@@ -2015,6 +2229,7 @@ mod tests {
         b.store.drain().await;
         drop(b);
         b = Core::new(paths, config, Arc::new(Mock)).await?;
+        b.setup_test_capability.store(false, Ordering::SeqCst);
         assert!(b.join_status(attempt).is_err());
         assert!(!b.paths.data.join("join-pending.json").exists());
         let fresh = a.start_pairing_with_addresses(vec![address]).await?;
@@ -2025,7 +2240,11 @@ mod tests {
         b.confirm_join(next).await?;
         let pending = b.mesh.join.lock().unwrap().as_ref().unwrap().clone();
         let worker = Task::spawn(b.clone().join_worker(pending));
-        until(|| b.join_status(next).unwrap()["state"] == "paired").await?;
+        until(|| b.join_status(next).unwrap()["state"] == "paired" || worker.is_finished()).await?;
+        if b.join_status(next)?["state"] != "paired" {
+            worker.await??;
+            bail!("join worker ended before installation");
+        }
         assert_eq!(
             a.paired_devices(),
             std::slice::from_ref(&b.identity.device_id)
@@ -2631,6 +2850,7 @@ mod tests {
         // Remote revocation occurs while A is stopped.
         b.unpair_device(id).await?;
         a = Core::new(paths, config, Arc::new(Mock)).await?;
+        a.setup_test_capability.store(false, Ordering::SeqCst);
         let server = Task::spawn(b.clone().serve(lb, false));
         let supervisor = Task::spawn(a.clone().mesh_supervise());
         until(|| a.paired_devices().is_empty()).await?;
@@ -2655,6 +2875,7 @@ mod tests {
         a.store.drain().await;
         drop(a);
         let a = Core::new(paths, config, Arc::new(Mock)).await?;
+        a.setup_test_capability.store(false, Ordering::SeqCst);
         let peer = a.store.peer_info().await?.remove(0);
         let (cancel, rx) = watch::channel(false);
         let worker = Task::spawn(a.clone().dial_worker(peer, rx));
@@ -3482,6 +3703,7 @@ mod tests {
         let (_db, b, _lb) = core().await?;
         bind(&a, &b).await?;
         let mut peer = a.store.peer_info().await?.remove(0);
+        peer.route_proven = true;
         peer.addresses = vec![
             "192.0.2.1:47821".into(), // last-good
             "192.0.2.2:47821".into(), // HELLO hint
@@ -3516,6 +3738,13 @@ mod tests {
             routes[1..]
                 .iter()
                 .all(|route| route.connect_timeout == Duration::from_secs(1))
+        );
+        peer.route_proven = false;
+        assert!(
+            a.dial_candidates(&peer)
+                .iter()
+                .all(|route| route.connect_timeout == Duration::from_secs(1)),
+            "forwarded hints have no proven last-good route"
         );
         a.shutdown_actions().await?;
         b.shutdown_actions().await
@@ -3972,4 +4201,385 @@ mod tests {
         Ok(())
     }
     include!("storage_failure_tests.rs");
+    async fn scoped_binding(a: &Core, b: &Core, remote_enabled: bool) -> Result<()> {
+        a.setup_test_capability.store(true, Ordering::SeqCst);
+        b.setup_test_capability.store(true, Ordering::SeqCst);
+        let mut hello = b.computer_hello();
+        hello.setup = Some(SetupHello {
+            scope: if remote_enabled {
+                SetupScope::Enabled
+            } else {
+                SetupScope::Disabled
+            },
+            setup_id: None,
+        });
+        let guard = a.pairing_gate.clone().lock_owned().await;
+        a.persist_pairing_hello_scoped(
+            &b.identity.device_id,
+            &b.identity.fingerprint,
+            guard,
+            false,
+            Some(hello),
+            None,
+            Some(true),
+        )
+        .await?;
+        Ok(())
+    }
+    async fn assign_from(a: &Core, b: &Core) -> Result<SetupFence> {
+        let mut fence = SetupFence {
+            generation: a.store.setup_state().generation,
+            binding_generation: a.store.pairing_generation(&b.identity.device_id).unwrap(),
+            device: b.identity.device_id.clone(),
+            fingerprint: b.identity.fingerprint.clone(),
+            connection: 100,
+            current: Arc::new(AtomicU64::new(100)),
+        };
+        a.store
+            .setup_activate(
+                fence.clone(),
+                a.self_member(),
+                b.self_member(),
+                SetupHello {
+                    scope: SetupScope::Enabled,
+                    setup_id: Some(
+                        a.store
+                            .setup_state()
+                            .setup_id
+                            .unwrap_or_else(|| Id::from_bytes([42; 16])),
+                    ),
+                },
+                |_| {},
+            )
+            .await?;
+        fence.generation = a.store.setup_state().generation;
+        Ok(fence)
+    }
+    #[tokio::test]
+    async fn setup_advisory_one_sided_scope_keeps_ready_and_prehello_loss_handling() -> Result<()> {
+        let mut outcomes = Vec::new();
+        for ready in [true, false] {
+            let (_da, a, la) = core().await?;
+            let (_db, b, lb) = core().await?;
+            drop(la);
+            scoped_binding(&a, &b, false).await?;
+            bind(&b, &a).await?;
+            b.store
+                .setup_link(a.identity.device_id.clone(), SetupScope::Disabled)
+                .await?;
+            a.store
+                .remember_route(b.identity.device_id.clone(), lb.local_addr()?.to_string())
+                .await?;
+            a.store
+                .mark_peer_established(b.identity.device_id.clone())
+                .await?;
+            let peer = a.store.peer_info().await?.remove(0);
+            let (cancel, rx) = watch::channel(false);
+            let worker = Task::spawn(a.clone().dial_worker(peer, rx));
+            let mut tls = accept_client_hello(&b, &lb).await?;
+            if ready {
+                let mut hello = b.computer_hello();
+                hello.setup = Some(SetupHello {
+                    scope: SetupScope::Disabled,
+                    setup_id: None,
+                });
+                send(&mut tls, &Message::Hello(hello)).await?;
+                let Some(Message::Ping(p)) = read_frame(&mut tls).await? else {
+                    bail!("expected READY ping");
+                };
+                send(&mut tls, &Message::Pong(p)).await?;
+                until(|| a.connected_devices().contains(&b.identity.device_id)).await?;
+            }
+            send_error(&mut tls, ErrorCode::Unauthorized).await?;
+            outcomes.push((ready, until(|| a.paired_devices().is_empty()).await.is_ok()));
+            cancel.send_replace(true);
+            worker.await??;
+            a.shutdown_actions().await?;
+            b.shutdown_actions().await?;
+        }
+        assert_eq!(
+            outcomes,
+            vec![(true, true), (false, true)],
+            "READY and pre-HELLO refusal must both forget this direct link"
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn setup_advisory_disabled_remote_unpair_keeps_unrelated_setup_and_rechecks_gate()
+    -> Result<()> {
+        let (_da, a, la) = core().await?;
+        let (_db, b, lb) = core().await?;
+        let (_dc, c, _lc) = core().await?;
+        drop(la);
+        scoped_binding(&a, &c, true).await?;
+        let fence = assign_from(&a, &c).await?;
+        scoped_binding(&a, &b, false).await?;
+        bind(&b, &a).await?;
+        let mut member = b.self_member();
+        member.hlc = crate::now_ms();
+        let mut roster = a.store.setup_state().roster;
+        roster.push(member);
+        let setup_id = a.store.setup_state().setup_id.unwrap();
+        a.store
+            .members_merge(
+                fence,
+                a.self_member(),
+                Members {
+                    transfer_id: Id::from_bytes(rand::random()),
+                    setup_id: setup_id.clone(),
+                    members: roster,
+                },
+                Vec::new(),
+                |_| {},
+            )
+            .await?;
+        a.store
+            .remember_route(b.identity.device_id.clone(), lb.local_addr()?.to_string())
+            .await?;
+        let peer = a
+            .store
+            .peer_info()
+            .await?
+            .into_iter()
+            .find(|p| p.id == b.identity.device_id)
+            .unwrap();
+        let (cancel, rx) = watch::channel(false);
+        let worker = Task::spawn(a.clone().dial_worker(peer, rx));
+        let mut tls = accept_client_hello(&b, &lb).await?;
+        let mut hello = b.computer_hello();
+        hello.setup = Some(SetupHello {
+            scope: SetupScope::Disabled,
+            setup_id: None,
+        });
+        send(&mut tls, &Message::Hello(hello.clone())).await?;
+        let Some(Message::Ping(p)) = read_frame(&mut tls).await? else {
+            bail!("READY ping");
+        };
+        send(&mut tls, &Message::Pong(p)).await?;
+        until(|| a.connected_devices().contains(&b.identity.device_id)).await?;
+        // Recheck under the gate even if a caller observed participation before
+        // waiting: a newer authenticated disabled HELLO has won the lifecycle.
+        let mut captured = a.store.with_current_pairing();
+        captured.connection_id =
+            Some(a.sessions.lock().unwrap().sessions[&b.identity.device_id].id);
+        captured.setup_generation = Some(a.store.setup_state().generation);
+        let guard = a.pairing_gate.clone().lock_owned().await;
+        let mut withdraw = Box::pin(a.withdraw_setup(&captured, &hello));
+        assert!(futures_util::poll!(withdraw.as_mut()).is_pending());
+        drop(guard);
+        assert!(!withdraw.await?);
+        send(&mut tls, &Message::Unpair(Unpair {})).await?;
+        until(|| !a.paired_devices().contains(&b.identity.device_id)).await?;
+        assert_eq!(a.store.setup_state().setup_id, Some(setup_id));
+        assert!(!a.store.setup_state().withdrawn);
+        assert!(a.paired_devices().contains(&c.identity.device_id));
+        cancel.send_replace(true);
+        worker.await??;
+        a.shutdown_actions().await?;
+        b.shutdown_actions().await?;
+        c.shutdown_actions().await
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn setup_review_retry_cannot_resurrect_withdrawn_join() -> Result<()> {
+        let (_da, a, _la) = core().await?;
+        let (_db, b, lb) = core().await?;
+        let uri = b
+            .start_pairing_with_addresses(vec![lb.local_addr()?.to_string()])
+            .await?;
+        let preview = a.join(&uri.build()?).await?;
+        let attempt = preview["attempt"].as_str().unwrap();
+        a.confirm_join(attempt).await?;
+        let (entered, wait) = tokio::sync::oneshot::channel();
+        let (release, blocking) = std::sync::mpsc::channel();
+        *a.mesh.retry_hook.lock().unwrap() = Some((entered, blocking));
+        a.mesh.panic_join.store(true, Ordering::SeqCst);
+        let supervisor = Task::spawn(a.clone().mesh_supervise());
+        let mut tls = accept_hello(&b, &lb, None).await?;
+        assert!(matches!(
+            read_frame(&mut tls).await?,
+            Some(Message::PairRequest(_))
+        ));
+        drop(tls);
+        tokio::time::timeout(Duration::from_secs(5), wait).await??;
+        let held = a.mesh.join.try_lock().is_err();
+        let cancellation = if held {
+            let cancel = a.clone();
+            Some(tokio::task::spawn_blocking(move || {
+                cancel.mesh.cancel_withdrawn_join();
+            }))
+        } else {
+            // Complete withdrawal in the old clone-and-replace gap.
+            a.mesh.cancel_withdrawn_join();
+            None
+        };
+        release.send(())?;
+        if let Some(cancellation) = cancellation {
+            cancellation.await?;
+        }
+        a.request_shutdown();
+        supervisor.await??;
+        assert_eq!(a.join_status(attempt)?["state"], "cancelled");
+        assert!(a.mesh.join.lock().unwrap().as_ref().unwrap().phase == JoinPhase::Finished);
+        assert!(held, "retry exposed a stale clone to withdrawal");
+        assert!(a.paired_devices().is_empty());
+        a.shutdown_actions().await?;
+        b.shutdown_actions().await
+    }
+    #[tokio::test]
+    async fn setup_review_stale_periodic_refresh_preserves_rename_on_restart() -> Result<()> {
+        let (_da, a, la) = core().await?;
+        let (_db, b, _lb) = core().await?;
+        scoped_binding(&a, &b, true).await?;
+        assign_from(&a, &b).await?;
+        let (captured, wait) = tokio::sync::oneshot::channel();
+        let (release, blocked) = tokio::sync::oneshot::channel();
+        let refresher = a.clone();
+        let refresh = tokio::spawn(async move {
+            let mut stale = refresher.self_member();
+            stale.reach.as_mut().unwrap().addresses = vec!["127.0.0.1:45678".into()];
+            let _ = captured.send(());
+            blocked.await?;
+            refresher.store.setup_refresh_self(stale).await
+        });
+        wait.await?;
+        a.rename("Renamed computer".into()).await?;
+        let own = || {
+            a.store
+                .setup_state()
+                .roster
+                .into_iter()
+                .find(|m| m.device_id == a.identity.device_id)
+                .unwrap()
+        };
+        let renamed = own();
+        release.send(()).unwrap();
+        refresh.await??;
+        let refreshed = own();
+        assert_eq!(refreshed.name, "Renamed computer");
+        assert_eq!(refreshed.hlc, renamed.hlc);
+        assert_eq!(refreshed.writer_device, renamed.writer_device);
+        let reach = refreshed.reach.unwrap();
+        assert_eq!(reach.addresses, vec!["127.0.0.1:45678"]);
+        assert!(reach.hlc > renamed.hlc);
+        let paths = a.paths.clone();
+        let config = Config::load(&paths.config)?;
+        a.shutdown_actions().await?;
+        a.store.drain().await;
+        drop(la);
+        drop(a);
+        let restarted = Core::new(paths, config, Arc::new(Mock)).await?;
+        assert_eq!(restarted.config().name, "Renamed computer");
+        assert_eq!(
+            Config::load(&restarted.paths.config)?.name,
+            "Renamed computer"
+        );
+        restarted.shutdown_actions().await?;
+        b.shutdown_actions().await
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn setup_advisory_confirmation_holds_join_mutex_through_mutation() -> Result<()> {
+        for withdrawal in [false, true] {
+            let (_da, a, _la) = core().await?;
+            let (_db, b, lb) = core().await?;
+            let uri = b
+                .start_pairing_with_addresses(vec![lb.local_addr()?.to_string()])
+                .await?;
+            let preview = a.join(&uri.build()?).await?;
+            let attempt = preview["attempt"].as_str().unwrap().to_string();
+            let (entered, wait) = tokio::sync::oneshot::channel();
+            let (release, blocking) = std::sync::mpsc::channel();
+            *a.mesh.confirm_hook.lock().unwrap() = Some((entered, blocking));
+            let confirmer = a.clone();
+            let id = attempt.clone();
+            let confirm =
+                tokio::spawn(async move { confirmer.confirm_join_scoped(&id, true).await });
+            wait.await?;
+            let held = a.mesh.join.try_lock().is_err();
+            let cancel = a.clone();
+            let key = (b.identity.device_id.clone(), b.identity.fingerprint.clone());
+            let cancellation = if held {
+                Some(tokio::task::spawn_blocking(move || {
+                    if withdrawal {
+                        cancel.mesh.cancel_withdrawn_join();
+                    } else {
+                        cancel.mesh.cancel_removed(&[key]);
+                    }
+                }))
+            } else {
+                // With the old clone-and-replace path, complete cancellation
+                // inside that gap before confirmation can publish its clone.
+                if withdrawal {
+                    cancel.mesh.cancel_withdrawn_join();
+                } else {
+                    cancel.mesh.cancel_removed(&[key]);
+                }
+                None
+            };
+            release.send(())?;
+            confirm.await??;
+            if let Some(cancellation) = cancellation {
+                cancellation.await?;
+            }
+            assert_eq!(a.join_status(&attempt)?["state"], "cancelled");
+            assert!(held, "confirmation exposed a stale clone to cancellation");
+            a.shutdown_actions().await?;
+            b.shutdown_actions().await?;
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn setup_advisory_cancelled_worker_rechecks_after_pairing_gate_before_request()
+    -> Result<()> {
+        let (_da, a, la) = core().await?;
+        let (_db, b, _lb) = core().await?;
+        let uri = a
+            .start_pairing_with_addresses(vec![la.local_addr()?.to_string()])
+            .await?;
+        let preview = b.join(&uri.build()?).await?;
+        let attempt = preview["attempt"].as_str().unwrap();
+        b.confirm_join(attempt).await?;
+        let pending = b.mesh.join.lock().unwrap().as_ref().unwrap().clone();
+        let (entered, wait) = tokio::sync::oneshot::channel();
+        let (release, blocked) = tokio::sync::oneshot::channel();
+        *b.mesh.request_hook.lock().unwrap() = Some((entered, blocked));
+        let worker = Task::spawn(b.clone().join_worker(pending));
+        let mut tls = accept_hello(&a, &la, None).await?;
+        wait.await?;
+        let guard = b.pairing_gate.clone().lock_owned().await;
+        b.mesh
+            .cancel_removed(&[(a.identity.device_id.clone(), a.identity.fingerprint.clone())]);
+        release.send(()).unwrap();
+        drop(guard);
+        closed_without_unpair(&mut tls).await?;
+        assert_eq!(worker.await?.unwrap_err().to_string(), "cancelled");
+        let join = b.mesh.join.lock().unwrap().as_ref().unwrap().clone();
+        assert!(!join.requested);
+        assert!(join.authority.is_none());
+        assert_eq!(b.join_status(attempt)?["state"], "cancelled");
+        a.shutdown_actions().await?;
+        b.shutdown_actions().await
+    }
+    #[tokio::test]
+    async fn setup_advisory_plain_unpair_rechecks_member_after_waiting_for_gate() -> Result<()> {
+        let (_da, a, _la) = core().await?;
+        let (_db, b, _lb) = core().await?;
+        scoped_binding(&a, &b, true).await?;
+        let guard = a.pairing_gate.clone().lock_owned().await;
+        let mut unpair = Box::pin(a.unpair_device(b.identity.device_id.clone()));
+        assert!(futures_util::poll!(unpair.as_mut()).is_pending());
+        assign_from(&a, &b).await?;
+        let before = a.store.setup_state();
+        drop(guard);
+        assert!(
+            unpair
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("confirm Remove from all devices")
+        );
+        assert!(a.paired_devices().contains(&b.identity.device_id));
+        assert_eq!(a.store.setup_state(), before);
+        a.shutdown_actions().await?;
+        b.shutdown_actions().await
+    }
 }

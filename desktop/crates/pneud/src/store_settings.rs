@@ -39,7 +39,7 @@ pub(super) fn fields(c: &Connection, peer: &Id) -> Result<Vec<PeerSetting>> {
     })
     .collect()
 }
-fn initialize(tx: &Transaction<'_>, local: &Id, peer: &Id, phone: bool) -> Result<()> {
+pub(super) fn initialize(tx: &Transaction<'_>, local: &Id, peer: &Id, phone: bool) -> Result<()> {
     ensure!(local != peer, SettingsUnexpected);
     for key in pair_keys(local, peer, phone) {
         tx.execute(

@@ -71,6 +71,7 @@ async fn wait_established(db: &rusqlite::Connection, device: &Id) -> Result<()> 
 }
 fn hello(c: &Core, addresses: Vec<String>) -> Hello {
     Hello {
+        setup: None,
         version: 1,
         device_id: c.identity.device_id.clone(),
         name: c.config().name,

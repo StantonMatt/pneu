@@ -167,6 +167,8 @@ object_struct! {
             skip_serializing_if = "Option::is_none"
         )]
         pub addresses: Option<Vec<String>>,
+        #[serde(default, deserialize_with = "non_null", skip_serializing_if = "Option::is_none")]
+        pub setup: Option<SetupHello>,
     }
 }
 string_enum! {
@@ -174,6 +176,127 @@ string_enum! {
     pub enum DeviceRole {
         Phone => "phone",
         Computer => "computer",
+    }
+}
+string_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum SetupScope {
+        Enabled => "enabled",
+        Disabled => "disabled",
+        Ask => "ask",
+    }
+}
+object_struct! {
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    pub struct SetupHello {
+        pub scope: SetupScope,
+        #[serde(default, deserialize_with = "non_null", skip_serializing_if = "Option::is_none")]
+        pub setup_id: Option<Id>,
+    }
+}
+string_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum MemberStatus {
+        Member => "member",
+        Removed => "removed",
+    }
+}
+object_struct! {
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    pub struct MemberReach {
+        pub addresses: Vec<String>,
+        pub relay: Vec<serde_json::Value>,
+        pub hlc: u64,
+        pub writer_device: Id,
+    }
+}
+object_struct! {
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    pub struct Member {
+        pub device_id: Id,
+        pub fingerprint: Hash,
+        pub role: DeviceRole,
+        pub name: String,
+        pub status: MemberStatus,
+        pub hlc: u64,
+        pub writer_device: Id,
+        #[serde(default, deserialize_with = "non_null", skip_serializing_if = "Option::is_none")]
+        pub reach: Option<MemberReach>,
+    }
+}
+object_struct! {
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    pub struct Members {
+        pub transfer_id: Id,
+        pub setup_id: Id,
+        pub members: Vec<Member>,
+    }
+}
+impl Members {
+    /// Semantic receipt identity ignores entry order, retaining address order.
+    pub fn canonical(mut self) -> Self {
+        self.members.sort_by(|a, b| {
+            (a.device_id.as_str(), a.fingerprint.as_str())
+                .cmp(&(b.device_id.as_str(), b.fingerprint.as_str()))
+        });
+        self
+    }
+    pub fn validate(&self) -> Result<()> {
+        require(
+            (1..=64).contains(&self.members.len()),
+            "expected 1..=64 members",
+        )?;
+        let mut keys = HashSet::new();
+        let mut active_ids = HashSet::new();
+        let mut active_pins = HashSet::new();
+        let mut incarnations = std::collections::HashMap::new();
+        let mut active = 0;
+        for member in &self.members {
+            string_limit(&member.name, 1, 128, "member name")?;
+            require(
+                keys.insert((&member.device_id, &member.fingerprint)),
+                "duplicate member key",
+            )?;
+            let count = incarnations.entry(&member.device_id).or_insert(0);
+            *count += 1;
+            require(*count <= 4, "too many fingerprints for member ID")?;
+            if member.status == MemberStatus::Member {
+                active += 1;
+                require(
+                    active_ids.insert(&member.device_id),
+                    "multiple active pins for member ID",
+                )?;
+                require(
+                    active_pins.insert(&member.fingerprint),
+                    "multiple active IDs for member pin",
+                )?;
+            }
+            if let Some(reach) = &member.reach {
+                require(
+                    member.status == MemberStatus::Member,
+                    "removed member has reach",
+                )?;
+                require(
+                    reach.writer_device == member.device_id,
+                    "reach writer must be subject",
+                )?;
+                require(reach.relay.is_empty(), "relay is reserved")?;
+                require(
+                    member.role != DeviceRole::Phone || reach.addresses.is_empty(),
+                    "phone has addresses",
+                )?;
+                require(
+                    reach.addresses.len() <= crate::MAX_CANDIDATE_ADDRESSES,
+                    "too many reach addresses",
+                )?;
+                let mut seen = HashSet::new();
+                for address in &reach.addresses {
+                    crate::validate_address(address)?;
+                    require(seen.insert(address), "duplicate reach address")?;
+                }
+            }
+        }
+        require(active <= 17, "too many active members")
     }
 }
 object_struct! {
@@ -453,6 +576,7 @@ pub enum Message {
     Nack(Nack),
     Clipboard(Clipboard),
     PeerSettings(PeerSettings),
+    Members(Members),
     Error(ErrorMessage),
 }
 
@@ -473,6 +597,7 @@ impl Message {
             Self::Nack(_) => 0x14,
             Self::Clipboard(_) => 0x20,
             Self::PeerSettings(_) => 0x21,
+            Self::Members(_) => 0x22,
             Self::Error(_) => 0x7f,
         }
     }
@@ -499,6 +624,17 @@ impl Message {
                     !seen.contains("clipboard_image") || seen.contains("files"),
                     "clipboard_image requires files",
                 )?;
+                require(
+                    !seen.contains("setup")
+                        || (seen.contains("mesh") && m.role.is_some() && m.setup.is_some()),
+                    "setup requires mesh, role and setup object",
+                )?;
+                if let Some(setup) = &m.setup {
+                    require(
+                        setup.scope != SetupScope::Disabled || setup.setup_id.is_none(),
+                        "disabled setup has ID",
+                    )?;
+                }
                 if let Some(addresses) = &m.addresses {
                     require(
                         addresses.len() <= crate::MAX_CANDIDATE_ADDRESSES,
@@ -573,6 +709,7 @@ impl Message {
                     "incomplete clipboard clock",
                 )?;
             }
+            Self::Members(m) => m.validate()?,
             Self::PeerSettings(m) => {
                 require(
                     (1..=3).contains(&m.settings.len()),

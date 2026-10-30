@@ -1,6 +1,8 @@
 //! Paired peers, completed file receipts, bounded clipboard history, latest outgoing text.
 #[path = "store_clipboard.rs"]
 mod clipboard;
+#[path = "store_members.rs"]
+pub(crate) mod members;
 #[path = "outbox.rs"]
 pub mod outbox;
 #[path = "store_settings.rs"]
@@ -78,6 +80,8 @@ fn keyed_text_receipt(
 pub enum Metadata {
     File(FileBegin),
     Settings(pneu_proto::PeerSettings),
+    Members(pneu_proto::Members),
+    MembersHash { sha256: String },
     Text(TextReceipt),
 }
 
@@ -95,6 +99,7 @@ pub(crate) struct PeerInfo {
     pub role: String,
     pub name: String,
     pub addresses: Vec<String>,
+    pub route_proven: bool,
 }
 #[derive(Clone)]
 struct AbandonedClaim {
@@ -103,6 +108,8 @@ struct AbandonedClaim {
 }
 #[derive(Clone)]
 pub struct Store {
+    pub(crate) setup: Arc<Mutex<Option<members::SetupState>>>,
+    pub(crate) setup_changed: tokio::sync::watch::Sender<u64>,
     connection: Arc<Mutex<Connection>>,
     clipboard_history_revision: Arc<AtomicU64>,
     clipboard_clock_slots: Arc<tokio::sync::Semaphore>,
@@ -120,6 +127,7 @@ pub struct Store {
     pub(crate) connection_id: Option<u64>,
     pub(crate) action_connection_id: Option<u64>,
     pub(crate) mesh: bool,
+    pub(crate) setup_generation: Option<u64>,
     pub(crate) local_device: Option<Id>,
     generations: Arc<Mutex<HashMap<Id, u64>>>,
     peer_generations: Option<HashMap<Id, u64>>,
@@ -495,7 +503,7 @@ impl Store {
         };
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;")?;
         let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        ensure!(version <= 3, "unsupported store schema version {version}");
+        ensure!(version <= 4, "unsupported store schema version {version}");
         // All schema changes and legacy cleanup are one transaction. A failed
         // migration leaves the existing pairing, receipts and outbox intact.
         let tx = conn.transaction()?;
@@ -644,6 +652,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS settings_replay(device TEXT PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS settings_confirmed(device TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,key TEXT NOT NULL,enabled INTEGER NOT NULL,hlc TEXT NOT NULL,writer_device TEXT NOT NULL,PRIMARY KEY(device,key));")?;
         outbox::migrate(&tx)?;
+        let setup = members::migrate(&tx)?;
         // Policy is authoritative before Core can expose any clipboard offers.
         let pair_settings = {
             let mut q = tx.prepare("SELECT id FROM peers")?;
@@ -678,6 +687,8 @@ impl Store {
         let folder = Folder::open(path.parent().context("database parent")?, false)?;
         folder.file.sync_all()?;
         Ok(Self {
+            setup: Arc::new(Mutex::new(Some(setup))),
+            setup_changed: tokio::sync::watch::channel(0).0,
             connection: Arc::new(Mutex::new(conn)),
             pair_settings: Arc::new(Mutex::new(pair_settings)),
             settings_changed: tokio::sync::watch::channel(0).0,
@@ -689,6 +700,7 @@ impl Store {
             connection_id: None,
             action_connection_id: None,
             mesh: false,
+            setup_generation: None,
             local_device: None,
             generations: Arc::new(Mutex::new(generations)),
             peer_generations: None,
@@ -930,12 +942,13 @@ impl Store {
                     "invalid saved addresses"
                 );
                 Ok(PeerInfo {
-                    id: Id::new(id)?,
+                    id: Id::new(id.clone())?,
                     fingerprint: Hash::new(fp)?,
                     generation: generation as u64,
                     role,
                     name,
                     addresses,
+                    route_proven: members::route_proven(c, &Id::new(id)?)?,
                 })
             })
             .collect()
@@ -992,6 +1005,10 @@ impl Store {
                     "UPDATE peers SET addresses=? WHERE id=?",
                     params![serde_json::to_string(&addresses)?, device.as_str()],
                 )?;
+                tx.execute(
+                    "UPDATE setup_links SET route_proven=1 WHERE device=?",
+                    [device.as_str()],
+                )?;
                 Ok(())
             })
         })
@@ -1034,12 +1051,13 @@ impl Store {
                     } else {
                         serde_json::from_str(&previous)?
                     };
-                    let mut addresses: Vec<String> = cached.first().cloned().into_iter().collect();
+                    let proven=members::route_proven(tx,&hello.device_id)?&&!cached.is_empty();
+                    let mut addresses: Vec<String> = if proven {cached.first().cloned().into_iter().collect()}else{Vec::new()};
                     for address in hello
                         .addresses
                         .unwrap_or_default()
                         .into_iter()
-                        .chain(cached.into_iter().skip(1))
+                        .chain(cached.into_iter().skip(usize::from(proven)))
                     {
                         if pneu_proto::validate_address(&address).is_ok()
                             && !addresses.contains(&address)
@@ -1048,6 +1066,7 @@ impl Store {
                             addresses.push(address);
                         }
                     }
+                    tx.execute("UPDATE setup_links SET route_proven=? WHERE device=?",params![proven,hello.device_id.as_str()])?;
                     tx.execute(
                         "UPDATE peers SET name=?,role=?,addresses=? WHERE id=?",
                         params![
@@ -1081,11 +1100,34 @@ impl Store {
     ) -> Result<()> {
         self.pair_then_hello(device, fp, None, finish).await
     }
+    #[cfg(test)]
     pub(crate) async fn pair_then_hello(
         &self,
         device: Id,
         fp: Hash,
         hello: Option<pneu_proto::Hello>,
+        finish: impl FnOnce() + Send + 'static,
+    ) -> Result<()> {
+        self.pair_then_hello_scoped(
+            device,
+            fp,
+            hello,
+            None,
+            pneu_proto::SetupScope::Ask,
+            false,
+            finish,
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn pair_then_hello_scoped(
+        &self,
+        device: Id,
+        fp: Hash,
+        hello: Option<pneu_proto::Hello>,
+        local: Option<pneu_proto::Member>,
+        scope: pneu_proto::SetupScope,
+        route_proven: bool,
         finish: impl FnOnce() + Send + 'static,
     ) -> Result<()> {
         self.blocking(move |store| {
@@ -1102,6 +1144,8 @@ impl Store {
                     let mut q = tx.prepare("SELECT key,enabled,hlc,writer_device FROM peer_settings WHERE device=?")?;
                     q.query_map([device.as_str()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?.collect::<rusqlite::Result<_>>()?
                 };
+                let previous_setup = members::state(&tx)?.links.into_iter().find(|l|l.device==device);
+                tx.execute("DELETE FROM members_receipts WHERE device=?",[device.as_str()])?;
                 tx.execute("DELETE FROM peers WHERE id=?", [device.as_str()])?;
                 let role = if hello.as_ref().is_some_and(|h| h.role == Some(pneu_proto::DeviceRole::Computer)) { "computer" } else { "phone" };
                 let addresses = hello.as_ref().and_then(|h| h.addresses.clone()).unwrap_or_default();
@@ -1111,7 +1155,13 @@ impl Store {
                     tx.execute("INSERT INTO peer_settings VALUES(?,?,?,?,?)",params![device.as_str(),key,enabled,hlc,writer])?;
                 }
                 tx.execute("INSERT INTO peer_generations VALUES(?,?) ON CONFLICT(device) DO UPDATE SET generation=excluded.generation",params![device.as_str(),generation])?;
+                if let (Some(local),Some(hello)) = (&local,&hello) { members::paired(&tx,local,hello,&fp,scope,previous_setup)?; }
+                else { tx.execute("INSERT INTO setup_links(device,scope) VALUES(?,'ask')",[device.as_str()])?; }
+                if route_proven&&!addresses.is_empty() {tx.execute("UPDATE setup_links SET route_proven=1 WHERE device=?",[device.as_str()])?;}
+                let setup = members::state(&tx)?;
                 tx.commit()?;
+                *store.setup.lock().expect("setup") = Some(setup);
+                store.setup_changed.send_modify(|n|*n=n.wrapping_add(1));
                 store.generations.lock().expect("peer generations").insert(device, generation as u64);
                 Ok(())
             })?;
@@ -1142,6 +1192,10 @@ impl Store {
                 store.fault("unpair_reserved")?;
                 let tx = c.transaction()?;
                 epoch.check(&tx)?;
+                tx.execute(
+                    "DELETE FROM members_receipts WHERE device=?",
+                    [device.as_str()],
+                )?;
                 ensure!(
                     tx.execute("DELETE FROM peers WHERE id=?", [device.as_str()])? == 1,
                     "pairing was not removed"
@@ -1155,7 +1209,10 @@ impl Store {
                     [device.as_str()],
                     |r| r.get(0),
                 )?;
+                let setup = members::state(&tx)?;
                 tx.commit()?;
+                *store.setup.lock().expect("setup") = Some(setup);
+                store.setup_changed.send_modify(|n| *n = n.wrapping_add(1));
                 store
                     .pair_settings
                     .lock()
@@ -1694,7 +1751,7 @@ fn validate_failed_file(c: &Connection, device: &Id, begin: &FileBegin) -> Resul
     Ok(())
 }
 fn receipt_row(c: &Connection, device: &str, id: &str) -> Result<Option<(Metadata, bool)>> {
-    let row: Option<(String, bool)> = c.query_row("SELECT meta,json_extract(meta,'$.operation')!='Text' FROM receipts WHERE device=? AND id=? UNION ALL SELECT meta,1 FROM clipboard_recent WHERE device=? AND id=? UNION ALL SELECT meta,1 FROM settings_receipts WHERE device=? AND id=?", params![device,id,device,id,device,id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let row: Option<(String, bool)> = c.query_row("SELECT meta,json_extract(meta,'$.operation')!='Text' FROM receipts WHERE device=? AND id=? UNION ALL SELECT meta,1 FROM clipboard_recent WHERE device=? AND id=? UNION ALL SELECT meta,1 FROM settings_receipts WHERE device=? AND id=? UNION ALL SELECT meta,1 FROM members_receipts WHERE device=? AND id=? AND generation=(SELECT generation FROM setup_state WHERE singleton=1)", params![device,id,device,id,device,id,device,id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
     row.map(|(m, complete)| Ok((serde_json::from_str(&m)?, complete)))
         .transpose()
 }
@@ -2378,7 +2435,7 @@ mod tests {
             .call(|c| {
                 assert_eq!(
                     c.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))?,
-                    3
+                    4
                 );
                 assert_eq!(
                     c.query_row(
@@ -2502,6 +2559,7 @@ mod tests {
             let captured = store.with_current_pairing();
             let current = Arc::new(AtomicU64::new(1));
             let hello = pneu_proto::Hello {
+                setup: None,
                 version: 1,
                 device_id: device.clone(),
                 name: "Revoked computer".into(),
@@ -3797,3 +3855,7 @@ mod released_store;
 #[cfg(test)]
 #[path = "store_settings_tests.rs"]
 mod settings_tests;
+
+#[cfg(test)]
+#[path = "store_members_tests.rs"]
+mod members_tests;

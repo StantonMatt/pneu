@@ -121,6 +121,33 @@ pub enum Command {
     JoinConfirm {
         attempt: String,
     },
+    JoinConfirmScoped {
+        attempt: String,
+        enabled: bool,
+    },
+    PairingScope {
+        enabled: bool,
+    },
+    SetupStatus,
+    LinkExistingDevice {
+        device: Id,
+    },
+    SetupDecision {
+        device: Id,
+        setup_generation: u64,
+        binding_generation: u64,
+        allow: bool,
+    },
+    RemoveFromSetup {
+        device: Id,
+        setup_generation: u64,
+        binding_generation: Option<u64>,
+        fingerprint: Hash,
+    },
+    DismissSetupNotice {
+        device: Id,
+        binding_generation: u64,
+    },
     JoinStatus {
         attempt: String,
     },
@@ -449,6 +476,13 @@ async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
         Command::SendClipboard{targets}=>serde_json::json!({"transfer_id":core.share_clipboard(targets).await?}),
         Command::Join { uri } => core.join(&uri).await?,
         Command::JoinConfirm { attempt } => core.confirm_join(&attempt).await?,
+        Command::JoinConfirmScoped { attempt, enabled } => core.confirm_join_scoped(&attempt,enabled).await?,
+        Command::PairingScope { enabled } => {core.set_pairing_scope(enabled).await?;serde_json::Value::Null},
+        Command::SetupStatus => core.setup_status().await?,
+        Command::LinkExistingDevice {device} => {core.link_existing_device(device).await?;serde_json::Value::Null},
+        Command::SetupDecision {device,setup_generation,binding_generation,allow} => {core.decide_setup(device,setup_generation,binding_generation,allow).await?;serde_json::Value::Null},
+        Command::RemoveFromSetup {device,setup_generation,binding_generation,fingerprint} => {core.remove_setup_device_confirmed(device,setup_generation,binding_generation,fingerprint).await?;serde_json::Value::Null},
+        Command::DismissSetupNotice {device,binding_generation} => {core.dismiss_setup_notice(device,binding_generation).await?;serde_json::Value::Null},
         Command::JoinStatus { attempt } => core.join_status(&attempt)?,
         Command::JoinCancel { attempt } => { core.cancel_join(&attempt).await?; serde_json::Value::Null },
         Command::Pair => { let uri = core.start_pairing().await?; serde_json::json!({"uri":uri.build()?,"expires_at":uri.expires_at,"qr_data":uri.build()?}) },
@@ -466,7 +500,7 @@ async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
         #[cfg(windows)]
         Command::WindowClosed { request } => { core.window_closed(request); serde_json::Value::Null },
         Command::WindowFocus { request, focused } => { core.set_window_focus(request, focused); serde_json::Value::Null },
-        Command::UiStatus => { let (revision, invitation) = core.pairing_status(); let snapshot = core.ui_snapshot(); let (window_request, activation_token) = core.window_request_with_activation(); serde_json::json!({"device":snapshot.device, "snapshot":snapshot, "config": core.config(), "window_request":window_request,"add_device":core.window_add_device(window_request),"activation_token":activation_token,"invitation_revision":revision,"invitation":invitation,"pending_send":core.pending_send()}) },
+        Command::UiStatus => { let (revision, invitation) = core.pairing_status(); let snapshot = core.ui_snapshot(); let (window_request, activation_token) = core.window_request_with_activation(); serde_json::json!({"device":snapshot.device, "snapshot":snapshot, "config": core.config(), "window_request":window_request,"add_device":core.window_add_device(window_request),"activation_token":activation_token,"invitation_revision":revision,"invitation":invitation,"pending_send":core.pending_send(),"setup":core.setup_status().await?}) },
         Command::AddDevice => { core.request_add_device(); serde_json::Value::Null },
         Command::ShowWindow { choose_folder } => { core.request_window(choose_folder); serde_json::Value::Null },
         Command::Status => {

@@ -17,6 +17,7 @@ required-features = ["windows-package"]
 [dependencies]
 pneu-proto = { path = "../pneu-proto" }
 anyhow = "1"
+thiserror.workspace = true
 async-trait = "0.1"
 hex.workspace = true
 serde.workspace = true

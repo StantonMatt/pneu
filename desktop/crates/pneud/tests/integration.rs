@@ -1,7 +1,7 @@
 #![cfg(unix)]
 #[path = "../src/test_support.rs"]
 mod test_support;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use pneu_proto::*;
 use pneud::{
@@ -637,6 +637,7 @@ async fn unknown_clients_obey_provisional_and_total_connection_quotas() -> Resul
     write_frame(
         &mut provisional,
         &Message::Hello(Hello {
+            setup: None,
             role: None,
             addresses: None,
             version: 1,
@@ -862,6 +863,7 @@ async fn missing_certificate_verify_private_key_is_rejected() -> Result<()> {
         Err(_) => true,
         Ok(mut stream) => {
             let hello = Message::Hello(Hello {
+                setup: None,
                 role: None,
                 addresses: None,
                 version: 1,
@@ -1218,6 +1220,7 @@ async fn omitted_hello_paused_defaults_to_false() -> Result<()> {
     write_frame(
         &mut tls,
         &Message::Hello(Hello {
+            setup: None,
             role: None,
             addresses: None,
             version: 1,
@@ -1827,6 +1830,7 @@ async fn shutdown_cancels_a_tls_connection_waiting_for_hello() -> Result<()> {
         .await?;
     h.core.request_shutdown();
     let hello = Message::Hello(Hello {
+        setup: None,
         role: None,
         addresses: None,
         version: 1,
@@ -2693,6 +2697,7 @@ async fn outgoing_clipboard_images_require_capability_and_keep_latest_while_rece
     write_frame(
         &mut tls,
         &Message::Hello(Hello {
+            setup: None,
             role: None,
             addresses: None,
             version: 1,
@@ -3403,7 +3408,7 @@ async fn frozen_recipients_and_same_device_replacement_preserve_other_session() 
 async fn sweep_ready_budget_refuses_extra_peer_and_allows_same_peer_replacement() -> Result<()> {
     let h = Harness::new().await?;
     let mut phones = Vec::new();
-    for index in 0..17 {
+    for index in 0..16 {
         if index != 0 {
             tokio::time::sleep(Duration::from_millis(1010)).await;
         }
@@ -3414,6 +3419,48 @@ async fn sweep_ready_budget_refuses_extra_peer_and_allows_same_peer_replacement(
         event_matching(&mut events, |e|matches!(e,pneud::Event::ConnectionChanged {device,connected:false} if *device==phone.identity.device_id)).await?;
         phones.push(phone);
     }
+    let extra_phone = h.phone("legacy-peer-16")?;
+    let denied = h
+        .pair(&extra_phone)
+        .await
+        .err()
+        .expect("a new seventeenth binding must be refused");
+    assert!(denied.to_string().contains("StorageFailed"));
+    assert_eq!(h.core.paired_devices().len(), 16);
+    // Released databases may already exceed the new admission cap. Seed that
+    // legacy condition while this disposable daemon is fully stopped, then
+    // test the independent READY-connection budget and same-peer replacement.
+    let paths = h.core.paths.clone();
+    let config = h.core.config();
+    let actions = h.actions.clone();
+    h.core.request_shutdown();
+    h.task.await??;
+    drop(h.core);
+    {
+        let db = rusqlite::Connection::open(paths.data.join("state.sqlite3"))?;
+        db.execute("INSERT INTO peers(id,fp,generation,role,name,addresses,established) VALUES(?,?,1,'phone','Legacy peer','[]',0)",rusqlite::params![extra_phone.identity.device_id.as_str(),extra_phone.identity.fingerprint.as_str()])?;
+        db.execute(
+            "INSERT INTO peer_generations VALUES(?,1)",
+            [extra_phone.identity.device_id.as_str()],
+        )?;
+    }
+    // All clients in this fixture bind to the same computer identity/routes.
+    std::fs::copy(
+        phones[0].directory.join("binding.json"),
+        extra_phone.directory.join("binding.json"),
+    )?;
+    phones.push(extra_phone);
+    let core = Core::new(paths, config, actions.clone()).await?;
+    let listener = TcpListener::from_std(h.listener.try_clone()?)?;
+    let task = tokio::spawn(core.clone().serve(listener, false));
+    let h = Harness {
+        dir: h.dir,
+        core,
+        task,
+        actions,
+        address: h.address,
+        listener: h.listener,
+    };
     let mut connected = Vec::new();
     for phone in phones.iter().take(16) {
         let mut events = h.core.subscribe();
@@ -3625,9 +3672,13 @@ async fn computer_invitation_join_preserves_phone_and_reports_role() -> Result<(
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     })
-    .await?;
+    .await
+    .context("invitation did not connect")?;
+    wait_computer_setup(&a, &b).await?;
     phone_link.send_status(true).await?;
-    b.core
+    let mut sent = b.core.subscribe();
+    let clip = b
+        .core
         .send_clipboard(a.core.identity.device_id.clone(), "computer text".into())
         .await?;
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -3642,18 +3693,21 @@ async fn computer_invitation_join_preserves_phone_and_reports_role() -> Result<(
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await?;
+    .await
+    .context("computer clipboard did not arrive")?;
+    event_matching(&mut sent, |event| matches!(event, pneud::Event::ClipboardSent {transfer_id, ..} if transfer_id == &clip)).await?;
     let devices = serde_json::to_value(b.core.ui_snapshot())?;
     assert_eq!(devices["devices"][0]["role"], "computer");
     b.core
-        .unpair_device(a.core.identity.device_id.clone())
+        .remove_setup_device(a.core.identity.device_id.clone())
         .await?;
     tokio::time::timeout(Duration::from_secs(5), async {
         while a.core.paired_devices().contains(&b.core.identity.device_id) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await?;
+    .await
+    .context("setup removal did not reach peer")?;
     phone_link.close().await?;
     a.stop().await?;
     b.stop().await?;
@@ -3762,6 +3816,7 @@ async fn hello_phone(h: &Harness, phone: &Phone, mesh: bool, text: bool) -> Resu
     write_frame(
         &mut tls,
         &Message::Hello(Hello {
+            setup: None,
             version: 1,
             device_id: phone.identity.device_id.clone(),
             name: "Mesh phone".into(),
@@ -3942,6 +3997,33 @@ async fn mesh_global_order_and_slow_image_recheck_preserve_newer_text() -> Resul
     h.stop().await
 }
 
+// Token pairing can expose a transient READY connection before setup ID
+// assignment reconnects. Connected-only clipboard assertions start only after
+// matching persisted IDs have exchanged MEMBERS and pair settings are settled.
+async fn wait_computer_setup(a: &Harness, b: &Harness) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let sa = a.core.setup_status().await?;
+            let sb = b.core.setup_status().await?;
+            let mut ready = !sa["setup_id"].is_null() && sa["setup_id"] == sb["setup_id"];
+            for (local, remote) in [(a, b), (b, a)] {
+                ready &= local.core.connected_devices().contains(&remote.core.identity.device_id);
+                let db = rusqlite::Connection::open(local.core.paths.data.join("state.sqlite3"))?;
+                ready &= db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM members_receipts WHERE device=? AND generation=(SELECT generation FROM setup_state WHERE singleton=1))",
+                    [remote.core.identity.device_id.as_str()], |r| r.get::<_, bool>(0),
+                )?;
+                let settings = local.core.peer_settings(remote.core.identity.device_id.clone()).await?;
+                ready &= settings["can_sync"] == true
+                    && settings["settings"].as_array().is_some_and(|v| !v.is_empty() && v.iter().all(|f| f["pending"] == false));
+            }
+            if ready { return Ok::<_, anyhow::Error>(()); }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.context("computer setup and settings did not synchronize")??;
+    Ok(())
+}
+
 async fn link_computers(a: &Harness, b: &Harness) -> Result<()> {
     let uri = a
         .core
@@ -3966,7 +4048,7 @@ async fn link_computers(a: &Harness, b: &Harness) -> Result<()> {
         }
     })
     .await?;
-    Ok(())
+    wait_computer_setup(a, b).await
 }
 #[tokio::test]
 async fn mesh_file_images_from_computer_and_phone_use_the_same_clipboard_register() -> Result<()> {
@@ -4143,7 +4225,8 @@ async fn mesh_three_way_near_simultaneous_local_copies_converge_without_forwardi
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await?;
+    .await
+    .context("computer clipboards did not converge")?;
     assert_eq!(phone_clipboard, winner.text);
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -4164,7 +4247,8 @@ async fn mesh_three_way_near_simultaneous_local_copies_converge_without_forwardi
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await?;
+    .await
+    .context("durable clipboard registers did not converge")?;
     for h in [&a, &b] {
         let db = rusqlite::Connection::open(h.core.paths.data.join("state.sqlite3"))?;
         let register: (String, String) =
@@ -4301,7 +4385,8 @@ async fn computer_restart_redials_persisted_pair_and_does_not_replay_old_clipboa
             tokio::task::yield_now().await;
         }
     })
-    .await?;
+    .await
+    .context("initial clipboard did not arrive")?;
     let old_id = b.core.identity.device_id.clone();
     let paths = b.core.paths.clone();
     let config = b.core.config();
@@ -4315,7 +4400,8 @@ async fn computer_restart_redials_persisted_pair_and_does_not_replay_old_clipboa
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await?;
+    .await
+    .context("stopped peer stayed connected")?;
     // No computer recipient exists while B is down; observation must not queue
     // a value for that peer. Restart uses the real persisted identity/routes.
     assert!(a.core.observe_clipboard_offer().is_none());
@@ -4337,7 +4423,8 @@ async fn computer_restart_redials_persisted_pair_and_does_not_replay_old_clipboa
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await?;
+    .await
+    .context("persisted pair did not reconnect")?;
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
         b.actions.text.lock().unwrap().is_empty(),
@@ -4352,7 +4439,8 @@ async fn computer_restart_redials_persisted_pair_and_does_not_replay_old_clipboa
             tokio::task::yield_now().await;
         }
     })
-    .await?;
+    .await
+    .context("post-restart clipboard did not arrive")?;
     assert_eq!(*b.actions.text.lock().unwrap(), vec!["after restart"]);
     a.stop().await?;
     b.stop().await

@@ -689,6 +689,7 @@ async fn lifecycle_and_capability_transitions_cannot_resurrect_dropped_text() ->
                 s.settings_edit(local.clone(), peer.clone(), false, key.clone(), false)
                     .await?;
                 let mut hello = pneu_proto::Hello {
+                    setup: None,
                     version: 1,
                     device_id: peer.clone(),
                     name: "peer".into(),

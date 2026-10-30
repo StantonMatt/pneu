@@ -44,6 +44,8 @@ mod file_sender;
 pub mod mesh;
 #[path = "peer_settings.rs"]
 mod peer_settings;
+#[path = "setup.rs"]
+mod setup;
 use file_sender::{FileWrite, transmit_file};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -115,12 +117,17 @@ pub enum Event {
 pub(crate) enum CloseReason {
     Error(ErrorCode),
     Unpair,
+    MembershipAck([u8; 16]),
 }
 impl CloseReason {
     fn message(self) -> Message {
         match self {
             Self::Error(code) => error_message(code),
             Self::Unpair => Message::Unpair(Unpair {}),
+            Self::MembershipAck(id) => Message::Ack(Ack {
+                transfer_id: Id::from_bytes(id),
+                deduplicated: false,
+            }),
         }
     }
 }
@@ -923,6 +930,7 @@ impl From<Message> for ApplicationMessage {
     }
 }
 struct ReadyState {
+    setup_sent: Option<(SetupHello, u64)>,
     store: Store,
     allow_recovery: bool,
     action_scope: Option<ActionScope>,
@@ -956,7 +964,7 @@ struct PhoneWrites {
 pub struct Core {
     #[cfg(target_os = "macos")]
     pub(crate) ui_ready: Mutex<Arc<std::sync::atomic::AtomicBool>>,
-    mesh: mesh::Mesh,
+    mesh: Arc<mesh::Mesh>,
     transports: Arc<Semaphore>,
     ingress: Arc<Semaphore>,
     outbound_ingress: Arc<Semaphore>,
@@ -973,6 +981,10 @@ pub struct Core {
     store: Store,
     admission: Arc<Mutex<Admission>>,
     invitation_changes: watch::Sender<u64>,
+    setup_invitation_scope: AtomicBool,
+    #[cfg(test)]
+    setup_test_capability: AtomicBool,
+    setup_incoming: Arc<Mutex<HashMap<u64, setup::IncomingTarget>>>,
     provisional: Arc<AtomicBool>,
     pairing_gate: Arc<tokio::sync::Mutex<()>>,
     config_gate: Arc<tokio::sync::Mutex<()>>,
@@ -1022,6 +1034,15 @@ impl Core {
         paths.prepare()?;
         let store = Store::open(&paths.data.join("state.sqlite3"))?;
         let identity = Identity::load_or_create(&paths.data)?;
+        if let Some(own) = store.setup_state().roster.iter().find(|m| {
+            m.device_id == identity.device_id
+                && m.fingerprint == identity.fingerprint
+                && m.status == MemberStatus::Member
+        }) && config.name != own.name
+        {
+            config.name = own.name.clone();
+            config.save(&paths.config)?;
+        }
         let outbox = crate::outbox::Outbox::open(store.clone(), &paths.data.join("outbox"))?;
         let admission = Arc::new(Mutex::new(Admission {
             peers: store.peers().await?,
@@ -1107,7 +1128,11 @@ impl Core {
         );
         clipboard_state.seed_tickets(rand::random());
         let core = Arc::new(Self {
-            mesh,
+            setup_invitation_scope: AtomicBool::new(true),
+            #[cfg(test)]
+            setup_test_capability: AtomicBool::new(true),
+            setup_incoming: Default::default(),
+            mesh: Arc::new(mesh),
             outbox,
             transports: Arc::new(Semaphore::new(TRANSPORT_LIMIT)),
             ingress: Arc::new(Semaphore::new(ADMISSION_LIMIT)),
@@ -1493,6 +1518,7 @@ impl Core {
         self.create_pairing(addresses)
     }
     fn create_pairing(&self, addresses: Vec<String>) -> Result<PairingUri> {
+        self.setup_invitation_scope.store(true, Ordering::SeqCst);
         ensure!(!addresses.is_empty(), "no reachable interface for pairing");
         let uri = PairingUri {
             version: 1,
@@ -1566,6 +1592,17 @@ impl Core {
         registration: Option<mesh::LinkEpoch>,
     ) -> Result<bool> {
         let guard = self.pairing_gate.clone().lock_owned().await;
+        if matches!(reason, CloseReason::Unpair) {
+            ensure!(
+                !self
+                    .store
+                    .setup_state()
+                    .roster
+                    .iter()
+                    .any(|m| m.device_id == device && m.status == MemberStatus::Member),
+                "setup membership changed; confirm Remove from all devices"
+            );
+        }
         if generation.is_some() && self.store.pairing_generation(&device) != generation {
             return Ok(false);
         }
@@ -1751,37 +1788,48 @@ impl Core {
         let ui = self.ui.clone();
         let settings = self.config.clone();
         let events = self.events.clone();
+        let mut member = self.self_member();
+        member.name = config.name.clone();
+        let saved = config.clone();
+        #[cfg(test)]
+        let save_store = self.store.clone();
         self.store
-            .blocking(move |_| {
-                let _guard = guard;
-                config.save(&path)?;
-                let mut automatic = automatic.lock().expect("automatic clipboard");
-                if cancel_automatic {
-                    // Fence effects computed before this change, even if their
-                    // publication runs after the existing queue is invalidated.
-                    config_epoch.fetch_add(1, Ordering::SeqCst);
-                    automatic.invalidate();
-                    clipboard.event(ClipboardEvent::Policy {
-                        allowed: Vec::new(),
-                    });
-                }
-                settings.send_replace(config);
-                clipboard.event(ClipboardEvent::Mode(
-                    if settings.borrow().clipboard_sync_to_phone {
-                        settings.borrow().clipboard_mode
-                    } else {
-                        crate::config::ClipboardMode::Off
-                    },
-                ));
-                drop(automatic);
-                if clear_error {
-                    let mut ui = ui.lock().expect("UI state");
-                    ui.snapshot
-                        .clear_destination(crate::ui::ReceiveDestination::SaveFolder, None);
-                }
-                let _ = events.send(Event::ConfigChanged);
-                Ok(())
-            })
+            .setup_refresh_self_then(
+                member,
+                move || {
+                    #[cfg(test)]
+                    save_store.fault("setup_config_after_commit")?;
+                    saved.save(&path)
+                },
+                move || {
+                    let _guard = guard;
+                    let mut automatic = automatic.lock().expect("automatic clipboard");
+                    if cancel_automatic {
+                        // Fence effects computed before this change, even if their
+                        // publication runs after the existing queue is invalidated.
+                        config_epoch.fetch_add(1, Ordering::SeqCst);
+                        automatic.invalidate();
+                        clipboard.event(ClipboardEvent::Policy {
+                            allowed: Vec::new(),
+                        });
+                    }
+                    settings.send_replace(config);
+                    clipboard.event(ClipboardEvent::Mode(
+                        if settings.borrow().clipboard_sync_to_phone {
+                            settings.borrow().clipboard_mode
+                        } else {
+                            crate::config::ClipboardMode::Off
+                        },
+                    ));
+                    drop(automatic);
+                    if clear_error {
+                        let mut ui = ui.lock().expect("UI state");
+                        ui.snapshot
+                            .clear_destination(crate::ui::ReceiveDestination::SaveFolder, None);
+                    }
+                    let _ = events.send(Event::ConfigChanged);
+                },
+            )
             .await
     }
     pub async fn send_clipboard(&self, device: Id, text: String) -> Result<Id> {
@@ -2646,7 +2694,32 @@ impl Core {
                     .context("missing client cert")?[0]
                     .as_ref(),
             );
-            if !verifier.admit(&fp) {
+            let already_known = self
+                .admission
+                .lock()
+                .expect("admission")
+                .peers
+                .contains_key(&fp);
+            let (admitted, _setup_incoming) = if already_known {
+                (true, None)
+            } else {
+                let _gate = self.pairing_gate.lock().await;
+                let admitted = verifier.admit(&fp);
+                let target = if admitted
+                    && !self
+                        .admission
+                        .lock()
+                        .expect("admission")
+                        .peers
+                        .contains_key(&fp)
+                {
+                    Some(self.track_setup_incoming(candidate, fp.clone()))
+                } else {
+                    None
+                };
+                (admitted, target)
+            };
+            if !admitted {
                 self.event(Event::Blocked {
                     address: peer_address.ip().to_canonical().to_string(),
                 });
@@ -2719,9 +2792,42 @@ impl Core {
                 return Ok(());
             }
             normalize_legacy_hello(&mut hello, false);
+            if _setup_incoming.is_some() {
+                let _gate = self.pairing_gate.lock().await;
+                if let Some(target) = self
+                    .setup_incoming
+                    .lock()
+                    .expect("setup incoming")
+                    .get_mut(&candidate)
+                {
+                    target.peer = Some(hello.device_id.clone());
+                }
+            }
+            let (mut local_hello, setup_revision) = {
+                (
+                    self.computer_hello_for(&fp, Some(&hello.device_id), false),
+                    self.store.setup_state().generation,
+                )
+            };
+            if let Some(target) = self
+                .setup_incoming
+                .lock()
+                .expect("setup incoming")
+                .get(&candidate)
+            {
+                local_hello.setup = Some(self.store.setup_hello(
+                    None,
+                    if target.scope {
+                        SetupScope::Enabled
+                    } else {
+                        SetupScope::Disabled
+                    },
+                ));
+            }
+            let setup_sent = local_hello.setup.clone().map(|h| (h, setup_revision));
             crate::transport::send(
                 &mut tls,
-                &Message::Hello(self.computer_hello()),
+                &Message::Hello(local_hello),
                 Duration::from_secs(10),
             )
             .await?;
@@ -2741,6 +2847,10 @@ impl Core {
             } else {
                 let token = match read_handshake(&mut tls).await? {
                     Message::PairRequest(p) => p.token,
+                    Message::Members(_) => {
+                        send_error(&mut tls, ErrorCode::UnexpectedMessage).await?;
+                        return Ok(());
+                    }
                     Message::Error(_) => return Ok(()),
                     _ => {
                         send_error(&mut tls, ErrorCode::Unauthorized).await?;
@@ -2750,8 +2860,20 @@ impl Core {
                 self.event(Event::PairingProgress {
                     name: Some(hello.name.clone()),
                 });
+                let incoming_target = self
+                    .setup_incoming
+                    .lock()
+                    .expect("setup incoming")
+                    .get(&candidate)
+                    .cloned();
                 let result = self
-                    .finish_pairing_hello(&hello.device_id, &fp, &token, Some(hello.clone()))
+                    .finish_pairing_hello_target(
+                        &hello.device_id,
+                        &fp,
+                        &token,
+                        Some(hello.clone()),
+                        incoming_target,
+                    )
                     .await;
                 if let Ok(store) = &result {
                     captured = store.clone();
@@ -2779,7 +2901,7 @@ impl Core {
             }
             verifier.release_provisional();
             self.clone()
-                .register_buffered(
+                .register_buffered_setup(
                     tls,
                     hello,
                     fp,
@@ -2790,6 +2912,7 @@ impl Core {
                     allow_recovery,
                     Vec::new(),
                     Some(candidate),
+                    setup_sent,
                 )
                 .await
         })
@@ -2822,8 +2945,43 @@ impl Core {
         )
         .await
     }
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     async fn register_buffered(
+        self: Arc<Self>,
+        tls: TlsStream<TcpStream>,
+        hello: Hello,
+        fp: Hash,
+        peer_address: SocketAddr,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        captured: Store,
+        outbound: bool,
+        allow_recovery: bool,
+        buffered: Vec<Message>,
+        started: Option<u64>,
+    ) -> Result<()> {
+        let sent = Some((
+            self.store
+                .setup_hello(Some(&hello.device_id), SetupScope::Enabled),
+            self.store.setup_state().generation,
+        ));
+        self.register_buffered_setup(
+            tls,
+            hello,
+            fp,
+            peer_address,
+            permit,
+            captured,
+            outbound,
+            allow_recovery,
+            buffered,
+            started,
+            sent,
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn register_buffered_setup(
         self: Arc<Self>,
         mut tls: TlsStream<TcpStream>,
         mut hello: Hello,
@@ -2835,6 +2993,7 @@ impl Core {
         allow_recovery: bool,
         buffered: Vec<Message>,
         started: Option<u64>,
+        setup_sent: Option<(SetupHello, u64)>,
     ) -> Result<()> {
         if hello.device_id == self.identity.device_id {
             send_error(&mut tls, ErrorCode::Unauthorized).await?;
@@ -3051,6 +3210,7 @@ impl Core {
             .map(|scope| scope.connection_generation.load(Ordering::SeqCst));
         store.mesh = hello.capabilities.iter().any(|c| c == "mesh");
         store.local_device = Some(self.identity.device_id.clone());
+        store.setup_generation = Some(self.store.setup_state().generation);
         let result = if persisted {
             // The task's total transport permit remains held through READY
             // and teardown. Only the bounded ingress reserve is released.
@@ -3061,6 +3221,7 @@ impl Core {
                     &hello,
                     wake,
                     ReadyState {
+                        setup_sent,
                         store,
                         allow_recovery,
                         action_scope,
@@ -3204,6 +3365,7 @@ impl Core {
     ) -> std::result::Result<Store, PairCode> {
         self.finish_pairing_hello(device, fp, token, None).await
     }
+    #[cfg(test)]
     async fn finish_pairing_hello(
         &self,
         device: &Id,
@@ -3211,12 +3373,29 @@ impl Core {
         token: &Hash,
         hello: Option<Hello>,
     ) -> std::result::Result<Store, PairCode> {
+        self.finish_pairing_hello_target(device, fp, token, hello, None)
+            .await
+    }
+    async fn finish_pairing_hello_target(
+        &self,
+        device: &Id,
+        fp: &Hash,
+        token: &Hash,
+        hello: Option<Hello>,
+        target: Option<setup::IncomingTarget>,
+    ) -> std::result::Result<Store, PairCode> {
         // PAIR_REQUEST carries only a token; its remote ID comes from HELLO.
         // Refuse it before consuming the invitation or allocating a binding.
         if device == &self.identity.device_id {
             return Err(PairCode::InvalidToken);
         }
         let guard = self.pairing_gate.clone().lock_owned().await;
+        if target
+            .as_ref()
+            .is_some_and(|v| v.cancelled.load(Ordering::SeqCst))
+        {
+            return Err(PairCode::InvalidToken);
+        }
         {
             let state = self.admission.lock().expect("admission");
             let invitation = state.invitation.as_ref().ok_or(PairCode::PairingClosed)?;
@@ -3237,9 +3416,17 @@ impl Core {
             normalize_legacy_hello(&mut hello, false);
             hello
         });
-        self.persist_pairing_hello(device, fp, guard, true, hello, None)
-            .await
-            .map_err(|_| PairCode::StorageFailed)
+        self.persist_pairing_hello_scoped(
+            device,
+            fp,
+            guard,
+            true,
+            hello,
+            None,
+            target.map(|t| t.scope),
+        )
+        .await
+        .map_err(|_| PairCode::StorageFailed)
     }
     #[cfg(test)]
     async fn persist_pairing(
@@ -3252,6 +3439,7 @@ impl Core {
         self.persist_pairing_hello(device, fp, guard, consume_invitation, None, None)
             .await
     }
+    #[allow(clippy::too_many_arguments)]
     async fn persist_pairing_hello(
         &self,
         device: &Id,
@@ -3260,6 +3448,28 @@ impl Core {
         consume_invitation: bool,
         hello: Option<Hello>,
         installed: Option<Arc<AtomicU64>>,
+    ) -> Result<Store> {
+        self.persist_pairing_hello_scoped(
+            device,
+            fp,
+            guard,
+            consume_invitation,
+            hello,
+            installed,
+            None,
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_pairing_hello_scoped(
+        &self,
+        device: &Id,
+        fp: &Hash,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+        consume_invitation: bool,
+        hello: Option<Hello>,
+        installed: Option<Arc<AtomicU64>>,
+        scope: Option<bool>,
     ) -> Result<Store> {
         ensure!(
             device != &self.identity.device_id,
@@ -3280,46 +3490,105 @@ impl Core {
         let device = device.clone();
         let fp = fp.clone();
         let invitation_changes = self.invitation_changes.clone();
+        let local_scope = scope.unwrap_or_else(|| {
+            if consume_invitation {
+                self.setup_invitation_scope.load(Ordering::SeqCst)
+            } else {
+                self.mesh.join_scope(&fp)
+            }
+        });
+        let route_proven = !consume_invitation
+            && hello
+                .as_ref()
+                .is_some_and(|h| h.addresses.as_ref().is_some_and(|v| !v.is_empty()));
+        let old_pin = self
+            .admission
+            .lock()
+            .expect("admission")
+            .peers
+            .iter()
+            .find(|(pin, id)| **id == device && **pin != fp)
+            .map(|(pin, _)| pin.clone());
+        let mesh = self.mesh.clone();
+        let incoming = self.setup_incoming.clone();
+        let lifecycle_store = self.store.clone();
+        let setup_generation = self.store.setup_state().generation;
         self.store
-            .pair_then_hello(device.clone(), fp.clone(), hello, move || {
-                let _guard = guard;
-                let mut connections = sessions.lock().expect("sessions");
-                connections.unpairing.remove(&device);
-                automatic
-                    .lock()
-                    .expect("automatic clipboard")
-                    .invalidate_peer(&device);
-                if let Some(old) = connections.sessions.remove(&device) {
-                    old.close
-                        .send_replace(Some(CloseReason::Error(ErrorCode::Unauthorized)));
-                }
-                clipboard.event(ClipboardEvent::BindingReset(device.clone()));
-                let mut scopes = actions.lock().expect("actions");
-                if let Some(old) = scopes.insert(device.clone(), ActionScope::new()) {
-                    old.cancelled.send_replace(true);
-                }
-                pending.discard_invalid();
-                let mut state = admission.lock().expect("admission");
-                state.peers.retain(|_, id| *id != device);
-                state.peers.insert(fp, device.clone());
-                // The attempt owns this marker. Publish in the uncancelable
-                // commit callback so retry cannot mistake its own install for
-                // a newer local decision, even if its waiter disappears.
-                if let Some(installed) = installed {
-                    installed.store(installed_generation, Ordering::SeqCst);
-                }
-                if consume_invitation {
-                    state.invitation = None;
-                }
-                invitation_changes.send_modify(|r| *r = r.wrapping_add(1));
-                drop(state);
-                emit_event(&ui, &events, Event::Paired { device });
-                select_display(
-                    &connections,
-                    &admission.lock().expect("admission"),
-                    &mut ui.lock().expect("UI state"),
-                );
-            })
+            .pair_then_hello_scoped(
+                device.clone(),
+                fp.clone(),
+                hello,
+                Some(self.self_member()),
+                if local_scope {
+                    SetupScope::Enabled
+                } else {
+                    SetupScope::Disabled
+                },
+                route_proven,
+                move || {
+                    let _guard = guard;
+                    if let Some(pin) = old_pin {
+                        mesh.cancel_removed(&[(device.clone(), pin.clone())]);
+                        for target in incoming.lock().expect("setup incoming").values() {
+                            if target.pin == pin
+                                && target.peer.as_ref().is_none_or(|p| *p == device)
+                            {
+                                target.cancelled.store(true, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                    let mut connections = sessions.lock().expect("sessions");
+                    connections.unpairing.remove(&device);
+                    automatic
+                        .lock()
+                        .expect("automatic clipboard")
+                        .invalidate_peer(&device);
+                    if let Some(old) = connections.sessions.remove(&device) {
+                        old.close
+                            .send_replace(Some(CloseReason::Error(ErrorCode::Unauthorized)));
+                    }
+                    clipboard.event(ClipboardEvent::BindingReset(device.clone()));
+                    let mut scopes = actions.lock().expect("actions");
+                    if let Some(old) = scopes.insert(device.clone(), ActionScope::new()) {
+                        old.cancelled.send_replace(true);
+                    }
+                    pending.discard_invalid();
+                    let mut state = admission.lock().expect("admission");
+                    state.peers.retain(|_, id| *id != device);
+                    state.peers.insert(fp, device.clone());
+                    // The attempt owns this marker. Publish in the uncancelable
+                    // commit callback so retry cannot mistake its own install for
+                    // a newer local decision, even if its waiter disappears.
+                    if let Some(installed) = installed {
+                        installed.store(installed_generation, Ordering::SeqCst);
+                    }
+                    if consume_invitation {
+                        state.invitation = None;
+                    }
+                    invitation_changes.send_modify(|r| *r = r.wrapping_add(1));
+                    drop(state);
+                    let setup = lifecycle_store.setup_state();
+                    if setup.generation != setup_generation {
+                        for session in connections.sessions.values() {
+                            if session.capabilities.iter().any(|c| c == "setup")
+                                && setup.links.iter().any(|l| {
+                                    l.device == session.device && l.scope != SetupScope::Disabled
+                                })
+                            {
+                                session
+                                    .close
+                                    .send_replace(Some(CloseReason::Error(ErrorCode::Closing)));
+                            }
+                        }
+                    }
+                    emit_event(&ui, &events, Event::Paired { device });
+                    select_display(
+                        &connections,
+                        &admission.lock().expect("admission"),
+                        &mut ui.lock().expect("UI state"),
+                    );
+                },
+            )
             .await?;
         Ok(captured)
     }
@@ -3337,6 +3606,7 @@ impl Core {
         Box::pin(async move {
 
         let ReadyState {
+            setup_sent,
             store,
             allow_recovery,
             action_scope,
@@ -3344,6 +3614,7 @@ impl Core {
         } = state;
         let mut config = self.config.subscribe();
         let mut settings_changes=store.settings_changed.subscribe();
+        let mut setup_changes=store.setup_changed.subscribe();
         let (mut reader, writer) = tokio::io::split(tls);
         let activity = Arc::new(Mutex::new(Instant::now()));
         let mut writer = crate::transport::ActivityWriter { writer, sent: activity.clone() };
@@ -3373,7 +3644,7 @@ impl Core {
         let readiness = Arc::new(Notify::new());
         let needs_evidence = !outbound && hello.role == Some(DeviceRole::Computer);
         let _readiness = needs_evidence.then(|| self.persist_readiness(
-            store.clone(), hello.device_id.clone(), Some(readiness.clone()),
+            store.clone(), hello.device_id.clone(), if allow_recovery {None}else{Some(readiness.clone())},
         ));
         let reader_task = tokio::spawn(Box::pin(async move {
             for message in buffered {
@@ -3496,6 +3767,16 @@ impl Core {
         let mut settings_confirmed: Option<Vec<PeerSetting>> = None;
         let mut settings_received = !store.mesh;
         let mut settings_retry: Option<Instant> = None;
+        let mut members_pending: Option<PendingOutgoing> = None;
+        let mut members_snapshot: Option<Members> = None;
+        let mut members_confirmed: Option<Vec<Member>> = None;
+        let mut members_retry: Option<Instant> = None;
+        let mut members_blocked=false;
+        let mut members_init_retry: Option<Instant> = None;
+        let mut members_fence=match self.setup_ready(&store,hello,setup_sent.clone()).await {
+            Ok(fence)=>fence,
+            Err(error)=>{self.error(Some(hello.device_id.clone()),format!("membership initialization deferred: {error}"));members_init_retry=Some(Instant::now()+Duration::from_secs(60));None},
+        };
         let result:Result<()>=async {
             if let Err(error)=self.initialize_settings(&store,hello).await {
                 self.error(Some(hello.device_id.clone()),format!("settings initialization deferred: {error}"));
@@ -3503,6 +3784,25 @@ impl Core {
             }
             loop {
                 if close.borrow().is_some() || !self.connection_current(&store, &hello.device_id) {break;}
+                if members_init_retry.is_some_and(|at|at<=Instant::now()) {
+                    match self.setup_ready(&store,hello,setup_sent.clone()).await {
+                        Ok(fence)=>{members_fence=fence;members_init_retry=None;},
+                        Err(error)=>{self.error(Some(hello.device_id.clone()),format!("membership initialization deferred: {error}"));members_init_retry=Some(Instant::now()+Duration::from_secs(60));},
+                    }
+                }
+                if let Some(fence)=&members_fence {
+                    let state=store.setup_state();
+                    if state.generation!=fence.generation {break;}
+                    if !members_blocked && members_pending.is_none() && members_retry.is_none_or(|at|at<=Instant::now()) && members_confirmed.as_ref()!=Some(&state.roster) {
+                        match store.members_outgoing(fence.clone()).await {
+                            Ok(snapshot)=>{
+                                if !enqueue(&write_tx,Message::Members(snapshot.clone()),&mut close,Some(Instant::now()+Duration::from_secs(60))).await? {break;}
+                                members_pending=Some(PendingOutgoing::queued(snapshot.transfer_id.clone()));members_snapshot=Some(snapshot);members_retry=None;
+                            },
+                            Err(error)=>{self.error(Some(hello.device_id.clone()),format!("membership persistence failed: {error}"));members_retry=Some(Instant::now()+Duration::from_secs(60));},
+                        }
+                    }
+                }
                 if store.mesh {
                     let fields=self.store.pair_settings.lock().expect("pair settings").get(&hello.device_id).cloned().unwrap_or_default();
                     if settings_pending.is_none() && settings_retry.is_none_or(|at|at<=Instant::now()) && settings_confirmed.as_ref()!=Some(&fields) {
@@ -3567,7 +3867,8 @@ impl Core {
                 }
                 let content_deadline=pending.as_ref().and_then(|p|p.deadline).into_iter().chain(text_pending.as_ref().and_then(|p|p.deadline)).min();
                 let settings_deadline=settings_pending.as_ref().and_then(|p|p.deadline);
-                let receipt_deadline=content_deadline.into_iter().chain(settings_deadline).min().unwrap_or_else(||Instant::now()+Duration::from_secs(86400));
+                let members_deadline=members_pending.as_ref().and_then(|p|p.deadline);
+                let receipt_deadline=content_deadline.into_iter().chain(settings_deadline).chain(members_deadline).min().unwrap_or_else(||Instant::now()+Duration::from_secs(86400));
                 tokio::select! {
                     biased;
                     _=close.changed()=>break,
@@ -3580,6 +3881,7 @@ impl Core {
                             WriteReport::Sent { id, at } => {
                                 if let Some(pending) = pending.as_mut() { pending.sent(&id, at); }
                                 if let Some(pending) = settings_pending.as_mut() { pending.sent(&id, at); }
+                                if let Some(pending) = members_pending.as_mut() { pending.sent(&id, at); }
                                 if let Some(pending) = text_pending.as_mut() { pending.sent(&id, at); }
                             }
                         }
@@ -3589,12 +3891,15 @@ impl Core {
                         if !enqueue(&outbox_tx,work,&mut close,Some(Instant::now()+Duration::from_secs(60))).await? {break;}
                     },
                     writer=&mut workers.writer=>{writer_finished=true;if close.borrow().is_none() {writer??;}break;},
-                    _=tokio::time::sleep_until(receipt_deadline),if content_deadline.is_some() || settings_deadline.is_some()=>{let _=close_tx.send(Some(CloseReason::Error(ErrorCode::Timeout)));bail!("outgoing receipt timeout");},
+                    _=tokio::time::sleep_until(receipt_deadline),if content_deadline.is_some() || settings_deadline.is_some() || members_deadline.is_some()=>{let _=close_tx.send(Some(CloseReason::Error(ErrorCode::Timeout)));bail!("outgoing receipt timeout");},
+                    _=retry_timer(members_init_retry),if members_init_retry.is_some()=>{},
+                    _=retry_timer(members_retry),if members_retry.is_some()=>{members_retry=None;},
                     _=retry_timer(settings_retry),if settings_retry.is_some()=>{settings_retry=None;},
                     _=tokio::time::sleep_until(file_poll),if pending.is_none()=>{},
                     _=wake.notified()=>{file_poll=Instant::now();},
                     _=config.changed()=>{},
                     _=settings_changes.changed()=>{},
+                    _=setup_changes.changed()=>{},
                     message=read_rx.recv()=>{
                         let Some(message)=message else {break;};
                         if !self.connection_current(&store, &hello.device_id) {break;}
@@ -3632,12 +3937,13 @@ impl Core {
                                         self.set_link_problem(&hello.device_id, generation, Some(problem));
                                     }
                                 }
-                                if outbound && error.code == ErrorCode::Unauthorized {
+                                if outbound && error.code == ErrorCode::Unauthorized && !(hello.capabilities.iter().any(|c|c=="setup") && self.store.setup_protected(&hello.device_id)) {
                                     self.forget_pairing(hello.device_id.clone(), CloseReason::Error(ErrorCode::Closing), store.connection_id, Some(hello.name.clone())).await?;
                                 }
                                 break;
                             },
                             Message::Status(status)=>{self.set_phone_paused(&hello.device_id,store.connection_id.expect("connection id"),status.paused);},
+                            Message::Unpair(_) if hello.capabilities.iter().any(|c|c=="setup") && self.withdraw_setup(&store,hello).await?=>{break;},
                             Message::Unpair(_)=>{
                                 // Admission precedes worker teardown too. The
                                 // pairing epoch fences any in-flight commit;
@@ -3650,6 +3956,16 @@ impl Core {
                                 // A consumed/expired token is irrelevant to this recovery.
                                 recovered_pairing=true;
                                 if !enqueue(&write_tx,Message::PairResult(PairResult {accepted:true,code:None,message:None}),&mut close,Some(receipt_deadline.min(Instant::now()+Duration::from_secs(60)))).await? {break;}
+                            },
+                            Message::Members(snapshot) if hello.capabilities.iter().any(|c|c=="setup")=>{
+                                if members_init_retry.is_some()&&self.store.setup_hello(Some(&hello.device_id),SetupScope::Disabled).scope==SetupScope::Enabled&&self.store.setup_state().setup_id.as_ref()==Some(&snapshot.setup_id)&&hello.setup.as_ref().is_some_and(|h|h.scope==SetupScope::Enabled&&h.setup_id==self.store.setup_state().setup_id) {
+                                    if !enqueue(&write_tx,nack(snapshot.transfer_id,NackCode::StorageFailed),&mut close,Some(Instant::now()+Duration::from_secs(60))).await? {break;}
+                                    continue;
+                                }
+                                match self.receive_members(&store,hello,members_fence.as_ref(),snapshot).await {
+                                    Ok(response)=>{if !enqueue(&write_tx,response,&mut close,Some(Instant::now()+Duration::from_secs(60))).await? {break;}},
+                                    Err(error)=>{close_tx.send_replace(Some(CloseReason::Error(if error.is::<crate::store::SettingsMalformed>() {ErrorCode::MalformedMessage}else{ErrorCode::UnexpectedMessage})));break;},
+                                }
                             },
                             Message::PeerSettings(snapshot) if store.mesh=>{
                                 let result={
@@ -3671,6 +3987,15 @@ impl Core {
                                 if !enqueue(&write_tx,response,&mut close,Some(receipt_deadline.min(Instant::now()+Duration::from_secs(60)))).await? {break;}
                             },
                             Message::Ack(ack)=>{
+                                if members_pending.as_ref().is_some_and(|p|p.id==ack.transfer_id) {
+                                    members_pending=None;
+                                    let fence=members_fence.as_ref().context("missing membership fence")?;
+                                    match store.members_ack(fence.clone(),ack.transfer_id).await {
+                                        Ok(())=>members_confirmed=Some(members_snapshot.take().context("missing membership snapshot")?.members),
+                                        Err(error)=>{members_snapshot=None;members_retry=Some(Instant::now()+Duration::from_secs(60));self.error(Some(hello.device_id.clone()),format!("membership ACK persistence deferred: {error}"));},
+                                    }
+                                    continue;
+                                }
                                 if settings_pending.as_ref().is_some_and(|p|p.id==ack.transfer_id) {
                                     let deadline=settings_pending.take().and_then(|p|p.deadline).unwrap_or_else(||Instant::now()+Duration::from_secs(120));
                                     match tokio::time::timeout_at(deadline,store.settings_ack(hello.device_id.clone(),ack.transfer_id)).await.map_err(anyhow::Error::from).and_then(|result|result) {
@@ -3699,6 +4024,12 @@ impl Core {
                                 self.connection_event(&store,&hello.device_id,Event::ClipboardSent {device:hello.device_id.clone(),transfer_id:id});
                             },
                             Message::Nack(nack)=>{
+                                if members_pending.as_ref().is_some_and(|p|p.id==nack.transfer_id) {
+                                    members_pending=None;members_snapshot=None;members_confirmed=None;
+                                    members_blocked = !nack.retryable;
+                                    members_retry=nack.retryable.then(||Instant::now()+Duration::from_secs(60));
+                                    self.error(Some(hello.device_id.clone()),format!("membership synchronization rejected: {:?}",nack.code));continue;
+                                }
                                 if settings_pending.as_ref().is_some_and(|p|p.id==nack.transfer_id) {
                                     settings_pending=None;
                                     settings_snapshot=None;
@@ -5011,6 +5342,7 @@ fn frame_receipt_id(message: &Message) -> Option<Id> {
     match message {
         Message::Clipboard(text) => Some(text.transfer_id.clone()),
         Message::PeerSettings(snapshot) => Some(snapshot.transfer_id.clone()),
+        Message::Members(snapshot) => Some(snapshot.transfer_id.clone()),
         Message::FileEnd(end) => Some(end.transfer_id.clone()),
         _ => None,
     }
@@ -5157,7 +5489,9 @@ async fn close_transport<W: tokio::io::AsyncWrite + Unpin>(
     reason: CloseReason,
 ) -> Result<()> {
     let messages = match reason {
-        CloseReason::Unpair => vec![reason.message(), error_message(ErrorCode::Closing)],
+        CloseReason::Unpair | CloseReason::MembershipAck(_) => {
+            vec![reason.message(), error_message(ErrorCode::Closing)]
+        }
         _ => vec![reason.message()],
     };
     crate::transport::close(writer, &messages).await
@@ -5883,6 +6217,7 @@ mod tests {
             &state,
             id,
             &Hello {
+                setup: None,
                 role: None,
                 addresses: None,
                 version: 1,
@@ -7329,6 +7664,7 @@ mod tests {
             },
         );
         let current = Hello {
+            setup: None,
             role: None,
             addresses: None,
             version: pneu_proto::PROTOCOL_VERSION,
@@ -8258,6 +8594,7 @@ mod tests {
             .start_pairing_with_addresses(vec!["127.0.0.1:47821".into()])
             .await?;
         let hello = Hello {
+            setup: None,
             version: 1,
             device_id: device.clone(),
             name: "Legacy phone".into(),
@@ -10806,6 +11143,7 @@ mod tests {
                         rustls::pki_types::ServerName::try_from("pneu.local")?, stream,
                     ).await?;
                     write_frame(&mut tls, &Message::Hello(Hello {
+                        setup: None,
                         role: Some(DeviceRole::Computer),
                         addresses: Some(vec![format!("127.0.0.1:{}", 10000 + index)]),
                         version: 1,
