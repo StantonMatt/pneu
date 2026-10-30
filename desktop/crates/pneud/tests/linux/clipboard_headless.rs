@@ -447,6 +447,47 @@ async fn run() -> Result<()> {
     // this matrix so the recipient really negotiates clipboard images too.
     bc.close().await?;
     let mut startup_mesh = mesh_connect(&core, &b).await?;
+    // Consume the initial selection, then prove a new PNG offer is sent with
+    // the untouched default image policy to a peer that supports images.
+    assert!(core.config().clipboard_include_images);
+    let mut default_text = copy(b"default image policy", "text/plain;charset=utf-8").await?;
+    delay(650).await;
+    // The initial observation may be manual-only, depending on whether the
+    // empty compositor advertised a selection before this first copy.
+    match tokio::time::timeout(Duration::from_millis(120), read_frame(&mut startup_mesh)).await {
+        Err(_) => {}
+        Ok(Ok(Some(Message::Clipboard(text)))) => {
+            ensure!(
+                text.text == "default image policy",
+                "unexpected warmup text"
+            );
+            write_frame(
+                &mut startup_mesh,
+                &Message::Ack(Ack {
+                    transfer_id: text.transfer_id,
+                    deduplicated: false,
+                }),
+            )
+            .await?;
+        }
+        other => anyhow::bail!("unexpected default-policy warmup frame: {other:?}"),
+    }
+    if let Ok(message) = ac.read(Duration::from_millis(120)).await {
+        ensure!(
+            matches!(&message, Message::Clipboard(text) if text.text == "default image policy"),
+            "unexpected default-policy warmup frame"
+        );
+        ac.handle(message).await?;
+    }
+    let mut default_image = copy(&png_bytes, "image/png").await?;
+    manual_selection_seen(&mut startup_mesh, "image/png", &png_bytes).await?;
+    let _ = default_text.kill().await;
+    let _ = default_text.wait().await;
+    let _ = default_image.kill().await;
+    let _ = default_image.wait().await;
+    println!(
+        "PASS default Include images: image/png offer -> clipboard_image FILE_BEGIN/chunks/end -> paired peer ACK"
+    );
     for mode in ["automatic", "manual", "off"] {
         for (mime, bytes) in [
             ("text/plain;charset=utf-8", b"startup selection".as_slice()),
@@ -454,8 +495,6 @@ async fn run() -> Result<()> {
         ] {
             watch.shutdown().await;
             core.set_setting("clipboard_mode".into(), mode.into())
-                .await?;
-            core.set_setting("clipboard_include_images".into(), true.into())
                 .await?;
             let mut startup_owner = copy(bytes, mime).await?;
             watch = pneud::ui::clipboard::Watch::start(core.clone())?;

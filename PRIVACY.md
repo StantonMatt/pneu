@@ -1,13 +1,13 @@
 # Pneu privacy policy
 
-Effective date: 2026-10-28. Pneu is developed by Matthew Stanton.
+Effective date: 2026-10-30. Pneu is developed by Matthew Stanton.
 
 Pneu transfers clipboard content, photos and files between devices you pair. This policy covers Android, Linux, macOS and Windows. There are no Pneu accounts or developer-operated servers. Pneu processes and stores data only on your devices; the developer collects none. It has no ads, analytics or telemetry, and sells no data.
 
 ## Data Pneu uses
 
 - On Android, clipboard content when you choose to send it through a button, Quick Settings tile, notification action or share sheet. Android-marked sensitive clipboard items are not sent.
-- Desktop apps share clipboard content automatically with paired, connected devices by default. Settings offers Automatically, Manually or Off; each device's Send clipboard and Receive clipboard switches control directions. Include images is off by default. Supported exclusion and sensitivity markers are skipped, including on Windows, but Pneu cannot detect every sensitive item.
+- Desktop apps share clipboard content automatically with paired, connected devices by default. Settings offers Automatically, Manually or Off; each device's Send clipboard and Receive clipboard switches control directions. Include images is on by default. Supported exclusion and sensitivity markers are skipped, including on Windows, but Pneu cannot detect every sensitive item.
 - On Android, new screenshots, photos and screen recordings for the automatic-send categories you enable, after granting media access. Screenshots are enabled by default; photos and recordings are off by default. Automatic sending can work while the app is in the background. You can pause it or disable categories or individual computers.
 - Files, images, text and links you share to Pneu, and content received from paired devices.
 - On Android and macOS, camera frames only while the QR pairing scanner is open. Windows does not use the camera.

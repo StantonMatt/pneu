@@ -6343,7 +6343,7 @@ mod tests {
         for image in [false, true] {
             let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
             let close = admit_ui_test_phone(&core, &device, 1)?;
-            core.toggle_setting(crate::ui::Toggle::IncludeImages)
+            core.set_setting("clipboard_include_images".into(), true.into())
                 .await?;
             let work = test_automatic_work(&core, &device, image).await?;
             let id = work.selection.id().clone();
@@ -6433,7 +6433,7 @@ mod tests {
             for disable in [false, true] {
                 let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
                 let close = admit_ui_test_phone(&core, &device, 1)?;
-                core.toggle_setting(crate::ui::Toggle::IncludeImages)
+                core.set_setting("clipboard_include_images".into(), true.into())
                     .await?;
                 let work = test_automatic_work(&core, &device, image).await?;
                 let stale = work.selection.id().clone();
@@ -6547,7 +6547,7 @@ mod tests {
         for image in [false, true] {
             let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
             let _close = admit_ui_test_phone(&core, &device, 1)?;
-            core.toggle_setting(crate::ui::Toggle::IncludeImages)
+            core.set_setting("clipboard_include_images".into(), true.into())
                 .await?;
             let work = test_automatic_work(&core, &device, image).await?;
             let (mut stream, mut reader) = tokio::io::duplex(1);
@@ -7353,7 +7353,7 @@ mod tests {
         assert_eq!(before, std::fs::read(core.paths.data.join("phone.json"))?);
         assert_eq!(core.ui_snapshot().phone.name, "Current phone");
         assert_eq!(core.ui_snapshot().phone.route, "Tailscale");
-        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+        core.set_setting("clipboard_include_images".into(), true.into())
             .await?;
         assert!(
             !core
@@ -7428,7 +7428,7 @@ mod tests {
             .get_mut(&text_peer)
             .unwrap()
             .capabilities = vec!["clipboard_text".into()];
-        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+        core.set_setting("clipboard_include_images".into(), true.into())
             .await?;
         core.send_observed_formats(
             core.observe_clipboard_offer().unwrap(),
@@ -7519,7 +7519,7 @@ mod tests {
     async fn encoded_image_begin_rejected_before_automatic_publication() -> Result<()> {
         let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
         let _link = admit_ui_test_phone(&core, &device, 1)?;
-        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+        core.set_setting("clipboard_include_images".into(), true.into())
             .await?;
         let offer = core.observe_clipboard_offer().unwrap();
         core.store
@@ -7554,7 +7554,7 @@ mod tests {
             .unwrap()
             .capabilities = vec!["clipboard_text".into()];
         core.set_phone_paused(&image_peer, 2, true);
-        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+        core.set_setting("clipboard_include_images".into(), true.into())
             .await?;
         crate::ui::clipboard::tests::deliver_offer(
             &core,
@@ -7588,7 +7588,7 @@ mod tests {
             .get_mut(&text_peer)
             .unwrap()
             .capabilities = vec!["clipboard_text".into()];
-        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+        core.set_setting("clipboard_include_images".into(), true.into())
             .await?;
         let requested = crate::ui::clipboard::tests::deliver_offer(
             &core,
@@ -7636,7 +7636,7 @@ mod tests {
                 .unwrap()
                 .capabilities = vec!["clipboard_text".into()];
         }
-        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+        core.set_setting("clipboard_include_images".into(), true.into())
             .await?;
         let offer = core.observe_clipboard_offer().unwrap();
         core.send_observed_formats(
@@ -7685,7 +7685,7 @@ mod tests {
     async fn automatic_formats_validate_independently_before_recipient_preference() -> Result<()> {
         let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
         let _connection = admit_ui_test_phone(&core, &device, 1)?;
-        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+        core.set_setting("clipboard_include_images".into(), true.into())
             .await?;
         let png = b"\x89PNG\r\n\x1a\nvalid image".to_vec();
         for bytes in [
@@ -7896,7 +7896,7 @@ mod tests {
             .get_mut(&device)
             .unwrap()
             .capabilities = vec!["clipboard_text".into()];
-        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+        core.set_setting("clipboard_include_images".into(), true.into())
             .await?;
         let mut events = core.subscribe();
         let requested = crate::ui::clipboard::tests::deliver_offer(
@@ -7943,7 +7943,7 @@ mod tests {
             .get_mut(&text_peer)
             .unwrap()
             .capabilities = vec!["clipboard_text".into()];
-        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+        core.set_setting("clipboard_include_images".into(), true.into())
             .await?;
         for marker in [
             "application/x-keepassxc-secret",
@@ -7979,7 +7979,9 @@ mod tests {
     async fn automatic_formats_image_policy_and_text_aliases_follow_frozen_offer() -> Result<()> {
         let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
         let _connection = admit_ui_test_phone(&core, &device, 1)?;
-        // Images default off: a dual-capability recipient still gets offered text.
+        // Explicitly disabling images still lets a dual-capability recipient get text.
+        core.set_setting("clipboard_include_images".into(), false.into())
+            .await?;
         for mime in ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"] {
             let requested = crate::ui::clipboard::tests::deliver_offer(
                 &core,
@@ -8027,7 +8029,7 @@ mod tests {
             .unwrap()
             .capabilities = vec!["clipboard_text".into()];
         core.set_phone_paused(&image_peer, 2, true);
-        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+        core.set_setting("clipboard_include_images".into(), true.into())
             .await?;
         let mut late_connection = None;
         let requested = crate::ui::clipboard::tests::deliver_offer_after_observation(
@@ -8074,7 +8076,7 @@ mod tests {
             .get_mut(&text_peer)
             .unwrap()
             .capabilities = vec!["clipboard_text".into()];
-        core.toggle_setting(crate::ui::Toggle::IncludeImages)
+        core.set_setting("clipboard_include_images".into(), true.into())
             .await?;
         let offer = core.observe_clipboard_offer().unwrap();
         core.set_phone_paused(&image_peer, 1, true);
@@ -8115,7 +8117,7 @@ mod tests {
         for mesh in [false, true] {
             for image in [false, true] {
                 let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
-                core.toggle_setting(crate::ui::Toggle::IncludeImages)
+                core.set_setting("clipboard_include_images".into(), true.into())
                     .await?;
                 let _link = admit_ui_test_phone(&core, &device, 1)?;
                 core.sessions
@@ -8184,7 +8186,7 @@ mod tests {
             for old_kind in 0..3 {
                 for new_image in [false, true] {
                     let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
-                    core.toggle_setting(crate::ui::Toggle::IncludeImages)
+                    core.set_setting("clipboard_include_images".into(), true.into())
                         .await?;
                     let _link = admit_ui_test_phone(&core, &device, 1)?;
                     core.sessions

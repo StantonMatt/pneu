@@ -609,7 +609,7 @@ const SEP='<div class="msep"></div>';
 function trayMenu(status,{paired=true,clip=true}={}){
   return `<div class="menu">${mi(status,{dis:true})}${SEP}${mi('Open Folder',{icon:'folder'})}${SEP}
    ${mi('Save to Folder',{cb:true})}${mi('Show Notifications',{cb:true,hov:true})}${mi('Copy Images to Clipboard',{cb:true})}${mi('Open in Image Viewer',{cb:false})}${SEP}
-   ${mi('Send Clipboard to Phone',{cb:clip})}${mi('Include Images',{cb:false,dis:!clip})}${SEP}
+   ${mi('Send Clipboard to Phone',{cb:clip})}${mi('Include Images',{cb:true,dis:!clip})}${SEP}
    ${paired?mi('Configure Pneu…',{icon:'configure'}):mi('Pair Phone…',{icon:'phone'})}${mi('Quit',{icon:'exit'})}</div>`;
 }
 function desk(dark,inner,h=null){return `<div class="bz ${dark?'dark':''}"><div class="desk ${dark?'dark':'light'}" ${h?`style="height:${h}px"`:''}>${inner}</div></div>`}

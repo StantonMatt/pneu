@@ -5144,7 +5144,7 @@ async fn explicit_clipboard_supersedes_slow_watcher_while_waiting_for_receipt() 
             let phone = h.phone("manual-supersession")?;
             h.pair(&phone).await?.close().await?;
             h.core
-                .toggle_setting(pneud::ui::Toggle::IncludeImages)
+                .set_setting("clipboard_include_images".into(), true.into())
                 .await?;
             let mut link = negotiated_phone(&h, &phone, mesh, true).await?;
             let peer = phone.identity.device_id.clone();
