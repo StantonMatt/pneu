@@ -40,8 +40,10 @@ pairing invitation and admission quotas, the acceptor sends `ERROR unauthorized`
 short message and closes within the 2 s fatal-close bound. Unknown clients count
 toward the same total connection and handshake limits. During pairing only,
 admitted unknown clients enter the restricted provisional state specified below.
-Dialers treat `ERROR unauthorized` from an acceptor authenticated against the stored pin
-as a revocation signal ("Pairing lost"), rather than a network failure.
+On plain direct links, dialers treat `ERROR unauthorized` from an acceptor
+authenticated against the stored pin as a revocation signal ("Pairing lost"),
+subject to the readiness fences below. On setup-scoped links it is only a
+connection refusal; see Setup membership. It never revokes setup membership.
 
 Each computer advertises mDNS service `_pneu._tcp.local.` (service type `_pneu._tcp`), SRV
 port and TXT keys `v=1`, `fp=<computer fingerprint>`. Instance name is for display only.
@@ -148,9 +150,9 @@ For computer-to-computer pairing the joiner is the dialer and runs exactly the
 same invitation/token/pin/expiry flow as the phone. An invitation MUST NEVER be
 passed as a command-line argument (including a shell command containing the URI);
 a CLI MUST read it from stdin, or use a UI paste field. A bare short numeric code
-is forbidden: it would require a separately designed PAKE protocol. No phone
-introduction or transitive trust is defined. Discovery never supplies a trusted
-replacement fingerprint.
+is forbidden: it would require a separately designed PAKE protocol. Transitive
+trust is permitted only by negotiated, locally authorized setup membership below; it is never supplied by an invitation extension or discovery.
+Discovery never supplies a trusted replacement fingerprint.
 
 ## Mesh (capability `mesh`)
 
@@ -186,6 +188,104 @@ mutate that peer's replacement state or perform clipboard/desktop effects.
 Capability/version negotiation does not advance any generation. Unpairing one
 peer preserves all other peers and deliveries; local identity MUST remain stable
 while any other pairing exists. Re-pairing the same peer preserves pair switches.
+
+## Setup membership (capability `setup`)
+
+`setup` adds **pair once, join your setup** to v1. It requires `mesh`; advertise
+both only when the complete membership receive/persistence machinery exists.
+It introduces MEMBERS (`22`), not a new pairing handshake, invitation key, shared
+secret, administrator or signature. Any locally authorized setup member may
+introduce another member or remove one. Trust propagates over existing pinned,
+authenticated connections; clipboard/file content still travels directly and is
+never automatically forwarded. A legacy peer retains its ordinary direct link.
+The detailed wire and lifecycle rules are in MEMBERS below; implementation notes
+and shared test inputs are in [setup-membership.md](setup-membership.md).
+
+Each binding has a durable **local setup scope**: `enabled`, `disabled`, or `ask`
+(migrated, undecided). It is independent of PEER_SETTINGS, never synchronized as
+a sharing switch, and never inferred from a name, address or capability alone.
+The pairing confirmation offers **Also link with your other devices**, on by
+default; freeze that choice in the existing in-memory attempt. The inviter's
+local choice defaults on when opening the invitation. Switching off creates a
+plain direct link. Cancellation/recovery retain the existing pairing fences and
+NEVER send UNPAIR. Same-binding recovery preserves scope subject to setup-ID
+compatibility below. Introduced bindings are locally setup-enabled.
+
+Each device holds one optional random 128-bit `setup_id` (the existing `Id`
+format) alongside its roster. It is not a secret, admin or authority: admission
+stays by pin. Matching IDs never bypass consent, tombstones, pin uniqueness or
+pairing fences; MEMBERS still requires an authenticated, mutually enabled link.
+
+HELLO gains optional `setup`, required when advertising `setup`:
+
+```json
+{"scope":"enabled","setup_id":"0123456789abcdef0123456789abcdef"}
+```
+
+`scope` is the local decision, never authority to change the receiver's flag.
+Omit `setup_id` when unassigned or locally disabled on this link; never send null.
+Advertising `setup` without `mesh`, `role` or this object is malformed. Common
+nested JSON rules apply; ignore the object unless both negotiate `setup`.
+No invitation URI changes are permitted.
+
+After pairing authority and mutual consent, both endpoints evaluate the same
+authenticated HELLO pair symmetrically:
+
+| Local/remote persisted setup IDs | Result |
+| --- | --- |
+| absent / absent | Found a new setup after mutual opt-in |
+| absent / S (either direction) | The unassigned device joins S after mutual opt-in |
+| S / S | Synchronize |
+| S / T, S ≠ T | Keep the direct link; exchange no roster |
+
+Apply this to token pairings and existing-link activation: **Link existing
+device**, migration offer and Allow. Check compatibility before offering; Allow
+refreshes authenticated HELLO and rechecks before enabling. S/T disables this
+link's local scope on each end, resolves prompts and reports
+**Direct link kept; separate setups not linked**. Compatible same-device repair
+or replacement retains scope; reconnect preserves consent but checks IDs before synchronization.
+A disabled scope needs explicit local opt-in and a new HELLO before its ID
+participates.
+
+For absent/absent with both scopes enabled, the lower authenticated device ID
+endpoint generates a fresh random setup ID and atomically persists it with self
+and the first other member from the authenticated binding, then reconnects.
+The non-proposer waits unassigned without MEMBERS, retaining consent across
+restart until that next authenticated HELLO advertises the persisted ID. It
+adopts via the absent/S join transaction (ID, self and first other member), then
+reconnects. Synchronize only once both advertise the same persisted ID. The
+proposer has no continuing role. Never derive the ID from device IDs, names,
+addresses or roster, or reuse a retired ID when founding again.
+
+Serialize one activation at a time device-wide in the lifecycle transaction:
+only unassigned → S or idempotent S → S, never automatic S → T. Recheck assignment,
+consent, authenticated binding and connection at commit. Concurrent S/T joins:
+first durable assignment wins, the other link stays direct. Hold the gate only
+for the short local transaction, never over remote exchanges or user prompts.
+Persist a local setup generation, advancing on assignment, dissolution and
+withdrawal. Bind pending prompts, queued snapshots and receipts to it and recheck
+at commit/use, fencing stale work after leave/rejoin even to the same ID.
+Reconnect on assignment; the MEMBERS ID backstop rejects any residual race.
+
+Migrate bindings to `ask`, preserving identity, binding generations, settings,
+queues and receipts. Both-ask sends no MEMBERS; expose **Link existing device**
+to enable an ask/disabled local scope explicitly and reconnect. A compatible
+authenticated enabled/ask HELLO offers linking without a roster, even when both
+are unassigned. The ask receiver retains one durable prompt per binding/setup
+generation: **<name> wants to link your devices. Allow?** Allow refreshes HELLO,
+rechecks compatibility and atomically enables; Deny disables. Dismissal retains
+the prompt across restart. Capability changes never reset consent; fresh token
+pairing after removal creates a new decision. A disabled remote requires its
+own explicit opt-in; HELLO or MEMBERS never prompts it.
+
+Send MEMBERS only in READY after binding persistence, negotiated `setup`, both
+HELLO scopes enabled and matching persisted IDs. Pending/disabled receivers NACK
+`unsupported_kind` (`retryable=false`), without merge, clock observation, receipt
+or prompt. Before READY or without `setup`, use `ERROR unexpected_message`.
+Keepalive/direct traffic continue. Export a binding only after reciprocal enabled
+scope and compatible assignment; ask/disabled/legacy pins alone grant no export.
+Independently retained members remain in their assigned setup even when their
+direct link is ask. Exported trust requires explicit removal to revoke.
 
 ## Common types and JSON rules
 
@@ -292,6 +392,7 @@ objects are lowercase snake_case; these names are not carried on the wire.
 | `14` | NACK | Receipt failed |
 | `20` | CLIPBOARD | Clipboard text operation |
 | `21` | PEER_SETTINGS | Synced directional pair switches (`mesh` only) |
+| `22` | MEMBERS | Full setup membership snapshot (`setup` only) |
 | `7f` | ERROR | Fatal error or graceful close; then close TLS |
 
 The following JSON Schema (2020-12) defines the control payloads. Select the
@@ -317,7 +418,8 @@ unique known fields or filename safety).
         "capabilities":{"type":"array","maxItems":16,"uniqueItems":true,"items":{"type":"string","minLength":1}},
         "paused":{"type":"boolean"},
         "role":{"enum":["phone","computer"]},
-        "addresses":{"type":"array","maxItems":8,"uniqueItems":true,"items":{"type":"string","minLength":1}}
+        "addresses":{"type":"array","maxItems":8,"uniqueItems":true,"items":{"type":"string","minLength":1}},
+        "setup":{"$ref":"#/$defs/setup_hello"}
       }
     },
     "status": {
@@ -400,6 +502,40 @@ unique known fields or filename safety).
         "settings":{"type":"array","minItems":1,"maxItems":3,"items":{"$ref":"#/$defs/peer_setting"}}
       }
     },
+    "setup_hello": {
+      "type":"object","required":["scope"],
+      "properties":{"scope":{"enum":["enabled","disabled","ask"]},"setup_id":{"$ref":"#/$defs/id"}}
+    },
+    "member_reach": {
+      "type":"object","required":["addresses","relay","hlc","writer_device"],
+      "properties": {
+        "addresses":{"type":"array","maxItems":8,"uniqueItems":true,"items":{"type":"string","minLength":1}},
+        "relay":{"type":"array","maxItems":0},
+        "hlc":{"$ref":"#/$defs/hlc"},
+        "writer_device":{"$ref":"#/$defs/id"}
+      }
+    },
+    "member": {
+      "type":"object","required":["device_id","fingerprint","role","name","status","hlc","writer_device"],
+      "properties": {
+        "device_id":{"$ref":"#/$defs/id"},
+        "fingerprint":{"$ref":"#/$defs/hash"},
+        "role":{"enum":["phone","computer"]},
+        "name":{"type":"string","minLength":1},
+        "status":{"enum":["member","removed"]},
+        "hlc":{"$ref":"#/$defs/hlc"},
+        "writer_device":{"$ref":"#/$defs/id"},
+        "reach":{"$ref":"#/$defs/member_reach"}
+      }
+    },
+    "members": {
+      "type":"object","required":["transfer_id","setup_id","members"],
+      "properties": {
+        "transfer_id":{"$ref":"#/$defs/id"},
+        "setup_id":{"$ref":"#/$defs/id"},
+        "members":{"type":"array","minItems":1,"maxItems":64,"items":{"$ref":"#/$defs/member"}}
+      }
+    },
     "error": {
       "type":"object","required":["code"],
       "properties": {
@@ -437,7 +573,9 @@ READY whenever the user pauses or resumes. It has no receipt. A PC MAY send it
 with `paused=false` but v1 PCs never do.
 
 UNPAIR (`07`), payload `{}`, means the sender has deleted its pairing with the
-receiver. Receiver deletes the peer's pin, device binding and dedupe records,
+receiver. On a setup-scoped link it invokes local withdrawal without reciprocal
+global tombstones; see Admission, readiness and removal below. Otherwise the
+receiver deletes the peer's pin, device binding and dedupe records,
 shows the unpaired state only after durable removal succeeds, and closes the
 connection; the sender sends UNPAIR only after its own durable removal succeeds,
 then closes too
@@ -452,7 +590,8 @@ the same except for labelling.
 `disk_full` and `not_writable` NACKs mean the receiver could not store the file
 in its configured folder. The receiver does not keep a copy; the sender retries. Each capability is 1–64 UTF-8 bytes; at most 16
 unique entries. Defined capabilities are `files`, `clipboard_text`,
-`clipboard_image`, `mesh`. Advertising `clipboard_image` requires `files`. Capabilities
+`clipboard_image`, `mesh`, `setup`. Advertising `clipboard_image` requires `files`;
+`setup` requires `mesh` and the HELLO setup object above. Capabilities
 mean ability/willingness to receive that feature, not permission to bypass local
 settings. Send a feature only if the receiving HELLO advertises it. Both sides
 always implement ACK/NACK, HELLO, ERROR and keepalive. Unknown capabilities are
@@ -809,6 +948,356 @@ This makes a disabled legacy setting win the bootstrap merge. Later user edits
 use normal clocks. Preserve saved pair state during re-pairing; defaults never
 overwrite an existing field. Legacy peers exchange none of this message.
 
+## MEMBERS (`22`, decimal 34)
+
+`22` is the next free control ID after PEER_SETTINGS (`21`) in both registries;
+it shares v1 framing and ordinary ACK/NACK. Capability dependencies:
+
+| Capability | Requires | Additional semantics |
+| --- | --- | --- |
+| `mesh` | v1 HELLO and role | Direct mesh, HLC ordering, PEER_SETTINGS |
+| `setup` | `mesh`, HELLO setup object, local consent | MEMBERS and transitive trust |
+| `relay` (reserved, not implemented) | Future specification | Never implied by `setup`; no relay routes usable in v1 |
+
+### Snapshot and entry validation
+
+Example (A is a phone, B and C computers; full literal vectors are in the test
+plan). A forwards C's original self-written reach record, not its own route guess:
+
+```text
+{"transfer_id":"<fresh Id>","setup_id":"<setup Id>","members":[
+  {"device_id":"<A>","fingerprint":"<A pin>","role":"phone","name":"Phone","status":"member","hlc":1800000000001,"writer_device":"<A>"},
+  {"device_id":"<B>","fingerprint":"<B pin>","role":"computer","name":"Office PC","status":"member","hlc":1800000000002,"writer_device":"<A>"},
+  {"device_id":"<C>","fingerprint":"<C pin>","role":"computer","name":"Laptop","status":"member","hlc":1800000000003,"writer_device":"<A>","reach":{"addresses":["192.168.1.12:47821"],"relay":[],"hlc":1800000000004,"writer_device":"<C>"}}
+]}
+```
+
+* Required `setup_id` identifies this snapshot's setup; it is not authority.
+* `members` is the complete retained roster for that setup, including self and
+  its tombstones, never settings, content, tokens or private keys. Retired setup
+  state is never relabeled or exported under a new ID; retained deny history
+  still blocks local resurrection. Omission is NOT removal. Retain local
+  entries omitted by the sender and send the merged full
+  state back. A local unscoped pairing is never the basis for exporting a
+  binding; independently learned setup entries may be relayed without promoting
+  that existing direct link's local scope.
+* Entry key is `(device_id, fingerprint)`. Both are required Id/64-lowercase-hex
+  DER pin. Duplicate keys in one snapshot are malformed. Different fingerprints
+  under one device ID are allowed only to retain old removed incarnations,
+  including for the sender's or receiver's own ID. Historical `removed` entries
+  are barriers for their exact key only, never assertions of current identity;
+  at most one `member` fingerprint per device ID, and no member fingerprint may
+  appear under multiple IDs in a snapshot. All entry fields are required except
+  `reach`; `role` is phone/computer, `name` is 1–128 UTF-8 bytes without U+0000.
+* `hlc` and `writer_device` stamp the entire membership value (ID, pin, role,
+  name, status), excluding reach. Preserve the original writer/stamp on gossip.
+  Writer is an Id, not necessarily the authenticated forwarder or still active;
+  it is provenance for ordering/future signatures, not a signature in v1.
+* Optional `reach` is a separate register with required `addresses`, `relay`,
+  `hlc`, `writer_device`. Its writer MUST equal the entry device ID. Only that
+  device may originate/update it. A trusted intermediary may retransmit it
+  unchanged; it MUST NOT stamp its own observed endpoints as another device's
+  reach. `addresses` uses exactly the existing HELLO/invitation grammar and
+  0–8 distinct endpoints, each at most 259 ASCII bytes. Phone reach has empty
+  addresses; removed entries MUST omit reach. Absence preserves cached reach.
+  `relay` is reserved opaque future route data: in this version it MUST be `[]`.
+  Nonempty relay is malformed without a future separately negotiated relay
+  specification; never interpret it as addresses, commands or an authorization.
+* Common strict JSON rules apply recursively to known entry/reach fields.
+  Unknown fields are ignored for semantic equality, never copied into routes.
+  Unknown enum values, nulls, duplicate known fields, invalid strings, unsigned
+  integer token violations and equal stamps with different known values are
+  fatal `ERROR malformed_message`; reject the entire snapshot.
+* Bound the payload to **65536 encoded UTF-8 bytes**, including unknown fields
+  and JSON escaping, as for every control frame. At most **17 active members
+  including self**, **64 total entries including tombstones**, **4 distinct
+  fingerprints per device ID**, and **16 local direct peers** (setup and unscoped
+  combined). The per-ID cap permits one member plus at most three historical
+  tombstones, or at most four removed entries if none is active. Phone peers'
+  membership records count toward 17 even though no phone–phone transport is
+  created. Retained tombstones consume these budgets; there is no automatic
+  age-based GC or tombstone eviction, even at capacity. Retired deny history
+  still consumes local tombstone budgets, but is not a new setup's wire roster.
+  A sender MUST NOT truncate a full snapshot or silently evict trust/tombstones
+  to fit. Before a local setup add or metadata/reach edit, check that the new
+  full state fits; fail the edit visibly if not. Removal replaces an active entry
+  and omits reach, so it needs no new entry slot. Existing direct-only peers
+  exceeding these limits migrate intact but setup remains unavailable until the
+  user reduces the roster. Introducing a new incarnation needs another slot for
+  its retained old tombstone. Capacity never authorizes deleting other peers.
+  A received snapshot itself exceeding 17 active/64 total entries or four
+  fingerprints for one ID is malformed; a valid snapshot whose union exceeds
+  any local limit NACKs storage_failed below. Refuse an additional incarnation
+  before local replacement commits if it would exceed either tombstone budget;
+  never drop an old barrier to admit it or permit resurrection.
+
+### Ordering, terminal removals and local pairing authority
+
+For eligible values of the same key, use exactly PEER_SETTINGS' unsigned
+`(hlc, writer_device)` lexicographic comparison, greater wins. Equal tuple with
+a different membership value is malformed, even if it would otherwise be stale.
+Reach is compared independently by its own tuple; equal reach stamp with a
+different address list/order is malformed. Validate every incoming membership
+and reach HLC against `now_ms + 60000` before any mutation, including stale values;
+observe valid HLCs through the existing durable clock authority. Local membership
+edits use `max(now_ms, last_seen + 1)` with checked u64 arithmetic. HLCs order
+entries only; they NEVER expire trust, authorize a replacement or prove consent,
+reachability, token use or readiness. No TTL is attached to membership.
+
+**Terminal removal is an eligibility rule before LWW**, not a larger clock that
+can eventually be outvoted. Any valid `removed` value establishes a durable deny
+record for its exact `(id, pin)`, even if a concurrent `member` has a greater
+stamp. Compare removal values with each other by the tuple rule. A retained
+removal defeats all received introductions of that same key, including newer
+ones. An equal member/removal tuple with different values is still malformed.
+This exception is necessary to make concurrent add/remove and stale replay safe.
+It also applies to an unknown or currently absent binding. Gossip the retained
+removed value, not a suppressed newer member value.
+
+Only a **fresh, successful local token pairing** under the existing install
+fences can clear that endpoint's deny record for that key. Allocate its new
+member stamp strictly after all locally observed stamps, including the retained
+removal; retain a durable removal high-water mark so older removed snapshots
+cannot undo that fresh local pairing. A removal with a tuple greater than that
+high-water mark establishes a new deny record. Here fresh local token pairing
+means a newly user-confirmed local attempt created after the removal and fenced
+to that removal revision, or a newly validated token on the acceptor. The normal
+known-certificate response to that new attempt is unchanged. Retransmission or
+recovery of a pre-removal attempt, a token-independent reconnect without a new
+local confirmation, HELLO, clock changes, or a received member value cannot clear
+it. Retain the removed value's metadata with the high-water mark for conflict
+checking. A member advertised by another device does not prove fresh pairing;
+other endpoints that hold a tombstone require their own fresh local token pair.
+Thus re-enrolling a removed certificate is deliberately not automatic everywhere.
+A changed certificate still cannot replace a locally known ID by introduction.
+
+On setup assignment, create a local self member entry with a fresh local
+stamp and, for a computer, a self-written reach record with its current listening
+endpoints. Once a directly paired peer is eligible for export, create its member
+entry from its authenticated ID/pin/role/name with a fresh local stamp; do not
+invent its reach writer. Merge its self-written reach when received. A local
+rename creates a newer self membership value; a local endpoint change creates a
+newer self reach value. Forwarded HELLO/name observations alone do not mint an
+edit in another device's name. A direct token certificate replacement retains
+an old-key removal and creates a newer new-key member entry atomically when
+setup-scoped, subject to capacity and the existing platform replacement rules.
+Membership persistence belongs to the successful binding transaction; failure
+uses the existing storage_failed result, without changing handshake sequencing.
+
+### Receiver and reconciliation algorithm
+
+Apply the following under the local lifecycle/pairing gate, fenced to the
+current authenticated sender binding generation, connection and local setup
+generation. Recheck these, assignment and consent inside the durable transaction;
+concurrent unpair/withdrawal must win over obsolete received work. MEMBERS never
+silently upgrades an `ask` link or refreshes a live attempt's captured fence.
+
+1. Enforce READY, capability and scope rules above. Check required `setup_id`
+   before any merge, clock observation or receipt (including replay). A joined
+   receiver with a different ID NACKs `unsupported_kind` (`retryable=false`),
+   without state change; report the link as direct/separate setups. An unassigned
+   receiver can adopt only through the mutually enabled founding/join rule above,
+   never from a stray snapshot; otherwise use the same NACK without mutation.
+   If a terminal deny record is known for the authenticated sender's exact
+   `(id, pin)`, ignore all its MEMBERS and close the stale session. Recheck ID,
+   setup generation and deny inside the transaction. Fully decode and validate
+   the complete snapshot and every HLC before observing clocks, changing a row,
+   admitting a certificate, scheduling a dial or producing a success receipt.
+2. Check the shared receipt namespace `(authenticated sender ID, transfer_id)`.
+   Identical retained replay ACKs `deduplicated=true`, with no lifecycle effects.
+   An ID retained for different metadata or another operation type NACKs
+   `id_conflict` (`retryable=false`). Entry-array order and JSON representation
+   do not affect metadata equality; address-array order does. Unknown fields
+   are ignored. Metadata equality includes `setup_id`; recheck scope, setup ID
+   and captured local setup generation even for a retained replay.
+3. Stage the union of local and incoming membership/reach registers. Detect
+   equal-tuple conflicts against retained state before applying terminal/LWW
+   rules. The snapshot MUST contain a member entry for the authenticated sender.
+   Its member self entry is only a description of its already authenticated
+   `(id, pin)`; it MUST match that binding. Historical removed entries for its ID
+   may bear older pins without changing that check. It can refresh matching
+   metadata, never install itself, change its pin, or acquire trust from its own
+   assertion.
+4. A member entry matching the receiver's ID MUST match its own pin and role;
+   it is a round-trip observation, never an identity/settings/name update.
+   A removed entry for that ID with a different pin is historical: retain its
+   exact-key barrier without checking its role against the current identity or
+   withdrawing the current binding. A valid tombstone for the receiver's current
+   exact `(id, pin)` invokes withdrawal below, never local key/ID replacement.
+   A different-pin member for the receiver's ID or the receiver's current pin
+   under another ID is malformed. All other member entries are introduction
+   candidates.
+5. For each winning candidate, insert a trust binding **only** if: no row exists
+   for that device ID; its pin is not bound to another ID; no terminal deny record
+   exists for that key; and no live local direct pairing attempt targets that ID
+   **or** fingerprint. A preview/unresolved attempt counts; match by pin even
+   before HELLO reveals its ID. Recheck these conditions at commit. A known ID
+   with a different pin, or a pin already owned by another ID, is a blocked
+   introduction, never replacement, UNPAIR or a revocation error. Expose a
+   conflict and do not dial it locally. Do not replace a retained
+   active identity or publish two active pins for one ID; conflicting candidates
+   are diagnostic records outside the accepted roster, not installable state.
+   Retain attempt-blocked candidates and re-evaluate after the attempt finishes
+   or is cancelled; receipt replay is not the only trigger for reconciliation.
+   A removal cancels an attempt if either its resolved ID and target pin match
+   the removed incarnation, or its invitation pin matches before ID resolution;
+   it does not cancel an attempt with a known different replacement pin.
+6. For a matching existing binding, update winning display/reach metadata in
+   place. Preserve scope on existing disabled/ask links: a roster cannot opt them
+   in or resolve their migration prompt. For an absent binding, create exactly
+   one new generation, enabled scope, provenance, PEER_SETTINGS bootstrap state,
+   and `established/readiness=0`. Phones store other phones as roster metadata
+   only: never create a phone connection worker, dial, wait for phone settings,
+   or make them eligible direct content recipients. Computers may dial introduced
+   computers; phones may dial introduced computers; computers do not dial phones.
+7. Apply every effective tombstone to a currently bound **matching `(id, pin)`**
+   through the existing forget-pairing lifecycle: fence old work, drop only that
+   peer's waiting deliveries/receipts/settings, close its
+   sessions and cancel attempts targeting that key. It MUST NOT remove a newer
+   different-pin binding under a reused ID. Record unknown removals too. A later
+   snapshot lacking the removed entry cannot erase it.
+8. Check the resulting complete roster, local peer count and encoded full state
+   against all limits. On capacity failure NACK `storage_failed` (`retryable=true`)
+   with a bounded diagnostic, apply **none** of this snapshot and expose setup
+   capacity in UI; retry on the normal 60 s storage cadence. On durable failure
+   use the same NACK without partial merge. Do not report a capacity problem as
+   unauthorized, evict entries, or partially install a prefix of the roster.
+9. Commit winning state, deny/high-water records, clock observation, introduced
+   bindings, provenance, generation changes, teardown/reset intents and the
+   receipt atomically. Where Android DataStore and Room cannot share a transaction,
+   persist an idempotent recovery intent with the authoritative binding update;
+   fence removed generations immediately and finish dependent cleanup before ACK.
+   Startup MUST finish committed intents before enabling affected workers/content.
+   Rollback leaves old state authoritative; retries after commit finish intents
+   without advancing generations or repeating user notifications.
+10. Publish admission-map and worker changes only from committed state, then
+    ACK `deduplicated=false`. A crash after commit but before ACK replays safely.
+    Notify once per newly installed binding: **<name> joined**, **Added via
+    <introducer>**, with Remove. Persist the authenticated immediate introducer's
+    ID and display-name hint for the device page, including third-device gossip;
+    this is how it arrived here, not an authenticated original signer. Never
+    change it on unchanged replay. Schedule full snapshots to other enabled,
+    capable links when the union changes; do not echo unchanged state indefinitely.
+
+This is an **idempotent membership reconciliation** operation. It MUST NOT call
+an installer that deletes/reinserts an unchanged peer (desktop
+`pair_then_hello`) or invokes Android's new-pair reset for an existing binding.
+An unchanged replay or higher metadata stamp never changes generation, queues,
+file/text/settings receipts, pair switches, readiness or provenance. A new binding
+counts as a new pair for PEER_SETTINGS: applicable directions default on at
+`(0, lower_device_id)`, with all existing local/global gates retained. Never
+transport another pair's settings in MEMBERS. On its first direct READY session,
+hold content until the ordinary full PEER_SETTINGS bootstrap/merge succeeds.
+No new peer is added retroactively to a frozen content recipient set. Immediate
+MEMBERS after PAIR_RESULT follows the existing settings recovery rule: bound and
+defer it until the dialer's own install succeeds, with at most one 65536-byte
+membership payload buffered. Overflow closes for retry, without cancelling the
+attempt, refreshing its fence or applying the roster early.
+
+### Send, replay and receipts
+
+After each successful HELLO/binding persistence with matching setup IDs and
+mutually enabled scope, send the full roster alongside PEER_SETTINGS; neither
+control sender waits for the other's ACK. Coalesce and send full state after
+each local edit or contributing merge. Permit one unacknowledged MEMBERS snapshot
+per direction, separate from PEER_SETTINGS, using the **same operation-ID namespace**
+as files, text and settings. Bind pending state and receipts to the local setup
+generation; obsolete generations are ineligible for send, replay or receipt
+effects. Persist exact pending state and ID before sending; retain the
+acknowledged snapshot across restart. Replay unchanged state with the same ID;
+use a fresh Id for changed known stamped state. Replay pending snapshots before
+a newer coalesced state. A terminal tombstone always suppresses
+installation even from a pending older add snapshot.
+
+Use PEER_SETTINGS receipt rules: durable metadata receipt per authenticated
+sender/ID, ACK false for a new recorded snapshot, ACK true for identical retained
+replay, `id_conflict` for conflicting retained metadata, `storage_failed` for
+atomic persistence/capacity failure. A bounded window MAY keep the latest 4096
+membership receipts per sender, pruned atomically on insertion. Evicted replay
+merges again and records ACK false; terminal deny records and high-water marks
+are **not receipts** and MUST NOT be pruned with that window or by unpair cleanup.
+Use the 120 s receipt deadline and 60 s storage retry, exact-state retry after
+disconnect, and ordinary unsolicited-receipt errors. Match ACK/NACK by peer,
+connection, binding/setup generations and pending operation kind/ID. Membership
+synchronization failure does not block healthy existing pairs' content or
+PEER_SETTINGS; it delays new introductions/removals. Keepalive remains live.
+
+### Admission, readiness and removal
+
+Both prospective endpoints must learn each other's bindings from a common
+member **before** their direct connection succeeds. Desktop admission continues
+to reject unknown certificates immediately after TLS and before HELLO. No new
+unknown-client exception, invitation token recovery path or admission quota is
+added. If only one side learned, its pinned dial may receive unauthorized (or a
+provisional pairing refusal while a window is open); retain the introduced row,
+retry with the existing network backoff and continue gossip through any member.
+Do not send PAIR_REQUEST unless a real local attempt exists. Do not infer consent
+or capabilities of an introduced peer until its direct HELLO is authenticated.
+
+Readiness evidence starts at zero for introductions and is durable per generation.
+Establish it only by proof of the remote binding's persistence: a known-client
+incoming READY session (not provisional token acceptance), or a successful pinned
+outgoing connection through the peer's known-binding admission and HELLO. An
+ACK on the intermediary's snapshot, its PONG, address reachability or elapsed
+time is never readiness evidence. Preserve the existing post-PAIR_RESULT PING
+and reverse-admission evidence rules for ordinary direct pairing. Capture evidence
+before each dial; a delayed failure cannot upgrade its authority afterwards.
+For **all setup-scoped links**, even established ones, unauthorized/route/TLS
+failures do not remove membership or initiate setup-wide removal. Before
+readiness they are expected propagation races; afterwards show a connection
+problem and retry. Plain direct links retain existing loss handling. Neither a
+future relay's refusal nor transport error is a peer revocation signal.
+
+For every active member of the local roster, whatever the scope of any direct
+binding to it (enabled, `ask`, `disabled`, or none), the user action is
+**Remove from all devices**, with confirmation. Atomically replace its member
+entry by a newer locally stamped removed entry and, if a direct binding exists,
+perform today's local unpair; keep the tombstone outside peer-cascade deletion.
+On success send snapshots to remaining eligible members, and best-effort UNPAIR
+on the captured removed peer's existing connection, if any. On failure report
+it; do not claim removal. Peers that are not roster members (direct-only links)
+retain plain Unpair and are not exported. A received UNPAIR on a scoped link is a notification that
+**the receiver was removed**, and invokes only local withdrawal as below. It
+MUST NOT author or propagate tombstones against the sender or other devices.
+A separate user-initiated removal remains valid: B may remove A while B has not
+itself withdrawn or been removed. ERROR/EOF is not UNPAIR; received removals
+reuse the forget path without restamping or UNPAIR echoes on replay.
+Keep `setup_id` while any other active member remains, including independently
+learned members without enabled direct bindings. Last-other-member removal
+atomically dissolves the setup: clear ID/positive roster, advance setup generation,
+retain tombstones/deny history and high-water marks outside peer-cascade deletion.
+Retired history stays local, never exported under a new ID; exact-key barriers
+remain. The device may join or found again; v1 has no **Leave setup** UI.
+Only fresh local token pairing as defined above clears a tombstone; this never
+extends known-certificate recovery to an absent/removed binding.
+
+If a still-authorized, authenticated member delivers a tombstone naming the
+receiver's current exact identity, or UNPAIR on a scoped link, the receiver
+clears `setup_id` and the positive roster, advances the setup generation, and
+disables/forgets scoped links atomically through the same fenced lifecycle,
+preserving unscoped links, saved files and local identity. Keep all
+tombstones/deny history and high-water marks, including a received own-key
+tombstone; never relabel/export retired state under a new ID. Do not synthesize
+removals for forgotten peers, echo UNPAIR or send pending MEMBERS on withdrawal.
+It stops exporting membership, authoring removals or accepting introductions until
+a fresh local token pairing under the withdrawal fence and a new mutually
+consented setup assignment; create its self record at a newer stamp. It returns
+to first-run UI only if no direct links remain. Notification is best-effort:
+a removed device whose pin is absent from every reachable member is rejected
+before HELLO and cannot receive its own tombstone. v1 MUST NOT promise that such
+a device will forget everyone merely by reconnecting. No special revoked-client admission is introduced.
+
+Offline members learn removals/additions from **any** current scoped member,
+not only the original introducer. A device that has not received the tombstone
+still trusts the removed device. An authorized compromised member can introduce
+more devices until its removal arrives; v1 has no signatures or admin veto.
+A removal is visible and reversible by fresh pairing, not instantaneous global
+revocation or rollback of previously shared content. A per-link MEMBERS ACK
+proves durable receipt by that endpoint only, not delivery to every device or
+that a forwarded entry has reached its subject. The UI MAY show waits for known
+unacknowledged members, but MUST NOT claim globally completed removal from those
+ACKs alone; v1 carries no transitive per-member delivery attestation.
+
 ## Transfer and delivery state machines
 
 For mesh, the originator freezes the selected recipient set when creating the
@@ -1006,6 +1495,13 @@ bytes, clipboard text, pairing secrets or keys to logs. Avoid acknowledging data
 before durable storage: this is what protects offline delivery after crashes.
 User content and pins remain encrypted on the wire, including over Tailscale.
 Protocol syntax validation does not provide certificate/authorization checks.
+Setup membership deliberately extends trust to introductions from any authorized
+member; unsigned writer/reach provenance is not cryptographic proof. Bound hints
+and keep the existing pin, lifecycle and no-content-forwarding checks intact.
+`setup_id` is a stable correlation identifier, not a secret or authorization.
+It travels only inside pinned TLS, but HELLO precedes token validation, so a
+provisional pairing client can see it. Never include it in invitation URIs,
+mDNS advertisements or future relay rendezvous identifiers.
 
 Paired computers' address hints can trigger outbound TCP/TLS attempts to arbitrary
 host:port destinations, including loopback. The certificate pin prevents application
@@ -1015,8 +1511,11 @@ to sixteen persisted routes per peer and twenty-four dial candidates. Computer
 peers do not consume mDNS routing hints. The advertisement retains its eligible
 interface allowlist, eight-address shortlist and periodic refresh for phones.
 
-`docs/protocol-vectors/v1.json` is the interoperability fixture. `frames` contains
-exact full wire hex plus typed `decoded` meanings for every ID. Control encoders
+`docs/protocol-vectors/v1.json` is the interoperability fixture for currently
+implemented messages. MEMBERS literal inputs and frame prefixes are in
+[setup-membership.md](setup-membership.md#cross-language-json-vectors); port them
+into the shared executable fixture when implementing `setup`. `frames` contains
+exact full wire hex plus typed `decoded` meanings for its registered IDs. Control encoders
 need not reproduce its JSON field order or whitespace; decoders must accept its
 bytes. `transfers` references frame names and declares reconstructed bytes, count
 and hash, including a valid two-chunk transfer and an empty file. `pairing_uris`
