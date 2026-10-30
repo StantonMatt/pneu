@@ -114,6 +114,7 @@ jobs:
         run: |
           cargo build --release --locked -p pneud
           packaging/linux/build-packages.sh target/release/pneud "${RELEASE_TAG#v}" "$RUNNER_TEMP/pneu-linux"
+          cp "$RUNNER_TEMP/pneu-linux/pneu_${RELEASE_TAG#v}_amd64.deb" "$RUNNER_TEMP/pneu-linux/pneu-linux-amd64.deb"
       - name: Upload Linux artifacts (manual dry runs publish nothing)
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -197,7 +198,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           sha256sum --check SHA256SUMS.txt
-          assets=(Pneu-macOS.zip pneu_*_amd64.deb pneu-linux-x86_64.tar.gz)
+          assets=(Pneu-macOS.zip pneu_*_amd64.deb pneu-linux-amd64.deb pneu-linux-x86_64.tar.gz)
           sha256sum "${assets[@]}" > SHA256SUMS.txt
           sha256sum --check SHA256SUMS.txt
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
