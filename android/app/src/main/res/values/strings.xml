@@ -22,6 +22,7 @@
 <string name="pair_camera_off">Camera access is off</string>
 <string name="action_open_settings">Open settings</string>
 <string name="pair_not_pneu">That isn\'t a Pneu code</string>
+<string name="pair_download_code">That\'s the download code. On your computer, click Pairing Code.</string>
 <string name="pair_expired">This code expired. Scan the new one.</string>
 <string name="pair_pairing">Pairing…</string>
 <string name="pair_already_paired">Already paired with %1$s</string>
@@ -71,6 +72,9 @@
 <string name="anywhere_title">Connect from anywhere</string>
 <string name="anywhere_text">On the same Wi-Fi, Pneu connects by itself. Away from it, it needs one of these on this phone and your computers.</string>
 <string name="anywhere_tailscale_detail">Free app · install on each device</string>
+<string name="anywhere_not_on_computer">Not on %1$s yet</string>
+<string name="anywhere_not_on_computers">Not on your computers yet</string>
+<string name="anywhere_not_on_all_computers">Not on all your computers yet</string>
 <string name="action_get">Get</string>
 <string name="action_turn_on">Turn on</string>
 <string name="status_on">On</string>

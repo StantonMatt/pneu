@@ -65,6 +65,15 @@ import kotlinx.coroutines.launch
     }
 }
 
+/** The computer's download QR scanned instead of its pairing code: the page's host and path, trailing slash optional. */
+internal fun isDownloadCode(raw:String,page:String):Boolean {
+    fun place(value:String)=runCatching {java.net.URI(value.trim())}.getOrNull()
+        ?.takeIf {(it.scheme.equals("https",true) || it.scheme.equals("http",true)) && it.rawUserInfo==null && it.port==-1 && it.rawQuery==null && it.rawFragment==null}
+        ?.let {it.host?.lowercase() to it.rawPath.orEmpty().removeSuffix("/")}
+    val code=place(raw) ?: return false
+    return code.first!=null && code==place(page)
+}
+
 /** null when the device isn't unreachable. Shared by the Link card and a device page. */
 @Composable internal fun unreachableHint(unreachable:Boolean,peers:List<Peer>,tailscaleAllowed:Boolean):UnreachableHint? {
     val network=rememberPhoneNetwork();val installed=rememberTailscaleInstalled()
@@ -93,9 +102,17 @@ internal fun unreachableDetail(context:android.content.Context,hint:UnreachableH
 internal fun UnreachableHint.hasAction()=this!=UnreachableHint.LAST_CONNECTED
 
 /** One row per way to connect away from Wi-Fi. Today that's Tailscale. */
-@Composable internal fun ConnectAnywhereSheet(tailscaleAllowed:Boolean,close:()->Unit) {
+@Composable internal fun ConnectAnywhereSheet(tailscaleAllowed:Boolean,peers:List<Peer>,close:()->Unit) {
     val context=LocalContext.current;val resources=LocalResources.current;val c=LocalPneuColors.current;val scope=rememberCoroutineScope();val actions=LocalUiActions.current
-    val installed=rememberTailscaleInstalled()
+    val row=ReachabilityHints.tailscaleRow(rememberPhoneNetwork(),rememberTailscaleInstalled(),tailscaleAllowed)
+    // A computer without a Tailscale address can't be reached through it, whatever this phone has.
+    val active=peers.filter {!it.pairingLost};val missing=active.filter {peer->peer.addresses.none {it.tailscale}}
+    val detail=when {
+        missing.isEmpty() -> resources.getString(R.string.anywhere_tailscale_detail)
+        missing.size==1 -> resources.getString(R.string.anywhere_not_on_computer,missing.single().name)
+        missing.size==active.size -> resources.getString(R.string.anywhere_not_on_computers)
+        else -> resources.getString(R.string.anywhere_not_on_all_computers)
+    }
     PneuSheet(close) {
         Text(resources.getString(R.string.anywhere_title),style=PneuType.title2)
         Text(resources.getString(R.string.anywhere_text),Modifier.padding(top=8.dp),style=PneuType.dialog,color=c.text2)
@@ -104,13 +121,15 @@ internal fun UnreachableHint.hasAction()=this!=UnreachableHint.LAST_CONNECTED
                 Box(Modifier.size(36.dp).background(c.accentSoft,RoundedCornerShape(11.dp)),contentAlignment=Alignment.Center) {Symbol(R.drawable.ic_public,modifier=Modifier.size(20.dp),tint=c.onAccentSoft)}
                 Column(Modifier.weight(1f)) {
                     Text(resources.getString(R.string.tile_tailscale),style=PneuType.body)
-                    Text(resources.getString(R.string.anywhere_tailscale_detail),style=PneuType.subhead,color=c.text2)
+                    Text(detail,style=PneuType.subhead,color=c.text2)
                 }
-                when {
-                    installed && tailscaleAllowed -> Text(resources.getString(R.string.status_on),Modifier.padding(horizontal=6.dp),style=PneuType.button,color=c.text2)
-                    // Installed, but Settings → Tailscale when away is off.
-                    installed -> PneuButton({scope.launch {actions.run(resources.getString(R.string.ui_error_setting)) {context.graph.preferences.toggle("tailscale",true)}}},kind=ButtonKind.Text,contentPadding=PaddingValues(horizontal=6.dp)) {Text(resources.getString(R.string.action_turn_on))}
-                    else -> PneuButton({scope.launch {actions.run(resources.getString(R.string.ui_error_play)) {ReachabilityHints.openTailscaleListing(context)}}},kind=ButtonKind.Text,contentPadding=PaddingValues(horizontal=6.dp)) {Text(resources.getString(R.string.action_get))}
+                val padding=PaddingValues(horizontal=6.dp)
+                when(row) {
+                    TailscaleRow.ON -> Text(resources.getString(R.string.status_on),Modifier.padding(horizontal=6.dp),style=PneuType.button,color=c.text2)
+                    TailscaleRow.OPEN -> PneuButton({scope.launch {actions.run(resources.getString(R.string.ui_error_tailscale)) {ReachabilityHints.openTailscale(context)}}},kind=ButtonKind.Text,contentPadding=padding) {Text(resources.getString(R.string.action_open))}
+                    // Settings → Tailscale when away is off. Closing shows the card's next step.
+                    TailscaleRow.TURN_ON -> PneuButton({scope.launch {if(actions.run(resources.getString(R.string.ui_error_setting)) {context.graph.preferences.toggle("tailscale",true)})close()}},kind=ButtonKind.Text,contentPadding=padding) {Text(resources.getString(R.string.action_turn_on))}
+                    TailscaleRow.GET -> PneuButton({scope.launch {actions.run(resources.getString(R.string.ui_error_play)) {ReachabilityHints.openTailscaleListing(context)}}},kind=ButtonKind.Text,contentPadding=padding) {Text(resources.getString(R.string.action_get))}
                 }
             }
         }

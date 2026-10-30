@@ -26,4 +26,13 @@ class ReachabilityHintsTest {
         assertEquals(UnreachableHint.LAST_CONNECTED,hint(installed=true,vpn=true))
         assertEquals(UnreachableHint.LAST_CONNECTED,hint(wifi=true,installed=true,vpn=true))
     }
+    @Test fun theTailscaleRowNamesWhatIsMissingAndIsOnOnlyWhenConnected() {
+        fun row(installed:Boolean,allowed:Boolean,vpn:Boolean)=ReachabilityHints.tailscaleRow(PhoneNetwork(wifi=true,vpn=vpn),installed,allowed)
+        assertEquals(TailscaleRow.GET,row(installed=false,allowed=true,vpn=true))
+        assertEquals(TailscaleRow.TURN_ON,row(installed=true,allowed=false,vpn=true))
+        // Allowed but not connected: the card says Tailscale is off, so the sheet can't say On.
+        assertEquals(TailscaleRow.OPEN,row(installed=true,allowed=true,vpn=false))
+        assertEquals(UnreachableHint.TAILSCALE_OFF,hint(wifi=true,installed=true,allowed=true,vpn=false))
+        assertEquals(TailscaleRow.ON,row(installed=true,allowed=true,vpn=true))
+    }
 }

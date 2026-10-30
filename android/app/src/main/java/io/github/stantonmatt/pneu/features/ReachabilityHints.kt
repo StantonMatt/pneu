@@ -19,6 +19,9 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 /** What an unreachable device's card says, from what the phone can tell. */
 enum class UnreachableHint { SAME_WIFI, OFF_OR_OTHER_WIFI, TAILSCALE_OFF, LAST_CONNECTED }
 
+/** The Connect anywhere sheet's Tailscale row, named by what's missing on this phone. */
+enum class TailscaleRow { GET, TURN_ON, OPEN, ON }
+
 /** wifi: any Wi-Fi or Ethernet network is up, even one Android doesn't use by default.
  * vpn: the default network is a VPN, as RoutePolicy reads it. */
 data class PhoneNetwork(val wifi:Boolean,val vpn:Boolean)
@@ -31,6 +34,13 @@ object ReachabilityHints {
         tailscaleInstalled && tailscaleAllowed && peerHasTailscale -> if(network.vpn)UnreachableHint.LAST_CONNECTED else UnreachableHint.TAILSCALE_OFF
         network.wifi -> UnreachableHint.OFF_OR_OTHER_WIFI
         else -> UnreachableHint.SAME_WIFI
+    }
+    /** On only with the VPN up, the same signal that keeps the card from saying Tailscale is off. */
+    fun tailscaleRow(network:PhoneNetwork,tailscaleInstalled:Boolean,tailscaleAllowed:Boolean)=when {
+        !tailscaleInstalled -> TailscaleRow.GET
+        !tailscaleAllowed -> TailscaleRow.TURN_ON
+        network.vpn -> TailscaleRow.ON
+        else -> TailscaleRow.OPEN
     }
     fun tailscaleInstalled(context:Context)=runCatching {context.packageManager.getPackageInfo(TAILSCALE,0)}.isSuccess
     fun current(manager:ConnectivityManager):PhoneNetwork {

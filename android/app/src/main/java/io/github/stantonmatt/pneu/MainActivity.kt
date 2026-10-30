@@ -261,7 +261,8 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
             navigate("pair")
             // Keep this UI event independent of connection-state updates while
             // AnimatedContent brings the scanner into composition.
-            rejectedLinkFeedback=UiFeedback(resources.getString(R.string.pair_not_pneu))
+            // The computer's Phone tab shows the download code until Pairing Code is clicked.
+            rejectedLinkFeedback=UiFeedback(resources.getString(if(isDownloadCode(candidate,resources.getString(R.string.download_url)))R.string.pair_download_code else R.string.pair_not_pneu))
             offerPair(null)
         }}
         if(proposed!=null && pairingTarget!=null && p.deviceId.isNotEmpty())PneuTheme(dark=if(screen=="pair")true else dark) {PneuDialog(pairingHeader=true,onDismissRequest={offerPair(null)},
@@ -491,7 +492,6 @@ internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable internal fun HomeScreen(p: Prefs,link: LinkState,recent: List<Outgoing>,health: Health,modifier: Modifier,permissions: () -> Unit,pair: () -> Unit,onScrolled:(Boolean)->Unit,outcomes:Map<String,RecentItem> = emptyMap(),
                                     devices:List<DeviceState>?=null,deviceLinks:Map<String,LinkState>?=null,openDevice:(String)->Unit={}) {
     val context=LocalContext.current;val resources=LocalResources.current; val app=context.graph; val scope=rememberCoroutineScope();val actions=LocalUiActions.current
@@ -536,16 +536,16 @@ internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired
                         LinkView(link.copy(status=title.key),sending=link.transferMediaId.isNotEmpty(),receiving=link.incoming!=null,others=if(deviceList.size>1)linkTones(p,deviceList) else emptyList())
                         Crossfade(title,animationSpec=androidx.compose.animation.core.tween(PneuMotion.short),label="Connection status") {Text(UiPresentation.status(context,it),Modifier.fillMaxWidth().padding(top=16.dp),style=PneuType.title1,textAlign=TextAlign.Center)}
                         if(detail.isNotEmpty()) Text(detail,Modifier.padding(top=4.dp),style=MaterialTheme.typography.bodyMedium,color=MaterialTheme.colorScheme.onSurfaceVariant,maxLines=2,overflow=TextOverflow.Ellipsis,textAlign=TextAlign.Center)
-                        FlowRow(Modifier.fillMaxWidth().padding(top=20.dp),horizontalArrangement=Arrangement.spacedBy(10.dp),verticalArrangement=Arrangement.spacedBy(10.dp),maxItemsInEachRow=if(androidx.compose.ui.platform.LocalDensity.current.fontScale>1.3f)1 else 2) {
+                        PneuButtonPair(Modifier.fillMaxWidth().padding(top=20.dp)) {
                             if(p.pairingLost) PneuButton(pair,Modifier.fillMaxWidth().height(48.dp)) {Symbol(R.drawable.ic_qr_code_scanner,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_pair_again))}
                             else {
                                 // Unreachable: what helps reconnect takes Send clipboard's place, as Open Tailscale did.
-                                if(hint?.hasAction()==true)UnreachableAction(hint,Modifier.weight(1f).height(48.dp)) {anywhere=true}
+                                if(hint?.hasAction()==true)UnreachableAction(hint,Modifier.height(48.dp)) {anywhere=true}
                                 else PneuTonalButton(onClick={scope.launch {actions.run(resources.getString(R.string.toast_not_sent)) {
                                     context.startActivity(ManualEntries.clipboardIntent(context,p))
-                                }}},modifier=Modifier.weight(1f).height(48.dp),enabled=clipboardReady,contentPadding=PaddingValues(horizontal=12.dp)) {Symbol(R.drawable.ic_content_paste_go,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.tile_send_clipboard))}
-                                if(p.paused) PneuButton(onClick={scope.launch {actions.run(resources.getString(R.string.ui_error_resume)) {app.preferences.toggle("paused",false)}}},modifier=Modifier.weight(1f).height(48.dp)) {Symbol(R.drawable.ic_play_arrow,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_resume))}
-                                else PneuNeutralButton(onClick={scope.launch {actions.run(resources.getString(R.string.ui_error_pause)) {app.preferences.toggle("paused",true)}}},modifier=Modifier.weight(1f).height(48.dp)) {Symbol(R.drawable.ic_pause,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_pause))}
+                                }}},modifier=Modifier.height(48.dp),enabled=clipboardReady,contentPadding=PaddingValues(horizontal=12.dp)) {Symbol(R.drawable.ic_content_paste_go,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.tile_send_clipboard))}
+                                if(p.paused) PneuButton(onClick={scope.launch {actions.run(resources.getString(R.string.ui_error_resume)) {app.preferences.toggle("paused",false)}}},modifier=Modifier.height(48.dp)) {Symbol(R.drawable.ic_play_arrow,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_resume))}
+                                else PneuNeutralButton(onClick={scope.launch {actions.run(resources.getString(R.string.ui_error_pause)) {app.preferences.toggle("paused",true)}}},modifier=Modifier.height(48.dp)) {Symbol(R.drawable.ic_pause,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_pause))}
                             }
                         }
                     }
@@ -613,7 +613,7 @@ internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired
         }
     }
     RecentDetails(p,details,outcomes,links) {details=null}
-    if(anywhere)ConnectAnywhereSheet(p.tailscale) {anywhere=false}
+    if(anywhere)ConnectAnywhereSheet(p.tailscale,p.devices) {anywhere=false}
 }
 @Composable private fun RecentDetails(p:Prefs,details:String?,outcomes:Map<String,RecentItem>,links:Map<String,LinkState>,close:()->Unit) {
     val context=LocalContext.current;val resources=LocalResources.current;val app=context.graph;val scope=rememberCoroutineScope();val actions=LocalUiActions.current

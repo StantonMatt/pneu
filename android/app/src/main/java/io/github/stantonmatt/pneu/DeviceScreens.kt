@@ -102,7 +102,7 @@ private fun automaticKinds(context:android.content.Context,p:Prefs):String? {
 }
 
 /** One pair: status card, the pair's sharing switches, then Unpair. */
-@OptIn(ExperimentalMaterial3Api::class,ExperimentalLayoutApi::class)
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable internal fun DeviceScreen(p:Prefs,state:DeviceState,back:()->Unit,pair:()->Unit,unpair:()->Unit,sendFiles:()->Unit,setSwitch:(String,Boolean)->Unit) {
     val context=LocalContext.current;val resources=LocalResources.current;val c=LocalPneuColors.current
     val peer=state.peer;val link=state.connection;val online=connected(p,state)
@@ -138,12 +138,12 @@ private fun automaticKinds(context:android.content.Context,p:Prefs):String? {
                         }
                         Spacer(Modifier.height(20.dp))
                         if(peer.pairingLost)PneuButton(pair,Modifier.fillMaxWidth().height(48.dp)) {Symbol(R.drawable.ic_qr_code_scanner,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_pair_again))}
-                        // Unreachable: the Link card's action, beside Send files (files wait for the device).
-                        else FlowRow(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(10.dp),verticalArrangement=Arrangement.spacedBy(10.dp),maxItemsInEachRow=if(androidx.compose.ui.platform.LocalDensity.current.fontScale>1.3f)1 else 2) {
-                            if(hint?.hasAction()==true)UnreachableAction(hint,Modifier.weight(1f).height(48.dp)) {anywhere=true}
-                            PneuTonalButton(sendFiles,Modifier.weight(1f).height(48.dp)) {Symbol(R.drawable.ic_upload,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_send_files),maxLines=1,overflow=TextOverflow.Ellipsis)}
+                        // Unreachable: the Link card's action first, then Send files (files wait for the device).
+                        else PneuButtonPair(Modifier.fillMaxWidth()) {
+                            if(hint?.hasAction()==true)UnreachableAction(hint,Modifier.height(48.dp)) {anywhere=true}
+                            PneuTonalButton(sendFiles,Modifier.height(48.dp)) {Symbol(R.drawable.ic_upload,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_send_files),maxLines=1,overflow=TextOverflow.Ellipsis)}
                         }
-                        if(anywhere)ConnectAnywhereSheet(p.tailscale) {anywhere=false}
+                        if(anywhere)ConnectAnywhereSheet(p.tailscale,listOf(peer)) {anywhere=false}
                     }
                 }
                 if(!peer.pairingLost) {

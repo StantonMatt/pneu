@@ -187,8 +187,9 @@ class DeviceScreensDeviceTest {
         compose.waitForIdle();compose.onNodeWithText("Send clipboard").assertIsNotEnabled()
         compose.runOnUiThread {context.getSystemService(ClipboardManager::class.java).setPrimaryClip(clipboard("Send this"))}
         compose.waitForIdle();compose.onNodeWithText("Send clipboard").assertIsEnabled()
+        // Unreachable: what helps reconnect takes Send clipboard's place.
         online=false
-        compose.waitForIdle();compose.onNodeWithText("Send clipboard").assertIsNotEnabled()
+        compose.waitForIdle();compose.onNodeWithText("Send clipboard").assertDoesNotExist();compose.onNodeWithText("Connect anywhere").assertIsDisplayed()
     }
     @Test(timeout=30000) fun uriMimeReadSurvivesProgressAndSettingsWhileEligibilityUpdatesIndependently()=runBlocking<Unit> {
         val entered=java.util.concurrent.CountDownLatch(1);val release=java.util.concurrent.CountDownLatch(1)
@@ -290,7 +291,8 @@ class DeviceScreensDeviceTest {
         show {Device(p,DeviceState(p.devices[1],LinkState(),setOf("receiveClipboard"),true))}
         compose.onNodeWithText("Applies when MacBook Air connects").assertIsDisplayed()
         compose.onNodeWithText("Off for all devices in Settings").assertIsDisplayed()
-        compose.onNodeWithText("Last connected",substring=true).assertIsDisplayed()
+        // What the phone can tell replaces Last connected.
+        compose.onNode(hasText("MacBook Air may be off or on another Wi-Fi") or hasText("Connects on the same Wi-Fi") or hasText("Tailscale is off")).assertIsDisplayed()
         bothThemes("device-offline-pending")
     }
     @Test(timeout=30000) fun devicePagePairingLostAndNeedsUpdate()=runBlocking<Unit> {

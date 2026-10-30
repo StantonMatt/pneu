@@ -4,7 +4,12 @@ import android.Manifest
 import android.content.ClipboardManager
 import androidx.activity.ComponentActivity
 import androidx.compose.runtime.*
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.width
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -111,8 +116,33 @@ class OnboardingDeviceTest {
         compose.onNodeWithText("Open Tailscale").assertDoesNotExist()
         compose.onNodeWithText("Connect anywhere").performClick()
         awaitText("Connect from anywhere")
-        compose.onNodeWithText("Free app · install on each device").assertIsDisplayed()
+        // The computer has no Tailscale address either: the row says where it's missing.
+        compose.onNodeWithText("Not on Onboarding PC yet").assertIsDisplayed()
         compose.onNodeWithText("Get").assertIsDisplayed()
         assertTrue(failures.toString(),failures.isEmpty())
+    }
+    @Test fun unreachableButtonsStackWhenConnectAnywhereWouldNotFitHalfTheCard()=runBlocking<Unit> {
+        Assume.assumeFalse("Tailscale installed on this device",ReachabilityHints.tailscaleInstalled(c))
+        assertTrue(app.requestPairing(raw,null));assertTrue(app.installBinding(Invitation.parse(raw),"f".repeat(32)))
+        val p=app.preferences.read()
+        // 360 dp wide: half the card is narrower than "Connect anywhere".
+        content {PneuTheme {Box(Modifier.width(360.dp)) {HomeScreen(p,LinkState(status="PC unreachable"),emptyList(),Health(true,true,true,true),Modifier,{},{},{})}}}
+        awaitText("Connect anywhere")
+        val anywhere=compose.onNodeWithText("Connect anywhere").fetchSemanticsNode().boundsInRoot
+        val pause=compose.onNodeWithText("Pause").fetchSemanticsNode().boundsInRoot
+        assertTrue("Pause sits below Connect anywhere",pause.top>=anywhere.bottom)
+        // Not ellipsized: the label has the card's full width.
+        val layouts=mutableListOf<TextLayoutResult>()
+        compose.onNodeWithText("Connect anywhere",useUnmergedTree=true).performSemanticsAction(SemanticsActions.GetTextLayoutResult) {it(layouts)}
+        assertFalse(layouts.single().isLineEllipsized(0))
+    }
+    @Test(timeout=20000) fun scanningTheDownloadCodeSaysToClickPairingCode()=runBlocking<Unit> {
+        app.preferences.toggle("setup",true)
+        var candidate by mutableStateOf<String?>(null)
+        content {PneuScreen(candidate=candidate,offerPair={candidate=it})}
+        awaitText("Scan the QR code in Pneu on your computer")
+        compose.runOnIdle {candidate=c.getString(R.string.download_url)}
+        awaitText("That's the download code. On your computer, click Pairing Code.")
+        compose.onNodeWithText("That isn't a Pneu code").assertDoesNotExist()
     }
 }
