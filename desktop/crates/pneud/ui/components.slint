@@ -4,7 +4,8 @@ import { Pneu, Tone, Icons, WindowFocus } from "theme.slint";
 // Keyboard and accessibility actions share the same modal boundary.
 export global Interaction { in-out property <bool> modal-open; }
 
-export enum ButtonKind { neutral, danger, row, primary, tonal }
+// A link is a quiet accent-coloured action, such as "Can't connect?".
+export enum ButtonKind { neutral, danger, row, primary, tonal, link }
 
 // Keyboard focus shows a ring; pointer focus doesn't.
 component FocusTarget inherits FocusScope {
@@ -44,13 +45,16 @@ export component PneuButton inherits Rectangle {
     in property <bool> autofocus;
     callback clicked();
     private property <bool> is-row: kind == ButtonKind.row;
-    min-width: content.preferred-width + 28px;
+    private property <bool> is-link: kind == ButtonKind.link;
+    private property <length> inset: is-link ? 8px : 14px;
+    min-width: content.preferred-width + 2 * inset;
     max-width: is-row || wide ? 10000px : self.min-width;
     horizontal-stretch: is-row || wide ? 1 : 0;
-    min-height: is-row ? 44px : 30px;
+    min-height: is-row ? 44px : is-link ? 24px : 30px;
     max-height: self.min-height;
     border-radius: is-row ? 0px : 8px;
     background: is-row ? (touch.pressed ? Pneu.button : transparent)
+        : is-link ? transparent
         : kind == ButtonKind.danger ? Pneu.danger-fill
         : kind == ButtonKind.primary ? Pneu.accent
         : kind == ButtonKind.tonal ? Pneu.accent-soft : Pneu.button;
@@ -77,7 +81,7 @@ export component PneuButton inherits Rectangle {
         background: !root.enabled ? transparent : touch.pressed ? Pneu.pressed : touch.has-hover ? Pneu.hover : transparent;
     }
     content := HorizontalLayout {
-        x: 14px; width: parent.width - 28px; height: parent.height;
+        x: root.inset; width: parent.width - 2 * root.inset; height: parent.height;
         alignment: root.is-row ? start : center;
         spacing: 6px;
         if root.icon.width > 0: VerticalLayout {
@@ -88,8 +92,9 @@ export component PneuButton inherits Rectangle {
             text: root.text; vertical-alignment: center;
             color: root.kind == ButtonKind.danger || root.kind == ButtonKind.primary ? white
                 : root.kind == ButtonKind.row ? Pneu.danger
-                : root.kind == ButtonKind.tonal ? Pneu.on-accent-soft : Pneu.text;
-            font-weight: root.is-row ? 600 : 400;
+                : root.kind == ButtonKind.tonal ? Pneu.on-accent-soft
+                : root.is-link ? Pneu.accent-text : Pneu.text;
+            font-weight: root.is-row || root.is-link ? 600 : 400;
             overflow: elide;
         }
     }
@@ -363,6 +368,31 @@ export component QrCard inherits Rectangle {
     accessible-role: image;
     accessible-label: "Pairing QR code";
     Image { accessible-role: none; x: 14px; y: 14px; source: root.qr; width: root.qr.width * 1px; height: root.qr.height * 1px; image-rendering: pixelated; }
+}
+
+// The download page's code in the pairing code's card, so the two can swap in
+// place. Its image has one pixel per module and scales by whole pixels; Pneu's
+// icon covers the middle, which the code's high error correction allows for.
+export component DownloadQrCard inherits Rectangle {
+    in property <image> qr;
+    in property <length> size;
+    private property <length> module: qr.width > 0 ? floor(size / 1px / qr.width) * 1px : 0px;
+    width: size + 28px; height: size + 28px;
+    border-radius: 16px; background: white;
+    border-width: Pneu.dark ? 1px : 0px; border-color: #FFFFFF0F;
+    drop-shadow-blur: Pneu.dark ? 0px : 12px; drop-shadow-offset-y: 3px; drop-shadow-color: #14161A0D;
+    accessible-role: image;
+    accessible-label: "QR code for the Pneu download page";
+    Image { accessible-role: none;
+        width: root.module * root.qr.width; height: self.width;
+        x: floor((parent.width - self.width) / 2px) * 1px; y: self.x;
+        source: root.qr; image-rendering: pixelated;
+    }
+    Rectangle {
+        width: 60px; height: 60px; border-radius: 16px; background: white;
+        x: (parent.width - self.width) / 2; y: self.x;
+        Image { accessible-role: none; x: 4px; y: 4px; width: 52px; height: 52px; source: Icons.pneu; }
+    }
 }
 
 // Outlined single-line field for the rename popup.

@@ -62,6 +62,10 @@ pub async fn show_files(paths: &[PathBuf]) -> Result<()> {
     shell::show_files(paths.to_owned()).await?.await
 }
 
+pub async fn open_url(url: &str) -> Result<()> {
+    shell::open_url(url.to_owned()).await?.await
+}
+
 pub struct DesktopActions {
     // Preparation and reaping of retired offers only. Installed writers must
     // never hold this drain open while a replacement is being retired.

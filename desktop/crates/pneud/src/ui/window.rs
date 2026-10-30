@@ -28,6 +28,11 @@ slint::slint! {
 
 pub(crate) use super::send_request::SendRequest;
 
+/// The download page, shown as a code on Add Device → Phone (window.slint
+/// prints it without the scheme).
+const DOWNLOAD_PAGE: &str = "https://stantonmatt.github.io/pneu/";
+const TAILSCALE_DOWNLOAD: &str = "https://tailscale.com/download";
+
 fn is_pairing_page(page: Page) -> bool {
     matches!(page, Page::Add | Page::Code | Page::Scan)
 }
@@ -228,6 +233,7 @@ enum Action {
     OfferPair,
     OfferDismiss,
     Message(String, bool),
+    GetTailscale,
 }
 
 /// IPC currently exposes daemon rejections as this prefix; socket/timeout/
@@ -556,6 +562,21 @@ fn summary(peers: &[Peer], transfers: &[Transfer]) -> SummaryData {
         detail,
         link,
     }
+}
+
+/// No paired device can be reached, so the main page offers Can't connect?.
+/// A device that answered (even to refuse the pairing) counts as reachable.
+fn unreachable(peers: &[Peer]) -> bool {
+    !peers.is_empty()
+        && peers
+            .iter()
+            .all(|p| matches!(p.health, Health::Offline | Health::Connecting))
+}
+
+/// Tailscale runs here when one of this computer's addresses is in its ranges.
+fn tailscale_running() -> bool {
+    crate::discovery::candidates()
+        .is_ok_and(|addresses| addresses.iter().any(|a| super::route(a.ip) == "Tailscale"))
 }
 
 /// The device page's status card: one-to-one Link, title, detail and action.
@@ -1013,6 +1034,8 @@ struct Frame {
     copy_images: bool,
     viewer: bool,
     name: String,
+    unreachable: bool,
+    tailscale: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1494,6 +1517,11 @@ fn connect(
     ui.set_recent(ModelRc::new(VecModel::<RecentItem>::default()));
     ui.set_recipients(ModelRc::new(VecModel::<RecipientItem>::default()));
     ui.set_device_settings(ModelRc::new(VecModel::<SettingItem>::default()));
+    // High error correction keeps the code readable under Pneu's icon.
+    match qr_image(DOWNLOAD_PAGE, qrcode::EcLevel::H, 1) {
+        Ok(pixels) => ui.set_download_qr(slint::Image::from_rgba8(pixels)),
+        Err(error) => eprintln!("pneud window: download code: {error:#}"),
+    }
     let send = |action: fn() -> Action| {
         let c = commands.clone();
         move || {
@@ -1528,6 +1556,7 @@ fn connect(
     ui.on_offer_pair(send(|| Action::OfferPair));
     ui.on_offer_dismiss(send(|| Action::OfferDismiss));
     ui.on_picker_cancel(send(|| Action::PickerCancel));
+    ui.on_get_tailscale(send(|| Action::GetTailscale));
     ui.on_unpair(with(Action::Unpair));
     ui.on_send_files(with(Action::SendFiles));
     ui.on_cancel_item(with(Action::Cancel));
@@ -1685,6 +1714,7 @@ struct Worker {
     peer_settings: Option<(String, Value, Instant)>,
     last_view: View,
     requested_page: Option<Page>,
+    tailscale: Option<(bool, Instant)>,
 }
 
 impl Worker {
@@ -1737,6 +1767,7 @@ impl Worker {
             paired: None,
             peer_settings: None,
             requested_page: None,
+            tailscale: None,
             last_view: View {
                 page: Page::Main,
                 ..Default::default()
@@ -2274,6 +2305,12 @@ impl Worker {
                 if let Some(join) = self.join.take() {
                     self.dismissed_offer = Some(join.uri.clone());
                     self.cancel_join(&join).await;
+                }
+            }
+            Action::GetTailscale => {
+                if self.open_job.is_none() {
+                    self.open_origin = Some(self.view());
+                    self.open_job = Some(Box::pin(open_web(TAILSCALE_DOWNLOAD)));
                 }
             }
             Action::Message(action, primary) => match action.as_str() {
@@ -3305,6 +3342,16 @@ impl Worker {
             }
         }
 
+        // Checked only while Can't connect? shows, and at most every 5 s.
+        if view.page == Page::Main
+            && unreachable(&peers)
+            && self
+                .tailscale
+                .is_none_or(|(_, at)| at.elapsed() >= Duration::from_secs(5))
+        {
+            self.tailscale = Some((tailscale_running(), Instant::now()));
+        }
+
         if !self.current() {
             return Ok(());
         }
@@ -3443,6 +3490,8 @@ impl Worker {
             copy_images: config.copy_image_to_clipboard,
             viewer: config.open_in_viewer,
             name: display_peer_text(&config.name),
+            unreachable: unreachable(peers),
+            tailscale: self.tailscale.is_some_and(|(on, _)| on),
         }
     }
 }
@@ -3480,6 +3529,8 @@ fn apply(w: &PneuWindow, frame: Frame) {
     ui.set_copy_images(frame.copy_images);
     ui.set_viewer(frame.viewer);
     ui.set_name(frame.name.into());
+    ui.set_unreachable(frame.unreachable);
+    ui.set_tailscale(frame.tailscale);
 }
 
 /// Update a list in place so rows (and their keyboard focus) survive polling.
@@ -3532,9 +3583,16 @@ fn animations_enabled(ini: &str) -> bool {
         .is_none_or(|factor| factor > 0.0)
 }
 pub fn qr_pixels(uri: &str) -> Result<slint::SharedPixelBuffer<slint::Rgba8Pixel>> {
-    let code = qrcode::QrCode::with_error_correction_level(uri.as_bytes(), qrcode::EcLevel::M)?;
+    qr_image(uri, qrcode::EcLevel::M, 4)
+}
+/// Modules of `scale` pixels inside a four-module white quiet zone.
+fn qr_image(
+    text: &str,
+    level: qrcode::EcLevel,
+    scale: usize,
+) -> Result<slint::SharedPixelBuffer<slint::Rgba8Pixel>> {
+    let code = qrcode::QrCode::with_error_correction_level(text.as_bytes(), level)?;
     let modules = code.width();
-    let scale = 4;
     let offset = 4 * scale;
     let size = (modules + 8) * scale;
     let mut image = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(size as u32, size as u32);
@@ -3559,6 +3617,25 @@ async fn job_result<T>(
     match job {
         Some(job) => job.await,
         None => std::future::pending().await,
+    }
+}
+/// Opens a web page in the default browser.
+async fn open_web(url: &'static str) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::actions::open_uri(url, &zbus::Connection::session().await?).await
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        slint::invoke_from_event_loop(move || {
+            let _ = send.send(super::macos::native::open_url(url));
+        })?;
+        receive.await?
+    }
+    #[cfg(windows)]
+    {
+        crate::actions::open_url(url).await
     }
 }
 async fn change_folder(socket: &Path) -> Result<()> {
@@ -3816,6 +3893,29 @@ mod tests {
             ("Sending report.pdf…", 1)
         );
         assert_eq!(peers[0].item().status, "Sending report.pdf · 12 of 40 MB");
+    }
+
+    #[test]
+    fn cant_connect_shows_only_when_no_device_can_be_reached() {
+        let with = |states: &[&str]| {
+            let devices = states
+                .iter()
+                .enumerate()
+                .map(|(i, state)| device(i as u8 + 1, "Device", i == 0, state, 0))
+                .collect();
+            unreachable(&peers(&snapshot(devices), &[]))
+        };
+        assert!(!with(&[]));
+        assert!(with(&["disconnected"]));
+        assert!(with(&["disconnected", "connecting"]));
+        assert!(!with(&["disconnected", "connected"]));
+        // A paused phone is still connected.
+        let mut paused = snapshot(vec![device(1, "Phone", true, "connected", 0)]);
+        paused.paused_devices = vec![id(1)];
+        assert!(!unreachable(&peers(&paused, &[])));
+        // Devices which answered need re-pairing or an update, not a network.
+        assert!(!with(&["disconnected", "unauthorized"]));
+        assert!(!with(&["update_required"]));
     }
 
     #[test]
@@ -5754,6 +5854,161 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn download_code_and_cant_connect_follow_their_interaction_rules() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::download_code_and_cant_connect_follow_their_interaction_rules",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        let surface = headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (_worker, mut rx) = model_worker(&window, dir.path());
+        let ui = window.global::<Ui>();
+        ui.set_motion(false);
+        window.show()?;
+        surface.set_size(slint::PhysicalSize::new(400, 700));
+        window
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::WindowActiveChanged(true));
+        let draw = || {
+            surface.request_redraw();
+            surface.draw_if_needed(|renderer| {
+                let mut pixels = vec![
+                    slint::platform::software_renderer::PremultipliedRgbaColor::default();
+                    400 * 700
+                ];
+                renderer.render(&mut pixels, 400);
+            });
+            advance_ui();
+        };
+        let mut tailscale_requests = || {
+            let mut count = 0;
+            while let Ok(action) = rx.try_recv() {
+                if let Action::Scoped(_, action) = action
+                    && matches!(*action, Action::GetTailscale)
+                {
+                    count += 1;
+                }
+            }
+            count
+        };
+
+        // Esc returns from the download code to the pairing code, then leaves.
+        window.invoke_open_add(0);
+        ui.set_download(true);
+        draw();
+        key(&window, slint::platform::Key::Escape);
+        assert!(!ui.get_download());
+        assert_eq!(ui.get_page(), Page::Add);
+        key(&window, slint::platform::Key::Escape);
+        assert_eq!(ui.get_page(), Page::Main);
+        // Any navigation starts again on the pairing code.
+        ui.set_download(true);
+        window.invoke_open_add(0);
+        assert!(!ui.get_download());
+
+        // Get Tailscale… asks the worker to open the page and closes the popup.
+        window.invoke_go(Page::Main);
+        ui.set_unreachable(true);
+        ui.set_dialog(Dialog::Help);
+        draw();
+        key(&window, slint::platform::Key::Tab);
+        key(&window, slint::platform::Key::Return);
+        assert_eq!(ui.get_dialog(), Dialog::None);
+        assert_eq!(tailscale_requests(), 1);
+        // Close and Esc only dismiss it.
+        for close in [slint::platform::Key::Return, slint::platform::Key::Escape] {
+            draw();
+            ui.set_dialog(Dialog::Help);
+            draw();
+            key(&window, close);
+            assert_eq!(ui.get_dialog(), Dialog::None);
+        }
+        // With Tailscale running here, Close is the only button.
+        ui.set_tailscale(true);
+        draw();
+        ui.set_dialog(Dialog::Help);
+        draw();
+        key(&window, slint::platform::Key::Tab);
+        key(&window, slint::platform::Key::Return);
+        assert_eq!(ui.get_dialog(), Dialog::None);
+        assert_eq!(tailscale_requests(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_code_resets_when_leaving_the_phone_tab() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::download_code_resets_when_leaving_the_phone_tab",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        let surface = headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (_worker, _rx) = model_worker(&window, dir.path());
+        let ui = window.global::<Ui>();
+        ui.set_motion(false);
+        ui.set_first_run(true);
+        let pairing_qr = slint::Image::from_rgba8(qr_pixels(&sample_uri())?);
+        ui.set_qr(pairing_qr.clone());
+        window.show()?;
+        surface.set_size(slint::PhysicalSize::new(400, 700));
+        window
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::WindowActiveChanged(true));
+        let draw = || {
+            surface.request_redraw();
+            surface.draw_if_needed(|renderer| {
+                let mut pixels = vec![
+                    slint::platform::software_renderer::PremultipliedRgbaColor::default();
+                    400 * 700
+                ];
+                renderer.render(&mut pixels, 400);
+            });
+            advance_ui();
+        };
+
+        window.invoke_open_add(0);
+        draw();
+        key(&window, slint::platform::Key::Tab); // Phone / Computer
+        key(&window, slint::platform::Key::Tab); // Get Pneu for Android
+        key(&window, slint::platform::Key::Return);
+        assert!(ui.get_download());
+        draw();
+        key(&window, slint::platform::Key::Tab);
+        key(&window, slint::platform::Key::RightArrow); // Computer
+        assert_eq!(ui.get_add_tab(), 1);
+        draw();
+        key(&window, slint::platform::Key::LeftArrow); // Phone
+        draw();
+        assert_eq!(ui.get_add_tab(), 0);
+        assert!(!ui.get_download(), "Phone must return to the pairing QR");
+        assert_eq!(ui.get_qr(), pairing_qr);
+
+        key(&window, slint::platform::Key::Tab); // Get Pneu for Android
+        key(&window, slint::platform::Key::Return);
+        assert!(ui.get_download());
+        draw();
+        key(&window, slint::platform::Key::Tab);
+        key(&window, slint::platform::Key::RightArrow); // Computer
+        assert_eq!(ui.get_add_tab(), 1);
+        ui.set_first_run(false);
+        draw();
+        key(&window, slint::platform::Key::Escape);
+        assert_eq!(ui.get_page(), Page::Main, "Esc must leave Add Device");
+        assert!(!ui.get_download());
+        Ok(())
+    }
+
     // A native test fixture for private KWin/AT-SPI checks. Normal cargo tests
     // return immediately; no daemon, clipboard, session bus, or user data is used.
     #[test]
@@ -5908,6 +6163,8 @@ mod tests {
             );
             let ui = window.global::<Ui>();
             ui.set_dialog(Dialog::None);
+            ui.set_is_mac(false);
+            ui.set_download(false);
             ui.set_qr(slint::Image::from_rgba8(qr_pixels(&sample_uri())?));
             ui.set_code_qr(slint::Image::from_rgba8(qr_pixels(&sample_uri())?));
             (scene.setup)(&mut worker);
@@ -6188,6 +6445,23 @@ mod tests {
         ui.set_picks(ModelRc::new(VecModel::from(picks)));
         ui.set_dialog(Dialog::Picker);
     }
+    fn offline_phone(w: &mut Worker) {
+        let mut phone = device(1, "Galaxy S25+", true, "disconnected", 0);
+        phone.last_seen = crate::now_ms() - 7_200_000;
+        let waiting = transfer("w", 1, "notes.md", "waiting_for_device", 0, 9);
+        state(w, vec![phone], vec![waiting]);
+    }
+    fn help(w: &PneuWindow) {
+        go(Page::Main, 0, 0)(w);
+        w.global::<Ui>().set_dialog(Dialog::Help);
+    }
+    fn download(tab: i32, mac: bool) -> impl Fn(&PneuWindow) {
+        move |w: &PneuWindow| {
+            go(Page::Add, 0, tab)(w);
+            w.global::<Ui>().set_is_mac(mac);
+            w.global::<Ui>().set_download(true);
+        }
+    }
     fn scenes() -> Vec<Scene> {
         let peer = |device: u8, pending: bool| {
             let (me, it) = (id(9), id(device));
@@ -6321,6 +6595,51 @@ mod tests {
                     );
                 },
                 go(Page::Main, 0, 0),
+            ),
+            scene(
+                "06-main-cant-connect",
+                |w| {
+                    let mut list = vec![
+                        transfer("w", 1, "notes.md", "waiting_for_device", 0, 9),
+                        transfer("w", 2, "notes.md", "waiting_for_device", 0, 9),
+                    ];
+                    list.extend(recent_items()[..1].to_vec());
+                    state(
+                        w,
+                        vec![
+                            device(
+                                1,
+                                "Galaxy S25+",
+                                true,
+                                "disconnected",
+                                crate::now_ms() - 7_200_000,
+                            ),
+                            device(
+                                2,
+                                "MacBook Air",
+                                false,
+                                "disconnected",
+                                crate::now_ms() - 9_000_000,
+                            ),
+                        ],
+                        list,
+                    );
+                },
+                help,
+            ),
+            scene(
+                "09-main-one-device-unreachable",
+                offline_phone,
+                go(Page::Main, 0, 0),
+            ),
+            scene("09-main-cant-connect", offline_phone, help),
+            scene(
+                "09-main-cant-connect-tailscale",
+                |w| {
+                    offline_phone(w);
+                    w.tailscale = Some((true, Instant::now()));
+                },
+                help,
             ),
             scene(
                 "07-main-many-devices",
@@ -6482,6 +6801,42 @@ mod tests {
                     w.global::<Ui>()
                         .set_qr(slint::Image::from_rgba8(qr_pixels(&uri).unwrap()));
                 },
+            ),
+            scene(
+                "17-add-first-run-download",
+                |w| state(w, Vec::new(), Vec::new()),
+                download(0, false),
+            ),
+            scene(
+                "17-add-phone-download",
+                |w| state(w, two(), Vec::new()),
+                download(0, false),
+            ),
+            scene(
+                "17-add-phone-large-qr-download",
+                |w| state(w, two(), Vec::new()),
+                |w| {
+                    download(0, false)(w);
+                    let uri = sample_uri().replace(
+                        "MJStanton-Desktop",
+                        "A longer desktop name for checking QR layout sizing",
+                    );
+                    w.global::<Ui>()
+                        .set_qr(slint::Image::from_rgba8(qr_pixels(&uri).unwrap()));
+                },
+            ),
+            scene(
+                "17-add-first-run-mac",
+                |w| state(w, Vec::new(), Vec::new()),
+                |w| {
+                    go(Page::Add, 0, 0)(w);
+                    w.global::<Ui>().set_is_mac(true);
+                },
+            ),
+            scene(
+                "17-add-first-run-mac-download",
+                |w| state(w, Vec::new(), Vec::new()),
+                download(0, true),
             ),
             scene(
                 "18-add-phone-pairing",
