@@ -220,7 +220,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                             break
                         }
                         if (invitation != null && e.code in setOf("invalid_token", "expired_token", "pairing_closed", "already_paired", "storage_failed")) {
-                            if(e.code=="expired_token")app.rejectPairing(requireNotNull(attempt),if(invitation.expires > System.currentTimeMillis()) "Your PC's clock says this code expired. Check both clocks and scan the new code." else "This code expired. Scan the new one.")
+                            if(e.code=="expired_token")app.rejectPairing(requireNotNull(attempt),if(invitation.expires > System.currentTimeMillis()) "Your PC's clock says this code expired. Check both clocks and scan the new code." else PairingIssue.EXPIRED_MESSAGE)
                             else app.rejectPairing(requireNotNull(attempt),ConnectionStatus.UNREACHABLE)
                             break
                         }

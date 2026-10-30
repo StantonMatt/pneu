@@ -253,7 +253,7 @@ class ConnectionFaultDeviceTest {
         i.uiAutomation.grantRuntimePermission(c.packageName,Manifest.permission.CAMERA)
         c.startActivity(Intent(c,MainActivity::class.java).putExtra("pair",true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
         val device=androidx.test.uiautomator.UiDevice.getInstance(i)
-        assertTrue(device.wait(androidx.test.uiautomator.Until.hasObject(androidx.test.uiautomator.By.text("Scan the QR code on your computer")),5000))
+        assertTrue(device.wait(androidx.test.uiautomator.Until.hasObject(androidx.test.uiautomator.By.text("Scan the QR code in Pneu on your computer")),5000))
         assertFalse(device.hasObject(androidx.test.uiautomator.By.textStartsWith("Paired with ")))
         File(c.filesDir,"e2e-fix-screens").mkdirs()
         device.takeScreenshot(File(c.filesDir,"e2e-fix-screens/remote-unpair.png"))

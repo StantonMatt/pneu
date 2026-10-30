@@ -9,6 +9,11 @@ class ScannerPlacementTest {
         val placement=scannerPlacement(412,850,22,1f)
         assertEquals(264,placement.frameSize);assertEquals(200,placement.top);assertEquals(28,placement.gap)
     }
+    @Test fun getPneuUnderTheInstructionKeepsThePortraitFrame() {
+        // Instruction (22) + gap (20) + Get Pneu for your computer (44).
+        val placement=scannerPlacement(412,850,86,1f)
+        assertEquals(264,placement.frameSize);assertEquals(200,placement.top);assertEquals(28,placement.gap)
+    }
     @Test fun landscapeAndShortWindowsShrinkAndRaiseTheFrame() {
         val placement=scannerPlacement(800,352,22,1f)
         assertTrue(placement.frameSize<264);assertTrue(placement.top<200)

@@ -357,7 +357,7 @@ class DeviceScreensDeviceTest {
         val p=prefs(pc)
         show {PairScreen(p,wifi,{},{},{},validationFeedback=UiFeedback("Already paired with MJStanton-Desktop"),cameraPreview={modifier,_->androidx.compose.foundation.layout.Box(modifier.then(Modifier.fillMaxSize()))})}
         compose.waitUntil(5000) {compose.onAllNodesWithText("Already paired with MJStanton-Desktop").fetchSemanticsNodes().isNotEmpty()}
-        compose.onNodeWithText("Scan the QR code on your computer").assertIsDisplayed()
+        compose.onNodeWithText("Scan the QR code in Pneu on your computer").assertIsDisplayed()
         capture("add-device-already-paired")
     }
     @Test(timeout=30000) fun stoppedRecipientsShowTerminalOutcomesWithoutActionsWhileOtherRecipientsStayActionable()=runBlocking<Unit> {

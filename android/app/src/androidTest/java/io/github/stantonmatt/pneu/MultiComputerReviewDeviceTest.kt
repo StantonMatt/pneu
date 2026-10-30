@@ -599,7 +599,7 @@ class MultiComputerReviewDeviceTest {
             assertEquals(listOf(a),app.preferences.read().devices.map {peer->peer.deviceId})
             assertTrue(app.connection.connected(a))
             compose.onNodeWithText("Add device").performScrollTo().performClick()
-            compose.waitUntil(5000) {compose.onAllNodesWithText("Scan the QR code on your computer").fetchSemanticsNodes().isNotEmpty()}
+            compose.waitUntil(5000) {compose.onAllNodesWithText("Scan the QR code in Pneu on your computer").fetchSemanticsNodes().isNotEmpty()}
         }
     }
 

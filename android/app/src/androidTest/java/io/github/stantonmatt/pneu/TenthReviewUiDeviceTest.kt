@@ -171,18 +171,18 @@ class TenthReviewUiDeviceTest {
         assertTrue(app.installBinding(invitation,"f".repeat(32)))
         compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Settings").fetchSemanticsNodes().isNotEmpty()}
         compose.runOnIdle {requested="pair"}
-        compose.waitUntil(5000) {compose.onAllNodesWithText("Scan the QR code on your computer").fetchSemanticsNodes().isNotEmpty()}
+        compose.waitUntil(5000) {compose.onAllNodesWithText("Scan the QR code in Pneu on your computer").fetchSemanticsNodes().isNotEmpty()}
         // The old floor would report the previous install as a fresh success
         // and navigate Home immediately (or after the 800 ms success delay).
         compose.mainClock.advanceTimeBy(1200)
-        compose.onNodeWithText("Scan the QR code on your computer").assertIsDisplayed()
+        compose.onNodeWithText("Scan the QR code in Pneu on your computer").assertIsDisplayed()
         compose.onNodeWithContentDescription("Settings").assertDoesNotExist()
         // Re-enter while AnimatedContent still retains the leaving scanner.
         compose.mainClock.autoAdvance=false
         compose.onNodeWithContentDescription("Back").performClick()
         compose.runOnIdle {requested="pair"}
         compose.mainClock.advanceTimeBy(1200)
-        compose.onNodeWithText("Scan the QR code on your computer").assertIsDisplayed()
+        compose.onNodeWithText("Scan the QR code in Pneu on your computer").assertIsDisplayed()
         compose.onNodeWithContentDescription("Settings").assertDoesNotExist()
         compose.mainClock.autoAdvance=true
         compose.onNodeWithContentDescription("Back").performClick()
@@ -341,7 +341,8 @@ class TenthReviewUiDeviceTest {
         }
         assertEquals(2,retries);assertEquals(2,removes)
     }
-    @Test(timeout=20000) fun rejectedInvitationAndRecoveryDialogSurviveStateRestorationBeforeRetry()=runBlocking<Unit> {
+    @Test(timeout=40000) fun rejectedInvitationAndRecoveryDialogSurviveStateRestorationBeforeRetry()=runBlocking<Unit> {
+        DeviceFixture.setWifi(i,true)
         app.preferences.toggle("setup",true)
         i.uiAutomation.grantRuntimePermission(c.packageName,Manifest.permission.ACCESS_LOCAL_NETWORK)
         val invitation=invitation();val raw=invitationUri(invitation)
@@ -360,10 +361,10 @@ class TenthReviewUiDeviceTest {
         DeviceFixture.stopPneuService();app.connection.stop();app.connection.awaitStopped()
         assertTrue(app.cancelPairing(app.connection.attempt.value))
         compose.runOnIdle {app.connection.state.value=LinkState(pairing="Can't reach your PC")}
-        awaitText("Can't reach your computer")
+        awaitText("Can't reach Twelfth")
         awaitText("Try again")
         restore.emulateSavedInstanceStateRestore()
-        awaitText("Can't reach your computer")
+        awaitText("Can't reach Twelfth")
         compose.onNodeWithText("Try again").performClick()
         awaitText("Pair with Twelfth?")
         assertNull(app.connection.attempt.value?.invitation);assertNull(app.preferences.read().peer)
@@ -371,7 +372,7 @@ class TenthReviewUiDeviceTest {
         // silently approve another pairing attempt.
         restore.emulateSavedInstanceStateRestore()
         awaitText("Pair with Twelfth?")
-        compose.onNodeWithText("Can't reach your computer").assertDoesNotExist()
+        compose.onNodeWithText("Can't reach Twelfth").assertDoesNotExist()
         assertNull(app.connection.attempt.value?.invitation)
         compose.onNodeWithText("Cancel").performClick()
     }
@@ -406,16 +407,18 @@ class TenthReviewUiDeviceTest {
         app.preferences.toggle("setup",true)
         var candidate by mutableStateOf<String?>(null)
         content {PneuScreen(candidate=candidate,offerPair={candidate=it})}
-        compose.onNodeWithText("Scan the QR code on your computer").assertIsDisplayed()
+        compose.onNodeWithText("Scan the QR code in Pneu on your computer").assertIsDisplayed()
         fun shownThenGone(message:String) {
             compose.waitUntil(5000) {compose.onAllNodesWithText(message).fetchSemanticsNodes().isNotEmpty()}
             compose.onNodeWithText(message).assertIsDisplayed()
-            compose.mainClock.advanceTimeBy(6000)
+            // An expired code is a dialog; OK returns to scanning. Other feedback is a snackbar.
+            if(message==c.getString(R.string.pair_expired_title))compose.onNodeWithText(c.getString(R.string.action_ok)).performClick()
+            else compose.mainClock.advanceTimeBy(6000)
             compose.waitUntil(5000) {compose.onAllNodesWithText(message).fetchSemanticsNodes().isEmpty()}
         }
         val malformed="pneu://pair?v=1"
         val expired=invitationUri(invitation().copy(expires=System.currentTimeMillis()-1000))
-        val notPneu=c.getString(R.string.pair_not_pneu);val expiredCopy=c.getString(R.string.pair_expired)
+        val notPneu=c.getString(R.string.pair_not_pneu);val expiredCopy=c.getString(R.string.pair_expired_title)
         compose.runOnIdle {candidate=malformed}
         shownThenGone(notPneu)
         // The same validation used by an approved invitation, without a
@@ -437,7 +440,7 @@ class TenthReviewUiDeviceTest {
         content {PairScreen(prefs,LinkState(),{},{},{},cameraPreview={_,_->})}
         compose.onNode(SemanticsMatcher.expectValue(SemanticsProperties.PaneTitle,"Add device")).assertExists()
         compose.onNodeWithText("Add device").assertDoesNotExist()
-        compose.onNodeWithText("Scan the QR code on your computer").assertIsDisplayed()
+        compose.onNodeWithText("Scan the QR code in Pneu on your computer").assertIsDisplayed()
         compose.onNodeWithContentDescription("Back").assertHasClickAction()
     }
     @Test fun customSwitchKeepsItsAccessibleStateAndInteraction() {

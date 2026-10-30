@@ -102,7 +102,7 @@ private fun automaticKinds(context:android.content.Context,p:Prefs):String? {
 }
 
 /** One pair: status card, the pair's sharing switches, then Unpair. */
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class,ExperimentalLayoutApi::class)
 @Composable internal fun DeviceScreen(p:Prefs,state:DeviceState,back:()->Unit,pair:()->Unit,unpair:()->Unit,sendFiles:()->Unit,setSwitch:(String,Boolean)->Unit) {
     val context=LocalContext.current;val resources=LocalResources.current;val c=LocalPneuColors.current
     val peer=state.peer;val link=state.connection;val online=connected(p,state)
@@ -120,12 +120,14 @@ private fun automaticKinds(context:android.content.Context,p:Prefs):String? {
                 val status=when {peer.pairingLost->ConnectionStatus.PAIRING_LOST;online->ConnectionStatus.CONNECTED;else->link.connectionStatus}
                 val title=when(status) {ConnectionStatus.UNREACHABLE->resources.getString(R.string.device_not_connected);ConnectionStatus.UPDATE_REQUIRED->resources.getString(R.string.device_update_required);else->UiPresentation.status(context,status)}
                 val address=UiPresentation.pairedAddress(peer.addresses,link.route)
+                val hint=unreachableHint(status==ConnectionStatus.UNREACHABLE,listOf(peer),p.tailscale)
+                var anywhere by rememberSaveable {mutableStateOf(false)}
                 val detail=when(status) {
                     ConnectionStatus.PAIRING_LOST->resources.getString(R.string.detail_pairing_lost,peer.name)
                     ConnectionStatus.UPDATE_REQUIRED->resources.getString(R.string.device_update_detail,peer.name)
                     ConnectionStatus.CONNECTED->listOfNotNull(link.route.takeIf(String::isNotEmpty)?.let {UiPresentation.status(context,it)},address).joinToString(" · ")
                     ConnectionStatus.WAITING_WIFI->resources.getString(R.string.detail_mobile_data_off)
-                    else->if(state.lastSeen>0)resources.getString(R.string.detail_last_connected,lastConnectedLabel(context,state.lastSeen)) else ""
+                    else->hint?.let {unreachableDetail(context,it,listOf(peer))} ?: if(state.lastSeen>0)resources.getString(R.string.detail_last_connected,lastConnectedLabel(context,state.lastSeen)) else ""
                 }
                 Surface(shape=RoundedCornerShape(24.dp),border=if(c.dark)BorderStroke(1.dp,c.hairline)else null,color=c.surface,modifier=Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(start=20.dp,end=20.dp,top=22.dp,bottom=20.dp),horizontalAlignment=Alignment.CenterHorizontally) {
@@ -136,7 +138,12 @@ private fun automaticKinds(context:android.content.Context,p:Prefs):String? {
                         }
                         Spacer(Modifier.height(20.dp))
                         if(peer.pairingLost)PneuButton(pair,Modifier.fillMaxWidth().height(48.dp)) {Symbol(R.drawable.ic_qr_code_scanner,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_pair_again))}
-                        else PneuTonalButton(sendFiles,Modifier.fillMaxWidth().height(48.dp)) {Symbol(R.drawable.ic_upload,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_send_files))}
+                        // Unreachable: the Link card's action, beside Send files (files wait for the device).
+                        else FlowRow(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(10.dp),verticalArrangement=Arrangement.spacedBy(10.dp),maxItemsInEachRow=if(androidx.compose.ui.platform.LocalDensity.current.fontScale>1.3f)1 else 2) {
+                            if(hint?.hasAction()==true)UnreachableAction(hint,Modifier.weight(1f).height(48.dp)) {anywhere=true}
+                            PneuTonalButton(sendFiles,Modifier.weight(1f).height(48.dp)) {Symbol(R.drawable.ic_upload,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_send_files),maxLines=1,overflow=TextOverflow.Ellipsis)}
+                        }
+                        if(anywhere)ConnectAnywhereSheet(p.tailscale) {anywhere=false}
                     }
                 }
                 if(!peer.pairingLost) {

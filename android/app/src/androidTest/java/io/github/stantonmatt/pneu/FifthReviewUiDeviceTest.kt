@@ -83,7 +83,7 @@ class FifthReviewUiDeviceTest {
             val revoked=withTimeout(5000) {app.preferences.flow.first {it.resetPeers.isEmpty()}}
             click("Try again");assertTrue(visible("Finish unpairing?"));click("Unpair")
             withTimeout(5000) {app.prefs.first {it.devices.isEmpty() && it.resetPeers.isEmpty()}}
-            assertTrue(visible("Scan the QR code on your computer") || visible("Allow camera") || visible("Open settings"))
+            assertTrue(visible("Scan the QR code in Pneu on your computer") || visible("Allow camera") || visible("Open settings"))
             assertEquals(revoked.deviceId,app.preferences.flow.first().deviceId)
             assertEquals(revoked.tlsAlias,app.preferences.flow.first().tlsAlias)
         } catch(e:Throwable) {screen("ui-failure");device.dumpWindowHierarchy(File(c.filesDir,"fifth-review-screens/ui-failure.xml"));throw e

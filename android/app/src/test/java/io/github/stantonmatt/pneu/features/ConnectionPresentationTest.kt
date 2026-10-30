@@ -24,7 +24,10 @@ class ConnectionPresentationTest {
         for(status in ConnectionStatus.entries)assertEquals(status,LinkState(status.key).connectionStatus)
         assertEquals(PairingIssue.UNREACHABLE,UiFeedback("Can't reach your PC").issue)
         assertEquals(PairingIssue.CLOCK,UiFeedback("Your PC's clock says this code expired").issue)
+        assertEquals(PairingIssue.EXPIRED,UiFeedback(PairingIssue.EXPIRED_MESSAGE).issue)
+        assertEquals(PairingIssue.FEEDBACK,UiFeedback("That isn't a Pneu code").issue)
         val context=RuntimeEnvironment.getApplication()
+        assertEquals("This code expired. Scan the new one.",UiPresentation.pairing(context,UiFeedback(PairingIssue.EXPIRED_MESSAGE)))
         assertEquals("Update required",UiPresentation.status(context,ConnectionStatus.UPDATE_REQUIRED))
         assertEquals("Unreachable",UiPresentation.status(context,ConnectionStatus.UNREACHABLE))
     }

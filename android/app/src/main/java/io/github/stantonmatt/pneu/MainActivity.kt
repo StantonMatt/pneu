@@ -90,7 +90,7 @@ suspend fun beginPair(context: android.content.Context, uri: String, expected: C
     val invitation=runCatching { Invitation.parse(uri) }.getOrNull()
     val active=graph.connection.attempt.value
     if(invitation == null || invitation.version != 1L) { graph.connection.state.update { it.withPairing(context.getString(R.string.pair_not_pneu)) }; return false }
-    if(invitation != active?.invitation && invitation.expires <= System.currentTimeMillis()) { graph.connection.state.update { it.withPairing(context.getString(R.string.pair_expired)) }; return false }
+    if(invitation != active?.invitation && invitation.expires <= System.currentTimeMillis()) { graph.connection.state.update { it.withPairing(PairingIssue.EXPIRED_MESSAGE) }; return false }
     check(graph.requestPairing(uri,expected ?: ConfirmedBinding.forInvitation(graph.prefs.value,invitation))) {"Binding changed during pairing"}
     PneuService.start(context)
     return true
@@ -368,6 +368,9 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
     }
 }
 
+internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired:Boolean):Boolean =
+    attemptPending || installed || expired
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable internal fun PairScreen(p: Prefs, link: LinkState, home: () -> Unit, back: () -> Unit, offerPair:(String)->Unit,
                                    lastAttemptedInvitation:String?=null,initialPairingRevision:Long?=null,initialAttemptId:String?=null,validationFeedback:UiFeedback?=null,cameraPreview:@Composable (Modifier,(String)->Unit)->Unit={modifier,onCode->PairCamera(modifier,onCode)}) {
@@ -402,21 +405,29 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
             snackbar.showSnackbar(it.message,duration=SnackbarDuration.Short)
         }
     }}
-    val permission=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { camera=it;cameraAsked=true }
+    // Rationale and the request history aren't observable; recheck after every result and resume,
+    // or a permanent denial keeps the first denial's button and hides why the camera is off.
+    var cameraCheck by remember {mutableIntStateOf(0)}
+    val permission=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { camera=it;cameraAsked=true;cameraCheck++ }
     LaunchedEffect(Unit) { if(!camera && !PermissionRequests.settings(context as Activity,Manifest.permission.CAMERA))actions.run(resources.getString(R.string.ui_error_camera)) {PermissionRequests.mark(context,Manifest.permission.CAMERA);permission.launch(Manifest.permission.CAMERA)} }
     val lifecycle=androidx.lifecycle.compose.LocalLifecycleOwner.current
     DisposableEffect(lifecycle) {
-        val observer=androidx.lifecycle.LifecycleEventObserver { _,e -> if(e==androidx.lifecycle.Lifecycle.Event.ON_RESUME) camera=context.granted(Manifest.permission.CAMERA) }
+        val observer=androidx.lifecycle.LifecycleEventObserver { _,e -> if(e==androidx.lifecycle.Lifecycle.Event.ON_RESUME) {camera=context.granted(Manifest.permission.CAMERA);cameraCheck++} }
         lifecycle.lifecycle.addObserver(observer);onDispose { lifecycle.lifecycle.removeObserver(observer) }
     }
     var feedbackTimedOut by rememberSaveable(attempt?.id) { mutableStateOf(false) }
     val busy=attempt != null && !feedbackTimedOut && link.pairingFeedback?.issue != PairingIssue.UNREACHABLE
-    val scanBlocked=attempt!=null || installed
     BackHandler(busy) {}
     LaunchedEffect(busy,attempt?.id) {
         if(busy) { delay(15000);if(context.graph.connection.attempt.value?.id==attempt?.id) {feedbackTimedOut=true;dialog=true} }
     }
     val pairingFeedback=link.pairingFeedback?.takeIf {it.message==link.pairing}
+    var expired by rememberSaveable {mutableStateOf(false)}
+    val scanBlocked=pairingScanBlocked(attempt!=null,installed,expired)
+    var getPneu by rememberSaveable {mutableStateOf(false)}
+    val network=rememberPhoneNetwork();val tailscaleInstalled=rememberTailscaleInstalled()
+    val cameraSettings=remember(camera,cameraAsked,cameraCheck) {PermissionRequests.settings(context as Activity,Manifest.permission.CAMERA)}
+    val cameraLabel=remember(camera,cameraAsked,cameraCheck) {PermissionPolicy.cameraAction(cameraAsked,(context as Activity).shouldShowRequestPermissionRationale(Manifest.permission.CAMERA))}
     var consumedPairing by rememberSaveable {mutableStateOf<String?>(null)}
     LaunchedEffect(pairingFeedback?.id) {
         val event=pairingFeedback ?: return@LaunchedEffect
@@ -424,6 +435,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
         consumedPairing=event.id
         when {
             event.issue==PairingIssue.UNREACHABLE -> dialog=true
+            event.issue==PairingIssue.EXPIRED -> expired=true
             event.issue in setOf(PairingIssue.CLOCK,PairingIssue.FEEDBACK) -> snackbar.showSnackbar(UiPresentation.pairing(context,event),duration=SnackbarDuration.Short)
         }
     }
@@ -446,21 +458,35 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
                             context.graph.prefs.value.devices.find {it.pin==invite.fingerprint && !it.pairingLost && context.graph.connection.connected(it.deviceId)}
                         }
                         if(known!=null)scope.launch {snackbar.showSnackbar(resources.getString(R.string.pair_already_paired,known.name),duration=SnackbarDuration.Short)}
-                        else offerPair(raw)
+                        else {getPneu=false;offerPair(raw)}
                     }
                 }
-                ScannerFrame(busy,success,if(busy) resources.getString(R.string.pair_pairing) else if(success) resources.getString(R.string.pair_success,p.devices.find {it.deviceId==installedBinding?.pcId}?.name.orEmpty()) else resources.getString(R.string.pair_instruction))
-            } else Column(Modifier.align(Alignment.Center),horizontalAlignment=Alignment.CenterHorizontally,verticalArrangement=Arrangement.spacedBy(22.dp)) {
-                Box(Modifier.size(72.dp).background(Color.White.copy(alpha=.14f),CircleShape),contentAlignment=Alignment.Center){Symbol(R.drawable.ic_photo_camera,modifier=Modifier.size(32.dp),tint=Color.White)}
-                if(PermissionRequests.settings(context as Activity,Manifest.permission.CAMERA)) Text(resources.getString(R.string.pair_camera_off),color=Color.White.copy(alpha=.75f))
+                ScannerFrame(busy,success,if(busy) resources.getString(R.string.pair_pairing) else if(success) resources.getString(R.string.pair_success,p.devices.find {it.deviceId==installedBinding?.pcId}?.name.orEmpty()) else resources.getString(R.string.pair_instruction),
+                    extra=if(busy || success) null else ({GetPneuButton {getPneu=true}}))
+            } else Column(Modifier.align(Alignment.Center).padding(horizontal=24.dp),horizontalAlignment=Alignment.CenterHorizontally) {
+                Box(Modifier.size(72.dp).background(Color.White.copy(alpha=.12f),CircleShape),contentAlignment=Alignment.Center){Symbol(R.drawable.ic_no_photography,modifier=Modifier.size(32.dp),tint=Color.White)}
+                Text(resources.getString(R.string.pair_camera_off),Modifier.padding(top=16.dp),color=Color.White,style=PneuType.headline,textAlign=TextAlign.Center)
                 PneuButton(onClick={
-                    if(PermissionRequests.settings(context as Activity,Manifest.permission.CAMERA)) PermissionRequests.openSettings(context)
+                    if(cameraSettings) PermissionRequests.openSettings(context)
                     else {PermissionRequests.mark(context,Manifest.permission.CAMERA);permission.launch(Manifest.permission.CAMERA)}
-                }) {Text(resources.getString(PermissionPolicy.cameraAction(cameraAsked,(context as Activity).shouldShowRequestPermissionRationale(Manifest.permission.CAMERA))))}
+                },Modifier.padding(top=16.dp),contentPadding=PaddingValues(horizontal=18.dp)) {Text(resources.getString(cameraLabel))}
+                if(!busy && !success)Box(Modifier.padding(top=40.dp)) {GetPneuButton {getPneu=true}}
             }
             IconButton(onClick=back,enabled=!busy,modifier=Modifier.statusBarsPadding().padding(start=12.dp,top=8.dp).size(44.dp).background(Color.White.copy(alpha=.14f),CircleShape)) {Symbol(R.drawable.ic_arrow_back,resources.getString(R.string.cd_back),tint=Color.White.copy(alpha=if(busy).4f else 1f))}
             PneuSnackbarHost(snackbar,Modifier.align(Alignment.BottomCenter).navigationBarsPadding())
-            if(dialog) PneuDialog(dismissible=false,onDismissRequest={},title={Text(resources.getString(R.string.pair_unreachable_title))},text={Text(resources.getString(R.string.pair_unreachable_text))},confirmButton={PneuTextButton(onClick={val confirmed=ConfirmedBinding.from(p);val pending=attempt;val code=lastAttemptedInvitation ?: lastCode.takeIf(String::isNotEmpty);dialog=false;feedbackTimedOut=false;scope.launch {if(pending==null && code!=null)offerPair(code) else actions.run(resources.getString(R.string.ui_error_retry_connection),{dialog=true}) {check(context.graph.retryConnection(confirmed,pending,feedback=pending==null)) {"Pairing changed during retry"}}}}) {Text(resources.getString(R.string.action_try_again))}},dismissButton={PneuTextButton(onClick={val pending=attempt;dialog=false;scope.launch {actions.run(resources.getString(R.string.ui_error_cancel_pairing),{dialog=true}) {check(context.graph.cancelPairing(pending)) {"Pairing changed during cancellation"}}}}){Text(resources.getString(R.string.cd_cancel))}})
+            if(dialog) {
+                // Name the computer from the code being tried; the phone's own network picks the likely cause.
+                val computer=(attempt?.invitation ?: (lastAttemptedInvitation ?: lastCode.takeIf(String::isNotEmpty))?.let {runCatching {Invitation.parse(it)}.getOrNull()})
+                    ?.name?.takeIf(String::isNotBlank) ?: resources.getString(R.string.pair_your_computer)
+                fun cancel() {val pending=attempt;dialog=false;scope.launch {actions.run(resources.getString(R.string.ui_error_cancel_pairing),{dialog=true}) {check(context.graph.cancelPairing(pending)) {"Pairing changed during cancellation"}}}}
+                PneuDialog(dismissible=false,onDismissRequest={},title={Text(resources.getString(R.string.pair_unreachable_title,computer))},
+                text={Text(resources.getString(when {!network.wifi->R.string.pair_not_on_wifi;tailscaleInstalled->R.string.pair_unreachable_tailscale;else->R.string.pair_unreachable_text},computer))},
+                confirmButton={if(!network.wifi)PneuTextButton(onClick={cancel();scope.launch {actions.run(resources.getString(R.string.ui_error_wifi_settings)) {ReachabilityHints.openWifiSettings(context)}}}) {Text(resources.getString(R.string.action_wifi_settings))}
+                else PneuTextButton(onClick={val confirmed=ConfirmedBinding.from(p);val pending=attempt;val code=lastAttemptedInvitation ?: lastCode.takeIf(String::isNotEmpty);dialog=false;feedbackTimedOut=false;scope.launch {if(pending==null && code!=null)offerPair(code) else actions.run(resources.getString(R.string.ui_error_retry_connection),{dialog=true}) {check(context.graph.retryConnection(confirmed,pending,feedback=pending==null)) {"Pairing changed during retry"}}}}) {Text(resources.getString(R.string.action_try_again))}},dismissButton={PneuTextButton(onClick={cancel()}){Text(resources.getString(R.string.cd_cancel))}})
+            }
+            if(expired) PneuDialog(onDismissRequest={expired=false},title={Text(resources.getString(R.string.pair_expired_title))},text={Text(resources.getString(R.string.pair_expired_text))},
+                confirmButton={PneuTextButton(onClick={expired=false}) {Text(resources.getString(R.string.action_ok))}})
+            if(getPneu) GetPneuSheet {getPneu=false}
         }
     }
 }
@@ -480,14 +506,15 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
     LaunchedEffect(link.transferMediaId) {if(link.transferMediaId.isNotEmpty()){delay(1000);showProgress=true}}
     val title=if(p.pairingLost) ConnectionStatus.PAIRING_LOST else if(p.paused) ConnectionStatus.PAUSED else link.connectionStatus
     val network=RoutePolicy.active(context.getSystemService(android.net.ConnectivityManager::class.java))
-    val tailscaleOff=title==ConnectionStatus.UNREACHABLE && p.tailscale && !network.vpn && p.devices.any {peer->!peer.pairingLost && peer.addresses.any {it.tailscale}}
+    val hint=unreachableHint(title==ConnectionStatus.UNREACHABLE,p.devices,p.tailscale)
+    var anywhere by rememberSaveable {mutableStateOf(false)}
     val detail=when(title) {
         ConnectionStatus.PAIRING_LOST -> resources.getString(R.string.detail_pairing_lost,p.lostPcName.ifEmpty {p.peer?.name.orEmpty()})
         ConnectionStatus.PAUSED -> resources.getString(R.string.detail_paused)
         ConnectionStatus.CONNECTED -> UiPresentation.connectionDetail(context,p,links,link)
         ConnectionStatus.CONNECTING -> UiPresentation.connectionDetail(context,p,links,link)
         ConnectionStatus.WAITING_WIFI -> resources.getString(R.string.detail_mobile_data_off)
-        else -> if(tailscaleOff) resources.getString(R.string.detail_tailscale_off) else if(p.lastConnected>0) resources.getString(R.string.detail_last_connected,lastConnectedLabel(context,p.lastConnected)) else ""
+        else -> hint?.let {unreachableDetail(context,it,p.devices)} ?: if(p.lastConnected>0) resources.getString(R.string.detail_last_connected,lastConnectedLabel(context,p.lastConnected)) else ""
     }
     val navigationBottom=WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
     val list=androidx.compose.foundation.lazy.rememberLazyListState()
@@ -512,10 +539,11 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
                         FlowRow(Modifier.fillMaxWidth().padding(top=20.dp),horizontalArrangement=Arrangement.spacedBy(10.dp),verticalArrangement=Arrangement.spacedBy(10.dp),maxItemsInEachRow=if(androidx.compose.ui.platform.LocalDensity.current.fontScale>1.3f)1 else 2) {
                             if(p.pairingLost) PneuButton(pair,Modifier.fillMaxWidth().height(48.dp)) {Symbol(R.drawable.ic_qr_code_scanner,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_pair_again))}
                             else {
-                                PneuTonalButton(onClick={scope.launch {actions.run(resources.getString(if(tailscaleOff)R.string.ui_error_connection else R.string.toast_not_sent)) {
-                                    if(tailscaleOff)context.startActivity(requireNotNull(context.packageManager.getLaunchIntentForPackage("com.tailscale.ipn")))
-                                    else context.startActivity(ManualEntries.clipboardIntent(context,p))
-                                }}},modifier=Modifier.weight(1f).height(48.dp),enabled=clipboardReady || tailscaleOff,contentPadding=PaddingValues(horizontal=12.dp)) {Symbol(if(tailscaleOff)R.drawable.ic_open_in_new else R.drawable.ic_content_paste_go,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(if(tailscaleOff) resources.getString(R.string.action_open_tailscale) else resources.getString(R.string.tile_send_clipboard))}
+                                // Unreachable: what helps reconnect takes Send clipboard's place, as Open Tailscale did.
+                                if(hint?.hasAction()==true)UnreachableAction(hint,Modifier.weight(1f).height(48.dp)) {anywhere=true}
+                                else PneuTonalButton(onClick={scope.launch {actions.run(resources.getString(R.string.toast_not_sent)) {
+                                    context.startActivity(ManualEntries.clipboardIntent(context,p))
+                                }}},modifier=Modifier.weight(1f).height(48.dp),enabled=clipboardReady,contentPadding=PaddingValues(horizontal=12.dp)) {Symbol(R.drawable.ic_content_paste_go,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.tile_send_clipboard))}
                                 if(p.paused) PneuButton(onClick={scope.launch {actions.run(resources.getString(R.string.ui_error_resume)) {app.preferences.toggle("paused",false)}}},modifier=Modifier.weight(1f).height(48.dp)) {Symbol(R.drawable.ic_play_arrow,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_resume))}
                                 else PneuNeutralButton(onClick={scope.launch {actions.run(resources.getString(R.string.ui_error_pause)) {app.preferences.toggle("paused",true)}}},modifier=Modifier.weight(1f).height(48.dp)) {Symbol(R.drawable.ic_pause,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_pause))}
                             }
@@ -585,6 +613,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
         }
     }
     RecentDetails(p,details,outcomes,links) {details=null}
+    if(anywhere)ConnectAnywhereSheet(p.tailscale) {anywhere=false}
 }
 @Composable private fun RecentDetails(p:Prefs,details:String?,outcomes:Map<String,RecentItem>,links:Map<String,LinkState>,close:()->Unit) {
     val context=LocalContext.current;val resources=LocalResources.current;val app=context.graph;val scope=rememberCoroutineScope();val actions=LocalUiActions.current
@@ -624,7 +653,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
         val key=pendingMedia
         if(key.isNotEmpty() && result[mediaPermissionFor(key)]==true) {scope.launch {if(actions.run(resources.getString(R.string.ui_error_setting)) {app.preferences.toggle(key,true)})pendingMedia=""}}
     }
-    val tailscaleInstalled=remember {runCatching {context.packageManager.getPackageInfo("com.tailscale.ipn",0)}.isSuccess}
+    val tailscaleInstalled=rememberTailscaleInstalled()
     fun toggle(key: String,value: Boolean) {
         if((key=="wifi" && !value && !p.tailscale)||(key=="tailscale" && !value && !p.wifi)) {scope.launch {snackbar.showSnackbar(resources.getString(R.string.snackbar_need_route))};return}
         if(!value && pendingMedia==key)pendingMedia=""
