@@ -1,7 +1,7 @@
 # Windows
 
-Pneu runs as a per-user desktop app on Windows. It works from source and as a
-sideloaded MSIX; the Microsoft Store listing is coming. The package targets x64
+Pneu runs as a per-user desktop app on Windows. It is available from the
+[Microsoft Store](https://apps.microsoft.com/detail/9N48FLMGSDDV) and also works from source or as a sideloaded MSIX. The package targets x64
 Windows 10 version 2004 (build 19041) or later. Native acceptance so far is on a
 Windows 11 VM; physical-hardware acceptance remains pending.
 
@@ -249,8 +249,8 @@ Explorer recovery, DPI/theme changes, cold toasts, startup and updates.
 
 ## Known gaps
 
-- Store submission, certification and updates with the registered Store identity
-  remain pending. Sideload acceptance does not establish Store approval.
+- Pneu passed Store certification and 2.2.0 is live. Store-managed updates on a
+  real PC have not been verified yet.
 - Windows can show a pairing QR and paste a `pneu://pair` link, but has no camera
   QR scanner.
 - Physical acceptance remains pending, including real LAN multicast, Tailscale

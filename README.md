@@ -36,7 +36,7 @@ More phones and computers can join by pairing directly. See the [wire protocol](
 
 - **Linux:** Linux with KDE Plasma 6 on Wayland; built and tested on Kubuntu 26.04. Building needs Rust 1.93+ and Qt 6 development tools, including `qmake6` for the Slint UI (`QMAKE=qmake6`). See the [desktop README](desktop/README.md) for build and runtime details.
 - **Mac:** macOS 15.4+; tested on Apple Silicon. See the [macOS guide](docs/macos.md) for build requirements and platform details.
-- **Windows:** x64 Windows 10 version 2004 (build 19041) or later. Works from source and as a sideloaded MSIX; the Microsoft Store listing is coming. See the [Windows guide](docs/windows.md) for building, packaging and platform details.
+- **Windows:** x64 Windows 10 version 2004 (build 19041) or later. Available from the [Microsoft Store](https://apps.microsoft.com/detail/9N48FLMGSDDV); also works from source and as a sideloaded MSIX. See the [Windows guide](docs/windows.md) for building, packaging and platform details.
 - **Phone:** Android 14+ (`minSdk 34`); tested on a Samsung Galaxy S25+ and an emulator. Building needs JDK 21, Android SDK 37.2 and Build Tools 37.0.0; use the checked-in Gradle wrapper.
 - **Optional:** Tailscale installed and connected on each device for access away from the LAN.
 
@@ -147,7 +147,7 @@ Device suites use [android/tools/run_device_tests.py](android/tools/run_device_t
 
 ## Status and limitations
 
-Personal project: desktop **2.2.1**, Android **2.2.0**. Physical acceptance for 2.1.0 was completed with a Kubuntu 26.04 PC, a MacBook Air (macOS 26.6, arm64) and a Galaxy S25+, all three paired over Tailscale. This does not establish every Wi-Fi/mobile transition, OEM background condition or battery-use scenario. The Android app can be sideloaded; Google Play closed testing is coming. The Mac app is ad-hoc signed, without Developer ID signing or notarization. Windows works from source and as a sideloaded MSIX; Store submission and physical-hardware acceptance remain pending.
+Personal project: desktop **2.2.1**, Android **2.2.0**. Physical acceptance for 2.1.0 was completed with a Kubuntu 26.04 PC, a MacBook Air (macOS 26.6, arm64) and a Galaxy S25+, all three paired over Tailscale. This does not establish every Wi-Fi/mobile transition, OEM background condition or battery-use scenario. The Android app is in Google Play closed testing (join through the [download page](https://stantonmatt.github.io/pneu/)) and can be sideloaded. The Mac app is ad-hoc signed, without Developer ID signing or notarization. Windows is in the Microsoft Store and also works from source or as a sideloaded MSIX; physical-hardware acceptance remains pending.
 
 The phone supports up to 16 paired computers. Each link is direct: pairing a phone with two computers does not pair those computers with each other. Clipboard is connected-only, and phone clipboard sending requires a tap. Supported clipboard image formats and desktop actions have limits; a crash in the short window before a desktop file receipt is committed can leave a duplicate visible file after retry. Read the accepted behaviours in the [protocol's transfer section](docs/PROTOCOL.md#transfer-and-delivery-state-machines), the [desktop README](desktop/README.md) and the [Android README](android/README.md#accepted-behaviours).
 

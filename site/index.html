@@ -107,6 +107,7 @@ h2{font-weight:600;font-size:24px;line-height:30px;letter-spacing:-.02em;margin:
 /* Each card shows only the [data-when] parts that match its data-state. */
 .plat[data-state=test] [data-when]:not([data-when~=test]),
 .plat[data-state=play] [data-when]:not([data-when~=play]),
+.plat[data-state=store] [data-when]:not([data-when~=store]),
 .plat[data-state=available] [data-when]:not([data-when~=available]),
 .plat[data-state=soon] [data-when]:not([data-when~=soon]),
 .plat[data-state=source] [data-when]:not([data-when~=source]){display:none!important}
@@ -134,6 +135,10 @@ h2{font-weight:600;font-size:24px;line-height:30px;letter-spacing:-.02em;margin:
 .plat.mine .btn{background:var(--accent);color:var(--onAccent)}
 .badge{display:inline-block;line-height:0;border-radius:10px;margin:-12px 0 -12px -12px}
 .badge img{height:72px;width:auto;display:block}
+/* The Store badge has no built-in padding: 48px matches the Play badge's visible height.
+   Like Microsoft's own badge in auto mode, the light variant shows on the dark theme. */
+.badge-ms{margin:0;border-radius:8px}
+.badge-ms img{height:48px}
 
 /* Android: QR for computer visitors */
 .plat-main{display:flex;flex-direction:column;min-width:0;flex:1}
@@ -217,8 +222,10 @@ footer{max-width:1104px;margin:56px auto 0;padding:24px 20px calc(32px + env(saf
 footer a{color:var(--text2);text-decoration:none;font-weight:500}
 footer a:hover{color:var(--text);text-decoration:underline}
 .legal{margin-top:16px;font-size:12px;line-height:16px;color:var(--text2)}
-/* The Google Play trademark line only goes with the Play badge. */
+/* Each trademark line only goes with its store badge. */
 body:not(:has([data-os=android][data-state=play])) .legal-play{display:none}
+body:not(:has([data-os=windows][data-state=store])) .legal-ms{display:none}
+body:has([data-os=android][data-state=play]) .legal-ms{margin-top:4px}
 </style>
 </head>
 <body>
@@ -256,31 +263,32 @@ body:not(:has([data-os=android][data-state=play])) .legal-play{display:none}
     <!-- Each card's data-state picks which of its [data-when] parts show. -->
     <div class="platforms" id="platforms">
 
-      <!-- Android: data-state="test" links to the closed-test opt-in.
+      <!-- Android: data-state="test" links to the pneu-testers Google Group (button and QR); joining it
+           lets anyone opt in to the closed test from the step 2 link.
            When Pneu is public on Google Play, change it to data-state="play": that shows the
            Get it on Google Play badge and its QR (store listing) and the trademark line in the footer. -->
       <article class="card plat plat-android has-qr" data-os="android" data-state="test" aria-labelledby="p-android">
         <div class="plat-main">
         <div class="plat-head"><h3 id="p-android">Android</h3><span class="mine-tag">This device</span></div>
         <p class="req" data-when="play">Android 14 or later</p>
-        <p class="req" data-when="test">Android 14 or later · Invite-only test</p>
+        <p class="req" data-when="test">Android 14 or later · Open test</p>
         <div class="act" data-when="play">
           <a class="badge" href="https://play.google.com/store/apps/details?id=io.github.stantonmatt.pneu"><img src="assets/play-badge-en.png" width="186" height="72" alt="Get it on Google Play" loading="lazy"></a>
         </div>
         <div class="act" data-when="test">
-          <a class="btn" href="https://play.google.com/apps/testing/io.github.stantonmatt.pneu">
+          <a class="btn" href="https://groups.google.com/g/pneu-testers">
             <svg class="i" viewBox="0 -960 960 960" aria-hidden="true"><path d="M200-120q-33 0-56.5-23.5T120-200v-560q0-33 23.5-56.5T200-840h240q17 0 28.5 11.5T480-800q0 17-11.5 28.5T440-760H200v560h560v-240q0-17 11.5-28.5T800-480q17 0 28.5 11.5T840-440v240q0 33-23.5 56.5T760-120H200Zm560-584L416-360q-11 11-28 11t-28-11q-11-11-11-28t11-28l344-344H600q-17 0-28.5-11.5T560-800q0-17 11.5-28.5T600-840h200q17 0 28.5 11.5T840-800v200q0 17-11.5 28.5T800-560q-17 0-28.5-11.5T760-600v-104Z"/></svg>
             Join the test
           </a>
         </div>
         <ol class="steps" data-when="test">
-          <li><span>Sign in with the Google account you were invited with.</span></li>
-          <li><span>Choose <strong>Become a tester</strong>.</span></li>
+          <li><span>Join the Pneu Testers group with the Google account on your phone.</span></li>
+          <li><span>Open the <a href="https://play.google.com/apps/testing/io.github.stantonmatt.pneu">test link</a> and choose <strong>Become&nbsp;a&nbsp;tester</strong>.</span></li>
           <li><span>Install Pneu from Google Play.</span></li>
         </ol>
         </div>
         <div class="qr" data-when="play"><img src="assets/qr-play.svg" width="112" height="112" alt="QR code linking to Pneu on Google Play" loading="lazy"><span>Open on your phone</span></div>
-        <div class="qr" data-when="test"><img src="assets/qr-test.svg" width="112" height="112" alt="QR code linking to the Pneu test on Google Play" loading="lazy"><span>Open on your phone</span></div>
+        <div class="qr" data-when="test"><img src="assets/qr-test.svg" width="112" height="112" alt="QR code linking to the Pneu Testers group" loading="lazy"><span>Open on your phone</span></div>
       </article>
 
       <!-- macOS: data-state="available" downloads Pneu-macOS.zip from the latest GitHub release. -->
@@ -305,10 +313,15 @@ body:not(:has([data-os=android][data-state=play])) .legal-play{display:none}
         </details>
       </article>
 
-      <!-- Windows: data-state="soon". When a release publishes Pneu-Windows-Setup.exe,
-           change it to data-state="available" to show the download button and the SmartScreen steps. -->
-      <article class="card plat" data-os="windows" data-state="soon" aria-labelledby="p-win">
+      <!-- Windows: data-state="store" shows the Microsoft Store badge (listing 9N48FLMGSDDV) and the
+           trademark line in the footer. data-state="available" is ready for a release asset named
+           Pneu-Windows-Setup.exe, with the SmartScreen steps; data-state="soon" shows Coming soon. -->
+      <article class="card plat" data-os="windows" data-state="store" aria-labelledby="p-win">
         <div class="plat-head"><h3 id="p-win">Windows</h3><span class="mine-tag">This device</span></div>
+        <p class="req" data-when="store">Windows 10 or later · x64</p>
+        <div class="act" data-when="store">
+          <a class="badge badge-ms" href="https://apps.microsoft.com/detail/9N48FLMGSDDV"><picture><source srcset="assets/ms-store-badge-en-light.svg" media="(prefers-color-scheme:dark)"><img src="assets/ms-store-badge-en-dark.svg" width="176" height="48" alt="Download from the Microsoft Store" loading="lazy"></picture></a>
+        </div>
         <p class="req" data-when="available">Windows 11</p>
         <div class="act" data-when="available">
           <a class="btn" href="https://github.com/StantonMatt/pneu/releases/latest/download/Pneu-Windows-Setup.exe">
@@ -411,6 +424,7 @@ cd pneu/desktop
     <a href="https://github.com/StantonMatt/pneu/blob/main/PRIVACY.md">Privacy policy</a>
   </div>
   <p class="legal legal-play">Google Play and the Google Play logo are trademarks of Google LLC.</p>
+  <p class="legal legal-ms">Microsoft, Microsoft Store and the Microsoft Store logo are trademarks of the Microsoft group of companies.</p>
 </footer>
 
 <script>
