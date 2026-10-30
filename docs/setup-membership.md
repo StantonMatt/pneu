@@ -16,17 +16,34 @@ signature or admission authority. Pins, mutual scope consent, terminal removals,
 pin uniqueness and frozen pairing fences remain authoritative.
 
 HELLO carries local scope and an assigned ID (omitted on disabled links).
-After authority/consent: absent/absent founds, absent/S joins, S/S synchronizes,
-S/T stays direct without roster exchange. This replaces counts and exact-member
-evidence for token pairing and existing-link action/offer/Allow. No invitation
-keys or address grammar change. The stable ID travels inside pinned TLS, but a
+After authority/consent: absent/absent founds only for token pairings; migration
+waits for an advertised ID. Absent/S joins, S/S synchronizes, S/T stays direct
+without roster exchange. This replaces counts and exact-member evidence for
+token pairing and existing-link action/offer/Allow. No invitation keys or address
+grammar change. The stable ID travels inside pinned TLS, but a
 provisional client can see it before token validation; exclude it from invitations,
 mDNS and future relay rendezvous identifiers.
 
-For absent/absent, the lower authenticated device ID generates fresh random S,
-atomically persisting ID/self/first member. The other waits without MEMBERS;
-reconnect advertises S, the other joins atomically and reconnects. Synchronize
-only at S/S. The proposer has no later role; IDs are never derived or reused.
+For token pairing with absent/absent, the lower authenticated device ID generates
+fresh random S, atomically persisting ID/self/first member. The other waits
+without MEMBERS; reconnect advertises S, the other joins atomically and
+reconnects. Synchronize only at S/S. The proposer has no later role; IDs are never
+derived or reused.
+
+Migration founds only via **Link existing device** on an unassigned device with
+no pending prompt: enable local consent on the covered bindings, reconnect and
+wait briefly for refreshed HELLOs; join any advertised S, else atomically persist
+fresh random S/self-only roster, advance setup generation, then reconnect
+advertising S. Link
+with a pending prompt acts as Allow and joins instead. Allow, bulk enable and
+migration offers only join an advertised ID through an authenticated, mutually
+enabled link; absent/absent does nothing. There is no migration proposer: any
+enabled member advertising S can supply the join. A self-only Link-founded setup
+is normally assigned, with no special replaceability; dissolution is unchanged.
+A token pairing enables only its new link; if it completes while a migration
+join commits on the same device, serialized activation and the MEMBERS ID
+backstop keep conflicting assignments as a direct link, never a merge.
+
 One short device-wide transaction permits unassigned → S or idempotent S → S;
 first durable assignment wins concurrent S/T joins. No gate spans network/prompt
 waits. A local setup generation fences prompts, snapshots and receipts across
@@ -100,11 +117,16 @@ once-only identities, scoped to the new generation.
   deliberately adds no transitive receipt attestation. A phone cannot directly
   obtain an ACK from another phone. Do not show all-devices-complete on inference.
 * Both migrated endpoints start `ask`, so neither sends MEMBERS automatically.
-  Product must expose an explicit **Link existing device** action: enable the
-  local scope and reconnect. A compatible enabled/ask HELLO offers one durable
-  prompt without a roster (even absent/absent); Allow refreshes HELLO and rechecks
-  compatibility before enabling. Separate IDs block the offer/Allow; disabled
-  links require explicit local opt-in. Capability negotiation grants no consent.
+  Product must expose an explicit **Link existing device** action: enable every
+  local `ask` binding (and a selected `disabled` one) and reconnect; when
+  unassigned with no pending prompt, join an ID a refreshed peer HELLO
+  advertises, else found S. With a pending prompt, Link acts as Allow and joins instead. A
+  compatible enabled/ask HELLO offers one durable prompt without a roster;
+  Allow refreshes HELLO, rechecks compatibility, enables every local `ask`
+  binding and resolves the device's other prompts as allowed. Each link activates
+  separately; `disabled` links require their own explicit local opt-in and are
+  never bulk-enabled. Separate IDs block the offer/Allow on that link.
+  Capability negotiation grants no consent.
 * The remote setup ID is unavailable from today's URI; late detection may keep
   a pair direct. No group-merge approval, admin prompt or new invitation key is
   introduced.
@@ -115,20 +137,29 @@ A is the owner's phone, B the Linux PC, C the Mac. All three direct pairs
 already exist; after upgrade every local scope is `ask`, every setup ID absent.
 Preserve pins, binding generations, switches, queues and unrelated receipts.
 
-1. On A, choose **Link existing device** for B. A enables its local scope and
-   reconnects; the absent/absent HELLO pair gives B one prompt without a roster.
-   Allow refreshes HELLO and enables B's scope. A (the lower authenticated ID)
-   founds random S, atomically persisting self/B and S. B waits unassigned until
-   A reconnects advertising S, then joins S and reconnects. Matching S/S enables
-   synchronization; neither exports its `ask` link to C.
-2. On A, choose the same action for C. The HELLO pair is S/absent; C gets one
-   prompt, Allow refreshes compatibility and enables its scope. C adopts S in
-   the first-member transaction and reconnects. A–C synchronize only as S/S;
-   A can supply B to C and C to B without changing their B–C `ask` scopes.
-3. Explicitly link C on B (or B on C). Both already advertise S, so activation
-   passes immediately, without waiting for A's B/C roster gossip. The remote
-   gets one prompt and Allow rechecks S/S; after reconnect all scopes are enabled.
-   A roster alone never opts in an existing `ask` or disabled link.
+Link and Allow are device-wide, so this takes three user actions:
+
+1. On A, choose **Link existing device**. A enables both its `ask` scopes (A–B,
+   A–C) and reconnects; with no pending prompt and no refreshed peer advertising
+   an ID, A atomically founds random S with a self-only roster and advances setup
+   generation. It reconnects advertising S; B and C each get
+   one prompt, without a roster. A's device ID need not be the lowest.
+2. On B, Allow. It enables B–A and B–C and resolves B's other prompts. B joins S
+   via A's authenticated, mutually enabled S/absent link, atomically persisting
+   S/self/A, then reconnects. B–C is enabled on B only, so C's prompts remain.
+3. On C, Allow. It enables C–A and C–B and resolves C's other prompt. C joins S
+   via the phone or the PC, whichever enabled member advertises S first, then
+   reconnects. B–C sees S/S without waiting for A's roster gossip. All scopes
+   end enabled; links synchronize only as S/S.
+
+Concurrent Allows on B and C are safe even with device IDs ordered A<C<B and
+B–C HELLOs delivered first: absent/absent cannot found; either may join via A,
+then supply S to the other. If A disappears after B allows but before B assigns,
+B can join through C once C advertises S. A roster alone never opts in an
+existing `ask` or disabled link.
+
+Independent Link taps on two unassigned devices with no pending prompts found
+two setups; this is the intended no-merge boundary.
 
 Independent A–B and C–D bootstraps instead found S and T. An A–C action sees S/T
 and keeps the direct link, with no offer or roster exchange. If these assignments
@@ -153,14 +184,16 @@ serialization choices are not a JSON signing/canonicalization scheme.
 ### setup-id-compatibility
 
 These are nested `setup` HELLO objects, not MEMBERS frames. Both sides evaluate
-the same pair; after authority/consent the four ID cases below decide assignment
-or synchronization. An enabled/ask offer checks compatibility before prompting;
-Allow refreshes HELLO and rechecks. `expected` is test metadata, not a wire field.
+the same pair; after authority/consent the ID cases below decide assignment
+or synchronization, with absent/absent founding restricted to token pairing.
+An enabled/ask offer checks compatibility before prompting; Allow refreshes
+HELLO and rechecks. `expected` is test metadata, not a wire field.
 S/T values are deterministic test fixtures, never a recipe for founding IDs.
 
 ```json
 [
-  {"stage":"A-B mutual opt-in","left":{"scope":"enabled"},"right":{"scope":"enabled"},"expected":"absent/absent: lower authenticated ID founds random S; other waits for HELLO"},
+  {"stage":"A-B token pairing mutual opt-in","left":{"scope":"enabled"},"right":{"scope":"enabled"},"expected":"absent/absent: lower authenticated ID founds random S; other waits for HELLO"},
+  {"stage":"B-C migration mutual opt-in before assignment","left":{"scope":"enabled"},"right":{"scope":"enabled"},"expected":"absent/absent: no founding; wait for either endpoint to advertise an ID"},
   {"stage":"A-C mutual opt-in","left":{"scope":"enabled","setup_id":"00000000000000000000000000000000"},"right":{"scope":"enabled"},"expected":"S/absent: C joins S, reconnects before synchronization"},
   {"stage":"C-A mutual opt-in","left":{"scope":"enabled"},"right":{"scope":"enabled","setup_id":"00000000000000000000000000000000"},"expected":"absent/S: C joins S, reconnects before synchronization"},
   {"stage":"B-C before roster catch-up","left":{"scope":"enabled","setup_id":"00000000000000000000000000000000"},"right":{"scope":"enabled","setup_id":"00000000000000000000000000000000"},"expected":"S/S: synchronize without exact-member evidence"},
@@ -317,11 +350,20 @@ unrelated peer isolation. A static codec pass is not runtime pairing proof.
 | Legacy | Peer lacks setup or lacks mesh, unknown capability ignored | No MEMBERS sent; old direct file/clipboard/settings behavior preserved, no trust/generation change. Setup-without-mesh/object malformed. |
 | Switch off | Dialer or inviter chooses off; other endpoint enabled | New pair stays direct; neither introduces it to other members. Unexpected scoped traffic on disabled link NACKs unsupported_kind without mutation or prompt. |
 | Migration | Upgrade to ask, explicit local action, deny/allow, restart; absent or compatible IDs | Enabled/ask HELLO gives one durable prompt without MEMBERS; both-ask sends nothing. No roster/clock/receipt import before Allow; refresh HELLO and recheck assignment, then reconnect with matching persisted IDs to synchronize. Deny/disabled never prompts automatically. |
-| Setup ID compatibility | Run setup-id-compatibility in both directions, token pairing and existing-link action/offer/Allow; disabled local scope | Absent/absent founds, absent/S joins, S/S synchronizes, S/T keeps direct with no roster. Mutual enabled scope and authority required; disabled HELLO omits ID. IDs never bypass pins, tombstones or fences. Ordinary same-ID reconnect preserves consent. |
-| Three-device full-mesh migration | A phone, B Linux PC, C Mac, all pairwise ask; run walk-through with restart/replay of prompts; delay B/C gossip | A–B founds S, A–C adopts S, B–C sees S/S without waiting for gossip. Each explicit initiation prompts the remote once; Allow rechecks IDs. All scopes end enabled without binding/queue/settings resets; ask links never supply export authority. |
+| Setup ID compatibility | Run setup-id-compatibility in both directions, token pairing and existing-link action/offer/Allow; disabled local scope | Absent/absent founds only for token pairings; migration waits for an advertised ID. Link without a pending prompt founds locally if unassigned. Absent/S joins, S/S synchronizes, S/T keeps direct with no roster. Mutual enabled scope and authority required; disabled HELLO omits ID. IDs never bypass pins, tombstones or fences. Ordinary same-ID reconnect preserves consent. |
+| Three-device full-mesh migration | A phone, B Linux PC, C Mac, all pairwise ask; Link on A, Allow on B, Allow on C; restart/replay of prompts; delay B/C gossip | A's Link atomically founds S/self-only roster and advances setup generation; B joins via A; C joins via A or B, whichever advertises S first. B–C sees S/S without waiting for gossip. Three user actions total; each device prompts at most once per initiator and one Allow resolves its other prompts; `disabled` links are never bulk-enabled. All scopes end enabled without binding/queue/settings resets; ask links never supply export authority. |
+| Reordered migration HELLOs | IDs A<C<B; Link on A; Allow on B/C; deliver B–C HELLOs before A's assignment HELLOs, then reverse order; vary A–B/A–C delivery order | Only A's Link founds S. B–C absent/absent never founds T, even though C<B; B/C join the first enabled member advertising S and finish S/S. |
+| Migration founder loss | A's Link founds S; B allows but remains unassigned; C joins S; A disappears before B commits; deliver C's S HELLO to B | B joins S via authenticated, mutually enabled C, reconnects and synchronizes at S/S; no designated-proposer wait or second founding ID. |
+| Concurrent migration Allows | After A's Link, Allow on B and C concurrently; race absent/absent B–C HELLOs against A's S HELLOs and both join commits | B/C only join advertised S, with one durable assignment each; absent/absent cannot found. All three end in S, other prompts resolve and links synchronize only at S/S. |
+| Link joins before founding | A advertises S; unassigned B has A's link `disabled` (no prompt); user taps Link for A on B; separately, a peer unreachable during the window later advertises T | B enables, reconnects, sees A's refreshed S HELLO and joins S without founding. The late T peer yields S/T and a direct link, no merge. |
+| Link defers to an advertised ID | A is assigned S with A–B `ask`; unassigned B taps Link (no prompt); A allows only after B's discovery window | B's refreshed HELLO from A advertises S, so B never founds; it keeps its pending-Link record, shows waiting for A, and joins S when A–B becomes enabled. If A discovers B first (B founded before A's HELLO), the later Link joins instead; covered separately from the two-setup case. |
+| Link survives restart | Kill B after Link persisted consent and the pending-Link record but before founding or joining; restart | Discovery resumes from the start; B joins an advertised S or founds after the window. Never left enabled and unassigned with no pending record. |
+| Link with a pending prompt | A advertises S; unassigned B has A's prompt; tap B's Link banner instead of Allow | Link acts as Allow: enable B's ask bindings, resolve its other prompts, join advertised S and reconnect; no new setup founded. |
+| Independent Link taps | Unassigned A/B have no pending prompts; tap Link on both; hold each side's assigned HELLO until both founding commits have happened, then deliver in both orders | Each atomically founds its own S/T with self-only roster. They remain normal assigned setups, not replaceable; S/T keeps the direct link with no merge or roster exchange. |
+| Token pairing racing migration join | Unassigned B completes a token pairing with unassigned D while B's enabled migration join to S commits; arrange competing token founding T, swap the token proposer and test both commit orders with delayed HELLO/MEMBERS | Token pairing enables only B–D. First durable assignment wins; the conflicting link stays direct, with serialized activation and MEMBERS ID checks preventing a merge or cross-setup effects. |
 | Independent bootstraps stay separate | A–B found S, C–D found T; A–C ask action in either direction; also assign S/T while prompt pending | Block offer/Allow on S/T, disable evaluated scope, resolve prompt with Direct link kept; separate setups not linked. Preserve direct queues/settings; no cross-group roster, clock or receipt mutation. |
 | Concurrent joins to different IDs | Unassigned E races mutually enabled joins to S and T in both orders; fault before/after durable assignment | Device-wide local transaction admits exactly one ID; first durable assignment wins. Other link stays direct, no cross-group merge. No gate held over network/prompt; restart preserves assignment; mismatched late MEMBERS NACKs without effects. |
-| Founding on both ends and crash recovery | Both absent/enabled; swap lower ID and initiator; crash lower-ID proposer after assignment commit before reconnect and crash adopter before/after commit | Only lower authenticated ID generates random S; ID/self/first member atomic. Other waits unassigned without MEMBERS; restart advertises same persisted S, other adopts once and reconnects. Synchronize only at S/S; no second founding ID or repeated install. Retired IDs never reused or derived from identities/roster. |
+| Token founding on both ends and crash recovery | Token pairing, both absent/enabled; swap lower ID and initiator; crash lower-ID proposer after assignment commit before reconnect and crash adopter before/after commit | Only lower authenticated ID generates random S; ID/self/first member atomic. Other waits unassigned without MEMBERS; restart advertises same persisted S, other adopts once and reconnects. Synchronize only at S/S; no second founding ID or repeated install. Retired IDs never reused or derived from identities/roster. |
 | MEMBERS ID mismatch | Joined S receives valid T snapshot, including retained transfer ID; unassigned device receives stray S snapshot | NACK unsupported_kind, retryable=false; no roster, clock, receipt or worker change. Report separate setups for mismatch; unassigned cannot adopt without mutually enabled founding/join context. Missing/null/invalid ID malformed. |
 | Last-member dissolution | Remove last other active member locally or via MEMBERS; repeat with another retained active member whose direct scope is ask/offline | Last removal atomically clears ID and positive roster, advances setup generation, retains all tombstones/deny/high-water marks. Another active member preserves S. Later join/founding exports no retired state and cannot resurrect denied keys; retained history still counts toward local tombstone budgets. |
 | Stale work after leave/rejoin | Capture prompt, snapshot, pending send and receipt in generation g; dissolve/withdraw and join another ID, then also retry same-ID rejoin | All g work fails generation recheck at commit/use, including same-ID work; cannot enable scope, merge, observe clocks, replay receipt or send retired state. Fresh-generation consent/work required. |
