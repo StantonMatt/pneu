@@ -3628,7 +3628,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "pneu-proto"
-version = "2.2.1"
+version = "2.2.2"
 dependencies = [
  "hex",
  "percent-encoding",
@@ -3641,7 +3641,7 @@ dependencies = [
 
 [[package]]
 name = "pneu-sim"
-version = "2.2.1"
+version = "2.2.2"
 dependencies = [
  "anyhow",
  "pneu-proto",
@@ -3652,7 +3652,7 @@ dependencies = [
 
 [[package]]
 name = "pneud"
-version = "2.2.1"
+version = "2.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
