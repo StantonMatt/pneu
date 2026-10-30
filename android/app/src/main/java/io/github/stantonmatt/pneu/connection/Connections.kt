@@ -15,6 +15,7 @@ class Connections(private val app:AppGraph) {
     internal fun installed(attempt:PairingAttempt,binding:DeliveryBinding) {installation.value=Installation(attempt.id,binding)}
     private val activeAttempt=MutableStateFlow<PairingAttempt?>(null)
     val attempt=activeAttempt.asStateFlow()
+    val setupProblem=MutableStateFlow<String?>(null)
     internal fun setAttempt(value:PairingAttempt?) {activeAttempt.value=value;value?.let {pairingPin=it.invitation.fingerprint;lastStartedAttemptId=it.id};publish()}
     internal fun attemptFor(pin:String?)=attempt.value?.takeIf {pin==null || it.invitation.fingerprint==pin}
     val state=MutableStateFlow(LinkState()) // Aggregate status; action eligibility is computed from every recipient.
@@ -60,7 +61,7 @@ class Connections(private val app:AppGraph) {
                     app.connectionView()
                 }.recoverReads().collect {view->
                     val p=view.prefs;val a=view.attempt
-                    val pins=(p.devices.filter {!it.pairingLost}.map {it.pin}+listOfNotNull(a?.invitation?.fingerprint)).toSet()
+                    val pins=(p.devices.filter {!it.pairingLost && it.role=="computer" && it.deviceId !in p.resetPeers}.map {it.pin}+listOfNotNull(a?.invitation?.fingerprint)).toSet()
                     val removed=workers.filterKeys {it !in pins}.values.toList()
                     watchers.keys.filter {it !in pins}.forEach {watchers.remove(it)?.cancel()}
                     workers=workers.filterKeys {it in pins};removed.forEach {it.stop()};removed.forEach {it.awaitStopped()}
@@ -98,8 +99,8 @@ class Connections(private val app:AppGraph) {
         publish()
     }
     fun cancelTransfer(mediaId:String,peerId:String?=null)=workers.filterKeys {peerId==null || app.prefs.value.devices.find {peer->peer.deviceId==peerId}?.pin==it}.values.forEach {it.cancelTransfer(mediaId)}
-    suspend fun unpair(expected:ConfirmedBinding=ConfirmedBinding.from(app.prefs.value)):Boolean =
-        workers[expected.pin]?.unpair(expected) ?: app.forgetBinding(confirmed=expected)
+    suspend fun unpair(expected:ConfirmedBinding=ConfirmedBinding.from(app.prefs.value),setupMember:ConfirmedSetupMember?=null):Boolean =
+        workers[expected.pin]?.unpair(expected,setupMember) ?: app.forgetBinding(confirmed=expected,setupMember=setupMember)
     fun stop() {stopped=workers.values.toList();stopped.forEach {it.stop()};job?.cancel();workers=emptyMap();publish()}
     internal suspend fun awaitStopped() {job?.join();stopped.forEach {it.awaitStopped()}}
     internal val discoveryActive get()=workers.values.any {it.discoveryActive}

@@ -85,6 +85,8 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
         if(target===socket)tcpSocket?.runCatching {close()}
         target?.runCatching {close()}
     }
+    @Volatile private var membersFence:Triple<DeliveryBinding,Long,String>?=null
+    @Volatile private var membersReceipt:Pair<String,CompletableDeferred<Frame.Control>>?=null
     @Volatile private var settingsReady=false
     private val settingsEvents=Channel<Unit>(Channel.CONFLATED)
     @Volatile private var settingsReceipt:Pair<String,CompletableDeferred<Frame.Control>>?=null
@@ -215,8 +217,8 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                         if(issue!=null)lastIssue=issue
                         if(issue!=null) {attempt?.let {app.rejectPairing(it,issue)};break}
                         if (e.code == "unauthorized") {
-                            if(invitation == null) {rejected=PairingRejection.unauthorized(e.code,pinnedLeafVerified);if(rejected)onUnauthorized?.invoke()}
-                            else app.rejectPairing(requireNotNull(attempt),ConnectionStatus.UNREACHABLE)
+                            if(invitation == null) {rejected=PairingRejection.unauthorized(e.code,pinnedLeafVerified,readPrefs().peer?.setupScoped==true);if(rejected)onUnauthorized?.invoke()}
+                            else if(attempt!=null)app.rejectPairing(attempt,ConnectionStatus.UNREACHABLE)
                             break
                         }
                         if (invitation != null && e.code in setOf("invalid_token", "expired_token", "pairing_closed", "already_paired", "storage_failed")) {
@@ -237,7 +239,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                         val endingBinding=authenticatedBinding
                         clipboardCleanup=endingBinding?.let {it to ("mesh" !in capabilities)}
                         authenticatedBinding=null
-                        settingsReady=false;settingsReceipt=null
+                        settingsReady=false;settingsReceipt=null;membersReceipt=null;membersFence=null
                         activeReceipt = null; textReceipt=null;textEmission=null;capabilities=emptySet(); receiptReady=false;fileEmission=null
                         // Reconcile even if a subsequent pairing-loss persistence step fails.
                         // Runtime authority and disconnected UI are mandatory:
@@ -326,7 +328,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
             synchronized(discovery) { addAll(discovery.values.filter { it.first == pin }.flatMap { it.second }.filter { !it.tailscale }) }
             addAll(addresses.filter { !it.tailscale })
         } else emptyList()
-        return (lan + if (p.tailscale) addresses.filter { it.tailscale } else emptyList()).distinct()
+        return (lan + if (p.tailscale) addresses.filter { it.tailscale } else emptyList()).distinct().take(24)
     }
     private fun localNetworkGranted()=android.os.Build.VERSION.SDK_INT<37 || context.granted(android.Manifest.permission.ACCESS_LOCAL_NETWORK)
     private fun ensureDiscovery(p:Prefs) {
@@ -349,12 +351,16 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                                 attempt:PairingAttempt?,outcome:ConnectionOutcome?,onReady:()->Unit):Unit = coroutineScope {
         var sessionOutcome=outcome
         val name=p.selfName.ifEmpty {Settings.Global.getString(context.contentResolver,Settings.Global.DEVICE_NAME) ?: android.os.Build.MODEL}
+        val localScope=attempt?.prior?.setupScope ?: attempt?.let {if(it.setupEnabled)SetupScope.ENABLED else SetupScope.DISABLED} ?: p.peer?.setupScope ?: SetupScope.ASK
+        val localSetup=p.membership.hello(localScope)
         val hello=phase(ssl,10000) {
-        send(Frame.Control(Type.HELLO, json("version" to 1, "device_id" to p.deviceId, "name" to utf8Prefix(name,128).ifEmpty {"Pneu"}, "capabilities" to listOf("files","clipboard_text","clipboard_image","mesh"),"role" to "phone", "paused" to p.paused)))
+        send(Frame.Control(Type.HELLO, json("version" to 1, "device_id" to p.deviceId, "name" to utf8Prefix(name,128).ifEmpty {"Pneu"}, "capabilities" to listOf("files","clipboard_text","clipboard_image","mesh","setup"),"role" to "phone", "paused" to p.paused).apply {add("setup",localSetup.json())}))
         readControl(ssl)
         }
         if (hello.type == Type.ERROR) throw RemoteError(hello.body["code"].asString)
-        require(hello.type == Type.HELLO)
+        if(hello.type!=Type.HELLO) {
+            send(Frame.Control(Type.ERROR,json("code" to "unexpected_message")));throw RemoteError("unexpected_message")
+        }
         val advertised=hello.body["capabilities"].asJsonArray.map {it.asString}.toSet()
         if (ConnectionStatus.hello(hello.body["version"].asLong,advertised)!=null) {
             // HELLO already establishes the actionable failure. A failed
@@ -374,7 +380,8 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
             send(Frame.Control(Type.ERROR,json("code" to "unauthorized")))
             throw RemoteError("protocol_identity")
         }
-        val deferred=ArrayDeque<Frame.Control>()
+        val remoteSetup=if("setup" in advertised)SetupWire.hello(hello.body["setup"]) else null
+        val deferred=PairingControlBuffer(remoteSetup!=null)
         // Recovery can race a READY peer's file lane. Drain with the ordinary
         // framing checks and NACK only at END; never acquire storage or effects
         // before PAIR_RESULT has durably installed the binding. An in-flight
@@ -405,7 +412,12 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                 if(frame.type==Type.PAIR_RESULT || frame.type==Type.ERROR) {result=frame;break}
                 when(frame.type) {
                     Type.PING->send(Frame.Control(Type.PONG,frame.body))
-                    Type.CLIPBOARD,Type.STATUS,Type.PEER_SETTINGS->{require(deferred.size<4);deferred.add(frame)}
+                    Type.MEMBERS->{
+                        try {deferred.hold(frame)}catch(_:IllegalArgumentException) {
+                            send(Frame.Control(Type.ERROR,json("code" to "unexpected_message")));throw RemoteError("unexpected_message")
+                        }
+                    }
+                    Type.CLIPBOARD,Type.STATUS,Type.PEER_SETTINGS->deferred.hold(frame)
                     Type.FILE_BEGIN,Type.FILE_END->recoveryFile(frame)
                     else->throw RemoteError("unexpected_message")
                 }
@@ -414,7 +426,8 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
             if (!result.body["accepted"].asBoolean) throw RemoteError(result.body["code"].asString)
             // Persist before processing any READY traffic, including immediate peer data.
             if(epoch!=dialEpoch.get())throw java.io.IOException("Stale pairing")
-            authenticatedBinding=app.installSessionBinding(resolved,pcId,p.deviceId,onOutcome={sessionOutcome=it}) {authenticatedBinding=it}
+            authenticatedBinding=app.installSessionBinding(resolved,pcId,p.deviceId,setupHandshake=SetupHandshake(p.membership.generation,localSetup,remoteSetup,app.setupIdentity(p,name),hello.body["name"].asString,
+                if(mesh)hello.body["addresses"]?.asJsonArray?.map {Endpoint.parse(it.asString)}.orEmpty() else emptyList()),onOutcome={sessionOutcome=it}) {authenticatedBinding=it}
                 ?: throw java.io.IOException("Stale pairing")
             }
         }
@@ -426,7 +439,16 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
         val boundPeer=Peer(attempt?.invitation?.name ?: p.peer!!.name,sessionBinding.pin,pcId,emptyList(),generation=sessionBinding.generation)
         check(app.preferences.connected(sessionBinding,endpoint)) {"Binding changed"}
         capabilities=hello.body["capabilities"].asJsonArray.map {it.asString}.toSet()
-        app.preferences.hello(sessionBinding,hello.body["name"].asString,hello.body["addresses"]?.asJsonArray?.map {Endpoint.parse(it.asString)}.orEmpty(),mesh)
+        app.preferences.hello(sessionBinding,hello.body["name"].asString,if(mesh)hello.body["addresses"]?.asJsonArray?.map {Endpoint.parse(it.asString)}.orEmpty() else emptyList(),mesh,remoteSetup!=null)
+        if(readPrefs().membership.generation!=p.membership.generation)throw RemoteError("closing")
+        val setupResult=app.evaluateSetupHello(sessionBinding,p.membership.generation,localSetup,remoteSetup,app.setupIdentity(p,name),p.membership.pendingLink?.id) {
+            epoch==dialEpoch.get() && authenticatedBinding==sessionBinding
+        }
+        if(setupResult==SetupHelloResult.RECONNECT || setupResult==SetupHelloResult.SEPARATE)throw RemoteError("closing")
+        val setupEnabled=setupResult==SetupHelloResult.SYNCHRONIZE
+        val setupGeneration=p.membership.generation
+        val setupId=localSetup.setupId
+        membersFence=if(setupEnabled && setupId!=null)Triple(sessionBinding,setupGeneration,setupId) else null
         app.abandonClipboard(sessionBinding,sessionOnly=!mesh)
         settingsReady=!mesh
         app.queue.pendingPeer(pcId).filter {it.bindingGeneration==sessionBinding.generation && it.error=="unsupported_kind" && !it.rejectedCapabilities.startsWith("settings:") && it.rejectedCapabilities!=capabilities.sorted().joinToString(",") && (if(it.kind=="text")"clipboard_text" in capabilities else "files" in capabilities && (it.kind!="clipboard_image" || "clipboard_image" in capabilities))}.forEach {
@@ -497,9 +519,35 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
             catch(e:CancellationException) {throw e}
             catch(_:Exception) {send(Frame.Control(Type.NACK,json("transfer_id" to id,"code" to "storage_failed","retryable" to true)))}
         }
+        suspend fun receiveMembers(frame:Frame.Control) {
+            if(remoteSetup==null)throw MeshViolation("unexpected_message")
+            val id=frame.body["transfer_id"].asString
+            if(!setupEnabled || setupId==null) {
+                send(Frame.Control(Type.NACK,json("transfer_id" to id,"code" to "unsupported_kind","retryable" to false)));return
+            }
+            try {
+                val duplicate=app.receiveSetupMembers(sessionBinding,setupGeneration,setupId,frame.body,app.setupIdentity(p,name)) {
+                    ready && epoch==dialEpoch.get() && authenticatedBinding==sessionBinding
+                }
+                app.connection.setupProblem.value=null
+                send(Frame.Control(Type.ACK,json("transfer_id" to id,"deduplicated" to duplicate)))
+            }catch(e:SetupCapacity) {
+                app.connection.setupProblem.value="Setup capacity reached"
+                send(Frame.Control(Type.NACK,json("transfer_id" to id,"code" to "storage_failed","retryable" to true)))
+            }catch(e:RemovedSetupSender) {throw RemoteError("closing")}
+            catch(e:SetupUnavailable) {
+                if(frame.body["setup_id"].asString!=setupId)app.connection.setupProblem.value="Direct link kept; separate setups not linked"
+                send(Frame.Control(Type.NACK,json("transfer_id" to id,"code" to "unsupported_kind","retryable" to false)))
+            }
+            catch(e:SetupReceiptConflict) {send(Frame.Control(Type.NACK,json("transfer_id" to id,"code" to "id_conflict","retryable" to false)))}
+            catch(e:MeshViolation) {throw e}
+            catch(e:CancellationException) {throw e}
+            catch(_:Exception) {send(Frame.Control(Type.NACK,json("transfer_id" to id,"code" to "storage_failed","retryable" to true)))}
+        }
         suspend fun content(frame:Frame.Control) {
             try {when(frame.type) {
                 Type.PEER_SETTINGS->receiveSettings(frame)
+                Type.MEMBERS->receiveMembers(frame)
                 Type.CLIPBOARD->send(app.clipboard.receive(pcId,frame.body,sessionBinding,mesh))
                 else->Unit
             }}catch(e:MeshViolation) {send(Frame.Control(Type.ERROR,json("code" to e.code)));throw RemoteError(e.code)}
@@ -537,7 +585,45 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                 events.cancel();settingsReceipt=null
             }
         }} else null
-        deferred.forEach {content(it)}
+        val membersSender=if(setupEnabled && setupId!=null)launch {
+            val events=Channel<Unit>(Channel.CONFLATED)
+            val watch=launch {app.prefs.map {it.membership}.distinctUntilChanged().collect {events.trySend(Unit)}}
+            var first=true
+            try {while(isActive) {
+                try {
+                    val current=readPrefs().membership
+                    if(current.generation!=setupGeneration || current.setupId!=setupId)break
+                    val delivery=current.sends[pcId]
+                    val canonical=MembersSnapshot("0".repeat(32),setupId,current.roster).canonical()
+                    val confirmed=delivery?.acknowledged?.takeIf {it.isNotEmpty()}?.let {SetupWire.decode(com.google.gson.JsonParser.parseString(it).asJsonObject).canonical()}
+                    if(first || delivery?.pending?.isNotEmpty()==true || confirmed!=canonical) {
+                        val snapshot=app.withBinding(sessionBinding) {
+                            check(epoch==dialEpoch.get() && ready)
+                            app.preferences.prepareMembers(sessionBinding,setupGeneration,setupId) {epoch==dialEpoch.get() && ready && authenticatedBinding==sessionBinding}
+                        } ?: throw SetupUnavailable()
+                        val receipt=CompletableDeferred<Frame.Control>();membersReceipt=snapshot["transfer_id"].asString to receipt
+                        send(Frame.Control(Type.MEMBERS,snapshot))
+                        val response=awaitReceipt(receipt);membersReceipt=null
+                        if(response.type==Type.ACK) {
+                            app.withBinding(sessionBinding) {app.preferences.acknowledgeMembers(sessionBinding,setupGeneration,setupId,snapshot) {epoch==dialEpoch.get() && ready && authenticatedBinding==sessionBinding}}
+                            first=false
+                        } else if(response.body["code"].asString=="storage_failed")delay(60000)
+                        else {
+                            app.connection.setupProblem.value="Device linking paused: ${response.body["code"].asString}"
+                            val blocked=readPrefs().membership.roster
+                            while(readPrefs().membership.roster==blocked)events.receive()
+                            continue
+                        }
+                    } else events.receive()
+                }catch(e:CancellationException) {throw e}
+                catch(e:TransportFailure) {closeSocket(ssl);throw e}
+                catch(e:RemoteError) {closeSocket(ssl);throw e}
+                catch(e:SetupUnavailable) {break}
+                catch(e:RemovedSetupSender) {break}
+                catch(_:Exception) {membersReceipt=null;delay(60000)}
+            }}finally {membersReceipt=null;watch.cancel();events.close()}
+        } else null
+        deferred.afterInstall(sessionBinding.matches(readPrefs())).forEach {content(it)}
         fun launchSender(text: Boolean)=launch {
             val work=Channel<Unit>(Channel.CONFLATED)
             val events=launch {combine(app.prefs,app.work,state.map {it.status to it.cellular}.distinctUntilChanged()) {_,_,_->Unit}.collect {work.trySend(Unit)}}
@@ -656,7 +742,12 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                     Type.ACK, Type.NACK -> {
                         val receipt = activeReceipt
                         val id=frame.body["transfer_id"].asString
-                        val target=if(receiptReady && receipt?.first==id)receipt else textReceipt?.takeIf {it.first==id} ?: settingsReceipt?.takeIf {it.first==id}
+                        val target=if(receiptReady && receipt?.first==id)receipt else textReceipt?.takeIf {it.first==id} ?: settingsReceipt?.takeIf {it.first==id} ?: membersReceipt?.takeIf {it.first==id}
+                        if(target!=null && target===membersReceipt) {
+                            val fence=membersFence ?: throw RemoteError("closing")
+                            val current=readPrefs()
+                            if(current.membership.generation!=fence.second || current.membership.setupId!=fence.third || !fence.first.matches(current))throw RemoteError("closing")
+                        }
                         require(target != null && target.second.complete(frame))
                     }
                     Type.UNPAIR -> {
@@ -664,16 +755,19 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                         // visible authority before any DataStore observer can see
                         // removal; persistence failure cannot make this link READY.
                         bindingChanged();app.connection.sessionChanged(sessionBinding)
-                        app.forgetBinding(boundPeer,sessionBinding.phoneId,internalOutcome=sessionOutcome); throw RemoteError("closing")
+                        if(localScope==SetupScope.ENABLED && remoteSetup?.scope==SetupScope.ENABLED)
+                            app.withdrawSetup(sessionBinding,setupGeneration) {epoch==dialEpoch.get() && authenticatedBinding==sessionBinding}
+                        else app.forgetBinding(boundPeer,sessionBinding.phoneId,internalOutcome=sessionOutcome,remoteUnpair=true)
+                        throw RemoteError("closing")
                     }
                     Type.ERROR -> throw RemoteError(frame.body["code"].asString)
                     Type.STATUS -> Unit
-                    Type.CLIPBOARD,Type.PEER_SETTINGS -> content(frame)
+                    Type.CLIPBOARD,Type.PEER_SETTINGS,Type.MEMBERS -> content(frame)
                     Type.FILE_BEGIN,Type.FILE_END -> receiveFile(frame)
                     else -> { send(Frame.Control(Type.ERROR, json("code" to "unexpected_message"))); throw RemoteError("unexpected_message") }
                 }
             }
-        } finally { closeSocket(ssl); monitor.cancel(); sender.cancel(); textSender.cancel(); writeWatchdog.cancel();settingsSender?.cancel();receiveWatchdog.cancel();receiveWake.close()
+        } finally { closeSocket(ssl); monitor.cancel(); sender.cancel(); textSender.cancel(); writeWatchdog.cancel();settingsSender?.cancel();membersSender?.cancel();receiveWatchdog.cancel();receiveWake.close()
             withContext(NonCancellable) {
                 state.update {it.copy(incoming=null)}
                 runCatching {receiver.disconnect()}
@@ -780,6 +874,12 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
         if(emission!=null)beforeFirstFrame(emission.row)
         return writes.withLock {
         val s = socket ?: throw TransportFailure(java.io.IOException("Disconnected"))
+        if(frame is Frame.Control && frame.type==Type.MEMBERS) {
+            val fence=membersFence ?: throw SetupUnavailable()
+            val current=readPrefs()
+            if(!ready || !fence.first.matches(current) || current.membership.generation!=fence.second ||
+                current.membership.setupId!=fence.third || current.membership.withdrawn || current.peer?.setupScope!=SetupScope.ENABLED)throw SetupUnavailable()
+        }
         if(unpairing)throw TransportFailure(java.io.IOException("Unpairing"))
         if(frame is Frame.Chunk || (frame is Frame.Control && frame.type in setOf(Type.FILE_BEGIN,Type.CLIPBOARD))) {
             val current=SendFailures.local("local_storage") {readPrefs()}
@@ -833,14 +933,14 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
         textEmission?.takeIf {it.row.mediaId==mediaId}?.cancel()
     }
     internal var beforeUnpairRemoval:suspend ()->Unit={}
-    suspend fun unpair(expected:ConfirmedBinding=ConfirmedBinding.from(app.prefs.value)):Boolean = withContext(Dispatchers.IO + NonCancellable) {unpairs.withLock {
+    suspend fun unpair(expected:ConfirmedBinding=ConfirmedBinding.from(app.prefs.value),setupMember:ConfirmedSetupMember?=null):Boolean = withContext(Dispatchers.IO + NonCancellable) {unpairs.withLock {
         var captured:CapturedConnection?=null
         var matched=false
         try {
             // Freeze normal writes/teardown while durable removal changes the
             // policy. Only this captured authenticated session may notify it.
             beforeUnpairRemoval()
-            if(!LifecycleOrder.revoke({app.forgetBinding(rotateUnpaired=false,confirmed=expected,beforeRemoval={
+            if(!LifecycleOrder.revoke({app.forgetBinding(rotateUnpaired=false,confirmed=expected,setupMember=setupMember,beforeRemoval={
                 // Called only after the confirmed identity matched under the
                 // binding lock. A stale confirmation must not close a new session.
                 matched=true

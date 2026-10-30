@@ -6,7 +6,7 @@ import kotlinx.coroutines.CancellationException
 /** Only an explicit protocol rejection from the pinned PC signals revocation.
  * Fatal TLS alerts also describe cryptographic faults and never revoke trust. */
 internal object PairingRejection {
-    fun unauthorized(code:String,pinnedLeafVerified:Boolean)=pinnedLeafVerified && code=="unauthorized"
+    fun unauthorized(code:String,pinnedLeafVerified:Boolean,setupScoped:Boolean=false)=pinnedLeafVerified && code=="unauthorized" && !setupScoped
     /** The PC may close immediately after its post-TLS rejection, racing HELLO.
      * Recover only a complete, validated ERROR unauthorized frame on that socket. */
     fun afterWriteFailure(error:Exception,read:()->Boolean):Boolean {

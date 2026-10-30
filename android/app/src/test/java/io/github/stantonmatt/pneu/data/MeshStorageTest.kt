@@ -182,7 +182,7 @@ class MeshStorageTest {
         catch(_:java.io.IOException) {}
         assertNull(prefs.store.data.first()[stringPreferencesKey("peers")])
         val migrated=prefs.read();assertEquals(pc,migrated.devices.single().deviceId)
-        prefs.store.edit {PeerRegistry.write(it,PeerRegistry.read(it)+peer(other))}
+        prefs.store.edit {PeerRegistry.write(it,PeerRegistry.read(it)+peer(other).copy(pin="e".repeat(64)))}
         prefs.forget(peerId=pc)
         val remaining=prefs.read()
         assertEquals(listOf(other),remaining.devices.map {it.deviceId});assertEquals(setOf(pc),remaining.resetPeers)

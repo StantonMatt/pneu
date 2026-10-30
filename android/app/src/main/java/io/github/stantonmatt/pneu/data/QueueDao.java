@@ -163,6 +163,7 @@ import kotlinx.coroutines.flow.Flow;
     }
     @Query("UPDATE deliveries SET state='superseded', revision=revision+1 WHERE mediaId IN (SELECT mediaId FROM artifacts WHERE kind='text') AND state IN ('waiting','failed')") void supersedeText();
     @Query("SELECT * FROM outgoing") List<Outgoing> all();
+    @Query("DELETE FROM receipts WHERE peerId=:peer AND origin='members' AND rowid NOT IN (SELECT rowid FROM receipts WHERE peerId=:peer AND origin='members' ORDER BY rowid DESC LIMIT 4096)") void pruneMembersReceipts(String peer);
     @Query("SELECT COUNT(*) FROM receipts") int receiptCount();
     @Query("DELETE FROM receipts") void clearReceiptRows();
     @Query("DELETE FROM clipboard_clock") void clearClipboardClocks();

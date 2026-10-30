@@ -17,8 +17,8 @@ class PneuApp : Application() {
     override fun onCreate() { super.onCreate(); StatusNotificationChannel.create(this); graph = AppGraph(this) }
 }
 val Context.graph get() = (applicationContext as PneuApp).graph
-class AppGraph(val context: Context,val preferences: Preferences=Preferences(context)) {
-    val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+class AppGraph(val context: Context,val preferences: Preferences=Preferences(context),
+               val scope:CoroutineScope=CoroutineScope(SupervisorJob() + Dispatchers.IO)) {
     private val snapshots=PreferenceSnapshots(preferences.flow,scope)
     val prefs=snapshots.state
     suspend fun awaitPrefs():Prefs=snapshots.awaitLoaded()
@@ -68,7 +68,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
     private val lifecycle=mutableMapOf<String,Long>()
     private val outcomes=mutableMapOf<String,Long>()
     private fun invalidateOutcomes(id:String) {outcomes[id]=Math.addExact(outcomes[id] ?: 0,1)}
-    private fun changed(peer:Peer) {
+    internal fun changed(peer:Peer) {
         connection.revoked(peer)
         for(key in listOf("id:${peer.deviceId}","pin:${peer.pin}"))lifecycle[key]=Math.addExact(lifecycle[key] ?: 0,1)
         invalidateOutcomes(peer.deviceId)
@@ -254,10 +254,14 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
         clearLegacy={clearDelivery()},finishLegacy={preferences.toggle("deliveryReset",false)},
         clearPeer={clearPeerDelivery(it)},finishPeer={preferences.finishPeerReset(it)}
     )
-    private suspend fun completePeerReset(id:String)=deliveryResets.peer(id)
+    internal suspend fun completePeerReset(id:String)=deliveryResets.peer(id)
     suspend fun reconcileDelivery()=withContext(Dispatchers.IO) {bindingMutex.withLock {
         preferences.migrateSettingsReceipts(queue)
         deliveryResets.reconcile()
+        preferences.finishMembersIntents(queue)
+        val recovered=preferences.read()
+        connection.attempt.value?.takeIf {!it.matches(recovered,lifecycle)}?.let {endPairing(it)}
+        reconcileSetupCandidatesLocked()
         // Recover a process death between the DataStore and Room commits.
         queueMutex.withLock {preferences.read().devices.filter {!it.clipboardSend}.forEach {queue.supersedePeerText(it.deviceId)}}
     }}
@@ -265,16 +269,17 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
         val current=preferences.read()
         if(!currentOutcome(internalOutcome) || expected==null || expectedPhoneId!=null && current.deviceId!=expectedPhoneId ||
             current.devices.none {it.deviceId==expected.deviceId && it.pin==expected.pin && it.generation==expected.generation})return@withLock false
+        if(current.devices.find {it.deviceId==expected.deviceId}?.setupScoped==true)return@withLock false
         preferences.forget(expected.name,expected.deviceId)
         changed(expected)
         connection.bindingChanged(lost=true,peerId=expected.deviceId)
         completePeerReset(expected.deviceId)
         true
     }}
-    suspend fun requestPairing(uri:String,expected:ConfirmedBinding):Boolean = withContext(Dispatchers.IO) {bindingMutex.withLock {
+    suspend fun requestPairing(uri:String,expected:ConfirmedBinding,setupEnabled:Boolean=true):Boolean = withContext(Dispatchers.IO) {bindingMutex.withLock {
         val p=preferences.read()
         if(!expected.matches(p))return@withLock false
-        startPairing(uri,p)
+        startPairing(uri,p,setupEnabled)
     }}
 
     // Fixture callers explicitly supply their already-selected pin.
@@ -284,7 +289,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
         startPairing(uri,p)
     }}
 
-    private fun startPairing(uri:String,p:Prefs):Boolean {
+    private fun startPairing(uri:String,p:Prefs,setupEnabled:Boolean=true):Boolean {
         if(connection.attempt.value!=null)return false
         val invitation=io.github.stantonmatt.pneu.protocol.Invitation.parse(uri)
         val prior=p.devices.find {it.pin==invitation.fingerprint}
@@ -294,7 +299,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
             return true
         }
         prior?.let {invalidateOutcomes(it.deviceId)}
-        connection.setAttempt(PairingAttempt(io.github.stantonmatt.pneu.protocol.randomId(),invitation,p,lifecycle.toMap()))
+        connection.setAttempt(PairingAttempt(io.github.stantonmatt.pneu.protocol.randomId(),invitation,p,lifecycle.toMap(),setupEnabled=setupEnabled))
         // Invalidates the old transport before any further outcome can commit.
         connection.retryPeer(invitation.fingerprint)
         return true
@@ -307,12 +312,13 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
         true
     }}
 
-    private fun endPairing(expected:PairingAttempt?,message:String?=null):Boolean {
+    internal fun endPairing(expected:PairingAttempt?,message:String?=null):Boolean {
         if(expected==null || connection.attempt.value?.id!=expected.id)return false
         // Revoke first. Closing is local and never sends UNPAIR.
         connection.setAttempt(null)
         if(message!=null)connection.pairingFailed(message)
         connection.retryPeer(expected.invitation.fingerprint)
+        scope.launch {reconcileSetupCandidates()}
         return true
     }
     internal suspend fun rejectPairing(expected:PairingAttempt,status:ConnectionStatus):Boolean=withContext(NonCancellable) {bindingMutex.withLock {
@@ -357,13 +363,19 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
         return installSessionBinding(resolved,pcId,resolved.scanned.deviceId)!=null
     }
     internal suspend fun installSessionBinding(attempt:PairingAttempt,pcId:String,
-                                               phoneId:String,onOutcome:(ConnectionOutcome)->Unit={},onInstalled:(DeliveryBinding)->Unit={}):DeliveryBinding?=bindingMutex.withLock {
+                                               phoneId:String,setupHandshake:SetupHandshake?=null,onOutcome:(ConnectionOutcome)->Unit={},onInstalled:(DeliveryBinding)->Unit={}):DeliveryBinding?=bindingMutex.withLock {
         val current=connection.attempt.value?.takeIf {it.id==attempt.id && it.deviceId==pcId} ?: return@withLock null
         val p=preferences.read()
         if(p.deviceId!=phoneId || pcId==phoneId || !current.matches(p,lifecycle))return@withLock null
         val replacement=current.prior?.let {ConfirmedBinding.from(current.scanned,it.deviceId)}
         var installed:DeliveryBinding?=null
-        if(!preferences.paired(current.invitation,pcId,replacement) {installed=it;onInstalled(it)})return@withLock null
+        if(!preferences.paired(current.invitation,pcId,replacement,setupChoice=current.setupEnabled,setupFence=current.scanned.membership,beforeInstall={data,binding->
+            setupHandshake?.let {h->
+                PeerRegistry.write(data,PeerRegistry.read(data).map {peer->if(peer.deviceId==binding.pcId && peer.pin==binding.pin)
+                    peer.copy(name=h.remoteName,setupSupported=h.remote!=null,addresses=(h.remoteAddresses+peer.addresses).distinct().take(16)) else peer})
+                SetupTransactions.tokenHello(data,binding,h.remote,h.self)
+            }
+        }) {installed=it;onInstalled(it)})return@withLock null
         // Durable installation consumed the attempt. Cleanup retries use resetPeers;
         // neither cleanup failure nor a lost READY can install it again.
         connection.installed(current,requireNotNull(installed))
@@ -372,10 +384,11 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
             p.devices.find {it.deviceId==pcId}?.let(::changed) ?: invalidateOutcomes(pcId)
         onOutcome(ConnectionOutcome(pcId,outcomes[pcId] ?: 0))
         for(id in preferences.read().resetPeers)completePeerReset(id)
+        scope.launch {reconcileSetupCandidates()}
         installed?.takeIf {it.matches(preferences.read())}
     }
     suspend fun forgetBinding(expected:Peer?=null,expectedPhoneId:String?=null,rotateUnpaired:Boolean=true,
-                              confirmed:ConfirmedBinding?=null,internalOutcome:ConnectionOutcome?=null,beforeRemoval:()->Unit={}):Boolean=withContext(Dispatchers.IO+NonCancellable) {bindingMutex.withLock {
+                              confirmed:ConfirmedBinding?=null,internalOutcome:ConnectionOutcome?=null,remoteUnpair:Boolean=false,setupMember:ConfirmedSetupMember?=null,beforeRemoval:()->Unit={}):Boolean=withContext(Dispatchers.IO+NonCancellable) {bindingMutex.withLock {
         val p=preferences.read()
         if(!currentOutcome(internalOutcome) || confirmed!=null && !confirmed.matches(p) || expectedPhoneId!=null && p.deviceId!=expectedPhoneId)return@withLock false
         val id=expected?.deviceId ?: confirmed?.pcId ?: p.peer?.deviceId
@@ -388,10 +401,14 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
             connection.attempt.value?.takeIf {it.targetId==confirmed.pcId}?.let {endPairing(it)}
             completePeerReset(confirmed.pcId);return@withLock true
         }
+        val rosterMember=p.membership.roster.find {it.deviceId==id && it.active && (peer==null || it.fingerprint==peer.pin)}
+        if(!remoteUnpair && (setupMember!=null && (!setupMember.matches(p) || setupMember.member!=rosterMember) ||
+            rosterMember!=null && setupMember==null))return@withLock false
         beforeRemoval()
-        preferences.forget(peerId=id)
+        if(rosterMember!=null && !remoteUnpair)preferences.edit {SetupTransactions.remove(it,rosterMember.key,p.membership.generation)}
+        else preferences.forget(peerId=id)
         peer?.let(::changed)
-        connection.attempt.value?.takeIf {it.targetId==id}?.let {endPairing(it)}
+        connection.attempt.value?.takeIf {it.targetId==id && (peer==null || it.invitation.fingerprint==peer.pin)}?.let {endPairing(it)}
         connection.bindingChanged(peerId=id)
         if(id!=null) {completePeerReset(id)}
         true
@@ -414,6 +431,17 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
             catch(e:Exception) {android.util.Log.w("PneuRecovery",e.javaClass.simpleName)}
             initialized.complete(Unit)
         }
+        scope.launch {
+            initialized.await()
+            prefs.filter {it.loaded}.map {it.resetPeers to it.membership.receiptIntents}.distinctUntilChanged().collect {pending->
+                if(pending.first.isNotEmpty() || pending.second.isNotEmpty())while(isActive) {
+                    try {reconcileDelivery();break}
+                    catch(e:CancellationException) {throw e}
+                    catch(e:Exception) {android.util.Log.w("PneuSetupRecovery",e.javaClass.simpleName);delay(60000)}
+                }
+            }
+        }
+        resumeSetupLinkDiscovery()
         scope.launch { prefs.filter {it.loaded && it.deviceId.isNotEmpty()}.distinctUntilChangedBy {Triple(it.peer,it.shareSheet,it.pairingLost)}.collect {p->PostCommit.maintain {ManualEntries.configureShareTarget(context,p.shareSheet);if(!p.pairingLost)context.getSystemService(android.app.NotificationManager::class.java).cancel(2)} } }
     }
     /** A Recent row represents its artifact's complete, originally frozen operation. */
