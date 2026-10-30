@@ -233,7 +233,7 @@ authenticated HELLO pair symmetrically:
 
 | Local/remote persisted setup IDs | Result |
 | --- | --- |
-| absent / absent | Found a new setup after mutual opt-in |
+| absent / absent | Token pairing: found after mutual opt-in; migration: wait for an advertised ID |
 | absent / S (either direction) | The unassigned device joins S after mutual opt-in |
 | S / S | Synchronize |
 | S / T, S ≠ T | Keep the direct link; exchange no roster |
@@ -247,10 +247,11 @@ or replacement retains scope; reconnect preserves consent but checks IDs before 
 A disabled scope needs explicit local opt-in and a new HELLO before its ID
 participates.
 
-For absent/absent with both scopes enabled, the lower authenticated device ID
-endpoint generates a fresh random setup ID and atomically persists it with self
-and the first other member from the authenticated binding, then reconnects.
-The non-proposer waits unassigned without MEMBERS, retaining consent across
+For a token pairing with absent/absent and both scopes enabled, the lower
+authenticated device ID endpoint generates a fresh random setup ID and
+atomically persists it with self and the first other member from the
+authenticated binding, then reconnects. The non-proposer waits unassigned
+without MEMBERS, retaining consent across
 restart until that next authenticated HELLO advertises the persisted ID. It
 adopts via the absent/S join transaction (ID, self and first other member), then
 reconnects. Synchronize only once both advertise the same persisted ID. The
@@ -270,13 +271,53 @@ Reconnect on assignment; the MEMBERS ID backstop rejects any residual race.
 Migrate bindings to `ask`, preserving identity, binding generations, settings,
 queues and receipts. Both-ask sends no MEMBERS; expose **Link existing device**
 to enable an ask/disabled local scope explicitly and reconnect. A compatible
-authenticated enabled/ask HELLO offers linking without a roster, even when both
-are unassigned. The ask receiver retains one durable prompt per binding/setup
-generation: **<name> wants to link your devices. Allow?** Allow refreshes HELLO,
-rechecks compatibility and atomically enables; Deny disables. Dismissal retains
+authenticated enabled/ask HELLO offers linking without a roster. The ask
+receiver retains one durable prompt per binding/setup generation:
+**<name> wants to link your devices. Allow?** Allow refreshes HELLO, rechecks
+compatibility and atomically enables; Deny disables. Dismissal retains
 the prompt across restart. Capability changes never reset consent; fresh token
 pairing after removal creates a new decision. A disabled remote requires its
 own explicit opt-in; HELLO or MEMBERS never prompts it.
+
+Link and Allow are device-wide consent. **Link existing device** enables every
+local `ask` binding; Allow on any prompt does the same and resolves this
+device's other pending prompts as allowed. `disabled` bindings are never
+enabled in bulk. Each binding still activates on its own: the compatibility
+table applies per link (an S/T link alone stays direct), its remote endpoint
+needs its own enabled scope, and activations serialize as above. Thus a fully
+paired phone, PC and Mac need one Link and one Allow on each other device.
+
+Migration MUST NOT found through an absent/absent pair. Only **Link existing
+device** founds during migration: if the device has a pending prompt, Link acts
+as Allow on it and joins instead of founding. Otherwise, if unassigned, Link
+atomically enables local consent on the bindings it covers (including a
+`disabled` one the user selected) together with a durable pending-Link record,
+reconnects them and waits a bounded time for refreshed authenticated HELLOs.
+Discovery is separate from adoption: if any refreshed HELLO, `enabled` or `ask`,
+advertises an ID S, Link does not found; it keeps the pending-Link record and
+joins S through the absent/S transaction once that peer's scope is enabled (the
+UI shows it waiting for that device's Allow). Only when the window ends with no
+covered peer advertising an ID does it atomically persist a fresh random setup
+ID S with a self-only roster, advance the setup generation and clear the
+record, then reconnect advertising S; its offers therefore carry S. After a
+restart, a surviving pending-Link record resumes discovery from the start. A
+peer that was unreachable during the window and later advertises a different ID
+yields S/T and a direct link, as for any other independently founded setup. A self-only Link-founded setup is a normal assigned
+setup, with no special replaceability; dissolution rules are unchanged.
+Allow, bulk enable and migration offers only join: after mutual opt-in, an
+unassigned device may adopt S from whichever authenticated, enabled member first
+advertises it, using the absent/S transaction above, then reconnect. There is no
+designated migration proposer; loss of the founder does not block adoption via
+another enabled member advertising S. An absent/absent migration link does
+nothing until one endpoint advertises an ID; S/S synchronizes as usual.
+Independent Link taps on two devices with no pending prompts found two setups;
+this is the intended no-merge boundary.
+
+Token pairing still enables only its own new link and retains the two-party
+absent/absent founding rule. A token pairing completing at the same moment as a
+migration join commits on the same device can still race: serialized activation
+and the MEMBERS ID backstop keep conflicting assignments as a direct link,
+never a merge.
 
 Send MEMBERS only in READY after binding persistence, negotiated `setup`, both
 HELLO scopes enabled and matching persisted IDs. Pending/disabled receivers NACK
