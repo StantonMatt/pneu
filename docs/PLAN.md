@@ -32,7 +32,7 @@ See [core.rs](../desktop/crates/pneud/src/core.rs),
 | Phone screenshots | On | Send new screenshots to eligible computers |
 | Camera photos / screen recordings | Off | Optional automatic media |
 | Manual files | Available | Android Share → Pneu or Send files; desktop window, tray/menu, Dolphin or CLI |
-| Share clipboard on desktop | Automatically | Text; Include images is off by default |
+| Share clipboard on desktop | Automatically | Text and images; Include images is on by default |
 | Phone clipboard | Manual | A button, tile or share action is required |
 | Choose devices each time | Off | Otherwise use eligible connected recipients |
 | Queue for offline devices | Off | Optional on both phone and desktop; explicit file targets can queue offline |

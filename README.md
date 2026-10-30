@@ -104,7 +104,7 @@ Open **Settings** in the desktop window or Android app. Select a device to chang
 | Desktop setting | Default |
 | --- | --- |
 | Share clipboard | Automatically |
-| Include images | Off |
+| Include images | On |
 | Choose devices each time | Off |
 | Queue for offline devices | Off |
 | Save to folder | On (`~/Pictures/Pneu` on Linux, `~/Downloads/Pneu` on Mac, `Downloads\Pneu` on Windows) |
@@ -121,7 +121,7 @@ Open **Settings** in the desktop window or Android app. Select a device to chang
 
 The automatic-media switch applies only to phone → computer pairs and covers the enabled screenshot, photo and recording kinds. Computer pairs have the two clipboard switches. Turning off a pair's clipboard direction also suppresses copying received images to that clipboard; ordinary file saving remains available.
 
-At least one of Wi-Fi or Tailscale must stay enabled on the phone. With originals off on metered networks, automatic images are compressed and recordings wait; shared files stay unchanged. Pause suspends automatic capture; manual shares still work. Clipboard images require **Include images** on the sending desktop and image support on the receiver; Android can receive them too.
+At least one of Wi-Fi or Tailscale must stay enabled on the phone. With originals off on metered networks, automatic images are compressed and recordings wait; shared files stay unchanged. Pause suspends automatic capture; manual shares still work. Clipboard images require **Include images** (on by default) on the sending desktop and image support on the receiver; Android can receive them too.
 
 By default, file sends target connected eligible devices. **Choose devices each time** opens a recipient picker. **Queue for offline devices** includes offline paired devices for automatic phone media and desktop sends; Android manual shares use offline devices when none are connected and queueing is enabled. Explicit file targets can queue while offline, including `pneud send --to DEVICE_ID FILE`. Clipboard sends stay connected-only regardless of the queue setting. Linux configuration lives in `~/.config/pneu/config.toml`; Mac and Windows paths are in the [macOS guide](docs/macos.md#paths-and-overrides) and [Windows guide](docs/windows.md#paths-and-overrides).
 

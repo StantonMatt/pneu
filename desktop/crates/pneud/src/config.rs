@@ -80,7 +80,7 @@ impl Default for Config {
             copy_image_to_clipboard: true,
             open_in_viewer: false,
             clipboard_sync_to_phone: true,
-            clipboard_include_images: false,
+            clipboard_include_images: true,
             port: pneu_proto::DEFAULT_PORT,
             cache_retention_days: 1,
             max_file_bytes: pneu_proto::MAX_FILE_SIZE,
@@ -328,6 +328,15 @@ pub fn sync_parent(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn clipboard_images_default_on_and_explicit_off_is_preserved() -> Result<()> {
+        assert!(Config::default().clipboard_include_images);
+        assert!(toml::from_str::<Config>("")?.clipboard_include_images);
+        let config: Config = toml::from_str("clipboard_include_images = false")?;
+        assert!(!config.clipboard_include_images);
+        assert!(!toml::from_str::<Config>(&toml::to_string(&config)?)?.clipboard_include_images);
+        Ok(())
+    }
     #[test]
     #[cfg(unix)]
     fn unresolvable_folder_errors_do_not_reject_settings() -> Result<()> {

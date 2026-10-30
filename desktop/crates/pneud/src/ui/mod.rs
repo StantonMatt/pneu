@@ -510,12 +510,12 @@ mod tests {
         let mut c = Config::default();
         assert_eq!(
             Toggle::all().map(|t| t.checked(&c)),
-            [true, true, true, false, true, false]
+            [true, true, true, false, true, true]
         );
         Toggle::Clipboard.flip(&mut c);
         assert!(!Toggle::IncludeImages.enabled(&c));
         Toggle::IncludeImages.flip(&mut c);
-        assert!(c.clipboard_include_images);
+        assert!(!c.clipboard_include_images);
     }
     #[test]
     fn routes_include_both_tailscale_ranges() {

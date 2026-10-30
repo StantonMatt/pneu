@@ -162,7 +162,7 @@ Reads and OS effects run outside the actor. Password/sensitive markers suppress
 sharing, and received content is not automatically forwarded. Disconnect or a
 policy change invalidates unsent work; an already-started frame may finish.
 Text and images are connected-only, including explicit sends. Automatic clipboard
-sharing defaults on; **Include images** defaults off and requires the receiver's
+sharing defaults on; **Include images** defaults on and requires the receiver's
 `clipboard_image` capability. Outgoing clipboard images are bounded to 10 MiB.
 See the [main README](../README.md#settings) for the current settings and defaults.
 

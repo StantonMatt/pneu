@@ -35,7 +35,7 @@ Rules that apply everywhere:
 | Mobile data | Mobile data off waits for Wi-Fi. With originals off, automatic images are compressed and recordings wait; shared files stay unchanged. |
 | Dedupe | Stable transfer IDs and per-sender receipts deduplicate completed retries. A desktop crash after placement but before receipt commit can leave a duplicate visible file. |
 | Clipboard ordering | Text/images share a device-wide `(hlc, source_device)` register on mesh links. Install tickets and recent keyed fingerprints suppress echoes. Received content is not automatically forwarded. |
-| Clipboard policy | Desktop Automatically / Manually / Off and Include images combine with per-pair direction switches. Sends require a live eligible session; new connections do not join an existing observation. Phone sends require a foreground action. |
+| Clipboard policy | Desktop Automatically / Manually / Off and Include images (on by default) combine with per-pair direction switches. Sends require a live eligible session; new connections do not join an existing observation. Phone sends require a foreground action. |
 | Sensitive data | Platform password/sensitive markers suppress sharing. See platform guides for exact formats and limits. |
 | Receipts and errors | Saving, clipboard effects and user navigation are distinct. A successful file receipt does not promise every optional OS action succeeded. UI errors use readable reasons, not wire enum names. |
 
@@ -293,7 +293,7 @@ It handles several peers; it does not broadcast received content onward.
 
 - **Automatically:** observe local clipboard changes and send to currently
   eligible peers. **Manually:** explicit sends. **Off:** no local sharing.
-- Include images starts off. Sending requires receiver support and the pair's
+- Include images starts on. Sending requires receiver support and the pair's
   direction to be enabled. Phone pause suppresses incoming automatic clipboard.
 - Received supported images may be copied according to receive settings and the
   pair's clipboard direction. Ordinary file saving remains independent.
