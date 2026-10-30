@@ -5,6 +5,13 @@ phone transport simulator. Shared syntax and framing live in `pneu-proto`;
 the [wire protocol](../docs/PROTOCOL.md) defines mesh negotiation and delivery.
 Nothing in this directory installs automatically.
 
+Linux releases include a .deb and a prebuilt tarball with a per-user installer.
+Download them from the [latest release](https://github.com/StantonMatt/pneu/releases/latest).
+See the [Linux guide](../docs/linux.md) for installation, uninstalling, package
+building and source-install precedence. Supported: Plasma 6 Wayland; GNOME/Mutter
+lacks data-control, so file transfers can run but automatic clipboard sync and
+clipboard writes are unavailable (sources in the guide).
+
 Linux uses KDE Plasma 6 on Wayland with a Slint/Qt window and tray. Builds need
 Rust 1.93+ and Qt 6 development tools (`QMAKE=qmake6`). On macOS 15.4+,
 `./install-macos.sh` builds and installs `Pneu.app`, with a menu bar and Slint
@@ -29,7 +36,7 @@ heavy cargo build --release -p pneud -p pneu-sim
 Run `pneud run` to start the daemon and tray/menu bar. On Windows, `Pneu.exe`
 opens the window and starts the daemon if needed; `pneud.exe` is the console CLI.
 Tray activation or
-`pneud window` opens the desktop window. Use **Add Device… → Phone** to show a
+`pneud window` opens the desktop window and starts the Linux user service if needed. Use **Add Device… → Phone** to show a
 QR for the phone. **Add Device… → Computer** offers **Show Pairing Code** and
 **Paste Link**, plus **Scan QR Code** on a Mac with a camera. Each computer can
 pair with several computers and phones; adding one device preserves the others.
@@ -97,10 +104,10 @@ share` marks shared text, and `send-file PATH file MIME` sends an ordinary file.
 It checks the PC's advertised clipboard-image capability before sending that kind.
 
 `install.sh` on Linux builds the release daemon (through `heavy` when available), installs it into
-`~/.local/bin`, installs the app/tray icons and desktop entry, writes the systemd user unit, and reenables it for `graphical-session.target`.
+`~/.local/bin`, installs the app icon and desktop entries, writes the systemd user unit, and reenables it for `graphical-session.target`.
 An active graphical session starts/restarts the daemon immediately, including
-reinstalls; otherwise it starts with the next graphical session. Run it only
-when installation is intended. The unit uses an owner-only umask, follows the
+reinstalls; otherwise it starts with the next graphical session. `./install.sh --uninstall` removes the per-user installation without rebuilding
+or deleting Pneu data. Run the installer only when installation is intended. The unit uses an owner-only umask, follows the
 graphical session, and restarts after failures. `pneud` handles SIGINT/SIGTERM,
 closes its sessions, removes its own Unix socket and stops its clipboard helper.
 An advisory lock prevents competing daemons from recovering the same store.
@@ -166,7 +173,7 @@ sharing defaults on; **Include images** defaults on and requires the receiver's
 `clipboard_image` capability. Outgoing clipboard images are bounded to 10 MiB.
 See the [main README](../README.md#settings) for the current settings and defaults.
 
-On Linux, tray SVGs are bundled and installed. The default ARGB fallback uses kdeglobals'
+On Linux, tray SVGs are embedded and materialized into the data directory at startup. The default ARGB fallback uses kdeglobals'
 active Plasma desktop theme palette (or the window scheme for adaptive themes), refreshed by KGlobalSettings
 `notifyChange` and periodically as a fallback. `PNEU_TRAY_NAMED_ICONS=1` enables
 the named-icon spike; `PNEU_KDEGLOBALS` selects an isolated color configuration.

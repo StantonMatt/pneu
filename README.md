@@ -34,7 +34,7 @@ More phones and computers can join by pairing directly. See the [wire protocol](
 
 ## Requirements
 
-- **Linux:** Linux with KDE Plasma 6 on Wayland; built and tested on Kubuntu 26.04. Building needs Rust 1.93+ and Qt 6 development tools, including `qmake6` for the Slint UI (`QMAKE=qmake6`). See the [desktop README](desktop/README.md) for build and runtime details.
+- **Linux:** KDE Plasma 6 on Wayland, x86_64; release binaries target Ubuntu 24.04+ / Debian 13. GNOME/Mutter lacks data-control: file transfers can run, but automatic clipboard sync and clipboard writes are unavailable. See the [Linux guide](docs/linux.md) for runtime requirements and support sources.
 - **Mac:** macOS 15.4+; tested on Apple Silicon. See the [macOS guide](docs/macos.md) for build requirements and platform details.
 - **Windows:** x64 Windows 10 version 2004 (build 19041) or later. Available from the [Microsoft Store](https://apps.microsoft.com/detail/9N48FLMGSDDV); also works from source and as a sideloaded MSIX. See the [Windows guide](docs/windows.md) for building, packaging and platform details.
 - **Phone:** Android 14+ (`minSdk 34`); tested on a Samsung Galaxy S25+ and an emulator. Building needs JDK 21, Android SDK 37.2 and Build Tools 37.0.0; use the checked-in Gradle wrapper.
@@ -42,14 +42,20 @@ More phones and computers can join by pairing directly. See the [wire protocol](
 
 ## Install
 
-On Linux, from the repo root:
+On Linux, download `pneu_<version>_amd64.deb` from the [latest release](https://github.com/StantonMatt/pneu/releases/latest), then run:
+
+```sh
+sudo apt install ./pneu_*_amd64.deb
+```
+
+Open **Pneu** from the app menu. Alternatively, extract [pneu-linux-x86_64.tar.gz](https://github.com/StantonMatt/pneu/releases/latest/download/pneu-linux-x86_64.tar.gz) and run its `./install.sh` as your regular user. That installs the prebuilt binary into `~/.local` and enables its user service; `./install.sh --uninstall` removes it while preserving your data. See the [Linux guide](docs/linux.md) for dependencies, upgrades and switching from an existing source installation.
+
+To build and install from source:
 
 ```sh
 cd desktop
 ./install.sh
 ```
-
-The installer builds `pneud`, installs it into `~/.local/bin`, installs icons and a desktop entry, and enables a systemd user service tied to the graphical session. It starts or restarts the daemon immediately if that session is active.
 
 On the Mac, download [Pneu-macOS.zip from GitHub Releases](https://github.com/StantonMatt/pneu/releases/latest/download/Pneu-macOS.zip), unzip it and move **Pneu.app** to Applications. The app is ad-hoc signed, without notarization. If macOS blocks it, try opening it, then go to **System Settings → Privacy & Security → Open Anyway** and confirm.
 

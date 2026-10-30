@@ -1,0 +1,50 @@
+.TH PNEUD 1 "2026-10-30" "Pneu" "User Commands"
+.SH NAME
+pneud \- direct file and clipboard sharing between paired devices
+.SH SYNOPSIS
+.B pneud
+.RI [ command ]
+.SH DESCRIPTION
+Pneu connects paired Android phones and computers over authenticated, encrypted
+connections. The Linux desktop integration supports Plasma 6 on Wayland.
+.SH COMMANDS
+.TP
+.B run
+Run the per-user daemon and tray. Normally managed by the systemd user service.
+.TP
+.B window
+Open the desktop window, starting the systemd user service if necessary.
+.TP
+.B status
+Show daemon status.
+.TP
+.BI "send [--to " "DEVICE" "] " "FILE..."
+Send files to eligible paired devices, or to the explicitly selected device.
+.TP
+.B pair
+Create an invitation and print its link and terminal QR code.
+.TP
+.B join
+Read a computer pairing invitation from standard input.
+.TP
+.B reload
+Apply configuration changes supported without a daemon restart.
+.TP
+.B \-\-help
+Print the complete command list.
+.SH FILES
+.TP
+.I ~/.config/pneu/config.toml
+Configuration, unless XDG_CONFIG_HOME is set.
+.TP
+.I ~/.local/share/pneu
+Private trust, receipts and queue state, unless XDG_DATA_HOME is set.
+.SH NOTES
+Clipboard integration requires a Wayland compositor implementing data-control.
+A user service installed under ~/.config/systemd/user takes precedence over the
+system package's service. Uninstalling preserves user data.
+.SH SEE ALSO
+.BR systemctl (1),
+.BR journalctl (1)
+.PP
+https://stantonmatt.github.io/pneu/
