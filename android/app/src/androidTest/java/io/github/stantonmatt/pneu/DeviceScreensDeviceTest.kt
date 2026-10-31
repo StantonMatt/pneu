@@ -386,12 +386,16 @@ class DeviceScreensDeviceTest {
         show {Device(snapshot,DeviceProjection.states(snapshot,if(online)mapOf(pc.deviceId to wifi) else emptyMap()).single())}
         compose.onNodeWithText("Applies when Pending PC connects").assertIsDisplayed()
         online=true;compose.waitForIdle()
-        compose.onNodeWithText("Applies when Pending PC connects").assertIsDisplayed()
+        compose.onNodeWithText("Connected",substring=true).assertIsDisplayed()
+        compose.onNodeWithText("Applies when Pending PC connects").assertDoesNotExist()
+        capture("connected-settings-pending")
         val binding=DeliveryBinding.from(app.preferences.read(),pc.deviceId)!!
         val old=app.preferences.prepareSettings(binding)
         app.preferences.setPairSwitch(pc.deviceId,"receiveClipboard",true)
         app.preferences.acknowledgeSettings(binding,old)
         snapshot=app.preferences.read();compose.waitForIdle()
+        compose.onNodeWithText("Applies when Pending PC connects").assertDoesNotExist()
+        online=false;compose.waitForIdle()
         compose.onNodeWithText("Applies when Pending PC connects").assertIsDisplayed()
         val latest=app.preferences.prepareSettings(binding);app.preferences.acknowledgeSettings(binding,latest)
         snapshot=app.preferences.read();compose.waitForIdle()

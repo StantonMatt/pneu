@@ -169,11 +169,14 @@ class SetupFlowDeviceTest {
         app.answerReadmission(prompt,true)
         assertEquals(peer,app.preferences.read().devices.single {it.deviceId==mac})
         app.preferences.introducedRefusal(DeliveryBinding(admitted.deviceId,peer.pin,mac,peer.generation),true)
-        waitFor("MacBook Air doesn't recognize this phone · Pair with it directly")
+        waitFor("Not allowed on MacBook Air yet")
         capture("flow-readmission-refused-row")
         openDevice("MacBook Air")
-        waitFor("MacBook Air doesn't recognize this phone · Pair with it directly")
+        waitFor("Not allowed on MacBook Air yet")
         capture("flow-readmission-refused-page")
+        compose.onNodeWithText("Allow it on MacBook Air, or pair with it directly").assertIsDisplayed()
+        compose.onNodeWithText("Pair again").performClick()
+        waitFor("Scan the QR code in Pneu on your computer")
         assertEquals(peer.pin,app.preferences.read().devices.single {it.deviceId==mac}.pin)
     }
     @Test(timeout=90000) fun keepRemovedSurvivesReopenAndStaleNotificationCannotAllowANewerBarrier()=runBlocking<Unit> {
@@ -382,6 +385,31 @@ class SetupFlowDeviceTest {
         scenario!!.moveToState(androidx.lifecycle.Lifecycle.State.RESUMED);scenario!!.recreate()
         waitFor("MacBook Air")
         compose.onNodeWithText("MacBook Air joined · Added via MJStanton-Desktop").assertDoesNotExist()
+    }
+    @Test(timeout=90000) fun lateAlsoLinkedAfterLeavingPairingAndRecreationIncludesEarlierReadyDevices()=runBlocking<Unit> {
+        val office="d".repeat(32)
+        bind(pc,"MJStanton-Desktop",'b');bind(mac,"MacBook Air",'c');bind(office,"Office-PC",'d')
+        linkedWith(pc,mac,office)
+        setup {peers,state->
+            val introduced=peers.filter {it.deviceId!=pc}
+            val notices=introduced.map {SetupNotice("${state.generation}/${it.deviceId}/${it.generation}",it.deviceId,it.name,pc,"MJStanton-Desktop",true)}
+            peers.map {if(it.deviceId==pc)it else it.copy(addedViaId=pc,addedViaName="MJStanton-Desktop",readyObserved=false)} to state.copy(
+                notices=notices,provenance=introduced.associate {"${it.deviceId}/${it.pin}" to SetupProvenance(pc,"MJStanton-Desktop",true)})
+        }
+        // Pairing has already returned to Home, and neither introduction reached READY.
+        launch();waitFor("Office-PC")
+        compose.onNodeWithText("Also linked:",substring=true).assertDoesNotExist()
+        setup {peers,state->peers.map {if(it.deviceId==mac)it.copy(readyObserved=true) else it} to state}
+        waitFor("Also linked: MacBook Air")
+        withTimeout(5000) {app.prefs.first {it.membership.notices.none {n->n.peerId==mac}}}
+        capture("flow-also-linked-first-ready")
+        // The first notice is gone and the Activity is replaced before the late READY.
+        scenario!!.recreate();waitFor("Office-PC")
+        setup {peers,state->peers.map {if(it.deviceId==office)it.copy(readyObserved=true) else it} to state}
+        waitFor("Also linked: MacBook Air and Office-PC")
+        capture("flow-also-linked-late-full-list")
+        withTimeout(5000) {app.prefs.first {it.membership.notices.isEmpty()}}
+        assertEquals(2,c.setupUi.presentedNotices.value.size)
     }
     @Test(timeout=90000) fun removingLastComputerKeepsRosterOnlyPhonesOnHome()=runBlocking<Unit> {
         bind(pc,"MJStanton-Desktop",'b');linkedWith(pc)

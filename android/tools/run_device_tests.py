@@ -248,6 +248,8 @@ def local_case(test):
         screenshots('files/fifth-review-screens', 'screens')
         if test == 'V2ScreensDeviceTest':
             screenshots('files/v2-screens', 'screens')
+        if test in ('SetupFlowDeviceTest', 'SetupScreensDeviceTest'):
+            screenshots('files/setup-screens', 'setup-screens')
         if test == 'DeviceScreensDeviceTest':
             screenshots('files/device-screens', 'device-screens')
         if test == 'SixteenthRecentDeviceTest':

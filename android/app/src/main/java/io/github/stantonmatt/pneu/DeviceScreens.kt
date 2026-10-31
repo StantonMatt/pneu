@@ -135,7 +135,7 @@ private fun automaticKinds(context:android.content.Context,p:Prefs):String? {
                 val address=UiPresentation.pairedAddress(peer.addresses,link.route)
                 val hint=unreachableHint(status==ConnectionStatus.UNREACHABLE,listOf(peer),p.tailscale)
                 var anywhere by rememberSaveable {mutableStateOf(false)}
-                val detail=if(peer.setupRefused)"" else if(SetupPresentation.introducedStatus(peer)==IntroducedStatus.SILENT && status==ConnectionStatus.UNREACHABLE)
+                val detail=if(peer.setupRefused)resources.getString(R.string.setup_refused_hint,peer.name) else if(SetupPresentation.introducedStatus(peer)==IntroducedStatus.SILENT && status==ConnectionStatus.UNREACHABLE)
                     resources.getString(R.string.setup_silent_hint,peer.name) else when(status) {
                     ConnectionStatus.PAIRING_LOST->resources.getString(R.string.detail_pairing_lost,peer.name)
                     ConnectionStatus.UPDATE_REQUIRED->resources.getString(R.string.device_update_detail,peer.name)
@@ -151,7 +151,7 @@ private fun automaticKinds(context:android.content.Context,p:Prefs):String? {
                             if(detail.isNotEmpty())Text(detail,Modifier.padding(top=4.dp),style=PneuType.subhead,color=c.text2,maxLines=2,overflow=TextOverflow.Ellipsis,textAlign=TextAlign.Center)
                         }
                         Spacer(Modifier.height(20.dp))
-                        if(peer.pairingLost)PneuButton(pair,Modifier.fillMaxWidth().height(48.dp)) {Symbol(R.drawable.ic_qr_code_scanner,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_pair_again))}
+                        if(peer.pairingLost || peer.setupRefused || SetupPresentation.introducedStatus(peer)==IntroducedStatus.SILENT && status==ConnectionStatus.UNREACHABLE)PneuButton(pair,Modifier.fillMaxWidth().height(48.dp)) {Symbol(R.drawable.ic_qr_code_scanner,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_pair_again))}
                         // Unreachable: the Link card's action first, then Send files (files wait for the device).
                         else PneuButtonPair(Modifier.fillMaxWidth()) {
                             if(hint?.hasAction()==true)UnreachableAction(hint,Modifier.height(48.dp)) {anywhere=true}
@@ -163,7 +163,7 @@ private fun automaticKinds(context:android.content.Context,p:Prefs):String? {
                 if(!peer.pairingLost) {
                     Text(resources.getString(R.string.group_sharing),Modifier.padding(start=16.dp,top=22.dp,bottom=8.dp),style=PneuType.section,color=c.text2)
                     val pending=resources.getString(R.string.switch_pending,peer.name)
-                    fun note(key:String)=if(key in state.pendingSwitches && state.settingsSupported!=false)pending else null
+                    fun note(key:String)=if(!online && key in state.pendingSwitches && state.settingsSupported!=false)pending else null
                     val kinds=automaticKinds(context,p)
                     PneuCard {
                         SwitchRow(resources.getString(R.string.pref_send_clipboard),peer.clipboardSend,note("sendClipboard"),divider=false) {setSwitch("sendClipboard",it)}

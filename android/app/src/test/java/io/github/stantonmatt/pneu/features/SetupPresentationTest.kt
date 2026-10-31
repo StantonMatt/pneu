@@ -180,6 +180,26 @@ class SetupPresentationTest {
         assertEquals("Also linked: A and B",SetupPresentation.newsText(r,SetupNews.AlsoLinked(listOf("A","B"),emptyList())))
         assertEquals("Also linked: A, B and 2 more",SetupPresentation.newsText(r,SetupNews.AlsoLinked(listOf("A","B","C","D"),emptyList())))
     }
+    @Test fun lateReadyExtendsTheFullAlsoLinkedListAfterEarlierNoticesWereDismissed() {
+        val first=mac.copy(readyObserved=true,addedViaId=pc.deviceId)
+        val late=office.copy(readyObserved=false,addedViaId=pc.deviceId)
+        val firstNotice=notice(first,pc).copy(alsoLinked=true)
+        val lateNotice=notice(late,pc).copy(alsoLinked=true)
+        val state=linked(member('c',mac.name),member('d',office.name)).copy(
+            notices=listOf(firstNotice,lateNotice),
+            provenance=listOf(first,late).associate {"${it.deviceId}/${it.pin}" to SetupProvenance(pc.deviceId,pc.name,true)})
+        val p=prefs(pc,first,late,state=state)
+        assertEquals(listOf(mac.name),(SetupPresentation.news(p,SetupUiState(),0) as SetupNews.AlsoLinked).names)
+        val dismissed=p.copy(membership=state.copy(notices=listOf(lateNotice)))
+        assertNull(SetupPresentation.news(dismissed,SetupUiState(),Long.MAX_VALUE,setOf(firstNotice.id)))
+        val ready=dismissed.copy(peers=listOf(pc,first,late.copy(readyObserved=true)))
+        val news=SetupPresentation.news(ready,SetupUiState(),Long.MAX_VALUE,setOf(firstNotice.id)) as SetupNews.AlsoLinked
+        assertEquals(listOf(mac.name,office.name),news.names)
+        assertEquals(listOf(lateNotice.id),news.notices)
+        // Removed/reset and no-longer-member devices cannot reappear in the cumulative list.
+        assertEquals(listOf(office.name),(SetupPresentation.news(ready.copy(resetPeers=setOf(first.deviceId)),SetupUiState(),0) as SetupNews.AlsoLinked).names)
+        assertEquals(listOf(office.name),(SetupPresentation.news(ready.copy(membership=ready.membership.copy(roster=listOf(me,member('d',office.name)))),SetupUiState(),0) as SetupNews.AlsoLinked).names)
+    }
     @Test fun noticeClassificationSurvivesRenamesAndPresentationSuppressesDelivery() {
         val notices=listOf(notice(mac,pc).copy(alsoLinked=true),notice(office,pc))
         val state=linked(member('c',mac.name),member('d',office.name)).copy(notices=notices)

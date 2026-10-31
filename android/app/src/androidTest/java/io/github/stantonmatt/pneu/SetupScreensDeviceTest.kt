@@ -71,7 +71,10 @@ class SetupScreensDeviceTest {
     @Test(timeout=60000) fun silentIntroducedPeerHasNeutralCopyWithoutRefusalInBothThemes()=runBlocking<Unit> {
         val silent=mac.copy(lastConnected=0,addedViaId=pc.deviceId,addedViaName=pc.name,setupSupported=false)
         val p=prefs(pc,silent,state=linked(member(pc),member(silent)))
-        show {Device(p,silent,LinkState())}
+        var paired=0
+        show {DeviceScreen(p,DeviceState(silent,LinkState(),emptySet(),true),{},{paired++},{},{}) {_,_->}}
+        compose.onNodeWithText("Pair again").performClick();assertEquals(1,paired)
+        compose.onNodeWithText("Send files").assertDoesNotExist()
         compose.onNodeWithText("Hasn't connected").assertIsDisplayed()
         compose.onNodeWithText("Open Pneu on MacBook Air, or pair with it directly").assertIsDisplayed()
         compose.onNodeWithText("MacBook Air doesn't recognize this phone",substring=true).assertDoesNotExist()
@@ -82,12 +85,17 @@ class SetupScreensDeviceTest {
         val refused=mac.copy(lastConnected=0,addedViaId=pc.deviceId,addedViaName=pc.name,setupSupported=false,setupRefused=true)
         val p=prefs(pc,refused,state=linked(member(pc),member(refused)))
         var page by mutableStateOf(false)
-        show {if(page)Device(p,refused) else Home(p,mapOf(pc.deviceId to wifi,refused.deviceId to LinkState()))}
-        val diagnostic="MacBook Air doesn't recognize this phone · Pair with it directly"
+        var paired=0
+        show {if(page)DeviceScreen(p,DeviceState(refused,LinkState(),emptySet(),true),{},{paired++},{},{}) {_,_->}
+            else Home(p,mapOf(pc.deviceId to wifi,refused.deviceId to LinkState()))}
+        val diagnostic="Not allowed on MacBook Air yet"
         compose.onNodeWithText(diagnostic).assertIsDisplayed()
         bothThemes("readmission-refused-row")
         page=true;compose.waitForIdle()
         compose.onNodeWithText(diagnostic).assertIsDisplayed()
+        compose.onNodeWithText("Allow it on MacBook Air, or pair with it directly").assertIsDisplayed()
+        compose.onNodeWithText("Pair again").performClick();assertEquals(1,paired)
+        compose.onNodeWithText("Send files").assertDoesNotExist()
         compose.onNodeWithText("Update Pneu on MacBook Air to sync these switches.").assertDoesNotExist()
         bothThemes("readmission-refused-page")
     }

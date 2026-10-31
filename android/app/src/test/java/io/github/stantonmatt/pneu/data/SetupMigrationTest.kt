@@ -66,6 +66,24 @@ class SetupMigrationTest {
             assertTrue(PeerRegistry.resets(node.p).isEmpty())
         }
     }
+    @Test fun lateMigrationLinkNeverAnnouncesAnAlreadyPairedComputerAsJoined() {
+        val (a,b,c)=nodes(4,3,2)
+        val originals=a.peers
+        link(a,b);assertTrue(finish(a))
+        hello(b,a);allow(b);hello(b,a);sync(a,b)
+        hello(c,a);SetupTransactions.answer(c.p,c.state.prompts.single(),false)
+        // The third computer links later, with a membership stamp newer than A's.
+        link(c,a);hello(c,a);hello(c,a);sync(a,c)
+        val selfMember=a.state.member(a.id)!!
+        val late=c.state.member(c.id)!!.copy(hlc=(selfMember.hlc.toBigInteger()+10.toBigInteger()).toString())
+        val snapshot=MembersSnapshot(randomId(),s,listOf(selfMember,b.state.member(b.id)!!,late))
+        val plan=SetupReconcile.plan(a.state,a.peers,a.self,a.peers.single {it.deviceId==b.id},snapshot,now=now+100)
+        assertTrue(plan.installed.isEmpty())
+        SetupTransactions.commit(a.p,plan,a.peers.single {it.deviceId==b.id})
+        assertTrue(a.state.notices.isEmpty())
+        assertEquals(originals.map {it.deviceId to it.generation},a.peers.map {it.deviceId to it.generation})
+        assertEquals(originals.map {it.deviceId to it.pin},a.peers.map {it.deviceId to it.pin})
+    }
     @Test fun reorderedMigrationHellosACBBothDeliveryOrdersNeverFoundOnAbsentAbsent() {
         for(bcFirst in listOf(true,false))for(bFirst in listOf(true,false)) {
             val (a,b,c)=nodes(1,3,2);link(a,b);finish(a)

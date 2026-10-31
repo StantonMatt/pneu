@@ -112,7 +112,13 @@ internal object SetupPresentation {
     /** Home's next message, in order: what this phone linked with, separate devices, joins, then Linked. */
     fun news(p:Prefs,ui:SetupUiState,now:Long,presented:Set<String> = emptySet()):SetupNews? {
         if(!p.loaded)return null
-        alsoLinked(p).filterNot {it.id in presented}.takeIf {it.isNotEmpty()}?.let {list->return SetupNews.AlsoLinked(list.map {it.name},list.map {it.id})}
+        alsoLinked(p).filterNot {it.id in presented}.takeIf {it.isNotEmpty()}?.let {list->
+            // A late READY extends the same joining outcome, including devices
+            // whose earlier snackbar was acknowledged and its notice removed.
+            val names=p.devices.filter {peer->peer.readyObserved && peer.deviceId !in p.resetPeers &&
+                (list.any {it.peerId==peer.deviceId} || memberKey(p,peer)?.let {p.membership.provenance[it]?.alsoLinked}==true)}.map {it.name}
+            return SetupNews.AlsoLinked(names,list.map {it.id})
+        }
         val via=recentPairVia(p,ui,now)
         p.membership.separateLinks.firstOrNull {it !in ui.announcedSeparate}?.let {id->
             p.devices.find {it.deviceId==id}?.let {peer->return SetupNews.Separate(id,peer.name,peer.deviceId==via?.deviceId)}
