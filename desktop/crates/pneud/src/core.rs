@@ -108,6 +108,7 @@ pub enum Event {
     },
     Blocked {
         address: String,
+        fingerprint: Hash,
     },
     RemoteUnpaired {
         name: String,
@@ -493,6 +494,9 @@ fn update_ui_state(ui: &Mutex<crate::ui::State>, event: &Event) {
     let mut ui = ui.lock().expect("UI state");
     match event {
         Event::ConnectionChanged { device, connected } => {
+            if *connected {
+                ui.scope_reconnect_finished(device);
+            }
             let now = crate::now_ms();
             if let Some(phone) = ui.phones.get_mut(device) {
                 phone.last_seen = now;
@@ -989,6 +993,7 @@ pub struct Core {
     readmission_errors: Mutex<Vec<(crate::store::members::ReadmissionKey, String)>>,
     provisional: Arc<AtomicBool>,
     pairing_gate: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) setup_decisions: tokio::sync::Mutex<()>,
     config_gate: Arc<tokio::sync::Mutex<()>>,
     clipboard: clipboard_driver::Handle,
     clipboard_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -1165,6 +1170,7 @@ impl Core {
             invitation_changes,
             provisional: Arc::new(AtomicBool::new(false)),
             pairing_gate: Arc::new(tokio::sync::Mutex::new(())),
+            setup_decisions: tokio::sync::Mutex::new(()),
             config_gate: Arc::new(tokio::sync::Mutex::new(())),
             sessions: Arc::new(Mutex::new(Connections::default())),
             clipboard,
@@ -1410,6 +1416,7 @@ impl Core {
         let mut ui = self.ui.lock().expect("UI state");
         select_display(&sessions, &admission, &mut ui);
         let mut snapshot = ui.snapshot.clone();
+        snapshot.setup_refusal_since = self.setup_refusal_since();
         snapshot.devices = self.device_snapshots(&sessions, &admission, &ui);
         snapshot.send_targets = self.file_targets(&snapshot.devices, &sessions, &admission);
         ui.scope_refresh.retain(|id, until| {
@@ -2725,6 +2732,14 @@ impl Core {
                     .context("missing client cert")?[0]
                     .as_ref(),
             );
+            let _refresh = self
+                .admission
+                .lock()
+                .expect("admission")
+                .peers
+                .get(&fp)
+                .cloned()
+                .map(|device| crate::ui::ScopeReconnect::new(self.ui.clone(), device));
             let already_known = self
                 .admission
                 .lock()
@@ -2754,6 +2769,7 @@ impl Core {
                 if !self.store.setup_quiet_reconnect(fp.clone()).await? {
                     self.event(Event::Blocked {
                         address: peer_address.ip().to_canonical().to_string(),
+                        fingerprint: fp.clone(),
                     });
                 }
                 crate::transport::close(
@@ -3813,10 +3829,25 @@ impl Core {
         let mut members_retry: Option<Instant> = None;
         let mut members_blocked=false;
         let mut members_init_retry: Option<Instant> = None;
-        let mut members_fence=match self.setup_ready(&store,hello,setup_sent.clone()).await {
+        let setup_negotiated=hello.capabilities.iter().any(|c|c=="setup");
+        // Legacy READY evidence is bookkeeping, not a prerequisite for control
+        // traffic. Poll one bounded store job alongside the control loop; drop
+        // cancels its admission wait and admitted work remains store-tracked.
+        let legacy_ready=async {
+            loop {
+                match self.setup_ready(&store,hello,setup_sent.clone()).await {
+                    Ok(_)=>break,
+                    Err(error)=>self.error(Some(hello.device_id.clone()),format!("membership initialization deferred: {error}")),
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        };
+        tokio::pin!(legacy_ready);
+        let mut legacy_ready_pending=!setup_negotiated;
+        let mut members_fence=if setup_negotiated {match self.setup_ready(&store,hello,setup_sent.clone()).await {
             Ok(fence)=>fence,
             Err(error)=>{self.error(Some(hello.device_id.clone()),format!("membership initialization deferred: {error}"));members_init_retry=Some(Instant::now()+Duration::from_secs(60));None},
-        };
+        }} else {None};
         let result:Result<()>=async {
             if let Err(error)=self.initialize_settings(&store,hello).await {
                 self.error(Some(hello.device_id.clone()),format!("settings initialization deferred: {error}"));
@@ -3912,6 +3943,7 @@ impl Core {
                 tokio::select! {
                     biased;
                     _=close.changed()=>break,
+                    _=&mut legacy_ready,if legacy_ready_pending=>{legacy_ready_pending=false;},
                     Some(report)=reports_rx.recv()=>{
                         match report {
                             WriteReport::Canceled(id) => {
@@ -8955,6 +8987,7 @@ mod tests {
             });
             original.write(&ping).await?;
             original.read(Duration::from_secs(2)).await?;
+            settle_legacy_ready(&core, &mut original).await?;
             let device = phone.identity.device_id.clone();
             let scope = core.action_scope.lock().unwrap()[&device].clone();
             let connection = core.sessions.lock().unwrap().sessions[&device].id;
@@ -9717,6 +9750,26 @@ mod tests {
             .insert(device.clone(), ActionScope::new());
         Ok((dir, core, device))
     }
+    // PONG is handled by the reader before READY initialization finishes.
+    // STATUS reaches the control loop; draining afterwards includes its evidence
+    // write rather than racing that job's admission after ConnectionChanged.
+    async fn settle_legacy_ready(
+        core: &Core,
+        connection: &mut crate::client::PhoneConnection,
+    ) -> Result<()> {
+        let mut events = core.subscribe();
+        for paused in [true, false] {
+            connection
+                .write(&Message::Status(Status { paused }))
+                .await?;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !matches!(events.recv().await?, Event::PhonePaused { paused: value, .. } if value == paused) {}
+                Ok::<_, anyhow::Error>(())
+            }).await??;
+        }
+        core.store.drain().await;
+        Ok(())
+    }
     #[tokio::test]
     async fn blocked_notice_uses_canonical_peer_addresses() -> Result<()> {
         let (dir, core, _) = fixture(Arc::new(NoActions)).await?;
@@ -9762,7 +9815,7 @@ mod tests {
                 Ok::<_, anyhow::Error>(())
             })
             .await??;
-            let Event::Blocked { address } =
+            let Event::Blocked { address, .. } =
                 tokio::time::timeout(Duration::from_secs(2), events.recv()).await??
             else {
                 panic!("expected blocked event");
@@ -10116,6 +10169,7 @@ mod tests {
                 ..
             }
         ) {}
+        settle_legacy_ready(&core, &mut original).await?;
         let device = phone.identity.device_id.clone();
         let scope = core
             .action_scope
@@ -10173,13 +10227,34 @@ mod tests {
         })
         .await?;
         let mut replacement = phone.reconnect().await?;
-        while !matches!(
-            events.recv().await?,
-            Event::ConnectionChanged {
-                connected: true,
-                ..
-            }
-        ) {}
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !matches!(
+                events.recv().await?,
+                Event::ConnectionChanged {
+                    connected: true,
+                    ..
+                }
+            ) {}
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("replacement registration blocked by READY evidence persistence")??;
+        replacement
+            .write(&Message::Status(Status { paused: true }))
+            .await?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !matches!(
+                events.recv().await?,
+                Event::PhonePaused { paused: true, .. }
+            ) {}
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("replacement STATUS blocked by READY evidence persistence")??;
+        let gate = tokio::time::timeout(Duration::from_secs(2), core.pairing_gate.lock())
+            .await
+            .context("READY evidence persistence held the pairing gate")?;
+        drop(gate);
         assert!(
             !*scope.cancelled.borrow(),
             "reconnect unexpectedly revoked the pairing scope"
@@ -10650,6 +10725,7 @@ mod tests {
                     ..
                 }
             ) {}
+            settle_legacy_ready(&core, &mut original).await?;
             core.event(Event::TransferStarted {
                 device: phone.identity.device_id.clone(),
                 metadata: test_begin(b"partial"),
@@ -11141,7 +11217,7 @@ mod tests {
             let ping = Ping { nonce: Nonce::new("d".repeat(16))? };
             initial.write(&Message::Ping(ping.clone())).await?;
             assert_eq!(initial.read(Duration::from_secs(2)).await?, Message::Pong(ping));
-            core.store.drain().await;
+            settle_legacy_ready(&core, &mut initial).await?;
             let connector = tokio_rustls::TlsConnector::from(Arc::new(crate::tls::client_config(
                 &phone.identity, core.identity.fingerprint.clone(),
             )?));
@@ -11279,6 +11355,20 @@ mod tests {
                 ..
             }
         ) {}
+        // ConnectionChanged precedes READY initialization and its legacy
+        // setup evidence write. Synchronize with the actual control loop before
+        // blocking the store; drain alone can run before that job is admitted.
+        connection
+            .write(&Message::Status(Status { paused: true }))
+            .await?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !matches!(
+                events.recv().await?,
+                Event::PhonePaused { paused: true, .. }
+            ) {}
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
         core.store.drain().await;
         let (entered, wait) = tokio::sync::oneshot::channel();
         let (release, blocking) = std::sync::mpsc::channel();
@@ -11332,6 +11422,7 @@ mod tests {
         let phone = crate::client::Phone::new(dir.path().join("phone"))?;
         let invitation = core.start_pairing_with_addresses(vec![address]).await?;
         let mut original = phone.pair(&invitation).await?;
+        settle_legacy_ready(&core, &mut original).await?;
         let mut listening = tokio::spawn(async move { original.listen(60).await });
         let (entered, wait) = tokio::sync::oneshot::channel();
         let (release, blocking) = std::sync::mpsc::channel();

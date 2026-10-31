@@ -259,13 +259,21 @@ impl Core {
         sent: Option<(SetupHello, u64)>,
     ) -> Result<Option<SetupFence>> {
         if !hello.capabilities.iter().any(|c| c == "setup") {
-            let _guard = self.pairing_gate.lock().await;
+            // Capture coherently with registration, then release the pairing
+            // gate before disk/admission waits. The transaction rechecks the
+            // setup, binding, pin and current connection through SetupFence.
+            let fence = {
+                let _guard = self.pairing_gate.lock().await;
+                if self.connection_current(store, &hello.device_id) {
+                    Some(self.setup_fence(store, hello)?)
+                } else {
+                    None
+                }
+            };
             // HELLO/READY is link evidence even when setup was never negotiated
             // or this binding was already legacy before the daemon restarted.
-            if self.connection_current(store, &hello.device_id) {
-                self.store
-                    .setup_legacy_ready(self.setup_fence(store, hello)?)
-                    .await?;
+            if let Some(fence) = fence {
+                self.store.setup_legacy_ready(fence).await?;
             }
             return Ok(None);
         }
@@ -415,8 +423,18 @@ impl Core {
             })
             .await
     }
+    pub(crate) async fn quiet_blocked_notice(&self, pin: Hash) -> Result<bool> {
+        Ok(self.store.setup_quiet_reconnect(pin.clone()).await?
+            || self
+                .admission
+                .lock()
+                .expect("admission")
+                .peers
+                .contains_key(&pin))
+    }
     pub(crate) async fn setup_request_notice(&self) -> Option<crate::ui::notifications::Notice> {
         use crate::ui::window_setup::Decision;
+        let _batch = self.setup_decisions.lock().await;
         let _guard = self.pairing_gate.lock().await;
         let state = self.store.setup_state();
         if let Some(record) = state.readmissions.first() {

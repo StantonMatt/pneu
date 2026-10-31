@@ -400,7 +400,7 @@ pub(crate) fn request_key(setup: &Setup, link: &Link) -> String {
 // ---------- Link request notifications ----------
 
 /// Authority captured when the notification is posted, just like the top card.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Decision {
     pub readmission: Option<crate::store::members::ReadmissionKey>,
     pub device: pneu_proto::Id,
@@ -409,6 +409,17 @@ pub struct Decision {
 }
 
 pub(crate) async fn decide(core: &crate::core::Core, requests: &[Decision], allow: bool) {
+    if let Err(error) = decide_all(core, requests, allow).await {
+        eprintln!("pneud: link request action: {error:#}");
+    }
+}
+pub(crate) async fn decide_all(
+    core: &crate::core::Core,
+    requests: &[Decision],
+    allow: bool,
+) -> anyhow::Result<()> {
+    let _batch = core.setup_decisions.lock().await;
+    let mut failure = None;
     for request in requests {
         let result = if let Some(key) = &request.readmission {
             core.decide_readmission(key.clone(), allow).await
@@ -425,9 +436,13 @@ pub(crate) async fn decide(core: &crate::core::Core, requests: &[Decision], allo
             if request.readmission.is_some() {
                 core.request_window(false);
             }
-            eprintln!("pneud: link request action: {error:#}");
+            failure = Some(error);
         }
     }
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// A dismissal is remembered by keeping the displayed set. Only a changed set

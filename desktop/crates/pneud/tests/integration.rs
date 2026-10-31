@@ -3528,6 +3528,15 @@ fn sweep_superseded_connections_close_while_metadata_worker_is_blocked() -> Resu
             initial.read(Duration::from_secs(2)).await?,
             Message::Pong(ping)
         );
+        // PONG bypasses READY initialization. Reach the control loop before
+        // occupying the only blocking worker and exercising replacements.
+        let mut events = h.core.subscribe();
+        for paused in [true, false] {
+            initial.write(&Message::Status(Status { paused })).await?;
+            event_matching(&mut events, |event| {
+                matches!(event, pneud::Event::PhonePaused { paused: value, .. } if *value == paused)
+            }).await?;
+        }
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let blocker = tokio::task::spawn_blocking(move || {

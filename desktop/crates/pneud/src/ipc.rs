@@ -142,6 +142,10 @@ pub enum Command {
         binding_generation: u64,
         allow: bool,
     },
+    SetupDecisions {
+        requests: Vec<crate::ui::window_setup::Decision>,
+        allow: bool,
+    },
     ReadmissionDecision {
         key: crate::store::members::ReadmissionKey,
         allow: bool,
@@ -491,6 +495,11 @@ async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
             ensure!(binding_generation.is_some()==expected_scope.is_some(),"incomplete setup link expectation");
             let linked=core.link_existing_device(device,binding_generation.zip(expected_scope)).await?;
             if binding_generation.is_some() {serde_json::json!(linked)} else {serde_json::Value::Null}
+        },
+        Command::SetupDecisions { requests, allow } => {
+            ensure!(requests.len() <= 16, "too many setup decisions");
+            crate::ui::window_setup::decide_all(&core, &requests, allow).await?;
+            serde_json::Value::Null
         },
         Command::ReadmissionDecision { key, allow } => {core.decide_readmission(key,allow).await?;serde_json::Value::Null},
         Command::SetupDecision {device,setup_generation,binding_generation,allow} => {core.decide_setup(device,setup_generation,binding_generation,allow).await?;serde_json::Value::Null},

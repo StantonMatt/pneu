@@ -1577,3 +1577,45 @@ async fn setup_readmission_actions_recheck_lifecycle_gate_and_publish_only_commi
     );
     a.stop().await
 }
+
+#[tokio::test]
+async fn setup_live_rename_reaches_direct_peer_without_reconnect() -> Result<()> {
+    let a = Running::new().await?;
+    let b = Running::new().await?;
+    pair(&a.core, &b.core, true).await?;
+    until(|| {
+        a.core.store.setup_state().setup_id.is_some()
+            && a.core.store.setup_state().setup_id == b.core.store.setup_state().setup_id
+            && a.core
+                .connected_devices()
+                .contains(&b.core.identity.device_id)
+    })
+    .await?;
+    let generation = a.core.store.pairing_generation(&b.core.identity.device_id);
+    b.core.rename("Office-PC 2".into()).await?;
+    until(|| {
+        a.core
+            .ui_snapshot()
+            .devices
+            .iter()
+            .any(|d| d.device == b.core.identity.device_id && d.name == "Office-PC 2")
+    })
+    .await?;
+    assert_eq!(
+        a.core.store.pairing_generation(&b.core.identity.device_id),
+        generation
+    );
+    assert_eq!(
+        a.core
+            .store
+            .peer_info()
+            .await?
+            .iter()
+            .find(|p| p.id == b.core.identity.device_id)
+            .unwrap()
+            .name,
+        "Office-PC 2"
+    );
+    a.stop().await?;
+    b.stop().await
+}

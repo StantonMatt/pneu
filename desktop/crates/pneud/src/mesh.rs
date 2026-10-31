@@ -91,6 +91,7 @@ struct LinkState {
 struct LinkIssue {
     generation: u64,
     problem: LinkProblem,
+    since: u64,
     retry_at: Instant,
 }
 fn link_problem(error: &anyhow::Error) -> Option<LinkProblem> {
@@ -270,6 +271,7 @@ impl Core {
         admission: &Admission,
         ui: &crate::ui::State,
     ) -> Vec<DeviceSnapshot> {
+        let setup = self.store.setup_state();
         let peers = self.mesh.peers.lock().expect("mesh peers");
         let mut devices: Vec<_> = admission
             .peers
@@ -282,8 +284,16 @@ impl Core {
                 let phone = ui.phones.get(id);
                 DeviceSnapshot {
                     device: id.clone(),
-                    name: phone
-                        .map(|p| p.name.clone())
+                    name: setup
+                        .roster
+                        .iter()
+                        .find(|m| {
+                            &m.device_id == id
+                                && m.status == MemberStatus::Member
+                                && admission.peers.get(&m.fingerprint) == Some(id)
+                        })
+                        .map(|m| m.name.clone())
+                        .or_else(|| phone.map(|p| p.name.clone()))
                         .or_else(|| peer.map(|p| p.name.clone()))
                         .unwrap_or_default(),
                     role: session
@@ -389,6 +399,20 @@ impl Core {
         let _sessions = self.sessions.lock().expect("sessions");
         self.set_link_problem_checked(device, generation, Some(epoch), problem);
     }
+    pub(super) fn setup_refusal_since(&self) -> Option<u64> {
+        self.mesh
+            .links
+            .lock()
+            .expect("link state")
+            .iter()
+            .filter_map(|(id, link)| {
+                let issue = link.issue.as_ref()?;
+                (issue.problem == LinkProblem::Unauthorized
+                    && self.store.pairing_generation(id) == Some(issue.generation))
+                .then_some(issue.since)
+            })
+            .min()
+    }
     pub(super) fn set_link_problem(
         &self,
         device: &Id,
@@ -414,9 +438,16 @@ impl Core {
         }
         link.epoch.issue += 1;
         if let Some(problem) = problem {
+            let since = link
+                .issue
+                .as_ref()
+                .filter(|i| i.generation == generation && i.problem == problem)
+                .map(|i| i.since)
+                .unwrap_or_else(crate::now_ms);
             link.issue = Some(LinkIssue {
                 generation,
                 problem,
+                since,
                 retry_at: Instant::now() + Duration::from_secs(300),
             });
         } else if link
@@ -1019,6 +1050,7 @@ impl Core {
                         false
                     }
                 };
+                let reconnect = crate::ui::ScopeReconnect::new(self.ui.clone(), peer.id.clone());
                 let dial = async {
                     let addresses = self.dial_candidates(&peer);
                     let ComputerLink {
@@ -1081,6 +1113,7 @@ impl Core {
                     _ = shutdown.changed() => break,
                     result = &mut dial => result
                 };
+                drop(reconnect);
                 if let Err(error) = &result
                     && error
                         .downcast_ref::<crate::client::PcRejection>()
@@ -1601,6 +1634,36 @@ mod tests {
         a.persist_pairing(&b.identity.device_id, &b.identity.fingerprint, guard, false)
             .await
     }
+    #[tokio::test]
+    async fn setup_refusal_timestamp_survives_retry_and_clears_on_ready_or_repair() -> Result<()> {
+        let (_da, a, _la) = core().await?;
+        let (_db, b, _lb) = core().await?;
+        bind(&a, &b).await?;
+        let device = &b.identity.device_id;
+        let generation = a.store.pairing_generation(device).unwrap();
+        a.set_link_problem(device, generation, Some(LinkProblem::Unauthorized));
+        // Model an earlier authenticated refusal without a wall-clock sleep.
+        a.mesh
+            .links
+            .lock()
+            .unwrap()
+            .get_mut(device)
+            .unwrap()
+            .issue
+            .as_mut()
+            .unwrap()
+            .since = 42;
+        a.set_link_problem(device, generation, Some(LinkProblem::Unauthorized));
+        assert_eq!(a.ui_snapshot().setup_refusal_since, Some(42));
+        a.set_link_problem(device, generation, None);
+        assert_eq!(a.ui_snapshot().setup_refusal_since, None);
+        a.set_link_problem(device, generation, Some(LinkProblem::Unauthorized));
+        bind(&a, &b).await?;
+        assert_eq!(a.ui_snapshot().setup_refusal_since, None);
+        a.shutdown_actions().await?;
+        b.shutdown_actions().await
+    }
+
     #[tokio::test]
     async fn own_device_id_inbound_hello_rejected_before_pair_request() -> Result<()> {
         for known in [false, true] {

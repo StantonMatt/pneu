@@ -81,6 +81,9 @@ pub async fn run(
     if core.paired_devices().is_empty() {
         core.request_window(false);
     }
+    if let Err(error) = actions.restore_setup_notices().await {
+        eprintln!("pneud: previous setup notifications: {error:#}");
+    }
     post_joined(&core, &actions).await;
     let mut requests = Some(super::window_setup::Requests::default());
     let mut request_job: Option<futures_util::future::BoxFuture<'static, super::window_setup::Requests>> = None;
@@ -117,15 +120,16 @@ pub async fn run(
             Some(())=theme_rx.recv()=>{themes.changed(Instant::now());refresh_icons=true;},
             event=events.recv()=>match event {
                 Ok(Event::Error {message,..})=>eprintln!("pneud: {message}"),
-                Ok(Event::Blocked {address})=>{
+                Ok(Event::Blocked {address,fingerprint})=>{
                     if last_blocked.is_none_or(|time:Instant|time.elapsed()>=Duration::from_secs(3600)) {
-                        last_blocked=Some(Instant::now());let _=actions.notice(Notice::blocked(&address),Vec::new(),None,0,None).await;
+                        last_blocked=Some(Instant::now());let mut notice=Notice::blocked(&address);notice.blocked_pin=Some(fingerprint);let _=actions.notice(notice,Vec::new(),None,0,None).await;
                     }
                 }
                 Ok(Event::ComputerPaired {name,..})=>{
                     if !core.window_focused() {let _=actions.notice(Notice::paired(&name),Vec::new(),None,0,None).await;}
                 },
                 Ok(Event::RemoteUnpaired {name})=>{let _=actions.notice(Notice::unpaired(&name),Vec::new(),None,0,None).await;},
+                Ok(Event::Unpaired {device})=>{let _=actions.withdraw_device_notices(&device).await;},
                 Ok(Event::Paired {..})=>post_joined(&core,&actions).await,
                 Ok(event @ (Event::ConnectionChanged {..}|Event::PhonePaused {..}|Event::ConfigChanged))=>clipboard_policy_event(&core,&event),
                 Err(tokio::sync::broadcast::error::RecvError::Closed)=>break,
@@ -169,7 +173,7 @@ pub async fn run(
             if sync_requests && request_job.is_none() && let Some(mut state) = requests.take() {
             let core = core.clone();
             let actions = actions.clone();
-            request_job = Some(spawn_request_job(async move { state.sync(&core, &actions).await; state }));
+            request_job = Some(spawn_request_job(async move { let _=actions.withdraw_known_blocked(&core).await; state.sync(&core, &actions).await; state }));
         }
         if !update_tray { continue; }
         if let Some(child) = window.as_mut()

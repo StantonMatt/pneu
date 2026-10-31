@@ -3536,3 +3536,43 @@ async fn setup_regression_review_legacy_phone_ready_is_generation_fenced() -> Re
     assert!(!f.s.setup_binding_ready(id(3)).await?);
     Ok(())
 }
+
+#[tokio::test]
+async fn setup_removed_certificate_stays_quiet_before_during_and_after_question() -> Result<()> {
+    let f = Fixture::new().await?;
+    let pin = member(3).fingerprint;
+    assert!(!f.s.setup_quiet_reconnect(pin.clone()).await?);
+    let mut removed = member(3);
+    removed.status = MemberStatus::Removed;
+    removed.hlc = 10;
+    f.merge(f.snapshot(vec![removed])).await?;
+    assert!(f.s.setup_quiet_reconnect(pin.clone()).await?);
+    let mut newer = member(3);
+    newer.hlc = 20;
+    f.merge(f.snapshot(vec![newer])).await?;
+    let key = f.s.setup_state().readmissions[0].key.clone();
+    assert!(f.s.setup_quiet_reconnect(pin.clone()).await?);
+    f.s.setup_readmit(key, id(2), false, vec![], |_| {}).await?;
+    assert!(f.s.setup_quiet_reconnect(pin).await?);
+    assert!(!f.s.setup_quiet_reconnect(member(4).fingerprint).await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_sender_members_rename_updates_direct_binding_without_reconnect() -> Result<()> {
+    let f = Fixture::new().await?;
+    let mut renamed = member(1);
+    renamed.hlc = crate::now_ms() + 100;
+    renamed.name = "Office-PC 2".into();
+    f.merge(f.snapshot(vec![renamed])).await?;
+    assert_eq!(
+        f.s.peer_info()
+            .await?
+            .iter()
+            .find(|p| p.id == id(1))
+            .unwrap()
+            .name,
+        "Office-PC 2"
+    );
+    Ok(())
+}

@@ -102,6 +102,9 @@ pub struct Snapshot {
     /// Presentation only: never used for recipient or session authority.
     #[serde(default)]
     pub refreshing_devices: Vec<pneu_proto::Id>,
+    /// First current authenticated refusal, preserved while the window is closed.
+    #[serde(default)]
+    pub setup_refusal_since: Option<u64>,
     /// Local UI hint only. Never a separate clipboard publication or log event.
     #[serde(default)]
     pub pairing_clipboard: Option<String>,
@@ -223,6 +226,36 @@ pub(crate) struct State {
     pub incoming: std::collections::VecDeque<crate::outbox::Transfer>,
     pub active_transfers: std::collections::HashSet<(pneu_proto::Id, pneu_proto::Id)>,
 }
+/// Captured at the start of an authenticated reconnect attempt. An old socket
+/// ending cannot clear the grace for a newer planned refresh.
+pub(crate) struct ScopeReconnect {
+    ui: std::sync::Arc<std::sync::Mutex<State>>,
+    device: pneu_proto::Id,
+    refresh: Option<tokio::time::Instant>,
+}
+impl ScopeReconnect {
+    pub(crate) fn new(ui: std::sync::Arc<std::sync::Mutex<State>>, device: pneu_proto::Id) -> Self {
+        let refresh = ui
+            .lock()
+            .expect("UI state")
+            .scope_refresh
+            .get(&device)
+            .copied();
+        Self {
+            ui,
+            device,
+            refresh,
+        }
+    }
+}
+impl Drop for ScopeReconnect {
+    fn drop(&mut self) {
+        let mut ui = self.ui.lock().expect("UI state");
+        if self.refresh.is_some() && ui.scope_refresh.get(&self.device).copied() == self.refresh {
+            ui.scope_reconnect_finished(&self.device);
+        }
+    }
+}
 impl State {
     pub(crate) fn refreshing_scope(&mut self, device: &pneu_proto::Id) {
         let now = tokio::time::Instant::now();
@@ -230,10 +263,15 @@ impl State {
             .entry(device.clone())
             .and_modify(|until| {
                 if *until <= now {
-                    *until = now + std::time::Duration::from_secs(5);
+                    *until = now + std::time::Duration::from_secs(10);
                 }
             })
-            .or_insert(now + std::time::Duration::from_secs(5));
+            .or_insert(now + std::time::Duration::from_secs(10));
+    }
+    /// End the planned-refresh presentation after the first failed attempt.
+    /// Successful registrations clear it through ConnectionChanged.
+    pub(crate) fn scope_reconnect_finished(&mut self, device: &pneu_proto::Id) {
+        self.scope_refresh.remove(device);
     }
     pub fn prune_incoming(&mut self) {
         while self
@@ -520,14 +558,14 @@ pub enum Command {
 mod tests {
     use super::*;
     #[tokio::test(start_paused = true)]
-    async fn scope_refresh_grace_is_bounded_to_five_seconds() {
+    async fn scope_refresh_waits_for_first_attempt_but_is_capped_at_ten_seconds() {
         let mut state = State::default();
         let device = pneu_proto::Id::from_bytes([1; 16]);
         state.refreshing_scope(&device);
         let deadline = state.scope_refresh[&device];
         assert_eq!(
             deadline - tokio::time::Instant::now(),
-            std::time::Duration::from_secs(5)
+            std::time::Duration::from_secs(10)
         );
         tokio::time::advance(std::time::Duration::from_secs(4)).await;
         state.refreshing_scope(&device);
@@ -535,8 +573,31 @@ mod tests {
             state.scope_refresh[&device], deadline,
             "repeated refresh does not extend a disconnect"
         );
-        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::time::advance(std::time::Duration::from_secs(3)).await;
+        assert!(
+            state.scope_refresh[&device] > tokio::time::Instant::now(),
+            "phone reconnect at 6.6 seconds stays connected"
+        );
+        state.scope_reconnect_finished(&device);
+        assert!(!state.scope_refresh.contains_key(&device));
+        state.refreshing_scope(&device);
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
         assert!(state.scope_refresh[&device] <= tokio::time::Instant::now());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scope_refresh_only_the_new_reconnect_attempt_can_end_grace() {
+        let ui = std::sync::Arc::new(std::sync::Mutex::new(State::default()));
+        let device = pneu_proto::Id::from_bytes([1; 16]);
+        let old = ScopeReconnect::new(ui.clone(), device.clone());
+        ui.lock().unwrap().refreshing_scope(&device);
+        drop(old);
+        assert!(ui.lock().unwrap().scope_refresh.contains_key(&device));
+        let attempt = ScopeReconnect::new(ui.clone(), device.clone());
+        tokio::time::advance(std::time::Duration::from_millis(6600)).await;
+        assert!(ui.lock().unwrap().scope_refresh[&device] > tokio::time::Instant::now());
+        drop(attempt);
+        assert!(!ui.lock().unwrap().scope_refresh.contains_key(&device));
     }
 
     #[test]

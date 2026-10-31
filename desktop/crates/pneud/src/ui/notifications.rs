@@ -11,6 +11,7 @@ pub struct Notice {
     pub urls: Vec<String>,
     /// The device an action such as Remove… is about.
     pub device: Option<pneu_proto::Id>,
+    pub blocked_pin: Option<pneu_proto::Hash>,
     pub setup_requests: Vec<super::window_setup::Decision>,
 }
 impl Notice {
@@ -24,6 +25,7 @@ impl Notice {
             expires: -1,
             urls: Vec::new(),
             device: None,
+            blocked_pin: None,
             setup_requests: Vec::new(),
         }
     }
@@ -121,9 +123,9 @@ impl Notice {
         n
     }
     pub fn blocked(address: &str) -> Self {
-        let mut n = Self::new("Blocked an unpaired phone");
+        let mut n = Self::new("Blocked an unpaired device");
         n.body = format!("{address} tried to connect");
-        n.actions.push(("pair", "Pair Phone…"));
+        n.actions.push(("pair", "Add Device…"));
         n
     }
     pub fn paired(name: &str) -> Self {
@@ -163,7 +165,7 @@ impl Notice {
             super::window_setup::askers(&names)
         ));
         notice.body = "New devices then pair just once.".into();
-        notice.actions = vec![("allow", "Allow"), ("deny", "Don't Allow")];
+        notice.actions = vec![("deny", "Don't Allow"), ("allow", "Allow")];
         notice.setup_requests = requests;
         notice
     }
@@ -269,6 +271,18 @@ mod tests {
             source_media_id: None,
         }
     }
+    #[test]
+    fn blocked_copy_is_device_neutral_and_decision_actions_are_negative_first() {
+        let blocked = Notice::blocked("127.0.0.1");
+        assert_eq!(blocked.summary, "Blocked an unpaired device");
+        assert_eq!(blocked.actions, vec![("pair", "Add Device…")]);
+        let request = Notice::link_request(&["Computer".into()], Vec::new());
+        assert_eq!(
+            request.actions,
+            vec![("deny", "Don't Allow"), ("allow", "Allow")]
+        );
+    }
+
     #[test]
     fn file_copy_and_save_failure_copy() {
         let n = Notice::file(

@@ -547,11 +547,15 @@ impl Store {
     /// normally, but do not invite the owner to pair an apparent stranger.
     pub(crate) async fn setup_quiet_reconnect(&self, pin: Hash) -> Result<bool> {
         self.call(move |c| {
-            Ok(c.query_row(
+            let withdrawn: bool = c.query_row(
                 "SELECT EXISTS(SELECT 1 FROM setup_withdrawn_pins WHERE fingerprint=?)",
                 [pin.as_str()],
                 |r| r.get(0),
-            )?)
+            )?;
+            Ok(withdrawn
+                || entries(c)?
+                    .iter()
+                    .any(|entry| entry.denied && entry.value.fingerprint == pin))
         })
         .await
     }
@@ -994,7 +998,8 @@ impl Store {
                     tx.execute("DELETE FROM setup_candidates WHERE device=? AND fingerprint=?",params![m.device_id.as_str(),m.fingerprint.as_str()])?;
                     delta.added.push(m.device_id.clone());
                 }
-                if m.device_id!=fence.device {
+                if m.device_id != fence.device || retained.iter().any(|e|
+                    e.value.device_id == m.device_id && e.value.fingerprint == m.fingerprint && stamp(&value) > stamp(&e.value)) {
                     tx.execute("UPDATE peers SET name=? WHERE id=? AND fp=?",params![value.name,m.device_id.as_str(),m.fingerprint.as_str()])?;
                 }
                 if let Some(r)=&value.reach {merge_routes(tx,&m.device_id,&m.fingerprint,&r.addresses)?;}

@@ -123,7 +123,7 @@ pub async fn run(
                 Ok(event) => {
                     use super::notifications::Notice;
                     let notice = match &event {
-                        Event::Blocked { address } if last_blocked.is_none_or(|time: std::time::Instant| time.elapsed() >= Duration::from_secs(3600)) => { last_blocked = Some(std::time::Instant::now()); Some(Notice::blocked(address)) },
+                        Event::Blocked { address, .. } if last_blocked.is_none_or(|time: std::time::Instant| time.elapsed() >= Duration::from_secs(3600)) => { last_blocked = Some(std::time::Instant::now()); Some(Notice::blocked(address)) },
                         Event::ComputerPaired { name, .. } if !core.window_focused() => Some(Notice::paired(name)),
                         Event::RemoteUnpaired { name } => Some(Notice::unpaired(name)),
                         Event::Paired { .. } => {

@@ -1099,6 +1099,7 @@ struct Paired {
     name: String,
     device: Option<String>,
     at: Instant,
+    linked: String,
 }
 
 #[derive(Default)]
@@ -3107,36 +3108,30 @@ impl Worker {
             .await;
     }
     async fn answer_from(&mut self, shown: &Setup, devices: &[String], allow: bool) {
-        let mut answered = false;
-        let mut failure = None;
-        for device in devices {
-            if !shown.link(device).is_some_and(|l| l.prompt) {
-                continue;
-            }
-            let binding = shown.binding_generations.get(device).copied().flatten();
-            let setup_generation = shown.generation;
-            let result = async {
-                let command = ipc::Command::SetupDecision {
-                    device: pneu_proto::Id::new(device.as_str())?,
-                    setup_generation,
-                    binding_generation: binding.context("pairing changed")?,
-                    allow,
-                };
-                self.command(command).await
-            }
-            .await;
-            match result {
-                Ok(_) => answered = true,
-                Err(error) => failure = Some(error),
-            }
-        }
-        if let (false, Some(error)) = (answered, failure) {
-            let message = if allow {
-                "Couldn't link"
-            } else {
-                "Couldn't save the answer"
-            };
-            self.fail(message, error);
+        let requests = devices
+            .iter()
+            .filter_map(|device| {
+                shown.link(device).filter(|l| l.prompt)?;
+                Some(setup::Decision {
+                    readmission: None,
+                    device: pneu_proto::Id::new(device.as_str()).ok()?,
+                    setup_generation: shown.generation,
+                    binding_generation: shown.binding_generations.get(device).copied().flatten()?,
+                })
+            })
+            .collect();
+        if let Err(error) = self
+            .command(ipc::Command::SetupDecisions { requests, allow })
+            .await
+        {
+            self.fail(
+                if allow {
+                    "Couldn't link"
+                } else {
+                    "Couldn't save the answer"
+                },
+                error,
+            );
         }
     }
     /// Remove from all devices, exactly as the confirmation showed it. The
@@ -3331,6 +3326,7 @@ impl Worker {
                     name: join.name,
                     device: Some(device.into()),
                     at: Instant::now(),
+                    linked: String::new(),
                 });
                 self.ui(|w| {
                     if w.global::<Ui>().get_dialog() == Dialog::Message {
@@ -3628,6 +3624,44 @@ impl Worker {
         )
         .unwrap_or(None);
 
+        self.poll_join().await;
+
+        // Finish only for the displayed invitation that was actually consumed,
+        // including a direct pairing to a device already in the list.
+        if is_pairing_page(view.page)
+            && self.join.is_none()
+            && self.current()
+            && self.paired.is_none()
+            && let Some(peer) = peers.iter().find(|p| {
+                self.snapshot
+                    .pairing_completion
+                    .as_ref()
+                    .is_some_and(|done| {
+                        done.device.as_str() == p.id
+                            && self.seen_pairing_token.as_ref() != Some(&done.token)
+                            && (self.phone_token.as_ref() == Some(&done.token)
+                                || self.code.token.as_ref() == Some(&done.token))
+                    })
+                    && !p.name.is_empty()
+            })
+        {
+            self.seen_pairing_token = self
+                .snapshot
+                .pairing_completion
+                .as_ref()
+                .map(|done| done.token.clone());
+            self.paired = Some(Paired {
+                origin: view.clone(),
+                name: peer.name.clone(),
+                device: Some(peer.id.clone()),
+                at: Instant::now(),
+                linked: String::new(),
+            });
+            #[cfg(target_os = "macos")]
+            if view.page == Page::Scan {
+                self.ui(|_| super::macos::camera::close());
+            }
+        }
         // Phone pairing QR (v2): keep an invitation open while the tab shows.
         let phone_tab = view.page == Page::Add && view.add_tab == 0;
         if phone_tab {
@@ -3666,43 +3700,6 @@ impl Worker {
         {
             self.adopt_code(invitation);
         }
-        self.poll_join().await;
-
-        // Finish only for the displayed invitation that was actually consumed,
-        // including a direct pairing to a device already in the list.
-        if is_pairing_page(view.page)
-            && self.join.is_none()
-            && self.current()
-            && self.paired.is_none()
-            && let Some(peer) = peers.iter().find(|p| {
-                self.snapshot
-                    .pairing_completion
-                    .as_ref()
-                    .is_some_and(|done| {
-                        done.device.as_str() == p.id
-                            && self.seen_pairing_token.as_ref() != Some(&done.token)
-                            && (self.phone_token.as_ref() == Some(&done.token)
-                                || self.code.token.as_ref() == Some(&done.token))
-                    })
-                    && !p.name.is_empty()
-            })
-        {
-            self.seen_pairing_token = self
-                .snapshot
-                .pairing_completion
-                .as_ref()
-                .map(|done| done.token.clone());
-            self.paired = Some(Paired {
-                origin: view.clone(),
-                name: peer.name.clone(),
-                device: Some(peer.id.clone()),
-                at: Instant::now(),
-            });
-            #[cfg(target_os = "macos")]
-            if view.page == Page::Scan {
-                self.ui(|_| super::macos::camera::close());
-            }
-        }
         if self
             .paired
             .as_ref()
@@ -3710,8 +3707,21 @@ impl Worker {
         {
             self.paired = None;
         }
+        let (detail, _) = self.paired_detail();
+        if let Some(paired) = &mut self.paired
+            && detail.starts_with("Also linked:")
+            && paired.linked != detail
+        {
+            paired.linked = detail;
+            paired.at = Instant::now();
+        }
         if let Some(paired) = &self.paired
-            && paired.at.elapsed() >= Duration::from_millis(1500)
+            && paired.at.elapsed()
+                >= if paired.linked.is_empty() {
+                    Duration::from_millis(1500)
+                } else {
+                    Duration::from_secs(3)
+                }
         {
             let device = paired.device.clone();
             self.paired = None;
@@ -3872,9 +3882,12 @@ impl Worker {
                         summary.detail.clear();
                     }
                     if introduced && peer.health == Health::Lost {
-                        summary.title =
-                            format!("{} doesn't recognize {}", peer.name, this_computer());
-                        summary.detail = "Pair with it directly".into();
+                        summary.title = format!("Waiting for {}", peer.name);
+                        summary.detail =
+                            format!("Allow it on {}, or pair with it directly", peer.name);
+                        let mut waiting = peer.clone();
+                        waiting.health = Health::Offline;
+                        summary.link = device_summary(&waiting).0.link;
                     }
                     let (settings, mut note) = self
                         .peer_settings
@@ -3888,13 +3901,71 @@ impl Worker {
                     {
                         note = format!("Switches sync when {} connects.", peer.name);
                     }
-                    (peer.item(), summary, action.to_owned(), settings, note)
+                    let mut item = peer.item();
+                    if introduced && peer.health == Health::Lost {
+                        item.tone = Tone::Neutral;
+                        item.status_tone = Tone::Neutral;
+                    }
+                    (item, summary, action.to_owned(), settings, note)
                 }
                 None => Default::default(),
             };
+        // Phones never accept a desktop dial, so they cannot report refusal.
+        // A fresh phone connection is evidence that this computer still belongs.
+        let pair_again = !peers.is_empty()
+            && ((peers.iter().all(Peer::lost)
+                && peers.iter().all(|p| {
+                    p.health != Health::Lost
+                        || self
+                            .setup
+                            .link(&p.id)
+                            .is_none_or(|l| l.introduced_by.is_none())
+                }))
+                || (self.snapshot.setup_refusal_since.is_some()
+                    && peers.iter().any(|p| !p.phone)
+                    && peers
+                        .iter()
+                        .filter(|p| !p.phone)
+                        .all(|p| p.health == Health::Lost)
+                    && peers.iter().filter(|p| p.phone).all(|p| {
+                        !p.connected()
+                            && p.last_seen <= self.snapshot.setup_refusal_since.unwrap_or(0)
+                    })));
+        let presented: Vec<_> = peers
+            .iter()
+            .cloned()
+            .map(|mut p| {
+                if p.health == Health::Lost
+                    && self
+                        .setup
+                        .link(&p.id)
+                        .is_some_and(|l| l.introduced_by.is_some())
+                {
+                    p.health = Health::Offline;
+                }
+                p
+            })
+            .collect();
+        let mut hero = summary(&presented, &self.transfers);
+        if pair_again {
+            hero.title = "Pairing lost".into();
+            hero.detail = format!("Your devices don't recognize {}", this_computer());
+        } else if peers.iter().all(|p| !p.connected())
+            && peers.iter().any(|p| {
+                p.health == Health::Lost
+                    && self
+                        .setup
+                        .link(&p.id)
+                        .is_some_and(|l| l.introduced_by.is_some())
+            })
+        {
+            hero.title = "Waiting for your devices".into();
+            hero.detail.clear();
+            hero.link.tube = Tube::Dashed;
+        }
         Frame {
             error,
-            summary: summary(peers, &self.transfers),
+            summary: hero,
             devices: peers
                 .iter()
                 .map(|p| {
@@ -3914,19 +3985,16 @@ impl Worker {
                             .link(&p.id)
                             .is_some_and(|l| l.introduced_by.is_some())
                     {
-                        item.status = format!(
-                            "{} doesn't recognize {} · Pair with it directly",
-                            p.name,
-                            this_computer()
-                        )
-                        .into();
+                        item.status = format!("Waiting for {}", p.name).into();
+                        item.tone = Tone::Neutral;
+                        item.status_tone = Tone::Neutral;
                     }
                     item
                 })
                 .collect(),
             recent: recent(peers, &self.transfers),
             manual_clipboard: mode == ClipboardMode::Manual,
-            pair_again: !peers.is_empty() && peers.iter().all(Peer::lost),
+            pair_again,
             motion: animations_enabled(&super::palette::globals()),
             device: device_item,
             device_summary,
@@ -6661,13 +6729,15 @@ mod tests {
         advance_ui();
     }
     fn sent(mock: &MockIpc, command: &str) -> Vec<Value> {
-        mock.requests
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|r| r["command"] == command)
-            .cloned()
-            .collect()
+        mock.requests.lock().unwrap().iter().flat_map(|request| {
+            if command == "setup_decision" && request["command"] == "setup_decisions" {
+                request["requests"].as_array().unwrap().iter().map(|r| json!({
+                    "command":"setup_decision", "device":r["device"],
+                    "setup_generation":r["setup_generation"], "binding_generation":r["binding_generation"], "allow":request["allow"],
+                })).collect()
+            } else if request["command"] == command { vec![request.clone()] }
+            else { vec![] }
+        }).collect()
     }
 
     #[tokio::test]
@@ -7339,6 +7409,189 @@ mod tests {
             peers(&snap, &[])[0].lost(),
             "a refresh never hides pairing loss"
         );
+    }
+
+    #[tokio::test]
+    async fn first_run_phone_completion_survives_renewal_and_linked_result_stays_readable()
+    -> Result<()> {
+        if in_offscreen_child("ui::window::tests::first_run_phone_completion_survives_renewal_and_linked_result_stays_readable", &[]).await? { return Ok(()); }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        let mock = mock_ipc(&worker.paths.socket, |_| (true, Value::Null))?;
+        state(&mut worker, vec![], vec![]);
+        window.invoke_open_add(0);
+        drain(&mut worker, &mut actions).await;
+        let invitation = pneu_proto::PairingUri::parse(&sample_uri())?;
+        let mut initial = status_value(&worker);
+        initial["invitation"] = serde_json::to_value(&invitation)?;
+        let visible = AtomicBool::new(true);
+        worker.refresh(initial, &visible).await?;
+        flush_ui();
+        assert_eq!(worker.phone_token.as_ref(), Some(&invitation.token));
+        assert!(
+            window.global::<Ui>().get_link_on(),
+            "first run defaults to linking"
+        );
+        state(&mut worker, trio(), vec![]);
+        worker.snapshot.pairing_completion = Some(super::super::PairingCompletion {
+            token: invitation.token.clone(),
+            device: id(1),
+        });
+        let introduced = with(
+            with(link_of(2, "enabled"), "introduced_by", json!(id(1))),
+            "ready",
+            json!(false),
+        );
+        let mut setup = setup_json(
+            vec![link_of(1, "enabled"), introduced],
+            &[(1, "Galaxy S25+"), (2, "MacBook Air")],
+        );
+        let mut next = linked_status(&worker, &setup);
+        let mut renewed = invitation.clone();
+        renewed.token = pneu_proto::Hash::new("ef".repeat(32))?;
+        next["invitation"] = serde_json::to_value(&renewed)?;
+        worker.refresh(next, &visible).await?;
+        flush_ui();
+        assert_eq!(window.global::<Ui>().get_paired(), "Galaxy S25+");
+        assert!(worker.paired.is_some());
+        assert!(
+            sent(&mock, "pairing_scope")
+                .iter()
+                .all(|r| r["enabled"] == true)
+        );
+        // READY arriving near the original deadline starts its own 3 seconds.
+        worker.paired.as_mut().unwrap().at = Instant::now() - Duration::from_millis(1400);
+        setup["links"][1]["ready"] = json!(true);
+        worker
+            .refresh(linked_status(&worker, &setup), &visible)
+            .await?;
+        assert_eq!(worker.paired_detail().0, "Also linked: MacBook Air");
+        assert!(worker.paired.as_ref().unwrap().at.elapsed() < Duration::from_millis(500));
+        worker.paired.as_mut().unwrap().at = Instant::now() - Duration::from_millis(2900);
+        worker
+            .refresh(linked_status(&worker, &setup), &visible)
+            .await?;
+        assert!(
+            worker.paired.is_some(),
+            "Also linked is readable for three seconds"
+        );
+        worker.paired.as_mut().unwrap().at = Instant::now() - Duration::from_millis(3100);
+        worker
+            .refresh(linked_status(&worker, &setup), &visible)
+            .await?;
+        flush_ui();
+        assert!(worker.paired.is_none());
+        assert_eq!(worker.view().page, Page::Device);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn removed_self_with_offline_phone_and_ambiguous_refusal_have_distinct_presentations()
+    -> Result<()> {
+        if in_offscreen_child("ui::window::tests::removed_self_with_offline_phone_and_ambiguous_refusal_have_distinct_presentations", &[]).await? { return Ok(()); }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, _actions) = model_worker(&window, dir.path());
+        state(
+            &mut worker,
+            vec![
+                device(1, "Phone", true, "disconnected", 100),
+                device(2, "MacBook Air", false, "unauthorized", 100),
+            ],
+            vec![],
+        );
+        worker.snapshot.setup_refusal_since = Some(200);
+        linking(
+            &mut worker,
+            vec![
+                link_of(1, "enabled"),
+                with(link_of(2, "enabled"), "introduced_by", json!(id(1))),
+            ],
+            &[(1, "Phone"), (2, "MacBook Air")],
+        );
+        let frame = |w: &Worker| {
+            let peers = peers(&w.snapshot, &[]);
+            w.frame(
+                &Config::default(),
+                &peers,
+                peers.iter().find(|p| p.id == id(2).as_str()),
+                None,
+                false,
+                crate::now_ms(),
+            )
+        };
+        let removed = frame(&worker);
+        assert!(removed.pair_again);
+        assert_eq!(removed.summary.title, "Pairing lost");
+        // The phone has connected since the refusal: the computer may still be deciding.
+        worker.snapshot.devices[0].last_seen = 300;
+        let waiting = frame(&worker);
+        assert!(!waiting.pair_again);
+        let row = waiting
+            .devices
+            .iter()
+            .find(|d| d.id == id(2).as_str())
+            .unwrap();
+        assert_eq!(row.status, "Waiting for MacBook Air");
+        assert_eq!(row.status_tone, Tone::Neutral);
+        assert_eq!(waiting.device_summary.title, "Waiting for MacBook Air");
+        assert_eq!(
+            waiting.device_summary.detail,
+            "Allow it on MacBook Air, or pair with it directly"
+        );
+        assert_eq!(waiting.summary.title, "Waiting for your devices");
+        worker.snapshot.devices.retain(|d| d.role != "phone");
+        worker.snapshot.setup_refusal_since = None;
+        let ambiguous = frame(&worker);
+        assert!(!ambiguous.pair_again);
+        assert_eq!(ambiguous.summary.title, "Waiting for your devices");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dont_allow_submits_every_displayed_asker_in_one_batch() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::dont_allow_submits_every_displayed_asker_in_one_batch",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        let mock = mock_ipc(&worker.paths.socket, |_| (true, Value::Null))?;
+        state(&mut worker, trio(), vec![]);
+        let setup = setup_json(
+            vec![
+                with(link_of(1, "ask"), "prompt", json!(true)),
+                with(link_of(2, "ask"), "prompt", json!(true)),
+            ],
+            &[],
+        );
+        worker
+            .refresh(linked_status(&worker, &setup), &AtomicBool::new(true))
+            .await?;
+        flush_ui();
+        window.global::<Ui>().invoke_top_action(false);
+        drain(&mut worker, &mut actions).await;
+        let batches = sent(&mock, "setup_decisions");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0]["allow"], false);
+        assert_eq!(batches[0]["requests"].as_array().unwrap().len(), 2);
+        assert!(
+            mock.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|r| r["command"] != "setup_decision")
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -8389,6 +8642,7 @@ mod tests {
                         name: "MacBook Air".into(),
                         device: None,
                         at: Instant::now(),
+                        linked: String::new(),
                     });
                 },
                 go(Page::Add, 0, 1),
@@ -8553,6 +8807,7 @@ mod tests {
                         name: "MacBook Air".into(),
                         device: None,
                         at: Instant::now(),
+                        linked: String::new(),
                     });
                 },
                 go(Page::Code, 0, 1),
@@ -8834,6 +9089,7 @@ mod tests {
                         name: "Other Mac".into(),
                         device: Some(id(2).as_str().into()),
                         at: Instant::now(),
+                        linked: String::new(),
                     });
                 },
                 |w| {
@@ -8972,6 +9228,7 @@ mod tests {
             name: name.into(),
             device: Some(id(n).as_str().into()),
             at: Instant::now(),
+            linked: String::new(),
         });
     }
     fn readmission_record() -> crate::store::members::Readmission {
@@ -9124,6 +9381,26 @@ mod tests {
                     );
                     linking(w, vec![link_of(1, "enabled")], &[(1, "Galaxy S25+")]);
                     w.setup.readmissions = vec![readmission_record()];
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "73-removed-self-offline-phone",
+                |w| {
+                    state(
+                        w,
+                        vec![
+                            device(1, "Galaxy S25+", true, "disconnected", 100),
+                            device(2, "MacBook Air", false, "unauthorized", 100),
+                        ],
+                        vec![],
+                    );
+                    w.snapshot.setup_refusal_since = Some(200);
+                    linking(
+                        w,
+                        vec![link_of(1, "enabled"), link_of(2, "enabled")],
+                        &[(1, "Galaxy S25+"), (2, "MacBook Air")],
+                    );
                 },
                 go(Page::Main, 0, 0),
             ),
