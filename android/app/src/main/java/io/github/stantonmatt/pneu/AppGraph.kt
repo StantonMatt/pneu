@@ -411,9 +411,12 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
         peer?.let(::changed)
         connection.attempt.value?.takeIf {it.targetId==id && (peer==null || it.invitation.fingerprint==peer.pin)}?.let {endPairing(it)}
         connection.bindingChanged(peerId=id)
-        // The removal is committed. resetPeers retains cleanup failures for recovery.
-        if(id!=null)try {completePeerReset(id)}
-        catch(e:Exception) {android.util.Log.w("PneuRemovalCleanup",e.javaClass.simpleName)}
+        if(id!=null) {
+            // Setup removal is committed. resetPeers retains cleanup failures for recovery.
+            if(rosterMember!=null && !remoteUnpair)try {completePeerReset(id)}
+            catch(e:Exception) {android.util.Log.w("PneuRemovalCleanup",e.javaClass.simpleName)}
+            else completePeerReset(id)
+        }
         true
     }}
     init {

@@ -236,6 +236,7 @@ LOCAL_TESTS = (
     'SixteenthReviewDeviceTest', 'SixteenthRecentDeviceTest', 'EighteenthReviewUiDeviceTest',
     'TwentiethReviewDeviceTest', 'TwentyFirstPolicyDeviceTest', 'TwentySecondReviewDeviceTest',
     'OnboardingDeviceTest',
+    'SetupFlowDeviceTest', 'SetupScreensDeviceTest',
 )
 
 
