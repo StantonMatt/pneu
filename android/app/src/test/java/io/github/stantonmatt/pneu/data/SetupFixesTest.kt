@@ -185,6 +185,42 @@ class SetupFixesTest {
             }finally {graph.scope.cancel();graph.database.close();context.deleteDatabase("outgoing.db")}
         }
     }
+    @Test fun removalStillSucceedsWhenJournaledCleanupFailsAndRecoveryCanRetry()=runBlocking<Unit>(Dispatchers.IO) {
+        fixture {f->
+            val graph=AppGraph(context,f.preferences,CoroutineScope(SupervisorJob()+StandardTestDispatcher()))
+            try {
+                val before=f.preferences.read()
+                // Fail the first DAO operation in post-commit cleanup; production recovery uses the real DAO.
+                val queueField=AppGraph::class.java.getDeclaredField("queue").apply {isAccessible=true}
+                queueField.set(graph,Proxy.newProxyInstance(QueueDao::class.java.classLoader,arrayOf(QueueDao::class.java)) {_,_,_->
+                    throw java.io.IOException("Injected cleanup failure")
+                })
+                assertTrue(graph.forgetBinding(confirmed=ConfirmedBinding.from(before,b),setupMember=ConfirmedSetupMember.from(before,remote.key)))
+                val after=f.preferences.read()
+                assertTrue(after.membership.denies(b,peer.pin));assertTrue(after.devices.isEmpty())
+                assertTrue(b in after.resetPeers)
+                val recovered=AppGraph(context,f.preferences,CoroutineScope(SupervisorJob()+StandardTestDispatcher()))
+                try {
+                    recovered.completePeerReset(b);recovered.completePeerReset(b)
+                    assertFalse(b in f.preferences.read().resetPeers)
+                }finally {recovered.scope.cancel();recovered.database.close()}
+            }finally {graph.scope.cancel();graph.database.close();context.deleteDatabase("outgoing.db")}
+        }
+    }
+    @Test fun attemptRechecksPhoneOnlyCapacityAfterConfirmation()=runBlocking<Unit>(Dispatchers.IO) {
+        fixture(SetupState(),emptyList()) {f->
+            val p=f.preferences
+            val confirmed=ConfirmedBinding.from(p.read())
+            p.edit {SetupStorage.write(it,initial.copy(roster=(1..17).map {n->own.copy(deviceId="%032x".format(n),fingerprint="%064x".format(n))}))}
+            assertTrue(confirmed.matches(p.read())) // A roster-only addition does not change pairingRevision.
+            val graph=AppGraph(context,p,CoroutineScope(SupervisorJob()+StandardTestDispatcher()))
+            try {
+                val uri="pneu://pair?v=1&name=PC&fp=${peer.pin}&addr=127.0.0.1%3A1&token=${"e".repeat(64)}&exp=9999999999999"
+                assertTrue(graph.requestPairing(uri,confirmed,true))
+                assertFalse(graph.connection.attempt.value!!.setupEnabled)
+            }finally {graph.scope.cancel();graph.database.close();context.deleteDatabase("outgoing.db")}
+        }
+    }
     @Test fun tokenPairingCannotBindPinOwnedByRetainedPhoneMember()=runBlocking<Unit>(Dispatchers.IO) {
         val phone=candidate.copy(role="phone")
         fixture(initial.copy(roster=initial.roster+phone)) {f->

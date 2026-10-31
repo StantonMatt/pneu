@@ -92,7 +92,8 @@ internal object SetupTransactions {
         var assigned=false
         if(state.setupId==null) {
             val id=remote.setupId ?: generateSequence(newId).first {it !in state.retiredIds}
-            next=state.copy(pendingLink=null,setupId=id,generation=Math.addExact(state.generation,1),prompts=emptyList(),sends=emptyMap(),receipts=emptyList(),
+            // HELLO installs self before the first snapshot. Remember that admission until it arrives.
+            next=state.copy(pendingLink=null,initialSnapshotPending=remote.setupId!=null,setupId=id,generation=Math.addExact(state.generation,1),prompts=emptyList(),sends=emptyMap(),receipts=emptyList(),
                 roster=listOf(member(p,self.id,self.pin,self.role,self.name,now)))
             assigned=true
         }
@@ -117,8 +118,10 @@ internal object SetupTransactions {
         SetupStorage.write(p,state.copy(prompts=emptyList(),separateLinks=state.separateLinks-
             peers.filter {it.setupScope==SetupScope.ASK || it.deviceId==selected}.map {it.deviceId}.toSet()))
     }
-    fun link(p:MutablePreferences,confirmed:ConfirmedBinding) {
-        val state=SetupStorage.read(p);check(!state.withdrawn) {"Pair again before linking devices"}
+    fun link(p:MutablePreferences,confirmed:ConfirmedBinding,displayedPrompts:List<SetupPrompt>?=null) {
+        val state=SetupStorage.read(p)
+        check(displayedPrompts==null || state.prompts==displayedPrompts) {"Link request changed"}
+        check(!state.withdrawn) {"Pair again before linking devices"}
         val peers=PeerRegistry.read(p)
         check(confirmed.matches(Prefs(deviceId=p[deviceId].orEmpty(),peers=peers))) {"Pairing changed"}
         val prompt=state.prompts.firstOrNull {offer->offer.setupGeneration==state.generation && peers.any {
@@ -165,7 +168,7 @@ internal object SetupTransactions {
         val installed=plan.installed.associate {peer->peer.deviceId to peer.copy(generation=Math.addExact(generation,1).also {generation=it})}
         val peers=plan.peers.map {installed[it.deviceId] ?: it}
         val notices=installed.values.map {peer->SetupNotice("${plan.state.generation}/${peer.deviceId}/${peer.generation}",peer.deviceId,peer.name,
-            peer.addedViaId ?: requireNotNull(sender).deviceId,peer.addedViaName ?: requireNotNull(sender).name)}
+            peer.addedViaId ?: requireNotNull(sender).deviceId,peer.addedViaName ?: requireNotNull(sender).name,plan.alsoLinked)}
         val state=plan.state.copy(notices=(plan.state.notices+notices).takeLast(64))
         plan.observed.forEach {MeshClock.observe(p,it,plan.validatedAt)}
         stage("membersClockStaged")
@@ -205,8 +208,8 @@ internal suspend fun Preferences.setupHello(binding:DeliveryBinding,generation:L
     edit {check(current()) {"Connection changed"};result=SetupTransactions.hello(it,binding,generation,local,remote,self,discoveryId=discoveryId)}
     result
 }
-internal suspend fun Preferences.requestSetupLink(confirmed:ConfirmedBinding) =policy.locked {
-    edit {SetupTransactions.link(it,confirmed)}
+internal suspend fun Preferences.requestSetupLink(confirmed:ConfirmedBinding,displayedPrompts:List<SetupPrompt>?=null) =policy.locked {
+    edit {SetupTransactions.link(it,confirmed,displayedPrompts)}
 }
 internal suspend fun Preferences.answerSetupPrompt(prompt:SetupPrompt,allow:Boolean)=policy.locked {
     edit {SetupTransactions.answer(it,prompt,allow)}

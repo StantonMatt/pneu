@@ -37,6 +37,7 @@
         </service>
         <service android:name=".features.ShareAdmissionService" android:exported="false" android:stopWithTask="false" android:foregroundServiceType="connectedDevice"/>
         <service android:name=".PneuService" android:exported="false" android:foregroundServiceType="connectedDevice" android:stopWithTask="false"/>
+        <receiver android:name=".features.SetupActionReceiver" android:exported="false"/>
         <receiver android:name=".BootReceiver" android:exported="false"><intent-filter><action android:name="android.intent.action.BOOT_COMPLETED"/><action android:name="android.intent.action.MY_PACKAGE_REPLACED"/></intent-filter></receiver>
     </application>
 </manifest>

@@ -299,7 +299,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
             return true
         }
         prior?.let {invalidateOutcomes(it.deviceId)}
-        connection.setAttempt(PairingAttempt(io.github.stantonmatt.pneu.protocol.randomId(),invitation,p,lifecycle.toMap(),setupEnabled=setupEnabled))
+        connection.setAttempt(PairingAttempt(io.github.stantonmatt.pneu.protocol.randomId(),invitation,p,lifecycle.toMap(),setupEnabled=setupEnabled && p.membership.roster.count {it.active}<17))
         // Invalidates the old transport before any further outcome can commit.
         connection.retryPeer(invitation.fingerprint)
         return true
@@ -372,7 +372,8 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
         if(!preferences.paired(current.invitation,pcId,replacement,setupChoice=current.setupEnabled,setupFence=current.scanned.membership,beforeInstall={data,binding->
             setupHandshake?.let {h->
                 PeerRegistry.write(data,PeerRegistry.read(data).map {peer->if(peer.deviceId==binding.pcId && peer.pin==binding.pin)
-                    peer.copy(name=h.remoteName,setupSupported=h.remote!=null,addresses=(h.remoteAddresses+peer.addresses).distinct().take(16)) else peer})
+                    peer.copy(name=h.remoteName,setupSupported=h.remote!=null,remoteSetupScope=h.remote?.scope,
+                        addresses=(h.remoteAddresses+peer.addresses).distinct().take(16)) else peer})
                 SetupTransactions.tokenHello(data,binding,h.remote,h.self)
             }
         }) {installed=it;onInstalled(it)})return@withLock null
@@ -410,7 +411,9 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
         peer?.let(::changed)
         connection.attempt.value?.takeIf {it.targetId==id && (peer==null || it.invitation.fingerprint==peer.pin)}?.let {endPairing(it)}
         connection.bindingChanged(peerId=id)
-        if(id!=null) {completePeerReset(id)}
+        // The removal is committed. resetPeers retains cleanup failures for recovery.
+        if(id!=null)try {completePeerReset(id)}
+        catch(e:Exception) {android.util.Log.w("PneuRemovalCleanup",e.javaClass.simpleName)}
         true
     }}
     init {

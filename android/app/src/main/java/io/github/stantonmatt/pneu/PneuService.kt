@@ -93,6 +93,7 @@ class PneuService : Service() {
                 } else updateNotification(nm)
             }
         }
+        scope.launch {graph.initialized.await();SetupNotifications.run(graph)}
         scope.launch {graph.initialized.await();graph.prefs.first {it.deviceId.isNotEmpty()};PostCommit.maintain {health();ServiceEvidence.start(this@PneuService)}; while(isActive) { PostCommit.maintainSuspending {checkHealthAlerts()}; delay(86_400_000) } }
     }
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

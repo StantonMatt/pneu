@@ -17,7 +17,9 @@ data class Peer(val name: String, val pin: String, val deviceId: String, val add
     @com.google.gson.annotations.SerializedName("localSettingsEdits") private val localEdits:Set<String>? = null,val settingsSupported:Boolean?=null,
     private val acknowledgedSettings:String?=null,
     @com.google.gson.annotations.SerializedName("setupScope") private val setupDecision:SetupScope?=null,
-    val addedViaId:String?=null,val addedViaName:String?=null,val established:Boolean=false,val setupSupported:Boolean=false) {
+    val addedViaId:String?=null,val addedViaName:String?=null,val established:Boolean=false,val setupSupported:Boolean=false,
+    /** Last authenticated HELLO observation for this binding; never local consent. */
+    val remoteSetupScope:SetupScope?=null) {
     val setupScope get()=setupDecision ?: SetupScope.ASK
     val setupScoped get()=addedViaId!=null || setupScope==SetupScope.ENABLED && setupSupported
     internal val acknowledgedSnapshot get()=acknowledgedSettings.orEmpty()
@@ -48,7 +50,7 @@ data class Prefs(
     fun automaticRevocation(kind:String)=automaticRevocations[when(kind) {"photo"->"photos";"recording"->"recordings";else->"screenshots"}] ?: 0
     // Compatibility projection for the existing single-computer screens/fixtures.
     val devices get()=peers.ifEmpty {listOfNotNull(peer)}
-    fun installedAfter(revision:Long):DeliveryBinding? = devices.filter {it.generation>revision}.maxByOrNull {it.generation}?.let {DeliveryBinding.from(this,it.deviceId)}
+    fun installedAfter(revision:Long,pin:String?=null):DeliveryBinding? = devices.filter {it.generation>revision && (pin==null || it.pin==pin)}.maxByOrNull {it.generation}?.let {DeliveryBinding.from(this,it.deviceId)}
     fun forPeer(id:String):Prefs {
         val selected=devices.find {it.deviceId==id}
         return copy(peer=selected,lastLan=selected?.lastLan.orEmpty(),lastConnected=selected?.lastConnected ?: 0,
@@ -427,9 +429,10 @@ class Preferences(private val context:Context,internal val store:androidx.datast
         }
     }
     internal class SettingsConflict:Exception()
-    internal suspend fun hello(binding:DeliveryBinding,name:String,addresses:List<Endpoint>,mesh:Boolean=true,setup:Boolean=false) {edit {p->
+    internal suspend fun hello(binding:DeliveryBinding,name:String,addresses:List<Endpoint>,mesh:Boolean=true,setup:Boolean=false,remoteSetupScope:SetupScope?=null) {edit {p->
         PeerRegistry.write(p,PeerRegistry.read(p).map {if(it.deviceId==binding.pcId && it.generation==binding.generation && it.pin==binding.pin)
-            it.copy(name=name,settingsSupported=mesh,setupSupported=setup,addresses=if(addresses.isEmpty())it.addresses else (addresses+it.addresses).distinct().take(16)) else it})
+            it.copy(name=name,settingsSupported=mesh,setupSupported=setup,remoteSetupScope=remoteSetupScope.takeIf {setup},
+                addresses=if(addresses.isEmpty())it.addresses else (addresses+it.addresses).distinct().take(16)) else it})
     }}
     suspend fun finishPeerReset(peerId:String) {edit {PeerRegistry.finishReset(it,peerId)}}
     suspend fun forget(lostPcName:String?=null,peerId:String?=null):Unit=policy.locked {

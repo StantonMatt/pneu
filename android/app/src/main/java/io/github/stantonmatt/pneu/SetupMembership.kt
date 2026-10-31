@@ -19,8 +19,8 @@ internal suspend fun AppGraph.evaluateSetupHello(binding:DeliveryBinding,generat
     result
 }
 /** Public UI actions carry the same frozen authority used by other device actions. */
-suspend fun AppGraph.linkExistingDevice(confirmed:ConfirmedBinding)=withContext(Dispatchers.IO) {withBindingLifecycle {
-    preferences.requestSetupLink(confirmed);retrySetupLinks()
+suspend fun AppGraph.linkExistingDevice(confirmed:ConfirmedBinding,displayedPrompts:List<SetupPrompt>?=null)=withContext(Dispatchers.IO) {withBindingLifecycle {
+    preferences.requestSetupLink(confirmed,displayedPrompts);retrySetupLinks()
 }}
 suspend fun AppGraph.answerSetupPrompt(prompt:SetupPrompt,allow:Boolean)=withContext(Dispatchers.IO) {withBindingLifecycle {
     preferences.answerSetupPrompt(prompt,allow);if(allow)retrySetupLinks() else connection.retryPeer(prompt.pin)

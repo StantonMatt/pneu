@@ -26,7 +26,7 @@ data class PendingSetupLink(val id:String,val setupGeneration:Long,val bindings:
                             val advertised:List<SetupLinkAdvertisement> = emptyList()) {
     val waitingFor get()=advertised.firstOrNull()?.name
 }
-data class SetupNotice(val id:String,val peerId:String,val name:String,val introducerId:String,val introducerName:String)
+data class SetupNotice(val id:String,val peerId:String,val name:String,val introducerId:String,val introducerName:String,val alsoLinked:Boolean=false)
 data class SetupProvenance(val id:String,val name:String)
 data class SetupConflict(val deviceId:String,val fingerprint:String,val reason:String)
 data class SetupSend(val bindingGeneration:Long,val setupGeneration:Long,val pending:String="",val acknowledged:String="")
@@ -36,7 +36,7 @@ data class SetupState(val setupId:String?=null,val generation:Long=0,val roster:
     val sends:Map<String,SetupSend> = emptyMap(),val receipts:List<SetupReceipt> = emptyList(),
     val receiptIntents:List<SetupReceipt> = emptyList(),val notices:List<SetupNotice> = emptyList(),
     val conflicts:List<SetupConflict> = emptyList(),val provenance:Map<String,SetupProvenance> = emptyMap(),val separateLinks:Set<String> = emptySet(),
-    val pendingLink:PendingSetupLink?=null,val withdrawn:Boolean=false,val withdrawalRevision:Long=0,val retiredIds:Set<String> = emptySet()) {
+    val pendingLink:PendingSetupLink?=null,val initialSnapshotPending:Boolean=false,val withdrawn:Boolean=false,val withdrawalRevision:Long=0,val retiredIds:Set<String> = emptySet()) {
     fun denies(id:String,pin:String)=barriers["$id/$pin"]?.cleared==false
     val linkStatus get()=pendingLink?.waitingFor?.let {"Waiting for $it"}
     fun linkOutcome(peerId:String)=if(peerId in separateLinks)"Direct link kept; separate setups not linked" else null
@@ -79,7 +79,7 @@ internal data class SetupAttemptTarget(val deviceId:String?,val pin:String) {
     fun matchesRemoval(key:String)=key.substringAfter('/')==pin && (deviceId==null || deviceId==key.substringBefore('/'))
 }
 internal data class SetupPlan(val state:SetupState,val peers:List<Peer>,val removed:List<Peer>,val installed:List<Peer>,
-                              val observed:List<java.math.BigInteger>,val removedKeys:Set<String>,val validatedAt:Long)
+                              val observed:List<java.math.BigInteger>,val removedKeys:Set<String>,val validatedAt:Long,val alsoLinked:Boolean=false)
 
 /** Pure staged reconciliation. The caller commits this whole result, the clock,
  * reset intents and receipt in one DataStore edit under the binding lock. */
@@ -158,7 +158,7 @@ internal object SetupReconcile {
             if(m.deviceId!=self.id && m.deviceId!=sender.deviceId && peers.none {it.deviceId==m.deviceId})
                 provenance.putIfAbsent(m.key,SetupProvenance(sender.deviceId,sender.name))
         }
-        var result=state.copy(roster=roster.values.sortedBy {it.key},barriers=barriers,conflicts=conflicts.distinct().takeLast(64),provenance=provenance)
+        var result=state.copy(initialSnapshotPending=false,roster=roster.values.sortedBy {it.key},barriers=barriers,conflicts=conflicts.distinct().takeLast(64),provenance=provenance)
         var remaining=peers.toList();val removed=mutableListOf<Peer>();val installed=mutableListOf<Peer>()
         if(result.denies(self.id,self.pin)) {
             val scoped=remaining.filter {it.setupScoped}
@@ -186,7 +186,8 @@ internal object SetupReconcile {
             if(result.setupId!=null && result.roster.none {it.active && it.deviceId!=self.id})result=retire(result,false)
         }
         capacity(result,remaining)
-        return SetupPlan(result,remaining,removed,installed,observed,removedKeys,now)
+        return SetupPlan(result,remaining,removed,installed,observed,removedKeys,now,
+            state.initialSnapshotPending || state.member(self.id)==null)
     }
     fun retained(state:SetupState,peers:List<Peer>,selfId:String,attempt:SetupAttemptTarget?):SetupPlan {
         if(state.setupId==null || state.withdrawn)throw SetupUnavailable()
@@ -202,6 +203,6 @@ internal object SetupReconcile {
         return SetupPlan(state,peers+installed,emptyList(),installed,emptyList(),emptySet(),System.currentTimeMillis())
     }
     fun retire(state:SetupState,withdrawal:Boolean)=state.copy(setupId=null,generation=Math.addExact(state.generation,1),
-        roster=emptyList(),prompts=emptyList(),pendingLink=null,sends=emptyMap(),receipts=emptyList(),
+        roster=emptyList(),prompts=emptyList(),pendingLink=null,initialSnapshotPending=false,sends=emptyMap(),receipts=emptyList(),
         receiptIntents=state.receiptIntents,provenance=emptyMap(),notices=emptyList(),withdrawn=state.withdrawn || withdrawal,withdrawalRevision=if(withdrawal)Math.addExact(state.withdrawalRevision,1) else state.withdrawalRevision,retiredIds=state.retiredIds+listOfNotNull(state.setupId))
 }

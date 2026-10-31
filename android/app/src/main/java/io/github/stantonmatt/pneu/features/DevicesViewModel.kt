@@ -35,7 +35,7 @@ class DevicesViewModel(application:Application):AndroidViewModel(application) {
     val setup=app.prefs.map {p->p.membership.copy(notices=p.membership.notices.filter {it.peerId !in p.resetPeers})}.stateIn(viewModelScope,SharingStarted.WhileSubscribed(5000),SetupState())
     val setupProblem=app.connection.setupProblem.asStateFlow()
     val pairing=app.connection.attempt
-    suspend fun linkExistingDevice(confirmed:ConfirmedBinding) {app.linkExistingDevice(confirmed);PneuService.start(app.context)}
+    suspend fun linkExistingDevice(confirmed:ConfirmedBinding,displayedPrompts:List<SetupPrompt>?=null) {app.linkExistingDevice(confirmed,displayedPrompts);PneuService.start(app.context)}
     suspend fun allowSetup(prompt:SetupPrompt) {app.answerSetupPrompt(prompt,true);PneuService.start(app.context)}
     suspend fun denySetup(prompt:SetupPrompt)=app.answerSetupPrompt(prompt,false)
     fun confirmRemoveFromAllDevices(key:String)=ConfirmedSetupMember.from(app.prefs.value,key)

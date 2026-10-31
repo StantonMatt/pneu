@@ -439,7 +439,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
         val boundPeer=Peer(attempt?.invitation?.name ?: p.peer!!.name,sessionBinding.pin,pcId,emptyList(),generation=sessionBinding.generation)
         check(app.preferences.connected(sessionBinding,endpoint)) {"Binding changed"}
         capabilities=hello.body["capabilities"].asJsonArray.map {it.asString}.toSet()
-        app.preferences.hello(sessionBinding,hello.body["name"].asString,if(mesh)hello.body["addresses"]?.asJsonArray?.map {Endpoint.parse(it.asString)}.orEmpty() else emptyList(),mesh,remoteSetup!=null)
+        app.preferences.hello(sessionBinding,hello.body["name"].asString,if(mesh)hello.body["addresses"]?.asJsonArray?.map {Endpoint.parse(it.asString)}.orEmpty() else emptyList(),mesh,remoteSetup!=null,remoteSetup?.scope)
         if(readPrefs().membership.generation!=p.membership.generation)throw RemoteError("closing")
         val setupResult=app.evaluateSetupHello(sessionBinding,p.membership.generation,localSetup,remoteSetup,app.setupIdentity(p,name),p.membership.pendingLink?.id) {
             epoch==dialEpoch.get() && authenticatedBinding==sessionBinding

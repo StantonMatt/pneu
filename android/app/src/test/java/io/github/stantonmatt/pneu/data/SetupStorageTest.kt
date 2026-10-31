@@ -5,6 +5,7 @@ import androidx.datastore.preferences.core.*
 import androidx.room.Room
 import io.github.stantonmatt.pneu.protocol.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.first
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -46,6 +47,80 @@ class SetupStorageTest {
     private suspend fun finish(p:Preferences,q:QueueDao) {
         for(id in p.read().resetPeers) {q.clearPeer(id);p.finishPeerReset(id)}
         p.finishMembersIntents(q)
+    }
+    @Test fun firstSnapshotClassifiesNoticesOnceAndOldNoticesDefaultToJoined() {
+        fun prefs(state:SetupState)=mutablePreferencesOf(stringPreferencesKey("deviceId") to a).also {
+            PeerRegistry.write(it,listOf(sender));SetupStorage.write(it,state)
+        }
+        val p=prefs(initial.copy(roster=listOf(senderRow)))
+        val first=SetupReconcile.plan(SetupStorage.read(p),listOf(sender),self,sender,join,now=now)
+        assertTrue(SetupTransactions.commit(p,first,sender).notices.single().alsoLinked)
+        // A normal admission installs self during HELLO, before MEMBERS arrives.
+        val adopting=prefs(SetupState())
+        assertEquals(SetupHelloResult.RECONNECT,SetupTransactions.hello(adopting,binding,0,SetupHello(SetupScope.ENABLED),
+            SetupHello(SetupScope.ENABLED,s),self,now))
+        val admitted=SetupStorage.read(adopting)
+        assertNotNull(admitted.member(a));assertTrue(admitted.initialSnapshotPending)
+        val plan=SetupReconcile.plan(admitted,listOf(sender),self,sender,join,now=now)
+        val committed=SetupTransactions.commit(adopting,plan,sender)
+        assertTrue(committed.notices.single().alsoLinked);assertFalse(committed.initialSnapshotPending)
+        val later=prefs(initial.copy(roster=initial.roster.map {it.copy(name="Renamed",hlc="100")}))
+        val next=SetupReconcile.plan(SetupStorage.read(later),listOf(sender),self,sender,join,now=now)
+        assertFalse(SetupTransactions.commit(later,next,sender).notices.single().alsoLinked)
+        val legacy=mutablePreferencesOf(stringPreferencesKey("setupMembership") to
+            """{"notices":[{"id":"n","peerId":"$c","name":"Laptop","introducerId":"$b","introducerName":"PC"}]}""")
+        assertFalse(SetupStorage.read(legacy).notices.single().alsoLinked)
+    }
+    @Test fun linkCannotAnswerARequestThatArrivedAfterItsControlWasRendered() {
+        val peer=sender.copy(setupDecision=SetupScope.ASK)
+        val p=mutablePreferencesOf(stringPreferencesKey("deviceId") to a)
+        PeerRegistry.write(p,listOf(peer))
+        val displayed=emptyList<SetupPrompt>()
+        val prompt=SetupPrompt(b,pb,7,1,"PC")
+        SetupStorage.write(p,initial.copy(prompts=listOf(prompt)))
+        val confirmed=ConfirmedBinding.from(Prefs(deviceId=a,peers=listOf(peer)),b)
+        assertThrows(IllegalStateException::class.java) {SetupTransactions.link(p,confirmed,displayed)}
+        assertEquals(listOf(prompt),SetupStorage.read(p).prompts)
+        assertEquals(SetupScope.ASK,PeerRegistry.read(p).single().setupScope)
+    }
+    @Test fun helloRefreshesRemoteScopeWithoutChangingLocalDecisionOrMembership()=runBlocking<Unit>(Dispatchers.IO) {
+        for(local in SetupScope.entries)fixture(peer=sender.copy(setupDecision=local)) {p,_->
+            val before=p.read()
+            for(remote in SetupScope.entries) {
+                p.hello(binding,sender.name,sender.addresses,setup=true,remoteSetupScope=remote)
+                val after=p.read()
+                assertEquals(remote,after.devices.single().remoteSetupScope)
+                assertEquals(local,after.devices.single().setupScope)
+                assertEquals(before.membership,after.membership)
+                // This is serialized in the existing peer record, not another trust store.
+                assertEquals(remote,PeerRegistry.read(p.store.data.first()).single().remoteSetupScope)
+            }
+            p.hello(binding,sender.name,emptyList(),setup=true)
+            assertNull(p.read().devices.single().remoteSetupScope)
+            p.hello(binding,sender.name,emptyList(),setup=true,remoteSetupScope=SetupScope.DISABLED)
+            p.hello(binding,sender.name,emptyList(),setup=false,remoteSetupScope=SetupScope.ENABLED)
+            assertNull(p.read().devices.single().remoteSetupScope)
+            assertFalse(p.read().devices.single().setupSupported)
+        }
+    }
+    @Test fun staleHelloCannotOverwriteAnotherBindingRemoteScope()=runBlocking<Unit>(Dispatchers.IO) {
+        fixture(peer=sender.copy(remoteSetupScope=SetupScope.DISABLED)) {p,_->
+            val before=p.read()
+            for(stale in listOf(binding.copy(generation=8),binding.copy(pin=pc),binding.copy(pcId=c)))
+                p.hello(stale,"Stale",emptyList(),setup=true,remoteSetupScope=SetupScope.ENABLED)
+            assertEquals(before,p.read())
+        }
+    }
+    @Test fun removedOrReplacedPeerDoesNotInheritRemoteScope()=runBlocking<Unit>(Dispatchers.IO) {
+        fixture(peer=sender.copy(remoteSetupScope=SetupScope.DISABLED)) {p,_->
+            p.edit {PeerRegistry.remove(it,b)}
+            assertTrue(p.read().devices.isEmpty())
+            p.hello(binding,sender.name,emptyList(),setup=true,remoteSetupScope=SetupScope.ENABLED)
+            assertTrue(p.read().devices.isEmpty())
+            p.edit {PeerRegistry.write(it,listOf(sender.copy(pin=pc,generation=8,remoteSetupScope=null)))}
+            p.hello(binding,sender.name,emptyList(),setup=true,remoteSetupScope=SetupScope.DISABLED)
+            assertNull(p.read().devices.single().remoteSetupScope)
+        }
     }
     @Test fun crashBeforeAuthoritativeCommitKeepsStateAndOnlyReservesSharedReceipt()=runBlocking<Unit>(Dispatchers.IO) {
         fixture {p,q->
