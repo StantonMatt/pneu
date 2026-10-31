@@ -250,7 +250,8 @@ class Preferences(private val context:Context,internal val store:androidx.datast
                 lastConnected=prior?.takeIf {it.deviceId==pcId && it.pin==invitation.fingerprint}?.lastConnected ?: 0,
                 clipboardSend=prior?.clipboardSend ?: true,clipboardReceive=prior?.clipboardReceive ?: true,automaticMedia=prior?.automaticMedia ?: true,
                 settings=prior?.takeIf {it.deviceId==pcId}?.settings.orEmpty(),localEdits=prior?.takeIf {it.deviceId==pcId}?.localSettingsEdits.orEmpty(),settingsSupported=prior?.settingsSupported)
-            peer=peer.copy(setupDecision=prior?.setupScope ?: if(setupChoice)SetupScope.ENABLED else SetupScope.DISABLED)
+            peer=peer.copy(setupDecision=prior?.setupScope ?: if(setupChoice)SetupScope.ENABLED else SetupScope.DISABLED,
+                addedViaId=null,addedViaName=null)
             SetupTransactions.paired(it,setup,peer,prior,setupChoice,setupFence!=null,
                 selfPin=if(setup.withdrawn)sha256(TlsIdentity(s(it,"tlsAlias")).certificate.encoded) else null)
             PeerRegistry.write(it,if(prior==null)peers+peer else peers.map {p->if(p==prior)peer else p})

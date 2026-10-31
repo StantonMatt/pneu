@@ -39,6 +39,8 @@
 <string name="device_not_connected_yet">Not connected yet</string>
 <string name="ui_error_link">Couldn\'t link your devices</string>
     <string name="setup_readmission">%1$s was removed from this phone. %2$s added it again</string>
+    <string name="setup_readmission_title">%1$s was removed from this phone</string>
+    <string name="setup_readmission_text">%1$s added it again</string>
     <string name="setup_keep_removed">Keep removed</string>
     <string name="setup_readmission_error">Couldn’t allow this device</string>
     <string name="setup_refused">%1$s doesn\'t recognize this phone · Pair with it directly</string>

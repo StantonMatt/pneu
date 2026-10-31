@@ -56,6 +56,22 @@ class SetupFixesTest {
         p.read().resetPeers.forEach {q.clearPeer(it);p.finishPeerReset(it)}
         p.finishMembersIntents(q)
     }
+    @Test fun directPairingClearsBothIntroductionFieldsAndPageProvenanceWithoutResettingBinding()=runBlocking<Unit>(Dispatchers.IO) {
+        val introduced=peer.copy(addedViaId=c,addedViaName="Laptop")
+        val state=initial.copy(provenance=mapOf(remote.key to SetupProvenance(c,"Laptop")))
+        fixture(state,listOf(introduced)) {f->
+            val p=f.preferences;val before=p.read()
+            assertTrue(p.paired(Invitation(1,peer.name,peer.pin,emptyList(),"e".repeat(64),now),b,
+                replacement=ConfirmedBinding.from(before,b),setupFence=before.membership))
+            val after=p.read();val direct=after.devices.single()
+            assertNull(direct.addedViaId);assertNull(direct.addedViaName)
+            assertNull(io.github.stantonmatt.pneu.features.SetupPresentation.page(after,direct).addedVia)
+            assertEquals(peer.generation,direct.generation)
+            assertEquals(before.membership.roster,after.membership.roster)
+            assertEquals(before.membership.barriers,after.membership.barriers)
+            assertTrue(after.resetPeers.isEmpty())
+        }
+    }
     @Test fun answerPersistsAllowUntilRefreshedHelloAndRejectsChangedSetup()=runBlocking<Unit>(Dispatchers.IO) {
         for(unavailable in listOf(true,false))fixture(peers=listOf(peer.copy(setupDecision=SetupScope.ASK))) {f->
             var p=f.preferences

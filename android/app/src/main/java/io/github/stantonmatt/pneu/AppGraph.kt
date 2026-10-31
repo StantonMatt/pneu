@@ -448,7 +448,11 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
             }
         }
         resumeSetupLinkDiscovery()
-        scope.launch { prefs.filter {it.loaded && it.deviceId.isNotEmpty()}.distinctUntilChangedBy {Triple(it.peer,it.shareSheet,it.pairingLost)}.collect {p->PostCommit.maintain {ManualEntries.configureShareTarget(context,p.shareSheet);if(!p.pairingLost)context.getSystemService(android.app.NotificationManager::class.java).cancel(2)} } }
+        scope.launch { prefs.filter {it.loaded && it.deviceId.isNotEmpty()}.distinctUntilChangedBy {Triple(it.peer,it.shareSheet,it.pairingLost)}.collect {p->PostCommit.maintain {
+            ManualEntries.configureShareTarget(context,p.shareSheet)
+            val nm=context.getSystemService(android.app.NotificationManager::class.java)
+            if(!p.pairingLost && nm.activeNotifications.any {it.tag==null && it.id==2})nm.cancel(2)
+        }} }
     }
     /** A Recent row represents its artifact's complete, originally frozen operation. */
     suspend fun confirmArtifact(p:Prefs,item:ConfirmedItem):ConfirmedQueue=withContext(Dispatchers.IO) {queueMutex.withLock {

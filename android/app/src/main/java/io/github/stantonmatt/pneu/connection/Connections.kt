@@ -96,7 +96,7 @@ class Connections(private val app:AppGraph) {
             delay(SetupRefreshDisplay.GRACE_MS);publish()
         }
     }
-    internal fun refreshSetupPeer(pin:String) {expectSetupRefresh(pin);retryPeer(pin)}
+    internal fun refreshSetupPeer(pin:String) {expectSetupRefresh(pin);workers[pin]?.refreshSetup()}
     internal fun pairingFailed(status:ConnectionStatus) {pairingResult=LinkState.pairingFailure(status);publish()}
     internal fun pairingFailed(message:String) {pairingResult=LinkState(pairing=message);publish()}
     internal fun clearPairingResult(pin:String?=null) {

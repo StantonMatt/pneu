@@ -104,6 +104,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
     @Volatile private var textEmission:QueuedEmission?=null
     @Volatile private var capabilities:Set<String> = emptySet()
     private val dialEpoch=java.util.concurrent.atomic.AtomicLong()
+    private val setupRefreshRedial=java.util.concurrent.atomic.AtomicBoolean()
     @Volatile private var activeEndpoint:Endpoint?=null
     @Volatile private var activePin=""
     @Volatile private var authenticatedBinding:DeliveryBinding?=null
@@ -218,6 +219,12 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                         session(ssl,endpoint,prefs,epoch,attempt,outcome) {lastIssue=null;failures=0;succeeded=true}
                     } catch (e: CancellationException) { throw e }
                     catch (e: RemoteError) {
+                        // An authenticated READY setup peer explicitly closing is a
+                        // planned refresh. EOF, timeout and TLS failures never qualify.
+                        if(e.code=="closing" && ready && "setup" in capabilities) {
+                            app.connection.expectSetupRefresh(peerPin)
+                            setupRefreshRedial.set(true)
+                        }
                         issue=ConnectionStatus.remoteError(e.code)
                         if(issue!=null)lastIssue=issue
                         if(issue!=null) {attempt?.let {app.rejectPairing(it,issue)};break}
@@ -268,7 +275,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                 }
                 } catch(e:CancellationException) {throw e}
                 catch(e:Exception) {android.util.Log.w("PneuAttempt",e.javaClass.simpleName)}
-                failures=backoff(failures,succeeded)
+                failures=if(setupRefreshRedial.getAndSet(false)) {wake.tryReceive();0} else backoff(failures,succeeded)
             }
             } finally {try {discoveryLease.close()}finally {runCatching {cm.unregisterNetworkCallback(callback)}}}
         }
@@ -449,7 +456,10 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
         val setupResult=app.evaluateSetupHello(sessionBinding,p.membership.generation,localSetup,remoteSetup,app.setupIdentity(p,name),p.membership.pendingLink?.id) {
             epoch==dialEpoch.get() && authenticatedBinding==sessionBinding
         }
-        if(setupResult==SetupHelloResult.RECONNECT || setupResult==SetupHelloResult.SEPARATE)throw RemoteError("closing")
+        if(setupResult==SetupHelloResult.RECONNECT || setupResult==SetupHelloResult.SEPARATE) {
+            setupRefreshRedial.set(true)
+            throw RemoteError("closing")
+        }
         val setupEnabled=setupResult==SetupHelloResult.SYNCHRONIZE
         val setupGeneration=p.membership.generation
         val setupId=localSetup.setupId
@@ -934,6 +944,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
     private suspend fun lost(expected:Peer?,phoneId:String,outcome:ConnectionOutcome?) {if(app.loseBinding(expected,phoneId,outcome))state.value=LinkState("Pairing lost")}
     fun bindingChanged(lost: Boolean=false) { lastIssue=null;admissionSession=null;ready=false;capabilities=emptySet();rejections.clear();state.value=LinkState(if(lost)"Pairing lost" else "PC unreachable") }
     fun retry() { admissionSession=null;dialEpoch.incrementAndGet();closeSocket(); wake.trySend(Unit) }
+    internal fun refreshSetup() {setupRefreshRedial.set(true);retry()}
     fun cancelTransfer(mediaId: String) {
         fileEmission?.takeIf {it.row.mediaId==mediaId}?.let {if(it.cancel())retry()}
         // Already-emitted text must consume its ACK/NACK without resetting the

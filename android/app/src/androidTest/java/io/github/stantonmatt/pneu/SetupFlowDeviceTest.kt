@@ -364,6 +364,24 @@ class SetupFlowDeviceTest {
             scoped to state.copy(setupId="f".repeat(32),generation=state.generation+1,roster=listOf(me)+scoped.filter {it.deviceId in ids}.map(::member))
         }
     }
+    @Test(timeout=90000) fun directPairingClearsAddedViaFromTheDevicePage()=runBlocking<Unit> {
+        bind(pc,"MJStanton-Desktop",'b');bind(mac,"MacBook Air",'c')
+        linkedWith(pc,mac)
+        setup {peers,state->
+            val peer=peers.single {it.deviceId==mac}
+            peers.map {if(it==peer)it.copy(addedViaId=pc,addedViaName="MJStanton-Desktop") else it} to
+                state.copy(provenance=mapOf("${peer.deviceId}/${peer.pin}" to SetupProvenance(pc,"MJStanton-Desktop")))
+        }
+        launch();openDevice("MacBook Air")
+        compose.onNodeWithText("Added via MJStanton-Desktop").performScrollTo().assertIsDisplayed()
+        bind(mac,"MacBook Air",'c')
+        compose.waitUntil(10000) {compose.onAllNodesWithText("Added via MJStanton-Desktop").fetchSemanticsNodes().isEmpty()}
+        compose.onNodeWithText("Remove from all devices").performScrollTo().assertIsDisplayed()
+        capture("flow-direct-pair-no-added-via")
+        scenario!!.recreate()
+        compose.onNodeWithText("Remove from all devices").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Added via MJStanton-Desktop").assertDoesNotExist()
+    }
     @Test(timeout=120000) fun removeFromAllDevicesAsksFirstThenRemovesHere()=runBlocking<Unit> {
         bind(pc,"MJStanton-Desktop",'b');bind(mac,"MacBook Air",'c')
         linkedWith(pc,mac)

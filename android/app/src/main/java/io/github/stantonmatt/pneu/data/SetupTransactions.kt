@@ -12,8 +12,9 @@ internal object SetupTransactions {
         MeshClock.next(p,p[deviceId].orEmpty(),false,now).let {SetupMember(id,pin,role,name,"member",it.hlc.toString(),it.source)}
     fun paired(p:MutablePreferences,state:SetupState,peer:Peer,prior:Peer?,choice:Boolean,fresh:Boolean,selfPin:String?=null,now:Long=System.currentTimeMillis()) {
         require(state.roster.none {it.active && it.fingerprint==peer.pin && it.deviceId!=peer.deviceId}) {"Conflicting peer identity"}
-        var next=state
         val key="${peer.deviceId}/${peer.pin}"
+        // A confirmed direct pairing supersedes introduction provenance only.
+        var next=state.copy(provenance=state.provenance-key)
         if(state.denies(peer.deviceId,peer.pin)) {
             check(fresh) {"A fresh confirmed pairing is required after removal"}
             next=next.copy(barriers=next.barriers+(key to next.barriers.getValue(key).copy(cleared=true,readmission=null)))

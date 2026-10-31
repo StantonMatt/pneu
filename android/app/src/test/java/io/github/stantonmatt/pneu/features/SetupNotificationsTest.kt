@@ -27,6 +27,11 @@ class SetupNotificationsTest {
     @Implements(NotificationManager::class)
     class ThrowingNotifications:ShadowNotificationManager() {
         var failPost=false
+        var requestCancels=0
+        @Implementation override fun cancel(tag:String?,id:Int) {
+            if(tag==SetupNotifications.REQUEST)requestCancels++
+            super.cancel(tag,id)
+        }
         @Implementation override fun notify(tag:String?,id:Int,notification:Notification) {
             if(failPost)throw SecurityException("Injected post failure")
             super.notify(tag,id,notification)
@@ -103,7 +108,7 @@ class SetupNotificationsTest {
         assertEquals("setup_requests",n.channelId)
         assertEquals(NotificationManager.IMPORTANCE_HIGH,nm.getNotificationChannel(n.channelId).importance)
         assertFalse(n.flags and Notification.FLAG_GROUP_SUMMARY!=0)
-        assertEquals(listOf("Allow","Don't allow"),n.actions.map {it.title.toString()})
+        assertEquals(listOf("Don't allow","Allow"),n.actions.map {it.title.toString()})
     }
     @Test fun readmissionNotificationCarriesExactBarrierFencesAndStaleActionsDoNothing()=runBlocking<Unit> {
         fixture {app,p->
@@ -119,13 +124,33 @@ class SetupNotificationsTest {
             val intent=Shadows.shadowOf(notification.actions[1].actionIntent).savedIntent
             assertEquals(SetupNotifications.READMIT_ALLOW,intent.action)
             assertArrayEquals(arrayOf(prompt.actionKey),intent.getStringArrayExtra("keys"))
-            assertEquals("Old laptop was removed from this phone. Laptop added it again",notification.extras.getCharSequence(Notification.EXTRA_TITLE).toString())
+            assertEquals("Old laptop was removed from this phone",notification.extras.getCharSequence(Notification.EXTRA_TITLE).toString())
+            assertEquals("Laptop added it again",notification.extras.getCharSequence(Notification.EXTRA_TEXT).toString())
+            assertEquals("Laptop added it again",notification.extras.getCharSequence(Notification.EXTRA_BIG_TEXT).toString())
             SetupNotifications.show(app,nm,current,true,emptySet(),mutableSetOf())
             assertNull(shadow.getNotification(prompt.actionKey,0))
             app.preferences.edit {SetupStorage.write(it,state.copy(generation=4))}
             app.preferences.answerReadmission(prompt,true)
             assertTrue(app.preferences.read().membership.denies(removed.deviceId,removed.fingerprint))
             assertTrue(app.preferences.read().devices.none {it.deviceId==removed.deviceId})
+        }
+    }
+    @Test fun repeatedEmptySnapshotsAndForegroundDismissalsCancelEachRequestOnlyOnce()=runBlocking<Unit> {
+        fixture {app,p->
+            val prompt=SetupPrompt(peer.deviceId,peer.pin,1,0,peer.name)
+            val requested=p.copy(membership=p.membership.copy(prompts=listOf(prompt),notices=emptyList()))
+            val empty=requested.copy(membership=requested.membership.copy(prompts=emptyList()))
+            repeat(30) {SetupNotifications.show(app,nm,empty,false,emptySet(),mutableSetOf())}
+            assertEquals(0,shadow.requestCancels)
+            SetupNotifications.show(app,nm,requested,false,emptySet(),mutableSetOf())
+            repeat(30) {SetupNotifications.cancelRequest(c);SetupNotifications.show(app,nm,empty,false,emptySet(),mutableSetOf())}
+            assertEquals(1,shadow.requestCancels)
+            assertNull(shadow.getNotification(SetupNotifications.REQUEST,0))
+            // A surviving system notification still cancels after process-local markers disappear.
+            SetupNotifications.postRequest(c,requested,listOf(prompt))
+            repeat(30) {SetupNotifications.cancelRequest(c)}
+            assertEquals(2,shadow.requestCancels)
+            assertNull(shadow.getNotification(SetupNotifications.REQUEST,0))
         }
     }
     @OptIn(ExperimentalCoroutinesApi::class)

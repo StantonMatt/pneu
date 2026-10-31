@@ -22,6 +22,7 @@ internal class LocalPeerFixture(private val app:AppGraph,
     private val helloVersion:Int=1,
     private val helloError:String?=null,
     private val beforeHello:()->Unit={},
+    private val setupHello:SetupHello?=null,
     private val handle:(Frame.Control,(Frame.Control)->Unit)->Boolean={_,_->false}):AutoCloseable {
     private val alias=TlsIdentity.aliasFor(randomId())
     private val identity=TlsIdentity(alias,create=true)
@@ -57,6 +58,9 @@ internal class LocalPeerFixture(private val app:AppGraph,
     val pairRequests=java.util.concurrent.atomic.AtomicInteger()
     val hellos=java.util.concurrent.atomic.AtomicInteger()
     val activeConnections get()=clients.size
+    @Volatile private var controlSender:((Frame.Control)->Unit)?=null
+    fun sendControl(frame:Frame.Control)=checkNotNull(controlSender)(frame)
+    fun disconnect() {clients.forEach {it.close()}}
     fun invitation(deviceId:String,name:String):String {
         peer=Peer(name,sha256(identity.certificate.encoded),deviceId,listOf(Endpoint("127.0.0.1",server.localPort)))
         pairingToken=randomId(32)
@@ -78,8 +82,11 @@ internal class LocalPeerFixture(private val app:AppGraph,
             val selected=requireNotNull(peer)
             val output=ssl.outputStream
             val send:(Frame.Control)->Unit={frame->synchronized(output) {Protocol.write(output,frame)}}
+            controlSender=send
             helloError?.let {send(Frame.Control(Type.ERROR,json("code" to it,"supported_version" to 1)));return}
-            send(Frame.Control(Type.HELLO,json("version" to helloVersion,"device_id" to selected.deviceId,"name" to selected.name,"capabilities" to capabilities.toList(),"role" to "computer")))
+            send(Frame.Control(Type.HELLO,json("version" to helloVersion,"device_id" to selected.deviceId,"name" to selected.name,"capabilities" to capabilities.toList(),"role" to "computer").apply {
+                setupHello?.let {add("setup",it.json())}
+            }))
             while(!closed) {
                 val frame=Protocol.read(ssl.inputStream)
                 if(frame is Frame.Control && !handle(frame,send))when(frame.type) {

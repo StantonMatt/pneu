@@ -97,6 +97,37 @@ class MultiComputerReviewDeviceTest {
             assertTrue(fixture.hellos.get()>=2)
         }finally {hold.set(false);release.countDown()}
     }
+    @Test(timeout=30000) fun remoteSetupRefreshRedialsWithoutBackoffAndKeepsOnlyDisplayAuthority()=runBlocking<Unit> {
+        val blocked=CountDownLatch(1);val release=CountDownLatch(1);val hold=AtomicBoolean(false)
+        val fixture=LocalPeerFixture(app,capabilities=setOf("files","mesh","setup"),setupHello=SetupHello(SetupScope.ASK,null),
+            beforeHello={if(hold.get()) {blocked.countDown();check(release.await(10,TimeUnit.SECONDS))}}).also {local+=it}
+        fixture.connect(a,holdFirstFrame=false)
+        try {
+            hold.set(true)
+            fixture.sendControl(Frame.Control(Type.ERROR,json("code" to "closing")))
+            assertTrue("Explicit peer refresh redials before the minimum 1.6 s backoff",blocked.await(1400,TimeUnit.MILLISECONDS))
+            assertFalse(app.connection.connected(a))
+            assertEquals("Connected",app.connection.devices.value.getValue(a).status)
+            assertNull(app.connection.freezeSession(requireNotNull(DeliveryBinding.from(app.preferences.read(),a))))
+            hold.set(false);release.countDown()
+            withTimeout(5000) {while(!app.connection.connected(a))delay(20)}
+        }finally {hold.set(false);release.countDown()}
+    }
+    @Test(timeout=30000) fun ordinarySetupPeerEofNeverStartsDisplayGrace()=runBlocking<Unit> {
+        val blocked=CountDownLatch(1);val release=CountDownLatch(1);val hold=AtomicBoolean(false)
+        val fixture=LocalPeerFixture(app,capabilities=setOf("files","mesh","setup"),setupHello=SetupHello(SetupScope.ASK,null),
+            beforeHello={if(hold.get()) {blocked.countDown();check(release.await(10,TimeUnit.SECONDS))}}).also {local+=it}
+        fixture.connect(a,holdFirstFrame=false)
+        try {
+            hold.set(true);fixture.disconnect()
+            withTimeout(5000) {app.connection.devices.first {it[a]?.status=="PC unreachable"}}
+            assertFalse(app.connection.connected(a))
+            // Network/discovery wakes may legitimately shorten ordinary backoff.
+            // Hold HELLO so neither the disconnect nor the dial can borrow grace.
+            assertTrue(blocked.await(5000,TimeUnit.MILLISECONDS))
+            assertEquals("Connecting…",app.connection.devices.value.getValue(a).status)
+        }finally {hold.set(false);release.countDown()}
+    }
     @Test(timeout=30000) fun offlineTextSharesFailImmediatelyWithAndWithoutPicker()=runBlocking<Unit> {
         bind(b,"B",'b');app.preferences.toggle("chooseDevicesEachTime",true)
         for(picker in listOf(true,false))unavailableCapturedShare(picker=picker)

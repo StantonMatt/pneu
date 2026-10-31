@@ -63,6 +63,7 @@ class SetupScreensDeviceTest {
         }
         compose.onNodeWithText("Keep removed").assertIsDisplayed()
         compose.onNodeWithText("Allow").assertIsDisplayed()
+        assertTrue(compose.onNodeWithText("Keep removed").fetchSemanticsNode().boundsInRoot.left < compose.onNodeWithText("Allow").fetchSemanticsNode().boundsInRoot.left)
         bothThemes("readmission-prompt")
         compose.onNodeWithText("Keep removed").performClick();assertEquals(1,kept);assertEquals(0,allowed)
         compose.onNodeWithText("Allow").performClick();assertEquals(1,allowed)
@@ -90,16 +91,33 @@ class SetupScreensDeviceTest {
         SetupNotifications.channel(context)
         for(night in listOf(false,true)) {
             device.executeShellCommand("cmd uimode night ${if(night)"yes" else "no"}")
-            SetupNotifications.postReadmission(context,p,prompt)
+            // Post into the open shade: Android 17 can otherwise keep the
+            // heads-up accessibility node while omitting its pixels in captures.
             device.openNotification()
+            SetupNotifications.postReadmission(context,p,prompt)
             assertTrue(device.wait(Until.hasObject(By.text("Keep removed")),5000))
             assertTrue(device.wait(Until.hasObject(By.text("Allow")),5000))
+            assertTrue(device.wait(Until.hasObject(By.text("MacBook Air was removed from this phone")),5000))
+            assertTrue(device.wait(Until.hasObject(By.text("MJStanton-Desktop added it again")),5000))
             Thread.sleep(500)
             assertTrue(device.wait(Until.hasObject(By.text("Keep removed")),5000))
             shade("readmission-notification-${if(night)"dark" else "light"}")
             context.getSystemService(NotificationManager::class.java).cancelAll()
             device.pressBack();device.pressHome()
         }
+    }
+    @Test(timeout=60000) fun linkRequestNotificationPutsDontAllowBeforeAllow()=runBlocking<Unit> {
+        val prompt=SetupPrompt(pc.deviceId,pc.pin,pc.generation,3,pc.name)
+        val p=prefs(pc,state=linked(member(pc)).copy(prompts=listOf(prompt)))
+        app.preferences.store.edit {PeerRegistry.write(it,listOf(pc));SetupStorage.write(it,p.membership)}
+        device.pressHome();SetupNotifications.channel(context)
+        device.openNotification()
+        SetupNotifications.postRequest(context,p,listOf(prompt))
+        val n=context.getSystemService(NotificationManager::class.java).activeNotifications.single {it.tag==SetupNotifications.REQUEST}.notification
+        assertEquals(listOf("Don't allow","Allow"),n.actions.map {it.title.toString()})
+        assertTrue(device.wait(Until.hasObject(By.text(pc.name+" wants to link your devices")),5000))
+        shade("link-request-notification-negative-first")
+        device.pressBack();device.pressHome()
     }
     @Test(timeout=30000) fun introducedComputerDoesNotCompleteAnotherScannedTarget() {
         var current by mutableStateOf(Prefs(deviceId="a".repeat(32),pairingRevision=1))
@@ -261,6 +279,7 @@ class SetupScreensDeviceTest {
         compose.onNodeWithText("MJStanton-Desktop wants to link your devices").assertIsDisplayed()
         compose.onNodeWithText("New devices then pair just once.").assertIsDisplayed()
         compose.onNodeWithText("Don't allow").assertIsDisplayed();compose.onNodeWithText("Allow").assertIsDisplayed()
+        assertTrue(compose.onNodeWithText("Don't allow").fetchSemanticsNode().boundsInRoot.left < compose.onNodeWithText("Allow").fetchSemanticsNode().boundsInRoot.left)
         bothThemes("request-dialog")
         names=listOf(pc.name,mac.name);compose.waitForIdle()
         compose.onNodeWithText("MJStanton-Desktop and MacBook Air want to link your devices").assertIsDisplayed()

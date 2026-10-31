@@ -25,7 +25,10 @@ internal object SetupNotifications {
     const val READMIT_ALLOW="io.github.stantonmatt.pneu.READMIT_ALLOW"
     const val READMIT_KEEP="io.github.stantonmatt.pneu.READMIT_KEEP"
     fun cancelReadmission(context:Context,key:String) {
-        context.getSystemService(NotificationManager::class.java).cancel(key,0)
+        val nm=context.getSystemService(NotificationManager::class.java)
+        // System notifications can outlive this process's in-memory markers.
+        if(key !in context.setupUi.notifiedReadmissions.value && nm.activeNotifications.none {it.tag==key && it.id==0})return
+        nm.cancel(key,0)
         context.setupUi.notifiedReadmissions.value=context.setupUi.notifiedReadmissions.value-key
     }
     fun joinedTag(id:String)="setup_joined:$id"
@@ -43,7 +46,9 @@ internal object SetupNotifications {
         Intent(context,SetupActionReceiver::class.java).setAction(action).setIdentifier("setup:$action:"+keys.joinToString(",")).putExtra("keys",keys.toTypedArray()),
         PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
     fun cancelRequest(context:Context) {
-        context.getSystemService(NotificationManager::class.java).cancel(REQUEST,0)
+        val nm=context.getSystemService(NotificationManager::class.java)
+        if(context.setupUi.notifiedPrompts.value.isEmpty() && nm.activeNotifications.none {it.tag==REQUEST && it.id==0})return
+        nm.cancel(REQUEST,0)
         context.setupUi.notifiedPrompts.value=emptySet()
     }
 
@@ -71,7 +76,7 @@ internal object SetupNotifications {
             }
         }
         val prompts=SetupPresentation.prompts(p);val keys=prompts.map(SetupPresentation::promptKey)
-        if(prompts.isEmpty()) {nm.cancel(REQUEST,0);ui.notifiedPrompts.value=emptySet()}
+        if(prompts.isEmpty())cancelRequest(context)
         else if(canPost(context,REQUEST_CHANNEL) && !front && keys.any {it !in dismissed} && keys.toSet()!=ui.notifiedPrompts.value) {
             postRequest(context,p,prompts)
             ui.notifiedPrompts.value=keys.toSet()
@@ -88,7 +93,7 @@ internal object SetupNotifications {
     }
     internal fun canPost(context:Context,channel:String=CHANNEL)=NotificationManagerCompat.from(context).areNotificationsEnabled() &&
         (context.getSystemService(NotificationManager::class.java).getNotificationChannel(channel)?.importance ?: NotificationManager.IMPORTANCE_NONE)>NotificationManager.IMPORTANCE_NONE
-    /** {device} wants to link your devices · Allow · Don't allow. Swiping it away leaves it waiting. */
+    /** Negative action first, positive last, matching the in-app dialogs. */
     fun postRequest(context:Context,p:Prefs,prompts:List<SetupPrompt>) {
         val keys=prompts.map(SetupPresentation::promptKey)
         val title=SetupPresentation.requestTitle(context.resources,SetupPresentation.promptNames(p,prompts))
@@ -98,15 +103,16 @@ internal object SetupNotifications {
             .setContentIntent(activity(context,Intent(context,MainActivity::class.java).putExtra("home",true)))
             .setPriority(NotificationCompat.PRIORITY_HIGH).setGroup("setup_requests").setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_ALL)
             .setDeleteIntent(broadcast(context,ACTION_DISMISS,keys)).setOnlyAlertOnce(true).setAutoCancel(true)
-            .addAction(0,context.getString(R.string.action_allow),broadcast(context,ACTION_ALLOW,keys))
-            .addAction(0,context.getString(R.string.action_dont_allow),broadcast(context,ACTION_DENY,keys)).build())
+            .addAction(0,context.getString(R.string.action_dont_allow),broadcast(context,ACTION_DENY,keys))
+            .addAction(0,context.getString(R.string.action_allow),broadcast(context,ACTION_ALLOW,keys)).build())
     }
     fun postReadmission(context:Context,p:Prefs,prompt:ReadmissionPrompt) {
-        val text=SetupPresentation.readmissionText(context.resources,p,prompt)
+        val title=context.getString(R.string.setup_readmission_title,prompt.removal.name)
+        val text=context.getString(R.string.setup_readmission_text,requireNotNull(p.membership.barriers[prompt.key]?.readmission).introducerName)
         val keys=listOf(prompt.actionKey)
         context.getSystemService(NotificationManager::class.java).notify(prompt.actionKey,0,
             NotificationCompat.Builder(context,REQUEST_CHANNEL).setSmallIcon(R.drawable.ic_stat_pneu).setColor(0xFF4F5BFF.toInt())
-                .setContentTitle(text).setStyle(NotificationCompat.BigTextStyle().bigText(text))
+                .setContentTitle(title).setContentText(text).setStyle(NotificationCompat.BigTextStyle().bigText(text))
                 .setContentIntent(activity(context,Intent(context,MainActivity::class.java).putExtra("home",true)))
                 .setPriority(NotificationCompat.PRIORITY_HIGH).setGroup("setup_requests").setOnlyAlertOnce(true).setAutoCancel(true)
                 .setDeleteIntent(broadcast(context,ACTION_DISMISS,keys))
