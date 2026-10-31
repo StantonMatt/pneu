@@ -581,6 +581,16 @@ fn local_value(tx: &Transaction<'_>, mut value: Member, setup_id: &Id, fresh: bo
 // The self entry is authored locally on assignment, before the first MEMBERS.
 // Keep that original admission stamp even when a rename advances its value HLC.
 fn joined_is_new(c: &Connection, local: &Id, member: &Member) -> Result<bool> {
+    // A member can opt into linking after this computer's admission, especially
+    // during an upgrade. An existing pairing is already known to its owner.
+    let already_paired: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM peers WHERE id=? AND fp=?)",
+        params![member.device_id.as_str(), member.fingerprint.as_str()],
+        |r| r.get(0),
+    )?;
+    if already_paired {
+        return Ok(false);
+    }
     let baseline = entries(c)?
         .into_iter()
         .find(|e| {
@@ -1468,6 +1478,10 @@ fn reconcile_candidates(
         if exists {
             continue;
         }
+        let joined_notice = match entry.joined_notice {
+            Some(joined) => joined,
+            None => joined_is_new(tx, local, &entry.value)?,
+        };
         let generation: i64 = tx.query_row(
             "SELECT coalesce((SELECT generation FROM peer_generations WHERE device=?),0)+1",
             [id.as_str()],
@@ -1484,10 +1498,6 @@ fn reconcile_candidates(
             "UPDATE setup_links SET introduced_by=?,introducer_name=? WHERE device=?",
             params![by, name, id.as_str()],
         )?;
-        let joined_notice = match entry.joined_notice {
-            Some(joined) => joined,
-            None => joined_is_new(tx, local, &entry.value)?,
-        };
         if joined_notice {
             tx.execute("INSERT OR IGNORE INTO setup_notices VALUES(?,?,?)",params![id.as_str(),generation,serde_json::to_string(&serde_json::json!({"device":id,"name":entry.value.name,"introduced_by":by,"introducer_name":name}))?])?;
         }

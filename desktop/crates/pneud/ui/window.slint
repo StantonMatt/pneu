@@ -229,17 +229,20 @@ component LinkCard inherits Card {
     in property <bool> motion;
     in property <length> text-line;
     in property <length> title-line;
+    in property <bool> wrap-text: false;
     VerticalLayout {
         padding-top: 16px; padding-bottom: 14px; padding-left: 14px; padding-right: 14px; spacing: 0px;
         Link { state: root.summary.link; motion: root.motion; }
         Rectangle { height: 12px; }
         Text {
             text: root.summary.title; font-size: Pneu.title-size; font-weight: 700; color: Pneu.text;
-            overflow: elide; max-height: root.title-line; horizontal-alignment: center;
+            wrap: root.wrap-text ? word-wrap : no-wrap;
+            overflow: elide; max-height: root.wrap-text ? self.preferred-height : root.title-line; horizontal-alignment: center;
         }
         if root.summary.detail != "": Text {
             text: root.summary.detail; color: Pneu.text2;
-            overflow: elide; max-height: root.text-line; horizontal-alignment: center;
+            wrap: root.wrap-text ? word-wrap : no-wrap;
+            overflow: elide; max-height: root.wrap-text ? self.preferred-height : root.text-line; horizontal-alignment: center;
         }
         @children
     }
@@ -698,7 +701,7 @@ export component PneuWindow inherits Window {
                     spacing: 12px;
                     Header { title: Ui.device.name; go-back => { root.back(); } }
                     LinkCard {
-                        summary: Ui.device-summary; motion: Ui.motion;
+                        summary: Ui.device-summary; motion: Ui.motion; wrap-text: true;
                         text-line: text-line.preferred-height; title-line: title-line.preferred-height;
                         HorizontalLayout {
                             padding-top: 14px;
@@ -706,8 +709,8 @@ export component PneuWindow inherits Window {
                                 text: "Send Files…"; icon: Icons.upload; kind: ButtonKind.tonal; wide: true;
                                 clicked => { Ui.send-files(Ui.device-id); }
                             }
-                            if Ui.device-action == "pair": PneuButton { enabled: root.device-ready;
-                                text: "Pair Again…"; icon: Icons.qr-code; kind: ButtonKind.primary; wide: true;
+                            if Ui.device-action == "pair" || Ui.device-action == "pair-warning": PneuButton { enabled: root.device-ready;
+                                text: "Pair Again…"; icon: Icons.qr-code; kind: Ui.device-action == "pair" ? ButtonKind.primary : ButtonKind.tonal; wide: true;
                                 clicked => { root.open-add(Ui.device.phone ? 0 : 1); }
                             }
                         }

@@ -704,7 +704,7 @@ fn device_settings(peer: &Peer, reply: &Value) -> (Vec<SettingItem>, String) {
                 SettingItem {
                     key: key.into(),
                     label: label.into(),
-                    sub: if s["pending"] == json!(true) {
+                    sub: if s["pending"] == json!(true) && !peer.connected() {
                         format!("Applies when {} connects", peer.name).into()
                     } else {
                         SharedString::new()
@@ -1099,6 +1099,7 @@ struct Paired {
     name: String,
     device: Option<String>,
     at: Instant,
+    linked_at: Option<Instant>,
     linked: String,
 }
 
@@ -3208,6 +3209,23 @@ impl Worker {
             waiting: waiting as i32,
         }
     }
+    fn device_item(&self, peer: &Peer) -> DeviceItem {
+        let mut item = peer.item();
+        if let Some(link) = self.setup.link(&peer.id)
+            && link.introduced_by.is_some()
+        {
+            if peer.health == Health::Lost {
+                item.status = format!("Not allowed on {} yet", peer.name).into();
+                item.tone = Tone::Warn;
+                item.status_tone = Tone::Warn;
+            } else if !link.ready && matches!(peer.health, Health::Offline | Health::Connecting) {
+                item.status = format!("Waiting for {}", peer.name).into();
+                item.tone = Tone::Neutral;
+                item.status_tone = Tone::Neutral;
+            }
+        }
+        item
+    }
     fn top_card(&self, peers: &[Peer]) -> TopCard {
         match setup::top(&self.setup, peers, &self.remembered) {
             Top::Diagnostic { title, .. } => TopCard {
@@ -3326,6 +3344,7 @@ impl Worker {
                     name: join.name,
                     device: Some(device.into()),
                     at: Instant::now(),
+                    linked_at: None,
                     linked: String::new(),
                 });
                 self.ui(|w| {
@@ -3655,6 +3674,7 @@ impl Worker {
                 name: peer.name.clone(),
                 device: Some(peer.id.clone()),
                 at: Instant::now(),
+                linked_at: None,
                 linked: String::new(),
             });
             #[cfg(target_os = "macos")]
@@ -3713,15 +3733,28 @@ impl Worker {
             && paired.linked != detail
         {
             paired.linked = detail;
-            paired.at = Instant::now();
+            paired.linked_at = Some(Instant::now());
         }
+        // MEMBERS and READY can arrive in several batches after direct pairing.
+        // Keep a five-second discovery window even before the first introduction,
+        // then leave each updated line readable for three seconds.
+        let linking = self.paired.as_ref().is_some_and(|p| {
+            p.device.as_deref().is_some_and(|device| {
+                self.setup
+                    .link(device)
+                    .is_none_or(|l| l.scope == "enabled" && !l.separate())
+            })
+        });
         if let Some(paired) = &self.paired
             && paired.at.elapsed()
-                >= if paired.linked.is_empty() {
-                    Duration::from_millis(1500)
+                >= if linking {
+                    Duration::from_secs(5)
                 } else {
-                    Duration::from_secs(3)
+                    Duration::from_millis(1500)
                 }
+            && paired
+                .linked_at
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(3))
         {
             let device = paired.device.clone();
             self.paired = None;
@@ -3869,7 +3902,7 @@ impl Worker {
         let (device_item, device_summary, device_action, device_settings, device_note) =
             match device {
                 Some(peer) => {
-                    let (mut summary, action) = device_summary(peer);
+                    let (mut summary, mut action) = device_summary(peer);
                     let introduced = self
                         .setup
                         .link(&peer.id)
@@ -3881,6 +3914,15 @@ impl Worker {
                         summary.title = format!("Waiting for {}", peer.name);
                         summary.detail =
                             format!("Open Pneu on {}, or pair with it directly", peer.name);
+                        action = "pair-warning";
+                    }
+                    if introduced && peer.health == Health::Lost {
+                        summary.title = format!("{} hasn't allowed this computer", peer.name);
+                        summary.detail =
+                            format!("Allow it on {}, or pair with it directly", peer.name);
+                        summary.link.tube = Tube::Dashed;
+                        summary.link.tiles[0].tone = Tone::Warn;
+                        action = "pair-warning";
                     }
                     let (settings, mut note) = self
                         .peer_settings
@@ -3894,12 +3936,13 @@ impl Worker {
                     {
                         note = format!("Switches sync when {} connects.", peer.name);
                     }
-                    let mut item = peer.item();
-                    if introduced && peer.health == Health::Lost {
-                        item.tone = Tone::Neutral;
-                        item.status_tone = Tone::Neutral;
-                    }
-                    (item, summary, action.to_owned(), settings, note)
+                    (
+                        self.device_item(peer),
+                        summary,
+                        action.to_owned(),
+                        settings,
+                        note,
+                    )
                 }
                 None => Default::default(),
             };
@@ -3959,24 +4002,7 @@ impl Worker {
         Frame {
             error,
             summary: hero,
-            devices: peers
-                .iter()
-                .map(|p| {
-                    let mut item = p.item();
-                    // Added via another device: it keeps trying, never an error.
-                    if matches!(p.health, Health::Offline | Health::Connecting)
-                        && self
-                            .setup
-                            .link(&p.id)
-                            .is_some_and(|l| l.introduced_by.is_some() && !l.ready)
-                    {
-                        item.status = format!("Waiting for {}", p.name).into();
-                        item.tone = Tone::Neutral;
-                        item.status_tone = Tone::Neutral;
-                    }
-                    item
-                })
-                .collect(),
+            devices: peers.iter().map(|p| self.device_item(p)).collect(),
             recent: recent(peers, &self.transfers),
             manual_clipboard: mode == ClipboardMode::Manual,
             pair_again,
@@ -4705,6 +4731,13 @@ mod tests {
             device_settings(&seen, &json!({"can_sync": false})).1,
             "Update Pneu on Galaxy S25+ to sync these switches."
         );
+        let mut connected = phone.clone();
+        connected.health = Health::Connected;
+        let (items, _) = device_settings(&connected, &reply);
+        assert!(
+            items.iter().all(|s| s.sub.is_empty()),
+            "connected settings must not say waiting to connect"
+        );
         assert_eq!(phone.connection(), "Not connected yet");
     }
 
@@ -5076,7 +5109,7 @@ mod tests {
                     worker.paired.as_ref().unwrap().device.as_deref(),
                     Some(id(2).as_str())
                 );
-                worker.paired.as_mut().unwrap().at = Instant::now() - Duration::from_secs(2);
+                worker.paired.as_mut().unwrap().at = Instant::now() - Duration::from_millis(5100);
                 worker.refresh(status_value(&worker), &visible).await?;
                 flush_ui();
                 while let Ok(action) = actions.try_recv() {
@@ -5205,7 +5238,7 @@ mod tests {
             Some(id(3).as_str())
         );
         assert_eq!(window.global::<Ui>().get_paired(), "Office PC");
-        worker.paired.as_mut().unwrap().at = Instant::now() - Duration::from_secs(2);
+        worker.paired.as_mut().unwrap().at = Instant::now() - Duration::from_millis(5100);
         worker
             .refresh(status_value(&worker), &AtomicBool::new(true))
             .await?;
@@ -7446,15 +7479,54 @@ mod tests {
                 .iter()
                 .all(|r| r["enabled"] == true)
         );
-        // READY arriving near the original deadline starts its own 3 seconds.
-        worker.paired.as_mut().unwrap().at = Instant::now() - Duration::from_millis(1400);
+        // No READY yet: the old 1.5-second deadline must not dismiss the page.
+        worker.paired.as_mut().unwrap().at = Instant::now() - Duration::from_secs(2);
+        worker
+            .refresh(linked_status(&worker, &setup), &visible)
+            .await?;
+        assert!(worker.paired.is_some());
+        // READY in separate batches updates in place and keeps the full list readable.
+        worker.paired.as_mut().unwrap().at = Instant::now() - Duration::from_secs(4);
         setup["links"][1]["ready"] = json!(true);
         worker
             .refresh(linked_status(&worker, &setup), &visible)
             .await?;
         assert_eq!(worker.paired_detail().0, "Also linked: MacBook Air");
-        assert!(worker.paired.as_ref().unwrap().at.elapsed() < Duration::from_millis(500));
-        worker.paired.as_mut().unwrap().at = Instant::now() - Duration::from_millis(2900);
+        assert!(
+            worker.paired.as_ref().unwrap().linked_at.unwrap().elapsed()
+                < Duration::from_millis(500)
+        );
+        let second = with(
+            with(link_of(3, "enabled"), "introduced_by", json!(id(1))),
+            "ready",
+            json!(false),
+        );
+        setup["links"].as_array_mut().unwrap().push(second);
+        setup["roster"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"device_id": id(3), "fingerprint": "03".repeat(32), "name": "Office-PC", "status": "member"}));
+        worker.paired.as_mut().unwrap().linked_at =
+            Some(Instant::now() - Duration::from_millis(3100));
+        worker
+            .refresh(linked_status(&worker, &setup), &visible)
+            .await?;
+        assert!(
+            worker.paired.is_some(),
+            "a partial list waits for late introductions"
+        );
+        worker.paired.as_mut().unwrap().at = Instant::now() - Duration::from_millis(4900);
+        setup["links"][2]["ready"] = json!(true);
+        worker
+            .refresh(linked_status(&worker, &setup), &visible)
+            .await?;
+        assert_eq!(
+            worker.paired_detail().0,
+            "Also linked: MacBook Air and Office-PC"
+        );
+        worker.paired.as_mut().unwrap().at = Instant::now() - Duration::from_millis(5100);
+        worker.paired.as_mut().unwrap().linked_at =
+            Some(Instant::now() - Duration::from_millis(2900));
         worker
             .refresh(linked_status(&worker, &setup), &visible)
             .await?;
@@ -7462,7 +7534,8 @@ mod tests {
             worker.paired.is_some(),
             "Also linked is readable for three seconds"
         );
-        worker.paired.as_mut().unwrap().at = Instant::now() - Duration::from_millis(3100);
+        worker.paired.as_mut().unwrap().linked_at =
+            Some(Instant::now() - Duration::from_millis(3100));
         worker
             .refresh(linked_status(&worker, &setup), &visible)
             .await?;
@@ -7563,7 +7636,7 @@ mod tests {
                     "diagnostic" => {
                         assert_eq!(
                             frame.device_summary.detail,
-                            "Phone doesn't recognize this computer"
+                            "Allow it on Phone, or pair with it directly"
                         );
                         assert!(
                             expected
@@ -7636,12 +7709,20 @@ mod tests {
             .iter()
             .find(|d| d.id == id(2).as_str())
             .unwrap();
-        assert_eq!(row.status, "Pairing lost");
-        assert_eq!(row.status_tone, Tone::Danger);
-        assert_eq!(waiting.device_summary.title, "Pairing lost");
+        assert_eq!(row.status, "Not allowed on MacBook Air yet");
+        assert_eq!(row.tone, Tone::Warn);
+        assert_eq!(row.status_tone, Tone::Warn);
+        assert_eq!(waiting.device.status, row.status);
+        assert_eq!(waiting.device_summary.link.tiles[0].tone, Tone::Warn);
+        assert_eq!(waiting.device_summary.link.tube, Tube::Dashed);
+        assert_eq!(waiting.device_action, "pair-warning");
+        assert_eq!(
+            waiting.device_summary.title,
+            "MacBook Air hasn't allowed this computer"
+        );
         assert_eq!(
             waiting.device_summary.detail,
-            "MacBook Air doesn't recognize this computer"
+            "Allow it on MacBook Air, or pair with it directly"
         );
         assert_eq!(waiting.summary.title, "Waiting for your devices");
         worker.snapshot.devices.retain(|d| d.role != "phone");
@@ -7649,6 +7730,65 @@ mod tests {
         let ambiguous = frame(&worker);
         assert!(!ambiguous.pair_again);
         assert_eq!(ambiguous.summary.title, "Waiting for your devices");
+        worker.setup.links[1].introduced_by = None;
+        let direct = frame(&worker);
+        assert_eq!(direct.device_summary.title, "Pairing lost");
+        assert_eq!(direct.device_action, "pair");
+        assert_eq!(direct.device.status_tone, Tone::Danger);
+        worker.setup.links[1].introduced_by = Some(id(1).to_string());
+        worker.snapshot.devices[0].state = "fingerprint_mismatch".into();
+        let mismatch = frame(&worker);
+        assert_eq!(mismatch.device_summary.title, "Pairing lost");
+        assert_eq!(mismatch.device_action, "pair");
+        assert_eq!(mismatch.device.status_tone, Tone::Danger);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn introduced_waiting_page_offers_direct_pairing() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::introduced_waiting_page_offers_direct_pairing",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, _actions) = model_worker(&window, dir.path());
+        state(
+            &mut worker,
+            vec![device(1, "sdk_gphone16k_x86_64", true, "disconnected", 0)],
+            vec![],
+        );
+        linking(
+            &mut worker,
+            vec![with(
+                with(link_of(1, "enabled"), "introduced_by", json!(id(2))),
+                "ready",
+                json!(false),
+            )],
+            &[(1, "sdk_gphone16k_x86_64")],
+        );
+        let peers = peers(&worker.snapshot, &[]);
+        let frame = worker.frame(
+            &Config::default(),
+            &peers,
+            Some(&peers[0]),
+            None,
+            false,
+            crate::now_ms(),
+        );
+        assert_eq!(
+            frame.device_summary.detail,
+            "Open Pneu on sdk_gphone16k_x86_64, or pair with it directly"
+        );
+        assert_eq!(frame.device_action, "pair-warning");
+        window.invoke_open_add(if frame.device.phone { 0 } else { 1 });
+        assert_eq!(window.global::<Ui>().get_page(), Page::Add);
+        assert_eq!(window.global::<Ui>().get_add_tab(), 0);
         Ok(())
     }
 
@@ -8743,6 +8883,7 @@ mod tests {
                         name: "MacBook Air".into(),
                         device: None,
                         at: Instant::now(),
+                        linked_at: None,
                         linked: String::new(),
                     });
                 },
@@ -8908,6 +9049,7 @@ mod tests {
                         name: "MacBook Air".into(),
                         device: None,
                         at: Instant::now(),
+                        linked_at: None,
                         linked: String::new(),
                     });
                 },
@@ -9190,6 +9332,7 @@ mod tests {
                         name: "Other Mac".into(),
                         device: Some(id(2).as_str().into()),
                         at: Instant::now(),
+                        linked_at: None,
                         linked: String::new(),
                     });
                 },
@@ -9329,6 +9472,7 @@ mod tests {
             name: name.into(),
             device: Some(id(n).as_str().into()),
             at: Instant::now(),
+            linked_at: None,
             linked: String::new(),
         });
     }
@@ -9545,6 +9689,64 @@ mod tests {
                     device_page(w, 2);
                 },
                 go(Page::Device, 2, 0),
+            ),
+            scene(
+                "73-introduced-waiting-long-name",
+                |w| {
+                    state(
+                        w,
+                        vec![device(2, "sdk_gphone16k_x86_64", true, "disconnected", 0)],
+                        vec![],
+                    );
+                    linking(
+                        w,
+                        vec![with(
+                            with(link_of(2, "enabled"), "introduced_by", json!(id(1))),
+                            "ready",
+                            json!(false),
+                        )],
+                        &[(2, "sdk_gphone16k_x86_64")],
+                    );
+                    device_page(w, 2);
+                },
+                go(Page::Device, 2, 0),
+            ),
+            scene(
+                "73-introduced-waiting-max-name",
+                |w| {
+                    let name = "Very long device name ".repeat(6);
+                    assert_eq!(name.len(), 132);
+                    let name = &name[..128];
+                    state(w, vec![device(2, name, true, "disconnected", 0)], vec![]);
+                    linking(
+                        w,
+                        vec![with(
+                            with(link_of(2, "enabled"), "introduced_by", json!(id(1))),
+                            "ready",
+                            json!(false),
+                        )],
+                        &[(2, name)],
+                    );
+                    device_page(w, 2);
+                },
+                go(Page::Device, 2, 0),
+            ),
+            scene(
+                "73-connected-settings-pending",
+                |w| {
+                    state(
+                        w,
+                        vec![device(1, "Galaxy S25+", true, "connected", 1)],
+                        vec![],
+                    );
+                    device_page(w, 1);
+                    if let Some((_, reply, _)) = &mut w.peer_settings {
+                        for setting in reply["settings"].as_array_mut().unwrap() {
+                            setting["pending"] = json!(true);
+                        }
+                    }
+                },
+                go(Page::Device, 1, 0),
             ),
             scene(
                 "74-paired-before-ready",
@@ -9972,7 +10174,10 @@ mod tests {
                     state(w, trio(), Vec::new());
                     linking(
                         w,
-                        vec![link_of(1, "enabled"), link_of(2, "enabled")],
+                        [1, 2, 4, 5, 6]
+                            .into_iter()
+                            .map(|n| link_of(n, "enabled"))
+                            .collect(),
                         &[
                             (1, "Galaxy S25+"),
                             (2, "MacBook Air"),

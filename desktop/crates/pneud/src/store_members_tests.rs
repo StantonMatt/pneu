@@ -2385,6 +2385,90 @@ async fn setup_joined_notices_use_admission_before_rename_including_candidates()
 }
 
 #[tokio::test]
+async fn setup_preexisting_pairing_later_link_does_not_post_joined_notice() -> Result<()> {
+    let f = Fixture::new().await?;
+    // This direct binding predates Link-your-devices. Its later admission has a
+    // newer stamp than ours, as when an upgraded device initially declines Link.
+    f.s.pair(id(3), member(3).fingerprint).await?;
+    let baseline =
+        f.s.setup_state()
+            .roster
+            .iter()
+            .map(|m| m.hlc)
+            .max()
+            .unwrap();
+    let mut existing = member(3);
+    existing.hlc = baseline + 1;
+    let mut new = member(4);
+    new.hlc = baseline + 2;
+    f.merge(f.snapshot(vec![existing.clone(), new])).await?;
+    let notified =
+        f.s.call(|c| {
+            let mut q = c.prepare("SELECT device FROM setup_notices ORDER BY device")?;
+            Ok(q.query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await?;
+    assert_eq!(notified, vec![id(4).to_string()]);
+    // The decision survives restart and a later rename/update.
+    drop(f.s);
+    let s = Store::open(&f._dir.path().join("state.sqlite3"))?;
+    existing.hlc += 2;
+    existing.name = "Renamed existing computer".into();
+    let mut roster = s.setup_state().roster;
+    roster.retain(|m| m.device_id != id(3));
+    roster.push(existing);
+    s.members_merge(
+        f.f.clone(),
+        member(2),
+        Members {
+            transfer_id: id(8),
+            setup_id: id(0),
+            members: roster,
+        },
+        vec![],
+        |_| {},
+    )
+    .await?;
+    let known: bool = s.call(|c| Ok(c.query_row("SELECT json_extract(payload,'$.joined_notice')=0 FROM setup_entries WHERE device=?", [id(3).as_str()], |r| r.get(0))?)).await?;
+    assert!(
+        known,
+        "pre-existing binding stays already known after restart"
+    );
+    // Reconciliation can install this known member again without announcing it
+    // as a new device; genuinely new members still keep their joined notice.
+    s.unpair_then(id(3), |_| {}).await?;
+    let roster = s.setup_state().roster;
+    s.members_merge(
+        SetupFence {
+            generation: s.setup_state().generation,
+            ..f.f.clone()
+        },
+        member(2),
+        Members {
+            transfer_id: id(9),
+            setup_id: id(0),
+            members: roster,
+        },
+        vec![],
+        |_| {},
+    )
+    .await?;
+    let notices: i64 = s
+        .call(|c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM setup_notices WHERE device=?",
+                [id(3).as_str()],
+                |r| r.get(0),
+            )?)
+        })
+        .await?;
+    assert_eq!(notices, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn setup_direct_repair_clears_introducer_without_resetting_binding() -> Result<()> {
     let f = Fixture::new().await?;
     f.merge(f.snapshot(vec![member(3)])).await?;
