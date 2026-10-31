@@ -212,6 +212,13 @@ object_struct! {
 }
 object_struct! {
     #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    pub struct MemberReadmits {
+        pub hlc: u64,
+        pub writer_device: Id,
+    }
+}
+object_struct! {
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
     pub struct Member {
         pub device_id: Id,
         pub fingerprint: Hash,
@@ -222,6 +229,8 @@ object_struct! {
         pub writer_device: Id,
         #[serde(default, deserialize_with = "non_null", skip_serializing_if = "Option::is_none")]
         pub reach: Option<MemberReach>,
+        #[serde(default, deserialize_with = "non_null", skip_serializing_if = "Option::is_none")]
+        pub readmits: Option<MemberReadmits>,
     }
 }
 object_struct! {
@@ -253,6 +262,10 @@ impl Members {
         let mut active = 0;
         for member in &self.members {
             string_limit(&member.name, 1, 128, "member name")?;
+            require(
+                member.readmits.is_none() || member.status == MemberStatus::Member,
+                "removed member has readmits",
+            )?;
             require(
                 keys.insert((&member.device_id, &member.fingerprint)),
                 "duplicate member key",

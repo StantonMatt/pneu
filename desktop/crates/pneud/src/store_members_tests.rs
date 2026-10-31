@@ -15,6 +15,7 @@ fn member(n: u8) -> Member {
         hlc: n as u64,
         writer_device: id(1),
         reach: None,
+        readmits: None,
     }
 }
 struct Fixture {
@@ -79,6 +80,13 @@ impl Fixture {
         self.s
             .members_merge(self.f.clone(), member(2), m, Vec::new(), |_| {})
             .await
+    }
+    // Legacy persisted barriers have no origin bits and conservatively ask.
+    // The v2 vector runner separately exercises real authored local removals.
+    async fn legacy_authored_removal(&self, m: Member) -> Result<()> {
+        self.merge(self.snapshot(vec![m.clone()])).await?;
+        self.s.call(move |c| {c.execute("UPDATE setup_entries SET payload=json_remove(payload,'$.authored','$.revoked_binding') WHERE device=? AND fingerprint=?",params![m.device_id.as_str(),m.fingerprint.as_str()])?;Ok(())}).await?;
+        ReadmitVectors::reload(&self.s).await
     }
     async fn pin(&self, n: u8) -> Result<Option<Hash>> {
         Ok(self
@@ -2590,6 +2598,14 @@ impl ReadmitVectors {
     }
 }
 
+async fn binding_pin(s: &Store, subject: &Id) -> Result<Option<Hash>> {
+    Ok(s.peers()
+        .await?
+        .into_iter()
+        .find(|(_, d)| d == subject)
+        .map(|(p, _)| p))
+}
+
 #[tokio::test]
 async fn setup_shared_readmission_sequences() -> Result<()> {
     use serde_json::{Value, json};
@@ -2599,10 +2615,16 @@ async fn setup_shared_readmission_sequences() -> Result<()> {
     let new_pin = Hash::new("e".repeat(64))?;
     let subject = Id::from_bytes([0x33; 16]);
     for scenario in v["scenarios"].as_array().unwrap() {
+        // The presentation-only sequence runs against the real window model in
+        // ui::window::tests::setup_shared_readmission_silent_keeper_vector.
+        if scenario["name"] == "silent-keeper-neutral-status" {
+            continue;
+        }
         let mut h = ReadmitVectors::new(&v).await?;
         let mut captured = None;
         let mut blocked = Vec::new();
         let mut filled = Vec::new();
+        let mut holder_results = serde_json::Map::new();
         for step in scenario["steps"].as_array().unwrap() {
             let context = format!("{}: {step}", scenario["name"]);
             let before = h.s.setup_state();
@@ -2620,15 +2642,23 @@ async fn setup_shared_readmission_sequences() -> Result<()> {
             let mut result = Ok(());
             if let Some(receive) = step["receive"].as_str() {
                 let fixture = &v["fixtures"][receive];
-                let sender = if fixture["authenticated_sender"] == json!(h.a.device_id) {
-                    &h.a
-                } else {
-                    &h.d
-                };
+                let sender_id: Id =
+                    serde_json::from_value(fixture["authenticated_sender"].clone())?;
+                let sender =
+                    h.s.setup_state()
+                        .roster
+                        .into_iter()
+                        .find(|m| m.device_id == sender_id && m.status == MemberStatus::Member)
+                        .or_else(|| {
+                            [h.a.clone(), h.d.clone()]
+                                .into_iter()
+                                .find(|m| m.device_id == sender_id)
+                        })
+                        .expect(&context);
                 let snapshot: Members = serde_json::from_value(fixture["payload"].clone())?;
                 result =
                     h.s.members_merge_at(
-                        h.fence(sender),
+                        h.fence(&sender),
                         h.local.clone(),
                         snapshot,
                         blocked.clone(),
@@ -2642,6 +2672,239 @@ async fn setup_shared_readmission_sequences() -> Result<()> {
             } else if let Some(action) = step["local_action"].as_str() {
                 match action {
                     "dismiss" => {}
+                    "reset-to-initial-state" => {
+                        h = ReadmitVectors::new(&v).await?;
+                        blocked.clear();
+                    }
+                    "remove-C-from-all-devices" => {
+                        let clock = step["stamp"]["hlc"].as_u64().unwrap();
+                        h.s.call(move |c| {
+                            let previous: String =
+                                c.query_row("SELECT last_seen FROM mesh_clock", [], |r| r.get(0))?;
+                            anyhow::ensure!(
+                                previous.parse::<u64>()? < clock,
+                                "vector must never rewind the clock"
+                            );
+                            c.execute(
+                                "UPDATE mesh_clock SET last_seen=?",
+                                [(clock - 1).to_string()],
+                            )?;
+                            Ok(())
+                        })
+                        .await?;
+                        h.s.setup_remove_at(
+                            h.local.device_id.clone(),
+                            subject.clone(),
+                            clock,
+                            |_| {},
+                        )
+                        .await?;
+                        let actual = h
+                            .all_subject()
+                            .await?
+                            .into_iter()
+                            .find(|e| e["denied"] == true && e["removal"]["hlc"] == clock)
+                            .expect(&context);
+                        assert_eq!(
+                            actual["removal"]["writer_device"], step["stamp"]["writer_device"],
+                            "{context}"
+                        );
+                    }
+                    "authenticate-C-ready" | "authenticate-A-ready" => {
+                        let target = if action == "authenticate-C-ready" {
+                            subject.clone()
+                        } else {
+                            h.a.device_id.clone()
+                        };
+                        let m =
+                            h.s.setup_state()
+                                .roster
+                                .into_iter()
+                                .find(|m| m.device_id == target && m.status == MemberStatus::Member)
+                                .expect(&context);
+                        h.s.setup_activate(
+                            h.fence(&m),
+                            h.local.clone(),
+                            m.clone(),
+                            SetupHello {
+                                scope: SetupScope::Enabled,
+                                setup_id: Some(id(0)),
+                            },
+                            |_| {},
+                        )
+                        .await?;
+                        if m.role == DeviceRole::Computer {
+                            h.s.mark_peer_established(target).await?;
+                        }
+                    }
+                    "load-legacy-barrier-without-origin" => {
+                        let removal: Members =
+                            serde_json::from_value(v["fixtures"]["remove"]["payload"].clone())?;
+                        let m = removal
+                            .members
+                            .into_iter()
+                            .find(|m| m.device_id == subject)
+                            .unwrap();
+                        h.s.call(move |c| {
+                            let payload =
+                                json!({"value":m,"removal":m,"denied":true,"setup_id":id(0)});
+                            c.execute(
+                                "INSERT INTO setup_entries VALUES(?,?,?)",
+                                params![
+                                    m.device_id.as_str(),
+                                    m.fingerprint.as_str(),
+                                    payload.to_string()
+                                ],
+                            )?;
+                            Ok(())
+                        })
+                        .await?;
+                        ReadmitVectors::reload(&h.s).await?;
+                    }
+                    "load-legacy-member-without-claim" => {
+                        let snapshot: Members = serde_json::from_value(
+                            v["fixtures"]["later-introduction-unclaimed"]["payload"].clone(),
+                        )?;
+                        h.s.members_merge_at(
+                            h.fence(&h.a),
+                            h.local.clone(),
+                            snapshot,
+                            vec![],
+                            h.now,
+                            |_| {},
+                        )
+                        .await?;
+                    }
+                    "arrange-departed-keeper-and-fresh-repairer" => {
+                        let removal: Members = serde_json::from_value(
+                            v["fixtures"]["departed-keeper-removal"]["payload"].clone(),
+                        )?;
+                        let claimed: Members = serde_json::from_value(
+                            v["fixtures"]["departed-keeper-claimed-member"]["payload"].clone(),
+                        )?;
+                        let r = removal
+                            .members
+                            .iter()
+                            .find(|m| m.device_id == subject)
+                            .unwrap();
+                        let m = claimed
+                            .members
+                            .iter()
+                            .find(|m| m.device_id == subject)
+                            .unwrap();
+                        assert_eq!(
+                            json!({"hlc":r.hlc,"writer_device":r.writer_device}),
+                            step["keeper"]["removal"]
+                        );
+                        assert!(m.readmits.as_ref().is_some_and(|c| (
+                            c.hlc,
+                            c.writer_device.as_str()
+                        ) >= (
+                            r.hlc,
+                            r.writer_device.as_str()
+                        )));
+                    }
+                    "deliver-exported-snapshot-to-independent-holders" => {
+                        let payload = h.s.members_outgoing(h.fence(&h.a)).await?;
+                        for holder in step["holders"].as_array().unwrap() {
+                            let receiver: Id = serde_json::from_value(holder["device_id"].clone())?;
+                            let mut hv = v.clone();
+                            let all = v["fixtures"]["join"]["payload"]["members"]
+                                .as_array()
+                                .unwrap();
+                            let row = |id: &Id| {
+                                all.iter()
+                                    .find(|m| m["device_id"] == json!(id))
+                                    .unwrap()
+                                    .clone()
+                            };
+                            let other = if receiver == h.a.device_id {
+                                h.d.device_id.clone()
+                            } else {
+                                h.a.device_id.clone()
+                            };
+                            hv["fixtures"]["join"]["payload"]["members"] = json!([
+                                row(&h.local.device_id),
+                                row(&receiver),
+                                all[2],
+                                row(&other)
+                            ]);
+                            let trial = ReadmitVectors::new(&hv).await?;
+                            let authored = holder["origin"]["authored"].as_bool().unwrap();
+                            if authored {
+                                let join: Members = serde_json::from_value(
+                                    hv["fixtures"]["join"]["payload"].clone(),
+                                )?;
+                                trial
+                                    .s
+                                    .members_merge_at(
+                                        trial.fence(&trial.a),
+                                        trial.local.clone(),
+                                        join,
+                                        vec![],
+                                        h.now,
+                                        |_| {},
+                                    )
+                                    .await?;
+                                let clock =
+                                    holder["previous_local_removal"]["hlc"].as_u64().unwrap();
+                                trial
+                                    .s
+                                    .setup_remove_at(
+                                        receiver.clone(),
+                                        subject.clone(),
+                                        clock,
+                                        |_| {},
+                                    )
+                                    .await?;
+                            }
+                            let removal: Members =
+                                serde_json::from_value(v["fixtures"]["remove"]["payload"].clone())?;
+                            trial
+                                .s
+                                .members_merge_at(
+                                    trial.fence(&trial.a),
+                                    trial.local.clone(),
+                                    removal,
+                                    vec![],
+                                    h.now,
+                                    |_| {},
+                                )
+                                .await?;
+                            let notices: i64 = trial
+                                .s
+                                .call(|c| {
+                                    Ok(c.query_row(
+                                        "SELECT count(*) FROM setup_notices",
+                                        [],
+                                        |r| r.get(0),
+                                    )?)
+                                })
+                                .await?;
+                            trial
+                                .s
+                                .members_merge_at(
+                                    trial.fence(&trial.a),
+                                    trial.local.clone(),
+                                    payload.clone(),
+                                    vec![],
+                                    h.now,
+                                    |_| {},
+                                )
+                                .await?;
+                            let after_notices: i64 = trial
+                                .s
+                                .call(|c| {
+                                    Ok(c.query_row(
+                                        "SELECT count(*) FROM setup_notices",
+                                        [],
+                                        |r| r.get(0),
+                                    )?)
+                                })
+                                .await?;
+                            holder_results.insert(if authored {"authored_holder"} else {"inherited_holder"}.into(),json!({"binding_C":trial.s.peers().await?.iter().any(|(_,d)|*d==subject),"pending_questions_for_C":trial.s.setup_state().readmissions.len(),"joined_notices_delta":after_notices-notices}));
+                        }
+                    }
                     "restart" => {
                         let path = h.dir.path().join("state.sqlite3");
                         drop(h.s);
@@ -2779,12 +3042,19 @@ async fn setup_shared_readmission_sequences() -> Result<()> {
                 );
             }
             if let Some(code) = expect["nack_code"].as_str() {
-                assert_eq!(code, "unsupported_kind", "{context}");
-                assert!(
-                    h.s.setup_state().withdrawn
-                        && result.as_ref().unwrap_err().is::<PairingRevoked>(),
-                    "{context}"
-                );
+                if code == "id_conflict" {
+                    assert!(
+                        result.as_ref().unwrap_err().is::<ReceiptConflict>(),
+                        "{context}"
+                    );
+                } else {
+                    assert_eq!(code, "unsupported_kind", "{context}");
+                    assert!(
+                        h.s.setup_state().withdrawn
+                            && result.as_ref().unwrap_err().is::<PairingRevoked>(),
+                        "{context}"
+                    );
+                }
             }
             if expect["deferred"] == true {
                 assert!(
@@ -2804,6 +3074,18 @@ async fn setup_shared_readmission_sequences() -> Result<()> {
                 .and_then(|r| r["key"]["fingerprint"].as_str())
                 .map(Hash::new)
                 .transpose()?
+                .or_else(|| {
+                    entries
+                        .iter()
+                        .find(|e| {
+                            e["denied"] == true && e["value"]["fingerprint"] == json!(new_pin)
+                        })
+                        .and_then(|e| e["value"]["fingerprint"].as_str())
+                        .map(Hash::new)
+                        .transpose()
+                        .unwrap()
+                })
+                .or(binding_pin(&h.s, &subject).await?)
                 .unwrap_or(old_pin.clone());
             let entry = h.entry(&current_pin).await?;
             let after = h.s.setup_state();
@@ -2814,7 +3096,18 @@ async fn setup_shared_readmission_sequences() -> Result<()> {
                     .find(|(_, d)| *d == subject)
                     .map(|(p, _)| p);
             let mut actual = serde_json::Map::new();
-            actual.insert("denied".into(), entry["denied"].clone());
+            actual.insert("denied".into(), json!(entry["denied"] == true));
+            actual.insert("origin".into(),json!({"authored":entry["authored"].as_bool().unwrap_or(true),"revoked_binding":entry["revoked_binding"].as_bool().unwrap_or(false)}));
+            actual.insert(
+                "origin_effective_authored".into(),
+                json!(entry["authored"].as_bool().unwrap_or(true)),
+            );
+            for field in ["readmits", "retained_claim"] {
+                actual.insert(field.into(), entry["value"]["readmits"].clone());
+            }
+            for (field, value) in &holder_results {
+                actual.insert(field.clone(), value.clone());
+            }
             actual.insert(
                 "exported_C".into(),
                 json!(
@@ -2860,9 +3153,15 @@ async fn setup_shared_readmission_sequences() -> Result<()> {
             );
             actual.insert(
                 "introducer".into(),
-                record
-                    .map(|r| r["introducer"].clone())
-                    .unwrap_or(Value::Null),
+                record.map(|r| r["introducer"].clone()).unwrap_or_else(|| {
+                    json!(
+                        after
+                            .links
+                            .iter()
+                            .find(|l| l.device == subject)
+                            .and_then(|l| l.introduced_by.clone())
+                    )
+                }),
             );
             for (field, source) in [
                 ("value_hlc", "hlc"),
@@ -2873,7 +3172,7 @@ async fn setup_shared_readmission_sequences() -> Result<()> {
                     field.into(),
                     record
                         .map(|r| r["value"][source].clone())
-                        .unwrap_or(Value::Null),
+                        .unwrap_or_else(|| entry["value"][source].clone()),
                 );
             }
             actual.insert("record_barrier".into(),record.map(|r|json!({"hlc":r["key"]["removal_hlc"],"writer_device":r["key"]["removal_writer"]})).unwrap_or(Value::Null));
@@ -2881,7 +3180,10 @@ async fn setup_shared_readmission_sequences() -> Result<()> {
             actual.insert("roster_resend".into(), json!(before.roster != after.roster));
             actual.insert(
                 "binding_generation_delta".into(),
-                json!(h.s.pairing_generation(&subject).unwrap_or(0) - before_generation),
+                json!(
+                    h.s.pairing_generation(&subject).unwrap_or(0) as i128
+                        - before_generation as i128
+                ),
             );
             actual.insert(
                 "old_pin_denied".into(),
@@ -2916,7 +3218,13 @@ async fn setup_shared_readmission_sequences() -> Result<()> {
             );
             for (key, expected) in expect.as_object().into_iter().flatten() {
                 if let Some(got) = actual.get(key) {
-                    assert_eq!(got, expected, "{context}: {key}");
+                    if key == "authored_holder" || key == "inherited_holder" {
+                        for (k, v) in expected.as_object().unwrap() {
+                            assert_eq!(&got[k], v, "{context}: {key}.{k}");
+                        }
+                    } else {
+                        assert_eq!(got, expected, "{context}: {key}");
+                    }
                     continue;
                 }
                 match key.as_str() {
@@ -2956,10 +3264,19 @@ async fn setup_shared_readmission_sequences() -> Result<()> {
                         "{context}"
                     ),
                     "readiness" => {
-                        assert!(!h.s.peer_established(subject.clone()).await?, "{context}")
+                        assert_eq!(
+                            h.s.peer_established(subject.clone()).await?,
+                            expected == 1,
+                            "{context}"
+                        )
                     }
                     "hello_seen" => assert!(
-                        !h.s.setup_remote_scopes().contains_key(&subject),
+                        h.s.setup_state()
+                            .links
+                            .iter()
+                            .find(|l| l.device == subject)
+                            .is_some_and(|l| l.hello_seen)
+                            == expected.as_bool().unwrap(),
                         "{context}"
                     ),
                     "authored_values_delta" => assert_eq!(before.roster, after.roster, "{context}"),
@@ -3034,6 +3351,20 @@ async fn setup_shared_readmission_sequences() -> Result<()> {
                         assert_eq!(h.local.device_id, Id::from_bytes([0x22; 16]));
                         assert_eq!(h.local.fingerprint, Hash::new("b".repeat(64))?);
                     }
+                    "membership_stamp_unchanged" => {
+                        assert_eq!(
+                            before_subject
+                                .iter()
+                                .find(|e| e["value"]["fingerprint"] == json!(current_pin))
+                                .unwrap()["value"]["hlc"],
+                            entry["value"]["hlc"],
+                            "{context}"
+                        );
+                    }
+                    "retryable" => {
+                        assert_eq!(expected, false, "{context}");
+                        assert!(result.is_err(), "{context}");
+                    }
                     "error" | "nack_code" | "visible_error" | "deferred" => {}
                     _ => panic!("unhandled assertion {key}: {context}"),
                 }
@@ -3049,9 +3380,13 @@ async fn setup_readmission_transaction_failures_and_independent_reach() -> Resul
     let mut removed = member(3);
     removed.status = MemberStatus::Removed;
     removed.hlc = 10;
-    f.merge(f.snapshot(vec![removed.clone()])).await?;
+    f.legacy_authored_removal(removed.clone()).await?;
     let mut newer = member(3);
     newer.hlc = 20;
+    newer.readmits = Some(MemberReadmits {
+        hlc: 10,
+        writer_device: id(1),
+    });
     newer.reach = Some(MemberReach {
         addresses: vec!["192.168.1.12:47821".into()],
         relay: vec![],
@@ -3172,9 +3507,13 @@ async fn setup_readmission_is_per_key_and_keeps_introduced_protection_after_lega
     let mut removed = member(3);
     removed.status = MemberStatus::Removed;
     removed.hlc = 10;
-    f.merge(f.snapshot(vec![removed])).await?;
+    f.legacy_authored_removal(removed).await?;
     let mut newer = member(3);
     newer.hlc = 20;
+    newer.readmits = Some(MemberReadmits {
+        hlc: 10,
+        writer_device: id(1),
+    });
     f.merge(f.snapshot(vec![newer])).await?;
     let key = f.s.setup_state().readmissions[0].key.clone();
     f.s.pair(id(4), member(4).fingerprint).await?;
@@ -3267,12 +3606,16 @@ async fn setup_readmission_observation_and_keep_do_not_change_outgoing_union() -
     let mut removed = member(3);
     removed.hlc = 10;
     removed.status = MemberStatus::Removed;
-    f.merge(f.snapshot(vec![removed])).await?;
+    f.legacy_authored_removal(removed).await?;
     let before = f.s.members_outgoing(f.f.clone()).await?;
     f.s.members_ack(f.f.clone(), before.transfer_id.clone())
         .await?;
     let mut newer = member(3);
     newer.hlc = 20;
+    newer.readmits = Some(MemberReadmits {
+        hlc: 10,
+        writer_device: id(1),
+    });
     f.s.members_merge(
         f.f.clone(),
         member(2),
@@ -3545,10 +3888,14 @@ async fn setup_removed_certificate_stays_quiet_before_during_and_after_question(
     let mut removed = member(3);
     removed.status = MemberStatus::Removed;
     removed.hlc = 10;
-    f.merge(f.snapshot(vec![removed])).await?;
+    f.legacy_authored_removal(removed).await?;
     assert!(f.s.setup_quiet_reconnect(pin.clone()).await?);
     let mut newer = member(3);
     newer.hlc = 20;
+    newer.readmits = Some(MemberReadmits {
+        hlc: 10,
+        writer_device: id(1),
+    });
     f.merge(f.snapshot(vec![newer])).await?;
     let key = f.s.setup_state().readmissions[0].key.clone();
     assert!(f.s.setup_quiet_reconnect(pin.clone()).await?);
@@ -3574,5 +3921,414 @@ async fn setup_sender_members_rename_updates_direct_binding_without_reconnect() 
             .name,
         "Office-PC 2"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_readmits_invalid_vectors_are_atomic_including_sender_self() -> Result<()> {
+    let v: serde_json::Value =
+        serde_json::from_str(include_str!("../../../protocol-vectors/readmission.json"))?;
+    for invalid in v["invalid_readmits_entries"].as_array().unwrap() {
+        for sender_self in [false, true] {
+            if sender_self && invalid["also_validate_on_sender_self_row"] != true {
+                continue;
+            }
+            let h = ReadmitVectors::new(&v).await?;
+            let subject: Member =
+                serde_json::from_value(v["fixtures"]["join"]["payload"]["members"][2].clone())?;
+            if sender_self {
+                h.pair(subject.clone()).await?;
+            }
+            let sender = if sender_self { &subject } else { &h.a };
+            let before = h.s.setup_state();
+            let before_rows = h.all_subject().await?;
+            let bookkeeping = |c: &mut rusqlite::Connection| -> Result<(String, i64)> {
+                Ok((
+                    c.query_row("SELECT last_seen FROM mesh_clock", [], |r| r.get(0))?,
+                    c.query_row("SELECT count(*) FROM members_receipts", [], |r| r.get(0))?,
+                ))
+            };
+            let before_bookkeeping = h.s.call(bookkeeping).await?;
+            let raw = format!(
+                "{{\"transfer_id\":\"{}\",\"setup_id\":\"{}\",\"members\":[{},{}]}}",
+                id(70),
+                id(0),
+                serde_json::to_string(&h.a)?,
+                invalid["raw_entry"].as_str().unwrap()
+            );
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&((raw.len() + 1) as u32).to_be_bytes());
+            frame.push(0x22);
+            frame.extend_from_slice(raw.as_bytes());
+            match pneu_proto::decode_frame(&frame) {
+                Err(_) => assert_ne!(invalid["name"], "claim-future-hlc"),
+                Ok(Message::Members(snapshot)) => {
+                    let error =
+                        h.s.members_merge_at(
+                            h.fence(sender),
+                            h.local.clone(),
+                            snapshot,
+                            vec![],
+                            h.now,
+                            |_| panic!("invalid claim published"),
+                        )
+                        .await
+                        .unwrap_err();
+                    assert!(
+                        matches!(
+                            error.downcast_ref::<MembersError>(),
+                            Some(MembersError::Malformed)
+                        ),
+                        "{invalid}: {error}"
+                    );
+                }
+                Ok(_) => panic!("expected MEMBERS"),
+            }
+            assert_eq!(h.s.setup_state(), before, "{invalid}");
+            assert_eq!(h.all_subject().await?, before_rows, "{invalid}");
+            assert_eq!(
+                h.s.call(bookkeeping).await?,
+                before_bookkeeping,
+                "{invalid}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_readmits_review_withdrawal_validates_final_capacity() -> Result<()> {
+    let f = Fixture::new().await?;
+    // Fifteen direct-only peers plus the scoped sender fill the binding cap.
+    for n in 10..25 {
+        f.s.pair(id(n), member(n).fingerprint).await?;
+    }
+    assert_eq!(f.s.peers().await?.len(), 16);
+    let mut removed = member(2);
+    removed.status = MemberStatus::Removed;
+    removed.hlc = crate::now_ms() + 1;
+    f.merge(f.snapshot(vec![removed.clone(), member(3)]))
+        .await?;
+    let state = f.s.setup_state();
+    assert!(state.withdrawn);
+    assert!(state.setup_id.is_none());
+    let own: serde_json::Value =
+        f.s.call(|c| {
+            let raw: String = c.query_row(
+                "SELECT payload FROM setup_entries WHERE device=? AND fingerprint=?",
+                params![id(2).as_str(), member(2).fingerprint.as_str()],
+                |r| r.get(0),
+            )?;
+            Ok(serde_json::from_str(&raw)?)
+        })
+        .await?;
+    assert_eq!(own["removal"], serde_json::to_value(removed)?);
+    assert_eq!(own["denied"], true);
+    assert!(f.pin(1).await?.is_none());
+    assert!(f.pin(3).await?.is_none());
+    assert_eq!(f.s.peers().await?.len(), 15);
+    for n in 10..25 {
+        assert_eq!(f.pin(n).await?, Some(member(n).fingerprint));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_readmits_review_replaces_stale_candidate_introducer() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.merge(f.snapshot(vec![member(4)])).await?;
+    let blocked = vec![(Some(id(3)), member(3).fingerprint)];
+    f.s.members_merge(
+        f.f.clone(),
+        member(2),
+        f.snapshot(vec![member(3)]),
+        blocked.clone(),
+        |_| {},
+    )
+    .await?;
+    let mut removed = member(3);
+    removed.status = MemberStatus::Removed;
+    removed.hlc = 10;
+    f.merge(f.snapshot(vec![removed])).await?;
+    let stale: String =
+        f.s.call(|c| {
+            Ok(c.query_row(
+                "SELECT introduced_by FROM setup_candidates WHERE device=?",
+                [id(3).as_str()],
+                |r| r.get(0),
+            )?)
+        })
+        .await?;
+    assert_eq!(stale, id(1).as_str());
+    let mut candidate = member(3);
+    candidate.hlc = 20;
+    candidate.readmits = Some(MemberReadmits {
+        hlc: 10,
+        writer_device: id(1),
+    });
+    let mut introducer = f.f.clone();
+    introducer.device = id(4);
+    introducer.fingerprint = member(4).fingerprint;
+    introducer.binding_generation = f.s.pairing_generation(&id(4)).unwrap();
+    f.s.members_merge(
+        introducer,
+        member(2),
+        f.snapshot(vec![candidate]),
+        blocked,
+        |_| {},
+    )
+    .await?;
+    assert!(f.pin(3).await?.is_none());
+    f.s.setup_reconcile_candidates(id(2), vec![], |_| {})
+        .await?;
+    let link =
+        f.s.setup_state()
+            .links
+            .into_iter()
+            .find(|l| l.device == id(3))
+            .unwrap();
+    assert_eq!(link.introduced_by, Some(id(4)));
+    assert_eq!(link.introducer_name.as_deref(), Some("Device 4"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_inherited_readmits_follow_guards_and_restart_reconciliation() -> Result<()> {
+    for block_by_id in [false, true] {
+        let mut f = Fixture::new().await?;
+        let mut removed = member(3);
+        removed.status = MemberStatus::Removed;
+        removed.hlc = 10;
+        f.merge(f.snapshot(vec![removed.clone()])).await?;
+        let mut candidate = member(3);
+        candidate.hlc = 20;
+        candidate.readmits = Some(MemberReadmits {
+            hlc: 10,
+            writer_device: id(1),
+        });
+        let blocked = if block_by_id {
+            vec![(Some(id(3)), member(9).fingerprint)]
+        } else {
+            vec![(None, member(3).fingerprint)]
+        };
+        f.s.members_merge(
+            f.f.clone(),
+            member(2),
+            f.snapshot(vec![candidate.clone()]),
+            blocked.clone(),
+            |delta| {
+                assert!(!delta.roster_changed);
+                assert!(delta.added.is_empty());
+            },
+        )
+        .await?;
+        assert!(f.pin(3).await?.is_none());
+        assert!(f.s.setup_state().readmissions.is_empty());
+        assert!(f.s.setup_state().roster.contains(&removed));
+        // The candidate and its first introducer survive a restart without a
+        // prompt or an early deny clear, then install when the attempt ends.
+        let path = f._dir.path().join("state.sqlite3");
+        drop(f.s);
+        f.s = Store::open(&path)?;
+        f.s.setup_reconcile_candidates(id(2), blocked, |d| assert!(d.added.is_empty()))
+            .await?;
+        assert!(f.pin(3).await?.is_none());
+        f.s.fail_next("members_before_commit", 1);
+        let before = f.s.setup_state();
+        assert!(
+            f.s.setup_reconcile_candidates(id(2), vec![], |_| panic!("failed follow published"))
+                .await
+                .is_err()
+        );
+        assert_eq!(before, f.s.setup_state());
+        assert!(f.pin(3).await?.is_none());
+        f.s.setup_reconcile_candidates(id(2), vec![], |d| assert_eq!(d.added, vec![id(3)]))
+            .await?;
+        assert_eq!(f.pin(3).await?, Some(member(3).fingerprint));
+        assert!(f.s.setup_state().roster.contains(&candidate));
+        let generation = f.s.pairing_generation(&id(3));
+        f.s.mark_peer_established(id(3)).await?;
+        f.merge(f.snapshot(vec![removed])).await?;
+        assert_eq!(generation, f.s.pairing_generation(&id(3)));
+        assert!(f.s.peer_established(id(3)).await?);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_inherited_follow_rolls_back_storage_and_capacity_failures() -> Result<()> {
+    for fault in ["peers", "peer_settings", "capacity", "commit"] {
+        let f = Fixture::new().await?;
+        let mut removed = member(3);
+        removed.status = MemberStatus::Removed;
+        removed.hlc = 10;
+        f.merge(f.snapshot(vec![removed])).await?;
+        let mut candidate = member(3);
+        candidate.hlc = 20;
+        candidate.readmits = Some(MemberReadmits {
+            hlc: 10,
+            writer_device: id(1),
+        });
+        if fault == "capacity" {
+            f.merge(f.snapshot((10..25).map(member).collect())).await?;
+        } else if fault == "commit" {
+            f.s.fail_next("members_before_commit", 1);
+        } else {
+            let sql = format!(
+                "CREATE TEMP TRIGGER follow_fail BEFORE INSERT ON {fault} BEGIN SELECT RAISE(ABORT,'follow failed'); END;"
+            );
+            f.s.call(move |c| {
+                c.execute_batch(&sql)?;
+                Ok(())
+            })
+            .await?;
+        }
+        let before = f.s.setup_state();
+        let generation = f.s.pairing_generation(&id(3));
+        assert!(
+            f.s.members_merge(
+                f.f.clone(),
+                member(2),
+                f.snapshot(vec![candidate]),
+                vec![],
+                |_| panic!("failed follow published")
+            )
+            .await
+            .is_err(),
+            "{fault}"
+        );
+        assert_eq!(f.s.setup_state(), before, "{fault}");
+        assert_eq!(f.s.pairing_generation(&id(3)), generation, "{fault}");
+        assert!(f.pin(3).await?.is_none(), "{fault}");
+        assert!(
+            f.s.setup_quiet_reconnect(member(3).fingerprint).await?,
+            "{fault}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_claim_eligibility_is_independent_of_member_stamp_and_own_metadata() -> Result<()> {
+    for authored in [false, true] {
+        let f = Fixture::new().await?;
+        let mut removed = member(3);
+        removed.status = MemberStatus::Removed;
+        removed.hlc = 10;
+        if authored {
+            f.legacy_authored_removal(removed).await?;
+        } else {
+            f.merge(f.snapshot(vec![removed])).await?;
+        }
+        let mut old_member = member(3);
+        old_member.readmits = Some(MemberReadmits {
+            hlc: 10,
+            writer_device: id(1),
+        });
+        f.merge(f.snapshot(vec![old_member.clone()])).await?;
+        if authored {
+            let key = f.s.setup_state().readmissions[0].key.clone();
+            f.s.setup_readmit(key, id(2), true, vec![], |_| {}).await?;
+        }
+        assert_eq!(f.pin(3).await?, Some(member(3).fingerprint));
+        assert!(f.s.setup_state().roster.contains(&old_member));
+    }
+    // A third-party claim for this installation may merge without accepting
+    // the round-trip row as an identity, name or membership-register update.
+    let f = Fixture::new().await?;
+    let own =
+        f.s.setup_state()
+            .roster
+            .into_iter()
+            .find(|m| m.device_id == id(2))
+            .unwrap();
+    let mut forwarded = own.clone();
+    forwarded.name = "Do not rename me".into();
+    forwarded.hlc += 10;
+    forwarded.readmits = Some(MemberReadmits {
+        hlc: 10,
+        writer_device: id(1),
+    });
+    f.merge(f.snapshot(vec![forwarded])).await?;
+    let mut expected = own;
+    expected.readmits = Some(MemberReadmits {
+        hlc: 10,
+        writer_device: id(1),
+    });
+    assert!(f.s.setup_state().roster.contains(&expected));
+    let mut removed = member(2);
+    removed.status = MemberStatus::Removed;
+    removed.hlc = 10;
+    f.merge(f.snapshot(vec![removed])).await?;
+    assert!(!f.s.setup_state().withdrawn);
+    assert!(f.s.setup_state().roster.contains(&expected));
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_inherited_candidate_freezes_joined_notice_before_deferred_rename() -> Result<()> {
+    let f = Fixture::new().await?;
+    let mut removed = member(3);
+    removed.status = MemberStatus::Removed;
+    removed.hlc = 10;
+    f.merge(f.snapshot(vec![removed])).await?;
+    let mut candidate = member(3);
+    candidate.hlc = 20;
+    candidate.readmits = Some(MemberReadmits {
+        hlc: 10,
+        writer_device: id(1),
+    });
+    let blocked = vec![(Some(id(3)), candidate.fingerprint.clone())];
+    f.s.members_merge(
+        f.f.clone(),
+        member(2),
+        f.snapshot(vec![candidate.clone()]),
+        blocked.clone(),
+        |_| {},
+    )
+    .await?;
+    // Its original admission predates this receiver's assignment. A rename
+    // beyond that baseline cannot turn an initial import into a joined notice.
+    candidate.hlc = crate::now_ms() + 10;
+    candidate.name = "Renamed".into();
+    f.s.members_merge(
+        f.f.clone(),
+        member(2),
+        f.snapshot(vec![candidate]),
+        blocked,
+        |_| {},
+    )
+    .await?;
+    f.s.setup_reconcile_candidates(id(2), vec![], |d| assert_eq!(d.added, vec![id(3)]))
+        .await?;
+    let count: i64 =
+        f.s.call(|c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM setup_notices WHERE device=?",
+                [id(3).as_str()],
+                |r| r.get(0),
+            )?)
+        })
+        .await?;
+    assert_eq!(count, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_authored_origin_is_committed_atomically() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.merge(f.snapshot(vec![member(3)])).await?;
+    let before = f.s.setup_state();
+    f.s.fail_next("members_before_commit", 1);
+    assert!(
+        f.s.setup_remove(id(2), id(3), |_| panic!("failed removal published"))
+            .await
+            .is_err()
+    );
+    assert_eq!(f.s.setup_state(), before);
+    assert!(f.pin(3).await?.is_some());
+    f.s.setup_remove(id(2), id(3), |_| {}).await?;
+    let origin:(bool,bool)=f.s.call(|c|Ok(c.query_row("SELECT json_extract(payload,'$.authored'),json_extract(payload,'$.revoked_binding') FROM setup_entries WHERE device=?",[id(3).as_str()],|r|Ok((r.get(0)?,r.get(1)?)))?)).await?;
+    assert_eq!(origin, (true, true));
     Ok(())
 }

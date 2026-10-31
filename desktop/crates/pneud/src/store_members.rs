@@ -1,7 +1,9 @@
 //! Setup state has its own lifetime. Neither direct-peer cascades nor receipt
 //! pruning can erase a terminal removal or a retired incarnation's high water.
 use super::*;
-use pneu_proto::{DeviceRole, Member, MemberStatus, Members, SetupHello, SetupScope};
+use pneu_proto::{
+    DeviceRole, Member, MemberReadmits, MemberStatus, Members, SetupHello, SetupScope,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SetupState {
@@ -120,7 +122,39 @@ fn merge_member(a: &Member, b: &Member) -> Member {
         (Some(a), _) => Some(a.clone()),
         (_, b) => b.clone(),
     };
+    value.readmits = match (&a.readmits, &b.readmits) {
+        (Some(a), Some(b)) if claim_stamp(a) < claim_stamp(b) => Some(b.clone()),
+        (Some(a), _) => Some(a.clone()),
+        (_, b) => b.clone(),
+    };
     value
+}
+fn claim_stamp(claim: &MemberReadmits) -> (u64, &str) {
+    (claim.hlc, claim.writer_device.as_str())
+}
+fn claims(member: &Member, removal: &Member) -> bool {
+    member
+        .readmits
+        .as_ref()
+        .is_some_and(|c| claim_stamp(c) >= stamp(removal))
+}
+fn removal_claim(removal: &Member) -> MemberReadmits {
+    MemberReadmits {
+        hlc: removal.hlc,
+        writer_device: removal.writer_device.clone(),
+    }
+}
+fn legacy_authored() -> bool {
+    true
+}
+fn fresh_pair_claim(entry: &Entry) -> Option<MemberReadmits> {
+    let retained = entry.value.readmits.clone();
+    let removal = entry.removal.as_ref().map(removal_claim);
+    match (retained, removal) {
+        (Some(a), Some(b)) if claim_stamp(&a) >= claim_stamp(&b) => Some(a),
+        (_, Some(b)) => Some(b),
+        (a, None) => a,
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Entry {
@@ -137,6 +171,11 @@ struct Entry {
     joined_notice: Option<bool>,
     removal: Option<Member>,
     denied: bool,
+    // Local barrier episode facts, never inferred from the unsigned writer.
+    #[serde(default = "legacy_authored")]
+    authored: bool,
+    #[serde(default)]
+    revoked_binding: bool,
     setup_id: Option<Id>,
 }
 // Called only from the direct READY path. Phones do not use the computer's
@@ -153,6 +192,8 @@ fn membership_eq(a: &Member, b: &Member) -> bool {
     let mut b = b.clone();
     a.reach = None;
     b.reach = None;
+    a.readmits = None;
+    b.readmits = None;
     a == b
 }
 fn scope_text(scope: SetupScope) -> &'static str {
@@ -221,7 +262,7 @@ pub(super) fn state(c: &Connection) -> Result<SetupState> {
         withdrawn,
         roster,
         links,
-        readmissions: entries(c)?.into_iter().filter_map(|e| e.readmission).filter(|r| r.decision == "pending" && r.key.setup_generation == generation as u64 && setup_id.is_some() && !withdrawn).collect(),
+        readmissions: entries(c)?.into_iter().filter(|e| e.denied && e.authored).filter_map(|e| e.readmission.filter(|r| e.removal.as_ref().is_some_and(|removal| claims(&r.value, removal)))).filter(|r| r.decision == "pending" && r.key.setup_generation == generation as u64 && setup_id.is_some() && !withdrawn).collect(),
         pending_link: c.query_row("SELECT EXISTS(SELECT 1 FROM setup_pending_link)", [], |r| r.get(0))?,
         waiting_for: c.query_row("SELECT device FROM setup_links WHERE discovery_id IS NOT NULL ORDER BY device LIMIT 1", [], |r| r.get::<_, String>(0)).optional()?.map(Id::new).transpose()?,
     })
@@ -505,6 +546,11 @@ fn local_value(tx: &Transaction<'_>, mut value: Member, setup_id: &Id, fresh: bo
         return Ok(());
     }
     value.hlc = allocate_stamp(tx)?.1;
+    value.readmits = if fresh {
+        old.as_ref().and_then(fresh_pair_claim)
+    } else {
+        old.as_ref().and_then(|e| e.value.readmits.clone())
+    };
     if let Some(reach) = &mut value.reach {
         reach.hlc = value.hlc;
     }
@@ -526,6 +572,8 @@ fn local_value(tx: &Transaction<'_>, mut value: Member, setup_id: &Id, fresh: bo
             value,
             removal: old.and_then(|e| e.removal),
             denied: false,
+            authored: false,
+            revoked_binding: false,
             setup_id: Some(setup_id.clone()),
         },
     )
@@ -897,6 +945,7 @@ impl Store {
             for m in &snapshot.members {
                 validate_stamp(m.hlc,now).map_err(|_|MembersError::Malformed)?;
                 if let Some(r)=&m.reach {validate_stamp(r.hlc,now).map_err(|_|MembersError::Malformed)?;}
+                if let Some(c)=&m.readmits {validate_stamp(c.hlc,now).map_err(|_|MembersError::Malformed)?;}
             }
             let meta=members_metadata(&snapshot);
             if let Some((old,_))=receipt_row(tx,fence.device.as_str(),snapshot.transfer_id.as_str())? {ensure!(old==meta,ReceiptConflict);return Ok(true);}
@@ -929,27 +978,52 @@ impl Store {
             for m in snapshot.members.iter().filter(|m|m.status==MemberStatus::Removed)
                 .chain(snapshot.members.iter().filter(|m|m.status==MemberStatus::Member)) {
                 observe_hlc(tx,m.hlc)?;if let Some(r)=&m.reach {observe_hlc(tx,r.hlc)?;}
+                if let Some(c)=&m.readmits {observe_hlc(tx,c.hlc)?;}
+                // Receipt equality and validation use the complete wire row. Only
+                // after that may a sender self claim be ignored.
+                let mut incoming=m.clone();
+                if incoming.device_id==fence.device {incoming.readmits=None;}
+                let m=&incoming;
                 let old=entries(tx)?.into_iter().find(|e|e.value.device_id==m.device_id&&e.value.fingerprint==m.fingerprint);
                 if m.status==MemberStatus::Removed {
                     let removal=old.as_ref().and_then(|e|e.removal.as_ref());
                     if removal.is_some_and(|r|stamp(r)>=stamp(m)) {continue;}
-                    let e=Entry {ready_generation:None,readmission:None,value:m.clone(),admitted_hlc:None,joined_notice:None,removal:Some(m.clone()),denied:true,setup_id:Some(snapshot.setup_id.clone())};
+                    if let Some(mut e)=old.clone().filter(|e| !e.denied && e.value.status==MemberStatus::Member && claims(&e.value,m)) {
+                        e.removal=Some(m.clone());
+                        e.authored=false;e.revoked_binding=false;
+                        save_entry(tx,&e)?;
+                        continue;
+                    }
+                    let bound:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM peers WHERE id=? AND fp=?)",params![m.device_id.as_str(),m.fingerprint.as_str()],|r|r.get(0))?;
+                    let episode=old.as_ref().filter(|e|e.denied);
+                    let revoked_binding=bound || old.as_ref().is_some_and(|e| e.value.status==MemberStatus::Member && e.setup_id==s.setup_id) || episode.is_some_and(|e|e.revoked_binding);
+                    let e=Entry {authored:episode.is_some_and(|e|e.authored),revoked_binding,ready_generation:None,readmission:None,value:m.clone(),admitted_hlc:None,joined_notice:None,removal:Some(m.clone()),denied:true,setup_id:Some(snapshot.setup_id.clone())};
                     save_entry(tx,&e)?;
                     delta.tombstones.push((m.device_id.clone(),m.fingerprint.clone()));
                     forget(tx,&m.device_id,&m.fingerprint,delta)?;
                     continue;
                 }
-                if m.device_id==local.device_id {continue;}
+                if m.device_id==local.device_id {
+                    if let Some(mut entry)=old.filter(|e|!e.denied && e.value.status==MemberStatus::Member) {
+                        entry.value.readmits=merge_member(&entry.value,m).readmits;
+                        save_entry(tx,&entry)?;
+                    }
+                    continue;
+                }
                 if let Some(mut entry) = old.clone().filter(|e| e.denied) {
                     let r = entry.removal.as_ref().context("deny without removal")?;
-                    if stamp(m) > stamp(r) {
+                    let candidate=entry.readmission.as_ref().map(|record|merge_member(&record.value,m)).unwrap_or_else(||m.clone());
+                    if claims(&candidate,r) {
+                        if !entry.authored && entry.joined_notice.is_none() {
+                            entry.joined_notice=Some(joined_is_new(tx,&local.device_id,&candidate)?);
+                        }
                         if let Some(record) = &mut entry.readmission {
-                            record.value = merge_member(&record.value, m);
+                            record.value = candidate.clone();
                         } else {
                             let name: String = tx.query_row("SELECT name FROM peers WHERE id=?", [fence.device.as_str()], |r| r.get(0))?;
                             entry.readmission = Some(Readmission {
                                 key: ReadmissionKey { device: m.device_id.clone(), fingerprint: m.fingerprint.clone(), removal_hlc: r.hlc, removal_writer: r.writer_device.clone(), setup_generation: s.generation },
-                                removed_name: r.name.clone(), value: m.clone(), introducer: fence.device.clone(), introducer_name: name, decision: "pending".into(), error: None,
+                                removed_name: r.name.clone(), value: candidate, introducer: fence.device.clone(), introducer_name: name, decision: "pending".into(), error: None,
                             });
                         }
                         save_entry(tx, &entry)?;
@@ -968,15 +1042,12 @@ impl Store {
                 if conflict||active_conflict {
                     record_conflict(tx, m)?;continue;
                 }
-                let mut value=match &old {Some(e) if stamp(&e.value)>=stamp(m)=>e.value.clone(),_=>m.clone()};
-                if let Some(e)=&old {
-                    value.reach=match (&e.value.reach,&m.reach) {(Some(a),Some(b)) if (a.hlc,a.writer_device.as_str())<(b.hlc,b.writer_device.as_str())=>Some(b.clone()),(Some(a),_)=>Some(a.clone()),(_,r)=>r.clone()};
-                }
+                let value=old.as_ref().filter(|e|e.value.status==MemberStatus::Member).map(|e|merge_member(&e.value,m)).unwrap_or_else(||m.clone());
                 let joined_notice=match old.as_ref().filter(|e|e.setup_id.as_ref()==Some(&snapshot.setup_id)).and_then(|e|e.joined_notice) {
                     Some(joined)=>joined,
                     None=>joined_is_new(tx,&local.device_id,&value)?,
                 };
-                save_entry(tx,&Entry {ready_generation:old.as_ref().and_then(|e|e.ready_generation),readmission:old.as_ref().and_then(|e|e.readmission.clone()),value:value.clone(),admitted_hlc:None,joined_notice:Some(joined_notice),removal:old.and_then(|e|e.removal),denied:false,setup_id:Some(snapshot.setup_id.clone())})?;
+                save_entry(tx,&Entry {authored:false,revoked_binding:false,ready_generation:old.as_ref().and_then(|e|e.ready_generation),readmission:old.as_ref().and_then(|e|e.readmission.clone()),value:value.clone(),admitted_hlc:None,joined_notice:Some(joined_notice),removal:old.and_then(|e|e.removal),denied:false,setup_id:Some(snapshot.setup_id.clone())})?;
                 let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM peers WHERE id=?)",[m.device_id.as_str()],|r|r.get(0))?;
                 if !exists {
                     let name:String=tx.query_row("SELECT name FROM peers WHERE id=?",[fence.device.as_str()],|r|r.get(0))?;
@@ -1004,6 +1075,7 @@ impl Store {
                 }
                 if let Some(r)=&value.reach {merge_routes(tx,&m.device_id,&m.fingerprint,&r.addresses)?;}
             }
+            reconcile_candidates(tx,&local.device_id,&blocked,delta)?;
             let own_removed=denied(tx,&local.device_id,&local.fingerprint)?;
             if own_removed {retire(tx,true,delta)?;}else{dissolve_if_last(tx,&local.device_id,delta)?;}
             validate_capacity(tx)?;
@@ -1020,6 +1092,26 @@ impl Store {
         device: Id,
         finish: impl FnOnce(SetupDelta) + Send + 'static,
     ) -> Result<()> {
+        self.setup_remove_inner(local, device, None, finish).await
+    }
+    #[cfg(test)]
+    pub(crate) async fn setup_remove_at(
+        &self,
+        local: Id,
+        device: Id,
+        now: u64,
+        finish: impl FnOnce(SetupDelta) + Send + 'static,
+    ) -> Result<()> {
+        self.setup_remove_inner(local, device, Some(now), finish)
+            .await
+    }
+    async fn setup_remove_inner(
+        &self,
+        local: Id,
+        device: Id,
+        now: Option<u64>,
+        finish: impl FnOnce(SetupDelta) + Send + 'static,
+    ) -> Result<()> {
         self.setup_write(
             move |tx, delta| {
                 let s = state(tx)?;
@@ -1034,7 +1126,11 @@ impl Store {
                 let mut removed = member;
                 removed.status = MemberStatus::Removed;
                 removed.reach = None;
-                removed.hlc = allocate_stamp(tx)?.1;
+                removed.readmits = None;
+                removed.hlc = match now {
+                    Some(now) => allocate_stamp_at(tx, now)?.1,
+                    None => allocate_stamp(tx)?.1,
+                };
                 removed.writer_device = local.clone();
                 save_entry(
                     tx,
@@ -1046,6 +1142,8 @@ impl Store {
                         value: removed.clone(),
                         removal: Some(removed.clone()),
                         denied: true,
+                        authored: true,
+                        revoked_binding: true,
                         setup_id: Some(id),
                     },
                 )?;
@@ -1158,7 +1256,7 @@ pub(super) fn paired(
         set_scope(tx, &remote.device_id, SetupScope::Disabled)?;
         tx.execute("UPDATE setup_links SET outcome='Direct link kept; separate setups not linked' WHERE device=?",[remote.device_id.as_str()])?;
     }
-    let remote_value = Member {
+    let mut remote_value = Member {
         device_id: remote.device_id.clone(),
         fingerprint: pin.clone(),
         role: remote.role.unwrap_or(DeviceRole::Phone),
@@ -1167,6 +1265,7 @@ pub(super) fn paired(
         hlc: 0,
         writer_device: local.device_id.clone(),
         reach: None,
+        readmits: None,
     };
     let mut retired_member = false;
     // Replacing an exported certificate terminally retires its old incarnation.
@@ -1179,6 +1278,7 @@ pub(super) fn paired(
             let mut removed = e.value;
             removed.status = MemberStatus::Removed;
             removed.reach = None;
+            removed.readmits = None;
             removed.hlc = allocate_stamp(tx)?.1;
             removed.writer_device = local.device_id.clone();
             save_entry(
@@ -1191,6 +1291,8 @@ pub(super) fn paired(
                     value: removed.clone(),
                     removal: Some(removed),
                     denied: true,
+                    authored: false,
+                    revoked_binding: true,
                     setup_id: e.setup_id,
                 },
             )?;
@@ -1200,9 +1302,12 @@ pub(super) fn paired(
         .into_iter()
         .find(|e| e.value.device_id == remote.device_id && e.value.fingerprint == *pin)
     {
+        remote_value.readmits = fresh_pair_claim(&old);
         old.readmission = None;
         old.ready_generation = None;
         old.denied = false;
+        old.authored = false;
+        old.revoked_binding = false;
         old.value = remote_value.clone();
         old.value.hlc = allocate_stamp(tx)?.1;
         old.setup_id = None;
@@ -1237,6 +1342,167 @@ pub(super) fn paired(
     clear_resolved_conflicts(tx)?;
     validate_capacity(tx)
 }
+// Callers validate capacity after all lifecycle changes in the transaction.
+fn reconcile_candidates(
+    tx: &Transaction<'_>,
+    local: &Id,
+    blocked: &[(Option<Id>, Hash)],
+    delta: &mut SetupDelta,
+) -> Result<()> {
+    let s = state(tx)?;
+    let Some(setup_id) = s.setup_id else {
+        return Ok(());
+    };
+    for mut entry in entries(tx)? {
+        let Some(record) = entry.readmission.clone() else {
+            continue;
+        };
+        if !entry.denied
+            || entry.authored
+            || record.key.setup_generation != s.generation
+            || !entry
+                .removal
+                .as_ref()
+                .is_some_and(|r| claims(&record.value, r))
+        {
+            continue;
+        }
+        let value = &record.value;
+        if blocked
+            .iter()
+            .any(|(id, pin)| id.as_ref() == Some(&value.device_id) || *pin == value.fingerprint)
+        {
+            continue;
+        }
+        let conflict: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM peers WHERE id=? OR fp=?)",
+            params![value.device_id.as_str(), value.fingerprint.as_str()],
+            |r| r.get(0),
+        )?;
+        let active_conflict = entries(tx)?.iter().any(|e| {
+            e.value.status == MemberStatus::Member
+                && ((e.value.device_id == value.device_id
+                    && e.value.fingerprint != value.fingerprint)
+                    || (e.value.device_id != value.device_id
+                        && e.value.fingerprint == value.fingerprint))
+        });
+        if conflict || active_conflict {
+            record_conflict(tx, value)?;
+            continue;
+        }
+        if entry.joined_notice.is_none() {
+            entry.joined_notice = Some(joined_is_new(tx, local, value)?);
+        }
+        entry.value = record.value;
+        entry.setup_id = Some(setup_id.clone());
+        entry.denied = false;
+        entry.authored = false;
+        entry.revoked_binding = false;
+        entry.readmission = None;
+        save_entry(tx, &entry)?;
+        tx.execute(
+            "INSERT INTO setup_candidates VALUES(?,?,?,?) ON CONFLICT(device,fingerprint) DO UPDATE SET introduced_by=excluded.introduced_by,introducer_name=excluded.introducer_name",
+            params![
+                entry.value.device_id.as_str(),
+                entry.value.fingerprint.as_str(),
+                record.introducer.as_str(),
+                record.introducer_name
+            ],
+        )?;
+    }
+    let candidates: Vec<(Id, Hash, String, String)> = {
+        let mut q = tx.prepare(
+            "SELECT device,fingerprint,introduced_by,introducer_name FROM setup_candidates",
+        )?;
+        q.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?
+        .map(|r| {
+            let (d, p, b, n) = r?;
+            Ok((Id::new(d)?, Hash::new(p)?, b, n))
+        })
+        .collect::<Result<_>>()?
+    };
+    for (id, pin, by, name) in candidates {
+        if entries(tx)?
+            .iter()
+            .any(|e| e.denied && e.value.device_id == id)
+            && !entries(tx)?.iter().any(|e| {
+                !e.denied
+                    && e.value.device_id == id
+                    && e.value.fingerprint == pin
+                    && e.removal.is_some()
+            })
+        {
+            continue;
+        }
+        if blocked
+            .iter()
+            .any(|(d, p)| d.as_ref() == Some(&id) || *p == pin)
+        {
+            continue;
+        }
+        let Some(entry) = entries(tx)?.into_iter().find(|e| {
+            e.value.device_id == id
+                && e.value.fingerprint == pin
+                && !e.denied
+                && e.setup_id.as_ref() == Some(&setup_id)
+                && e.value.status == MemberStatus::Member
+        }) else {
+            tx.execute(
+                "DELETE FROM setup_candidates WHERE device=? AND fingerprint=?",
+                params![id.as_str(), pin.as_str()],
+            )?;
+            continue;
+        };
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM peers WHERE id=? OR fp=?)",
+            params![id.as_str(), pin.as_str()],
+            |r| r.get(0),
+        )?;
+        if exists {
+            continue;
+        }
+        let generation: i64 = tx.query_row(
+            "SELECT coalesce((SELECT generation FROM peer_generations WHERE device=?),0)+1",
+            [id.as_str()],
+            |r| r.get(0),
+        )?;
+        tx.execute("INSERT INTO peers(id,fp,generation,role,name,addresses,established) VALUES(?,?,?,?,?,'[]',0)",params![id.as_str(),pin.as_str(),generation,scope_role(entry.value.role),entry.value.name])?;
+        tx.execute("INSERT INTO peer_generations VALUES(?,?) ON CONFLICT(device) DO UPDATE SET generation=excluded.generation",params![id.as_str(),generation])?;
+        set_scope(tx, &id, SetupScope::Enabled)?;
+        tx.execute(
+            "UPDATE setup_links SET negotiated=1,participating=1 WHERE device=?",
+            [id.as_str()],
+        )?;
+        tx.execute(
+            "UPDATE setup_links SET introduced_by=?,introducer_name=? WHERE device=?",
+            params![by, name, id.as_str()],
+        )?;
+        let joined_notice = match entry.joined_notice {
+            Some(joined) => joined,
+            None => joined_is_new(tx, local, &entry.value)?,
+        };
+        if joined_notice {
+            tx.execute("INSERT OR IGNORE INTO setup_notices VALUES(?,?,?)",params![id.as_str(),generation,serde_json::to_string(&serde_json::json!({"device":id,"name":entry.value.name,"introduced_by":by,"introducer_name":name}))?])?;
+        }
+        settings::initialize(tx, local, &id, entry.value.role == DeviceRole::Phone)?;
+        if let Some(reach) = &entry.value.reach {
+            merge_routes(tx, &id, &pin, &reach.addresses)?;
+        }
+        tx.execute(
+            "DELETE FROM setup_candidates WHERE device=? AND fingerprint=?",
+            params![id.as_str(), pin.as_str()],
+        )?;
+        delta.added.push(id);
+    }
+    Ok(())
+}
 impl Store {
     pub(crate) async fn setup_reconcile_candidates(
         &self,
@@ -1244,33 +1510,14 @@ impl Store {
         blocked: Vec<(Option<Id>, Hash)>,
         finish: impl FnOnce(SetupDelta) + Send + 'static,
     ) -> Result<()> {
-        self.setup_write(move |tx,delta| {
-            let s=state(tx)?;let Some(setup_id)=s.setup_id else{return Ok(());};
-            let candidates:Vec<(Id,Hash,String,String)>={let mut q=tx.prepare("SELECT device,fingerprint,introduced_by,introducer_name FROM setup_candidates")?;q.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.map(|r|{let (d,p,b,n)=r?;Ok((Id::new(d)?,Hash::new(p)?,b,n))}).collect::<Result<_>>()?};
-            for (id,pin,by,name) in candidates {
-                if entries(tx)?.iter().any(|e|e.denied && e.value.device_id==id) {continue;}
-                if blocked.iter().any(|(d,p)|d.as_ref()==Some(&id)||*p==pin) {continue;}
-                let Some(entry)=entries(tx)?.into_iter().find(|e|e.value.device_id==id&&e.value.fingerprint==pin&&!e.denied&&e.setup_id.as_ref()==Some(&setup_id)&&e.value.status==MemberStatus::Member) else {tx.execute("DELETE FROM setup_candidates WHERE device=? AND fingerprint=?",params![id.as_str(),pin.as_str()])?;continue;};
-                let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM peers WHERE id=? OR fp=?)",params![id.as_str(),pin.as_str()],|r|r.get(0))?;if exists {continue;}
-                let generation:i64=tx.query_row("SELECT coalesce((SELECT generation FROM peer_generations WHERE device=?),0)+1",[id.as_str()],|r|r.get(0))?;
-                tx.execute("INSERT INTO peers(id,fp,generation,role,name,addresses,established) VALUES(?,?,?,?,?,'[]',0)",params![id.as_str(),pin.as_str(),generation,scope_role(entry.value.role),entry.value.name])?;
-                tx.execute("INSERT INTO peer_generations VALUES(?,?) ON CONFLICT(device) DO UPDATE SET generation=excluded.generation",params![id.as_str(),generation])?;
-                set_scope(tx,&id,SetupScope::Enabled)?;
-                tx.execute("UPDATE setup_links SET negotiated=1,participating=1 WHERE device=?",[id.as_str()])?;
-                tx.execute("UPDATE setup_links SET introduced_by=?,introducer_name=? WHERE device=?",params![by,name,id.as_str()])?;
-                let joined_notice=match entry.joined_notice {
-                    Some(joined)=>joined,
-                    None=>joined_is_new(tx,&local,&entry.value)?,
-                };
-                if joined_notice {
-                    tx.execute("INSERT OR IGNORE INTO setup_notices VALUES(?,?,?)",params![id.as_str(),generation,serde_json::to_string(&serde_json::json!({"device":id,"name":entry.value.name,"introduced_by":by,"introducer_name":name}))?])?;
-                }
-                settings::initialize(tx,&local,&id,entry.value.role==DeviceRole::Phone)?;
-                if let Some(reach)=&entry.value.reach {merge_routes(tx,&id,&pin,&reach.addresses)?;}
-                tx.execute("DELETE FROM setup_candidates WHERE device=? AND fingerprint=?",params![id.as_str(),pin.as_str()])?;delta.added.push(id);
-            }
-            validate_capacity(tx)
-        },finish).await
+        self.setup_write(
+            move |tx, delta| {
+                reconcile_candidates(tx, &local, &blocked, delta)?;
+                validate_capacity(tx)
+            },
+            finish,
+        )
+        .await
     }
     pub(crate) async fn setup_refresh_self(&self, local: Member) -> Result<()> {
         // Periodic reach discovery can capture a name before a concurrent rename.
@@ -1359,11 +1606,17 @@ fn fresh_setup_id(tx: &Transaction<'_>) -> Result<Id> {
 
 fn clear_own_deny(tx: &Transaction<'_>, local: &Member) -> Result<()> {
     if let Some(mut own) = entries(tx)?.into_iter().find(|e| {
-        e.value.device_id == local.device_id && e.value.fingerprint == local.fingerprint && e.denied
+        e.value.device_id == local.device_id
+            && e.value.fingerprint == local.fingerprint
+            && (e.denied || e.value.status != MemberStatus::Member)
     }) {
         own.readmission = None;
         own.denied = false;
+        own.authored = false;
+        own.revoked_binding = false;
+        let claim = fresh_pair_claim(&own);
         own.value = local.clone();
+        own.value.readmits = claim;
         own.value.hlc = allocate_stamp(tx)?.1;
         own.setup_id = None;
         save_entry(tx, &own)?;
@@ -1397,13 +1650,22 @@ impl Store {
                     .find(|e| e.value.device_id == peer && e.value.fingerprint.as_str() == pin)
                 {
                     entry.readmission = None;
+                    if entry.removal.is_some() {
+                        entry.value.readmits = fresh_pair_claim(&entry);
+                        entry.value.status = MemberStatus::Member;
+                        entry.value.hlc = allocate_stamp(tx)?.1;
+                        entry.value.writer_device = local.device_id.clone();
+                        entry.denied = false;
+                        entry.authored = false;
+                        entry.revoked_binding = false;
+                    }
                     save_entry(tx, &entry)?;
                 }
                 if state(tx)?.withdrawn {
                     clear_own_deny(tx, &local)?;
                     tx.execute("UPDATE setup_state SET withdrawn=0 WHERE singleton=1", [])?;
                 }
-                Ok(())
+                validate_capacity(tx)
             },
             finish,
         )
@@ -1547,7 +1809,7 @@ impl Store {
             let all = entries(tx)?;
             let Some(mut entry) = all.iter().find(|e| e.denied && e.value.device_id == key.device && e.value.fingerprint == key.fingerprint).cloned() else { return Ok(()); };
             let Some(record) = entry.readmission.as_ref().filter(|r| r.key == key && r.decision == "pending") else { return Ok(()); };
-            if !entry.removal.as_ref().is_some_and(|r| r.hlc == key.removal_hlc && r.writer_device == key.removal_writer) { return Ok(()); }
+            if !entry.authored || !entry.removal.as_ref().is_some_and(|r| r.hlc == key.removal_hlc && r.writer_device == key.removal_writer && claims(&record.value,r)) { return Ok(()); }
             if !allow {
                 entry.readmission.as_mut().unwrap().decision = "kept".into();
                 return save_entry(tx, &entry);
@@ -1560,6 +1822,8 @@ impl Store {
             entry.value = record.value.clone();
             entry.setup_id = s.setup_id;
             entry.denied = false;
+            entry.authored = false;
+            entry.revoked_binding = false;
             entry.ready_generation = None;
             entry.joined_notice = Some(false);
             entry.readmission.as_mut().unwrap().decision = "allowed".into();

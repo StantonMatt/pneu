@@ -1194,6 +1194,9 @@ impl Core {
             file_write_delay: Mutex::new(Duration::ZERO),
         });
         encode_frame(&Message::Hello(core.computer_hello()))?;
+        if let Err(error) = core.reconcile_setup_candidates().await {
+            core.error(None, format!("membership reconciliation deferred: {error}"));
+        }
         let weak = Arc::downgrade(&core);
         let stop = core.action_stop.subscribe();
         *core.action_worker.lock().expect("actions") = Some(tokio::spawn(Box::pin(action_loop(

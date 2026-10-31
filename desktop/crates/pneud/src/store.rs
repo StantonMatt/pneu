@@ -374,12 +374,15 @@ fn observe_hlc(tx: &Transaction<'_>, hlc: u64) -> Result<()> {
     Ok(())
 }
 fn allocate_stamp(tx: &Transaction<'_>) -> Result<(u64, u64)> {
+    allocate_stamp_at(tx, crate::now_ms())
+}
+fn allocate_stamp_at(tx: &Transaction<'_>, now: u64) -> Result<(u64, u64)> {
     let previous: String = tx.query_row(
         "SELECT last_seen FROM mesh_clock WHERE singleton=1",
         [],
         |r| r.get(0),
     )?;
-    let hlc = crate::now_ms().max(
+    let hlc = now.max(
         previous
             .parse::<u64>()?
             .checked_add(1)
@@ -390,7 +393,7 @@ fn allocate_stamp(tx: &Transaction<'_>) -> Result<(u64, u64)> {
         [],
         |r| r.get(0),
     )?;
-    let created_at = crate::now_ms().max(
+    let created_at = now.max(
         (legacy as u64)
             .checked_add(1)
             .context("clipboard timestamp exhausted")?,

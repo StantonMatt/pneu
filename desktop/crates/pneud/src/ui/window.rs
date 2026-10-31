@@ -3878,16 +3878,9 @@ impl Worker {
                         && self.setup.link(&peer.id).is_some_and(|l| !l.ready)
                         && matches!(peer.health, Health::Offline | Health::Connecting)
                     {
-                        summary.title = "Not connected yet".into();
-                        summary.detail.clear();
-                    }
-                    if introduced && peer.health == Health::Lost {
                         summary.title = format!("Waiting for {}", peer.name);
                         summary.detail =
-                            format!("Allow it on {}, or pair with it directly", peer.name);
-                        let mut waiting = peer.clone();
-                        waiting.health = Health::Offline;
-                        summary.link = device_summary(&waiting).0.link;
+                            format!("Open Pneu on {}, or pair with it directly", peer.name);
                     }
                     let (settings, mut note) = self
                         .peer_settings
@@ -3976,14 +3969,6 @@ impl Worker {
                             .setup
                             .link(&p.id)
                             .is_some_and(|l| l.introduced_by.is_some() && !l.ready)
-                    {
-                        item.status = "Not connected yet".into();
-                    }
-                    if p.health == Health::Lost
-                        && self
-                            .setup
-                            .link(&p.id)
-                            .is_some_and(|l| l.introduced_by.is_some())
                     {
                         item.status = format!("Waiting for {}", p.name).into();
                         item.tone = Tone::Neutral;
@@ -7488,6 +7473,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn setup_shared_readmission_silent_keeper_vector() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::setup_shared_readmission_silent_keeper_vector",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, _actions) = model_worker(&window, dir.path());
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../../../../protocol-vectors/readmission.json"
+        ))?;
+        let scenario = vectors["scenarios"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "silent-keeper-neutral-status")
+            .unwrap();
+        state(
+            &mut worker,
+            vec![device(1, "Phone", true, "disconnected", 0)],
+            vec![],
+        );
+        linking(
+            &mut worker,
+            vec![with(
+                with(link_of(1, "enabled"), "introduced_by", json!(id(4))),
+                "hello_seen",
+                json!(false),
+            )],
+            &[(1, "Phone")],
+        );
+        worker.setup.links[0].ready = false;
+        for step in scenario["steps"].as_array().unwrap() {
+            if let Some(action) = step["local_action"].as_str() {
+                match action {
+                    "arrange-introduced-phone-keeps-B-removed-and-stays-silent"
+                    | "observe-without-authenticated-refusal" => {}
+                    "receive-authenticated-unauthorized-from-A" => {
+                        worker.snapshot.devices[0].state = "unauthorized".into()
+                    }
+                    "authenticate-A-ready" => {
+                        worker.snapshot.devices[0].state = "connected".into();
+                        worker.setup.links[0].ready = true;
+                        worker.setup.links[0].hello_seen = true;
+                    }
+                    _ => panic!("unhandled action {action}"),
+                }
+            } else {
+                assert_eq!(step["receive"], "later-introduction-claimed");
+            }
+            let peers = peers(&worker.snapshot, &[]);
+            let frame = worker.frame(
+                &Config::default(),
+                &peers,
+                Some(&peers[0]),
+                None,
+                false,
+                crate::now_ms(),
+            );
+            for (key, expected) in step["expect"].as_object().into_iter().flatten() {
+                match key.as_str() {
+                    "remote_refusal_claimed" => {
+                        assert_eq!(peers[0].lost(), expected.as_bool().unwrap())
+                    }
+                    "remote_keep_removed_claimed" => {
+                        assert_eq!(expected, false);
+                        assert!(!frame.device_summary.detail.contains("Keep removed"));
+                    }
+                    "status" => {
+                        assert_eq!(expected, "neutral");
+                        assert_eq!(frame.devices[0].status_tone, Tone::Neutral);
+                    }
+                    "status_example" => {
+                        assert_eq!(frame.device_summary.title, "Waiting for Phone");
+                        assert_eq!(
+                            frame.device_summary.detail,
+                            "Open Pneu on Phone, or pair with it directly"
+                        );
+                    }
+                    "also_linked" => {
+                        assert_eq!(worker.setup.links[0].ready, expected.as_bool().unwrap())
+                    }
+                    "diagnostic" => {
+                        assert_eq!(
+                            frame.device_summary.detail,
+                            "Phone doesn't recognize this computer"
+                        );
+                        assert!(
+                            expected
+                                .as_str()
+                                .unwrap()
+                                .ends_with("Pair with it directly")
+                        );
+                    }
+                    "trust_A_retained" => assert_eq!(
+                        !worker.snapshot.devices.is_empty(),
+                        expected.as_bool().unwrap()
+                    ),
+                    "refusal_status_cleared" => {
+                        assert_eq!(expected, true);
+                        assert!(peers[0].connected());
+                        assert!(!frame.device_summary.detail.contains("doesn't recognize"));
+                    }
+                    _ => panic!("unhandled assertion {key}"),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn removed_self_with_offline_phone_and_ambiguous_refusal_have_distinct_presentations()
     -> Result<()> {
         if in_offscreen_child("ui::window::tests::removed_self_with_offline_phone_and_ambiguous_refusal_have_distinct_presentations", &[]).await? { return Ok(()); }
@@ -7535,12 +7636,12 @@ mod tests {
             .iter()
             .find(|d| d.id == id(2).as_str())
             .unwrap();
-        assert_eq!(row.status, "Waiting for MacBook Air");
-        assert_eq!(row.status_tone, Tone::Neutral);
-        assert_eq!(waiting.device_summary.title, "Waiting for MacBook Air");
+        assert_eq!(row.status, "Pairing lost");
+        assert_eq!(row.status_tone, Tone::Danger);
+        assert_eq!(waiting.device_summary.title, "Pairing lost");
         assert_eq!(
             waiting.device_summary.detail,
-            "Allow it on MacBook Air, or pair with it directly"
+            "MacBook Air doesn't recognize this computer"
         );
         assert_eq!(waiting.summary.title, "Waiting for your devices");
         worker.snapshot.devices.retain(|d| d.role != "phone");

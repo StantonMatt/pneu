@@ -160,6 +160,7 @@ async fn setup_remote_scope_status_drives_existing_window_states() -> Result<()>
             hlc: 0,
             writer_device: device.clone(),
             reach: None,
+            readmits: None,
         };
         a.core
             .store
@@ -907,6 +908,7 @@ async fn setup_tombstone_cancels_matching_preview_but_preserves_other_pin_attemp
         hlc: crate::now_ms(),
         writer_device: a.core.identity.device_id.clone(),
         reach: None,
+        readmits: None,
     };
     roster.push(removed.clone());
     let message = Members {
@@ -1453,6 +1455,7 @@ async fn setup_readmission_actions_recheck_lifecycle_gate_and_publish_only_commi
         hlc: 1,
         writer_device: sender.clone(),
         reach: None,
+        readmits: None,
     };
     let mut fence = SetupFence {
         device: sender.clone(),
@@ -1485,6 +1488,7 @@ async fn setup_readmission_actions_recheck_lifecycle_gate_and_publish_only_commi
         hlc: 10,
         writer_device: sender,
         reach: None,
+        readmits: None,
     };
     let snapshot = |m: Member| {
         let mut roster = a.core.store.setup_state().roster;
@@ -1506,6 +1510,12 @@ async fn setup_readmission_actions_recheck_lifecycle_gate_and_publish_only_commi
             |_| {},
         )
         .await?;
+    // Exercise the legacy-authored migration through the real Core action path.
+    a.core.store.call(|c| {c.execute("UPDATE setup_entries SET payload=json_remove(payload,'$.authored','$.revoked_binding') WHERE json_extract(payload,'$.denied')=1",[])?;Ok(())}).await?;
+    subject.readmits = Some(pneu_proto::MemberReadmits {
+        hlc: 10,
+        writer_device: subject.writer_device.clone(),
+    });
     subject.status = MemberStatus::Member;
     subject.hlc = 20;
     a.core
@@ -1528,6 +1538,7 @@ async fn setup_readmission_actions_recheck_lifecycle_gate_and_publish_only_commi
         core.decide_readmission(key, true).await
     });
     started.await?;
+    subject.readmits = None;
     subject.status = MemberStatus::Removed;
     subject.hlc = 30;
     a.core
@@ -1543,6 +1554,10 @@ async fn setup_readmission_actions_recheck_lifecycle_gate_and_publish_only_commi
     drop(gate);
     action.await??;
     assert!(!a.core.paired_devices().contains(&subject.device_id));
+    subject.readmits = Some(pneu_proto::MemberReadmits {
+        hlc: 30,
+        writer_device: subject.writer_device.clone(),
+    });
     subject.status = MemberStatus::Member;
     subject.hlc = 40;
     a.core
@@ -1618,4 +1633,332 @@ async fn setup_live_rename_reaches_direct_peer_without_reconnect() -> Result<()>
     );
     a.stop().await?;
     b.stop().await
+}
+
+#[tokio::test]
+async fn setup_readmits_review_core_resumes_after_cancel_and_restart() -> Result<()> {
+    use crate::store::members::SetupFence;
+    let mut outcomes = Vec::new();
+    for restart in [false, true] {
+        // No server or supervisor: exercise Core's reconciliation predicate
+        // deterministically, including startup before any supervisor tick.
+        let dir = crate::test_support::scratch()?;
+        let paths = Paths {
+            data: dir.path().join("data"),
+            cache: dir.path().join("cache"),
+            config: dir.path().join("config/config.toml"),
+            socket: dir.path().join("pneud.sock"),
+        };
+        let config = Config {
+            save_path: dir.path().join("saved"),
+            clipboard_mode: crate::config::ClipboardMode::Off,
+            clipboard_sync_to_phone: false,
+            ..Config::default()
+        };
+        let mut core = Core::new(paths.clone(), config.clone(), Arc::new(NoActions)).await?;
+        let sender = Id::from_bytes([1; 16]);
+        let subject = Id::from_bytes([3; 16]);
+        let mut remote = core.self_member();
+        remote.device_id = sender.clone();
+        remote.fingerprint = Hash::new("a".repeat(64))?;
+        remote.name = "Introducer".into();
+        remote.hlc = 1;
+        remote.writer_device = sender.clone();
+        remote.reach = None;
+        core.store
+            .pair(sender.clone(), remote.fingerprint.clone())
+            .await?;
+        core.store
+            .call(|c| {
+                c.execute("UPDATE peers SET role='computer',name='Introducer'", [])?;
+                Ok(())
+            })
+            .await?;
+        core.store
+            .setup_link(sender.clone(), SetupScope::Enabled)
+            .await?;
+        let local = core.self_member();
+        let mut fence = SetupFence {
+            device: sender.clone(),
+            fingerprint: remote.fingerprint.clone(),
+            binding_generation: 1,
+            generation: 0,
+            connection: 1,
+            current: Arc::new(AtomicU64::new(1)),
+        };
+        core.store
+            .setup_activate(
+                fence.clone(),
+                local.clone(),
+                remote.clone(),
+                SetupHello {
+                    scope: SetupScope::Enabled,
+                    setup_id: Some(Id::from_bytes([0; 16])),
+                },
+                |_| {},
+            )
+            .await?;
+        fence.generation = core.store.setup_state().generation;
+        let snapshot = |value: Member| Members {
+            transfer_id: Id::from_bytes(rand::random()),
+            setup_id: Id::from_bytes([0; 16]),
+            members: vec![local.clone(), remote.clone(), value],
+        };
+        let mut candidate = remote.clone();
+        candidate.device_id = subject.clone();
+        candidate.fingerprint = Hash::new("c".repeat(64))?;
+        candidate.name = "Laptop".into();
+        candidate.status = MemberStatus::Removed;
+        candidate.hlc = 10;
+        core.store
+            .members_merge(
+                fence.clone(),
+                local.clone(),
+                snapshot(candidate.clone()),
+                vec![],
+                |_| {},
+            )
+            .await?;
+        let uri = PairingUri {
+            version: 1,
+            name: candidate.name.clone(),
+            fingerprint: candidate.fingerprint.clone(),
+            addresses: vec!["127.0.0.1:9".into()],
+            token: Hash::new("d".repeat(64))?,
+            expires_at: crate::now_ms() + 300_000,
+        };
+        let preview = core.join(&uri.build()?).await?;
+        let attempt = preview["attempt"].as_str().unwrap();
+        candidate.status = MemberStatus::Member;
+        candidate.hlc = 20;
+        candidate.readmits = Some(pneu_proto::MemberReadmits {
+            hlc: 10,
+            writer_device: sender,
+        });
+        let message = snapshot(candidate);
+        core.store
+            .members_merge(
+                fence.clone(),
+                local.clone(),
+                message.clone(),
+                core.setup_attempts(),
+                |_| {},
+            )
+            .await?;
+        core.reconcile_setup_candidates().await?;
+        assert!(core.store.pairing_generation(&subject).is_none());
+        let rows: i64 = core
+            .store
+            .call(|c| Ok(c.query_row("SELECT count(*) FROM setup_candidates", [], |r| r.get(0))?))
+            .await?;
+        assert_eq!(rows, 0, "the deferred claim lives only in entry JSON");
+        assert!(
+            core.store
+                .members_merge(fence, local.clone(), message, core.setup_attempts(), |_| {})
+                .await?,
+            "an identical replay is deduplicated"
+        );
+        if restart {
+            core.shutdown_actions().await?;
+            core.store.drain().await;
+            drop(core);
+            core = Core::new(paths, config, Arc::new(NoActions)).await?;
+        } else {
+            core.cancel_join(attempt).await?;
+            core.reconcile_setup_candidates().await?;
+        }
+        outcomes.push((
+            restart,
+            core.store.pairing_generation(&subject).is_some(),
+            core.paired_devices().contains(&subject),
+        ));
+        assert!(core.setup_request_notice().await.is_none());
+        if let Some(link) = core
+            .store
+            .setup_state()
+            .links
+            .into_iter()
+            .find(|l| l.device == subject)
+        {
+            assert_eq!(link.introducer_name.as_deref(), Some("Introducer"));
+        }
+        core.shutdown_actions().await?;
+    }
+    assert_eq!(outcomes, vec![(false, true, true), (true, true, true)]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_readmits_notification_selection_only_asks_authored_barriers() -> Result<()> {
+    use crate::store::members::SetupFence;
+    let a = Running::new().await?;
+    let sender = Id::from_bytes([1; 16]);
+    let subject = Id::from_bytes([3; 16]);
+    let pin = Hash::new("a".repeat(64))?;
+    a.core.store.pair(sender.clone(), pin.clone()).await?;
+    a.core
+        .store
+        .call(|c| {
+            c.execute("UPDATE peers SET role='computer',name='Introducer'", [])?;
+            Ok(())
+        })
+        .await?;
+    a.core
+        .store
+        .setup_link(sender.clone(), SetupScope::Enabled)
+        .await?;
+    let local = a.core.self_member();
+    let remote = Member {
+        device_id: sender.clone(),
+        fingerprint: pin.clone(),
+        role: DeviceRole::Computer,
+        name: "Introducer".into(),
+        status: MemberStatus::Member,
+        hlc: 1,
+        writer_device: sender.clone(),
+        reach: None,
+        readmits: None,
+    };
+    let mut fence = SetupFence {
+        device: sender.clone(),
+        fingerprint: pin,
+        binding_generation: 1,
+        generation: 0,
+        connection: 1,
+        current: Arc::new(AtomicU64::new(1)),
+    };
+    a.core
+        .store
+        .setup_activate(
+            fence.clone(),
+            local.clone(),
+            remote,
+            SetupHello {
+                scope: SetupScope::Enabled,
+                setup_id: Some(Id::from_bytes([0; 16])),
+            },
+            |_| {},
+        )
+        .await?;
+    fence.generation = a.core.store.setup_state().generation;
+    let snapshot = |m: Member| {
+        let mut roster = a.core.store.setup_state().roster;
+        roster.retain(|r| r.device_id != m.device_id);
+        roster.push(m);
+        Members {
+            transfer_id: Id::from_bytes(rand::random()),
+            setup_id: Id::from_bytes([0; 16]),
+            members: roster,
+        }
+    };
+    let removed = Member {
+        device_id: subject.clone(),
+        fingerprint: Hash::new("c".repeat(64))?,
+        role: DeviceRole::Computer,
+        name: "Laptop".into(),
+        status: MemberStatus::Removed,
+        hlc: 10,
+        writer_device: sender.clone(),
+        reach: None,
+        readmits: None,
+    };
+    a.core
+        .store
+        .members_merge(
+            fence.clone(),
+            local.clone(),
+            snapshot(removed),
+            vec![],
+            |_| {},
+        )
+        .await?;
+    let mut claimed = Member {
+        device_id: subject.clone(),
+        fingerprint: Hash::new("c".repeat(64))?,
+        role: DeviceRole::Computer,
+        name: "Laptop".into(),
+        status: MemberStatus::Member,
+        hlc: 20,
+        writer_device: sender.clone(),
+        reach: None,
+        readmits: Some(pneu_proto::MemberReadmits {
+            hlc: 10,
+            writer_device: sender,
+        }),
+    };
+    a.core
+        .store
+        .members_merge(
+            fence.clone(),
+            local.clone(),
+            snapshot(claimed.clone()),
+            vec![(Some(subject.clone()), claimed.fingerprint.clone())],
+            |_| {},
+        )
+        .await?;
+    assert!(
+        a.core.setup_request_notice().await.is_none(),
+        "blocked inherited follow never asks"
+    );
+    a.core
+        .store
+        .setup_reconcile_candidates(local.device_id.clone(), vec![], |_| {})
+        .await?;
+    assert!(
+        a.core.setup_request_notice().await.is_none(),
+        "inherited follow never asks"
+    );
+    a.core
+        .store
+        .setup_remove(local.device_id.clone(), subject.clone(), |_| {})
+        .await?;
+    let removal = a
+        .core
+        .store
+        .setup_state()
+        .roster
+        .into_iter()
+        .find(|m| m.device_id == subject)
+        .unwrap();
+    claimed.hlc = removal.hlc + 1;
+    claimed.readmits = Some(pneu_proto::MemberReadmits {
+        hlc: removal.hlc,
+        writer_device: removal.writer_device,
+    });
+    a.core
+        .store
+        .members_merge(
+            fence.clone(),
+            local.clone(),
+            snapshot(claimed.clone()),
+            vec![],
+            |_| {},
+        )
+        .await?;
+    let first = a
+        .core
+        .setup_request_notice()
+        .await
+        .expect("authored question");
+    let request = first.setup_requests[0].readmission.clone().unwrap();
+    claimed.hlc += 1;
+    a.core
+        .store
+        .members_merge(fence, local.clone(), snapshot(claimed), vec![], |_| {})
+        .await?;
+    let second = a
+        .core
+        .setup_request_notice()
+        .await
+        .expect("same authored question");
+    assert_eq!(second.setup_requests[0].readmission, Some(request.clone()));
+    a.core
+        .store
+        .setup_readmit(request, local.device_id, false, vec![], |_| {})
+        .await?;
+    assert!(
+        a.core.setup_request_notice().await.is_none(),
+        "Keep removed closes the question"
+    );
+    a.stop().await
 }

@@ -78,6 +78,7 @@ impl Core {
                 hlc: 0,
                 writer_device: self.identity.device_id.clone(),
             }),
+            readmits: None,
         }
     }
     pub(super) fn setup_fence(&self, store: &Store, hello: &Hello) -> Result<SetupFence> {
@@ -230,17 +231,24 @@ impl Core {
         }
     }
     pub(super) async fn reconcile_setup_candidates(&self) -> Result<()> {
-        let count = self
+        let pending = self
             .store
             .call(|c| {
-                Ok(
-                    c.query_row("SELECT count(*) FROM setup_candidates", [], |r| {
-                        r.get::<_, i64>(0)
-                    })?,
-                )
+                Ok(c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM setup_candidates) OR EXISTS(
+                        SELECT 1 FROM setup_entries,setup_state
+                        WHERE singleton=1 AND setup_id IS NOT NULL AND withdrawn=0
+                        AND json_extract(payload,'$.denied')=1
+                        AND json_extract(payload,'$.authored')=0
+                        AND json_type(payload,'$.readmission')='object'
+                        AND json_extract(payload,'$.readmission.key.setup_generation')=generation
+                    )",
+                    [],
+                    |r| r.get::<_, bool>(0),
+                )?)
             })
             .await?;
-        if count == 0 {
+        if !pending {
             return Ok(());
         }
         let guard = self.pairing_gate.clone().lock_owned().await;
@@ -303,6 +311,7 @@ impl Core {
             hlc: 0,
             writer_device: self.identity.device_id.clone(),
             reach: None,
+            readmits: None,
         };
         let matched = self
             .store

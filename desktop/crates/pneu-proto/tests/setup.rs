@@ -191,4 +191,51 @@ fn shared_readmission_fixtures_use_existing_members_wire_format() {
             "{name}"
         );
     }
+    for invalid in vectors["invalid_readmits_entries"].as_array().unwrap() {
+        let raw = format!(
+            "{{\"transfer_id\":\"{}\",\"setup_id\":\"{}\",\"members\":[{}]}}",
+            "0".repeat(32),
+            "0".repeat(32),
+            invalid["raw_entry"].as_str().unwrap()
+        );
+        // Future-bound checks belong to the durable merge clock authority.
+        assert_eq!(
+            decode_frame(&frame(0x22, &raw)).is_ok(),
+            invalid["name"] == "claim-future-hlc",
+            "{}",
+            invalid["name"]
+        );
+    }
+}
+
+#[test]
+fn readmits_canonical_object_and_strict_fields() {
+    let writer = "2".repeat(32);
+    for value in [0, u64::MAX] {
+        let claim = MemberReadmits {
+            hlc: value,
+            writer_device: Id::new(&writer).unwrap(),
+        };
+        assert_eq!(
+            serde_json::to_string(&claim).unwrap(),
+            format!("{{\"hlc\":{value},\"writer_device\":\"{writer}\"}}")
+        );
+        let reordered =
+            format!("{{ \"writer_device\":\"{writer}\", \"unknown\":true,\"hlc\":{value} }}");
+        assert_eq!(
+            serde_json::from_str::<MemberReadmits>(&reordered).unwrap(),
+            claim
+        );
+    }
+    for raw in [
+        format!("{{\"hlc\":-0,\"writer_device\":\"{writer}\"}}"),
+        format!("{{\"hlc\":01,\"writer_device\":\"{writer}\"}}"),
+        format!("{{\"hlc\":1,\"writer_device\":\"{writer}\",\"writer_device\":\"{writer}\"}}"),
+        "[]".into(),
+    ] {
+        assert!(
+            serde_json::from_str::<MemberReadmits>(&raw).is_err(),
+            "{raw}"
+        );
+    }
 }
