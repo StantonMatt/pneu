@@ -123,3 +123,11 @@ internal data class HomeSetup(val banner:LinkBanner?=null,val phones:List<PhoneM
         }
     }
 }
+
+/** Same exact barrier action in-app and in the Link requests notification. */
+@Composable internal fun ReadmissionDialog(text:String,dismiss:()->Unit,keep:()->Unit,allow:()->Unit) {
+    val resources=LocalResources.current
+    PneuDialog(onDismissRequest=dismiss,pairingHeader=true,title={Text(text)},
+        confirmButton={PneuTextButton(onClick=allow) {Text(resources.getString(R.string.action_allow))}},
+        dismissButton={PneuTextButton(onClick=keep) {Text(resources.getString(R.string.setup_keep_removed))}})
+}

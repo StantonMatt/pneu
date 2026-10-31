@@ -3,6 +3,7 @@ package io.github.stantonmatt.pneu
 import android.Manifest
 import android.app.NotificationManager
 import android.graphics.Bitmap
+import androidx.datastore.preferences.core.edit
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
@@ -53,6 +54,53 @@ class SetupScreensDeviceTest {
     private fun member(p:Peer,role:String="computer")=SetupMember(p.deviceId,p.pin,role,p.name,"member","1","a".repeat(32))
     private val pixel=SetupMember("9".repeat(32),"9".repeat(64),"phone","Pixel 9","member","1","a".repeat(32))
 
+    @Test(timeout=60000) fun readmissionPromptHasBothActionsInLightAndDark()=runBlocking<Unit> {
+        var kept=0;var allowed=0
+        val p=prefs(pc)
+        show {
+            Home(p,mapOf(pc.deviceId to wifi))
+            ReadmissionDialog("MacBook Air was removed from this phone. MJStanton-Desktop added it again",{},{kept++}) {allowed++}
+        }
+        compose.onNodeWithText("Keep removed").assertIsDisplayed()
+        compose.onNodeWithText("Allow").assertIsDisplayed()
+        bothThemes("readmission-prompt")
+        compose.onNodeWithText("Keep removed").performClick();assertEquals(1,kept);assertEquals(0,allowed)
+        compose.onNodeWithText("Allow").performClick();assertEquals(1,allowed)
+    }
+    @Test(timeout=60000) fun authenticatedRefusedIntroducedRowAndPageKeepTrust()=runBlocking<Unit> {
+        val refused=mac.copy(lastConnected=0,addedViaId=pc.deviceId,addedViaName=pc.name,setupSupported=false,setupRefused=true)
+        val p=prefs(pc,refused,state=linked(member(pc),member(refused)))
+        var page by mutableStateOf(false)
+        show {if(page)Device(p,refused) else Home(p,mapOf(pc.deviceId to wifi,refused.deviceId to LinkState()))}
+        val diagnostic="MacBook Air doesn't recognize this phone · Pair with it directly"
+        compose.onNodeWithText(diagnostic).assertIsDisplayed()
+        bothThemes("readmission-refused-row")
+        page=true;compose.waitForIdle()
+        compose.onNodeWithText(diagnostic).assertIsDisplayed()
+        compose.onNodeWithText("Update Pneu on MacBook Air to sync these switches.").assertDoesNotExist()
+        bothThemes("readmission-refused-page")
+    }
+    @Test(timeout=60000) fun readmissionNotificationUsesTheLinkRequestsChannel()=runBlocking<Unit> {
+        val removed=member(mac).copy(status="removed",hlc="10",reach=null)
+        val state=linked(member(pc),removed).copy(barriers=mapOf(removed.key to RemovalBarrier(removed,readmission=Readmission(member(mac).copy(hlc="20"),pc.deviceId,pc.name,3))))
+        val p=prefs(pc,state=state);val prompt=SetupPresentation.readmissions(p).single()
+        // Give the notification collector the same durable state as the fixture.
+        app.preferences.store.edit {SetupStorage.write(it,state)}
+        device.pressHome()
+        SetupNotifications.channel(context)
+        for(night in listOf(false,true)) {
+            device.executeShellCommand("cmd uimode night ${if(night)"yes" else "no"}")
+            SetupNotifications.postReadmission(context,p,prompt)
+            device.openNotification()
+            assertTrue(device.wait(Until.hasObject(By.text("Keep removed")),5000))
+            assertTrue(device.wait(Until.hasObject(By.text("Allow")),5000))
+            Thread.sleep(500)
+            assertTrue(device.wait(Until.hasObject(By.text("Keep removed")),5000))
+            shade("readmission-notification-${if(night)"dark" else "light"}")
+            context.getSystemService(NotificationManager::class.java).cancelAll()
+            device.pressBack();device.pressHome()
+        }
+    }
     @Test(timeout=30000) fun introducedComputerDoesNotCompleteAnotherScannedTarget() {
         var current by mutableStateOf(Prefs(deviceId="a".repeat(32),pairingRevision=1))
         var home=0

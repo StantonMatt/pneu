@@ -356,9 +356,27 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
         val removedSelf=p.membership.withdrawalRevision>setupUi.seenWithdrawal
         val asking=displayedPrompts.filter {SetupPresentation.promptKey(it) !in answering}
         val askingKeys=asking.map(SetupPresentation::promptKey)
-        if(resumed && asking.isNotEmpty() && askingKeys.any {it !in dismissedPrompts} && screen !in setOf(null,"setup","permissions","pair") && !removedSelf) {
+        val showingMigrationRequest=resumed && asking.isNotEmpty() && askingKeys.any {it !in dismissedPrompts} && screen !in setOf(null,"setup","permissions","pair") && !removedSelf
+        if(showingMigrationRequest) {
             LaunchedEffect(askingKeys,resumed) {if(resumed)SetupNotifications.cancelRequest(context)}
             LinkRequestDialog(SetupPresentation.requestTitle(resources,SetupPresentation.promptNames(p,asking)),{setupStore.dismissPrompts(askingKeys)},{answer(asking,false)}) {answer(asking,true)}
+        }
+        val readmit=SetupPresentation.readmissions(p).firstOrNull {it.actionKey !in dismissedPrompts}
+        if(resumed && readmit!=null && !showingMigrationRequest && screen !in setOf(null,"setup","permissions","pair") && !removedSelf) {
+            LaunchedEffect(readmit.actionKey) {SetupNotifications.cancelReadmission(context,readmit.actionKey)}
+            fun decide(allow:Boolean) {scope.launch {actions.run(resources.getString(R.string.setup_readmission_error),errorMessage={readmissionError(context,it)}) {
+                app.answerReadmission(readmit,allow)
+            }}}
+            ReadmissionDialog(SetupPresentation.readmissionText(resources,p,readmit),{setupStore.dismissPrompts(listOf(readmit.actionKey))},{decide(false)}) {decide(true)}
+        }
+        var dismissedConflicts by remember {mutableStateOf(emptySet<String>())}
+        val certificateConflict=p.membership.conflicts.firstOrNull {it.reason.startsWith("Different certificate") && p.membership.barriers.values.any {b->!b.cleared && b.removed.deviceId==it.deviceId && b.removed.fingerprint!=it.fingerprint} &&
+            "${p.membership.generation}/${it.deviceId}/${it.fingerprint}" !in dismissedConflicts && p.devices.none {peer->peer.deviceId==it.deviceId}}
+        if(resumed && certificateConflict!=null && readmit==null && asking.isEmpty() && !removedSelf && screen !in setOf(null,"setup","permissions","pair")) {
+            val name=p.membership.barriers.values.firstOrNull {it.removed.deviceId==certificateConflict.deviceId}?.removed?.name.orEmpty()
+            SetupNoticeDialog(resources.getString(R.string.setup_different_certificate,name),null) {
+                dismissedConflicts=dismissedConflicts+"${p.membership.generation}/${certificateConflict.deviceId}/${certificateConflict.fingerprint}"
+            }
         }
         removing?.let {confirmed->
             val name=p.devices.find {it.deviceId==confirmed.member.deviceId}?.name ?: confirmed.member.name

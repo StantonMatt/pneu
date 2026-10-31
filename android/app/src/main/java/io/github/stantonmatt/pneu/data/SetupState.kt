@@ -6,7 +6,16 @@ import io.github.stantonmatt.pneu.protocol.*
 
 /** All terminal history is independent of peer cascades and of the current wire
  * roster. A cleared barrier retains the exact removal value for conflict checks. */
-data class RemovalBarrier(val removed:SetupMember,val cleared:Boolean=false)
+enum class ReadmissionDecision { PENDING, ALLOWED, KEPT }
+data class Readmission(val member:SetupMember,val introducerId:String,val introducerName:String,
+    val setupGeneration:Long,val decision:ReadmissionDecision=ReadmissionDecision.PENDING)
+/** The action authority deliberately excludes the observation, which can improve while shown. */
+data class ReadmissionPrompt(val key:String,val removal:SetupMember,val setupGeneration:Long) {
+    val actionKey get()="readmit/$key/${removal.hlc}/${removal.writer}/$setupGeneration"
+}
+data class RemovalBarrier(val removed:SetupMember,val cleared:Boolean=false,val readmission:Readmission?=null) {
+    fun pairingFence()=removed to cleared
+}
 data class ConfirmedSetupMember(val setupGeneration:Long,val member:SetupMember,val binding:ConfirmedBinding?) {
     fun matches(p:Prefs)=p.membership.generation==setupGeneration && p.membership.roster.any {it==member && it.active} &&
         (binding==null && p.devices.none {it.deviceId==member.deviceId && it.pin==member.fingerprint} || binding?.matches(p)==true)
@@ -70,6 +79,7 @@ internal object SetupStorage {
         p[key]=gson.toJson(live)
     }
 }
+internal class ReadmissionBlocked(val conflict:Boolean):Exception()
 internal class SetupCapacity:Exception("Setup capacity reached")
 internal class SetupUnavailable:Exception("Setup is not enabled for this connection")
 internal class RemovedSetupSender:Exception("Removed setup sender")
@@ -79,7 +89,7 @@ internal data class SetupAttemptTarget(val deviceId:String?,val pin:String) {
     fun matchesRemoval(key:String)=key.substringAfter('/')==pin && (deviceId==null || deviceId==key.substringBefore('/'))
 }
 internal data class SetupPlan(val state:SetupState,val peers:List<Peer>,val removed:List<Peer>,val installed:List<Peer>,
-                              val observed:List<java.math.BigInteger>,val removedKeys:Set<String>,val validatedAt:Long,val alsoLinked:Boolean=false)
+                              val observed:List<java.math.BigInteger>,val removedKeys:Set<String>,val validatedAt:Long,val alsoLinked:Boolean=false,val notifyJoined:Boolean=true)
 
 /** Pure staged reconciliation. The caller commits this whole result, the clock,
  * reset intents and receipt in one DataStore edit under the binding lock. */
@@ -128,7 +138,7 @@ internal object SetupReconcile {
         val conflicts=state.conflicts.toMutableList()
         val provenance=state.provenance.toMutableMap()
         val removedKeys=mutableSetOf<String>()
-        for(m in snapshot.members) {
+        for(m in snapshot.members.sortedBy {it.active}) {
             val old=roster[m.key]
             // Equal stamps conflict even when eligibility would suppress the row.
             merged(old,m)
@@ -137,7 +147,7 @@ internal object SetupReconcile {
             if(!m.active) {
                 if(barrier?.cleared==true && stamp(m)<=stamp(barrier.removed))continue
                 val removal=if(barrier!=null && stamp(barrier.removed)>stamp(m))barrier.removed else m
-                barriers[m.key]=RemovalBarrier(removal)
+                barriers[m.key]=if(barrier!=null && stamp(removal)==stamp(barrier.removed))barrier.copy(cleared=false) else RemovalBarrier(removal)
                 // Retain the local high-water value in history, but only
                 // this setup's received/current removals belong on the wire.
                 roster[m.key]=old?.takeIf {!it.active && stamp(it)>stamp(m)} ?: m
@@ -146,7 +156,18 @@ internal object SetupReconcile {
             }
             // A retired deny is local admission history, never a tombstone in
             // this setup. Only the current roster can supply a wire tombstone.
-            if(barrier?.cleared==false)continue
+            if(barrier?.cleared==false) {
+                if(m.deviceId!=self.id && stamp(m)>stamp(barrier.removed)) {
+                    val prior=barrier.readmission
+                    barriers[m.key]=barrier.copy(readmission=if(prior==null)
+                        Readmission(m,sender.deviceId,sender.name,state.generation)
+                        else prior.copy(member=merged(prior.member,m)))
+                }
+                continue
+            }
+            if(m.deviceId!=self.id && barriers.values.any {!it.cleared && it.removed.deviceId==m.deviceId} && peers.none {it.deviceId==m.deviceId && it.pin==m.fingerprint}) {
+                conflicts.add(SetupConflict(m.deviceId,m.fingerprint,"Different certificate · Pair with it directly"));continue
+            }
             val sameId=roster.values.find {it.active && it.deviceId==m.deviceId && it.fingerprint!=m.fingerprint}
             val bound=peers.find {it.deviceId==m.deviceId}
             val samePin=roster.values.find {it.active && it.fingerprint==m.fingerprint && it.deviceId!=m.deviceId}
@@ -177,7 +198,7 @@ internal object SetupReconcile {
                     remaining=remaining.map {if(it==prior)it.copy(name=if(changed)m.name else it.name,
                         addresses=if(reachChanged)(m.reach?.addresses.orEmpty().map(Endpoint::parse)+it.addresses).distinct().take(16) else it.addresses) else it}
                 } else if(prior==null && m.role=="computer" && remaining.none {it.pin==m.fingerprint} &&
-                    !result.denies(m.deviceId,m.fingerprint) && (attempt==null || attempt.deviceId!=m.deviceId && attempt.pin!=m.fingerprint)) {
+                    !deniedId(result,m.deviceId) && (attempt==null || attempt.deviceId!=m.deviceId && attempt.pin!=m.fingerprint)) {
                     val peer=Peer(m.name,m.fingerprint,m.deviceId,m.reach?.addresses.orEmpty().map(Endpoint::parse),
                         setupDecision=SetupScope.ENABLED,addedViaId=result.provenance[m.key]?.id ?: sender.deviceId,addedViaName=result.provenance[m.key]?.name ?: sender.name)
                     installed.add(peer);remaining=remaining+peer
@@ -194,7 +215,7 @@ internal object SetupReconcile {
         val installed=mutableListOf<Peer>()
         for(m in state.roster.filter {it.active && it.role=="computer" && it.deviceId!=selfId}) {
             val via=state.provenance[m.key] ?: continue
-            if(peers.any {it.deviceId==m.deviceId || it.pin==m.fingerprint} || state.denies(m.deviceId,m.fingerprint) ||
+            if(peers.any {it.deviceId==m.deviceId || it.pin==m.fingerprint} || deniedId(state,m.deviceId) ||
                 attempt!=null && (attempt.deviceId==m.deviceId || attempt.pin==m.fingerprint))continue
             installed.add(Peer(m.name,m.fingerprint,m.deviceId,m.reach?.addresses.orEmpty().map(Endpoint::parse),
                 setupDecision=SetupScope.ENABLED,addedViaId=via.id,addedViaName=via.name))
@@ -202,7 +223,32 @@ internal object SetupReconcile {
         capacity(state,peers+installed)
         return SetupPlan(state,peers+installed,emptyList(),installed,emptyList(),emptySet(),System.currentTimeMillis())
     }
+    private fun deniedId(state:SetupState,id:String)=state.barriers.values.any {!it.cleared && it.removed.deviceId==id}
+    fun readmissions(state:SetupState):List<ReadmissionPrompt> = if(state.setupId==null || state.withdrawn)emptyList() else
+        state.barriers.mapNotNull {(key,b)->b.readmission?.takeIf {!b.cleared && it.decision==ReadmissionDecision.PENDING && it.setupGeneration==state.generation}
+            ?.let {ReadmissionPrompt(key,b.removed,it.setupGeneration)}}
+    fun answer(state:SetupState,peers:List<Peer>,selfId:String,prompt:ReadmissionPrompt,allow:Boolean,
+               attempt:SetupAttemptTarget?=null):SetupPlan? {
+        if(prompt !in readmissions(state))return null
+        val barrier=state.barriers.getValue(prompt.key);val observation=requireNotNull(barrier.readmission)
+        val m=observation.member
+        if(allow) {
+            check(m.deviceId!=selfId) {"Cannot re-admit this phone"}
+            if(peers.any {it.deviceId==m.deviceId || it.pin==m.fingerprint} ||
+                state.roster.any {it.active && (it.deviceId==m.deviceId || it.fingerprint==m.fingerprint)})throw ReadmissionBlocked(true)
+            if(attempt!=null && (attempt.deviceId==m.deviceId || attempt.pin==m.fingerprint))throw ReadmissionBlocked(false)
+        }
+        val nextBarrier=barrier.copy(cleared=allow,readmission=observation.copy(decision=if(allow)ReadmissionDecision.ALLOWED else ReadmissionDecision.KEPT))
+        val next=state.copy(barriers=state.barriers+(prompt.key to nextBarrier),
+            roster=if(allow)state.roster.filterNot {it.key==m.key}+m else state.roster,
+            provenance=if(allow)state.provenance+(m.key to SetupProvenance(observation.introducerId,observation.introducerName)) else state.provenance)
+        val installed=if(allow && m.role=="computer")listOf(Peer(m.name,m.fingerprint,m.deviceId,m.reach?.addresses.orEmpty().map(Endpoint::parse),
+            setupDecision=SetupScope.ENABLED,addedViaId=observation.introducerId,addedViaName=observation.introducerName)) else emptyList()
+        capacity(next,peers+installed)
+        return SetupPlan(next,peers+installed,emptyList(),installed,emptyList(),emptySet(),System.currentTimeMillis(),notifyJoined=false)
+    }
     fun retire(state:SetupState,withdrawal:Boolean)=state.copy(setupId=null,generation=Math.addExact(state.generation,1),
+        barriers=state.barriers.mapValues {(_,b)->if(b.readmission?.decision==ReadmissionDecision.PENDING)b.copy(readmission=null) else b},
         roster=emptyList(),prompts=emptyList(),pendingLink=null,initialSnapshotPending=false,sends=emptyMap(),receipts=emptyList(),
         receiptIntents=state.receiptIntents,provenance=emptyMap(),notices=emptyList(),withdrawn=state.withdrawn || withdrawal,withdrawalRevision=if(withdrawal)Math.addExact(state.withdrawalRevision,1) else state.withdrawalRevision,retiredIds=state.retiredIds+listOfNotNull(state.setupId))
 }

@@ -19,11 +19,11 @@ data class PairingAttempt internal constructor(
         ?: scanned.devices.find {it.pin==invitation.fingerprint}
     internal fun matches(p:Prefs,current:Map<String,Long>):Boolean {
         if(!p.loaded || scanned.deviceId!=p.deviceId || scanned.membership.withdrawalRevision!=p.membership.withdrawalRevision ||
-            scanned.membership.barriers["${deviceId.orEmpty()}/${invitation.fingerprint}"]!=p.membership.barriers["${deviceId.orEmpty()}/${invitation.fingerprint}"])return false
+            scanned.membership.barriers["${deviceId.orEmpty()}/${invitation.fingerprint}"]?.pairingFence()!=p.membership.barriers["${deviceId.orEmpty()}/${invitation.fingerprint}"]?.pairingFence())return false
         fun same(a:Peer?,b:Peer?)=a?.let {Triple(it.deviceId,it.pin,it.generation)}==b?.let {Triple(it.deviceId,it.pin,it.generation)}
         fun revision(key:String)=revisions.getOrDefault(key,0)==current.getOrDefault(key,0)
         val pin=invitation.fingerprint
-        if(scanned.membership.barriers.filterKeys {it.endsWith("/$pin")}!=p.membership.barriers.filterKeys {it.endsWith("/$pin")})return false
+        if(scanned.membership.barriers.filterKeys {it.endsWith("/$pin")}.mapValues {it.value.pairingFence()}!=p.membership.barriers.filterKeys {it.endsWith("/$pin")}.mapValues {it.value.pairingFence()})return false
         if(!same(scanned.devices.find {it.pin==pin},p.devices.find {it.pin==pin}) || !revision("pin:$pin"))return false
         val id=deviceId ?: return true
         return same(scanned.devices.find {it.deviceId==id},p.devices.find {it.deviceId==id}) && revision("id:$id")

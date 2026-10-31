@@ -114,3 +114,10 @@ internal suspend fun AppGraph.reconcileSetupCandidatesLocked() {
     }}
     for(id in preferences.read().resetPeers)completePeerReset(id)
 }
+
+/** The lifecycle gate keeps attempts and binding replacement stable through durable commit. */
+internal suspend fun AppGraph.answerReadmission(prompt:ReadmissionPrompt,allow:Boolean)=withContext(Dispatchers.IO+NonCancellable) {withBindingLifecycle {
+    val attempt=connection.attempt.value?.let {SetupAttemptTarget(it.deviceId,it.invitation.fingerprint)}
+    preferences.answerReadmission(prompt,allow,attempt)
+    for(id in preferences.read().resetPeers)completePeerReset(id)
+}}

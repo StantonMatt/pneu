@@ -89,6 +89,71 @@ class SetupFlowDeviceTest {
         DeviceFixture.reset()
     }
 
+    private suspend fun arrangeReadmission():ReadmissionPrompt {
+        bind(pc,"MJStanton-Desktop",'b')
+        val me=self()
+        setup {peers,state->
+            val generation=state.generation+1
+            val removed=SetupMember(mac,"c".repeat(64),"computer","MacBook Air","removed","10",me.deviceId)
+            val retained=removed.copy(status="member",hlc="20",writer=pc,reach=MemberReach(listOf("127.0.0.1:1"),"21",mac))
+            peers to state.copy(setupId="f".repeat(32),generation=generation,roster=listOf(me,member(peers.single()),removed),
+                barriers=mapOf(removed.key to RemovalBarrier(removed,readmission=Readmission(retained,pc,"MJStanton-Desktop",generation))))
+        }
+        return SetupPresentation.readmissions(app.preferences.read()).single()
+    }
+    @Test(timeout=90000) fun dismissedMigrationRequestDoesNotHideReadmission()=runBlocking<Unit> {
+        arrangeReadmission();askedBy(pc)
+        launch();waitFor("MJStanton-Desktop wants to link your devices")
+        compose.onNodeWithText("Keep removed").assertDoesNotExist()
+        device.pressBack()
+        waitFor("MacBook Air was removed from this phone. MJStanton-Desktop added it again")
+        compose.onNodeWithText("Keep removed").assertIsDisplayed()
+        compose.onNodeWithText("Allow").assertIsDisplayed()
+        assertTrue("Dismissal leaves migration pending",SetupPresentation.prompts(app.preferences.read()).isNotEmpty())
+        assertTrue(MainActivity.foreground.value)
+        compose.onNodeWithText("Keep removed").performClick()
+        withTimeout(10000) {app.prefs.first {it.membership.barriers.values.single().readmission?.decision==ReadmissionDecision.KEPT}}
+    }
+    @Test(timeout=90000) fun readmissionAllowInstallsOnceAndAuthenticatedRefusalHasADirectPairHint()=runBlocking<Unit> {
+        val prompt=arrangeReadmission()
+        launch();waitFor("MacBook Air was removed from this phone. MJStanton-Desktop added it again")
+        compose.onNodeWithText("Keep removed").assertIsDisplayed();capture("flow-readmission-prompt")
+        compose.onNodeWithText("Allow").performClick()
+        withTimeout(10000) {app.prefs.first {it.devices.any {peer->peer.deviceId==mac}}}
+        val admitted=app.preferences.read();val peer=admitted.devices.single {it.deviceId==mac}
+        assertFalse(admitted.membership.denies(mac,peer.pin));assertEquals("20",admitted.membership.member(mac)!!.hlc)
+        assertEquals(pc,peer.addedViaId);assertFalse(peer.established);assertTrue(admitted.membership.notices.isEmpty())
+        app.answerReadmission(prompt,true)
+        assertEquals(peer,app.preferences.read().devices.single {it.deviceId==mac})
+        app.preferences.introducedRefusal(DeliveryBinding(admitted.deviceId,peer.pin,mac,peer.generation),true)
+        waitFor("MacBook Air doesn't recognize this phone · Pair with it directly")
+        capture("flow-readmission-refused-row")
+        openDevice("MacBook Air")
+        waitFor("MacBook Air doesn't recognize this phone · Pair with it directly")
+        capture("flow-readmission-refused-page")
+        assertEquals(peer.pin,app.preferences.read().devices.single {it.deviceId==mac}.pin)
+    }
+    @Test(timeout=90000) fun keepRemovedSurvivesReopenAndStaleNotificationCannotAllowANewerBarrier()=runBlocking<Unit> {
+        val prompt=arrangeReadmission()
+        SetupNotifications.channel(c)
+        SetupNotifications.postReadmission(c,app.preferences.read(),prompt)
+        val notification=c.getSystemService(NotificationManager::class.java).activeNotifications.single {it.tag==prompt.actionKey}.notification
+        val capturedAllow=notification.actions.last().actionIntent
+        launch();waitFor("Keep removed")
+        compose.onNodeWithText("Keep removed").performClick()
+        withTimeout(10000) {app.prefs.first {it.membership.barriers[prompt.key]?.readmission?.decision==ReadmissionDecision.KEPT}}
+        scenario?.close();launch();waitFor("MJStanton-Desktop")
+        compose.onNodeWithText("Keep removed").assertDoesNotExist()
+        assertTrue(app.preferences.read().membership.denies(mac,"c".repeat(64)))
+        setup {peers,state->peers to state.copy(barriers=state.barriers+(prompt.key to RemovalBarrier(prompt.removal.copy(hlc="30"))))}
+        val before=app.preferences.read()
+        val completed=CompletableDeferred<Unit>()
+        capturedAllow.send(c,0,null,{_,_,_,_,_->completed.complete(Unit)},android.os.Handler(android.os.Looper.getMainLooper()))
+        withTimeout(10000) {completed.await()}
+        app.answerReadmission(prompt,true)
+        assertEquals(before.membership,app.preferences.read().membership)
+        assertTrue(app.preferences.read().devices.none {it.deviceId==mac})
+    }
     @Test(timeout=90000) fun pairingSwitchIsOnByDefaultAndOffMakesAPlainPairing()=runBlocking<Unit> {
         // A first pairing, from a deep link: the confirmation is over the scanner.
         launch(Intent(Intent.ACTION_VIEW,Uri.parse(raw("MacBook Air",'e'))))

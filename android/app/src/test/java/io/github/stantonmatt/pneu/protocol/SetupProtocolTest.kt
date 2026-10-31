@@ -25,6 +25,13 @@ class SetupProtocolTest {
             assertEquals(snapshot,SetupWire.decode((Protocol.read(round.toByteArray().inputStream()) as Frame.Control).body))
         }
     }
+    @Test fun sharedReadmissionPayloadsUseTheExistingWireCodec() {
+        val shared=JsonParser.parseReader(javaClass.getResourceAsStream("/readmit-vectors.json")!!.reader()).asJsonObject
+        for((name,fixture) in shared.getAsJsonObject("fixtures").entrySet()) {
+            val payload=fixture.asJsonObject["payload"].toString()
+            assertEquals(name,SetupWire.decode(read(payload).body),SetupWire.decode(JsonParser.parseString(payload).asJsonObject))
+        }
+    }
     @Test fun literalInvalidNestedVectorsAreRejectedBeforeMapParsing() {
         val invalid=vectors["invalid"].asJsonArray.map {it.asString}
         for(entry in invalid.take(2))rejects("""{"transfer_id":"${"4".repeat(32)}","setup_id":"${"0".repeat(32)}","members":[$entry]}""")

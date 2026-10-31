@@ -40,11 +40,14 @@ internal object SetupPresentation {
     /** Requests still waiting for this phone's answer, for current bindings only. */
     fun prompts(p:Prefs)=p.membership.prompts.filter {prompt->!prompt.allowRequested && prompt.setupGeneration==p.membership.generation &&
         p.devices.any {it.deviceId==prompt.peerId && it.pin==prompt.pin && it.generation==prompt.bindingGeneration && !it.pairingLost}}
+    fun readmissions(p:Prefs)=SetupReconcile.readmissions(p.membership)
+    fun readmissionText(r:Resources,p:Prefs,prompt:ReadmissionPrompt)=r.getString(R.string.setup_readmission,
+        prompt.removal.name,requireNotNull(p.membership.barriers[prompt.key]?.readmission).introducerName)
     fun promptKey(prompt:SetupPrompt)="${prompt.peerId}/${prompt.pin}/${prompt.bindingGeneration}/${prompt.setupGeneration}"
     fun promptNames(p:Prefs,prompts:List<SetupPrompt>)=prompts.map {prompt->p.devices.find {it.deviceId==prompt.peerId}?.name ?: prompt.name}
     fun memberKey(p:Prefs,peer:Peer)=p.membership.member(peer.deviceId)?.takeIf {active(p) && it.fingerprint==peer.pin}?.key
     private fun participating(p:Prefs,peer:Peer)=memberKey(p,peer)!=null &&
-        (peer.remoteSetupScope==null || peer.remoteSetupScope==SetupScope.ENABLED)
+        peer.helloSeen && peer.remoteSetupScope==SetupScope.ENABLED
     fun page(p:Prefs,peer:Peer):SetupPage {
         val s=p.membership;val key=memberKey(p,peer)
         val row=when {
@@ -54,6 +57,7 @@ internal object SetupPresentation {
             // Allowed here; it links when that device next reconnects.
             s.prompts.any {it.peerId==peer.deviceId && it.allowRequested}->LinkRow.NONE
             participating(p,peer) && peer.setupScope==SetupScope.ENABLED->LinkRow.NONE
+            peer.addedViaId!=null && !peer.helloSeen->LinkRow.NONE
             !peer.setupSupported->LinkRow.UPDATE
             peer.setupScope==SetupScope.ENABLED && peer.remoteSetupScope==SetupScope.DISABLED->LinkRow.THEIRS
             peer.setupScope==SetupScope.ENABLED->LinkRow.PENDING
@@ -96,7 +100,7 @@ internal object SetupPresentation {
     fun notices(p:Prefs)=p.membership.notices.filter {notice->notice.peerId !in p.resetPeers && p.devices.any {it.deviceId==notice.peerId}}
     private fun recentPairVia(p:Prefs,ui:SetupUiState,now:Long)=
         ui.joinedPin.takeIf {it.isNotEmpty() && now-ui.joinedAt in 0 until PAIR_OUTCOME_WINDOW_MS}?.let {pin->p.devices.find {it.pin==pin}}
-    fun alsoLinked(p:Prefs)=notices(p).filter {it.alsoLinked}
+    fun alsoLinked(p:Prefs)=notices(p).filter {notice->notice.alsoLinked && p.devices.any {it.deviceId==notice.peerId && it.readyObserved && notice.id=="${p.membership.generation}/${it.deviceId}/${it.generation}"}}
     fun joined(p:Prefs)=notices(p).filterNot {it.alsoLinked}
     /** Home's next message, in order: what this phone linked with, separate devices, joins, then Linked. */
     fun news(p:Prefs,ui:SetupUiState,now:Long,presented:Set<String> = emptySet()):SetupNews? {
@@ -141,6 +145,7 @@ internal class SetupUiStore private constructor(context:Context) {
     private val prefs=context.getSharedPreferences("setup_ui",Context.MODE_PRIVATE)
     val state=MutableStateFlow(read())
     val dismissedPrompts=MutableStateFlow(emptySet<String>())
+    val notifiedReadmissions=MutableStateFlow(emptySet<String>())
     val notifiedPrompts=MutableStateFlow(emptySet<String>())
     val presentedNotices=MutableStateFlow(prefs.getStringSet("presentedNotices",emptySet()).orEmpty().toSet())
     @Synchronized fun presentNotices(ids:Set<String>) {
@@ -168,3 +173,10 @@ internal class SetupUiStore private constructor(context:Context) {
     }
 }
 internal val Context.setupUi get()=SetupUiStore.get(this)
+
+internal fun readmissionError(context:Context,error:Exception)=context.getString(when {
+    error is SetupCapacity->R.string.setup_readmission_capacity
+    error is ReadmissionBlocked && error.conflict->R.string.setup_readmission_conflict
+    error is ReadmissionBlocked->R.string.setup_readmission_attempt
+    else->R.string.setup_readmission_error
+})

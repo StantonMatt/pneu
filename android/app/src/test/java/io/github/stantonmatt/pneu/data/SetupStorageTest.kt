@@ -48,6 +48,42 @@ class SetupStorageTest {
         for(id in p.read().resetPeers) {q.clearPeer(id);p.finishPeerReset(id)}
         p.finishMembersIntents(q)
     }
+    @Test fun readmissionAllowRollsBackEveryStageAndResumesCommittedResetWithoutDuplicatePublication()=runBlocking<Unit>(Dispatchers.IO) {
+        val removal=newRow.copy(status="removed",hlc="15",reach=null)
+        val observation=Readmission(newRow.copy(hlc="20"),b,"PC",1)
+        val pending=initial.copy(roster=initial.roster+removal,barriers=mapOf(removal.key to RemovalBarrier(removal,readmission=observation)))
+        val prompt=SetupReconcile.readmissions(pending).single()
+        for(stage in listOf("membersClockStaged","membersPeersStaged","membersResetsStaged","readmissionStaged"))fixture(pending) {p,_->
+            val before=p.read();p.beforeMutation={if(it==stage)error("Injected")}
+            assertThrows(IllegalStateException::class.java) {runBlocking {p.answerReadmission(prompt,true)}}
+            p.beforeMutation={};assertEquals(before,p.read())
+        }
+        fixture(pending) {p,q->
+            p.beforeMutation={if(it=="readmissionCommitted")error("Crash after commit")}
+            assertThrows(IllegalStateException::class.java) {runBlocking {p.answerReadmission(prompt,true)}}
+            p.beforeMutation={}
+            val committed=p.read();val peer=committed.devices.single {it.deviceId==c}
+            assertEquals(8L,peer.generation);assertTrue(c in committed.resetPeers);assertTrue(committed.membership.notices.isEmpty())
+            assertFalse(committed.membership.denies(c,pc));assertEquals(removal,committed.membership.barriers.getValue(removal.key).removed)
+            p.answerReadmission(prompt,true);assertEquals(committed,p.read())
+            finish(p,q)
+            assertTrue(p.read().resetPeers.isEmpty());assertEquals(peer,p.read().devices.single {it.deviceId==c})
+            assertTrue(p.read().membership.notices.isEmpty())
+        }
+    }
+    @Test fun authenticatedIntroducedRefusalSurvivesRestartAndDirectReadyClearsIt()=runBlocking<Unit>(Dispatchers.IO) {
+        fixture(peer=sender.copy(addedViaId=c)) {p,_->
+            p.introducedRefusal(binding,false);assertFalse(p.read().devices.single().setupRefused)
+            p.introducedRefusal(binding,true)
+            assertTrue(PeerRegistry.read(p.store.data.first()).single().setupRefused)
+            val refused=p.read()
+            p.introducedRefusal(binding.copy(generation=99),true);assertEquals(refused,p.read())
+            assertTrue(p.connected(binding,sender.addresses.single()))
+            assertFalse(p.read().devices.single().setupRefused)
+            assertTrue(p.read().devices.single().readyObserved)
+            assertEquals(refused.membership,p.read().membership)
+        }
+    }
     @Test fun firstSnapshotClassifiesNoticesOnceAndOldNoticesDefaultToJoined() {
         fun prefs(state:SetupState)=mutablePreferencesOf(stringPreferencesKey("deviceId") to a).also {
             PeerRegistry.write(it,listOf(sender));SetupStorage.write(it,state)

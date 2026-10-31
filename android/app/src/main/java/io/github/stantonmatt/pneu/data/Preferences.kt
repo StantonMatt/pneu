@@ -19,7 +19,8 @@ data class Peer(val name: String, val pin: String, val deviceId: String, val add
     @com.google.gson.annotations.SerializedName("setupScope") private val setupDecision:SetupScope?=null,
     val addedViaId:String?=null,val addedViaName:String?=null,val established:Boolean=false,val setupSupported:Boolean=false,
     /** Last authenticated HELLO observation for this binding; never local consent. */
-    val remoteSetupScope:SetupScope?=null) {
+    val remoteSetupScope:SetupScope?=null,val helloObserved:Boolean=false,val setupRefused:Boolean=false,val readyObserved:Boolean=false) {
+    val helloSeen get()=helloObserved || remoteSetupScope!=null || lastConnected>0
     val setupScope get()=setupDecision ?: SetupScope.ASK
     val setupScoped get()=addedViaId!=null || setupScope==SetupScope.ENABLED && setupSupported
     internal val acknowledgedSnapshot get()=acknowledgedSettings.orEmpty()
@@ -221,7 +222,7 @@ class Preferences(private val context:Context,internal val store:androidx.datast
         edit {
             val peers=PeerRegistry.read(it);val peer=peers.find {peer->peer.deviceId==binding.pcId} ?: return@edit
             if(s(it,"deviceId")!=binding.phoneId || peer.pin!=binding.pin || peer.generation!=binding.generation || peer.deviceId in PeerRegistry.resets(it) || peer.pairingLost)return@edit
-            PeerRegistry.write(it,peers.map {if(it==peer)it.copy(established=true,lastLan=if(endpoint.tailscale)it.lastLan else endpoint.toString(),lastConnected=at) else it})
+            PeerRegistry.write(it,peers.map {if(it==peer)it.copy(established=true,readyObserved=true,setupRefused=false,lastLan=if(endpoint.tailscale)it.lastLan else endpoint.toString(),lastConnected=at) else it})
             recorded=true
         }
         return recorded
@@ -239,7 +240,7 @@ class Preferences(private val context:Context,internal val store:androidx.datast
             require(pcId!=s(it,"deviceId")) {"Remote device ID is the phone's own ID"}
             if(prior!=null && prior.pin!=invitation.fingerprint && !prior.pairingLost)return@edit
             val setup=SetupStorage.read(it)
-            if(setupFence!=null && (setup.withdrawalRevision!=setupFence.withdrawalRevision || setup.barriers["$pcId/${invitation.fingerprint}"]!=setupFence.barriers["$pcId/${invitation.fingerprint}"]))return@edit
+            if(setupFence!=null && (setup.withdrawalRevision!=setupFence.withdrawalRevision || setup.barriers["$pcId/${invitation.fingerprint}"]?.pairingFence()!=setupFence.barriers["$pcId/${invitation.fingerprint}"]?.pairingFence()))return@edit
             val first=peers.isEmpty()
             val unchanged=prior!=null && !PairingIdentity.changes(prior,invitation,pcId)
             val generation=if(unchanged)requireNotNull(prior).generation else Math.addExact(l(it,"pairingRevision"),1)
@@ -431,8 +432,11 @@ class Preferences(private val context:Context,internal val store:androidx.datast
     internal class SettingsConflict:Exception()
     internal suspend fun hello(binding:DeliveryBinding,name:String,addresses:List<Endpoint>,mesh:Boolean=true,setup:Boolean=false,remoteSetupScope:SetupScope?=null) {edit {p->
         PeerRegistry.write(p,PeerRegistry.read(p).map {if(it.deviceId==binding.pcId && it.generation==binding.generation && it.pin==binding.pin)
-            it.copy(name=name,settingsSupported=mesh,setupSupported=setup,remoteSetupScope=remoteSetupScope.takeIf {setup},
+            it.copy(name=name,helloObserved=true,settingsSupported=mesh,setupSupported=setup,remoteSetupScope=remoteSetupScope.takeIf {setup},
                 addresses=if(addresses.isEmpty())it.addresses else (addresses+it.addresses).distinct().take(16)) else it})
+    }}
+    internal suspend fun introducedRefusal(binding:DeliveryBinding,authenticated:Boolean) {edit {p->
+        PeerRegistry.write(p,PeerRegistry.read(p).map {peer->refusedPeer(peer,binding,authenticated)})
     }}
     suspend fun finishPeerReset(peerId:String) {edit {PeerRegistry.finishReset(it,peerId)}}
     suspend fun forget(lostPcName:String?=null,peerId:String?=null):Unit=policy.locked {
@@ -458,3 +462,7 @@ class Preferences(private val context:Context,internal val store:androidx.datast
         }
     }
 }
+
+internal fun refusedPeer(peer:Peer,binding:DeliveryBinding,authenticated:Boolean)=
+    if(authenticated && peer.addedViaId!=null && peer.deviceId==binding.pcId && peer.pin==binding.pin && peer.generation==binding.generation)
+        peer.copy(setupRefused=true) else peer

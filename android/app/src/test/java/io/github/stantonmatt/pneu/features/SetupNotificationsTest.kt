@@ -1,19 +1,25 @@
 package io.github.stantonmatt.pneu.features
 
 import android.app.*
+import android.content.*
 import androidx.datastore.preferences.core.*
 import io.github.stantonmatt.pneu.AppGraph
+import io.github.stantonmatt.pneu.PneuApp
+import io.github.stantonmatt.pneu.PneuService
 import io.github.stantonmatt.pneu.data.*
 import io.github.stantonmatt.pneu.data.Preferences
 import kotlinx.coroutines.*
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestDispatcher
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.*
 import org.robolectric.annotation.*
 import org.robolectric.shadows.ShadowNotificationManager
+import org.robolectric.util.ReflectionHelpers
 import java.io.File
+import kotlin.coroutines.ContinuationInterceptor
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk=[34],application=Application::class,shadows=[SetupNotificationsTest.ThrowingNotifications::class])
@@ -98,6 +104,72 @@ class SetupNotificationsTest {
         assertEquals(NotificationManager.IMPORTANCE_HIGH,nm.getNotificationChannel(n.channelId).importance)
         assertFalse(n.flags and Notification.FLAG_GROUP_SUMMARY!=0)
         assertEquals(listOf("Allow","Don't allow"),n.actions.map {it.title.toString()})
+    }
+    @Test fun readmissionNotificationCarriesExactBarrierFencesAndStaleActionsDoNothing()=runBlocking<Unit> {
+        fixture {app,p->
+            val removed=io.github.stantonmatt.pneu.protocol.SetupMember("e".repeat(32),"e".repeat(64),"computer","Old laptop","removed","10",peer.deviceId)
+            val observation=Readmission(removed.copy(status="member",hlc="20"),peer.deviceId,peer.name,3)
+            val state=p.membership.copy(setupId="f".repeat(32),generation=3,barriers=mapOf(removed.key to RemovalBarrier(removed,readmission=observation)),notices=emptyList())
+            app.preferences.edit {SetupStorage.write(it,state)}
+            val current=app.preferences.read();val prompt=SetupPresentation.readmissions(current).single()
+            SetupNotifications.show(app,nm,current,false,emptySet(),mutableSetOf())
+            val notification=shadow.getNotification(prompt.actionKey,0)
+            assertEquals("setup_requests",notification.channelId)
+            assertEquals(listOf("Keep removed","Allow"),notification.actions.map {it.title.toString()})
+            val intent=Shadows.shadowOf(notification.actions[1].actionIntent).savedIntent
+            assertEquals(SetupNotifications.READMIT_ALLOW,intent.action)
+            assertArrayEquals(arrayOf(prompt.actionKey),intent.getStringArrayExtra("keys"))
+            assertEquals("Old laptop was removed from this phone. Laptop added it again",notification.extras.getCharSequence(Notification.EXTRA_TITLE).toString())
+            SetupNotifications.show(app,nm,current,true,emptySet(),mutableSetOf())
+            assertNull(shadow.getNotification(prompt.actionKey,0))
+            app.preferences.edit {SetupStorage.write(it,state.copy(generation=4))}
+            app.preferences.answerReadmission(prompt,true)
+            assertTrue(app.preferences.read().membership.denies(removed.deviceId,removed.fingerprint))
+            assertTrue(app.preferences.read().devices.none {it.deviceId==removed.deviceId})
+        }
+    }
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun notificationAllowRestartsTheStoppedServiceAfterInstallingTheBinding()=runBlocking<Unit> {
+        fixture {app,p->
+            // Keep unrelated graph initialization out of this receiver test.
+            // Robolectric records service starts without launching connection workers.
+            app.scope.coroutineContext[Job]!!.children.forEach {it.cancel()}
+            val scheduler=(app.scope.coroutineContext[ContinuationInterceptor] as TestDispatcher).scheduler
+            scheduler.runCurrent()
+            val removed=io.github.stantonmatt.pneu.protocol.SetupMember("e".repeat(32),"e".repeat(64),"computer","Old laptop","removed","10",peer.deviceId)
+            val state=p.membership.copy(setupId="f".repeat(32),generation=3,roster=listOf(removed),
+                barriers=mapOf(removed.key to RemovalBarrier(removed,readmission=Readmission(removed.copy(status="member",hlc="20"),peer.deviceId,peer.name,3))))
+            app.preferences.edit {SetupStorage.write(it,state)}
+            val current=app.preferences.read();val prompt=SetupPresentation.readmissions(current).single()
+            SetupNotifications.postReadmission(c,current,prompt)
+            val action=Shadows.shadowOf(shadow.getNotification(prompt.actionKey,0).actions.last().actionIntent).savedIntent
+            val application=PneuApp().apply {graph=app}
+            val context=object:ContextWrapper(c) {override fun getApplicationContext():Context=application}
+            val receiver=SetupActionReceiver()
+            val dispatched=CompletableDeferred<BroadcastReceiver.PendingResult>()
+            // Supply a real pending broadcast result while using the isolated graph.
+            val relay=object:BroadcastReceiver() {
+                override fun onReceive(ignored:Context,intent:Intent) {
+                    val pending=goAsync();ReflectionHelpers.setField(receiver,"mPendingResult",pending)
+                    receiver.onReceive(context,action);dispatched.complete(pending)
+                }
+            }
+            val relayAction="test.READMIT_ALLOW"
+            c.registerReceiver(relay,IntentFilter(relayAction),Context.RECEIVER_NOT_EXPORTED)
+            try {
+                assertNull(Shadows.shadowOf(c).peekNextStartedService())
+                c.sendBroadcast(Intent(relayAction).setPackage(c.packageName))
+                Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+                val pending=withTimeout(5000) {dispatched.await()}
+                withTimeout(5000) {
+                    while(!Shadows.shadowOf(pending).future.isDone) {scheduler.runCurrent();delay(10)}
+                }
+                val admitted=app.preferences.read()
+                assertTrue(admitted.devices.any {it.deviceId==removed.deviceId})
+                assertFalse(admitted.membership.denies(removed.deviceId,removed.fingerprint))
+                assertEquals(PneuService::class.java.name,Shadows.shadowOf(c).nextStartedService?.component?.className)
+            }finally {c.unregisterReceiver(relay)}
+        }
     }
     @Test fun repeatedJoinPostsUseTheSameIdentityAndOnlyAlertOnce() {
         SetupNotifications.channel(c)

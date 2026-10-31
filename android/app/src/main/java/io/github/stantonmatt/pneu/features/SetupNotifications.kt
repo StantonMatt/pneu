@@ -22,6 +22,12 @@ internal object SetupNotifications {
     const val ACTION_ALLOW="io.github.stantonmatt.pneu.SETUP_ALLOW"
     const val ACTION_DENY="io.github.stantonmatt.pneu.SETUP_DENY"
     const val ACTION_DISMISS="io.github.stantonmatt.pneu.SETUP_DISMISS"
+    const val READMIT_ALLOW="io.github.stantonmatt.pneu.READMIT_ALLOW"
+    const val READMIT_KEEP="io.github.stantonmatt.pneu.READMIT_KEEP"
+    fun cancelReadmission(context:Context,key:String) {
+        context.getSystemService(NotificationManager::class.java).cancel(key,0)
+        context.setupUi.notifiedReadmissions.value=context.setupUi.notifiedReadmissions.value-key
+    }
     fun joinedTag(id:String)="setup_joined:$id"
     fun channel(context:Context) {
         val nm=context.getSystemService(NotificationManager::class.java)
@@ -54,6 +60,16 @@ internal object SetupNotifications {
     internal suspend fun show(app:AppGraph,nm:NotificationManager,p:Prefs,front:Boolean,dismissed:Set<String>,posted:MutableSet<String>) {
         val context=app.context;val ui=context.setupUi
         if(!p.loaded)return
+        val readmissions=SetupPresentation.readmissions(p)
+        val readmitKeys=readmissions.map {it.actionKey}.toSet()
+        (ui.notifiedReadmissions.value-readmitKeys).forEach {cancelReadmission(context,it)}
+        for(prompt in readmissions) {
+            if(front)cancelReadmission(context,prompt.actionKey)
+            else if(canPost(context,REQUEST_CHANNEL) && prompt.actionKey !in dismissed && prompt.actionKey !in ui.notifiedReadmissions.value) {
+                postReadmission(context,p,prompt)
+                ui.notifiedReadmissions.value=ui.notifiedReadmissions.value+prompt.actionKey
+            }
+        }
         val prompts=SetupPresentation.prompts(p);val keys=prompts.map(SetupPresentation::promptKey)
         if(prompts.isEmpty()) {nm.cancel(REQUEST,0);ui.notifiedPrompts.value=emptySet()}
         else if(canPost(context,REQUEST_CHANNEL) && !front && keys.any {it !in dismissed} && keys.toSet()!=ui.notifiedPrompts.value) {
@@ -84,6 +100,18 @@ internal object SetupNotifications {
             .setDeleteIntent(broadcast(context,ACTION_DISMISS,keys)).setOnlyAlertOnce(true).setAutoCancel(true)
             .addAction(0,context.getString(R.string.action_allow),broadcast(context,ACTION_ALLOW,keys))
             .addAction(0,context.getString(R.string.action_dont_allow),broadcast(context,ACTION_DENY,keys)).build())
+    }
+    fun postReadmission(context:Context,p:Prefs,prompt:ReadmissionPrompt) {
+        val text=SetupPresentation.readmissionText(context.resources,p,prompt)
+        val keys=listOf(prompt.actionKey)
+        context.getSystemService(NotificationManager::class.java).notify(prompt.actionKey,0,
+            NotificationCompat.Builder(context,REQUEST_CHANNEL).setSmallIcon(R.drawable.ic_stat_pneu).setColor(0xFF4F5BFF.toInt())
+                .setContentTitle(text).setStyle(NotificationCompat.BigTextStyle().bigText(text))
+                .setContentIntent(activity(context,Intent(context,MainActivity::class.java).putExtra("home",true)))
+                .setPriority(NotificationCompat.PRIORITY_HIGH).setGroup("setup_requests").setOnlyAlertOnce(true).setAutoCancel(true)
+                .setDeleteIntent(broadcast(context,ACTION_DISMISS,keys))
+                .addAction(0,context.getString(R.string.setup_keep_removed),broadcast(context,READMIT_KEEP,keys))
+                .addAction(0,context.getString(R.string.action_allow),broadcast(context,READMIT_ALLOW,keys)).build())
     }
     /** {device} joined · Added via {device} · Remove, which opens its page with the confirmation. */
     fun postJoined(context:Context,p:Prefs,notice:SetupNotice) {
@@ -116,6 +144,19 @@ class SetupActionReceiver:BroadcastReceiver() {
     override fun onReceive(context:Context,intent:Intent) {
         val keys=intent.getStringArrayExtra("keys")?.toSet().orEmpty()
         if(intent.action==SetupNotifications.ACTION_DISMISS) {context.setupUi.dismissPrompts(keys);return}
+        if(intent.action in setOf(SetupNotifications.READMIT_ALLOW,SetupNotifications.READMIT_KEEP)) {
+            val allow=intent.action==SetupNotifications.READMIT_ALLOW
+            val app=context.graph;val pending=goAsync()
+            app.scope.launch {
+                try {
+                    val prompt=SetupPresentation.readmissions(app.preferences.read()).find {it.actionKey in keys} ?: return@launch
+                    if(UiActions.feedback(context).run(context.getString(R.string.setup_readmission_error),errorMessage={readmissionError(context,it)}) {
+                        app.answerReadmission(prompt,allow)
+                    } && allow)runCatching {PneuService.start(context)}
+                }finally {pending.finish()}
+            }
+            return
+        }
         if(intent.action !in setOf(SetupNotifications.ACTION_ALLOW,SetupNotifications.ACTION_DENY) || keys.isEmpty())return
         val allow=intent.action==SetupNotifications.ACTION_ALLOW
         val app=context.graph;val pending=goAsync()

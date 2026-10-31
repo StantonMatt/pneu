@@ -41,7 +41,7 @@ class SetupPresentationTest {
         // Allowed here: it links when that device reconnects, so nothing to tap.
         assertEquals(LinkRow.NONE,row(pc,linked().copy(prompts=listOf(prompt(pc,allowed=true)))).row)
         val linkedPage=row(enabled,linked(member('b',pc.name)))
-        assertTrue(linkedPage.member);assertEquals(LinkRow.NONE,linkedPage.row);assertNull(linkedPage.addedVia)
+        assertTrue(linkedPage.member);assertEquals(LinkRow.PENDING,linkedPage.row);assertNull(linkedPage.addedVia)
         // In your devices through another device, this one pairing not linked: Link and Remove from all devices.
         val viaPhone=row(pc.copy(setupDecision=SetupScope.DISABLED),linked(member('b',pc.name)))
         assertTrue(viaPhone.member);assertEquals(LinkRow.LINK,viaPhone.row)
@@ -51,6 +51,29 @@ class SetupPresentationTest {
         // A removed member row or a different certificate is not one of your devices.
         assertFalse(row(enabled,linked(member('b',pc.name,status="removed"))).member)
         assertFalse(row(enabled.copy(pin="9".repeat(64)),linked(member('b',pc.name))).member)
+    }
+    @Test fun introducedClaimsNeedHelloAndAlsoLinkedNeedsReadyInTheCurrentGeneration() {
+        val introduced=mac.copy(setupDecision=SetupScope.ENABLED,addedViaId=pc.deviceId,setupSupported=false)
+        val state=linked(member('c',mac.name)).copy(notices=listOf(notice(introduced,pc).copy(alsoLinked=true)))
+        val p=prefs(introduced,state=state)
+        assertFalse(introduced.helloSeen);assertTrue(introduced.setupScoped)
+        assertEquals(LinkRow.NONE,SetupPresentation.page(p,introduced).row)
+        assertTrue(SetupPresentation.alsoLinked(p).isEmpty())
+        val hello=introduced.copy(helloObserved=true,setupSupported=true,remoteSetupScope=SetupScope.ENABLED)
+        assertEquals(LinkRow.NONE,SetupPresentation.page(p.copy(peers=listOf(hello)),hello).row)
+        assertTrue(SetupPresentation.alsoLinked(p.copy(peers=listOf(hello))).isEmpty())
+        assertTrue("Legacy established was set before READY",SetupPresentation.alsoLinked(p.copy(peers=listOf(hello.copy(established=true)))).isEmpty())
+        assertEquals(1,SetupPresentation.alsoLinked(p.copy(peers=listOf(hello.copy(established=true,readyObserved=true)))).size)
+        assertTrue(SetupPresentation.alsoLinked(p.copy(peers=listOf(hello.copy(established=true,readyObserved=true,generation=999)))).isEmpty())
+    }
+    @Test fun readmissionCopyUsesRemovalNameAndAuthenticatedIntroducer() {
+        val removed=member('c',"Old laptop",status="removed")
+        val observation=Readmission(member('c',"Renamed laptop").copy(hlc="2"),pc.deviceId,pc.name,3)
+        val p=prefs(pc,state=linked().copy(barriers=mapOf(removed.key to RemovalBarrier(removed,readmission=observation))))
+        val prompt=SetupPresentation.readmissions(p).single()
+        assertEquals("Old laptop was removed from this phone. MJStanton-Desktop added it again",SetupPresentation.readmissionText(r,p,prompt))
+        assertTrue(SetupPresentation.prompts(p).isEmpty())
+        assertTrue(SetupPresentation.readmissions(p.copy(membership=p.membership.copy(generation=4))).isEmpty())
     }
     @Test fun otherPhonesAreListedWithWhoAddedThem() {
         val pixel=member('e',"Pixel 9","phone")
@@ -70,7 +93,7 @@ class SetupPresentationTest {
             // A retained member is still removable, even if this direct link no longer participates.
             val retained=p.copy(membership=linked(member('b',pc.name)))
             assertTrue(SetupPresentation.page(retained,enabled).member)
-            assertEquals(when(remote) {SetupScope.DISABLED->LinkRow.THEIRS;SetupScope.ASK->LinkRow.PENDING;else->LinkRow.NONE},
+            assertEquals(when(remote) {SetupScope.DISABLED->LinkRow.THEIRS;SetupScope.ASK,null->LinkRow.PENDING;else->LinkRow.NONE},
                 SetupPresentation.page(retained,enabled).row)
             for(local in listOf(SetupScope.ASK,SetupScope.DISABLED)) {
                 val plain=enabled.copy(setupDecision=local)
@@ -100,7 +123,7 @@ class SetupPresentationTest {
         assertEquals("Allow linking on 3 devices",SetupPresentation.bannerText(r,LinkBanner.Waiting(listOf("A","B","C"))))
         assertNull(SetupPresentation.banner(after,SetupUiState()))
         // The PC linked; the Mac hasn't answered yet.
-        val oneLeft=after.copy(membership=linked(member('b',pc.name),generation=4))
+        val oneLeft=after.copy(peers=after.devices.map {if(it.deviceId==pc.deviceId)it.copy(remoteSetupScope=SetupScope.ENABLED) else it},membership=linked(member('b',pc.name),generation=4))
         assertEquals(LinkBanner.Waiting(listOf(mac.name)),SetupPresentation.banner(oneLeft,SetupUiState(linkStarted=true)))
         val done=after.copy(peers=after.devices.map {it.copy(remoteSetupScope=SetupScope.ENABLED)},membership=linked(member('b',pc.name),member('c',mac.name),generation=4))
         assertNull(SetupPresentation.banner(done,SetupUiState(linkStarted=true)))
@@ -135,7 +158,7 @@ class SetupPresentationTest {
         assertTrue(SetupPresentation.prompts(p.copy(membership=p.membership.copy(generation=5))).isEmpty())
     }
     @Test fun thePhoneThatJoinedSaysAlsoLinkedWhileTheOthersSayJoined() {
-        val viaPc=mac.copy(setupDecision=SetupScope.ENABLED,addedViaId=pc.deviceId,addedViaName=pc.name)
+        val viaPc=mac.copy(established=true,readyObserved=true,setupDecision=SetupScope.ENABLED,addedViaId=pc.deviceId,addedViaName=pc.name)
         val state=linked(member('b',pc.name),member('c',mac.name)).copy(
             roster=listOf(me.copy(hlc="100"),member('b',pc.name),member('c',mac.name)),notices=listOf(notice(viaPc,pc).copy(alsoLinked=true)))
         val p=prefs(pc,viaPc,state=state)
@@ -161,7 +184,7 @@ class SetupPresentationTest {
         val notices=listOf(notice(mac,pc).copy(alsoLinked=true),notice(office,pc))
         val state=linked(member('c',mac.name),member('d',office.name)).copy(notices=notices)
         for(clock in listOf("0","18446744073709551615")) {
-            val p=prefs(mac,office,state=state.copy(roster=state.roster.map {it.copy(hlc=clock,name="Renamed")}))
+            val p=prefs(mac.copy(established=true,readyObserved=true),office,state=state.copy(roster=state.roster.map {it.copy(hlc=clock,name="Renamed")}))
             assertEquals(listOf(notices[0]),SetupPresentation.alsoLinked(p))
             assertEquals(listOf(notices[1]),SetupPresentation.joined(p))
             assertNull(SetupPresentation.news(p,SetupUiState(),0,notices.map {it.id}.toSet()))

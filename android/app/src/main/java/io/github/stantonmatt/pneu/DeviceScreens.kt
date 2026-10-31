@@ -44,6 +44,7 @@ internal data class DeviceLine(val text:String,val tone:LinkTone,val color:Color
     val context=LocalContext.current;val resources=LocalResources.current;val c=LocalPneuColors.current;val link=state.connection
     return when {
         state.peer.pairingLost->DeviceLine(resources.getString(R.string.status_pairing_lost),LinkTone.Danger,c.danger)
+        state.peer.setupRefused->DeviceLine(resources.getString(R.string.setup_refused,state.peer.name),LinkTone.Warn,c.warn)
         link.connectionStatus==ConnectionStatus.FINGERPRINT_MISMATCH->DeviceLine(resources.getString(R.string.status_fingerprint_mismatch),LinkTone.Danger,c.danger)
         link.connectionStatus==ConnectionStatus.UPDATE_REQUIRED->DeviceLine(resources.getString(R.string.device_update_required),LinkTone.Warn,c.warn)
         connected(p,state)->DeviceLine(if(link.route.isEmpty())resources.getString(R.string.status_connected) else resources.getString(R.string.device_connected,UiPresentation.status(context,link.route)),LinkTone.On,c.text2)
@@ -84,7 +85,7 @@ private fun lastSeen(context:android.content.Context,timestamp:Long):String {
                 DeviceTile(line.tone)
                 Column(Modifier.weight(1f)) {
                     Text(state.peer.name,style=PneuType.body,maxLines=1,overflow=TextOverflow.Ellipsis)
-                    Text(line.text,style=PneuType.subhead,color=line.color,maxLines=1,overflow=TextOverflow.Ellipsis)
+                    Text(line.text,style=PneuType.subhead,color=line.color,maxLines=if(state.peer.setupRefused)Int.MAX_VALUE else 1,overflow=TextOverflow.Ellipsis)
                 }
                 Symbol(R.drawable.ic_chevron_right,modifier=Modifier.size(20.dp),tint=c.text3)
             }
@@ -130,11 +131,11 @@ private fun automaticKinds(context:android.content.Context,p:Prefs):String? {
             Column(Modifier.widthIn(max=600.dp).fillMaxWidth().verticalScroll(scroll).navigationBarsPadding().padding(horizontal=16.dp)) {
                 Text(peer.name,Modifier.onSizeChanged {titleHeight=it.height}.padding(start=4.dp,end=4.dp,top=6.dp,bottom=14.dp).semantics {heading()},style=PneuType.largeTitle,maxLines=2,overflow=TextOverflow.Ellipsis)
                 val status=when {peer.pairingLost->ConnectionStatus.PAIRING_LOST;online->ConnectionStatus.CONNECTED;else->link.connectionStatus}
-                val title=when(status) {ConnectionStatus.UNREACHABLE->resources.getString(R.string.device_not_connected);ConnectionStatus.UPDATE_REQUIRED->resources.getString(R.string.device_update_required);else->UiPresentation.status(context,status)}
+                val title=if(peer.setupRefused)resources.getString(R.string.setup_refused,peer.name) else if(peer.addedViaId!=null && !peer.established && status==ConnectionStatus.UNREACHABLE)resources.getString(R.string.device_not_connected_yet) else when(status) {ConnectionStatus.UNREACHABLE->resources.getString(R.string.device_not_connected);ConnectionStatus.UPDATE_REQUIRED->resources.getString(R.string.device_update_required);else->UiPresentation.status(context,status)}
                 val address=UiPresentation.pairedAddress(peer.addresses,link.route)
                 val hint=unreachableHint(status==ConnectionStatus.UNREACHABLE,listOf(peer),p.tailscale)
                 var anywhere by rememberSaveable {mutableStateOf(false)}
-                val detail=when(status) {
+                val detail=if(peer.setupRefused)"" else when(status) {
                     ConnectionStatus.PAIRING_LOST->resources.getString(R.string.detail_pairing_lost,peer.name)
                     ConnectionStatus.UPDATE_REQUIRED->resources.getString(R.string.device_update_detail,peer.name)
                     ConnectionStatus.CONNECTED->listOfNotNull(link.route.takeIf(String::isNotEmpty)?.let {UiPresentation.status(context,it)},address).joinToString(" · ")
@@ -169,7 +170,7 @@ private fun automaticKinds(context:android.content.Context,p:Prefs):String? {
                         if(kinds==null)SwitchRow(resources.getString(R.string.pref_automatic_sending),false,resources.getString(R.string.auto_off_all),enabled=false) {}
                         else SwitchRow(resources.getString(R.string.pref_automatic_sending),peer.automaticMedia,note("automaticMedia") ?: kinds) {setSwitch("automaticMedia",it)}
                     }
-                    if(state.settingsSupported==false)Text(resources.getString(R.string.sharing_needs_update,peer.name),Modifier.padding(start=16.dp,end=16.dp,top=8.dp),style=PneuType.subhead,color=c.text2)
+                    if(peer.helloSeen && state.settingsSupported==false)Text(resources.getString(R.string.sharing_needs_update,peer.name),Modifier.padding(start=16.dp,end=16.dp,top=8.dp),style=PneuType.subhead,color=c.text2)
                 }
                 Spacer(Modifier.height(12.dp))
                 SetupPageCard(peer.name,SetupPresentation.page(p,peer),setup,unpair)

@@ -16,13 +16,15 @@ internal object SetupTransactions {
         val key="${peer.deviceId}/${peer.pin}"
         if(state.denies(peer.deviceId,peer.pin)) {
             check(fresh) {"A fresh confirmed pairing is required after removal"}
-            next=next.copy(barriers=next.barriers+(key to next.barriers.getValue(key).copy(cleared=true)))
+            next=next.copy(barriers=next.barriers+(key to next.barriers.getValue(key).copy(cleared=true,readmission=null)))
         }
+        if(fresh && next.barriers[key]?.readmission!=null)
+            next=next.copy(barriers=next.barriers+(key to next.barriers.getValue(key).copy(readmission=null)))
         if(next.withdrawn) {
             check(fresh) {"A fresh confirmed pairing is required after withdrawal"}
             val ownKey="${p[deviceId]}/$selfPin"
             val own=next.barriers[ownKey]
-            next=next.copy(withdrawn=false,barriers=if(own!=null)next.barriers+(ownKey to own.copy(cleared=true)) else next.barriers)
+            next=next.copy(withdrawn=false,barriers=if(own!=null)next.barriers+(ownKey to own.copy(cleared=true,readmission=null)) else next.barriers)
         }
         if(prior!=null && prior.pin!=peer.pin && next.member(prior.deviceId)?.fingerprint==prior.pin) {
             val old=next.member(prior.deviceId)!!
@@ -167,9 +169,13 @@ internal object SetupTransactions {
         var generation=p[revision] ?: 0
         val installed=plan.installed.associate {peer->peer.deviceId to peer.copy(generation=Math.addExact(generation,1).also {generation=it})}
         val peers=plan.peers.map {installed[it.deviceId] ?: it}
-        val notices=installed.values.map {peer->SetupNotice("${plan.state.generation}/${peer.deviceId}/${peer.generation}",peer.deviceId,peer.name,
+        val notices=installed.values.filter {plan.notifyJoined}.map {peer->SetupNotice("${plan.state.generation}/${peer.deviceId}/${peer.generation}",peer.deviceId,peer.name,
             peer.addedViaId ?: requireNotNull(sender).deviceId,peer.addedViaName ?: requireNotNull(sender).name,plan.alsoLinked)}
-        val state=plan.state.copy(notices=(plan.state.notices+notices).takeLast(64))
+        // A notice belongs to its installed generation, including after remove
+        // and re-admission. An old unseen join must never reappear on Allow.
+        val retainedNotices=plan.state.notices.filter {notice->peers.any {peer->
+            notice.id=="${plan.state.generation}/${peer.deviceId}/${peer.generation}"}}
+        val state=plan.state.copy(notices=(retainedNotices+notices).takeLast(64))
         plan.observed.forEach {MeshClock.observe(p,it,plan.validatedAt)}
         stage("membersClockStaged")
         PeerRegistry.write(p,peers);p[revision]=generation
@@ -294,4 +300,13 @@ internal suspend fun Preferences.finishMembersIntents(queue:QueueDao)=policy.loc
         state.receiptIntents.map {it.sender}.distinct().forEach {queue.pruneMembersReceipts(it)}
         SetupStorage.write(p,state.copy(receiptIntents=emptyList()))
     }
+}
+
+internal suspend fun Preferences.answerReadmission(prompt:ReadmissionPrompt,allow:Boolean,attempt:SetupAttemptTarget?=null)=policy.locked {
+    edit {p->
+        val plan=SetupReconcile.answer(SetupStorage.read(p),PeerRegistry.read(p),p[stringPreferencesKey("deviceId")].orEmpty(),prompt,allow,attempt)
+        if(plan!=null)SetupTransactions.commit(p,plan,stage=beforeMutation)
+        beforeMutation("readmissionStaged")
+    }
+    beforeMutation("readmissionCommitted")
 }

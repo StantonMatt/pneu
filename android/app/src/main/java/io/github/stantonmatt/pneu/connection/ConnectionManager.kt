@@ -222,6 +222,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                         if(issue!=null)lastIssue=issue
                         if(issue!=null) {attempt?.let {app.rejectPairing(it,issue)};break}
                         if (e.code == "unauthorized") {
+                            if(invitation==null)authenticatedBinding?.let {app.preferences.introducedRefusal(it,pinnedLeafVerified)}
                             if(invitation == null) {rejected=PairingRejection.unauthorized(e.code,pinnedLeafVerified,readPrefs().peer?.setupScoped==true);if(rejected)onUnauthorized?.invoke()}
                             else if(attempt!=null)app.rejectPairing(attempt,ConnectionStatus.UNREACHABLE)
                             break
@@ -442,7 +443,6 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
         val sessionBinding=requireNotNull(authenticatedBinding)
         require(sessionBinding.pcId==pcId && sessionBinding.pin==(attempt?.invitation?.fingerprint ?: p.peer?.pin))
         val boundPeer=Peer(attempt?.invitation?.name ?: p.peer!!.name,sessionBinding.pin,pcId,emptyList(),generation=sessionBinding.generation)
-        check(app.preferences.connected(sessionBinding,endpoint)) {"Binding changed"}
         capabilities=hello.body["capabilities"].asJsonArray.map {it.asString}.toSet()
         app.preferences.hello(sessionBinding,hello.body["name"].asString,if(mesh)hello.body["addresses"]?.asJsonArray?.map {Endpoint.parse(it.asString)}.orEmpty() else emptyList(),mesh,remoteSetup!=null,remoteSetup?.scope)
         if(readPrefs().membership.generation!=p.membership.generation)throw RemoteError("closing")
@@ -463,6 +463,9 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
         // belongs to PING/PONG, write progress and post-END receipt deadlines.
         val admitted=app.withBinding(sessionBinding) {
             if(epoch!=dialEpoch.get())return@withBinding false
+            // Persist READY evidence only after setup activation has accepted
+            // this session; HELLO-triggered reconnects do not count as linked.
+            check(app.preferences.connected(sessionBinding,endpoint)) {"Binding changed"}
             admissionSession=randomId()
             app.connection.admitted(sessionBinding,requireNotNull(admissionSession))
             ready=true;true
