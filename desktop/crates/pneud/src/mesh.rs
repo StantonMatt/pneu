@@ -1510,9 +1510,31 @@ mod tests {
             Ok(())
         }
     }
-    async fn core() -> Result<(tempfile::TempDir, Arc<Core>, TcpListener)> {
-        let dir = crate::test_support::scratch()?;
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+    struct Fixture {
+        directory: tempfile::TempDir,
+        // Core advertises its configured port even when no server is running.
+        // Keep the socket bound after a test drops/moves its serving handle, so
+        // another parallel fixture cannot inherit a still-advertised address.
+        listeners: Vec<std::net::TcpListener>,
+    }
+    impl Fixture {
+        fn path(&self) -> &std::path::Path {
+            self.directory.path()
+        }
+        fn listen(&mut self) -> Result<TcpListener> {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            listener.set_nonblocking(true)?;
+            let serving = TcpListener::from_std(listener.try_clone()?)?;
+            self.listeners.push(listener);
+            Ok(serving)
+        }
+    }
+    async fn core() -> Result<(Fixture, Arc<Core>, TcpListener)> {
+        let mut dir = Fixture {
+            directory: crate::test_support::scratch()?,
+            listeners: Vec::new(),
+        };
+        let listener = dir.listen()?;
         let paths = Paths {
             data: dir.path().join("data"),
             cache: dir.path().join("cache"),
@@ -1534,6 +1556,28 @@ mod tests {
             dir.path().display()
         );
         Ok((dir, core, listener))
+    }
+    #[tokio::test]
+    async fn fixture_reserves_advertised_port_after_listener_drop_and_server_shutdown() -> Result<()>
+    {
+        for serve in [false, true] {
+            let (_dir, core, listener) = core().await?;
+            let address = listener.local_addr()?;
+            assert_eq!(address.port(), core.bound_port());
+            if serve {
+                let server = Task::spawn(core.clone().serve(listener, false));
+                core.request_shutdown();
+                server.await??;
+            } else {
+                drop(listener);
+                core.shutdown_actions().await?;
+            }
+            // Model a competing fixture claiming this port at precisely the
+            // old drop-then-dial gap, without depending on kernel allocation.
+            let error = TcpListener::bind(address).await.unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        }
+        Ok(())
     }
     // Real mesh peers now also exchange settings. These mocks acknowledge
     // those independent frames while tests inspect pairing/heartbeat controls.
@@ -1765,7 +1809,7 @@ mod tests {
     #[tokio::test]
     async fn settings_reconnect_wire_replay_is_deduplicated_and_unblocks_content_after_restart()
     -> Result<()> {
-        let (_da, mut a, mut la) = core().await?;
+        let (mut da, mut a, mut la) = core().await?;
         let (_db, b, lb) = core().await?;
         drop(lb);
         bind(&a, &b).await?;
@@ -1852,7 +1896,7 @@ mod tests {
             a.request_shutdown();
             server.await??;
             drop((tls, a));
-            la = TcpListener::bind("127.0.0.1:0").await?;
+            la = da.listen()?;
             config.port = la.local_addr()?.port();
             a = Core::new(paths, config, Arc::new(Mock)).await?;
             a.setup_test_capability.store(false, Ordering::SeqCst);
@@ -2626,8 +2670,8 @@ mod tests {
             })
             .await?;
         let peer = a.store.peer_info().await?.remove(0);
-        // Only B listens: its HELLO-advertised physical addresses cannot reach
-        // A's absent listener. This deliberately exercises a lone higher dial.
+        // Only B serves: A keeps its advertised port reserved but never accepts
+        // reverse dials. This deliberately exercises a lone higher dial.
         let sb = tokio::spawn(b.clone().serve(listener_b, false));
         drop(listener_a);
         let (cancel, rx) = watch::channel(false);
@@ -3322,9 +3366,9 @@ mod tests {
     #[tokio::test]
     async fn network_loss_redials_using_changed_hello_address() -> Result<()> {
         let (_da, a, la) = core().await?;
-        let (_db, b, old) = core().await?;
+        let (mut db, b, old) = core().await?;
         drop(la);
-        let moved = TcpListener::bind("127.0.0.1:0").await?;
+        let moved = db.listen()?;
         let address = moved.local_addr()?.to_string();
         computer_route(&a, &b, old.local_addr()?.to_string()).await?;
         bind(&b, &a).await?;
@@ -3346,7 +3390,14 @@ mod tests {
         })
         .await?;
         drop(tls);
-        drop(old);
+        // Keep the stale route owned, but reject its dials immediately so the
+        // cached last-good address cannot stall recovery to the moved server.
+        let _old_server = Task::spawn(async move {
+            loop {
+                let (socket, _) = old.accept().await?;
+                drop(socket);
+            }
+        });
         let server = Task::spawn(b.clone().serve(moved, false));
         until(|| {
             a.sessions
