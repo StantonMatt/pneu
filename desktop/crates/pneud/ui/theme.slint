@@ -10,7 +10,10 @@ export global Pneu {
     out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
     out property <color> card: dark ? #2A2E32 : #FFFFFF;
     out property <color> card-border: dark ? #373B41 : #DCDEE1;
-    out property <color> text: Palette.foreground;
+    // Defaults follow the native palette; offscreen render fixtures can supply
+    // the foreground/background without changing the desktop session.
+    in-out property <color> text: Palette.foreground;
+    in-out property <color> background: Palette.background;
     out property <color> text2: dark ? #A4A9B0 : #5E6369;
     out property <color> accent: #4F5BFF;
     out property <color> accent-text: dark ? #9AA3FF : #3D47E0;

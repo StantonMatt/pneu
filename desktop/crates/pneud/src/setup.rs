@@ -129,6 +129,11 @@ impl Core {
         let mesh = self.mesh.clone();
         let incoming = self.setup_incoming.clone();
         move |delta| {
+            let notify_mesh = delta.roster_changed
+                || delta.reconnect
+                || delta.reconnect_peer.is_some()
+                || !delta.added.is_empty()
+                || !delta.removed.is_empty();
             let _guard = guard;
             mesh.cancel_removed(&delta.tombstones);
             if delta.withdrawn {
@@ -218,7 +223,9 @@ impl Core {
             select_display(&connections, &admission, &mut ui.lock().expect("UI state"));
             if delta.changed {
                 let _ = events.send(Event::ConfigChanged);
-                changed.notify_waiters();
+                if notify_mesh {
+                    changed.notify_waiters();
+                }
             }
         }
     }
@@ -252,24 +259,10 @@ impl Core {
         sent: Option<(SetupHello, u64)>,
     ) -> Result<Option<SetupFence>> {
         if !hello.capabilities.iter().any(|c| c == "setup") {
-            if !self
-                .store
-                .setup_state()
-                .links
-                .iter()
-                .any(|l| l.device == hello.device_id && l.negotiated)
-            {
-                return Ok(None);
-            }
             let _guard = self.pairing_gate.lock().await;
-            if self.connection_current(store, &hello.device_id)
-                && self
-                    .store
-                    .setup_state()
-                    .links
-                    .iter()
-                    .any(|l| l.device == hello.device_id && l.negotiated)
-            {
+            // HELLO/READY is link evidence even when setup was never negotiated
+            // or this binding was already legacy before the daemon restarted.
+            if self.connection_current(store, &hello.device_id) {
                 self.store
                     .setup_legacy_ready(self.setup_fence(store, hello)?)
                     .await?;
@@ -426,6 +419,9 @@ impl Core {
         use crate::ui::window_setup::Decision;
         let _guard = self.pairing_gate.lock().await;
         let state = self.store.setup_state();
+        if let Some(record) = state.readmissions.first() {
+            return Some(crate::ui::notifications::Notice::readmission(record));
+        }
         let snapshot = self.ui_snapshot();
         let mut names = Vec::new();
         let requests: Vec<_> = state
@@ -442,6 +438,7 @@ impl Core {
                 let peer = snapshot.devices.iter().find(|p| p.device == link.device)?;
                 names.push(crate::ui::window::display_peer_text(&peer.name));
                 Some(Decision {
+                    readmission: None,
                     device: link.device.clone(),
                     setup_generation: state.generation,
                     binding_generation,
@@ -451,15 +448,58 @@ impl Core {
         (!requests.is_empty())
             .then(|| crate::ui::notifications::Notice::link_request(&names, requests))
     }
+    pub async fn decide_readmission(
+        &self,
+        key: crate::store::members::ReadmissionKey,
+        allow: bool,
+    ) -> Result<()> {
+        let guard = self.pairing_gate.clone().lock_owned().await;
+        let result = self
+            .store
+            .setup_readmit(
+                key.clone(),
+                self.identity.device_id.clone(),
+                allow,
+                self.setup_attempts(),
+                self.setup_publish(guard, None, None),
+            )
+            .await;
+        let mut errors = self.readmission_errors.lock().expect("re-admission errors");
+        errors.retain(|(old, _)| *old != key);
+        if let Err(error) = &result {
+            errors.push((key, format!("Couldn't save the answer: {error:#}")));
+            let excess = errors.len().saturating_sub(64);
+            errors.drain(..excess);
+        }
+        result
+    }
     pub async fn setup_status(&self) -> Result<serde_json::Value> {
+        let _guard = self.pairing_gate.lock().await;
         let state = self.store.setup_state();
         let mut value = serde_json::to_value(&state)?;
+        {
+            let mut errors = self.readmission_errors.lock().expect("re-admission errors");
+            errors.retain(|(key, _)| state.readmissions.iter().any(|r| r.key == *key));
+            for (record, value) in state
+                .readmissions
+                .iter()
+                .zip(value["readmissions"].as_array_mut().expect("readmissions"))
+            {
+                if let Some((_, error)) = errors.iter().find(|(key, _)| *key == record.key) {
+                    value["error"] = serde_json::json!(error);
+                }
+            }
+        }
         let remote_scopes = self.store.setup_remote_scopes();
         for (link, value) in state
             .links
             .iter()
             .zip(value["links"].as_array_mut().expect("setup links"))
         {
+            value["hello_seen"] =
+                serde_json::json!(link.hello_seen || remote_scopes.contains_key(&link.device));
+            value["ready"] =
+                serde_json::json!(self.store.setup_binding_ready(link.device.clone()).await?);
             if link.negotiated
                 && let Some(scope) = remote_scopes.get(&link.device)
             {
@@ -514,6 +554,12 @@ impl Core {
         }
         value["notices"] = serde_json::to_value(notices)?;
         value["conflicts"] = serde_json::to_value(conflicts)?;
+        for conflict in value["conflicts"].as_array_mut().expect("conflicts") {
+            conflict["diagnostic"] = serde_json::json!(format!(
+                "{} has a different certificate · Pair with it directly",
+                conflict["name"].as_str().unwrap_or("Device")
+            ));
+        }
         Ok(value)
     }
     fn setup_publish_peer(

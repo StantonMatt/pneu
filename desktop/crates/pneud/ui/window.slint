@@ -1,6 +1,5 @@
 // The Pneu window: main page, device pages, Add Device, Pairing Code and
 // Settings, with in-window popups. Rust drives everything through `Ui`.
-import { Palette } from "std-widgets.slint";
 import { Pneu, Tone, Icons, WindowFocus } from "theme.slint";
 import {
     PneuButton, ButtonKind, IconButton, Card, Row, Divider, SectionLabel, Tile, GhostTile,
@@ -70,8 +69,8 @@ export struct Summary { title: string, detail: string, link: LinkState }
 
 // Pair once, join your devices (window_setup.rs). The screens say "your
 // devices" and "linked", never "setup".
-export enum TopKind { none, offer, waiting, request }
-export struct TopCard { kind: TopKind, title: string, phone: bool }
+export enum TopKind { none, offer, waiting, request, readmit, diagnostic }
+export struct TopCard { kind: TopKind, title: string, phone: bool, error: string, key: string }
 export enum LinkRow { none, link, waiting, theirs, asked, update, separate }
 // The device page's last card: the row above Unpair or Remove from all devices.
 export struct DeviceLink { row: LinkRow, title: string, sub: string, via: string, member: bool, waiting: int }
@@ -390,12 +389,13 @@ component LinkCardTop inherits Card {
         VerticalLayout {
             alignment: start; horizontal-stretch: 1; spacing: 1px;
             Text { text: root.card.title; font-weight: 600; color: Pneu.text; wrap: word-wrap; }
-            Text { text: "New devices then pair just once."; font-size: Pneu.label-size; color: Pneu.text2; wrap: word-wrap; }
-            if root.card.kind != TopKind.waiting: HorizontalLayout {
+            if root.card.error != "": Text { text: root.card.error; font-size: Pneu.label-size; color: Pneu.danger; wrap: word-wrap; }
+            if root.card.kind != TopKind.readmit && root.card.kind != TopKind.diagnostic: Text { text: "New devices then pair just once."; font-size: Pneu.label-size; color: Pneu.text2; wrap: word-wrap; }
+            if root.card.kind != TopKind.waiting && root.card.kind != TopKind.diagnostic: HorizontalLayout {
                 padding-top: 10px; spacing: 8px; alignment: end;
-                if root.card.kind == TopKind.request: PneuButton { text: "Don't Allow"; clicked => { root.act(false); } }
+                if root.card.kind == TopKind.request || root.card.kind == TopKind.readmit: PneuButton { focus-key: root.card.key; autofocus: root.card.kind == TopKind.readmit; text: root.card.kind == TopKind.readmit ? "Keep removed" : "Don't Allow"; clicked => { root.act(false); } }
                 PneuButton {
-                    text: root.card.kind == TopKind.request ? "Allow" : "Link"; kind: ButtonKind.primary;
+                    text: root.card.kind == TopKind.request || root.card.kind == TopKind.readmit ? "Allow" : "Link"; kind: ButtonKind.primary;
                     clicked => { root.act(true); }
                 }
             }
@@ -450,7 +450,7 @@ export component PneuWindow inherits Window {
         width: drop-list.width / 1px, height: drop-list.height / 1px, scroll: drop-list.viewport-y / 1px
     };
     icon: @image-url("../../../assets/pneu.svg");
-    background: Palette.background;
+    background: Pneu.background;
     // Keep the last real QR size across invitation/pairing transitions.
     private property <int> last-qr-size: 292;
     changed qr => { if root.qr.width > 0 { root.last-qr-size = root.qr.width; } }

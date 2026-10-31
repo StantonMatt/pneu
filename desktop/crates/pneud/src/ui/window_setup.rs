@@ -31,8 +31,18 @@ pub(crate) struct Setup {
     pub binding_generations: HashMap<String, Option<u64>>,
     #[serde(default)]
     pub notices: Vec<Notice>,
+    #[serde(default)]
+    pub readmissions: Vec<crate::store::members::Readmission>,
+    #[serde(default)]
+    pub conflicts: Vec<Conflict>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub(crate) struct Conflict {
+    pub device_id: String,
+    pub fingerprint: String,
+    pub diagnostic: String,
+}
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub(crate) struct Member {
     pub device_id: String,
@@ -65,6 +75,10 @@ pub(crate) struct Link {
     /// for it.
     #[serde(default)]
     pub remote_scope: Option<String>,
+    #[serde(default)]
+    pub hello_seen: bool,
+    #[serde(default)]
+    pub ready: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
@@ -118,7 +132,9 @@ impl Setup {
     pub(crate) fn undecided(&self) -> Vec<&Link> {
         self.links
             .iter()
-            .filter(|l| l.scope == "ask" && !l.prompt && l.negotiated && !l.separate())
+            .filter(|l| {
+                l.scope == "ask" && !l.prompt && l.negotiated && l.hello_seen && !l.separate()
+            })
             .collect()
     }
     /// Linked here, and the other device hasn't answered yet.
@@ -127,6 +143,7 @@ impl Setup {
             .iter()
             .filter(|l| {
                 l.scope == "enabled"
+                    && l.hello_seen
                     && !l.participating
                     && !l.separate()
                     && l.remote_scope.as_deref() != Some("disabled")
@@ -146,7 +163,11 @@ impl Setup {
     /// Your devices this one learned since `known`, apart from `except`.
     pub(crate) fn learned(&self, known: &HashSet<String>, except: &[&str]) -> Vec<String> {
         self.active()
-            .filter(|m| !known.contains(&m.device_id) && !except.contains(&m.device_id.as_str()))
+            .filter(|m| {
+                !known.contains(&m.device_id)
+                    && !except.contains(&m.device_id.as_str())
+                    && self.link(&m.device_id).is_some_and(|l| l.ready)
+            })
             .map(|m| display_peer_text(&m.name))
             .collect()
     }
@@ -187,6 +208,9 @@ pub(crate) fn row(setup: &Setup, peer: &Peer) -> Row {
     if peer.lost() {
         return Row::None;
     }
+    if link.introduced_by.is_some() && !link.hello_seen {
+        return Row::None;
+    }
     if link.separate() {
         return Row::Separate;
     }
@@ -197,7 +221,7 @@ pub(crate) fn row(setup: &Setup, peer: &Peer) -> Row {
     let legacy = peer.connected() && !link.negotiated;
     match link.scope.as_str() {
         // Linked, or linking now that both agreed.
-        "enabled" if link.participating => Row::None,
+        "enabled" if link.participating && link.hello_seen => Row::None,
         "enabled" if link.remote_scope.as_deref() == Some("disabled") => Row::Theirs,
         "enabled" if legacy => Row::Update,
         "enabled" => Row::Waiting,
@@ -261,9 +285,20 @@ pub(crate) enum Top {
     #[default]
     None,
     /// Link your devices · Link · ✕, once after the update.
-    Offer { device: String },
+    Diagnostic {
+        title: String,
+        key: String,
+    },
+    Readmit {
+        record: Box<crate::store::members::Readmission>,
+    },
+    Offer {
+        device: String,
+    },
     /// After Link here: Allow linking on {a} and {b} · ✕.
-    Waiting { title: String },
+    Waiting {
+        title: String,
+    },
     /// {a} wants to link your devices · Don't Allow · Allow · ✕.
     Request {
         title: String,
@@ -273,6 +308,25 @@ pub(crate) enum Top {
 }
 
 pub(crate) fn top(setup: &Setup, peers: &[Peer], remembered: &Remembered) -> Top {
+    if let Some(record) = setup
+        .readmissions
+        .iter()
+        .find(|r| r.error.is_some() || !remembered.closed(&readmission_key(&r.key)))
+    {
+        return Top::Readmit {
+            record: Box::new(record.clone()),
+        };
+    }
+    if let Some(conflict) = setup
+        .conflicts
+        .iter()
+        .find(|c| !remembered.closed(&format!("conflict/{}/{}", c.device_id, c.fingerprint)))
+    {
+        return Top::Diagnostic {
+            title: conflict.diagnostic.clone(),
+            key: format!("conflict/{}/{}", conflict.device_id, conflict.fingerprint),
+        };
+    }
     let name = |device: &str| {
         peers
             .iter()
@@ -348,6 +402,7 @@ pub(crate) fn request_key(setup: &Setup, link: &Link) -> String {
 /// Authority captured when the notification is posted, just like the top card.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Decision {
+    pub readmission: Option<crate::store::members::ReadmissionKey>,
     pub device: pneu_proto::Id,
     pub setup_generation: u64,
     pub binding_generation: u64,
@@ -355,15 +410,21 @@ pub struct Decision {
 
 pub(crate) async fn decide(core: &crate::core::Core, requests: &[Decision], allow: bool) {
     for request in requests {
-        if let Err(error) = core
-            .decide_setup(
+        let result = if let Some(key) = &request.readmission {
+            core.decide_readmission(key.clone(), allow).await
+        } else {
+            core.decide_setup(
                 request.device.clone(),
                 request.setup_generation,
                 request.binding_generation,
                 allow,
             )
             .await
-        {
+        };
+        if let Err(error) = result {
+            if request.readmission.is_some() {
+                core.request_window(false);
+            }
             eprintln!("pneud: link request action: {error:#}");
         }
     }
@@ -576,16 +637,56 @@ pub(crate) fn daemon_instance() -> String {
         .clone()
 }
 
+pub(crate) fn readmission_key(key: &crate::store::members::ReadmissionKey) -> String {
+    serde_json::to_string(key).expect("re-admission key")
+}
+pub(crate) fn readmission_text(record: &crate::store::members::Readmission) -> String {
+    format!(
+        "{} was removed from {}. {} added it again",
+        display_peer_text(&record.removed_name),
+        super::this_computer(),
+        display_peer_text(&record.introducer_name)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
     fn link(device: &str, scope: &str) -> Value {
-        json!({"device": device, "scope": scope, "prompt": false, "negotiated": true, "participating": false})
+        json!({"device": device, "scope": scope, "prompt": false, "negotiated": true, "participating": false, "hello_seen": true})
     }
     fn setup(value: Value) -> Setup {
         Setup::parse(&json!({ "setup": value }))
+    }
+
+    #[test]
+    fn regression_review_dismissed_readmission_shows_later_action_error() {
+        let device = pneu_proto::Id::from_bytes([3; 16]);
+        let mut setup = setup(json!({"readmissions": [{
+            "key": {"device": device, "fingerprint": "a".repeat(64), "removal_hlc": 10,
+                "removal_writer": device, "setup_generation": 1},
+            "removed_name": "Phone", "value": {"device_id": device,
+                "fingerprint": "a".repeat(64), "role": "phone", "name": "Phone",
+                "status": "member", "hlc": 20, "writer_device": device},
+            "introducer": device, "introducer_name": "Laptop", "decision": "pending"
+        }]}));
+        assert_eq!(setup.readmissions.len(), 1);
+        assert!(matches!(
+            top(&setup, &[], &Remembered::default()),
+            Top::Readmit { .. }
+        ));
+        let mut remembered = Remembered::default();
+        remembered.close([readmission_key(&setup.readmissions[0].key)]);
+        assert_eq!(top(&setup, &[], &remembered), Top::None);
+        setup.readmissions[0].error = Some("setup capacity exceeded".into());
+        let Top::Readmit { record } = top(&setup, &[], &remembered) else {
+            panic!("native action failure must reopen the dismissed card");
+        };
+        assert_eq!(record.error.as_deref(), Some("setup capacity exceeded"));
+        setup.readmissions[0].error = None;
+        assert_eq!(top(&setup, &[], &remembered), Top::None);
     }
 
     #[test]

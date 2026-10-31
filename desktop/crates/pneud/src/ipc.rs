@@ -142,6 +142,10 @@ pub enum Command {
         binding_generation: u64,
         allow: bool,
     },
+    ReadmissionDecision {
+        key: crate::store::members::ReadmissionKey,
+        allow: bool,
+    },
     RemoveFromSetup {
         device: Id,
         setup_generation: u64,
@@ -488,6 +492,7 @@ async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
             let linked=core.link_existing_device(device,binding_generation.zip(expected_scope)).await?;
             if binding_generation.is_some() {serde_json::json!(linked)} else {serde_json::Value::Null}
         },
+        Command::ReadmissionDecision { key, allow } => {core.decide_readmission(key,allow).await?;serde_json::Value::Null},
         Command::SetupDecision {device,setup_generation,binding_generation,allow} => {core.decide_setup(device,setup_generation,binding_generation,allow).await?;serde_json::Value::Null},
         Command::RemoveFromSetup {device,setup_generation,binding_generation,fingerprint} => {core.remove_setup_device_confirmed(device,setup_generation,binding_generation,fingerprint).await?;serde_json::Value::Null},
         Command::DismissSetupNotice {device,binding_generation} => {core.dismiss_setup_notice(device,binding_generation).await?;serde_json::Value::Null},
@@ -962,6 +967,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn readmission_decisions_roundtrip_exact_removal_authority() -> Result<()> {
+        let key = crate::store::members::ReadmissionKey {
+            device: Id::from_bytes([3; 16]),
+            fingerprint: Hash::new("c".repeat(64))?,
+            removal_hlc: u64::MAX,
+            removal_writer: Id::from_bytes([2; 16]),
+            setup_generation: 7,
+        };
+        for allow in [false, true] {
+            let value =
+                serde_json::json!({"command":"readmission_decision","key":key,"allow":allow});
+            let command: Command = serde_json::from_value(value.clone())?;
+            assert_eq!(serde_json::to_value(command)?, value);
+        }
+        Ok(())
     }
 
     #[test]

@@ -4970,4 +4970,85 @@ mod tests {
         a.shutdown_actions().await?;
         b.shutdown_actions().await
     }
+    #[tokio::test]
+    async fn setup_introduced_authenticated_refusal_keeps_trust_before_and_after_ready()
+    -> Result<()> {
+        for ready in [false, true] {
+            let (_da, a, _la) = core().await?;
+            let (_db, b, lb) = core().await?;
+            let lb = MockListener::new(lb);
+            computer_route(&a, &b, lb.local_addr()?.to_string()).await?;
+            bind(&b, &a).await?;
+            let device = b.identity.device_id.clone();
+            let d = device.clone();
+            a.store.call(move |c| { c.execute("UPDATE setup_links SET introduced_by=?,introducer_name='Introducer',negotiated=1,participating=1 WHERE device=?",rusqlite::params![Id::from_bytes([9;16]).as_str(),d.as_str()])?;Ok(()) }).await?;
+            a.store
+                .setup_link(device.clone(), SetupScope::Enabled)
+                .await?;
+            let generation = a.store.pairing_generation(&device).unwrap();
+            assert!(a.store.setup_protected(&device));
+            assert_eq!(a.setup_status().await?["links"][0]["hello_seen"], false);
+            assert_eq!(a.setup_status().await?["links"][0]["ready"], false);
+            let peer = a.store.peer_info().await?.remove(0);
+            let (cancel, rx) = watch::channel(false);
+            let worker = Task::spawn(a.clone().dial_worker(peer, rx));
+            let mut tls = if ready {
+                accept_ready(&b, &lb, None).await?
+            } else {
+                accept_client_hello(&b, &lb).await?
+            };
+            if ready {
+                until(|| a.connected_devices().contains(&device)).await?;
+                wait_established(&a, &device).await?;
+            }
+            send_error(&mut tls, ErrorCode::Unauthorized).await?;
+            until(|| a.ui_snapshot().devices[0].state == "unauthorized").await?;
+            assert_eq!(a.paired_devices(), vec![device.clone()]);
+            assert_eq!(a.store.pairing_generation(&device), Some(generation));
+            assert!(a.store.setup_protected(&device));
+            assert!(
+                a.store
+                    .setup_state()
+                    .roster
+                    .iter()
+                    .all(|m| m.status != MemberStatus::Removed)
+            );
+            cancel.send_replace(true);
+            worker.await??;
+            drop(tls);
+            // A direct successful READY in this generation clears the hint.
+            let peer = a.store.peer_info().await?.remove(0);
+            a.mesh
+                .links
+                .lock()
+                .unwrap()
+                .get_mut(&device)
+                .unwrap()
+                .issue
+                .as_mut()
+                .unwrap()
+                .retry_at = Instant::now();
+            let (cancel, rx) = watch::channel(false);
+            let worker = Task::spawn(a.clone().dial_worker(peer, rx));
+            let tls = accept_ready(&b, &lb, None).await?;
+            until(|| a.connected_devices().contains(&device)).await?;
+            assert!(a.link_problem(&device).is_none());
+            cancel.send_replace(true);
+            worker.await??;
+            drop(tls);
+            a.store
+                .pair(device.clone(), b.identity.fingerprint.clone())
+                .await?;
+            a.set_link_problem(&device, generation, Some(LinkProblem::Unauthorized));
+            assert!(
+                a.link_problem(&device).is_none(),
+                "old generation refusal reached replacement"
+            );
+            assert!(link_problem(&anyhow::anyhow!("peer idle timeout")).is_none());
+            assert!(link_problem(&anyhow::anyhow!("TLS handshake failed")).is_none());
+            a.shutdown_actions().await?;
+            b.shutdown_actions().await?;
+        }
+        Ok(())
+    }
 }

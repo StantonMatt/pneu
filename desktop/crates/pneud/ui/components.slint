@@ -43,6 +43,8 @@ export component PneuButton inherits Rectangle {
     in property <bool> wide;
     // Popups focus their default button once shown; focusing during layout recurses.
     in property <bool> autofocus;
+    in property <string> focus-key;
+    changed focus-key => { if root.autofocus { focus-timer.running = true; } }
     callback clicked();
     private property <bool> is-row: kind == ButtonKind.row;
     private property <bool> is-link: kind == ButtonKind.link;
@@ -67,7 +69,7 @@ export component PneuButton inherits Rectangle {
     accessible-action-default => { if root.enabled && root.interactive { root.clicked(); } }
     forward-focus: fs;
     public function focus-popup() { fs.focus-popup(); }
-    Timer {
+    focus-timer := Timer {
         interval: 1ms; running: root.autofocus;
         triggered => { self.running = false; fs.focus-popup(); }
     }

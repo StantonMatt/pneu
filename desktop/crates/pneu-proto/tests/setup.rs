@@ -177,3 +177,18 @@ fn setup_encoded_payload_boundary() {
         assert_eq!(decode_frame(&frame(0x22, &raw)).is_ok(), good);
     }
 }
+
+#[test]
+fn shared_readmission_fixtures_use_existing_members_wire_format() {
+    let vectors: serde_json::Value =
+        serde_json::from_str(include_str!("../../../protocol-vectors/readmission.json")).unwrap();
+    for (name, fixture) in vectors["fixtures"].as_object().unwrap() {
+        let raw = serde_json::to_string(&fixture["payload"]).unwrap();
+        let message = decode_frame(&frame(0x22, &raw)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(
+            decode_frame(&encode_frame(&message).unwrap()).unwrap(),
+            message,
+            "{name}"
+        );
+    }
+}

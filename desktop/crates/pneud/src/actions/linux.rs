@@ -1445,6 +1445,7 @@ mod tests {
             let notice = Notice::link_request(
                 &["Phone".into()],
                 vec![Decision {
+                    readmission: None,
                     device: pneu_proto::Id::from_bytes([1; 16]),
                     setup_generation: 2,
                     binding_generation: 3,
@@ -1914,6 +1915,7 @@ mod tests {
                 window_setup::{Decision, Requests},
             };
             let request = |n| Decision {
+                readmission: None,
                 device: pneu_proto::Id::from_bytes([n; 16]),
                 setup_generation: 2,
                 binding_generation: 3,
@@ -2009,6 +2011,82 @@ mod tests {
                     .await
                     .contains_key(&id)
             );
+        }
+
+        // Re-admission uses the same private bus, but carries exact-key/R
+        // authority. Replacing the notice must invalidate its previous action.
+        {
+            use crate::{
+                store::members::{Readmission, ReadmissionKey},
+                ui::{notifications::Notice, window_setup::Requests},
+            };
+            let key = ReadmissionKey {
+                device: pneu_proto::Id::from_bytes([3; 16]),
+                fingerprint: pneu_proto::Hash::new("c".repeat(64))?,
+                removal_hlc: 10,
+                removal_writer: pneu_proto::Id::from_bytes([2; 16]),
+                setup_generation: 7,
+            };
+            let record: Readmission = serde_json::from_value(
+                serde_json::json!({"key":key,"removed_name":"Laptop","value":{"device_id":key.device,"fingerprint":key.fingerprint,"role":"computer","name":"Laptop renamed","status":"member","hlc":20,"writer_device":key.removal_writer},"introducer":pneu_proto::Id::from_bytes([1;16]),"introducer_name":"Phone","decision":"pending"}),
+            )?;
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            actions.set_commands(tx);
+            let mut requests = Requests::default();
+            requests
+                .sync_notice(Some(Notice::readmission(&record)), &actions)
+                .await;
+            assert_eq!(
+                notification_copy.lock().unwrap().0,
+                "Laptop was removed from this computer. Phone added it again"
+            );
+            assert_eq!(notification_actions.lock().unwrap()[1], "Keep removed");
+            assert_eq!(notification_actions.lock().unwrap()[3], "Allow");
+            let old_action = notification_actions.lock().unwrap()[0].clone();
+            let mut newer = record.clone();
+            newer.key.removal_hlc = 30;
+            requests
+                .sync_notice(Some(Notice::readmission(&newer)), &actions)
+                .await;
+            let id = {
+                let n = actions.notifications().await?;
+                let targets = n.as_ref().unwrap().targets.lock().await;
+                *targets.keys().max().unwrap()
+            };
+            let actions_shown = notification_actions.lock().unwrap().clone();
+            for action in [
+                old_action,
+                actions_shown[0].clone(),
+                actions_shown[2].clone(),
+            ] {
+                server
+                    .emit_signal(
+                        None::<&str>,
+                        "/org/freedesktop/Notifications",
+                        "org.freedesktop.Notifications",
+                        "ActionInvoked",
+                        &(id, action),
+                    )
+                    .await?;
+            }
+            for allow in [false, true] {
+                match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await?
+                    .context("readmission action")?
+                {
+                    crate::ui::Command::SetupDecision {
+                        requests,
+                        allow: got,
+                    } => {
+                        assert_eq!(got, allow);
+                        assert_eq!(requests.len(), 1);
+                        assert_eq!(requests[0].readmission, Some(newer.key.clone()));
+                    }
+                    _ => panic!("wrong readmission action"),
+                }
+            }
+            assert!(rx.try_recv().is_err());
+            requests.sync_notice(None, &actions).await;
         }
 
         // Real D-Bus signal ordering and all notification launch destinations.

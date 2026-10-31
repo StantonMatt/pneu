@@ -749,7 +749,11 @@ async fn setup_prompt_once_deny_allow_refresh_and_generation_fences() -> Result<
     f.s.setup_prompt(f.f.clone(), remote.clone()).await?;
     assert!(f.s.setup_state().links[0].prompt);
     let path = f._dir.path().join("state.sqlite3");
-    let before = f.s.setup_state();
+    let mut before = f.s.setup_state();
+    // HELLO evidence belongs to this daemon run; durable consent survives.
+    for link in &mut before.links {
+        link.hello_seen = false;
+    }
     drop(f.s);
     f.s = Store::open(&path)?;
     assert_eq!(f.s.setup_state(), before);
@@ -879,7 +883,10 @@ async fn setup_crash_before_and_after_commit_reopens_atomically_without_reinstal
     for before in [true, false] {
         let f = Fixture::new().await?;
         let path = f._dir.path().join("state.sqlite3");
-        let old = f.s.setup_state();
+        let mut old = f.s.setup_state();
+        for link in &mut old.links {
+            link.hello_seen = false;
+        }
         drop(f.s);
         let mut command = std::process::Command::new(std::env::current_exe()?);
         command
@@ -1974,7 +1981,7 @@ async fn setup_plain_unpair_clears_discovery_and_bounded_separate_markers() -> R
     Ok(())
 }
 #[tokio::test]
-async fn setup_legacy_roster_link_keeps_loss_handling_and_survives_withdrawal() -> Result<()> {
+async fn setup_legacy_introduced_link_keeps_protection_and_survives_withdrawal() -> Result<()> {
     for own in [true, false] {
         let f = Fixture::new().await?;
         f.merge(f.snapshot(vec![member(3)])).await?;
@@ -1985,7 +1992,7 @@ async fn setup_legacy_roster_link_keeps_loss_handling_and_survives_withdrawal() 
         };
         f.s.setup_legacy_ready(legacy).await?;
         assert!(!f.s.setup_scoped(&id(3)));
-        assert!(!f.s.setup_protected(&id(3)));
+        assert!(f.s.setup_protected(&id(3)));
         f.s.call(|c| {
             c.execute("INSERT INTO outbox_artifacts(id,operation,meta) VALUES('legacy','operation','{}')",[])?;
             c.execute("INSERT INTO outbox_deliveries(artifact,device,generation,fingerprint) VALUES('legacy',?,1,?)",params![id(3).as_str(),member(3).fingerprint.as_str()])?;Ok(())
@@ -2414,5 +2421,1118 @@ async fn setup_withdrawn_reconnect_notice_suppression_survives_restart() -> Resu
             .setup_quiet_reconnect(member(9).fingerprint)
             .await?
     );
+    Ok(())
+}
+
+// Shared scenario clock is intentionally fixed (and may be ahead of the host).
+// Keep fixture bytes identical to Android; only the validation clock is injected.
+struct ReadmitVectors {
+    dir: tempfile::TempDir,
+    s: Store,
+    local: Member,
+    a: Member,
+    d: Member,
+    now: u64,
+}
+impl ReadmitVectors {
+    async fn new(v: &serde_json::Value) -> Result<Self> {
+        let dir = crate::test_support::scratch()?;
+        let s = Store::open(&dir.path().join("state.sqlite3"))?;
+        let roster: Members = serde_json::from_value(v["fixtures"]["join"]["payload"].clone())?;
+        let a = roster.members[0].clone();
+        let local = roster.members[1].clone();
+        let d = roster.members[3].clone();
+        for m in [&a, &d] {
+            s.pair(m.device_id.clone(), m.fingerprint.clone()).await?;
+            let m = m.clone();
+            let device = m.device_id.clone();
+            s.call(move |c| {
+                c.execute(
+                    "UPDATE peers SET name=?,role=? WHERE id=?",
+                    params![
+                        m.name,
+                        if m.role == DeviceRole::Phone {
+                            "phone"
+                        } else {
+                            "computer"
+                        },
+                        m.device_id.as_str()
+                    ],
+                )?;
+                Ok(())
+            })
+            .await?;
+            s.setup_link(device, SetupScope::Enabled).await?;
+        }
+        let initial = [a.clone(), local.clone(), d.clone()];
+        s.call(move |c| {
+            c.execute("UPDATE setup_state SET setup_id=?,generation=7",[id(0).as_str()])?;
+            for value in initial {
+                let payload=serde_json::json!({"value":value,"removal":null,"denied":false,"setup_id":id(0)});
+                c.execute("INSERT INTO setup_entries VALUES(?,?,?)",params![value.device_id.as_str(),value.fingerprint.as_str(),payload.to_string()])?;
+            }
+            Ok(())
+        }).await?;
+        Self::reload(&s).await?;
+        let h = Self {
+            dir,
+            s,
+            local,
+            a,
+            d,
+            now: v["clock_ms"].as_u64().unwrap(),
+        };
+        // The shared initial state names authenticated READY senders, not
+        // merely locally enabled links. Establish their reciprocal authority.
+        for sender in [&h.a, &h.d] {
+            h.s.setup_activate(
+                h.fence(sender),
+                h.local.clone(),
+                sender.clone(),
+                SetupHello {
+                    scope: SetupScope::Enabled,
+                    setup_id: Some(id(0)),
+                },
+                |_| {},
+            )
+            .await?;
+            if sender.role == DeviceRole::Computer {
+                h.s.mark_peer_established(sender.device_id.clone()).await?;
+            }
+        }
+        Ok(h)
+    }
+    async fn reload(s: &Store) -> Result<()> {
+        let state = s.call(|c| members::state(c)).await?;
+        *s.setup.lock().unwrap() = Some(state);
+        Ok(())
+    }
+    fn fence(&self, sender: &Member) -> SetupFence {
+        SetupFence {
+            generation: self.s.setup_state().generation,
+            binding_generation: self.s.pairing_generation(&sender.device_id).unwrap_or(0),
+            device: sender.device_id.clone(),
+            fingerprint: sender.fingerprint.clone(),
+            connection: 1,
+            current: Arc::new(AtomicU64::new(1)),
+        }
+    }
+    async fn entry(&self, pin: &Hash) -> Result<serde_json::Value> {
+        let pin = pin.clone();
+        let subject = Id::from_bytes([0x33; 16]);
+        self.s
+            .call(move |c| {
+                let raw: Option<String> = c
+                    .query_row(
+                        "SELECT payload FROM setup_entries WHERE device=? AND fingerprint=?",
+                        params![subject.as_str(), pin.as_str()],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                Ok(raw
+                    .map(|v| serde_json::from_str(&v))
+                    .transpose()?
+                    .unwrap_or(serde_json::Value::Null))
+            })
+            .await
+    }
+    async fn all_subject(&self) -> Result<Vec<serde_json::Value>> {
+        self.s
+            .call(|c| {
+                let mut q = c.prepare(
+                    "SELECT payload FROM setup_entries WHERE device=? ORDER BY fingerprint",
+                )?;
+                q.query_map([Id::from_bytes([0x33; 16]).as_str()], |r| {
+                    r.get::<_, String>(0)
+                })?
+                .map(|r| Ok(serde_json::from_str(&r?)?))
+                .collect()
+            })
+            .await
+    }
+    async fn pair(&self, mut m: Member) -> Result<()> {
+        let floor = self.now - 1;
+        self.s
+            .call(move |c| {
+                c.execute(
+                    "UPDATE mesh_clock SET last_seen=max(last_seen,?)",
+                    [floor.to_string()],
+                )?;
+                Ok(())
+            })
+            .await?;
+        m.status = MemberStatus::Member;
+        let hello = Hello {
+            version: 1,
+            device_id: m.device_id.clone(),
+            name: m.name,
+            capabilities: vec!["mesh".into(), "setup".into()],
+            paused: None,
+            role: Some(m.role),
+            addresses: None,
+            setup: Some(SetupHello {
+                scope: SetupScope::Enabled,
+                setup_id: Some(id(0)),
+            }),
+        };
+        self.s
+            .pair_then_hello_scoped(
+                m.device_id,
+                m.fingerprint,
+                Some(hello),
+                Some(self.local.clone()),
+                SetupScope::Enabled,
+                false,
+                || {},
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn setup_shared_readmission_sequences() -> Result<()> {
+    use serde_json::{Value, json};
+    let v: Value =
+        serde_json::from_str(include_str!("../../../protocol-vectors/readmission.json"))?;
+    let old_pin = Hash::new("c".repeat(64))?;
+    let new_pin = Hash::new("e".repeat(64))?;
+    let subject = Id::from_bytes([0x33; 16]);
+    for scenario in v["scenarios"].as_array().unwrap() {
+        let mut h = ReadmitVectors::new(&v).await?;
+        let mut captured = None;
+        let mut blocked = Vec::new();
+        let mut filled = Vec::new();
+        for step in scenario["steps"].as_array().unwrap() {
+            let context = format!("{}: {step}", scenario["name"]);
+            let before = h.s.setup_state();
+            let before_subject = h.all_subject().await?;
+            let settings_subject = subject.clone();
+            let before_settings =
+                h.s.call(move |c| settings::fields(c, &settings_subject))
+                    .await?;
+            let before_generation = h.s.pairing_generation(&subject).unwrap_or(0);
+            let before_notices: i64 = h
+                .s
+                .call(|c| Ok(c.query_row("SELECT count(*) FROM setup_notices", [], |r| r.get(0))?))
+                .await?;
+            let mut dedup = None;
+            let mut result = Ok(());
+            if let Some(receive) = step["receive"].as_str() {
+                let fixture = &v["fixtures"][receive];
+                let sender = if fixture["authenticated_sender"] == json!(h.a.device_id) {
+                    &h.a
+                } else {
+                    &h.d
+                };
+                let snapshot: Members = serde_json::from_value(fixture["payload"].clone())?;
+                result =
+                    h.s.members_merge_at(
+                        h.fence(sender),
+                        h.local.clone(),
+                        snapshot,
+                        blocked.clone(),
+                        h.now,
+                        |_| {},
+                    )
+                    .await
+                    .map(|d| {
+                        dedup = Some(d);
+                    });
+            } else if let Some(action) = step["local_action"].as_str() {
+                match action {
+                    "dismiss" => {}
+                    "restart" => {
+                        let path = h.dir.path().join("state.sqlite3");
+                        drop(h.s);
+                        h.s = Store::open(&path)?;
+                    }
+                    "evict-membership-receipts" => {
+                        h.s.call(|c| {
+                            c.execute("DELETE FROM members_receipts", [])?;
+                            Ok(())
+                        })
+                        .await?
+                    }
+                    "capture-allow-notification" => {
+                        captured =
+                            h.s.setup_state()
+                                .readmissions
+                                .first()
+                                .map(|r| r.key.clone())
+                    }
+                    "invoke-captured-allow" => {
+                        if let Some(key) = captured.clone() {
+                            result =
+                                h.s.setup_readmit(
+                                    key,
+                                    h.local.device_id.clone(),
+                                    true,
+                                    blocked.clone(),
+                                    |_| {},
+                                )
+                                .await;
+                        }
+                    }
+                    "allow-C"
+                    | "allow-C-again"
+                    | "keep-removed-C"
+                    | "cancel-attempt-and-retry-allow-C" => {
+                        if action == "cancel-attempt-and-retry-allow-C" {
+                            blocked.clear();
+                        }
+                        let key =
+                            h.s.setup_state()
+                                .readmissions
+                                .first()
+                                .map(|r| r.key.clone())
+                                .or(captured.clone());
+                        if let Some(key) = key {
+                            captured = Some(key.clone());
+                            result =
+                                h.s.setup_readmit(
+                                    key,
+                                    h.local.device_id.clone(),
+                                    action != "keep-removed-C",
+                                    blocked.clone(),
+                                    |_| {},
+                                )
+                                .await;
+                        }
+                    }
+                    "fresh-token-pair-C-with-enabled-scope"
+                    | "fresh-token-pair-C-new-pin-with-enabled-scope" => {
+                        let mut m: Members =
+                            serde_json::from_value(v["fixtures"]["join"]["payload"].clone())?;
+                        let mut c = m.members.remove(2);
+                        if action.contains("new-pin") {
+                            c.fingerprint = new_pin.clone();
+                        }
+                        h.pair(c).await?;
+                    }
+                    "retire-and-rejoin-S-via-A" => {
+                        h.s.setup_withdraw(h.fence(&h.a), |_| {}).await?;
+                        h.pair(h.a.clone()).await?;
+                        h.pair(h.d.clone()).await?;
+                    }
+                    "fresh-token-rejoin-via-A" => h.pair(h.a.clone()).await?,
+                    "fill-active-roster-to-17" => {
+                        let count =
+                            h.s.setup_state()
+                                .roster
+                                .iter()
+                                .filter(|m| m.status == MemberStatus::Member)
+                                .count();
+                        let mut roster = h.s.setup_state().roster;
+                        for n in 80..80 + (17 - count) as u8 {
+                            let mut m = member(n);
+                            m.hlc = h.now;
+                            m.writer_device = h.local.device_id.clone();
+                            filled.push(m.device_id.clone());
+                            roster.push(m);
+                        }
+                        let snapshot = Members {
+                            setup_id: id(0),
+                            transfer_id: Id::from_bytes([90; 16]),
+                            members: roster,
+                        };
+                        h.s.members_merge_at(
+                            h.fence(&h.a),
+                            h.local.clone(),
+                            snapshot,
+                            vec![],
+                            h.now,
+                            |_| {},
+                        )
+                        .await?;
+                    }
+                    "free-active-slot-and-start-direct-attempt-targeting-C-pin" => {
+                        h.s.setup_remove(h.local.device_id.clone(), filled.pop().unwrap(), |_| {})
+                            .await?;
+                        blocked.push((None, old_pin.clone()));
+                    }
+                    _ => panic!("unhandled action {action}"),
+                }
+            }
+            let expect = &step["expect"];
+            let expected_error = expect.get("error").is_some()
+                || expect.get("nack_code").is_some()
+                || expect.get("visible_error").is_some()
+                || expect["deferred"] == true;
+            assert_eq!(result.is_err(), expected_error, "{context}: {result:?}");
+            if expect["error"] == "malformed_message" {
+                assert!(
+                    matches!(
+                        result.as_ref().unwrap_err().downcast_ref::<MembersError>(),
+                        Some(MembersError::Malformed)
+                    ),
+                    "{context}"
+                );
+            }
+            if expect["visible_error"] == "setup_capacity" {
+                assert!(
+                    matches!(
+                        result.as_ref().unwrap_err().downcast_ref::<MembersError>(),
+                        Some(MembersError::Capacity)
+                    ),
+                    "{context}"
+                );
+            }
+            if let Some(code) = expect["nack_code"].as_str() {
+                assert_eq!(code, "unsupported_kind", "{context}");
+                assert!(
+                    h.s.setup_state().withdrawn
+                        && result.as_ref().unwrap_err().is::<PairingRevoked>(),
+                    "{context}"
+                );
+            }
+            if expect["deferred"] == true {
+                assert!(
+                    result
+                        .as_ref()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("Pairing in progress"),
+                    "{context}"
+                );
+            }
+            let entries = h.all_subject().await?;
+            let record = entries
+                .iter()
+                .find_map(|e| e.get("readmission").filter(|r| !r.is_null()));
+            let current_pin = record
+                .and_then(|r| r["key"]["fingerprint"].as_str())
+                .map(Hash::new)
+                .transpose()?
+                .unwrap_or(old_pin.clone());
+            let entry = h.entry(&current_pin).await?;
+            let after = h.s.setup_state();
+            let binding =
+                h.s.peers()
+                    .await?
+                    .into_iter()
+                    .find(|(_, d)| *d == subject)
+                    .map(|(p, _)| p);
+            let mut actual = serde_json::Map::new();
+            actual.insert("denied".into(), entry["denied"].clone());
+            actual.insert(
+                "exported_C".into(),
+                json!(
+                    after
+                        .roster
+                        .iter()
+                        .find(|m| m.device_id == subject && m.fingerprint == current_pin)
+                        .map(|m| if m.status == MemberStatus::Member {
+                            "member"
+                        } else {
+                            "removed"
+                        })
+                ),
+            );
+            actual.insert("binding_C".into(), json!(binding.is_some()));
+            actual.insert("binding_C_pin".into(), json!(binding));
+            for field in ["removal", "removal_high_water"] {
+                actual.insert(field.into(),if entry["removal"].is_null(){Value::Null}else{json!({"hlc":entry["removal"]["hlc"],"writer_device":entry["removal"]["writer_device"]})});
+            }
+            actual.insert(
+                "record_decision".into(),
+                record.map(|r| r["decision"].clone()).unwrap_or(Value::Null),
+            );
+            actual.insert(
+                "pending_questions_for_C".into(),
+                json!(
+                    after
+                        .readmissions
+                        .iter()
+                        .filter(|r| r.key.device == subject)
+                        .count()
+                ),
+            );
+            actual.insert(
+                "pending_questions_for_own_key".into(),
+                json!(
+                    after
+                        .readmissions
+                        .iter()
+                        .filter(|r| r.key.device == h.local.device_id)
+                        .count()
+                ),
+            );
+            actual.insert(
+                "introducer".into(),
+                record
+                    .map(|r| r["introducer"].clone())
+                    .unwrap_or(Value::Null),
+            );
+            for (field, source) in [
+                ("value_hlc", "hlc"),
+                ("value_writer", "writer_device"),
+                ("value_name", "name"),
+            ] {
+                actual.insert(
+                    field.into(),
+                    record
+                        .map(|r| r["value"][source].clone())
+                        .unwrap_or(Value::Null),
+                );
+            }
+            actual.insert("record_barrier".into(),record.map(|r|json!({"hlc":r["key"]["removal_hlc"],"writer_device":r["key"]["removal_writer"]})).unwrap_or(Value::Null));
+            actual.insert("ack_deduplicated".into(), json!(dedup));
+            actual.insert("roster_resend".into(), json!(before.roster != after.roster));
+            actual.insert(
+                "binding_generation_delta".into(),
+                json!(h.s.pairing_generation(&subject).unwrap_or(0) - before_generation),
+            );
+            actual.insert(
+                "old_pin_denied".into(),
+                h.entry(&old_pin).await?["denied"].clone(),
+            );
+            actual.insert(
+                "new_pin_denied".into(),
+                h.entry(&new_pin).await?["denied"].clone(),
+            );
+            actual.insert(
+                "old_pin_barrier_retained".into(),
+                json!(!h.entry(&old_pin).await?["removal"].is_null()),
+            );
+            actual.insert(
+                "setup_generation_advanced".into(),
+                json!(after.generation > before.generation),
+            );
+            actual.insert("pending_record_discarded".into(), json!(record.is_none()));
+            actual.insert("withdrawn".into(), json!(after.withdrawn));
+            actual.insert("setup_id".into(), json!(after.setup_id));
+            actual.insert(
+                "retired_roster_exported".into(),
+                json!(after.roster.iter().any(|m| m.device_id == subject)),
+            );
+            let after_notices: i64 = h
+                .s
+                .call(|c| Ok(c.query_row("SELECT count(*) FROM setup_notices", [], |r| r.get(0))?))
+                .await?;
+            actual.insert(
+                "joined_notices_delta".into(),
+                json!(after_notices - before_notices),
+            );
+            for (key, expected) in expect.as_object().into_iter().flatten() {
+                if let Some(got) = actual.get(key) {
+                    assert_eq!(got, expected, "{context}: {key}");
+                    continue;
+                }
+                match key.as_str() {
+                    "record" => {
+                        if expected.is_null() {
+                            assert!(record.is_none(), "{context}");
+                        } else {
+                            let r = record.expect(&context);
+                            for (k, val) in expected.as_object().unwrap() {
+                                let got = match k.as_str() {
+                                    "value_hlc" => &r["value"]["hlc"],
+                                    "value_writer" => &r["value"]["writer_device"],
+                                    "value_name" => &r["value"]["name"],
+                                    _ => &r[k],
+                                };
+                                assert_eq!(got, val, "{context}: record.{k}");
+                            }
+                        }
+                    }
+                    "state_unchanged" => {
+                        assert_eq!(before, after, "{context}");
+                        assert_eq!(before_subject, entries, "{context}");
+                    }
+                    "new_question" => assert_eq!(
+                        before.readmissions.len(),
+                        after.readmissions.len(),
+                        "{context}"
+                    ),
+                    "scope" => assert_eq!(
+                        after
+                            .links
+                            .iter()
+                            .find(|l| l.device == subject)
+                            .unwrap()
+                            .scope,
+                        SetupScope::Enabled,
+                        "{context}"
+                    ),
+                    "readiness" => {
+                        assert!(!h.s.peer_established(subject.clone()).await?, "{context}")
+                    }
+                    "hello_seen" => assert!(
+                        !h.s.setup_remote_scopes().contains_key(&subject),
+                        "{context}"
+                    ),
+                    "authored_values_delta" => assert_eq!(before.roster, after.roster, "{context}"),
+                    "diagnostic" => {
+                        let raw: String =
+                            h.s.call(move |c| {
+                                Ok(c.query_row("SELECT payload FROM setup_conflicts", [], |r| {
+                                    r.get(0)
+                                })?)
+                            })
+                            .await?;
+                        let m: Member = serde_json::from_str(&raw)?;
+                        assert_eq!(
+                            format!(
+                                "{} has a different certificate · Pair with it directly",
+                                m.name
+                            ),
+                            expected.as_str().unwrap(),
+                            "{context}"
+                        );
+                    }
+                    "dial_C" => assert!(binding.is_none(), "{context}"),
+                    "new_member_tuple_greater_than" => assert!(
+                        entry["value"]["hlc"].as_u64().unwrap() > expected["hlc"].as_u64().unwrap(),
+                        "{context}"
+                    ),
+                    "member_hlc" => assert_eq!(
+                        h.s.setup_state()
+                            .roster
+                            .iter()
+                            .find(|m| m.device_id == subject)
+                            .unwrap()
+                            .hlc,
+                        expected.as_u64().unwrap(),
+                        "{context}"
+                    ),
+                    "settings_bootstrap" => {
+                        let d = subject.clone();
+                        let fields = h.s.call(move |c| settings::fields(c, &d)).await?;
+                        assert_eq!(fields.len(), 2, "{context}");
+                        assert!(fields.iter().all(|f| f.enabled && f.hlc == 0), "{context}");
+                    }
+                    "settings_reset" => {
+                        let d = subject.clone();
+                        assert_eq!(
+                            before_settings,
+                            h.s.call(move |c| settings::fields(c, &d)).await?,
+                            "{context}"
+                        );
+                    }
+                    "own_readmission_record" => assert!(
+                        !after
+                            .readmissions
+                            .iter()
+                            .any(|r| r.key.device == h.local.device_id),
+                        "{context}"
+                    ),
+                    "own_deny_cleared" | "own_removal_high_water" => {
+                        let own = h.local.clone();
+                        let entry:Value=h.s.call(move |c| { let raw:String=c.query_row("SELECT payload FROM setup_entries WHERE device=? AND fingerprint=?",params![own.device_id.as_str(),own.fingerprint.as_str()],|r|r.get(0))?;Ok(serde_json::from_str(&raw)?) }).await?;
+                        if key == "own_deny_cleared" {
+                            assert_eq!(entry["denied"], false, "{context}");
+                        } else {
+                            assert_eq!(entry["removal"]["hlc"], expected["hlc"], "{context}");
+                            assert_eq!(
+                                entry["removal"]["writer_device"], expected["writer_device"],
+                                "{context}"
+                            );
+                        }
+                    }
+                    "local_identity_unchanged" => {
+                        assert_eq!(h.local.device_id, Id::from_bytes([0x22; 16]));
+                        assert_eq!(h.local.fingerprint, Hash::new("b".repeat(64))?);
+                    }
+                    "error" | "nack_code" | "visible_error" | "deferred" => {}
+                    _ => panic!("unhandled assertion {key}: {context}"),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_readmission_transaction_failures_and_independent_reach() -> Result<()> {
+    let f = Fixture::new().await?;
+    let mut removed = member(3);
+    removed.status = MemberStatus::Removed;
+    removed.hlc = 10;
+    f.merge(f.snapshot(vec![removed.clone()])).await?;
+    let mut newer = member(3);
+    newer.hlc = 20;
+    newer.reach = Some(MemberReach {
+        addresses: vec!["192.168.1.12:47821".into()],
+        relay: vec![],
+        hlc: 30,
+        writer_device: id(3),
+    });
+    f.merge(f.snapshot(vec![newer.clone()])).await?;
+    let key = f.s.setup_state().readmissions[0].key.clone();
+    let mut renamed = newer.clone();
+    renamed.hlc = 21;
+    renamed.name = "Renamed".into();
+    renamed.reach.as_mut().unwrap().hlc = 25;
+    f.merge(f.snapshot(vec![renamed])).await?;
+    let record = &f.s.setup_state().readmissions[0];
+    assert_eq!(record.value.name, "Renamed");
+    assert_eq!(record.value.reach.as_ref().unwrap().hlc, 30);
+    let before = f.s.setup_state();
+    for trigger in [
+        "CREATE TEMP TRIGGER readmit_fail BEFORE INSERT ON peers BEGIN SELECT RAISE(ABORT,'install failed'); END;",
+        "CREATE TEMP TRIGGER readmit_fail BEFORE INSERT ON peer_settings BEGIN SELECT RAISE(ABORT,'settings failed'); END;",
+    ] {
+        f.s.call(move |c| {
+            c.execute_batch(trigger)?;
+            Ok(())
+        })
+        .await?;
+        assert!(
+            f.s.setup_readmit(key.clone(), id(2), true, vec![], |_| panic!(
+                "failed transaction published"
+            ))
+            .await
+            .is_err()
+        );
+        assert_eq!(f.s.setup_state(), before);
+        assert!(f.pin(3).await?.is_none());
+        f.s.call(|c| {
+            c.execute_batch("DROP TRIGGER readmit_fail;")?;
+            Ok(())
+        })
+        .await?;
+    }
+    f.s.fail_next("members_before_commit", 1);
+    assert!(
+        f.s.setup_readmit(key.clone(), id(2), true, vec![], |_| panic!(
+            "failed commit published"
+        ))
+        .await
+        .is_err()
+    );
+    assert_eq!(f.s.setup_state(), before);
+    assert!(f.pin(3).await?.is_none());
+    // A conflict or any live attempt (including unresolved fingerprint only)
+    // leaves the record pending. Ending an attempt makes the same Allow work.
+    for blocked in [
+        vec![(Some(id(3)), member(9).fingerprint)],
+        vec![(None, member(3).fingerprint.clone())],
+    ] {
+        assert!(
+            f.s.setup_readmit(key.clone(), id(2), true, blocked, |_| {})
+                .await
+                .is_err()
+        );
+        assert_eq!(f.s.setup_state(), before);
+    }
+    f.s.pair(id(8), member(3).fingerprint.clone()).await?;
+    assert!(
+        f.s.setup_readmit(key.clone(), id(2), true, vec![], |_| {})
+            .await
+            .is_err()
+    );
+    assert!(f.pin(3).await?.is_none());
+    f.s.unpair_then(id(8), |_| {}).await?;
+    f.s.setup_readmit(key.clone(), id(2), true, vec![], |_| {})
+        .await?;
+    assert!(f.s.setup_protected(&id(3)));
+    let generation = f.s.pairing_generation(&id(3));
+    // An edited setting and its outgoing receipt survive repeated Allow/replay.
+    f.s.call(|c| {
+        c.execute(
+            "UPDATE peer_settings SET enabled=0,hlc='23' WHERE device=?",
+            [id(3).as_str()],
+        )?;
+        Ok(())
+    })
+    .await?;
+    let settings = f.s.call(|c| settings::fields(c, &id(3))).await?;
+    f.s.setup_readmit(key, id(2), true, vec![], |_| {}).await?;
+    newer.hlc = 22;
+    f.merge(f.snapshot(vec![newer])).await?;
+    assert_eq!(settings, f.s.call(|c| settings::fields(c, &id(3))).await?);
+    assert_eq!(generation, f.s.pairing_generation(&id(3)));
+    assert_eq!(
+        f.s.setup_state()
+            .links
+            .iter()
+            .find(|l| l.device == id(3))
+            .unwrap()
+            .introduced_by,
+        Some(id(1))
+    );
+    let count: i64 =
+        f.s.call(|c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM setup_notices WHERE device=?",
+                [id(3).as_str()],
+                |r| r.get(0),
+            )?)
+        })
+        .await?;
+    assert_eq!(count, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_readmission_is_per_key_and_keeps_introduced_protection_after_legacy_hello()
+-> Result<()> {
+    let f = Fixture::new().await?;
+    let mut removed = member(3);
+    removed.status = MemberStatus::Removed;
+    removed.hlc = 10;
+    f.merge(f.snapshot(vec![removed])).await?;
+    let mut newer = member(3);
+    newer.hlc = 20;
+    f.merge(f.snapshot(vec![newer])).await?;
+    let key = f.s.setup_state().readmissions[0].key.clone();
+    f.s.pair(id(4), member(4).fingerprint).await?;
+    f.s.setup_readmit(key, id(2), true, vec![], |_| {}).await?;
+    assert_eq!(
+        f.s.setup_state()
+            .links
+            .iter()
+            .find(|l| l.device == id(4))
+            .unwrap()
+            .scope,
+        SetupScope::Ask
+    );
+    let fence = SetupFence {
+        generation: f.s.setup_state().generation,
+        binding_generation: f.s.pairing_generation(&id(3)).unwrap(),
+        device: id(3),
+        fingerprint: member(3).fingerprint,
+        connection: 3,
+        current: Arc::new(AtomicU64::new(3)),
+    };
+    f.s.setup_legacy_ready(fence).await?;
+    let link =
+        f.s.setup_state()
+            .links
+            .into_iter()
+            .find(|l| l.device == id(3))
+            .unwrap();
+    assert!(link.hello_seen);
+    assert!(!link.negotiated);
+    assert!(f.s.setup_protected(&id(3)));
+    // Allowed decisions survive retirement and a non-token HELLO activation.
+    // A later genuinely fresh local token confirmation drops just this record.
+    f.s.setup_withdraw(f.f.clone(), |_| {}).await?;
+    assert!(f.pin(3).await?.is_some());
+    let hello = Hello {
+        version: 1,
+        device_id: id(1),
+        name: "Introducer".into(),
+        capabilities: vec!["mesh".into(), "setup".into()],
+        paused: None,
+        role: Some(DeviceRole::Computer),
+        addresses: None,
+        setup: Some(SetupHello {
+            scope: SetupScope::Enabled,
+            setup_id: Some(id(0)),
+        }),
+    };
+    f.s.pair_then_hello_scoped(
+        id(1),
+        member(1).fingerprint,
+        Some(hello),
+        Some(member(2)),
+        SetupScope::Enabled,
+        false,
+        || {},
+    )
+    .await?;
+    let fence = SetupFence {
+        generation: f.s.setup_state().generation,
+        binding_generation: f.s.pairing_generation(&id(3)).unwrap(),
+        device: id(3),
+        fingerprint: member(3).fingerprint,
+        connection: 4,
+        current: Arc::new(AtomicU64::new(4)),
+    };
+    f.s.setup_activate(
+        fence,
+        member(2),
+        member(3),
+        SetupHello {
+            scope: SetupScope::Enabled,
+            setup_id: Some(id(0)),
+        },
+        |_| {},
+    )
+    .await?;
+    let decision:String=f.s.call(|c|Ok(c.query_row("SELECT json_extract(payload,'$.readmission.decision') FROM setup_entries WHERE device=? AND fingerprint=?",params![id(3).as_str(),member(3).fingerprint.as_str()],|r|r.get(0))?)).await?;
+    assert_eq!(decision, "allowed");
+    f.s.setup_fresh_local_recovery(id(3), member(2), |_| {})
+        .await?;
+    let cleared:bool=f.s.call(|c|Ok(c.query_row("SELECT json_extract(payload,'$.readmission') IS NULL AND json_extract(payload,'$.removal.hlc')=10 FROM setup_entries WHERE device=? AND fingerprint=?",params![id(3).as_str(),member(3).fingerprint.as_str()],|r|r.get(0))?)).await?;
+    assert!(cleared);
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_readmission_observation_and_keep_do_not_change_outgoing_union() -> Result<()> {
+    let f = Fixture::new().await?;
+    let mut removed = member(3);
+    removed.hlc = 10;
+    removed.status = MemberStatus::Removed;
+    f.merge(f.snapshot(vec![removed])).await?;
+    let before = f.s.members_outgoing(f.f.clone()).await?;
+    f.s.members_ack(f.f.clone(), before.transfer_id.clone())
+        .await?;
+    let mut newer = member(3);
+    newer.hlc = 20;
+    f.s.members_merge(
+        f.f.clone(),
+        member(2),
+        f.snapshot(vec![newer.clone()]),
+        vec![],
+        |delta| {
+            assert!(!delta.roster_changed);
+            assert!(delta.added.is_empty());
+            assert!(delta.removed.is_empty());
+        },
+    )
+    .await?;
+    let record = f.s.setup_state().readmissions[0].clone();
+    assert_eq!(before, f.s.members_outgoing(f.f.clone()).await?);
+    f.s.members_ack(f.f.clone(), before.transfer_id.clone())
+        .await?;
+    f.s.setup_readmit(record.key, id(2), false, vec![], |delta| {
+        assert!(!delta.roster_changed)
+    })
+    .await?;
+    assert_eq!(before, f.s.members_outgoing(f.f.clone()).await?);
+    f.s.members_ack(f.f.clone(), before.transfer_id.clone())
+        .await?;
+    newer.hlc = 21;
+    f.s.members_merge(
+        f.f.clone(),
+        member(2),
+        f.snapshot(vec![newer]),
+        vec![],
+        |delta| assert!(!delta.roster_changed),
+    )
+    .await?;
+    assert_eq!(before, f.s.members_outgoing(f.f).await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_new_pin_direct_pair_resolves_diagnostic_and_accepts_metadata() -> Result<()> {
+    let f = Fixture::new().await?;
+    let mut removed = member(3);
+    removed.status = MemberStatus::Removed;
+    removed.hlc = 10;
+    f.merge(f.snapshot(vec![removed])).await?;
+    let mut replacement = member(3);
+    replacement.fingerprint = member(9).fingerprint;
+    replacement.hlc = 20;
+    f.merge(f.snapshot(vec![replacement.clone()])).await?;
+    assert!(f.pin(3).await?.is_none());
+    let hello = Hello {
+        version: 1,
+        device_id: id(3),
+        name: "Direct".into(),
+        capabilities: vec!["mesh".into(), "setup".into()],
+        paused: None,
+        role: Some(DeviceRole::Computer),
+        addresses: None,
+        setup: Some(SetupHello {
+            scope: SetupScope::Enabled,
+            setup_id: Some(id(0)),
+        }),
+    };
+    f.s.pair_then_hello_scoped(
+        id(3),
+        replacement.fingerprint.clone(),
+        Some(hello),
+        Some(member(2)),
+        SetupScope::Enabled,
+        false,
+        || {},
+    )
+    .await?;
+    let count: i64 =
+        f.s.call(|c| Ok(c.query_row("SELECT count(*) FROM setup_conflicts", [], |r| r.get(0))?))
+            .await?;
+    assert_eq!(count, 0);
+    replacement.hlc =
+        f.s.setup_state()
+            .roster
+            .iter()
+            .find(|m| m.device_id == id(3) && m.status == MemberStatus::Member)
+            .unwrap()
+            .hlc
+            + 1;
+    replacement.name = "Renamed after direct pairing".into();
+    f.merge(f.snapshot(vec![replacement.clone()])).await?;
+    let count: i64 =
+        f.s.call(|c| Ok(c.query_row("SELECT count(*) FROM setup_conflicts", [], |r| r.get(0))?))
+            .await?;
+    assert_eq!(count, 0);
+    assert_eq!(
+        f.s.setup_state()
+            .roster
+            .iter()
+            .find(|m| m.device_id == id(3) && m.status == MemberStatus::Member)
+            .unwrap()
+            .name,
+        replacement.name
+    );
+    assert!(f.s.setup_state().readmissions.is_empty());
+    let old_denied:bool=f.s.call(|c|Ok(c.query_row("SELECT json_extract(payload,'$.denied') FROM setup_entries WHERE device=? AND fingerprint=?",params![id(3).as_str(),member(3).fingerprint.as_str()],|r|r.get(0))?)).await?;
+    assert!(old_denied);
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_phone_ready_evidence_is_local_durable_and_generation_scoped() -> Result<()> {
+    let mut f = Fixture::new().await?;
+    let mut phone = member(3);
+    phone.role = DeviceRole::Phone;
+    f.merge(f.snapshot(vec![phone.clone()])).await?;
+    assert!(!f.s.setup_binding_ready(id(3)).await?);
+    let roster = f.s.setup_state().roster;
+    let fence = SetupFence {
+        generation: f.s.setup_state().generation,
+        binding_generation: f.s.pairing_generation(&id(3)).unwrap(),
+        device: id(3),
+        fingerprint: phone.fingerprint.clone(),
+        connection: 3,
+        current: Arc::new(AtomicU64::new(3)),
+    };
+    f.s.setup_activate(
+        fence,
+        member(2),
+        phone.clone(),
+        SetupHello {
+            scope: SetupScope::Enabled,
+            setup_id: Some(id(0)),
+        },
+        |_| {},
+    )
+    .await?;
+    assert!(f.s.setup_binding_ready(id(3)).await?);
+    assert!(
+        !f.s.peer_established(id(3)).await?,
+        "phone READY must not supply computer revocation evidence"
+    );
+    assert_eq!(
+        f.s.setup_state().roster,
+        roster,
+        "READY is local, never a roster write"
+    );
+    let path = f._dir.path().join("state.sqlite3");
+    drop(f.s);
+    f.s = Store::open(&path)?;
+    assert!(f.s.setup_binding_ready(id(3)).await?);
+    f.s.pair(id(3), phone.fingerprint).await?;
+    assert!(!f.s.setup_binding_ready(id(3)).await?);
+    Ok(())
+}
+
+async fn new_pin_with_same_snapshot_removal(old_first: bool) -> Result<()> {
+    for reverse_wire_order in [false, true] {
+        let f = Fixture::new().await?;
+        let mut removed = member(3);
+        removed.fingerprint = member(if old_first { 4 } else { 9 }).fingerprint;
+        removed.status = MemberStatus::Removed;
+        removed.hlc = 10;
+        let mut replacement = member(3);
+        replacement.fingerprint = member(if old_first { 9 } else { 4 }).fingerprint;
+        replacement.hlc = 20;
+        let mut snapshot = f.snapshot(vec![removed.clone(), replacement]);
+        if reverse_wire_order {
+            snapshot.members.reverse();
+        }
+        assert!(f.pin(3).await?.is_none());
+        assert!(!f.merge(snapshot.clone()).await?);
+        assert!(
+            f.pin(3).await?.is_none(),
+            "a same-snapshot other-pin denial must block installation"
+        );
+        assert!(f.merge(snapshot).await?, "receipt replay");
+        f.s.setup_reconcile_candidates(id(2), vec![], |_| {})
+            .await?;
+        assert!(f.pin(3).await?.is_none());
+        assert!(f.s.setup_state().readmissions.is_empty());
+        assert!(f.s.setup_state().roster.contains(&removed));
+        assert!(
+            !f.s.setup_state()
+                .roster
+                .iter()
+                .any(|m| m.device_id == id(3) && m.status == MemberStatus::Member)
+        );
+        let conflicts: i64 = f
+            .s
+            .call(|c| Ok(c.query_row("SELECT count(*) FROM setup_conflicts", [], |r| r.get(0))?))
+            .await?;
+        assert_eq!(conflicts, 1);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_regression_review_new_pin_before_removed_pin() -> Result<()> {
+    new_pin_with_same_snapshot_removal(false).await
+}
+
+#[tokio::test]
+async fn setup_regression_review_new_pin_after_removed_pin() -> Result<()> {
+    new_pin_with_same_snapshot_removal(true).await
+}
+
+#[tokio::test]
+async fn setup_regression_review_legacy_phone_ready_is_generation_fenced() -> Result<()> {
+    let mut f = Fixture::new().await?;
+    let mut phone = member(3);
+    phone.role = DeviceRole::Phone;
+    f.merge(f.snapshot(vec![phone.clone()])).await?;
+    let roster = f.s.setup_state().roster;
+    let fence = SetupFence {
+        generation: f.s.setup_state().generation,
+        binding_generation: f.s.pairing_generation(&id(3)).unwrap(),
+        device: id(3),
+        fingerprint: phone.fingerprint.clone(),
+        connection: 3,
+        current: Arc::new(AtomicU64::new(3)),
+    };
+    let mut stale = fence.clone();
+    stale.connection = 2;
+    assert!(f.s.setup_legacy_ready(stale).await.is_err());
+    assert!(!f.s.setup_binding_ready(id(3)).await?);
+    f.s.setup_legacy_ready(fence.clone()).await?;
+    assert!(
+        f.s.setup_binding_ready(id(3)).await?,
+        "legacy phone READY must count for Also linked"
+    );
+    assert!(!f.s.peer_established(id(3)).await?);
+    assert_eq!(f.s.setup_state().roster, roster);
+    assert!(f.s.setup_protected(&id(3)));
+    let path = f._dir.path().join("state.sqlite3");
+    drop(f.s);
+    f.s = Store::open(&path)?;
+    assert!(f.s.setup_binding_ready(id(3)).await?);
+    assert!(
+        !f.s.setup_state()
+            .links
+            .iter()
+            .find(|l| l.device == id(3))
+            .unwrap()
+            .hello_seen
+    );
+    assert!(
+        !f.s.setup_state()
+            .links
+            .iter()
+            .find(|l| l.device == id(3))
+            .unwrap()
+            .negotiated
+    );
+    f.s.setup_legacy_ready(fence.clone()).await?;
+    assert!(
+        f.s.setup_state()
+            .links
+            .iter()
+            .find(|l| l.device == id(3))
+            .unwrap()
+            .hello_seen
+    );
+    f.s.pair(id(3), phone.fingerprint).await?;
+    assert!(!f.s.setup_binding_ready(id(3)).await?);
+    assert!(f.s.setup_legacy_ready(fence).await.is_err());
+    assert!(!f.s.setup_binding_ready(id(3)).await?);
     Ok(())
 }

@@ -364,9 +364,6 @@ impl Peer {
     pub(crate) fn paused(&self) -> bool {
         self.health == Health::Paused
     }
-    fn never_connected(&self) -> bool {
-        self.health == Health::Offline && self.last_seen == 0
-    }
     pub(crate) fn lost(&self) -> bool {
         self.health.lost()
     }
@@ -3035,6 +3032,17 @@ impl Worker {
                     self.remember(|r| r.offer = Some(setup::LINKED.into()));
                 }
             }
+            Top::Readmit { record } => {
+                if let Err(error) = self
+                    .command(ipc::Command::ReadmissionDecision {
+                        key: record.key,
+                        allow: yes,
+                    })
+                    .await
+                {
+                    self.fail("Couldn't save the answer", error);
+                }
+            }
             Top::Request { devices, .. } => {
                 self.answer_from(&self.origin.setup.clone(), &devices, yes)
                     .await;
@@ -3054,6 +3062,10 @@ impl Worker {
                     .map(|l| setup::request_key(&self.origin.setup, l))
                     .collect();
                 self.remember(|r| r.close(keys));
+            }
+            Top::Diagnostic { key, .. } => self.remember(|r| r.close([key])),
+            Top::Readmit { record } => {
+                self.remember(|r| r.close([setup::readmission_key(&record.key)]))
             }
             Top::None => {}
         }
@@ -3203,21 +3215,41 @@ impl Worker {
     }
     fn top_card(&self, peers: &[Peer]) -> TopCard {
         match setup::top(&self.setup, peers, &self.remembered) {
+            Top::Diagnostic { title, .. } => TopCard {
+                kind: TopKind::Diagnostic,
+                title: title.into(),
+                error: String::new().into(),
+                key: String::new().into(),
+                phone: false,
+            },
+            Top::Readmit { record } => TopCard {
+                kind: TopKind::Readmit,
+                title: setup::readmission_text(&record).into(),
+                key: setup::readmission_key(&record.key).into(),
+                error: record.error.unwrap_or_default().into(),
+                phone: false,
+            },
             Top::None => TopCard::default(),
             Top::Offer { .. } if !self.snapshot.refreshing_devices.is_empty() => TopCard::default(),
             Top::Offer { .. } => TopCard {
                 kind: TopKind::Offer,
                 title: "Link your devices".into(),
+                error: String::new().into(),
+                key: String::new().into(),
                 phone: false,
             },
             Top::Waiting { title } => TopCard {
                 kind: TopKind::Waiting,
                 title: title.into(),
+                error: String::new().into(),
+                key: String::new().into(),
                 phone: false,
             },
             Top::Request { title, phone, .. } => TopCard {
                 kind: TopKind::Request,
                 title: title.into(),
+                error: String::new().into(),
+                key: String::new().into(),
                 phone,
             },
         }
@@ -3827,13 +3859,35 @@ impl Worker {
         let (device_item, device_summary, device_action, device_settings, device_note) =
             match device {
                 Some(peer) => {
-                    let (summary, action) = device_summary(peer);
-                    let (settings, note) = self
+                    let (mut summary, action) = device_summary(peer);
+                    let introduced = self
+                        .setup
+                        .link(&peer.id)
+                        .is_some_and(|l| l.introduced_by.is_some());
+                    if introduced
+                        && self.setup.link(&peer.id).is_some_and(|l| !l.ready)
+                        && matches!(peer.health, Health::Offline | Health::Connecting)
+                    {
+                        summary.title = "Not connected yet".into();
+                        summary.detail.clear();
+                    }
+                    if introduced && peer.health == Health::Lost {
+                        summary.title =
+                            format!("{} doesn't recognize {}", peer.name, this_computer());
+                        summary.detail = "Pair with it directly".into();
+                    }
+                    let (settings, mut note) = self
                         .peer_settings
                         .as_ref()
                         .filter(|(id, _, _)| *id == peer.id)
                         .map(|(_, reply, _)| device_settings(peer, reply))
                         .unwrap_or_default();
+                    if introduced
+                        && self.setup.link(&peer.id).is_some_and(|l| !l.hello_seen)
+                        && note.starts_with("Update Pneu")
+                    {
+                        note = format!("Switches sync when {} connects.", peer.name);
+                    }
                     (peer.item(), summary, action.to_owned(), settings, note)
                 }
                 None => Default::default(),
@@ -3846,13 +3900,26 @@ impl Worker {
                 .map(|p| {
                     let mut item = p.item();
                     // Added via another device: it keeps trying, never an error.
-                    if p.never_connected()
+                    if matches!(p.health, Health::Offline | Health::Connecting)
                         && self
                             .setup
                             .link(&p.id)
-                            .is_some_and(|l| l.introducer_name.is_some())
+                            .is_some_and(|l| l.introduced_by.is_some() && !l.ready)
                     {
                         item.status = "Not connected yet".into();
+                    }
+                    if p.health == Health::Lost
+                        && self
+                            .setup
+                            .link(&p.id)
+                            .is_some_and(|l| l.introduced_by.is_some())
+                    {
+                        item.status = format!(
+                            "{} doesn't recognize {} · Pair with it directly",
+                            p.name,
+                            this_computer()
+                        )
+                        .into();
                     }
                     item
                 })
@@ -7302,7 +7369,15 @@ mod tests {
         flush_ui();
         window.invoke_open_add(1);
         drain(&mut worker, &mut actions).await;
-        let introduced = with(link_of(2, "enabled"), "introduced_by", json!(id(1)));
+        let introduced = with(
+            with(
+                with(link_of(2, "enabled"), "introduced_by", json!(id(1))),
+                "ready",
+                json!(false),
+            ),
+            "hello_seen",
+            json!(false),
+        );
         let mut roster = setup_json(
             vec![link_of(1, "enabled"), introduced.clone()],
             &[(1, "Galaxy S25+"), (2, "MacBook Air")],
@@ -7337,6 +7412,16 @@ mod tests {
             worker.paired.as_ref().and_then(|p| p.device.as_deref()),
             Some(id(3).as_str())
         );
+        assert_eq!(worker.paired_detail(), (String::new(), false));
+        roster["links"][1]["hello_seen"] = json!(true);
+        worker
+            .refresh(linked_status(&worker, &roster), &visible)
+            .await?;
+        assert_eq!(worker.paired_detail(), (String::new(), false));
+        roster["links"][1]["ready"] = json!(true);
+        worker
+            .refresh(linked_status(&worker, &roster), &visible)
+            .await?;
         assert_eq!(
             worker.paired_detail(),
             ("Also linked: MacBook Air".into(), false)
@@ -7493,6 +7578,21 @@ mod tests {
                 .set_color_scheme(slint::language::ColorScheme::Dark),
             "default" => (),
             _ => anyhow::bail!("unknown window theme: {theme}"),
+        }
+        // Qt's NativePalette reads QPalette colors independently of its scheme.
+        // Supply both colors for the headless theme fixture, never the session.
+        if theme != "default" {
+            let dark = theme == "dark";
+            window.global::<Pneu>().set_text(if dark {
+                slint::Color::from_rgb_u8(239, 240, 241)
+            } else {
+                slint::Color::from_rgb_u8(35, 38, 41)
+            });
+            window.global::<Pneu>().set_background(if dark {
+                slint::Color::from_rgb_u8(27, 30, 32)
+            } else {
+                slint::Color::from_rgb_u8(239, 240, 241)
+            });
         }
         let mut rendered = 0;
         for scene in scenes() {
@@ -8766,7 +8866,7 @@ mod tests {
     fn link_of(n: u8, scope: &str) -> Value {
         json!({"device": id(n), "scope": scope, "prompt": false, "introduced_by": null,
             "introducer_name": null, "outcome": null, "negotiated": true,
-            "participating": scope == "enabled"})
+            "participating": scope == "enabled", "hello_seen": true, "ready": scope == "enabled"})
     }
     fn with(mut link: Value, key: &str, value: Value) -> Value {
         link[key] = value;
@@ -8874,6 +8974,119 @@ mod tests {
             at: Instant::now(),
         });
     }
+    fn readmission_record() -> crate::store::members::Readmission {
+        serde_json::from_value(json!({
+            "key": {"device":id(2), "fingerprint":"02".repeat(32), "removal_hlc":10,
+                "removal_writer":id(1), "setup_generation":2},
+            "removed_name":"MacBook Air", "value": {"device_id":id(2), "fingerprint":"02".repeat(32),
+                "role":"computer", "name":"MacBook Air", "status":"member", "hlc":20,"writer_device":id(1)},
+            "introducer":id(1), "introducer_name":"Galaxy S25+", "decision":"pending"
+        })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn readmission_card_keeps_focus_and_captured_authority() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::readmission_card_keeps_focus_and_captured_authority",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        let surface = headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        std::fs::create_dir_all(&worker.paths.data)?;
+        let mock = mock_ipc(&worker.paths.socket, |_| (true, Value::Null))?;
+        let visible = AtomicBool::new(true);
+        state(&mut worker, trio(), vec![]);
+        let record = readmission_record();
+        let mut status = setup_json(vec![link_of(1, "enabled")], &[(1, "Galaxy S25+")]);
+        status["readmissions"] = json!([record]);
+        window.show()?;
+        surface.set_size(slint::PhysicalSize::new(400, 720));
+        window
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::WindowActiveChanged(true));
+        worker
+            .refresh(linked_status(&worker, &status), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(window.global::<Ui>().get_page(), Page::Main);
+        settle(&surface);
+        assert_eq!(window.global::<Ui>().get_top().kind, TopKind::Readmit);
+        // The native keyboard path must choose Keep removed by default.
+        slint::platform::update_timers_and_animations();
+        key(&window, slint::platform::Key::Return);
+        drain(&mut worker, &mut actions).await;
+        let commands = sent(&mock, "readmission_decision");
+        assert_eq!(
+            commands,
+            vec![json!({"command":"readmission_decision","key":record.key,"allow":false})]
+        );
+        // A click already queued from this frame keeps its old barrier/generation.
+        worker
+            .refresh(linked_status(&worker, &status), &visible)
+            .await?;
+        flush_ui();
+        window.global::<Ui>().invoke_top_action(true);
+        let mut next = status.clone();
+        next["readmissions"][0]["key"]["removal_hlc"] = json!(30);
+        next["readmissions"][0]["key"]["setup_generation"] = json!(9);
+        worker
+            .refresh(linked_status(&worker, &next), &visible)
+            .await?;
+        drain(&mut worker, &mut actions).await;
+        assert_eq!(
+            sent(&mock, "readmission_decision")[1],
+            json!({"command":"readmission_decision","key":record.key,"allow":true})
+        );
+        worker
+            .refresh(linked_status(&worker, &next), &visible)
+            .await?;
+        flush_ui();
+        key(&window, slint::platform::Key::Tab); // leave Keep removed on the old card
+        next["readmissions"][0]["key"]["removal_hlc"] = json!(40);
+        worker
+            .refresh(linked_status(&worker, &next), &visible)
+            .await?;
+        flush_ui();
+        settle(&surface);
+        key(&window, slint::platform::Key::Return);
+        drain(&mut worker, &mut actions).await;
+        assert_eq!(
+            sent(&mock, "readmission_decision")[2],
+            json!({"command":"readmission_decision","key":next["readmissions"][0]["key"],"allow":false})
+        );
+        // Dismissal is window-local, and does not decide or consume the prompt.
+        worker
+            .refresh(linked_status(&worker, &status), &visible)
+            .await?;
+        flush_ui();
+        window.global::<Ui>().invoke_top_close();
+        drain(&mut worker, &mut actions).await;
+        assert_eq!(sent(&mock, "readmission_decision").len(), 3);
+        assert!(matches!(
+            setup::top(
+                &worker.setup,
+                &peers(&worker.snapshot, &[]),
+                &worker.remembered
+            ),
+            Top::None
+        ));
+        assert!(matches!(
+            setup::top(
+                &worker.setup,
+                &peers(&worker.snapshot, &[]),
+                &Remembered::default()
+            ),
+            Top::Readmit { .. }
+        ));
+        Ok(())
+    }
+
     fn linking_scenes() -> Vec<Scene> {
         let both = || vec![link_of(1, "ask"), link_of(2, "ask")];
         let member = |link: Value| {
@@ -8901,6 +9114,91 @@ mod tests {
         );
         let separate = with(link_of(2, "disabled"), "outcome", json!(setup::SEPARATE));
         vec![
+            scene(
+                "72-readmission",
+                |w| {
+                    state(
+                        w,
+                        vec![device(1, "Galaxy S25+", true, "connected", 1)],
+                        vec![],
+                    );
+                    linking(w, vec![link_of(1, "enabled")], &[(1, "Galaxy S25+")]);
+                    w.setup.readmissions = vec![readmission_record()];
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "73-introduced-refused-row",
+                |w| {
+                    state(
+                        w,
+                        vec![device(2, "MacBook Air", false, "unauthorized", 0)],
+                        vec![],
+                    );
+                    linking(
+                        w,
+                        vec![with(
+                            with(link_of(2, "enabled"), "introduced_by", json!(id(1))),
+                            "ready",
+                            json!(false),
+                        )],
+                        &[(2, "MacBook Air")],
+                    );
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "73-introduced-refused",
+                |w| {
+                    state(
+                        w,
+                        vec![device(2, "MacBook Air", false, "unauthorized", 0)],
+                        vec![],
+                    );
+                    linking(
+                        w,
+                        vec![with(
+                            with(link_of(2, "enabled"), "introduced_by", json!(id(1))),
+                            "ready",
+                            json!(false),
+                        )],
+                        &[(2, "MacBook Air")],
+                    );
+                    device_page(w, 2);
+                },
+                go(Page::Device, 2, 0),
+            ),
+            scene(
+                "74-paired-before-ready",
+                |w| {
+                    state(
+                        w,
+                        vec![
+                            device(1, "Galaxy S25+", true, "connected", 1),
+                            device(2, "MacBook Air", false, "connecting", 0),
+                        ],
+                        vec![],
+                    );
+                    linking(
+                        w,
+                        vec![
+                            link_of(1, "enabled"),
+                            with(
+                                with(
+                                    with(link_of(2, "enabled"), "introduced_by", json!(id(1))),
+                                    "ready",
+                                    json!(false),
+                                ),
+                                "hello_seen",
+                                json!(false),
+                            ),
+                        ],
+                        &[(1, "Galaxy S25+"), (2, "MacBook Air")],
+                    );
+                    paired_with(w, 1, "Galaxy S25+");
+                },
+                go(Page::Add, 0, 0),
+            ),
             scene(
                 "61-main-link-refresh",
                 |w| {

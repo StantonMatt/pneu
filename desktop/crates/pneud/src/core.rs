@@ -986,6 +986,7 @@ pub struct Core {
     #[cfg(test)]
     setup_test_capability: AtomicBool,
     setup_incoming: Arc<Mutex<HashMap<u64, setup::IncomingTarget>>>,
+    readmission_errors: Mutex<Vec<(crate::store::members::ReadmissionKey, String)>>,
     provisional: Arc<AtomicBool>,
     pairing_gate: Arc<tokio::sync::Mutex<()>>,
     config_gate: Arc<tokio::sync::Mutex<()>>,
@@ -1135,6 +1136,7 @@ impl Core {
             #[cfg(test)]
             setup_test_capability: AtomicBool::new(true),
             setup_incoming: Default::default(),
+            readmission_errors: Default::default(),
             mesh: Arc::new(mesh),
             outbox,
             transports: Arc::new(Semaphore::new(TRANSPORT_LIMIT)),
@@ -3978,7 +3980,7 @@ impl Core {
                                         self.set_link_problem(&hello.device_id, generation, Some(problem));
                                     }
                                 }
-                                if outbound && error.code == ErrorCode::Unauthorized && !(hello.capabilities.iter().any(|c|c=="setup") && self.store.setup_protected(&hello.device_id)) {
+                                if outbound && error.code == ErrorCode::Unauthorized && !self.store.setup_protected(&hello.device_id) {
                                     self.forget_pairing(hello.device_id.clone(), CloseReason::Error(ErrorCode::Closing), store.connection_id, Some(hello.name.clone())).await?;
                                 }
                                 break;

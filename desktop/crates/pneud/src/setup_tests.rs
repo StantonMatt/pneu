@@ -538,6 +538,89 @@ async fn setup_legacy_peer_does_not_found_or_exchange_members() -> Result<()> {
     a.stop().await?;
     b.stop().await
 }
+
+#[tokio::test]
+async fn setup_regression_review_already_legacy_ready_records_hello() -> Result<()> {
+    let a = Running::new().await?;
+    for role in [DeviceRole::Computer, DeviceRole::Phone] {
+        let device = Id::from_bytes([if role == DeviceRole::Phone { 3 } else { 4 }; 16]);
+        let pin = Hash::new(crate::random_hex(32))?;
+        a.core.store.pair(device.clone(), pin.clone()).await?;
+        a.core
+            .admission
+            .lock()
+            .unwrap()
+            .peers
+            .insert(pin, device.clone());
+        let scope = ActionScope::new();
+        scope.registration_generation.store(7, Ordering::SeqCst);
+        a.core
+            .action_scope
+            .lock()
+            .unwrap()
+            .insert(device.clone(), scope);
+        let (close, _receiver) = watch::channel(None);
+        a.core.sessions.lock().unwrap().sessions.insert(
+            device.clone(),
+            Session {
+                outbound: false,
+                mesh: false,
+                role: if role == DeviceRole::Phone {
+                    "phone"
+                } else {
+                    "computer"
+                }
+                .into(),
+                device: device.clone(),
+                id: 7,
+                close,
+                wake: Arc::new(Notify::new()),
+                paused: false,
+                capabilities: vec![],
+                phone: crate::ui::Phone::default(),
+            },
+        );
+        let mut store = a.core.store.with_current_pairing();
+        store.connection_id = Some(7);
+        let mut hello = a.core.computer_hello();
+        hello.device_id = device.clone();
+        hello.role = Some(role);
+        hello.capabilities.clear();
+        hello.setup = None;
+        // Matches a restarted legacy binding: no current HELLO and no setup
+        // negotiation. A current authenticated READY must still be recorded.
+        let link = || {
+            a.core
+                .store
+                .setup_state()
+                .links
+                .into_iter()
+                .find(|l| l.device == device)
+                .unwrap()
+        };
+        assert!(!link().negotiated);
+        assert!(!link().hello_seen);
+        store.connection_id = Some(6);
+        assert!(a.core.setup_ready(&store, &hello, None).await?.is_none());
+        assert!(
+            !link().hello_seen,
+            "obsolete session must not supply evidence"
+        );
+        store.connection_id = Some(7);
+        assert!(a.core.setup_ready(&store, &hello, None).await?.is_none());
+        assert!(
+            link().hello_seen,
+            "already-legacy connections must record HELLO"
+        );
+        assert!(!link().negotiated);
+        assert!(!link().participating);
+        assert_eq!(link().scope, SetupScope::Ask);
+        assert!(a.core.setup_ready(&store, &hello, None).await?.is_none());
+        assert!(link().hello_seen);
+    }
+    assert!(a.core.store.setup_state().setup_id.is_none());
+    a.stop().await
+}
 #[tokio::test]
 async fn setup_partial_knowledge_refusals_and_established_unauthorized_retain_trust() -> Result<()>
 {
@@ -1340,4 +1423,157 @@ fn setup_refresh_grace_does_not_cross_binding_replacement() {
     ui.lock().unwrap().refreshing_scope(&device);
     update_ui_state(&ui, &Event::Unpaired { device });
     assert!(ui.lock().unwrap().scope_refresh.is_empty());
+}
+
+#[tokio::test]
+async fn setup_readmission_actions_recheck_lifecycle_gate_and_publish_only_commit() -> Result<()> {
+    use crate::store::members::SetupFence;
+    let a = Running::new().await?;
+    let sender = Id::from_bytes([1; 16]);
+    let pin = Hash::new("a".repeat(64))?;
+    a.core.store.pair(sender.clone(), pin.clone()).await?;
+    a.core
+        .store
+        .call(|c| {
+            c.execute("UPDATE peers SET role='computer',name='Introducer'", [])?;
+            Ok(())
+        })
+        .await?;
+    a.core
+        .store
+        .setup_link(sender.clone(), SetupScope::Enabled)
+        .await?;
+    let local = a.core.self_member();
+    let remote = Member {
+        device_id: sender.clone(),
+        fingerprint: pin.clone(),
+        role: DeviceRole::Computer,
+        name: "Introducer".into(),
+        status: MemberStatus::Member,
+        hlc: 1,
+        writer_device: sender.clone(),
+        reach: None,
+    };
+    let mut fence = SetupFence {
+        device: sender.clone(),
+        fingerprint: pin,
+        binding_generation: 1,
+        generation: 0,
+        connection: 1,
+        current: Arc::new(AtomicU64::new(1)),
+    };
+    a.core
+        .store
+        .setup_activate(
+            fence.clone(),
+            local.clone(),
+            remote,
+            SetupHello {
+                scope: SetupScope::Enabled,
+                setup_id: Some(Id::from_bytes([0; 16])),
+            },
+            |_| {},
+        )
+        .await?;
+    fence.generation = a.core.store.setup_state().generation;
+    let mut subject = Member {
+        device_id: Id::from_bytes([3; 16]),
+        fingerprint: Hash::new("c".repeat(64))?,
+        role: DeviceRole::Computer,
+        name: "Laptop".into(),
+        status: MemberStatus::Removed,
+        hlc: 10,
+        writer_device: sender,
+        reach: None,
+    };
+    let snapshot = |m: Member| {
+        let mut roster = a.core.store.setup_state().roster;
+        roster.retain(|v| v.device_id != m.device_id);
+        roster.push(m);
+        Members {
+            transfer_id: Id::from_bytes(rand::random()),
+            setup_id: Id::from_bytes([0; 16]),
+            members: roster,
+        }
+    };
+    a.core
+        .store
+        .members_merge(
+            fence.clone(),
+            local.clone(),
+            snapshot(subject.clone()),
+            vec![],
+            |_| {},
+        )
+        .await?;
+    subject.status = MemberStatus::Member;
+    subject.hlc = 20;
+    a.core
+        .store
+        .members_merge(
+            fence.clone(),
+            local.clone(),
+            snapshot(subject.clone()),
+            vec![],
+            |_| {},
+        )
+        .await?;
+    let old_key = a.core.store.setup_state().readmissions[0].key.clone();
+    let gate = a.core.pairing_gate.lock().await;
+    let core = a.core.clone();
+    let key = old_key.clone();
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let action = tokio::spawn(async move {
+        let _ = entered.send(());
+        core.decide_readmission(key, true).await
+    });
+    started.await?;
+    subject.status = MemberStatus::Removed;
+    subject.hlc = 30;
+    a.core
+        .store
+        .members_merge(
+            fence.clone(),
+            local.clone(),
+            snapshot(subject.clone()),
+            vec![],
+            |_| {},
+        )
+        .await?;
+    drop(gate);
+    action.await??;
+    assert!(!a.core.paired_devices().contains(&subject.device_id));
+    subject.status = MemberStatus::Member;
+    subject.hlc = 40;
+    a.core
+        .store
+        .members_merge(fence, local, snapshot(subject.clone()), vec![], |_| {})
+        .await?;
+    let key = a.core.store.setup_state().readmissions[0].key.clone();
+    let attempt = a.core.track_setup_incoming(99, subject.fingerprint.clone());
+    assert!(a.core.decide_readmission(key.clone(), true).await.is_err());
+    assert!(
+        a.core.setup_status().await?["readmissions"][0]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("Pairing in progress"))
+    );
+    assert_eq!(a.core.store.setup_state().readmissions[0].key, key);
+    assert!(!a.core.paired_devices().contains(&subject.device_id));
+    drop(attempt);
+    a.core.decide_readmission(key.clone(), true).await?;
+    assert!(a.core.paired_devices().contains(&subject.device_id));
+    let generation = a.core.store.pairing_generation(&subject.device_id);
+    a.core.decide_readmission(key, true).await?;
+    assert_eq!(
+        a.core.store.pairing_generation(&subject.device_id),
+        generation
+    );
+    assert!(a.core.store.setup_protected(&subject.device_id));
+    assert!(
+        a.core.setup_status().await?["notices"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    a.stop().await
 }

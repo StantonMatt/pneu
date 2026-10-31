@@ -10,6 +10,7 @@ pub(crate) struct SetupState {
     pub withdrawn: bool,
     pub roster: Vec<Member>,
     pub links: Vec<SetupLink>,
+    pub readmissions: Vec<Readmission>,
     pub pending_link: bool,
     pub waiting_for: Option<Id>,
 }
@@ -25,6 +26,7 @@ pub(crate) struct SetupLink {
     // Reciprocal authenticated consent, or an introduced binding before its
     // first HELLO. Capability support alone never grants setup authority.
     pub participating: bool,
+    pub hello_seen: bool,
 }
 impl SetupLink {
     fn participates(&self) -> bool {
@@ -69,6 +71,7 @@ pub(crate) struct SetupDelta {
     pub reconnect_peer: Option<Id>,
     pub withdrawn: bool,
     pub changed: bool,
+    pub roster_changed: bool,
     remote_scope: Option<(Id, SetupScope)>,
 }
 #[derive(Debug, thiserror::Error)]
@@ -82,9 +85,50 @@ pub(crate) enum MembersError {
     #[error("setup capacity exceeded")]
     Capacity,
 }
+/// Local action authority: the exact key, removal tuple and setup incarnation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadmissionKey {
+    pub device: Id,
+    pub fingerprint: Hash,
+    pub removal_hlc: u64,
+    pub removal_writer: Id,
+    pub setup_generation: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Readmission {
+    pub key: ReadmissionKey,
+    pub removed_name: String,
+    pub value: Member,
+    pub introducer: Id,
+    pub introducer_name: String,
+    pub decision: String,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+fn merge_member(a: &Member, b: &Member) -> Member {
+    let mut value = if stamp(a) >= stamp(b) {
+        a.clone()
+    } else {
+        b.clone()
+    };
+    value.reach = match (&a.reach, &b.reach) {
+        (Some(a), Some(b))
+            if (a.hlc, a.writer_device.as_str()) < (b.hlc, b.writer_device.as_str()) =>
+        {
+            Some(b.clone())
+        }
+        (Some(a), _) => Some(a.clone()),
+        (_, b) => b.clone(),
+    };
+    value
+}
 #[derive(Clone, Serialize, Deserialize)]
 struct Entry {
     value: Member,
+    #[serde(default)]
+    readmission: Option<Readmission>,
+    #[serde(default)]
+    ready_generation: Option<u64>,
     // Local admission stamp: metadata edits must not move the notice baseline.
     #[serde(default)]
     admitted_hlc: Option<u64>,
@@ -94,6 +138,12 @@ struct Entry {
     removal: Option<Member>,
     denied: bool,
     setup_id: Option<Id>,
+}
+// Called only from the direct READY path. Phones do not use the computer's
+// reverse-dial/revocation evidence bit. Keep this local marker out of MEMBERS.
+fn phone_ready(tx: &Transaction<'_>, fence: &SetupFence) -> Result<()> {
+    tx.execute("UPDATE setup_entries SET payload=json_set(payload,'$.ready_generation',?) WHERE device=? AND fingerprint=?",params![fence.binding_generation as i64,fence.device.as_str(),fence.fingerprint.as_str()])?;
+    Ok(())
 }
 fn stamp(m: &Member) -> (u64, &str) {
     (m.hlc, m.writer_device.as_str())
@@ -134,7 +184,7 @@ pub(super) fn state(c: &Connection) -> Result<SetupState> {
         .filter(|e| setup_id.is_some() && e.setup_id == setup_id)
         .map(|e| e.value)
         .collect();
-    let mut q=c.prepare("SELECT device,scope,(coalesce(prompt AND prompt_generation=(SELECT generation FROM setup_state) AND prompt_binding=(SELECT generation FROM peers WHERE id=device),0)),introduced_by,introducer_name,outcome,negotiated,participating FROM setup_links ORDER BY device")?;
+    let mut q=c.prepare("SELECT device,scope,(coalesce(prompt AND prompt_generation=(SELECT generation FROM setup_state) AND prompt_binding=(SELECT generation FROM peers WHERE id=device),0)),introduced_by,introducer_name,outcome,negotiated,participating,last_connection!=0 FROM setup_links ORDER BY device")?;
     let links = q
         .query_map([], |r| {
             Ok((
@@ -146,10 +196,12 @@ pub(super) fn state(c: &Connection) -> Result<SetupState> {
                 r.get(5)?,
                 r.get(6)?,
                 r.get(7)?,
+                r.get(8)?,
             ))
         })?
         .map(|r| {
-            let (device, scope, prompt, by, name, outcome, negotiated, participating) = r?;
+            let (device, scope, prompt, by, name, outcome, negotiated, participating, hello_seen) =
+                r?;
             Ok(SetupLink {
                 device: Id::new(device)?,
                 scope: SetupScope::try_from(scope)?,
@@ -159,15 +211,17 @@ pub(super) fn state(c: &Connection) -> Result<SetupState> {
                 outcome,
                 negotiated,
                 participating,
+                hello_seen,
             })
         })
         .collect::<Result<_>>()?;
     Ok(SetupState {
-        setup_id,
+        setup_id: setup_id.clone(),
         generation: generation as u64,
         withdrawn,
         roster,
         links,
+        readmissions: entries(c)?.into_iter().filter_map(|e| e.readmission).filter(|r| r.decision == "pending" && r.key.setup_generation == generation as u64 && setup_id.is_some() && !withdrawn).collect(),
         pending_link: c.query_row("SELECT EXISTS(SELECT 1 FROM setup_pending_link)", [], |r| r.get(0))?,
         waiting_for: c.query_row("SELECT device FROM setup_links WHERE discovery_id IS NOT NULL ORDER BY device LIMIT 1", [], |r| r.get::<_, String>(0)).optional()?.map(Id::new).transpose()?,
     })
@@ -332,6 +386,12 @@ fn retire(tx: &Transaction<'_>, withdraw: bool, delta: &mut SetupDelta) -> Resul
     }
     for mut e in entries(tx)? {
         if let Some(removal) = e.removal.clone() {
+            if e.readmission
+                .as_ref()
+                .is_some_and(|r| r.decision == "pending")
+            {
+                e.readmission = None;
+            }
             e.value = removal;
             e.setup_id = None;
             save_entry(tx, &e)?;
@@ -402,10 +462,18 @@ fn clear_resolved_conflicts(tx: &Transaction<'_>) -> Result<()> {
                 && ((e.value.device_id == m.device_id && e.value.fingerprint != m.fingerprint)
                     || (e.value.device_id != m.device_id && e.value.fingerprint == m.fingerprint))
         });
+        let different_denied = retained.iter().any(|e| {
+            e.denied && e.value.device_id == m.device_id && e.value.fingerprint != m.fingerprint
+        });
         let removed = retained.iter().any(|e| {
             e.denied && e.value.device_id == m.device_id && e.value.fingerprint == m.fingerprint
         });
-        if removed || (!conflict && !active_conflict) {
+        let bound: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM peers WHERE id=? AND fp=?)",
+            params![m.device_id.as_str(), m.fingerprint.as_str()],
+            |r| r.get(0),
+        )?;
+        if bound || removed || (!conflict && !active_conflict && !different_denied) {
             tx.execute(
                 "DELETE FROM setup_conflicts WHERE device=?",
                 [m.device_id.as_str()],
@@ -443,6 +511,16 @@ fn local_value(tx: &Transaction<'_>, mut value: Member, setup_id: &Id, fresh: bo
     save_entry(
         tx,
         &Entry {
+            readmission: if fresh {
+                None
+            } else {
+                old.as_ref().and_then(|e| e.readmission.clone())
+            },
+            ready_generation: if fresh {
+                None
+            } else {
+                old.as_ref().and_then(|e| e.ready_generation)
+            },
             admitted_hlc: Some(value.hlc),
             joined_notice: None,
             value,
@@ -526,6 +604,11 @@ impl Store {
                             .iter()
                             .any(|l| l.device == *device && l.negotiated)
                 });
+                let roster_changed = cached.as_ref().is_none_or(|old| {
+                    old.roster != setup.roster
+                        || old.setup_id != setup.setup_id
+                        || old.generation != setup.generation
+                });
                 let changed = cached.as_ref() != Some(&setup) || *remote_scopes != previous_scopes;
                 *cached = Some(setup);
                 *epochs = generations;
@@ -541,6 +624,7 @@ impl Store {
                 drop(epochs);
                 drop(cached);
                 delta.changed = changed;
+                delta.roster_changed = roster_changed;
                 finish(delta);
                 if changed {
                     s.setup_changed.send_modify(|n| *n = n.wrapping_add(1));
@@ -549,6 +633,13 @@ impl Store {
             })
         })
         .await
+    }
+    pub(crate) async fn setup_binding_ready(&self, device: Id) -> Result<bool> {
+        let epoch = self.peer_epoch(&device);
+        self.call(move |c| {
+            epoch.check(c)?;
+            Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM peers p WHERE p.id=? AND (p.established=1 OR EXISTS(SELECT 1 FROM setup_entries e WHERE e.device=p.id AND e.fingerprint=p.fp AND json_extract(e.payload,'$.ready_generation')=p.generation)))",[device.as_str()],|r|r.get(0))?)
+        }).await
     }
     pub(crate) fn setup_state(&self) -> SetupState {
         self.setup
@@ -597,7 +688,7 @@ impl Store {
         self.setup_state()
             .links
             .iter()
-            .any(|l| l.device == *device && l.participates())
+            .any(|l| l.device == *device && (l.participates() || l.introduced_by.is_some()))
     }
     pub(crate) fn setup_scoped(&self, device: &Id) -> bool {
         let s = self.setup_state();
@@ -701,8 +792,10 @@ impl Store {
             let mut s=state(tx)?;
             let link=s.links.iter().find(|l|l.device==fence.device).context("missing setup link")?.clone();
             let (last, allow, discovery, token): (i64,Option<i64>,Option<i64>,bool)=tx.query_row("SELECT last_connection,allow_connection,discovery_connection,token_founding FROM setup_links WHERE device=?",[fence.device.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+            let phone=remote.role==DeviceRole::Phone;
             let connection=fence.connection as i64;
             tx.execute("UPDATE setup_links SET last_connection=?,negotiated=1,participating=? WHERE device=?",params![connection,link.scope==SetupScope::Enabled && remote_hello.scope==SetupScope::Enabled,fence.device.as_str()])?;
+            if phone { phone_ready(tx,&fence)?; }
             if discovery.is_some_and(|old|old!=connection) && remote_hello.scope!=SetupScope::Disabled {
                 tx.execute("UPDATE setup_links SET discovery_id=coalesce(?,discovery_id) WHERE device=?",params![remote_hello.setup_id.as_ref().map(Id::as_str),fence.device.as_str()])?;
             }
@@ -737,6 +830,7 @@ impl Store {
             let id=s.setup_id.context("setup assignment")?;
             local_value(tx,local,&id,false)?;
             local_value(tx,remote,&id,false)?;
+            if phone { phone_ready(tx,&fence)?; }
             validate_capacity(tx)?;
             Ok(matched)
         },finish).await
@@ -776,6 +870,18 @@ impl Store {
         blocked: Vec<(Option<Id>, Hash)>,
         finish: impl FnOnce(SetupDelta) + Send + 'static,
     ) -> Result<bool> {
+        self.members_merge_at(fence, local, snapshot, blocked, crate::now_ms(), finish)
+            .await
+    }
+    pub(crate) async fn members_merge_at(
+        &self,
+        fence: SetupFence,
+        local: Member,
+        snapshot: Members,
+        blocked: Vec<(Option<Id>, Hash)>,
+        now: u64,
+        finish: impl FnOnce(SetupDelta) + Send + 'static,
+    ) -> Result<bool> {
         let epoch = self.peer_epoch(&fence.device);
         self.setup_write(move |tx,delta| {
             epoch.check(tx)?;fence.check(tx)?;
@@ -785,8 +891,8 @@ impl Store {
             snapshot.validate().map_err(|_|MembersError::Malformed)?;
             let snapshot=snapshot.canonical();
             for m in &snapshot.members {
-                validate_stamp(m.hlc,crate::now_ms()).map_err(|_|MembersError::Malformed)?;
-                if let Some(r)=&m.reach {validate_stamp(r.hlc,crate::now_ms()).map_err(|_|MembersError::Malformed)?;}
+                validate_stamp(m.hlc,now).map_err(|_|MembersError::Malformed)?;
+                if let Some(r)=&m.reach {validate_stamp(r.hlc,now).map_err(|_|MembersError::Malformed)?;}
             }
             let meta=members_metadata(&snapshot);
             if let Some((old,_))=receipt_row(tx,fence.device.as_str(),snapshot.transfer_id.as_str())? {ensure!(old==meta,ReceiptConflict);return Ok(true);}
@@ -806,26 +912,51 @@ impl Store {
             let retained=entries(tx)?;
             for m in &snapshot.members {
                 if let Some(old)=retained.iter().find(|e|e.value.device_id==m.device_id&&e.value.fingerprint==m.fingerprint) {
-                    for v in std::iter::once(&old.value).chain(old.removal.iter()) {
+                    for v in std::iter::once(&old.value).chain(old.removal.iter()).chain(old.readmission.iter().map(|r| &r.value)) {
                         ensure!(stamp(v)!=stamp(m)||membership_eq(v,m),MembersError::Malformed);
                     }
-                    if let (Some(a),Some(b))=(&old.value.reach,&m.reach) {ensure!((a.hlc,&a.writer_device)!=(b.hlc,&b.writer_device)||a==b,MembersError::Malformed);}
+                    for retained_reach in std::iter::once(&old.value).chain(old.readmission.iter().map(|r|&r.value)) {
+                        if let (Some(a),Some(b))=(&retained_reach.reach,&m.reach) {ensure!((a.hlc,&a.writer_device)!=(b.hlc,&b.writer_device)||a==b,MembersError::Malformed);}
+                    }
                 }
             }
-            for m in &snapshot.members {
+            // Stage every effective removal before any introduction: a new
+            // pin must see same-snapshot denials regardless of canonical order.
+            for m in snapshot.members.iter().filter(|m|m.status==MemberStatus::Removed)
+                .chain(snapshot.members.iter().filter(|m|m.status==MemberStatus::Member)) {
                 observe_hlc(tx,m.hlc)?;if let Some(r)=&m.reach {observe_hlc(tx,r.hlc)?;}
                 let old=entries(tx)?.into_iter().find(|e|e.value.device_id==m.device_id&&e.value.fingerprint==m.fingerprint);
                 if m.status==MemberStatus::Removed {
                     let removal=old.as_ref().and_then(|e|e.removal.as_ref());
                     if removal.is_some_and(|r|stamp(r)>=stamp(m)) {continue;}
-                    let e=Entry {value:m.clone(),admitted_hlc:None,joined_notice:None,removal:Some(m.clone()),denied:true,setup_id:Some(snapshot.setup_id.clone())};
+                    let e=Entry {ready_generation:None,readmission:None,value:m.clone(),admitted_hlc:None,joined_notice:None,removal:Some(m.clone()),denied:true,setup_id:Some(snapshot.setup_id.clone())};
                     save_entry(tx,&e)?;
                     delta.tombstones.push((m.device_id.clone(),m.fingerprint.clone()));
                     forget(tx,&m.device_id,&m.fingerprint,delta)?;
                     continue;
                 }
                 if m.device_id==local.device_id {continue;}
-                if old.as_ref().is_some_and(|e|e.denied) {continue;}
+                if let Some(mut entry) = old.clone().filter(|e| e.denied) {
+                    let r = entry.removal.as_ref().context("deny without removal")?;
+                    if stamp(m) > stamp(r) {
+                        if let Some(record) = &mut entry.readmission {
+                            record.value = merge_member(&record.value, m);
+                        } else {
+                            let name: String = tx.query_row("SELECT name FROM peers WHERE id=?", [fence.device.as_str()], |r| r.get(0))?;
+                            entry.readmission = Some(Readmission {
+                                key: ReadmissionKey { device: m.device_id.clone(), fingerprint: m.fingerprint.clone(), removal_hlc: r.hlc, removal_writer: r.writer_device.clone(), setup_generation: s.generation },
+                                removed_name: r.name.clone(), value: m.clone(), introducer: fence.device.clone(), introducer_name: name, decision: "pending".into(), error: None,
+                            });
+                        }
+                        save_entry(tx, &entry)?;
+                    }
+                    continue;
+                }
+                let already_bound:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM peers WHERE id=? AND fp=?)",params![m.device_id.as_str(),m.fingerprint.as_str()],|r|r.get(0))?;
+                if !already_bound && entries(tx)?.iter().any(|e| e.denied && e.value.device_id == m.device_id && e.value.fingerprint != m.fingerprint) {
+                    record_conflict(tx, m)?;
+                    continue;
+                }
                 // An introduction cannot replace a retained identity or bind a
                 // pin already owned under another ID, including direct-only pins.
                 let conflict:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM peers WHERE (id=? AND fp!=?) OR (id!=? AND fp=?))",params![m.device_id.as_str(),m.fingerprint.as_str(),m.device_id.as_str(),m.fingerprint.as_str()],|r|r.get(0))?;
@@ -841,7 +972,7 @@ impl Store {
                     Some(joined)=>joined,
                     None=>joined_is_new(tx,&local.device_id,&value)?,
                 };
-                save_entry(tx,&Entry {value:value.clone(),admitted_hlc:None,joined_notice:Some(joined_notice),removal:old.and_then(|e|e.removal),denied:false,setup_id:Some(snapshot.setup_id.clone())})?;
+                save_entry(tx,&Entry {ready_generation:old.as_ref().and_then(|e|e.ready_generation),readmission:old.as_ref().and_then(|e|e.readmission.clone()),value:value.clone(),admitted_hlc:None,joined_notice:Some(joined_notice),removal:old.and_then(|e|e.removal),denied:false,setup_id:Some(snapshot.setup_id.clone())})?;
                 let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM peers WHERE id=?)",[m.device_id.as_str()],|r|r.get(0))?;
                 if !exists {
                     let name:String=tx.query_row("SELECT name FROM peers WHERE id=?",[fence.device.as_str()],|r|r.get(0))?;
@@ -903,6 +1034,8 @@ impl Store {
                 save_entry(
                     tx,
                     &Entry {
+                        ready_generation: None,
+                        readmission: None,
                         admitted_hlc: None,
                         joined_notice: None,
                         value: removed.clone(),
@@ -1046,6 +1179,8 @@ pub(super) fn paired(
             save_entry(
                 tx,
                 &Entry {
+                    ready_generation: None,
+                    readmission: None,
                     admitted_hlc: None,
                     joined_notice: None,
                     value: removed.clone(),
@@ -1059,8 +1194,9 @@ pub(super) fn paired(
     if let Some(mut old) = entries(tx)?
         .into_iter()
         .find(|e| e.value.device_id == remote.device_id && e.value.fingerprint == *pin)
-        && old.denied
     {
+        old.readmission = None;
+        old.ready_generation = None;
         old.denied = false;
         old.value = remote_value.clone();
         old.value.hlc = allocate_stamp(tx)?.1;
@@ -1093,6 +1229,7 @@ pub(super) fn paired(
     if retired_member {
         dissolve_if_last(tx, &local.device_id, &mut SetupDelta::default())?;
     }
+    clear_resolved_conflicts(tx)?;
     validate_capacity(tx)
 }
 impl Store {
@@ -1106,6 +1243,7 @@ impl Store {
             let s=state(tx)?;let Some(setup_id)=s.setup_id else{return Ok(());};
             let candidates:Vec<(Id,Hash,String,String)>={let mut q=tx.prepare("SELECT device,fingerprint,introduced_by,introducer_name FROM setup_candidates")?;q.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.map(|r|{let (d,p,b,n)=r?;Ok((Id::new(d)?,Hash::new(p)?,b,n))}).collect::<Result<_>>()?};
             for (id,pin,by,name) in candidates {
+                if entries(tx)?.iter().any(|e|e.denied && e.value.device_id==id) {continue;}
                 if blocked.iter().any(|(d,p)|d.as_ref()==Some(&id)||*p==pin) {continue;}
                 let Some(entry)=entries(tx)?.into_iter().find(|e|e.value.device_id==id&&e.value.fingerprint==pin&&!e.denied&&e.setup_id.as_ref()==Some(&setup_id)&&e.value.status==MemberStatus::Member) else {tx.execute("DELETE FROM setup_candidates WHERE device=? AND fingerprint=?",params![id.as_str(),pin.as_str()])?;continue;};
                 let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM peers WHERE id=? OR fp=?)",params![id.as_str(),pin.as_str()],|r|r.get(0))?;if exists {continue;}
@@ -1218,6 +1356,7 @@ fn clear_own_deny(tx: &Transaction<'_>, local: &Member) -> Result<()> {
     if let Some(mut own) = entries(tx)?.into_iter().find(|e| {
         e.value.device_id == local.device_id && e.value.fingerprint == local.fingerprint && e.denied
     }) {
+        own.readmission = None;
         own.denied = false;
         own.value = local.clone();
         own.value.hlc = allocate_stamp(tx)?.1;
@@ -1244,6 +1383,17 @@ impl Store {
                     [peer.as_str()],
                 )?;
                 tx.execute("DELETE FROM setup_notices WHERE device=?", [peer.as_str()])?;
+                let pin: String =
+                    tx.query_row("SELECT fp FROM peers WHERE id=?", [peer.as_str()], |r| {
+                        r.get(0)
+                    })?;
+                if let Some(mut entry) = entries(tx)?
+                    .into_iter()
+                    .find(|e| e.value.device_id == peer && e.value.fingerprint.as_str() == pin)
+                {
+                    entry.readmission = None;
+                    save_entry(tx, &entry)?;
+                }
                 if state(tx)?.withdrawn {
                     clear_own_deny(tx, &local)?;
                     tx.execute("UPDATE setup_state SET withdrawn=0 WHERE singleton=1", [])?;
@@ -1358,13 +1508,69 @@ impl Store {
             move |tx, _| {
                 fence.check(tx)?;
                 tx.execute(
-                    "UPDATE setup_links SET negotiated=0,participating=0 WHERE device=?",
-                    [fence.device.as_str()],
+                    "UPDATE setup_links SET negotiated=0,participating=0,last_connection=? WHERE device=?",
+                    params![fence.connection as i64,fence.device.as_str()],
                 )?;
+                let phone: bool = tx.query_row(
+                    "SELECT role='phone' FROM peers WHERE id=?",
+                    [fence.device.as_str()],
+                    |r| r.get(0),
+                )?;
+                if phone {
+                    phone_ready(tx, &fence)?;
+                }
                 Ok(())
             },
             |_| {},
         )
         .await
+    }
+}
+
+impl Store {
+    pub(crate) async fn setup_readmit(
+        &self,
+        key: ReadmissionKey,
+        local: Id,
+        allow: bool,
+        blocked: Vec<(Option<Id>, Hash)>,
+        finish: impl FnOnce(SetupDelta) + Send + 'static,
+    ) -> Result<()> {
+        self.setup_write(move |tx, delta| {
+            let s = state(tx)?;
+            if s.withdrawn || s.setup_id.is_none() || s.generation != key.setup_generation { return Ok(()); }
+            let all = entries(tx)?;
+            let Some(mut entry) = all.iter().find(|e| e.denied && e.value.device_id == key.device && e.value.fingerprint == key.fingerprint).cloned() else { return Ok(()); };
+            let Some(record) = entry.readmission.as_ref().filter(|r| r.key == key && r.decision == "pending") else { return Ok(()); };
+            if !entry.removal.as_ref().is_some_and(|r| r.hlc == key.removal_hlc && r.writer_device == key.removal_writer) { return Ok(()); }
+            if !allow {
+                entry.readmission.as_mut().unwrap().decision = "kept".into();
+                return save_entry(tx, &entry);
+            }
+            ensure!(!blocked.iter().any(|(id,pin)| id.as_ref() == Some(&key.device) || *pin == key.fingerprint), "Pairing in progress · Try Allow when it finishes");
+            let conflict: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM peers WHERE id=? OR fp=?)", params![key.device.as_str(), key.fingerprint.as_str()], |r| r.get(0))?;
+            let active_conflict = all.iter().any(|e| e.value.status == MemberStatus::Member && ((e.value.device_id == key.device && e.value.fingerprint != key.fingerprint) || (e.value.device_id != key.device && e.value.fingerprint == key.fingerprint)));
+            ensure!(!conflict && !active_conflict, "{} has a different certificate · Pair with it directly", record.value.name);
+            let record = record.clone();
+            entry.value = record.value.clone();
+            entry.setup_id = s.setup_id;
+            entry.denied = false;
+            entry.ready_generation = None;
+            entry.joined_notice = Some(false);
+            entry.readmission.as_mut().unwrap().decision = "allowed".into();
+            save_entry(tx, &entry)?;
+            let previous: i64 = tx.query_row("SELECT coalesce((SELECT generation FROM peer_generations WHERE device=?),0)", [key.device.as_str()], |r| r.get(0))?;
+            let generation = previous.checked_add(1).context("pairing generation exhausted")?;
+            tx.execute("INSERT INTO peers(id,fp,generation,role,name,addresses,established) VALUES(?,?,?,?,?,'[]',0)", params![key.device.as_str(),key.fingerprint.as_str(),generation,scope_role(record.value.role),record.value.name])?;
+            tx.execute("INSERT INTO peer_generations VALUES(?,?) ON CONFLICT(device) DO UPDATE SET generation=excluded.generation",params![key.device.as_str(),generation])?;
+            set_scope(tx,&key.device,SetupScope::Enabled)?;
+            tx.execute("UPDATE setup_links SET negotiated=1,participating=1,introduced_by=?,introducer_name=? WHERE device=?",params![record.introducer.as_str(),record.introducer_name,key.device.as_str()])?;
+            settings::initialize(tx,&local,&key.device,record.value.role==DeviceRole::Phone)?;
+            if let Some(reach)=&record.value.reach {merge_routes(tx,&key.device,&key.fingerprint,&reach.addresses)?;}
+            tx.execute("DELETE FROM setup_candidates WHERE device=? AND fingerprint=?",params![key.device.as_str(),key.fingerprint.as_str()])?;
+            validate_capacity(tx)?;
+            delta.added.push(key.device);
+            Ok(())
+        },finish).await
     }
 }

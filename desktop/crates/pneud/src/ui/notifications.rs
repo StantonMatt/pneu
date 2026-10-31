@@ -141,6 +141,17 @@ impl Notice {
         n.device = Some(device);
         n
     }
+    pub(crate) fn readmission(record: &crate::store::members::Readmission) -> Self {
+        let mut notice = Self::new(super::window_setup::readmission_text(record));
+        notice.actions = vec![("deny", "Keep removed"), ("allow", "Allow")];
+        notice.setup_requests = vec![super::window_setup::Decision {
+            readmission: Some(record.key.clone()),
+            device: record.key.device.clone(),
+            setup_generation: record.key.setup_generation,
+            binding_generation: 0,
+        }];
+        notice
+    }
     pub(crate) fn link_request(
         names: &[String],
         requests: Vec<super::window_setup::Decision>,
