@@ -1700,6 +1700,7 @@ mod tests {
         for join in [false, true] {
             let (_da, a, la) = core().await?;
             let (_db, b, lb) = core().await?;
+            let lb = MockListener::new(lb);
             drop(la);
             let address = lb.local_addr()?.to_string();
             let uri = b
@@ -1730,16 +1731,20 @@ mod tests {
                     .await
                     .map(|_| ())
             };
+            let mock = mock_result(mock).await;
+            let outcome = format!("dial: {result:?}; mock: {mock:?}");
             assert!(
                 result
-                    .unwrap_err()
+                    .err()
+                    .context(outcome.clone())?
                     .downcast_ref::<crate::client::PcRejection>()
-                    .is_some_and(|e| e.0.code == ErrorCode::Unauthorized)
+                    .is_some_and(|e| e.0.code == ErrorCode::Unauthorized),
+                "{outcome}"
             );
             assert!(a.paired_devices().is_empty());
             assert!(a.store.peer_info().await?.is_empty());
             assert_eq!(a.store.pairing_generation(&a.identity.device_id), None);
-            mock.await??;
+            mock?;
             a.shutdown_actions().await?;
         }
         Ok(())
@@ -1768,6 +1773,7 @@ mod tests {
     async fn own_device_id_registration_rejected_before_session_state_changes() -> Result<()> {
         let (_da, a, la) = core().await?;
         let (_db, b, lb) = core().await?;
+        let lb = MockListener::new(lb);
         drop(la);
         let address = lb.local_addr()?.to_string();
         let pin = b.identity.fingerprint.clone();
@@ -1932,7 +1938,7 @@ mod tests {
     async fn accept_join_request(
         a: &Core,
         b: &Core,
-        la: &TcpListener,
+        la: &MockListener,
     ) -> Result<TlsStream<TcpStream>> {
         let mut tls = accept_hello(a, la, None).await?;
         let token = match read_frame(&mut tls).await? {
@@ -1966,6 +1972,7 @@ mod tests {
     #[tokio::test]
     async fn pairing_connection_pong_is_not_established_evidence() -> Result<()> {
         let (_da, a, la) = core().await?;
+        let la = MockListener::new(la);
         let (_db, b, lb) = core().await?;
         drop(lb);
         let uri = a
@@ -2118,6 +2125,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_before_request_preserves_both_endpoints_other_bindings() -> Result<()> {
         let (_da, a, la) = core().await?;
+        let la = MockListener::new(la);
         let (_db, b, lb) = core().await?;
         let (_dc, c, lc) = core().await?;
         drop(lb);
@@ -2135,7 +2143,7 @@ mod tests {
         let supervisor = Task::spawn(b.clone().mesh_supervise());
         // Stall before TLS/HELLO, so cancellation races a live connection but
         // no PAIR_REQUEST can have been sent.
-        let (mut tcp, _) = la.accept().await?;
+        let (mut tcp, _) = accept_tls_tcp(&la).await?;
         b.cancel_join(attempt).await?;
         assert_eq!(b.join_status(attempt)?["state"], "cancelled");
         until(|| b.transports.available_permits() == TRANSPORT_LIMIT).await?;
@@ -2158,6 +2166,7 @@ mod tests {
     #[tokio::test]
     async fn incoming_replacement_survives_old_attempt_retry_on_both_endpoints() -> Result<()> {
         let (_da, a, la) = core().await?;
+        let la = MockListener::new(la);
         let (_db, b, lb) = core().await?;
         drop(lb);
         let uri = a
@@ -2209,6 +2218,7 @@ mod tests {
     #[tokio::test]
     async fn unrelated_pairing_does_not_void_install_fence() -> Result<()> {
         let (_da, a, la) = core().await?;
+        let la = MockListener::new(la);
         let (_db, b, lb) = core().await?;
         let (_dc, c, lc) = core().await?;
         drop(lb);
@@ -2246,6 +2256,7 @@ mod tests {
     async fn restart_abandons_attempt_and_fresh_invitation_reuses_unestablished_binding()
     -> Result<()> {
         let (_da, a, la) = core().await?;
+        let la = MockListener::new(la);
         let (_db, mut b, lb) = core().await?;
         drop(lb);
         let address = la.local_addr()?.to_string();
@@ -2278,7 +2289,7 @@ mod tests {
         assert!(!b.paths.data.join("join-pending.json").exists());
         let fresh = a.start_pairing_with_addresses(vec![address]).await?;
         assert_ne!(uri.token, fresh.token);
-        let server = Task::spawn(a.clone().serve(la, false));
+        let server = Task::spawn(a.clone().serve(la.into_inner(), false));
         let preview = b.join(&fresh.build()?).await?;
         let next = preview["attempt"].as_str().unwrap();
         b.confirm_join(next).await?;
@@ -2310,6 +2321,7 @@ mod tests {
     #[tokio::test]
     async fn local_join_storage_error_preserves_supervisor_and_other_link() -> Result<()> {
         let (_da, a, la) = core().await?;
+        let la = MockListener::new(la);
         let (_db, b, lb) = core().await?;
         let (_dc, c, lc) = core().await?;
         drop(lb);
@@ -2363,7 +2375,7 @@ mod tests {
             })
             .await?;
         b.confirm_join(attempt).await?;
-        let a_server = Task::spawn(a.clone().serve(la, false));
+        let a_server = Task::spawn(a.clone().serve(la.into_inner(), false));
         until(|| b.join_status(attempt).unwrap()["state"] == "paired").await?;
         assert!(b.connected_devices().contains(&c.identity.device_id));
         assert!(b.paired_devices().contains(&a.identity.device_id));
@@ -2378,6 +2390,7 @@ mod tests {
     #[tokio::test]
     async fn cancellation_after_request_finishes_locally_without_unpair() -> Result<()> {
         let (_da, a, la) = core().await?;
+        let la = MockListener::new(la);
         let (_db, b, lb) = core().await?;
         drop(lb);
         let (_dc, c, lc) = core().await?;
@@ -2436,6 +2449,7 @@ mod tests {
     #[tokio::test]
     async fn lifecycle_change_while_pair_result_is_in_flight_cannot_install_trust() -> Result<()> {
         let (_da, a, la) = core().await?;
+        let la = MockListener::new(la);
         let (_db, b, lb) = core().await?;
         drop(lb);
         bind(&b, &a).await?;
@@ -2481,6 +2495,7 @@ mod tests {
     async fn storage_denial_and_missing_rejection_code_keep_same_attempt_retryable() -> Result<()> {
         for code in [Some(PairCode::StorageFailed), None] {
             let (_da, a, la) = core().await?;
+            let la = MockListener::new(la);
             let (_db, b, lb) = core().await?;
             drop(lb);
             let uri = a
@@ -2705,6 +2720,7 @@ mod tests {
         ] {
             let (_da, a, la) = core().await?;
             let (_db, b, lb) = core().await?;
+            let lb = MockListener::new(lb);
             let (_dc, c, lc) = core().await?;
             drop(la);
             drop(lc);
@@ -2780,12 +2796,9 @@ mod tests {
             tokio::time::advance(Duration::from_secs(120)).await;
             tokio::time::resume();
             a.mesh.changed.notify_waiters();
-            assert!(
-                tokio::time::timeout(Duration::from_millis(50), lb.accept())
-                    .await
-                    .is_err(),
-                "{failure} retried too soon"
-            );
+            no_tls_dial(&lb, Duration::from_millis(50))
+                .await
+                .with_context(|| format!("{failure} retried too soon"))?;
             cancel.send_replace(true);
             worker.await??;
             a.request_shutdown();
@@ -2869,6 +2882,7 @@ mod tests {
     async fn established_remote_revocation_is_detected_after_restart() -> Result<()> {
         let (_da, mut a, la) = core().await?;
         let (_db, b, lb) = core().await?;
+        let lb = MockListener::new(lb);
         drop(la);
         computer_route(&a, &b, lb.local_addr()?.to_string()).await?;
         bind(&b, &a).await?;
@@ -2895,7 +2909,7 @@ mod tests {
         b.unpair_device(id).await?;
         a = Core::new(paths, config, Arc::new(Mock)).await?;
         a.setup_test_capability.store(false, Ordering::SeqCst);
-        let server = Task::spawn(b.clone().serve(lb, false));
+        let server = Task::spawn(b.clone().serve(lb.into_inner(), false));
         let supervisor = Task::spawn(a.clone().mesh_supervise());
         until(|| a.paired_devices().is_empty()).await?;
         assert!(b.paired_devices().is_empty());
@@ -2910,6 +2924,7 @@ mod tests {
     async fn unconfirmed_reverse_dial_denial_after_restart_keeps_binding() -> Result<()> {
         let (_da, a, la) = core().await?;
         let (_db, b, lb) = core().await?;
+        let lb = MockListener::new(lb);
         drop(la);
         computer_route(&a, &b, lb.local_addr()?.to_string()).await?;
         let paths = a.paths.clone();
@@ -2947,14 +2962,14 @@ mod tests {
     }
     async fn accept_hello(
         core: &Core,
-        listener: &TcpListener,
+        listener: &MockListener,
         addresses: Option<Vec<String>>,
     ) -> Result<TlsStream<TcpStream>> {
         accept_hello_version(core, listener, addresses, 1).await
     }
     async fn accept_hello_version(
         core: &Core,
-        listener: &TcpListener,
+        listener: &MockListener,
         addresses: Option<Vec<String>>,
         version: u32,
     ) -> Result<TlsStream<TcpStream>> {
@@ -2965,20 +2980,118 @@ mod tests {
         send(&mut tls, &Message::Hello(hello)).await?;
         Ok(tls)
     }
+    type Candidate = futures_util::future::BoxFuture<
+        'static,
+        (TcpStream, SocketAddr, Vec<u8>, std::io::Result<()>),
+    >;
+    struct MockListener {
+        tcp: TcpListener,
+        candidates: tokio::sync::Mutex<futures_util::stream::FuturesUnordered<Candidate>>,
+    }
+    impl MockListener {
+        fn new(tcp: TcpListener) -> Self {
+            Self {
+                tcp,
+                candidates: tokio::sync::Mutex::new(futures_util::stream::FuturesUnordered::new()),
+            }
+        }
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            self.tcp.local_addr()
+        }
+        fn into_inner(self) -> TcpListener {
+            self.tcp
+        }
+    }
+    // Other host processes can reach these shared loopback listeners. Select
+    // the first handshake record carrying the dialers' encoded pneu.local SNI
+    // extension; rustls and the protocol assertions still validate that socket
+    // strictly, with no retry after selection. Concurrent reads let silent or
+    // partial candidates wait without polling or delaying another dialer.
+    // The listener owns candidate futures, preserving their sockets and read
+    // progress across selection or cancellation until the listener is dropped.
+    async fn accept_tls_tcp(listener: &MockListener) -> Result<(TcpStream, Vec<u8>)> {
+        use futures_util::{FutureExt, StreamExt};
+        use tokio::io::AsyncReadExt;
+        // server_name extension: type, extension length, list length, name type,
+        // name length, name. Match its encoding, not an arbitrary name substring.
+        const SNI: &[u8] = b"\x00\x00\x00\x0f\x00\x0d\x00\x00\x0apneu.local";
+        let local = listener.local_addr()?;
+        let mut candidates = listener.candidates.lock().await;
+        loop {
+            tokio::select! {
+                accepted = listener.tcp.accept() => {
+                    let (mut tcp, peer) = accepted?;
+                    candidates.push(async move {
+                        let mut prefix = vec![0; 1];
+                        let read = async {
+                            tcp.read_exact(&mut prefix).await?;
+                            if prefix[0] == 0x16 {
+                                prefix.resize(5, 0);
+                                tcp.read_exact(&mut prefix[1..]).await?;
+                                let len = usize::from(u16::from_be_bytes([prefix[3], prefix[4]]));
+                                prefix.resize(5 + len, 0);
+                                tcp.read_exact(&mut prefix[5..]).await?;
+                            }
+                            Ok::<_, std::io::Error>(())
+                        }.await;
+                        (tcp, peer, prefix, read)
+                    }.boxed());
+                }
+                Some((tcp, peer, prefix, read)) = candidates.next(), if !candidates.is_empty() => {
+                    match read {
+                        Ok(()) if prefix.windows(SNI.len()).any(|w| w == SNI) => {
+                            return Ok((tcp, prefix));
+                        }
+                        Ok(()) => eprintln!(
+                            "mock listener {local} dropped foreign connection from {peer}: \"{}\"",
+                            prefix[..prefix.len().min(32)].escape_ascii()
+                        ),
+                        Err(e) => eprintln!("mock listener {local} skipped connection from {peer}: {e}"),
+                    }
+                }
+            }
+        }
+    }
+    // A must-not-dial window: strays are filtered as above, but a TLS dialer
+    // that connects within it fails the caller's assertion.
+    async fn no_tls_dial(listener: &MockListener, window: Duration) -> Result<()> {
+        match tokio::time::timeout(window, accept_tls_tcp(listener)).await {
+            Err(_) => Ok(()),
+            Ok(Ok((tcp, _))) => bail!("unexpected TLS dial from {:?}", tcp.peer_addr()),
+            Ok(Err(e)) => Err(e),
+        }
+    }
+    // Await a mock peer with its own failure, so an unexpected dial outcome
+    // reports the cause rather than only a derived classification mismatch.
+    async fn mock_result(mock: Task) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(5), mock)
+            .await
+            .context("mock peer did not finish")??
+    }
     async fn accept_client_hello(
         core: &Core,
-        listener: &TcpListener,
+        listener: &MockListener,
     ) -> Result<TlsStream<TcpStream>> {
         let verifier = Arc::new(ClientVerifier::new(
             core.admission.clone(),
             core.provisional.clone(),
         ));
         let config = crate::tls::server_config(&core.identity, verifier.clone())?;
-        let (tcp, _) = listener.accept().await?;
-        let mut tls: TlsStream<TcpStream> = TlsAcceptor::from(Arc::new(config))
-            .accept(tcp)
-            .await?
-            .into();
+        let (tcp, prefix) = accept_tls_tcp(listener).await?;
+        // Feed exactly the inspected bytes to rustls, then continue its same
+        // handshake on the selected socket. Any TLS failure is returned.
+        let mut acceptor = rustls::server::Acceptor::default();
+        let mut prefix = std::io::Cursor::new(prefix);
+        let handshake = loop {
+            if prefix.position() == prefix.get_ref().len() as u64 {
+                break tokio_rustls::LazyConfigAcceptor::new(acceptor, tcp).await?;
+            }
+            acceptor.read_tls(&mut prefix)?;
+            if let Some(accepted) = acceptor.accept().map_err(|(error, _alert)| error)? {
+                break tokio_rustls::StartHandshake::from_parts(accepted, tcp);
+            }
+        };
+        let mut tls: TlsStream<TcpStream> = handshake.into_stream(Arc::new(config)).await?.into();
         assert!(matches!(
             read_frame(&mut tls).await?,
             Some(Message::Hello(_))
@@ -2988,7 +3101,7 @@ mod tests {
     }
     async fn accept_ready(
         core: &Core,
-        listener: &TcpListener,
+        listener: &MockListener,
         addresses: Option<Vec<String>>,
     ) -> Result<TlsStream<TcpStream>> {
         let mut tls = accept_hello(core, listener, addresses).await?;
@@ -2997,6 +3110,229 @@ mod tests {
         };
         send(&mut tls, &Message::Pong(ping)).await?;
         Ok(tls)
+    }
+    #[tokio::test]
+    async fn mock_accept_skips_foreign_loopback_connections_queued_before_the_dialer() -> Result<()>
+    {
+        let (_da, a, _la) = core().await?;
+        let (_db, b, lb) = core().await?;
+        let lb = MockListener::new(lb);
+        bind(&a, &b).await?;
+        let address = lb.local_addr()?.to_string();
+        // Queue foreign connections first, including partial records that must
+        // neither spin nor delay selection, and a real ClientHello for localhost.
+        let mut plaintext = TcpStream::connect(&address).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut plaintext, b"GET / HTTP/1.1\r\n").await?;
+        let mut probe = TcpStream::connect(&address).await?;
+        let config = crate::tls::client_config(&a.identity, b.identity.fingerprint.clone())?;
+        let mut client = rustls::ClientConnection::new(
+            Arc::new(config),
+            rustls::pki_types::ServerName::try_from("localhost")?,
+        )?;
+        let mut hello = Vec::new();
+        client.write_tls(&mut hello)?;
+        tokio::io::AsyncWriteExt::write_all(&mut probe, &hello).await?;
+        let mut partial_header = TcpStream::connect(&address).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut partial_header, &[0x16, 0x03]).await?;
+        let mut partial_body = TcpStream::connect(&address).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut partial_body, &[0x16, 0x03, 0x01, 0x00, 0x20])
+            .await?;
+        let mut closed_header = TcpStream::connect(&address).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut closed_header, &[0x16]).await?;
+        tokio::io::AsyncWriteExt::shutdown(&mut closed_header).await?;
+        // The name outside an encoded SNI extension is not a dialer marker.
+        let mut name_only = TcpStream::connect(&address).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut name_only, b"\x16\x03\x01\x00\x0apneu.local")
+            .await?;
+        let mut silent = TcpStream::connect(&address).await?;
+        drop(TcpStream::connect(&address).await?);
+        let mock_core = b.clone();
+        let mock = Task::spawn(async move { accept_hello(&mock_core, &lb, None).await.map(drop) });
+        let link = tokio::time::timeout(
+            Duration::from_secs(5),
+            a.connect_computer(
+                &[address],
+                b.identity.fingerprint.clone(),
+                Some(&b.identity.device_id),
+            ),
+        )
+        .await??;
+        assert_eq!(link.hello.device_id, b.identity.device_id);
+        mock_result(mock).await?;
+        for stray in [
+            &mut plaintext,
+            &mut probe,
+            &mut partial_header,
+            &mut partial_body,
+            &mut closed_header,
+            &mut name_only,
+            &mut silent,
+        ] {
+            let mut bytes = Vec::new();
+            // A reset (unread data) or EOF both mean the mock closed it.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::io::AsyncReadExt::read_to_end(stray, &mut bytes),
+            )
+            .await
+            .context("stray connection left open")?;
+            assert!(bytes.is_empty());
+        }
+        drop(link);
+        // The must-not-dial helper retains pending candidates on timeout;
+        // dropping the listener closes them without background tasks.
+        let listener = MockListener::new(TcpListener::bind("127.0.0.1:0").await?);
+        let mut stalled = TcpStream::connect(listener.local_addr()?).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut stalled, &[0x16, 0x03]).await?;
+        no_tls_dial(&listener, Duration::from_millis(50)).await?;
+        let mut byte = [0];
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                tokio::io::AsyncReadExt::read(&mut stalled, &mut byte),
+            )
+            .await
+            .is_err(),
+            "must-not-dial timeout dropped a pending candidate"
+        );
+        drop(listener);
+        let mut bytes = Vec::new();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read_to_end(&mut stalled, &mut bytes),
+        )
+        .await
+        .context("dropped listener left a candidate open")?;
+        assert!(bytes.is_empty());
+        let listener = MockListener::new(TcpListener::bind("127.0.0.1:0").await?);
+        let config = crate::tls::client_config(&a.identity, b.identity.fingerprint.clone())?;
+        let mut client = rustls::ClientConnection::new(
+            Arc::new(config),
+            rustls::pki_types::ServerName::try_from("pneu.local")?,
+        )?;
+        let mut hello = Vec::new();
+        client.write_tls(&mut hello)?;
+        let mut dialer = TcpStream::connect(listener.local_addr()?).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut dialer, &hello).await?;
+        let error = no_tls_dial(&listener, Duration::from_millis(50))
+            .await
+            .expect_err("must-not-dial window accepted a dialer");
+        assert!(error.to_string().contains("unexpected TLS dial"));
+        a.shutdown_actions().await?;
+        b.shutdown_actions().await
+    }
+    #[tokio::test]
+    async fn mock_accept_preserves_queued_legitimate_dialers_across_accepts() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (_da, a, _la) = core().await?;
+        let (_db, b, listener) = core().await?;
+        let listener = MockListener::new(listener);
+        let config = crate::tls::client_config(&a.identity, b.identity.fingerprint.clone())?;
+        let mut client = rustls::ClientConnection::new(
+            Arc::new(config),
+            rustls::pki_types::ServerName::try_from("pneu.local")?,
+        )?;
+        let mut hello = Vec::new();
+        client.write_tls(&mut hello)?;
+        let address = listener.local_addr()?;
+        let mut stray = TcpStream::connect(address).await?;
+        stray.write_all(b"GET / HTTP/1.1\r\n").await?;
+        let mut partial = TcpStream::connect(address).await?;
+        partial.write_all(&hello[..2]).await?;
+        let mut accepting = Box::pin(accept_tls_tcp(&listener));
+        // Keep an already-accepted legitimate candidate pending while other
+        // complete ClientHellos queue up behind it.
+        assert!(futures_util::poll!(accepting.as_mut()).is_pending());
+        let mut dialers = vec![partial];
+        for _ in 0..3 {
+            let mut dialer = TcpStream::connect(address).await?;
+            dialer.write_all(&hello).await?;
+            dialers.push(dialer);
+        }
+        let first = tokio::time::timeout(Duration::from_secs(2), accepting).await??;
+        dialers[0].write_all(&hello[2..]).await?;
+        for (index, dialer) in dialers.iter_mut().enumerate() {
+            dialer.write_all(&[index as u8]).await?;
+        }
+        let mut accepted = vec![first];
+        for _ in 1..dialers.len() {
+            accepted.push(
+                tokio::time::timeout(Duration::from_secs(2), accept_tls_tcp(&listener))
+                    .await
+                    .context("queued legitimate dialer was dropped")??,
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (mut tcp, prefix) in accepted {
+            assert_eq!(prefix, hello);
+            let mut marker = [0];
+            tokio::time::timeout(Duration::from_secs(2), tcp.read_exact(&mut marker)).await??;
+            let index = usize::from(marker[0]);
+            assert_eq!(tcp.peer_addr()?, dialers[index].local_addr()?);
+            assert!(seen.insert(index), "dialer accepted twice");
+        }
+        assert_eq!(seen.len(), dialers.len());
+        let mut bytes = Vec::new();
+        // A foreign connection may close with either EOF or a reset.
+        let _ = tokio::time::timeout(Duration::from_secs(2), stray.read_to_end(&mut bytes))
+            .await
+            .context("foreign stray left open")?;
+        assert!(bytes.is_empty());
+        a.shutdown_actions().await?;
+        b.shutdown_actions().await
+    }
+    #[tokio::test]
+    async fn mock_accept_fails_on_the_selected_tls_connection_without_skipping() -> Result<()> {
+        let (_da, a, _la) = core().await?;
+        let (_db, b, lb) = core().await?;
+        let lb = MockListener::new(lb);
+        let address = lb.local_addr()?.to_string();
+        // Skip plaintext first, then select a record with the encoded SNI but
+        // a truncated ClientHello body. Its TLS error must surface, not retry.
+        let mut plaintext = TcpStream::connect(&address).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut plaintext, b"GET / HTTP/1.1\r\n").await?;
+        let body = [
+            &[0x01, 0x00, 0x00, 0x15, 0x03, 0x03][..],
+            b"\x00\x00\x00\x0f\x00\x0d\x00\x00\x0apneu.local",
+        ]
+        .concat();
+        let record = [&[0x16, 0x03, 0x01, 0x00, body.len() as u8][..], &body].concat();
+        let mut corrupt = TcpStream::connect(&address).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut corrupt, &record[..2]).await?;
+        let mut accepted = Box::pin(accept_client_hello(&b, &lb));
+        assert!(futures_util::poll!(accepted.as_mut()).is_pending());
+        tokio::io::AsyncWriteExt::write_all(&mut corrupt, &record[2..]).await?;
+        let error = tokio::time::timeout(Duration::from_secs(2), accepted)
+            .await
+            .context("corrupt TLS connection was skipped")?
+            .err()
+            .context("corrupt TLS connection was accepted")?;
+        assert!(
+            matches!(
+                error.downcast_ref::<rustls::Error>(),
+                Some(rustls::Error::InvalidMessage(
+                    rustls::InvalidMessage::MissingData("Random")
+                ))
+            ),
+            "unexpected selected TLS error: {error:?}"
+        );
+        // A real dialer pinning the wrong fingerprint fails the handshake.
+        let pin = Hash::new("a".repeat(64))?;
+        let addresses = [address];
+        let (accepted, dialed) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(2), accept_client_hello(&b, &lb)),
+            a.connect_computer(&addresses, pin, None)
+        );
+        assert!(
+            accepted
+                .context("wrong-pin TLS connection was skipped")?
+                .is_err()
+        );
+        assert!(dialed.is_err());
+        drop(corrupt);
+        a.shutdown_actions().await?;
+        b.shutdown_actions().await
     }
     async fn computer_route(a: &Core, b: &Core, address: String) -> Result<()> {
         bind(a, b).await?;
@@ -3029,7 +3365,7 @@ mod tests {
         drop(initial);
         until(|| a.connected_devices().is_empty()).await?;
 
-        let stalled = TcpListener::bind("127.0.0.1:0").await?;
+        let stalled = MockListener::new(TcpListener::bind("127.0.0.1:0").await?);
         let mut peers = Vec::new();
         for _ in 0..16 {
             let device = Id::new(crate::random_hex(16))?;
@@ -3063,7 +3399,7 @@ mod tests {
         let mut stalled_sockets = Vec::new();
         for _ in 0..OUTBOUND_ADMISSION_LIMIT {
             stalled_sockets.push(
-                tokio::time::timeout(Duration::from_secs(2), stalled.accept())
+                tokio::time::timeout(Duration::from_secs(2), accept_tls_tcp(&stalled))
                     .await??
                     .0,
             );
@@ -3110,6 +3446,7 @@ mod tests {
     async fn outbound_legacy_hello_ignores_role_and_address_hints_before_pairing() -> Result<()> {
         let (_da, a, la) = core().await?;
         let (_db, b, lb) = core().await?;
+        let lb = MockListener::new(lb);
         drop(la);
         let address = lb.local_addr()?.to_string();
         let responder = b.clone();
@@ -3168,9 +3505,9 @@ mod tests {
         let (_da, a, la) = core().await?;
         let (_db, b, lb) = core().await?;
         drop((la, lb));
-        let first = TcpListener::bind("127.0.0.1:0").await?;
-        let second = TcpListener::bind("127.0.0.1:0").await?;
-        let other = TcpListener::bind("127.0.0.1:0").await?;
+        let first = MockListener::new(TcpListener::bind("127.0.0.1:0").await?);
+        let second = MockListener::new(TcpListener::bind("127.0.0.1:0").await?);
+        let other = MockListener::new(TcpListener::bind("127.0.0.1:0").await?);
         let reserved = a
             .outbound_ingress
             .clone()
@@ -3189,7 +3526,7 @@ mod tests {
                 .map(|_| ())
         });
         let (first_socket, _) =
-            tokio::time::timeout(Duration::from_secs(2), first.accept()).await??;
+            tokio::time::timeout(Duration::from_secs(2), accept_tls_tcp(&first)).await??;
         let addresses = [other.local_addr()?.to_string()];
         let mut queued =
             Box::pin(a.connect_computer(&addresses, b.identity.fingerprint.clone(), None));
@@ -3199,19 +3536,15 @@ mod tests {
         let (other_socket, _) = tokio::time::timeout(Duration::from_secs(2), async {
             tokio::select! {
                 result = &mut queued => bail!("queued handshake unexpectedly finished: {}", result.is_ok()),
-                accepted = other.accept() => Ok(accepted?),
+                accepted = accept_tls_tcp(&other) => accepted,
             }
         }).await??;
         // The sweep must yield to the earlier waiter, rather than retain a
         // permit while opening its second route.
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), second.accept())
-                .await
-                .is_err()
-        );
+        no_tls_dial(&second, Duration::from_millis(50)).await?;
         drop((queued, other_socket));
         let (second_socket, _) =
-            tokio::time::timeout(Duration::from_secs(2), second.accept()).await??;
+            tokio::time::timeout(Duration::from_secs(2), accept_tls_tcp(&second)).await??;
         sweep.abort();
         let _ = sweep.await;
         drop((reserved, second_socket));
@@ -3228,6 +3561,7 @@ mod tests {
     async fn authenticated_inbound_recovery_cancels_error_backoff_and_drop_redials() -> Result<()> {
         let (_da, a, la) = core().await?;
         let (_db, b, lb) = core().await?;
+        let lb = MockListener::new(lb);
         computer_route(&a, &b, lb.local_addr()?.to_string()).await?;
         bind(&b, &a).await?;
         let generation = a.store.pairing_generation(&b.identity.device_id).unwrap();
@@ -3242,11 +3576,7 @@ mod tests {
         tokio::task::yield_now().await;
         for _ in 0..3 {
             a.mesh.changed.notify_waiters();
-            assert!(
-                tokio::time::timeout(Duration::from_millis(50), lb.accept())
-                    .await
-                    .is_err()
-            );
+            no_tls_dial(&lb, Duration::from_millis(50)).await?;
         }
         let ComputerLink {
             mut tls,
@@ -3296,6 +3626,7 @@ mod tests {
     async fn dialer_keepalive_answers_then_times_out_without_pong() -> Result<()> {
         let (_da, a, la) = core().await?;
         let (_db, b, lb) = core().await?;
+        let lb = MockListener::new(lb);
         drop(la);
         computer_route(&a, &b, lb.local_addr()?.to_string()).await?;
         bind(&b, &a).await?;
@@ -3367,6 +3698,7 @@ mod tests {
     async fn network_loss_redials_using_changed_hello_address() -> Result<()> {
         let (_da, a, la) = core().await?;
         let (mut db, b, old) = core().await?;
+        let old = MockListener::new(old);
         drop(la);
         let moved = db.listen()?;
         let address = moved.local_addr()?.to_string();
@@ -3394,7 +3726,7 @@ mod tests {
         // cached last-good address cannot stall recovery to the moved server.
         let _old_server = Task::spawn(async move {
             loop {
-                let (socket, _) = old.accept().await?;
+                let (socket, _) = accept_tls_tcp(&old).await?;
                 drop(socket);
             }
         });
@@ -3424,12 +3756,13 @@ mod tests {
     -> Result<()> {
         let (_da, a, la) = core().await?;
         let (_db, b, lb) = core().await?;
+        let lb = MockListener::new(lb);
         drop(la);
         computer_route(&a, &b, lb.local_addr()?.to_string()).await?;
         bind(&b, &a).await?;
         let supervisor = Task::spawn(a.clone().mesh_supervise());
         // Stall TLS after TCP admission. The snapshot exposes an active dial.
-        let (tcp, _) = lb.accept().await?;
+        let (tcp, _) = accept_tls_tcp(&lb).await?;
         until(|| {
             a.ui_snapshot()
                 .devices
@@ -3471,6 +3804,7 @@ mod tests {
     #[tokio::test]
     async fn pending_join_recovers_lost_result_and_buffers_ready_before_binding() -> Result<()> {
         let (_da, a, la) = core().await?;
+        let la = MockListener::new(la);
         let (_db, b, lb) = core().await?;
         drop(lb);
         let uri = a
@@ -3555,6 +3889,7 @@ mod tests {
     #[tokio::test]
     async fn supervisor_recovers_join_and_dial_panics_without_leaking_children() -> Result<()> {
         let (_da, a, la) = core().await?;
+        let la = MockListener::new(la);
         let (_db, b, lb) = core().await?;
         drop(lb);
         let uri = a
@@ -3574,7 +3909,7 @@ mod tests {
             .await
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         drop(tls);
-        let server = Task::spawn(a.clone().serve(la, false));
+        let server = Task::spawn(a.clone().serve(la.into_inner(), false));
         until(|| a.connected_devices().len() == 1 && b.connected_devices().len() == 1).await?;
         assert_eq!(b.join_status(attempt)?["state"], "paired");
         // An actual worker panic is collected, then the supervisor replaces it.
@@ -3720,6 +4055,7 @@ mod tests {
     async fn invitation_versions_are_distinct_from_malformed_links_without_dialing() -> Result<()> {
         let (_da, a, _la) = core().await?;
         let (_db, b, lb) = core().await?;
+        let lb = MockListener::new(lb);
         let uri = b
             .start_pairing_with_addresses(vec![lb.local_addr()?.to_string()])
             .await?
@@ -3739,11 +4075,7 @@ mod tests {
             assert!(a.mesh.join.lock().unwrap().is_none());
         }
         assert_eq!(a.join("unrelated clipboard").await?["state"], "no_link");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), lb.accept())
-                .await
-                .is_err()
-        );
+        no_tls_dial(&lb, Duration::from_millis(50)).await?;
         assert!(a.paired_devices().is_empty());
         a.shutdown_actions().await?;
         b.shutdown_actions().await
@@ -3872,7 +4204,7 @@ mod tests {
     #[tokio::test]
     async fn dial_sweep_deadline_cancels_an_active_handshake_after_admission_wait() -> Result<()> {
         let (_da, a, _la) = core().await?;
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let listener = MockListener::new(TcpListener::bind("127.0.0.1:0").await?);
         let reserved = a
             .outbound_ingress
             .clone()
@@ -3889,7 +4221,7 @@ mod tests {
         let (socket, _) = tokio::time::timeout(Duration::from_secs(2), async {
             tokio::select! {
                 _ = &mut dial => bail!("dial ended before TCP accept"),
-                accepted = listener.accept() => Ok(accepted?),
+                accepted = accept_tls_tcp(&listener) => accepted,
             }
         })
         .await??;
@@ -3983,9 +4315,10 @@ mod tests {
         ] {
             let (_da, a, _la) = core().await?;
             let (_db, b, lb) = core().await?;
+            let lb = MockListener::new(lb);
             bind(&a, &b).await?;
             let generation = a.store.pairing_generation(&b.identity.device_id);
-            let fallback = TcpListener::bind("127.0.0.1:0").await?;
+            let fallback = MockListener::new(TcpListener::bind("127.0.0.1:0").await?);
             let addresses = [
                 lb.local_addr()?.to_string(),
                 fallback.local_addr()?.to_string(),
@@ -4032,35 +4365,38 @@ mod tests {
                     Some(&b.identity.device_id),
                 )
                 .await;
+            let mock = mock_result(mock).await;
+            let outcome = format!(
+                "{variant}: dial: {:?}; mock: {mock:?}",
+                result.as_ref().err()
+            );
             if variant == "invalid_capability" {
                 assert!(
                     result
                         .err()
-                        .unwrap()
+                        .context(outcome.clone())?
                         .downcast_ref::<ProtocolError>()
-                        .is_some()
+                        .is_some(),
+                    "{outcome}"
                 );
             } else if matches!(variant, "missing_role" | "phone_role") {
                 assert!(
                     result
                         .err()
-                        .unwrap()
+                        .context(outcome.clone())?
                         .downcast_ref::<crate::client::PcRejection>()
-                        .is_some_and(|e| e.0.code == ErrorCode::MalformedMessage)
+                        .is_some_and(|e| e.0.code == ErrorCode::MalformedMessage),
+                    "{outcome}"
                 );
             } else {
-                let link = result?;
-                assert_eq!(link.hello.role, Some(DeviceRole::Computer));
+                let link = result.context(outcome.clone())?;
+                assert_eq!(link.hello.role, Some(DeviceRole::Computer), "{outcome}");
                 if variant == "legacy" {
                     assert!(link.hello.addresses.is_none());
                 }
             }
-            mock.await??;
-            assert!(
-                tokio::time::timeout(Duration::from_millis(30), fallback.accept())
-                    .await
-                    .is_err()
-            );
+            mock.context(outcome)?;
+            no_tls_dial(&fallback, Duration::from_millis(30)).await?;
             assert_eq!(
                 a.store.pairing_generation(&b.identity.device_id),
                 generation
@@ -4155,6 +4491,7 @@ mod tests {
     #[tokio::test]
     async fn attempt_own_committed_install_is_reused_without_replacing_generation() -> Result<()> {
         let (_da, a, la) = core().await?;
+        let la = MockListener::new(la);
         let (_db, b, _lb) = core().await?;
         let address = la.local_addr()?.to_string();
         let uri = a
@@ -4312,6 +4649,7 @@ mod tests {
         for ready in [true, false] {
             let (_da, a, la) = core().await?;
             let (_db, b, lb) = core().await?;
+            let lb = MockListener::new(lb);
             drop(la);
             scoped_binding(&a, &b, false).await?;
             bind(&b, &a).await?;
@@ -4360,6 +4698,7 @@ mod tests {
     -> Result<()> {
         let (_da, a, la) = core().await?;
         let (_db, b, lb) = core().await?;
+        let lb = MockListener::new(lb);
         let (_dc, c, _lc) = core().await?;
         drop(la);
         scoped_binding(&a, &c, true).await?;
@@ -4434,6 +4773,7 @@ mod tests {
     async fn setup_review_retry_cannot_resurrect_withdrawn_join() -> Result<()> {
         let (_da, a, _la) = core().await?;
         let (_db, b, lb) = core().await?;
+        let lb = MockListener::new(lb);
         let uri = b
             .start_pairing_with_addresses(vec![lb.local_addr()?.to_string()])
             .await?;
@@ -4582,6 +4922,7 @@ mod tests {
     async fn setup_advisory_cancelled_worker_rechecks_after_pairing_gate_before_request()
     -> Result<()> {
         let (_da, a, la) = core().await?;
+        let la = MockListener::new(la);
         let (_db, b, _lb) = core().await?;
         let uri = a
             .start_pairing_with_addresses(vec![la.local_addr()?.to_string()])

@@ -412,6 +412,7 @@ async fn storage_fault_dial_evidence_and_route_retry_without_dropping_connection
     let (_da, a, la) = core().await?;
     drop(la);
     let (_db, b, lb) = core().await?;
+    let lb = MockListener::new(lb);
     let address = lb.local_addr()?.to_string();
     computer_route(&a, &b, address.clone()).await?;
     // Keep a stale last-good route ahead of the reachable cached hint.
@@ -462,6 +463,7 @@ async fn storage_fault_join_install_retries_and_existing_legacy_binding_saves_wo
         let (_da, a, la) = core().await?;
         drop(la);
         let (_db, b, lb) = core().await?;
+        let lb = MockListener::new(lb);
         let address = lb.local_addr()?.to_string();
         if existing {
             computer_route(&a, &b, "192.0.2.9:47821".into()).await?;
@@ -744,6 +746,7 @@ async fn storage_fault_readiness_read_cannot_authorize_revocation() -> Result<()
     let (_da, a, la) = core().await?;
     drop(la);
     let (_db, b, lb) = core().await?;
+    let lb = MockListener::new(lb);
     computer_route(&a, &b, lb.local_addr()?.to_string()).await?;
     a.store
         .mark_peer_established(b.identity.device_id.clone())
