@@ -375,6 +375,20 @@ async fn setup_three_device_migration_ask_prompts_allow_without_resets() -> Resu
         until(|| target.store.setup_state().links.iter().any(|l| l.prompt)).await?;
         let state = target.store.setup_state();
         let prompt = state.links.iter().find(|l| l.prompt).unwrap();
+        let notice = target
+            .setup_request_notice()
+            .await
+            .context("link request notification")?;
+        assert_eq!(notice.body, "New devices then pair just once.");
+        assert!(
+            notice
+                .setup_requests
+                .iter()
+                .any(|r| r.device == prompt.device
+                    && r.setup_generation == state.generation
+                    && Some(r.binding_generation)
+                        == target.store.pairing_generation(&prompt.device))
+        );
         target
             .decide_setup(
                 prompt.device.clone(),
@@ -1224,4 +1238,106 @@ async fn setup_committed_removal_succeeds_when_outbox_cleanup_fails() -> Result<
     a.core.outbox.reconcile().await?;
     a.stop().await?;
     b.stop().await
+}
+
+#[tokio::test]
+async fn setup_known_peer_consumes_only_matching_invitation_and_preserves_binding() -> Result<()> {
+    let a = Running::new().await?;
+    let b = Running::new().await?;
+    pair(&a.core, &b.core, false).await?;
+    let device = b.core.identity.device_id.clone();
+    let generation = a.core.store.pairing_generation(&device);
+    let uri = a
+        .core
+        .start_pairing_with_addresses(vec![format!("127.0.0.1:{}", a.core.bound_port())])
+        .await?;
+    let store = {
+        let sessions = a.core.sessions.lock().unwrap();
+        let session = sessions.sessions.get(&device).context("repair session")?;
+        let mut store = a.core.store.with_current_pairing();
+        store.connection_id = Some(session.id);
+        store
+    };
+    a.core
+        .consume_repair_invitation(
+            &store,
+            &b.core.computer_hello(),
+            &Hash::new("ef".repeat(32))?,
+        )
+        .await?;
+    assert!(a.core.admission.lock().unwrap().invitation.is_some());
+    a.core
+        .consume_repair_invitation(&store, &b.core.computer_hello(), &uri.token)
+        .await?;
+    assert!(a.core.admission.lock().unwrap().invitation.is_none());
+    let done = a
+        .core
+        .ui_snapshot()
+        .pairing_completion
+        .context("consumed invitation")?;
+    assert_eq!(done.device, device);
+    assert_eq!(done.token, uri.token);
+    assert_eq!(a.core.store.pairing_generation(&device), generation);
+    // Exercise the production known-peer PAIR_REQUEST path over TLS; the
+    // computer Join preview deliberately short-circuits already-paired pins.
+    let invitation = a
+        .core
+        .start_pairing_with_addresses(vec![format!("127.0.0.1:{}", a.core.bound_port())])
+        .await?;
+    let config = crate::tls::client_config(&b.core.identity, a.core.identity.fingerprint.clone())?;
+    let hello = b.core.computer_hello();
+    // Stop its automatic dials so they cannot replace this test-owned stream.
+    b.stop().await?;
+    until(|| a.core.connected_devices().is_empty()).await?;
+    let tcp = TcpStream::connect(("127.0.0.1", a.core.bound_port())).await?;
+    let mut tls: TlsStream<TcpStream> = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(rustls::pki_types::ServerName::try_from("pneu.local")?, tcp)
+        .await?
+        .into();
+    pneu_proto::write_frame(&mut tls, &Message::Hello(hello)).await?;
+    assert!(matches!(read_handshake(&mut tls).await?, Message::Hello(_)));
+    pneu_proto::write_frame(
+        &mut tls,
+        &Message::PairRequest(PairRequest {
+            token: invitation.token.clone(),
+        }),
+    )
+    .await?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Message::PairResult(result) = read_handshake(&mut tls).await? {
+                ensure!(result.accepted, "known-peer repair was refused");
+                break;
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    let completion = a
+        .core
+        .ui_snapshot()
+        .pairing_completion
+        .context("TLS pairing completion")?;
+    assert_eq!(completion.token, invitation.token);
+    drop(tls);
+    assert_eq!(a.core.store.pairing_generation(&device), generation);
+    assert!(a.core.admission.lock().unwrap().invitation.is_none());
+    a.stop().await
+}
+
+#[test]
+fn setup_refresh_grace_does_not_cross_binding_replacement() {
+    let ui = Mutex::new(crate::ui::State::default());
+    let device = Id::from_bytes([1; 16]);
+    ui.lock().unwrap().refreshing_scope(&device);
+    update_ui_state(
+        &ui,
+        &Event::Paired {
+            device: device.clone(),
+        },
+    );
+    assert!(ui.lock().unwrap().scope_refresh.is_empty());
+    ui.lock().unwrap().refreshing_scope(&device);
+    update_ui_state(&ui, &Event::Unpaired { device });
+    assert!(ui.lock().unwrap().scope_refresh.is_empty());
 }

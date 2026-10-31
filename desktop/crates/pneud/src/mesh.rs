@@ -822,17 +822,13 @@ impl Core {
         }
         let captured = if admission.as_ref() == Some(&hello.device_id) {
             let captured = self.store.with_current_pairing();
-            if self.store.setup_state().withdrawn {
-                captured
-                    .setup_fresh_local_recovery(
-                        hello.device_id.clone(),
-                        self.self_member(),
-                        self.setup_publish(guard, None, None),
-                    )
-                    .await?;
-            } else {
-                drop(guard);
-            }
+            captured
+                .setup_fresh_local_recovery(
+                    hello.device_id.clone(),
+                    self.self_member(),
+                    self.setup_publish(guard, None, None),
+                )
+                .await?;
             captured
         } else {
             let mut initial = hello.clone();

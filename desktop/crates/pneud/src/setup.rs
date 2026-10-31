@@ -189,6 +189,9 @@ impl Core {
             if let Some(device) = delta.reconnect_peer
                 && let Some(session) = connections.sessions.get(&device)
             {
+                ui.lock()
+                    .expect("UI state")
+                    .refreshing_scope(&session.device);
                 session
                     .close
                     .send_replace(Some(CloseReason::Error(ErrorCode::Closing)));
@@ -203,6 +206,9 @@ impl Core {
                             .iter()
                             .any(|l| l.device == session.device && l.scope != SetupScope::Disabled)
                     {
+                        ui.lock()
+                            .expect("UI state")
+                            .refreshing_scope(&session.device);
                         session
                             .close
                             .send_replace(Some(CloseReason::Error(ErrorCode::Closing)));
@@ -369,6 +375,82 @@ impl Core {
             Err(e) => Ok(nack(id, crate::store::save_failure_code(&e))),
         }
     }
+    /// A known peer still sends PAIR_REQUEST when scanning a fresh invitation.
+    /// Preserve the binding/settings, but record this explicit direct pairing.
+    pub(super) async fn consume_repair_invitation(
+        &self,
+        store: &Store,
+        hello: &Hello,
+        token: &Hash,
+    ) -> Result<()> {
+        let guard = self.pairing_gate.clone().lock_owned().await;
+        ensure!(
+            self.connection_current(store, &hello.device_id),
+            "obsolete pairing repair"
+        );
+        let matches = self
+            .admission
+            .lock()
+            .expect("admission")
+            .invitation
+            .as_ref()
+            .is_some_and(|i| {
+                i.is_active()
+                    && bool::from(i.token.as_str().as_bytes().ct_eq(token.as_str().as_bytes()))
+            });
+        if !matches {
+            return Ok(());
+        } // Existing consumed-token recovery stays valid.
+        let admission = self.admission.clone();
+        let ui = self.ui.clone();
+        let events = self.events.clone();
+        let changes = self.invitation_changes.clone();
+        let device = hello.device_id.clone();
+        let token = token.clone();
+        store
+            .setup_fresh_local_recovery(device.clone(), self.self_member(), move |_| {
+                let _guard = guard;
+                admission.lock().expect("admission").invitation = None;
+                ui.lock().expect("UI state").snapshot.pairing_completion =
+                    Some(crate::ui::PairingCompletion {
+                        token,
+                        device: device.clone(),
+                    });
+                changes.send_modify(|r| *r = r.wrapping_add(1));
+                // Same binding: retain its live metadata and transfers.
+                let _ = events.send(Event::Paired { device });
+            })
+            .await
+    }
+    pub(crate) async fn setup_request_notice(&self) -> Option<crate::ui::notifications::Notice> {
+        use crate::ui::window_setup::Decision;
+        let _guard = self.pairing_gate.lock().await;
+        let state = self.store.setup_state();
+        let snapshot = self.ui_snapshot();
+        let mut names = Vec::new();
+        let requests: Vec<_> = state
+            .links
+            .iter()
+            .filter(|link| {
+                link.prompt
+                    && link.outcome.as_deref() != Some("allow_pending_refresh")
+                    && link.outcome.as_deref()
+                        != Some("Direct link kept; separate setups not linked")
+            })
+            .filter_map(|link| {
+                let binding_generation = self.store.pairing_generation(&link.device)?;
+                let peer = snapshot.devices.iter().find(|p| p.device == link.device)?;
+                names.push(crate::ui::window::display_peer_text(&peer.name));
+                Some(Decision {
+                    device: link.device.clone(),
+                    setup_generation: state.generation,
+                    binding_generation,
+                })
+            })
+            .collect();
+        (!requests.is_empty())
+            .then(|| crate::ui::notifications::Notice::link_request(&names, requests))
+    }
     pub async fn setup_status(&self) -> Result<serde_json::Value> {
         let state = self.store.setup_state();
         let mut value = serde_json::to_value(&state)?;
@@ -446,9 +528,12 @@ impl Core {
             .sessions
             .get(device)
             .map(|s| s.close.clone());
+        let ui = self.ui.clone();
+        let device = device.clone();
         let publish = self.setup_publish(guard, None, None);
         move |delta| {
             if let Some(close) = close {
+                ui.lock().expect("UI state").refreshing_scope(&device);
                 close.send_replace(Some(CloseReason::Error(ErrorCode::Closing)));
             }
             publish(delta);
@@ -505,6 +590,7 @@ impl Core {
     }
     fn reconnect_setup_peer(&self, device: &Id) {
         if let Some(session) = self.sessions.lock().expect("sessions").sessions.get(device) {
+            self.ui.lock().expect("UI state").refreshing_scope(device);
             session
                 .close
                 .send_replace(Some(CloseReason::Error(ErrorCode::Closing)));

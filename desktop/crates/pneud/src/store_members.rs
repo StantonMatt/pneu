@@ -182,6 +182,7 @@ pub(super) fn migrate(tx: &Transaction<'_>) -> Result<SetupState> {
         CREATE TABLE IF NOT EXISTS members_replay(device TEXT PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,generation INTEGER NOT NULL,payload TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS setup_conflicts(device TEXT NOT NULL,fingerprint TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(device,fingerprint));
         CREATE TABLE IF NOT EXISTS setup_retired(setup_id TEXT PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS setup_withdrawn_pins(fingerprint TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS setup_candidates(device TEXT NOT NULL,fingerprint TEXT NOT NULL,introduced_by TEXT NOT NULL,introducer_name TEXT NOT NULL,PRIMARY KEY(device,fingerprint));
         CREATE TABLE IF NOT EXISTS setup_notices(device TEXT NOT NULL,generation INTEGER NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(device,generation));
         PRAGMA user_version=4;")?;
@@ -313,12 +314,18 @@ fn retire(tx: &Transaction<'_>, withdraw: bool, delta: &mut SetupDelta) -> Resul
                 .collect::<Result<_>>()?
         };
         let roster = state(tx)?.roster;
+        // Only the latest retired setup, bounded by the 16 direct bindings.
+        tx.execute("DELETE FROM setup_withdrawn_pins", [])?;
         for (id, pin) in peers {
             // Local opt-in alone is not a scoped link: the remote may have
             // chosen off, or be legacy. Keep those direct-only bindings.
             if roster.iter().any(|m| {
                 m.device_id == id && m.fingerprint == pin && m.status == MemberStatus::Member
             }) {
+                tx.execute(
+                    "INSERT OR IGNORE INTO setup_withdrawn_pins VALUES(?)",
+                    [pin.as_str()],
+                )?;
                 forget(tx, &id, &pin, delta)?;
             }
         }
@@ -458,6 +465,19 @@ fn joined_is_new(c: &Connection, local: &Id, member: &Member) -> Result<bool> {
     Ok(member.hlc >= baseline)
 }
 impl Store {
+    /// A known former member can race withdrawal with a reconnect. Refuse it
+    /// normally, but do not invite the owner to pair an apparent stranger.
+    pub(crate) async fn setup_quiet_reconnect(&self, pin: Hash) -> Result<bool> {
+        self.call(move |c| {
+            Ok(c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM setup_withdrawn_pins WHERE fingerprint=?)",
+                [pin.as_str()],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+    }
+
     /// Every externally visible peer/cache change is published after COMMIT in
     /// this blocking continuation. Canceling its async caller cannot skip it.
     async fn setup_write<T: Send + 'static>(
@@ -970,7 +990,7 @@ pub(super) fn paired(
     let scope = previous.as_ref().map(|l| l.scope).unwrap_or(scope);
     set_scope(tx, &remote.device_id, scope)?;
     tx.execute(
-        "UPDATE setup_links SET token_founding=1,negotiated=?,participating=? WHERE device=?",
+        "UPDATE setup_links SET introduced_by=NULL,introducer_name=NULL,token_founding=1,negotiated=?,participating=? WHERE device=?",
         params![
             remote.capabilities.iter().any(|c| c == "setup"),
             remote
@@ -1207,8 +1227,8 @@ fn clear_own_deny(tx: &Transaction<'_>, local: &Member) -> Result<()> {
     Ok(())
 }
 impl Store {
-    /// Only the joiner's newly confirmed, still-fenced local token attempt may
-    /// call this. A remote known-certificate recovery is not fresh consent.
+    /// Only a newly confirmed local token attempt, or consumption of a matching
+    /// active local invitation, may call this. Old-token recovery is not consent.
     pub(crate) async fn setup_fresh_local_recovery(
         &self,
         peer: Id,
@@ -1219,6 +1239,11 @@ impl Store {
         self.setup_write(
             move |tx, _| {
                 epoch.check(tx)?;
+                tx.execute(
+                    "UPDATE setup_links SET introduced_by=NULL,introducer_name=NULL WHERE device=?",
+                    [peer.as_str()],
+                )?;
+                tx.execute("DELETE FROM setup_notices WHERE device=?", [peer.as_str()])?;
                 if state(tx)?.withdrawn {
                     clear_own_deny(tx, &local)?;
                     tx.execute("UPDATE setup_state SET withdrawn=0 WHERE singleton=1", [])?;

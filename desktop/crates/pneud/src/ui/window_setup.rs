@@ -251,7 +251,7 @@ pub(crate) fn also_linked(names: &[String]) -> String {
         [] => String::new(),
         [one] => format!("Also linked: {one}"),
         [a, b] => format!("Also linked: {a} and {b}"),
-        [a, b, rest @ ..] => format!("Also linked: {a}, {b} and {} more", rest.len()),
+        [a, b, rest @ ..] => format!("Also linked: {a}, {b} and\u{a0}{}\u{a0}more", rest.len()),
     }
 }
 
@@ -302,7 +302,7 @@ pub(crate) fn top(setup: &Setup, peers: &[Peer], remembered: &Remembered) -> Top
         };
     }
     // While a request waits, Link would only answer it; its page has Allow.
-    if !requests.is_empty() {
+    if !requests.is_empty() || setup.links.iter().any(Link::allowing) {
         return Top::None;
     }
     match remembered.offer.as_deref() {
@@ -341,6 +341,84 @@ pub(crate) fn request_key(setup: &Setup, link: &Link) -> String {
         .flatten()
         .unwrap_or_default();
     format!("{}/{}/{binding}", link.device, setup.generation)
+}
+
+// ---------- Link request notifications ----------
+
+/// Authority captured when the notification is posted, just like the top card.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Decision {
+    pub device: pneu_proto::Id,
+    pub setup_generation: u64,
+    pub binding_generation: u64,
+}
+
+pub(crate) async fn decide(core: &crate::core::Core, requests: &[Decision], allow: bool) {
+    for request in requests {
+        if let Err(error) = core
+            .decide_setup(
+                request.device.clone(),
+                request.setup_generation,
+                request.binding_generation,
+                allow,
+            )
+            .await
+        {
+            eprintln!("pneud: link request action: {error:#}");
+        }
+    }
+}
+
+/// A dismissal is remembered by keeping the displayed set. Only a changed set
+/// posts again. Answering in the window withdraws the outstanding native notice.
+#[derive(Default)]
+pub(crate) struct Requests {
+    displayed: Vec<Decision>,
+    id: u32,
+}
+impl Requests {
+    pub(crate) async fn sync(
+        &mut self,
+        core: &crate::core::Core,
+        actions: &crate::actions::DesktopActions,
+    ) {
+        self.sync_notice(core.setup_request_notice().await, actions)
+            .await;
+    }
+    pub(crate) async fn sync_notice(
+        &mut self,
+        notice: Option<super::notifications::Notice>,
+        actions: &crate::actions::DesktopActions,
+    ) {
+        let requests = notice
+            .as_ref()
+            .map(|n| n.setup_requests.clone())
+            .unwrap_or_default();
+        if requests == self.displayed {
+            return;
+        }
+        if let Some(notice) = notice {
+            match actions
+                .notice(notice, Vec::new(), None, self.id, None)
+                .await
+            {
+                Ok(id) => {
+                    self.id = id;
+                    self.displayed = requests;
+                }
+                Err(error) => eprintln!("pneud: link request notification: {error:#}"),
+            }
+        } else {
+            if self.id != 0
+                && let Err(error) = actions.withdraw_notice(self.id).await
+            {
+                eprintln!("pneud: withdraw link request: {error:#}");
+                return;
+            }
+            self.id = 0;
+            self.displayed.clear();
+        }
+    }
 }
 
 // ---------- "{device} joined" notifications ----------
@@ -528,9 +606,30 @@ mod tests {
         assert_eq!(also_linked(&n(&["A", "B"])), "Also linked: A and B");
         assert_eq!(
             also_linked(&n(&["A", "B", "C", "D"])),
-            "Also linked: A, B and 2 more"
+            "Also linked: A, B and\u{a0}2\u{a0}more"
+        );
+        assert_eq!(
+            also_linked(&n(&["A", "B", "C"])),
+            "Also linked: A, B and\u{a0}1\u{a0}more"
         );
         assert_eq!(also_linked(&[]), "");
+    }
+
+    #[test]
+    fn pending_allow_hides_offer_for_other_undecided_links() {
+        let s = setup(json!({"links": [
+            {"device": "aa", "scope": "ask", "prompt": true, "outcome": ALLOWING, "negotiated": true},
+            link("bb", "ask")
+        ]}));
+        let snapshot: super::super::Snapshot = serde_json::from_value(json!({
+            "phone": {"name":"", "last_seen":0, "route":""}, "paired":true,
+            "connected":false,"paused":false,"receiving":false,"pairing":null,"error":null,
+            "devices":[{"device":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","name":"Mac", "role":"computer","state":"connected","last_seen":1,"dialer":null}]
+        })).unwrap();
+        let mut s = s;
+        s.links[1].device = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
+        let peers = super::super::window::peers(&snapshot, &[]);
+        assert_eq!(top(&s, &peers, &Remembered::default()), Top::None);
     }
 
     #[test]

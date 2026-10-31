@@ -89,8 +89,19 @@ pub struct Phone {
     #[serde(default)]
     pub route: String,
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PairingCompletion {
+    pub token: pneu_proto::Hash,
+    pub device: pneu_proto::Id,
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// Last locally consumed invitation, published with Event::Paired.
+    #[serde(default)]
+    pub pairing_completion: Option<PairingCompletion>,
+    /// Presentation only: never used for recipient or session authority.
+    #[serde(default)]
+    pub refreshing_devices: Vec<pneu_proto::Id>,
     /// Local UI hint only. Never a separate clipboard publication or log event.
     #[serde(default)]
     pub pairing_clipboard: Option<String>,
@@ -202,6 +213,7 @@ impl Snapshot {
 }
 #[derive(Default)]
 pub(crate) struct State {
+    pub scope_refresh: std::collections::HashMap<pneu_proto::Id, tokio::time::Instant>,
     pub snapshot: Snapshot,
     pub receiving_until: std::collections::HashMap<(pneu_proto::Id, pneu_proto::Id), Instant>,
     pub phone_generation: Option<u64>,
@@ -212,6 +224,17 @@ pub(crate) struct State {
     pub active_transfers: std::collections::HashSet<(pneu_proto::Id, pneu_proto::Id)>,
 }
 impl State {
+    pub(crate) fn refreshing_scope(&mut self, device: &pneu_proto::Id) {
+        let now = tokio::time::Instant::now();
+        self.scope_refresh
+            .entry(device.clone())
+            .and_modify(|until| {
+                if *until <= now {
+                    *until = now + std::time::Duration::from_secs(5);
+                }
+            })
+            .or_insert(now + std::time::Duration::from_secs(5));
+    }
     pub fn prune_incoming(&mut self) {
         while self
             .incoming
@@ -461,6 +484,10 @@ pub(crate) fn captured_authorities(snapshot: &Snapshot) -> Vec<crate::outbox::Au
 }
 #[derive(Clone, Debug)]
 pub enum Command {
+    SetupDecision {
+        requests: Vec<window_setup::Decision>,
+        allow: bool,
+    },
     RetryTransfer {
         operation: pneu_proto::Id,
         artifact: pneu_proto::Id,
@@ -492,6 +519,26 @@ pub enum Command {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn scope_refresh_grace_is_bounded_to_five_seconds() {
+        let mut state = State::default();
+        let device = pneu_proto::Id::from_bytes([1; 16]);
+        state.refreshing_scope(&device);
+        let deadline = state.scope_refresh[&device];
+        assert_eq!(
+            deadline - tokio::time::Instant::now(),
+            std::time::Duration::from_secs(5)
+        );
+        tokio::time::advance(std::time::Duration::from_secs(4)).await;
+        state.refreshing_scope(&device);
+        assert_eq!(
+            state.scope_refresh[&device], deadline,
+            "repeated refresh does not extend a disconnect"
+        );
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert!(state.scope_refresh[&device] <= tokio::time::Instant::now());
+    }
+
     #[test]
     fn icons_and_status_precedence() {
         let mut s = Snapshot::default();

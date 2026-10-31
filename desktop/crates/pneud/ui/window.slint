@@ -110,6 +110,7 @@ export global Ui {
     in property <[DeviceItem]> devices;
     in property <[RecentItem]> recent;
     in property <bool> manual-clipboard;
+    in property <bool> pair-again;
     in property <bool> motion: true;
 
     in property <DeviceItem> device;
@@ -624,10 +625,10 @@ export component PneuWindow inherits Window {
                         HorizontalLayout {
                             padding-top: 14px; spacing: 8px;
                             PneuButton {
-                                text: "Send Files…"; icon: Icons.upload; kind: ButtonKind.tonal; wide: true;
-                                clicked => { Ui.send-files(""); }
+                                text: Ui.pair-again ? "Pair Again…" : "Send Files…"; icon: Ui.pair-again ? Icons.qr-code : Icons.upload; kind: Ui.pair-again ? ButtonKind.primary : ButtonKind.tonal; wide: true;
+                                clicked => { if Ui.pair-again { root.open-add(0); } else { Ui.send-files(""); } }
                             }
-                            if Ui.manual-clipboard: PneuButton {
+                            if Ui.manual-clipboard && !Ui.pair-again: PneuButton {
                                 text: "Send Clipboard"; icon: Icons.send-clipboard; kind: ButtonKind.tonal; wide: true;
                                 clicked => { Ui.send-clipboard(); }
                             }

@@ -564,6 +564,7 @@ fn update_ui_state(ui: &Mutex<crate::ui::State>, event: &Event) {
             ui.prune_incoming();
         }
         Event::Unpaired { device } | Event::Paired { device } => {
+            ui.scope_refresh.remove(device);
             ui.phones.remove(device);
             ui.phone_generations.remove(device);
             ui.clear_transfers(device);
@@ -1409,6 +1410,15 @@ impl Core {
         let mut snapshot = ui.snapshot.clone();
         snapshot.devices = self.device_snapshots(&sessions, &admission, &ui);
         snapshot.send_targets = self.file_targets(&snapshot.devices, &sessions, &admission);
+        ui.scope_refresh.retain(|id, until| {
+            *until > Instant::now() && admission.peers.values().any(|p| p == id)
+        });
+        snapshot.refreshing_devices = ui.scope_refresh.keys().cloned().collect();
+        for device in &mut snapshot.devices {
+            if snapshot.refreshing_devices.contains(&device.device) && device.route.is_none() {
+                device.route = ui.phones.get(&device.device).map(|p| p.route.clone());
+            }
+        }
         snapshot.transfers = self.outbox.snapshot(&snapshot.connected_devices);
         snapshot.transfers.extend(ui.incoming.iter().cloned());
         snapshot
@@ -2739,9 +2749,11 @@ impl Core {
                 (admitted, target)
             };
             if !admitted {
-                self.event(Event::Blocked {
-                    address: peer_address.ip().to_canonical().to_string(),
-                });
+                if !self.store.setup_quiet_reconnect(fp.clone()).await? {
+                    self.event(Event::Blocked {
+                        address: peer_address.ip().to_canonical().to_string(),
+                    });
+                }
                 crate::transport::close(
                     &mut tls,
                     &[Message::Error(ErrorMessage {
@@ -3581,8 +3593,12 @@ impl Core {
                     if let Some(installed) = installed {
                         installed.store(installed_generation, Ordering::SeqCst);
                     }
-                    if consume_invitation {
-                        state.invitation = None;
+                    if consume_invitation && let Some(invitation) = state.invitation.take() {
+                        ui.lock().expect("UI state").snapshot.pairing_completion =
+                            Some(crate::ui::PairingCompletion {
+                                token: invitation.token,
+                                device: device.clone(),
+                            });
                     }
                     invitation_changes.send_modify(|r| *r = r.wrapping_add(1));
                     drop(state);
@@ -3594,6 +3610,9 @@ impl Core {
                                     l.device == session.device && l.scope != SetupScope::Disabled
                                 })
                             {
+                                ui.lock()
+                                    .expect("UI state")
+                                    .refreshing_scope(&session.device);
                                 session
                                     .close
                                     .send_replace(Some(CloseReason::Error(ErrorCode::Closing)));
@@ -3946,6 +3965,9 @@ impl Core {
                         }
                         match message {
                             Message::Error(error)=>{
+                                if error.code == ErrorCode::Closing && hello.capabilities.iter().any(|c| c == "setup") && self.connection_current(&store, &hello.device_id) {
+                                    self.ui.lock().expect("UI state").refreshing_scope(&hello.device_id);
+                                }
                                 if let Some(problem) = match error.code {
                                     ErrorCode::VersionMismatch => Some(mesh::LinkProblem::UpdateRequired),
                                     ErrorCode::Unauthorized => Some(mesh::LinkProblem::Unauthorized),
@@ -3970,9 +3992,10 @@ impl Core {
                                 self.forget_pairing(hello.device_id.clone(), CloseReason::Error(ErrorCode::Closing), store.connection_id, Some(hello.name.clone())).await?;
                                 break;
                             },
-                            Message::PairRequest(_) if !recovered_pairing=>{
+                            Message::PairRequest(request) if !recovered_pairing=>{
                                 // TLS + HELLO binding were checked before READY.
                                 // A consumed/expired token is irrelevant to this recovery.
+                                self.consume_repair_invitation(&store,hello,&request.token).await?;
                                 recovered_pairing=true;
                                 if !enqueue(&write_tx,Message::PairResult(PairResult {accepted:true,code:None,message:None}),&mut close,Some(receipt_deadline.min(Instant::now()+Duration::from_secs(60)))).await? {break;}
                             },

@@ -82,13 +82,22 @@ pub async fn run(
         core.request_window(false);
     }
     post_joined(&core, &actions).await;
+    let mut requests = Some(super::window_setup::Requests::default());
+    let mut request_job: Option<futures_util::future::BoxFuture<'static, super::window_setup::Requests>> = None;
     loop {
         if *stop.borrow() {
             break;
         }
         let mut refresh_icons = false;
         let mut update_tray = true;
+        let mut sync_requests = true;
         tokio::select! {
+            state = async { request_job.as_mut().expect("link request job").await }, if request_job.is_some() => {
+                request_job = None;
+                requests = Some(state);
+                sync_requests = false;
+            },
+
             _=stop.changed()=>break,
             result=async {folder_open.as_mut().expect("folder open").await},if folder_open.is_some()=>{
                 folder_open=None;
@@ -124,6 +133,7 @@ pub async fn run(
                 Err(_)=>update_tray=false,
             },
             command=rx.recv()=>match command {
+                Some(Command::SetupDecision {requests, allow})=>super::window_setup::decide(&core, &requests, allow).await,
                 Some(Command::Window { activation_token })=>core.request_window_with_activation(false, activation_token),
                 Some(Command::ChooseFolder)=>core.request_window(true),
                 Some(Command::Quit)=>core.request_shutdown(),
@@ -155,6 +165,11 @@ pub async fn run(
                 Some(Command::RemoveDevice {device,activation_token})=>core.request_remove_window(device,activation_token),
                 None=>break,
             },
+        }
+            if sync_requests && request_job.is_none() && let Some(mut state) = requests.take() {
+            let core = core.clone();
+            let actions = actions.clone();
+            request_job = Some(spawn_request_job(async move { state.sync(&core, &actions).await; state }));
         }
         if !update_tray { continue; }
         if let Some(child) = window.as_mut()
@@ -215,6 +230,23 @@ pub async fn run(
     Ok(())
 
         }).await
+}
+
+pub(crate) fn spawn_request_job(
+    job: impl std::future::Future<Output = super::window_setup::Requests> + Send + 'static,
+) -> futures_util::future::BoxFuture<'static, super::window_setup::Requests> {
+    // A selected UI event can itself await the notification mutex. Keep the
+    // sync running independently so it can finish its D-Bus call and release
+    // that mutex even while the UI loop is handling the event. The JoinSet
+    // aborts the task if the owning future is dropped on shutdown.
+    let mut jobs = tokio::task::JoinSet::new();
+    jobs.spawn(job);
+    Box::pin(async move {
+        jobs.join_next()
+            .await
+            .expect("link request task")
+            .expect("link request task panicked")
+    })
 }
 
 pub(super) fn file_recipients(
@@ -348,6 +380,23 @@ pub(crate) fn clipboard_policy_event(core: &Core, event: &Event) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn dropping_unpolled_request_job_cancels_sync() -> Result<()> {
+        let (owned, dropped) = tokio::sync::oneshot::channel::<()>();
+        let job = spawn_request_job(async move {
+            let _owned = owned;
+            std::future::pending::<()>().await;
+            super::super::window_setup::Requests::default()
+        });
+        drop(job);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), dropped)
+                .await?
+                .is_err()
+        );
+        Ok(())
+    }
+
     #[test]
     fn all_connected_file_targets_exclude_offline_and_ineligible_devices() {
         use crate::outbox::SendTarget;

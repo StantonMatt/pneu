@@ -46,10 +46,21 @@ pub async fn run(
         let (core, actions) = (core.clone(), actions.clone());
         jobs.spawn(async move { post_joined(&core, &actions).await });
     }
+    let mut requests = Some(super::window_setup::Requests::default());
+    let mut request_job: Option<
+        futures_util::future::BoxFuture<'static, super::window_setup::Requests>,
+    > = None;
     let mut timer = tokio::time::interval(Duration::from_secs(1));
     while !*stop.borrow() {
         let mut update_tray = true;
+        let mut sync_requests = true;
         tokio::select! {
+            state = async { request_job.as_mut().expect("link request job").await }, if request_job.is_some() => {
+                request_job = None;
+                requests = Some(state);
+                sync_requests = false;
+            },
+
             _ = stop.changed() => break,
             _ = timer.tick() => {
                 if watcher.as_ref().is_some_and(|w| w.is_finished()) {
@@ -69,6 +80,7 @@ pub async fn run(
             },
             Some(_) = jobs.join_next(), if !jobs.is_empty() => {},
             Some(command) = rx.recv() => match command {
+                Command::SetupDecision { requests, allow } => super::window_setup::decide(&core, &requests, allow).await,
                 Command::Window { .. } => core.request_window(false),
                 Command::ChooseFolder => core.request_window(true),
                 Command::AddDevice { .. } => core.request_add_device_with_activation(None),
@@ -132,6 +144,18 @@ pub async fn run(
                     for device in core.paired_devices() { core.cancel_automatic_clipboard(&device); }
                 }
             }
+        }
+        if sync_requests
+            && interactive
+            && request_job.is_none()
+            && let Some(mut state) = requests.take()
+        {
+            let core = core.clone();
+            let actions = actions.clone();
+            request_job = Some(Box::pin(async move {
+                state.sync(&core, &actions).await;
+                state
+            }));
         }
         if let Some(child) = window.as_mut() {
             match child.try_wait() {

@@ -20,6 +20,7 @@ struct Target {
     retry: Option<(pneu_proto::Id, pneu_proto::Id, pneu_proto::Id)>,
     actions: Vec<String>,
     device: Option<pneu_proto::Id>,
+    setup_requests: Vec<crate::ui::window_setup::Decision>,
 }
 struct NotificationRecord {
     target: Target,
@@ -96,6 +97,17 @@ impl DesktopActions {
             burst: Mutex::new(None),
         }
     }
+    pub(crate) async fn withdraw_notice(&self, id: u32) -> Result<()> {
+        if let Some(record) = self
+            .targets
+            .lock()
+            .expect("notification targets")
+            .remove(&id)
+        {
+            record.withdraw();
+        }
+        Ok(())
+    }
     pub async fn notice(
         &self,
         notice: Notice,
@@ -125,6 +137,7 @@ impl DesktopActions {
                 retry: None,
                 actions: Vec::new(),
                 device: None,
+                setup_requests: Vec::new(),
             },
             replaces,
         )
@@ -147,6 +160,7 @@ impl DesktopActions {
         anyhow::ensure!(id != 0, "notification identifier exhausted");
         target.actions = notice.actions.iter().map(|(id, _)| (*id).into()).collect();
         target.device = notice.device.clone();
+        target.setup_requests = notice.setup_requests.clone();
         let notification = Notification {
             id,
             namespace: self.namespace.clone(),
@@ -291,6 +305,10 @@ impl DesktopActions {
         // paths, pairing links, or notification bodies.
         eprintln!("pneud: notification action notification={id} action={action}");
         match action {
+            "allow" | "deny" => {
+                crate::ui::window_setup::decide(core, &target.setup_requests, action == "allow")
+                    .await
+            }
             "default" | "open" => {
                 if let Some(file) = target.files.last() {
                     self.begin_viewer(file, false)?.await?;
@@ -597,6 +615,7 @@ impl PcActions for DesktopActions {
                     retry,
                     actions: Vec::new(),
                     device: None,
+                    setup_requests: Vec::new(),
                 },
                 0,
             )
@@ -730,6 +749,7 @@ impl PcActions for DesktopActions {
                     retry: None,
                     actions: Vec::new(),
                     device: None,
+                    setup_requests: Vec::new(),
                 },
                 replaces,
             )

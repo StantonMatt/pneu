@@ -60,6 +60,8 @@ struct Target {
     link: Option<String>,
     retry: Option<(pneu_proto::Id, pneu_proto::Id, pneu_proto::Id)>,
     device: Option<pneu_proto::Id>,
+    setup_requests: Vec<crate::ui::window_setup::Decision>,
+    revision: String,
 }
 struct Burst {
     id: u32,
@@ -281,6 +283,14 @@ impl DesktopActions {
                                 let path=action_paths.lock().await.get(&id).cloned();
                                 let token=tokens.take(id, std::time::Instant::now());
                                 if let Some(target)=target {
+                                    if !target.setup_requests.is_empty() {
+                                        let allow = action == format!("setup-{}-allow", target.revision);
+                                        let deny = action == format!("setup-{}-deny", target.revision);
+                                        if (allow || deny) && let Some(commands)=commands.lock().expect("UI commands").clone() {
+                                            let _=commands.try_send(crate::ui::Command::SetupDecision { requests: target.setup_requests, allow });
+                                        }
+                                        continue;
+                                    }
                                     match action.as_str() {
                                         "default"|"open" => { if interactions.available() && let Some(file)=target.files.first() && let Some(wait)=notification_open(file,&action_connection,token.as_deref()).await { interactions.push(async move { let _=wait.await; }); } },
                                         "show" => { if let Ok(urls)=target.paths.iter().map(|path| file_uri(path)).collect::<Result<Vec<_>>>() { let _=show_files(&urls,&action_connection,token.as_deref()).await; } else { let _=file_unavailable_notice(&action_connection).await; } },
@@ -308,6 +318,15 @@ impl DesktopActions {
             });
         }
         Ok(current)
+    }
+    pub(crate) async fn withdraw_notice(&self, id: u32) -> Result<()> {
+        let current = self.notifications().await?;
+        let n = current.as_ref().context("notification proxy")?;
+        n.targets.lock().await.remove(&id);
+        n.proxy
+            .call::<_, _, ()>("CloseNotification", &(id,))
+            .await?;
+        Ok(())
     }
     pub async fn notice(
         &self,
@@ -372,6 +391,19 @@ impl DesktopActions {
                 zbus::zvariant::Value::from(zbus::zvariant::Structure::from(preview)),
             );
         }
+        let revision = crate::random_hex(16);
+        let offered_actions: Vec<String> = notice
+            .actions
+            .iter()
+            .flat_map(|(action, label)| {
+                let action = if notice.setup_requests.is_empty() {
+                    (*action).to_string()
+                } else {
+                    format!("setup-{revision}-{action}")
+                };
+                [action, (*label).to_string()]
+            })
+            .collect();
         let mut targets = n.targets.lock().await;
         let id: u32 = n
             .proxy
@@ -383,16 +415,15 @@ impl DesktopActions {
                     "pneu",
                     &notice.summary,
                     &notice.body,
-                    notice
-                        .actions
-                        .iter()
-                        .flat_map(|(id, label)| [*id, *label])
-                        .collect::<Vec<_>>(),
+                    offered_actions,
                     hints,
                     notice.expires,
                 ),
             )
             .await?;
+        if replaces != 0 && replaces != id {
+            targets.remove(&replaces);
+        }
         if targets.len() >= NOTIFICATION_ACTION_LIMIT
             && !targets.contains_key(&id)
             && let Some(old) = targets.keys().min().copied()
@@ -407,6 +438,8 @@ impl DesktopActions {
                 link,
                 retry,
                 device: notice.device.clone(),
+                setup_requests: notice.setup_requests,
+                revision,
             },
         );
         Ok(id)
@@ -1316,19 +1349,24 @@ mod tests {
         assert!(waiting);
         Ok(())
     }
+    struct DeferredNotification {
+        entered: tokio::sync::oneshot::Sender<()>,
+        resume: tokio::sync::oneshot::Receiver<()>,
+    }
     struct NotificationServer(
         std::sync::atomic::AtomicU32,
         Arc<std::sync::Mutex<HashMap<String, zbus::zvariant::OwnedValue>>>,
         Arc<std::sync::Mutex<Vec<String>>>,
         Arc<std::sync::Mutex<(String, String)>>,
+        Arc<std::sync::Mutex<Option<DeferredNotification>>>,
     );
     #[zbus::interface(name = "org.freedesktop.Notifications")]
     impl NotificationServer {
         #[allow(clippy::too_many_arguments)]
-        fn notify(
+        async fn notify(
             &self,
             _app: &str,
-            _replaces: u32,
+            replaces: u32,
             _icon: &str,
             summary: &str,
             body: &str,
@@ -1336,11 +1374,112 @@ mod tests {
             hints: HashMap<String, zbus::zvariant::OwnedValue>,
             _timeout: i32,
         ) -> u32 {
+            let deferred = self.4.lock().unwrap().take();
+            if let Some(deferred) = deferred {
+                let _ = deferred.entered.send(());
+                let _ = deferred.resume.await;
+            }
             *self.3.lock().unwrap() = (summary.into(), body.into());
             *self.1.lock().unwrap() = hints;
             *self.2.lock().unwrap() = actions;
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+            let next = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if replaces == 0 { next } else { replaces }
         }
+        fn close_notification(&self, _id: u32) {}
+    }
+    #[tokio::test]
+    async fn link_request_sync_progresses_while_ui_event_awaits_another_notice() -> Result<()> {
+        use crate::ui::{
+            notifications::Notice,
+            window_setup::{Decision, Requests},
+        };
+        let bus_dir = tempfile::tempdir()?;
+        let config = bus_dir.path().join("bus.conf");
+        std::fs::write(
+            &config,
+            format!(
+                "<busconfig><type>session</type><listen>unix:tmpdir={}</listen><auth>EXTERNAL</auth><apparmor mode=\"disabled\"/><policy context=\"default\"><allow user=\"*\"/><allow own=\"*\"/><allow send_destination=\"*\"/><allow receive_sender=\"*\"/></policy></busconfig>",
+                bus_dir.path().display()
+            ),
+        )?;
+        let mut bus = tokio::process::Command::new("dbus-daemon")
+            .arg("--config-file")
+            .arg(&config)
+            .args(["--nofork", "--print-address=1"])
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let mut line = String::new();
+        BufReader::new(bus.stdout.take().context("bus stdout")?)
+            .read_line(&mut line)
+            .await?;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let copy = Arc::new(std::sync::Mutex::new((String::new(), String::new())));
+        let _server = zbus::connection::Builder::address(line.trim())?
+            .name("org.freedesktop.Notifications")?
+            .serve_at(
+                "/org/freedesktop/Notifications",
+                NotificationServer(
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                    copy.clone(),
+                    Arc::new(std::sync::Mutex::new(Some(DeferredNotification {
+                        entered: entered_tx,
+                        resume: resume_rx,
+                    }))),
+                ),
+            )?
+            .build()
+            .await?;
+        let connection = zbus::connection::Builder::address(line.trim())?
+            .build()
+            .await?;
+        let mut actions = DesktopActions::new(bus_dir.path().to_owned());
+        actions.bus = Some(connection);
+        let actions = Arc::new(actions);
+        let sync_actions = actions.clone();
+        let mut request_job = crate::ui::runtime::spawn_request_job(async move {
+            let mut requests = Requests::default();
+            let notice = Notice::link_request(
+                &["Phone".into()],
+                vec![Decision {
+                    device: pneu_proto::Id::from_bytes([1; 16]),
+                    setup_generation: 2,
+                    binding_generation: 3,
+                }],
+            );
+            requests.sync_notice(Some(notice), &sync_actions).await;
+            requests
+        });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            // Poll the job as the UI select does, until Notify is awaiting its
+            // reply with the notifications mutex held.
+            tokio::select! {
+                _ = &mut request_job => anyhow::bail!("link request finished before reply"),
+                entered = entered_rx => entered?,
+            }
+            assert!(actions.notifications.try_lock().is_err());
+            // This selected event does not poll request_job again until its
+            // own notice finishes. A loop-polled sync deadlocks here, even
+            // though the private server can now send the pending reply.
+            resume_tx
+                .send(())
+                .map_err(|_| anyhow::anyhow!("reply receiver closed"))?;
+            actions
+                .notice(Notice::new("Overlapping notice"), Vec::new(), None, 0, None)
+                .await?;
+            let _ = request_job.await;
+            assert_eq!(copy.lock().unwrap().0, "Overlapping notice");
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        actions.shutdown().await?;
+        bus.kill().await?;
+        bus.wait().await?;
+        result??;
+        Ok(())
     }
     struct PortalServer(
         Arc<std::sync::Mutex<Vec<u8>>>,
@@ -1545,6 +1684,7 @@ mod tests {
                     notification_hints.clone(),
                     notification_actions.clone(),
                     notification_copy.clone(),
+                    Default::default(),
                 ),
             )?
             .build()
@@ -1764,6 +1904,111 @@ mod tests {
             if action == "open" {
                 assert_eq!(&*portal_bytes.lock().unwrap(), b"file");
             }
+        }
+
+        // Request replacement carries a new action revision. Delayed clicks on
+        // the replaced content cannot authorize the newly displayed asker set.
+        {
+            use crate::ui::{
+                notifications::Notice,
+                window_setup::{Decision, Requests},
+            };
+            let request = |n| Decision {
+                device: pneu_proto::Id::from_bytes([n; 16]),
+                setup_generation: 2,
+                binding_generation: 3,
+            };
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            actions.set_commands(tx);
+            let mut requests = Requests::default();
+            let one = Notice::link_request(&["Phone".into()], vec![request(1)]);
+            requests.sync_notice(Some(one.clone()), &actions).await;
+            assert_eq!(
+                notification_copy.lock().unwrap().0,
+                "Phone wants to link your devices"
+            );
+            let old_action = notification_actions.lock().unwrap()[0].clone();
+            let id = {
+                let current = actions.notifications().await?;
+                let targets = current.as_ref().unwrap().targets.lock().await;
+                *targets.keys().max().unwrap()
+            };
+            // Dismissal leaves the durable prompt waiting and does not re-post.
+            server
+                .emit_signal(
+                    None::<&str>,
+                    "/org/freedesktop/Notifications",
+                    "org.freedesktop.Notifications",
+                    "NotificationClosed",
+                    &(id, 2u32),
+                )
+                .await?;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let current = actions.notifications().await?;
+                    if !current
+                        .as_ref()
+                        .unwrap()
+                        .targets
+                        .lock()
+                        .await
+                        .contains_key(&id)
+                    {
+                        break;
+                    }
+                    drop(current);
+                    tokio::task::yield_now().await;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await??;
+            notification_copy.lock().unwrap().0 = "unchanged".into();
+            requests.sync_notice(Some(one), &actions).await;
+            assert_eq!(notification_copy.lock().unwrap().0, "unchanged");
+            let both = Notice::link_request(
+                &["Phone".into(), "Mac".into()],
+                vec![request(1), request(2)],
+            );
+            requests.sync_notice(Some(both), &actions).await;
+            let new_action = notification_actions.lock().unwrap()[0].clone();
+            assert_ne!(old_action, new_action);
+            assert_eq!(
+                notification_copy.lock().unwrap().0,
+                "Phone and Mac want to link your devices"
+            );
+            for action in [old_action, new_action] {
+                server
+                    .emit_signal(
+                        None::<&str>,
+                        "/org/freedesktop/Notifications",
+                        "org.freedesktop.Notifications",
+                        "ActionInvoked",
+                        &(id, action),
+                    )
+                    .await?;
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await?
+                .context("setup action")?
+            {
+                crate::ui::Command::SetupDecision { requests, allow } => {
+                    assert!(allow);
+                    assert_eq!(requests, vec![request(1), request(2)]);
+                }
+                _ => panic!("wrong request action"),
+            }
+            assert!(rx.try_recv().is_err());
+            requests.sync_notice(None, &actions).await;
+            let current = actions.notifications().await?;
+            assert!(
+                !current
+                    .as_ref()
+                    .unwrap()
+                    .targets
+                    .lock()
+                    .await
+                    .contains_key(&id)
+            );
         }
 
         // Real D-Bus signal ordering and all notification launch destinations.

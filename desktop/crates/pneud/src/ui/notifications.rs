@@ -11,6 +11,7 @@ pub struct Notice {
     pub urls: Vec<String>,
     /// The device an action such as Remove… is about.
     pub device: Option<pneu_proto::Id>,
+    pub setup_requests: Vec<super::window_setup::Decision>,
 }
 impl Notice {
     pub fn new(summary: impl Into<String>) -> Self {
@@ -23,6 +24,7 @@ impl Notice {
             expires: -1,
             urls: Vec::new(),
             device: None,
+            setup_requests: Vec::new(),
         }
     }
     pub fn file(
@@ -138,6 +140,21 @@ impl Notice {
         n.actions.push(("remove", "Remove…"));
         n.device = Some(device);
         n
+    }
+    pub(crate) fn link_request(
+        names: &[String],
+        requests: Vec<super::window_setup::Decision>,
+    ) -> Self {
+        let names: Vec<_> = names.iter().map(|name| label(name)).collect();
+        let verb = if names.len() == 1 { "wants" } else { "want" };
+        let mut notice = Self::new(format!(
+            "{} {verb} to link your devices",
+            super::window_setup::askers(&names)
+        ));
+        notice.body = "New devices then pair just once.".into();
+        notice.actions = vec![("allow", "Allow"), ("deny", "Don't Allow")];
+        notice.setup_requests = requests;
+        notice
     }
     pub fn unpaired(device: &str) -> Self {
         let mut n = Self::new(format!(

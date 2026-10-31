@@ -235,6 +235,7 @@ enum Action {
     PasteLink(String),
     ScannedLink(String),
     Probed(String),
+    Focused,
     OfferPair(bool),
     OfferDismiss,
     ConfirmJoin(bool),
@@ -356,7 +357,7 @@ impl Peer {
             Health::Connecting => "Connecting…".into(),
             Health::Update => "Update required".into(),
             Health::Lost | Health::Mismatch => "Pairing lost".into(),
-            Health::Offline if self.last_seen == 0 => "Not connected".into(),
+            Health::Offline if self.last_seen == 0 => "Not connected yet".into(),
             Health::Offline => format!("Not connected · last seen {}", seen(self.last_seen)),
         }
     }
@@ -434,7 +435,16 @@ pub(crate) fn peers(snapshot: &super::Snapshot, transfers: &[Transfer]) -> Vec<P
         .map(|d| {
             let id = d.device.as_str().to_owned();
             let paused = d.role == "phone" && snapshot.paused_devices.contains(&d.device);
-            let health = Health::of(&d.state, paused);
+            let mut health = Health::of(&d.state, paused);
+            if snapshot.refreshing_devices.contains(&d.device)
+                && matches!(health, Health::Offline | Health::Connecting)
+            {
+                health = if paused {
+                    Health::Paused
+                } else {
+                    Health::Connected
+                };
+            }
             let active = |incoming: bool| {
                 transfers
                     .iter()
@@ -633,7 +643,7 @@ fn device_summary(peer: &Peer) -> (SummaryData, &'static str) {
             "Not connected".into(),
             format!("Last connected {}", seen(peer.last_seen)),
         ),
-        Health::Offline => ("Not connected".into(), String::new()),
+        Health::Offline => ("Not connected yet".into(), String::new()),
     };
     let capsule = match (&peer.sending, &peer.receiving) {
         _ if tube != Tube::Solid => 0,
@@ -667,6 +677,12 @@ fn device_settings(peer: &Peer, reply: &Value) -> (Vec<SettingItem>, String) {
         return (Vec::new(), String::new());
     }
     if reply["can_sync"] == json!(false) {
+        if peer.last_seen == 0 && !peer.connected() {
+            return (
+                Vec::new(),
+                format!("Switches sync when {} connects.", peer.name),
+            );
+        }
         return (
             Vec::new(),
             format!("Update Pneu on {} to sync these switches.", peer.name),
@@ -1024,6 +1040,7 @@ struct Frame {
     devices: Vec<DeviceItem>,
     recent: Vec<RecentItem>,
     manual_clipboard: bool,
+    pair_again: bool,
     motion: bool,
     device: DeviceItem,
     device_summary: SummaryData,
@@ -1163,11 +1180,15 @@ pub fn run(paths: Paths) -> Result<()> {
     ));
     let focused = Arc::new(AtomicBool::new(false));
     let view = Arc::new(Mutex::new(View::default()));
-    let focus = focused.clone();
-    window.global::<WindowFocus>().on_changed(move |value| {
-        focus.store(value, Ordering::SeqCst);
-    });
     let (commands, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let focus = focused.clone();
+    let focus_commands = commands.clone();
+    window.global::<WindowFocus>().on_changed(move |value| {
+        let was_focused = focus.swap(value, Ordering::SeqCst);
+        if value && !was_focused {
+            let _ = focus_commands.send(Action::Focused);
+        }
+    });
     connect(&window, &commands, &view);
     let c = commands.clone();
     window.window().on_close_requested(move || {
@@ -1761,8 +1782,7 @@ struct Worker {
     live_pairing_link: Option<String>,
     live_pairing_revision: u64,
     probed: bool,
-    known: HashSet<String>,
-    lost: HashSet<String>,
+    seen_pairing_token: Option<pneu_proto::Hash>,
     paired: Option<Paired>,
     peer_settings: Option<(String, Value, Instant)>,
     last_view: View,
@@ -1825,8 +1845,7 @@ impl Worker {
             live_pairing_link: None,
             live_pairing_revision: 0,
             probed: false,
-            known: HashSet::new(),
-            lost: HashSet::new(),
+            seen_pairing_token: None,
             paired: None,
             peer_settings: None,
             requested_page: None,
@@ -1978,14 +1997,6 @@ impl Worker {
             }
         });
     }
-    fn device_ids(&self) -> HashSet<String> {
-        self.snapshot
-            .devices
-            .iter()
-            .map(|d| d.device.as_str().to_owned())
-            .collect()
-    }
-
     async fn act(&mut self, action: Action) {
         let action = match action {
             Action::Scoped(view, action) => {
@@ -2013,6 +2024,11 @@ impl Worker {
             Action::Scoped(_, _) => unreachable!("nested UI action"),
             Action::Close => {}
             Action::Navigated => self.navigated(true).await,
+            Action::Focused => {
+                if self.view().page == Page::Add && self.join.is_none() {
+                    self.ui(|w| w.invoke_probe_clipboard());
+                }
+            }
             Action::Folder => {
                 if self.folder_job.is_none() {
                     self.folder_origin = Some(self.view());
@@ -2428,9 +2444,7 @@ impl Worker {
         }
         let previous = std::mem::replace(&mut self.last_view, view.clone());
         if is_pairing_page(view.page) && !is_pairing_page(previous.page) {
-            self.known = self.device_ids();
             self.known_roster = self.setup.roster_ids();
-            self.lost = self.lost_ids();
             self.paired = None;
             self.probed = false;
         }
@@ -2467,14 +2481,6 @@ impl Worker {
             self.remove_request = None;
         }
     }
-    fn lost_ids(&self) -> HashSet<String> {
-        peers(&self.snapshot, &[])
-            .into_iter()
-            .filter(|p| p.health.lost())
-            .map(|p| p.id)
-            .collect()
-    }
-
     async fn set_flag(&self, key: &str, on: bool) -> Result<()> {
         anyhow::ensure!(
             matches!(
@@ -3198,6 +3204,7 @@ impl Worker {
     fn top_card(&self, peers: &[Peer]) -> TopCard {
         match setup::top(&self.setup, peers, &self.remembered) {
             Top::None => TopCard::default(),
+            Top::Offer { .. } if !self.snapshot.refreshing_devices.is_empty() => TopCard::default(),
             Top::Offer { .. } => TopCard {
                 kind: TopKind::Offer,
                 title: "Link your devices".into(),
@@ -3603,7 +3610,7 @@ impl Worker {
                 }
             } else {
                 // Never show a URI which Core no longer accepts.
-                if self.phone_token.take().is_some() {
+                if self.phone_token.is_some() {
                     self.ui(|w| w.global::<Ui>().set_qr(slint::Image::default()));
                 }
                 if self.snapshot.pairing.is_none()
@@ -3629,21 +3636,30 @@ impl Worker {
         }
         self.poll_join().await;
 
-        // A device that appears (or recovers from a lost pairing) while a
-        // pairing page shows was just paired: check, then its page.
+        // Finish only for the displayed invitation that was actually consumed,
+        // including a direct pairing to a device already in the list.
         if is_pairing_page(view.page)
             && self.join.is_none()
             && self.current()
             && self.paired.is_none()
             && let Some(peer) = peers.iter().find(|p| {
-                (!self.known.contains(&p.id) || (self.lost.contains(&p.id) && !p.health.lost()))
+                self.snapshot
+                    .pairing_completion
+                    .as_ref()
+                    .is_some_and(|done| {
+                        done.device.as_str() == p.id
+                            && self.seen_pairing_token.as_ref() != Some(&done.token)
+                            && (self.phone_token.as_ref() == Some(&done.token)
+                                || self.code.token.as_ref() == Some(&done.token))
+                    })
                     && !p.name.is_empty()
-                    && self
-                        .setup
-                        .link(&p.id)
-                        .is_none_or(|link| link.introduced_by.is_none())
             })
         {
+            self.seen_pairing_token = self
+                .snapshot
+                .pairing_completion
+                .as_ref()
+                .map(|done| done.token.clone());
             self.paired = Some(Paired {
                 origin: view.clone(),
                 name: peer.name.clone(),
@@ -3667,8 +3683,6 @@ impl Worker {
         {
             let device = paired.device.clone();
             self.paired = None;
-            self.known = self.device_ids();
-            self.lost = self.lost_ids();
             self.ui(move |w| match device {
                 Some(device) => w.invoke_open_device(device.into()),
                 None => w.invoke_go(Page::Main),
@@ -3845,6 +3859,7 @@ impl Worker {
                 .collect(),
             recent: recent(peers, &self.transfers),
             manual_clipboard: mode == ClipboardMode::Manual,
+            pair_again: !peers.is_empty() && peers.iter().all(Peer::lost),
             motion: animations_enabled(&super::palette::globals()),
             device: device_item,
             device_summary,
@@ -3898,6 +3913,7 @@ fn apply(w: &PneuWindow, frame: Frame) {
     let ui = w.global::<Ui>();
     ui.set_error(frame.error.into());
     ui.set_summary(frame.summary.summary());
+    ui.set_pair_again(frame.pair_again);
     sync(ui.get_devices(), &frame.devices);
     sync(ui.get_recent(), &frame.recent);
     ui.set_manual_clipboard(frame.manual_clipboard);
@@ -4562,7 +4578,14 @@ mod tests {
         );
         let (items, note) = device_settings(phone, &json!({"can_sync": false, "settings": []}));
         assert!(items.is_empty());
-        assert_eq!(note, "Update Pneu on Galaxy S25+ to sync these switches.");
+        assert_eq!(note, "Switches sync when Galaxy S25+ connects.");
+        let mut seen = phone.clone();
+        seen.last_seen = 1;
+        assert_eq!(
+            device_settings(&seen, &json!({"can_sync": false})).1,
+            "Update Pneu on Galaxy S25+ to sync these switches."
+        );
+        assert_eq!(phone.connection(), "Not connected yet");
     }
 
     #[test]
@@ -4998,10 +5021,8 @@ mod tests {
         while let Ok(action) = actions.try_recv() {
             worker.act(action).await;
         }
-        let known = worker.device_ids();
-        let lost = worker.lost_ids();
-        assert_eq!(worker.known, known);
-        assert_eq!(worker.lost, lost);
+        let token = pneu_proto::PairingUri::parse(&sample_uri())?.token;
+        worker.code.token = Some(token.clone());
         assert!(worker.probed);
         // A peer appears while Scan is open. Returning to Add must not absorb
         // that peer into the baseline and hide the pairing-success transition.
@@ -5023,8 +5044,10 @@ mod tests {
         }
         assert_eq!(worker.view().page, Page::Add);
         assert_eq!(worker.view().add_tab, 1);
-        assert_eq!(worker.known, known);
-        assert_eq!(worker.lost, lost);
+        worker.snapshot.pairing_completion = Some(super::super::PairingCompletion {
+            token: token.clone(),
+            device: id(2),
+        });
         assert!(worker.probed);
         worker
             .refresh(status_value(&worker), &AtomicBool::new(true))
@@ -5039,12 +5062,16 @@ mod tests {
         while let Ok(action) = actions.try_recv() {
             worker.act(action).await;
         }
-        assert_eq!(worker.known, worker.device_ids());
-        assert_eq!(worker.lost, worker.lost_ids());
-        assert!(worker.lost.is_empty());
+        assert_eq!(worker.seen_pairing_token, Some(token));
         assert!(worker.paired.is_none());
         assert!(!worker.probed);
         // Newly paired peers are also recognized while Scan itself is open.
+        let next_token = pneu_proto::Hash::new("bc".repeat(32))?;
+        worker.code.token = Some(next_token.clone());
+        worker.snapshot.pairing_completion = Some(super::super::PairingCompletion {
+            token: next_token,
+            device: id(3),
+        });
         worker
             .snapshot
             .devices
@@ -7172,6 +7199,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consumed_invitation_completes_existing_device_and_focus_reprobes_clipboard()
+    -> Result<()> {
+        if in_offscreen_child("ui::window::tests::consumed_invitation_completes_existing_device_and_focus_reprobes_clipboard", &[]).await? { return Ok(()); }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        let _mock = mock_ipc(&worker.paths.socket, |_| (true, Value::Null))?;
+        state(&mut worker, trio(), vec![]);
+        window.invoke_open_add(0);
+        drain(&mut worker, &mut actions).await;
+        let token = pneu_proto::PairingUri::parse(&sample_uri())?.token;
+        worker.phone_token = Some(token.clone());
+        worker.snapshot.pairing_completion = Some(super::super::PairingCompletion {
+            token,
+            device: id(2),
+        });
+        let probes = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = probes.clone();
+        window
+            .global::<Ui>()
+            .on_probed(move |_| count.set(count.get() + 1));
+        worker.act(Action::Focused).await;
+        flush_ui();
+        assert_eq!(probes.get(), 1);
+        worker
+            .refresh(status_value(&worker), &AtomicBool::new(true))
+            .await?;
+        flush_ui();
+        assert_eq!(
+            worker.paired.as_ref().and_then(|p| p.device.as_deref()),
+            Some(id(2).as_str())
+        );
+        assert_eq!(window.global::<Ui>().get_paired(), "MacBook Air");
+        let mut lost = peers(&worker.snapshot, &[]);
+        for peer in &mut lost {
+            peer.health = Health::Lost;
+        }
+        let frame = worker.frame(
+            &Config::default(),
+            &lost,
+            None,
+            None,
+            false,
+            crate::now_ms(),
+        );
+        assert!(frame.pair_again);
+        apply(&window, frame);
+        assert!(window.global::<Ui>().get_pair_again());
+        let never = peers(
+            &snapshot(vec![device(2, "MacBook Air", false, "disconnected", 0)]),
+            &[],
+        );
+        assert_eq!(device_summary(&never[0]).0.title, "Not connected yet");
+        Ok(())
+    }
+
+    #[test]
+    fn scope_refresh_preserves_connection_presentation_and_lost_devices_offer_pair_again() {
+        let mut snap = snapshot(vec![device(1, "Phone", true, "disconnected", 123)]);
+        snap.refreshing_devices = vec![id(1)];
+        let refreshed = peers(&snap, &[]);
+        assert!(refreshed[0].connected());
+        assert!(!unreachable(&refreshed));
+        assert_eq!(device_summary(&refreshed[0]).0.title, "Connected");
+        snap.refreshing_devices.clear();
+        assert!(!peers(&snap, &[])[0].connected());
+        snap.devices[0].state = "unauthorized".into();
+        snap.refreshing_devices = vec![id(1)];
+        assert!(
+            peers(&snap, &[])[0].lost(),
+            "a refresh never hides pairing loss"
+        );
+    }
+
+    #[tokio::test]
     async fn introduced_peer_does_not_complete_pairing_but_is_also_linked() -> Result<()> {
         if in_offscreen_child(
             "ui::window::tests::introduced_peer_does_not_complete_pairing_but_is_also_linked",
@@ -7216,6 +7319,12 @@ mod tests {
         let mut devices = trio();
         devices.push(device(3, "New computer", false, "connected", 0));
         state(&mut worker, devices, vec![]);
+        let token = pneu_proto::PairingUri::parse(&sample_uri())?.token;
+        worker.code.token = Some(token.clone());
+        worker.snapshot.pairing_completion = Some(super::super::PairingCompletion {
+            token,
+            device: id(3),
+        });
         roster = setup_json(
             vec![link_of(1, "enabled"), introduced, link_of(3, "enabled")],
             &[(1, "Galaxy S25+"), (2, "MacBook Air"), (3, "New computer")],
@@ -8793,6 +8902,59 @@ mod tests {
         let separate = with(link_of(2, "disabled"), "outcome", json!(setup::SEPARATE));
         vec![
             scene(
+                "61-main-link-refresh",
+                |w| {
+                    state(
+                        w,
+                        vec![
+                            device(1, "Galaxy S25+", true, "disconnected", 123),
+                            device(2, "MacBook Air", false, "disconnected", 123),
+                        ],
+                        vec![],
+                    );
+                    w.snapshot.refreshing_devices = vec![id(1), id(2)];
+                    linking(
+                        w,
+                        vec![
+                            with(
+                                with(link_of(1, "ask"), "prompt", json!(true)),
+                                "outcome",
+                                json!("allow_pending_refresh"),
+                            ),
+                            link_of(2, "ask"),
+                        ],
+                        &[],
+                    );
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "65-device-not-connected-yet",
+                |w| {
+                    state(
+                        w,
+                        vec![device(2, "MacBook Air", false, "disconnected", 0)],
+                        vec![],
+                    );
+                    linking(
+                        w,
+                        vec![with(
+                            link_of(2, "enabled"),
+                            "introducer_name",
+                            json!("Phone"),
+                        )],
+                        &[(2, "MacBook Air")],
+                    );
+                    device_page(w, 2);
+                    w.peer_settings = Some((
+                        id(2).to_string(),
+                        json!({"can_sync": false}),
+                        Instant::now(),
+                    ));
+                },
+                go(Page::Device, 2, 0),
+            ),
+            scene(
                 "60-main-link-offer",
                 move |w| {
                     state(w, trio(), Vec::new());
@@ -9084,6 +9246,28 @@ mod tests {
                     state(w, two(), Vec::new());
                     full(w);
                     offer_card(w);
+                },
+                go(Page::Add, 0, 1),
+            ),
+            scene(
+                "70-paired-also-one-more",
+                |w| {
+                    let names = [
+                        (1, "MacBook Air"),
+                        (2, "MJStanton-Desktop"),
+                        (3, "sdk_gphone16k_x86_64"),
+                        (4, "Den-PC"),
+                    ];
+                    state(
+                        w,
+                        names
+                            .iter()
+                            .map(|(n, name)| device(*n, name, false, "connected", 0))
+                            .collect(),
+                        vec![],
+                    );
+                    linking(w, (1..=4).map(|n| link_of(n, "enabled")).collect(), &names);
+                    paired_with(w, 1, "MacBook Air");
                 },
                 go(Page::Add, 0, 1),
             ),

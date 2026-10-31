@@ -109,6 +109,16 @@ impl DesktopActions {
     ) -> Option<tokio::sync::mpsc::Receiver<toasts::Activation>> {
         self.activations.lock().expect("toast activations").take()
     }
+    pub(crate) async fn withdraw_notice(&self, id: u32) -> Result<()> {
+        let mut targets = self.targets.lock().expect("toast targets");
+        if let Some(record) = targets.records.get(&id).cloned() {
+            targets.remove(&record);
+            if let Some(sender) = self.sender.get() {
+                sender.remove(record.id, record.group());
+            }
+        }
+        Ok(())
+    }
     pub async fn notice(
         &self,
         notice: Notice,
@@ -241,6 +251,14 @@ impl DesktopActions {
         );
         let target = &record.target;
         match action.as_str() {
+            "allow" | "deny" => {
+                crate::ui::window_setup::decide(
+                    core,
+                    &record.notice.setup_requests,
+                    action == "allow",
+                )
+                .await
+            }
             "window" => core.request_window(false),
             "default" | "open" => {
                 if let Some(file) = target.files.last() {

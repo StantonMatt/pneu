@@ -73,11 +73,22 @@ pub async fn run(
     let mut interactions = crate::ui::portal::Interactions::new();
     let mut last_blocked: Option<Instant> = None;
     let mut notices = tokio::task::JoinSet::new();
+    let mut requests = Some(crate::ui::window_setup::Requests::default());
+    let mut request_job: Option<
+        futures_util::future::BoxFuture<'static, crate::ui::window_setup::Requests>,
+    > = None;
     loop {
         if *stop.borrow() {
             break;
         }
+        let mut sync_requests = true;
         tokio::select! {
+            state = async { request_job.as_mut().expect("link request job").await }, if request_job.is_some() => {
+                request_job = None;
+                requests = Some(state);
+                sync_requests = false;
+            },
+
             _=stop.changed()=>break,
             Some(_)=notices.join_next(),if !notices.is_empty()=>{},
             _=timer.tick()=>{
@@ -104,6 +115,8 @@ pub async fn run(
                     ui.channel.close();
                     crate::ui::child_supervision::stop(&mut ui.child, Duration::from_secs(3)).await;
                     actions.clear_notifications().await;
+                    request_job = None;
+                    requests = Some(crate::ui::window_setup::Requests::default());
                     restart.failed(Instant::now(),ui.started.elapsed());
                     eprintln!("pneud: menu bar child stopped; restarting with backoff");
                 }
@@ -138,6 +151,19 @@ pub async fn run(
                 Err(tokio::sync::broadcast::error::RecvError::Closed)=>break,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_))=>for device in core.paired_devices() {core.cancel_automatic_clipboard(&device);},
             }
+        }
+
+        if sync_requests
+            && require_ui(&core).is_ok()
+            && request_job.is_none()
+            && let Some(mut state) = requests.take()
+        {
+            let core = core.clone();
+            let actions = actions.clone();
+            request_job = Some(Box::pin(async move {
+                state.sync(&core, &actions).await;
+                state
+            }));
         }
     }
     notices.abort_all();

@@ -560,6 +560,10 @@ async fn setup_scoped_unpair_and_own_tombstone_only_withdraw_locally() -> Result
         assert!(s.withdrawn);
         assert_eq!(s.setup_id, None);
         assert!(s.roster.is_empty());
+        assert!(f.s.setup_quiet_reconnect(member(1).fingerprint).await?);
+        assert!(f.s.setup_quiet_reconnect(member(3).fingerprint).await?);
+        assert!(!f.s.setup_quiet_reconnect(member(4).fingerprint).await?);
+        assert!(!f.s.setup_quiet_reconnect(member(9).fingerprint).await?);
         assert_eq!(f.s.peers().await?.len(), 2);
         assert!(f.pin(4).await?.is_some());
         assert!(f.pin(5).await?.is_some());
@@ -1055,7 +1059,7 @@ async fn setup_v3_migration_preserves_bindings_settings_queues_and_receipts() ->
     drop(s);
     {
         let c = Connection::open(&path)?;
-        c.execute_batch("DROP TABLE setup_links;DROP TABLE setup_entries;DROP TABLE setup_state;DROP TABLE members_receipts;DROP TABLE members_outgoing;DROP TABLE members_replay;DROP TABLE setup_candidates;DROP TABLE setup_conflicts;DROP TABLE setup_notices;DROP TABLE setup_retired;PRAGMA user_version=3;")?;
+        c.execute_batch("DROP TABLE setup_links;DROP TABLE setup_entries;DROP TABLE setup_state;DROP TABLE members_receipts;DROP TABLE members_outgoing;DROP TABLE members_replay;DROP TABLE setup_candidates;DROP TABLE setup_conflicts;DROP TABLE setup_notices;DROP TABLE setup_retired;DROP TABLE setup_withdrawn_pins;PRAGMA user_version=3;")?;
     }
     let s = Store::open(&path)?;
     assert_eq!(s.setup_state().links[0].scope, SetupScope::Ask);
@@ -2362,5 +2366,53 @@ async fn setup_joined_notices_use_admission_before_rename_including_candidates()
         assert_eq!(devices, vec![id(4).to_string()], "deferred={deferred}");
         assert!(store.peers().await?.values().any(|id_| *id_ == id(3)));
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_direct_repair_clears_introducer_without_resetting_binding() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.merge(f.snapshot(vec![member(3)])).await?;
+    assert!(
+        f.s.setup_state()
+            .links
+            .iter()
+            .find(|l| l.device == id(3))
+            .unwrap()
+            .introduced_by
+            .is_some()
+    );
+    let generation = f.s.pairing_generation(&id(3));
+    f.s.setup_fresh_local_recovery(id(3), member(2), |_| {})
+        .await?;
+    let link =
+        f.s.setup_state()
+            .links
+            .into_iter()
+            .find(|l| l.device == id(3))
+            .unwrap();
+    assert!(link.introduced_by.is_none());
+    assert!(link.introducer_name.is_none());
+    assert_eq!(f.s.pairing_generation(&id(3)), generation);
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_withdrawn_reconnect_notice_suppression_survives_restart() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.s.setup_withdraw(f.f.clone(), |_| {}).await?;
+    let path = f._dir.path().join("state.sqlite3");
+    drop(f.s);
+    let reopened = Store::open(&path)?;
+    assert!(
+        reopened
+            .setup_quiet_reconnect(member(1).fingerprint)
+            .await?
+    );
+    assert!(
+        !reopened
+            .setup_quiet_reconnect(member(9).fingerprint)
+            .await?
+    );
     Ok(())
 }
