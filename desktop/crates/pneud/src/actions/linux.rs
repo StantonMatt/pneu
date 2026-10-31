@@ -59,6 +59,7 @@ struct Target {
     paths: Vec<PathBuf>,
     link: Option<String>,
     retry: Option<(pneu_proto::Id, pneu_proto::Id, pneu_proto::Id)>,
+    device: Option<pneu_proto::Id>,
 }
 struct Burst {
     id: u32,
@@ -286,6 +287,7 @@ impl DesktopActions {
                                         "link" => { if interactions.available() && let Some(link)=target.link { let wait=begin_open_uri(&link,&action_connection,token.as_deref()).await; interactions.push(async move { let _=wait.await; }); } },
                                         "retry" => { if let Some((operation,artifact,device))=target.retry && let Some(commands)=commands.lock().expect("UI commands").clone() { let _=commands.try_send(crate::ui::Command::RetryTransfer {operation,artifact,device}); } },
                                         "folder"|"pair" => { if let Some(commands)=commands.lock().expect("UI commands").clone() { let _=commands.try_send(if action=="folder" { crate::ui::Command::ChooseFolder } else { crate::ui::Command::AddDevice { activation_token: token } }); } },
+                                        "remove" => { if let Some(device)=target.device && let Some(commands)=commands.lock().expect("UI commands").clone() { let _=commands.try_send(crate::ui::Command::RemoveDevice { device, activation_token: token }); } },
                                         _=>{},
                                     }
                                     continue;
@@ -404,6 +406,7 @@ impl DesktopActions {
                 paths,
                 link,
                 retry,
+                device: notice.device.clone(),
             },
         );
         Ok(id)
@@ -1764,12 +1767,19 @@ mod tests {
         }
 
         // Real D-Bus signal ordering and all notification launch destinations.
-        for action in ["default", "open", "show", "link", "folder", "pair"] {
+        for action in [
+            "default", "open", "show", "link", "folder", "pair", "remove",
+        ] {
             let (tx, mut rx) = tokio::sync::mpsc::channel(2);
             actions.set_commands(tx);
+            let joined = pneu_proto::Id::from_bytes([9; 16]);
             let id = actions
                 .notice(
-                    crate::ui::notifications::Notice::blocked("phone"),
+                    if action == "remove" {
+                        crate::ui::notifications::Notice::joined(joined.clone(), "Mac", "Phone")
+                    } else {
+                        crate::ui::notifications::Notice::blocked("phone")
+                    },
                     vec![final_file.clone()],
                     Some("https://example.com".into()),
                     0,
@@ -1795,7 +1805,7 @@ mod tests {
                     )
                     .await?;
             }
-            if matches!(action, "folder" | "pair") {
+            if matches!(action, "folder" | "pair" | "remove") {
                 let command = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
                     .await?
                     .unwrap();
@@ -1804,6 +1814,13 @@ mod tests {
                         assert_eq!(activation_token.as_deref(), Some("notification-token"));
                     }
                     crate::ui::Command::ChooseFolder if action == "folder" => {}
+                    crate::ui::Command::RemoveDevice {
+                        device,
+                        activation_token,
+                    } if action == "remove" => {
+                        assert_eq!(device, joined);
+                        assert_eq!(activation_token.as_deref(), Some("notification-token"));
+                    }
                     _ => panic!("wrong notification command"),
                 }
             } else {

@@ -52,6 +52,10 @@ pub(crate) fn spawn(
         .env("PNEU_UI_FD", descriptor.to_string())
         .env("PNEU_UI_TOKEN", &token)
         .env("PNEU_WINDOW_REQUEST", window_request.to_string())
+        .env(
+            "PNEU_DAEMON_INSTANCE",
+            super::window_setup::daemon_instance(),
+        )
         .kill_on_drop(true);
     command
         .env_remove("PNEU_UI_VIEW_CACHE")

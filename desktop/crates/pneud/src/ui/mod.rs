@@ -57,6 +57,7 @@ mod viewer_cache;
 pub mod window;
 #[cfg(any(target_os = "linux", windows))]
 mod window_process;
+pub(crate) mod window_setup;
 #[cfg(any(windows, test))]
 mod windows_clipboard_content;
 #[cfg(windows)]
@@ -480,6 +481,11 @@ pub enum Command {
     SendClipboard(Vec<crate::outbox::Authority>),
     ClipboardMode(&'static str),
     AddDevice {
+        activation_token: Option<String>,
+    },
+    /// A joined notification's Remove…: that device's page and confirmation.
+    RemoveDevice {
+        device: pneu_proto::Id,
         activation_token: Option<String>,
     },
 }

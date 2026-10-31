@@ -1003,6 +1003,8 @@ pub struct Core {
     shutdown: watch::Sender<bool>,
     port: AtomicU16,
     window_request: Mutex<(u64, Option<String>, bool)>,
+    // The window request whose device page opens with Remove from all devices.
+    window_remove: Mutex<Option<(u64, Id)>>,
     pending_sends: Mutex<std::collections::VecDeque<crate::ui::window::SendRequest>>,
     window_focus: Mutex<Option<(u64, Instant)>>,
     #[cfg(test)]
@@ -1176,6 +1178,7 @@ impl Core {
             shutdown,
             port: AtomicU16::new(port),
             window_request: Mutex::new((0, None, false)),
+            window_remove: Mutex::new(None),
             pending_sends: Mutex::default(),
             window_focus: Mutex::new(None),
             #[cfg(test)]
@@ -1336,6 +1339,22 @@ impl Core {
         request.0 = ((request.0 >> 1) + 1) * 2;
         request.1 = token;
         request.2 = true;
+    }
+    /// A joined notification's Remove…: that device's page and its confirmation.
+    pub(crate) fn request_remove_window(&self, device: Id, token: Option<String>) {
+        let mut request = self.window_request.lock().expect("window request");
+        request.0 = ((request.0 >> 1) + 1) * 2;
+        request.1 = token;
+        request.2 = false;
+        *self.window_remove.lock().expect("window remove") = Some((request.0, device));
+    }
+    pub fn window_remove_device(&self, id: u64) -> Option<Id> {
+        self.window_remove
+            .lock()
+            .expect("window remove")
+            .as_ref()
+            .filter(|(request, _)| *request == id)
+            .map(|(_, device)| device.clone())
     }
     pub fn window_add_device(&self, id: u64) -> bool {
         let request = self.window_request.lock().expect("window request");

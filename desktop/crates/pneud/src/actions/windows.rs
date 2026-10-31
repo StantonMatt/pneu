@@ -26,6 +26,7 @@ struct Target {
     url: Option<String>,
     retry: Option<(pneu_proto::Id, pneu_proto::Id, pneu_proto::Id)>,
     attribution: Option<String>,
+    device: Option<pneu_proto::Id>,
 }
 struct Burst {
     id: u32,
@@ -136,6 +137,7 @@ impl DesktopActions {
                 url,
                 retry: None,
                 attribution: None,
+                device: None,
             },
             replaces,
         )
@@ -144,9 +146,10 @@ impl DesktopActions {
     async fn issue_notice_target(
         &self,
         notice: Notice,
-        target: Target,
+        mut target: Target,
         replaces: u32,
     ) -> Result<(u32, Interaction)> {
+        target.device = notice.device.clone();
         let sender = self
             .sender
             .get()
@@ -252,6 +255,11 @@ impl DesktopActions {
             }
             "folder" => core.request_window(true),
             "pair" => core.request_add_device(),
+            "remove" => {
+                if let Some(device) = &target.device {
+                    core.request_remove_window(device.clone(), None);
+                }
+            }
             "retry" => {
                 if let Some((operation, artifact, device)) = &target.retry {
                     core.retry_transfer_artifact(
@@ -551,6 +559,7 @@ impl PcActions for DesktopActions {
                     url: None,
                     retry,
                     attribution: None,
+                    device: None,
                 },
                 0,
             )
@@ -693,6 +702,7 @@ impl PcActions for DesktopActions {
                     url: None,
                     retry: None,
                     attribution: (count == 1).then(|| file_attribution(metadata)).flatten(),
+                    device: None,
                 },
                 replaces,
             )

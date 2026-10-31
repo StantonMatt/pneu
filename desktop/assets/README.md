@@ -12,4 +12,6 @@ and `description.svg` use the Rounded variant.
 `wifi.svg` and `language.svg` are Google's Material Symbols Rounded
 [wifi](https://raw.githubusercontent.com/google/material-design-icons/master/symbols/web/wifi/materialsymbolsrounded/wifi_24px.svg)
 and [language](https://raw.githubusercontent.com/google/material-design-icons/master/symbols/web/language/materialsymbolsrounded/language_24px.svg)
-icons, prepared the same way.
+icons, prepared the same way. So is the Rounded
+[link](https://raw.githubusercontent.com/google/material-design-icons/master/symbols/web/link/materialsymbolsrounded/link_24px.svg)
+icon (`link.svg`).

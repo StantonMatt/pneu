@@ -69,6 +69,7 @@ pub(crate) struct SetupDelta {
     pub reconnect_peer: Option<Id>,
     pub withdrawn: bool,
     pub changed: bool,
+    remote_scope: Option<(Id, SetupScope)>,
 }
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum MembersError {
@@ -84,6 +85,12 @@ pub(crate) enum MembersError {
 #[derive(Clone, Serialize, Deserialize)]
 struct Entry {
     value: Member,
+    // Local admission stamp: metadata edits must not move the notice baseline.
+    #[serde(default)]
+    admitted_hlc: Option<u64>,
+    // Freeze import classification before deferred candidates can be renamed.
+    #[serde(default)]
+    joined_notice: Option<bool>,
     removal: Option<Member>,
     denied: bool,
     setup_id: Option<Id>,
@@ -429,12 +436,26 @@ fn local_value(tx: &Transaction<'_>, mut value: Member, setup_id: &Id, fresh: bo
     save_entry(
         tx,
         &Entry {
+            admitted_hlc: Some(value.hlc),
+            joined_notice: None,
             value,
             removal: old.and_then(|e| e.removal),
             denied: false,
             setup_id: Some(setup_id.clone()),
         },
     )
+}
+// The self entry is authored locally on assignment, before the first MEMBERS.
+// Keep that original admission stamp even when a rename advances its value HLC.
+fn joined_is_new(c: &Connection, local: &Id, member: &Member) -> Result<bool> {
+    let baseline = entries(c)?
+        .into_iter()
+        .find(|e| {
+            e.value.device_id == *local && e.value.status == MemberStatus::Member && !e.denied
+        })
+        .map(|e| e.admitted_hlc.unwrap_or(e.value.hlc))
+        .unwrap_or(0);
+    Ok(member.hlc >= baseline)
 }
 impl Store {
     /// Every externally visible peer/cache change is published after COMMIT in
@@ -470,8 +491,22 @@ impl Store {
                 let mut cached = s.setup.lock().expect("setup");
                 let mut epochs = s.generations.lock().expect("peer generations");
                 let mut policy = s.pair_settings.lock().expect("pair settings");
+                let mut remote_scopes = s.setup_remote_scopes.lock().expect("remote setup scopes");
                 tx.commit()?;
-                let changed = cached.as_ref() != Some(&setup);
+                let previous_scopes = remote_scopes.clone();
+                if let Some((device, scope)) = delta.remote_scope.take()
+                    && let Some(generation) = generations.get(&device)
+                {
+                    remote_scopes.insert(device, (*generation, scope));
+                }
+                remote_scopes.retain(|device, (generation, _)| {
+                    generations.get(device) == Some(generation)
+                        && setup
+                            .links
+                            .iter()
+                            .any(|l| l.device == *device && l.negotiated)
+                });
+                let changed = cached.as_ref() != Some(&setup) || *remote_scopes != previous_scopes;
                 *cached = Some(setup);
                 *epochs = generations;
                 for id in &delta.removed {
@@ -481,6 +516,7 @@ impl Store {
                         .expect("settings generations")
                         .remove(id);
                 }
+                drop(remote_scopes);
                 drop(policy);
                 drop(epochs);
                 drop(cached);
@@ -501,6 +537,16 @@ impl Store {
             .as_ref()
             .expect("loaded setup")
             .clone()
+    }
+    pub(crate) fn setup_remote_scopes(&self) -> HashMap<Id, SetupScope> {
+        let generations = self.generations.lock().expect("peer generations");
+        self.setup_remote_scopes
+            .lock()
+            .expect("remote setup scopes")
+            .iter()
+            .filter(|(device, (generation, _))| generations.get(*device) == Some(generation))
+            .map(|(device, (_, scope))| (device.clone(), *scope))
+            .collect()
     }
     pub(crate) fn setup_hello(&self, device: Option<&Id>, default: SetupScope) -> SetupHello {
         let s = self.setup_state();
@@ -631,6 +677,7 @@ impl Store {
         let epoch = self.peer_epoch(&fence.device);
         self.setup_write(move |tx,delta| {
             epoch.check(tx)?;fence.check(tx)?;
+            delta.remote_scope=Some((fence.device.clone(),remote_hello.scope));
             let mut s=state(tx)?;
             let link=s.links.iter().find(|l|l.device==fence.device).context("missing setup link")?.clone();
             let (last, allow, discovery, token): (i64,Option<i64>,Option<i64>,bool)=tx.query_row("SELECT last_connection,allow_connection,discovery_connection,token_founding FROM setup_links WHERE device=?",[fence.device.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
@@ -751,7 +798,7 @@ impl Store {
                 if m.status==MemberStatus::Removed {
                     let removal=old.as_ref().and_then(|e|e.removal.as_ref());
                     if removal.is_some_and(|r|stamp(r)>=stamp(m)) {continue;}
-                    let e=Entry {value:m.clone(),removal:Some(m.clone()),denied:true,setup_id:Some(snapshot.setup_id.clone())};
+                    let e=Entry {value:m.clone(),admitted_hlc:None,joined_notice:None,removal:Some(m.clone()),denied:true,setup_id:Some(snapshot.setup_id.clone())};
                     save_entry(tx,&e)?;
                     delta.tombstones.push((m.device_id.clone(),m.fingerprint.clone()));
                     forget(tx,&m.device_id,&m.fingerprint,delta)?;
@@ -770,7 +817,11 @@ impl Store {
                 if let Some(e)=&old {
                     value.reach=match (&e.value.reach,&m.reach) {(Some(a),Some(b)) if (a.hlc,a.writer_device.as_str())<(b.hlc,b.writer_device.as_str())=>Some(b.clone()),(Some(a),_)=>Some(a.clone()),(_,r)=>r.clone()};
                 }
-                save_entry(tx,&Entry {value:value.clone(),removal:old.and_then(|e|e.removal),denied:false,setup_id:Some(snapshot.setup_id.clone())})?;
+                let joined_notice=match old.as_ref().filter(|e|e.setup_id.as_ref()==Some(&snapshot.setup_id)).and_then(|e|e.joined_notice) {
+                    Some(joined)=>joined,
+                    None=>joined_is_new(tx,&local.device_id,&value)?,
+                };
+                save_entry(tx,&Entry {value:value.clone(),admitted_hlc:None,joined_notice:Some(joined_notice),removal:old.and_then(|e|e.removal),denied:false,setup_id:Some(snapshot.setup_id.clone())})?;
                 let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM peers WHERE id=?)",[m.device_id.as_str()],|r|r.get(0))?;
                 if !exists {
                     let name:String=tx.query_row("SELECT name FROM peers WHERE id=?",[fence.device.as_str()],|r|r.get(0))?;
@@ -785,7 +836,9 @@ impl Store {
                     tx.execute("UPDATE setup_links SET negotiated=1,participating=1 WHERE device=?",[m.device_id.as_str()])?;
                     let introducer_name:String=tx.query_row("SELECT name FROM peers WHERE id=?",[fence.device.as_str()],|r|r.get(0))?;
                     tx.execute("UPDATE setup_links SET introduced_by=?,introducer_name=? WHERE device=?",params![fence.device.as_str(),introducer_name,m.device_id.as_str()])?;
-                    tx.execute("INSERT OR IGNORE INTO setup_notices VALUES(?,?,?)",params![m.device_id.as_str(),generation,serde_json::to_string(&serde_json::json!({"device":m.device_id,"name":value.name,"introduced_by":fence.device,"introducer_name":introducer_name}))?])?;
+                    if joined_notice {
+                        tx.execute("INSERT OR IGNORE INTO setup_notices VALUES(?,?,?)",params![m.device_id.as_str(),generation,serde_json::to_string(&serde_json::json!({"device":m.device_id,"name":value.name,"introduced_by":fence.device,"introducer_name":introducer_name}))?])?;
+                    }
                     settings::initialize(tx,&local.device_id,&m.device_id,m.role==DeviceRole::Phone)?;
                     tx.execute("DELETE FROM setup_candidates WHERE device=? AND fingerprint=?",params![m.device_id.as_str(),m.fingerprint.as_str()])?;
                     delta.added.push(m.device_id.clone());
@@ -830,6 +883,8 @@ impl Store {
                 save_entry(
                     tx,
                     &Entry {
+                        admitted_hlc: None,
+                        joined_notice: None,
                         value: removed.clone(),
                         removal: Some(removed.clone()),
                         denied: true,
@@ -971,6 +1026,8 @@ pub(super) fn paired(
             save_entry(
                 tx,
                 &Entry {
+                    admitted_hlc: None,
+                    joined_notice: None,
                     value: removed.clone(),
                     removal: Some(removed),
                     denied: true,
@@ -1038,7 +1095,13 @@ impl Store {
                 set_scope(tx,&id,SetupScope::Enabled)?;
                 tx.execute("UPDATE setup_links SET negotiated=1,participating=1 WHERE device=?",[id.as_str()])?;
                 tx.execute("UPDATE setup_links SET introduced_by=?,introducer_name=? WHERE device=?",params![by,name,id.as_str()])?;
-                tx.execute("INSERT OR IGNORE INTO setup_notices VALUES(?,?,?)",params![id.as_str(),generation,serde_json::to_string(&serde_json::json!({"device":id,"name":entry.value.name,"introduced_by":by,"introducer_name":name}))?])?;
+                let joined_notice=match entry.joined_notice {
+                    Some(joined)=>joined,
+                    None=>joined_is_new(tx,&local,&entry.value)?,
+                };
+                if joined_notice {
+                    tx.execute("INSERT OR IGNORE INTO setup_notices VALUES(?,?,?)",params![id.as_str(),generation,serde_json::to_string(&serde_json::json!({"device":id,"name":entry.value.name,"introduced_by":by,"introducer_name":name}))?])?;
+                }
                 settings::initialize(tx,&local,&id,entry.value.role==DeviceRole::Phone)?;
                 if let Some(reach)=&entry.value.reach {merge_routes(tx,&id,&pin,&reach.addresses)?;}
                 tx.execute("DELETE FROM setup_candidates WHERE device=? AND fingerprint=?",params![id.as_str(),pin.as_str()])?;delta.added.push(id);
@@ -1084,6 +1147,7 @@ impl Store {
                         && !e.denied
                         && e.setup_id.as_ref() == Some(&setup_id)
                 }) {
+                    entry.admitted_hlc.get_or_insert(entry.value.hlc);
                     if update_name && entry.value.name != local.name {
                         entry.value.name = local.name;
                         entry.value.hlc = allocate_stamp(tx)?.1;
@@ -1190,13 +1254,22 @@ impl Store {
     pub(crate) async fn setup_begin_link(
         &self,
         peer: Id,
+        expected: Option<(u64, SetupScope)>,
         connections: Vec<(Id, u64)>,
         finish: impl FnOnce(SetupDelta) + Send + 'static,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let epoch = self.peer_epoch(&peer);
         self.setup_write(move |tx,delta| {
-            epoch.check(tx)?;
             let s=state(tx)?;
+            // Check the displayed binding and scope in the enabling transaction.
+            if let Some((binding,scope))=expected {
+                let current:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM peers WHERE id=? AND generation=?)",params![peer.as_str(),binding as i64],|r|r.get(0))?;
+                if !current || !s.links.iter().any(|l|l.device==peer&&l.scope==scope) {
+                    return Ok(false);
+                }
+            } else {
+                epoch.check(tx)?;
+            }
             ensure!(!s.withdrawn,"fresh token pairing required after withdrawal");
             for (id,connection) in connections {
                 tx.execute("UPDATE setup_links SET last_connection=? WHERE device=?",params![connection as i64,id.as_str()])?;
@@ -1214,7 +1287,7 @@ impl Store {
                 } else {clear_pending_link(tx)?;}
             }
             delta.reconnect=true;
-            Ok(())
+            Ok(true)
         },finish).await
     }
     pub(crate) async fn setup_discovery_tick(

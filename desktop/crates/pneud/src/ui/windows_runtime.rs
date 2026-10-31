@@ -42,6 +42,10 @@ pub async fn run(
     let mut last_request = 0;
     let mut last_blocked = None;
     let mut jobs = tokio::task::JoinSet::new();
+    if interactive {
+        let (core, actions) = (core.clone(), actions.clone());
+        jobs.spawn(async move { post_joined(&core, &actions).await });
+    }
     let mut timer = tokio::time::interval(Duration::from_secs(1));
     while !*stop.borrow() {
         let mut update_tray = true;
@@ -68,6 +72,7 @@ pub async fn run(
                 Command::Window { .. } => core.request_window(false),
                 Command::ChooseFolder => core.request_window(true),
                 Command::AddDevice { .. } => core.request_add_device_with_activation(None),
+                Command::RemoveDevice { device, .. } => core.request_remove_window(device, None),
                 Command::Quit => core.request_shutdown(),
                 Command::OpenFolder => {
                     let folder = core.config().save_path;
@@ -109,6 +114,11 @@ pub async fn run(
                         Event::Blocked { address } if last_blocked.is_none_or(|time: std::time::Instant| time.elapsed() >= Duration::from_secs(3600)) => { last_blocked = Some(std::time::Instant::now()); Some(Notice::blocked(address)) },
                         Event::ComputerPaired { name, .. } if !core.window_focused() => Some(Notice::paired(name)),
                         Event::RemoteUnpaired { name } => Some(Notice::unpaired(name)),
+                        Event::Paired { .. } => {
+                            let (core, actions) = (core.clone(), actions.clone());
+                            jobs.spawn(async move { post_joined(&core, &actions).await; });
+                            None
+                        }
                         _ => None,
                     };
                     if let Some(notice) = notice {
@@ -166,6 +176,15 @@ pub async fn run(
     }
     core.close_pairing().await;
     Ok(())
+}
+/// "{device} joined" for each device another of your devices added.
+async fn post_joined(core: &Core, actions: &DesktopActions) {
+    for joined in super::window_setup::joined(core).await {
+        let result = actions
+            .notice(joined.notice.clone(), Vec::new(), None, 0, None)
+            .await;
+        joined.posted(core, result).await;
+    }
 }
 pub(crate) fn clipboard_policy_event(core: &Core, event: &Event) {
     match event {

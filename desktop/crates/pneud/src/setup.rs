@@ -372,6 +372,18 @@ impl Core {
     pub async fn setup_status(&self) -> Result<serde_json::Value> {
         let state = self.store.setup_state();
         let mut value = serde_json::to_value(&state)?;
+        let remote_scopes = self.store.setup_remote_scopes();
+        for (link, value) in state
+            .links
+            .iter()
+            .zip(value["links"].as_array_mut().expect("setup links"))
+        {
+            if link.negotiated
+                && let Some(scope) = remote_scopes.get(&link.device)
+            {
+                value["remote_scope"] = serde_json::to_value(scope)?;
+            }
+        }
         value["binding_generations"] = serde_json::to_value(
             state
                 .links
@@ -442,7 +454,11 @@ impl Core {
             publish(delta);
         }
     }
-    pub async fn link_existing_device(&self, device: Id) -> Result<()> {
+    pub async fn link_existing_device(
+        &self,
+        device: Id,
+        expected: Option<(u64, SetupScope)>,
+    ) -> Result<bool> {
         let guard = self.pairing_gate.clone().lock_owned().await;
         let connections = self
             .sessions
@@ -452,12 +468,13 @@ impl Core {
             .iter()
             .map(|(id, s)| (id.clone(), s.id))
             .collect();
+        let publish = self.setup_publish_peer(guard, &device);
         self.store
-            .setup_begin_link(
-                device.clone(),
-                connections,
-                self.setup_publish_peer(guard, &device),
-            )
+            .setup_begin_link(device, expected, connections, move |delta| {
+                if delta.reconnect {
+                    publish(delta);
+                }
+            })
             .await
     }
     pub async fn decide_setup(
@@ -534,7 +551,9 @@ impl Core {
                 self.setup_publish(guard, Some(device), None),
             )
             .await?;
-        self.outbox.reconcile().await?;
+        if let Err(error) = self.outbox.reconcile().await {
+            self.error(None, format!("outbox cleanup deferred: {error}"));
+        }
         Ok(())
     }
     pub(super) async fn withdraw_setup(&self, store: &Store, hello: &Hello) -> Result<bool> {

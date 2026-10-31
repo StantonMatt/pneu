@@ -87,6 +87,10 @@ pub(super) fn launch(request: u64, token: Option<&str>) -> Result<Child> {
     let child = command
         .arg("ui-window")
         .env("PNEU_WINDOW_REQUEST", request.to_string())
+        .env(
+            "PNEU_DAEMON_INSTANCE",
+            super::window_setup::daemon_instance(),
+        )
         .kill_on_drop(true)
         .spawn()?;
     #[cfg(windows)]

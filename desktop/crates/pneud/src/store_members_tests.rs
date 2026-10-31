@@ -91,6 +91,136 @@ impl Fixture {
     }
 }
 #[tokio::test]
+async fn setup_remote_scope_tracks_hello_without_changing_local_scope() -> Result<()> {
+    let f = Fixture::new().await?;
+    assert_eq!(
+        f.s.setup_remote_scopes().get(&id(1)),
+        Some(&SetupScope::Enabled)
+    );
+    let mut changed = f.s.setup_changed.subscribe();
+    for scope in [SetupScope::Ask, SetupScope::Disabled, SetupScope::Enabled] {
+        changed.borrow_and_update();
+        f.s.setup_activate(
+            f.f.clone(),
+            member(2),
+            member(1),
+            SetupHello {
+                scope,
+                setup_id: Some(id(0)),
+            },
+            |_| {},
+        )
+        .await?;
+        assert_eq!(f.s.setup_remote_scopes().get(&id(1)), Some(&scope));
+        assert!(changed.has_changed()?);
+        let link = f.s.setup_state().links.remove(0);
+        assert_eq!(link.scope, SetupScope::Enabled);
+        assert!(!link.prompt);
+        assert_eq!(link.participating, scope == SetupScope::Enabled);
+    }
+    // Failed or obsolete HELLO work must not publish UI metadata either.
+    let before = f.s.setup_remote_scopes();
+    f.s.fail_next("members_before_commit", 1);
+    assert!(
+        f.s.setup_activate(
+            f.f.clone(),
+            member(2),
+            member(1),
+            SetupHello {
+                scope: SetupScope::Disabled,
+                setup_id: None
+            },
+            |_| {},
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(f.s.setup_remote_scopes(), before);
+    f.f.current.store(2, Ordering::SeqCst);
+    assert!(
+        f.s.setup_activate(
+            f.f.clone(),
+            member(2),
+            member(1),
+            SetupHello {
+                scope: SetupScope::Disabled,
+                setup_id: None
+            },
+            |_| {},
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(f.s.setup_remote_scopes(), before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_remote_scope_is_unknown_after_restart_or_binding_end() -> Result<()> {
+    let f = Fixture::new().await?;
+    let path = f._dir.path().join("state.sqlite3");
+    // Changing an unrelated binding must preserve the last HELLO here.
+    f.s.pair(id(3), member(3).fingerprint).await?;
+    assert_eq!(
+        f.s.setup_remote_scopes().get(&id(1)),
+        Some(&SetupScope::Enabled)
+    );
+    assert!(!f.s.setup_remote_scopes().contains_key(&id(3)));
+    f.s.unpair_then(id(3), |_| {}).await?;
+    assert_eq!(
+        f.s.setup_remote_scopes().get(&id(1)),
+        Some(&SetupScope::Enabled)
+    );
+    drop(f.s);
+    let s = Store::open(&path)?;
+    assert!(s.setup_remote_scopes().is_empty());
+    s.setup_activate(
+        f.f.clone(),
+        member(2),
+        member(1),
+        SetupHello {
+            scope: SetupScope::Ask,
+            setup_id: Some(id(0)),
+        },
+        |_| {},
+    )
+    .await?;
+    assert_eq!(s.setup_remote_scopes().get(&id(1)), Some(&SetupScope::Ask));
+    s.pair(id(1), member(1).fingerprint).await?;
+    assert!(s.setup_remote_scopes().is_empty());
+    let mut fence = f.f;
+    fence.binding_generation = s.pairing_generation(&id(1)).unwrap();
+    s.setup_activate(
+        fence,
+        member(2),
+        member(1),
+        SetupHello {
+            scope: SetupScope::Disabled,
+            setup_id: None,
+        },
+        |_| {},
+    )
+    .await?;
+    assert_eq!(
+        s.setup_remote_scopes().get(&id(1)),
+        Some(&SetupScope::Disabled)
+    );
+    s.unpair_then(id(1), |_| {}).await?;
+    assert!(s.setup_remote_scopes().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_remote_scope_is_cleared_when_setup_is_not_negotiated() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.s.setup_legacy_ready(f.f.clone()).await?;
+    assert!(f.s.setup_remote_scopes().is_empty());
+    assert!(!f.s.setup_state().links[0].negotiated);
+    assert_eq!(f.s.setup_state().links[0].scope, SetupScope::Enabled);
+    Ok(())
+}
+
+#[tokio::test]
 async fn setup_join_installs_once_with_provenance_zero_readiness_and_pair_defaults() -> Result<()> {
     let f = Fixture::new().await?;
     let mut c = member(3);
@@ -723,7 +853,9 @@ async fn setup_crash_fixture() -> Result<()> {
         current: Arc::new(AtomicU64::new(1)),
     };
     let mut roster = s.setup_state().roster;
-    roster.push(member(3));
+    let mut new = member(3);
+    new.hlc = roster.iter().map(|m| m.hlc).max().unwrap() + 1;
+    roster.push(new);
     s.members_merge(
         fence,
         member(2),
@@ -764,7 +896,9 @@ async fn setup_crash_before_and_after_commit_reopens_atomically_without_reinstal
         } else {
             assert_eq!(s.pairing_generation(&id(3)), Some(1));
             let mut roster = old.roster;
-            roster.push(member(3));
+            let mut new = member(3);
+            new.hlc = roster.iter().map(|m| m.hlc).max().unwrap() + 1;
+            roster.push(new);
             assert!(
                 s.members_merge(
                     f.f.clone(),
@@ -1369,7 +1503,10 @@ impl Migration {
         &self.stores[n as usize - 1]
     }
     async fn link(&self, n: u8, peer: u8) -> Result<()> {
-        self.s(n).setup_begin_link(id(peer), vec![], |_| {}).await
+        self.s(n)
+            .setup_begin_link(id(peer), None, vec![], |_| {})
+            .await
+            .map(|_| ())
     }
     async fn expire(&self, n: u8) -> Result<()> {
         self.s(n)
@@ -2026,7 +2163,16 @@ async fn setup_advisory_conflicts_coalesce_bound_and_clear_on_resolution() -> Re
 async fn setup_advisory_joined_notices_end_with_binding_and_keep_current_generation() -> Result<()>
 {
     let f = Fixture::new().await?;
-    f.merge(f.snapshot(vec![member(3)])).await?;
+    let mut new_member = member(3);
+    new_member.hlc =
+        f.s.setup_state()
+            .roster
+            .iter()
+            .map(|m| m.hlc)
+            .max()
+            .unwrap()
+            + 1;
+    f.merge(f.snapshot(vec![new_member.clone()])).await?;
     assert_eq!(
         f.s.call(
             |c| Ok(c.query_row("SELECT count(*) FROM setup_notices", [], |r| r
@@ -2044,7 +2190,7 @@ async fn setup_advisory_joined_notices_end_with_binding_and_keep_current_generat
         .await?,
         0
     );
-    f.merge(f.snapshot(vec![member(3)])).await?;
+    f.merge(f.snapshot(vec![new_member])).await?;
     let generation = f.s.pairing_generation(&id(3)).unwrap();
     assert_eq!(
         f.s.call(|c| Ok(
@@ -2063,5 +2209,158 @@ async fn setup_advisory_joined_notices_end_with_binding_and_keep_current_generat
         .await?,
         0
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_begin_link_checks_displayed_binding_and_scope_before_enabling() -> Result<()> {
+    for replacement in [false, true] {
+        let dir = crate::test_support::scratch()?;
+        let store = Store::open(&dir.path().join("state.sqlite3"))?;
+        for n in [1, 2] {
+            store.pair(id(n), member(n).fingerprint).await?;
+            store.setup_link(id(n), SetupScope::Ask).await?;
+        }
+        let shown_binding = store.pairing_generation(&id(1)).unwrap();
+        if replacement {
+            store.pair(id(1), member(3).fingerprint).await?;
+            store.setup_link(id(1), SetupScope::Ask).await?;
+        } else {
+            store.setup_link(id(1), SetupScope::Disabled).await?;
+        }
+        let before = store.setup_state();
+        let published = Arc::new(AtomicU64::new(0));
+        let observed = published.clone();
+        assert!(
+            !store
+                .setup_begin_link(
+                    id(1),
+                    Some((shown_binding, SetupScope::Ask)),
+                    vec![(id(1), 42)],
+                    move |delta| {
+                        if delta.reconnect {
+                            observed.fetch_add(1, Ordering::SeqCst);
+                        }
+                    },
+                )
+                .await?,
+            "replacement={replacement}"
+        );
+        assert_eq!(store.setup_state(), before);
+        assert_eq!(published.load(Ordering::SeqCst), 0);
+        let connection: Option<i64> = store
+            .call(|c| {
+                Ok(c.query_row(
+                    "SELECT last_connection FROM setup_links WHERE device=?",
+                    [id(1).as_str()],
+                    |r| r.get(0),
+                )?)
+            })
+            .await?;
+        assert_eq!(connection, Some(0));
+        let scope = if replacement {
+            SetupScope::Ask
+        } else {
+            SetupScope::Disabled
+        };
+        assert!(
+            store
+                .setup_begin_link(
+                    id(1),
+                    Some((store.pairing_generation(&id(1)).unwrap(), scope)),
+                    vec![],
+                    |_| {},
+                )
+                .await?
+        );
+        assert!(
+            store
+                .setup_state()
+                .links
+                .iter()
+                .all(|l| l.scope == SetupScope::Enabled)
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_joined_notices_use_admission_before_rename_including_candidates() -> Result<()> {
+    for deferred in [false, true] {
+        let f = Fixture::new().await?;
+        let baseline =
+            f.s.setup_state()
+                .roster
+                .into_iter()
+                .find(|m| m.device_id == id(2))
+                .unwrap()
+                .hlc;
+        let mut new = member(4);
+        new.hlc = baseline + 1;
+        let snapshot = f.snapshot(vec![member(3), new]);
+        let blocked = if deferred {
+            vec![
+                (Some(id(3)), member(3).fingerprint),
+                (Some(id(4)), member(4).fingerprint),
+            ]
+        } else {
+            vec![]
+        };
+        if deferred {
+            f.s.members_merge(
+                f.f.clone(),
+                member(2),
+                snapshot.clone(),
+                blocked.clone(),
+                |_| {},
+            )
+            .await?;
+            let mut renamed_remote = member(3);
+            renamed_remote.hlc = baseline + 2;
+            renamed_remote.name = "Renamed pre-existing member".into();
+            f.s.members_merge(
+                f.f.clone(),
+                member(2),
+                f.snapshot(vec![renamed_remote]),
+                blocked,
+                |_| {},
+            )
+            .await?;
+        }
+        let mut renamed = member(2);
+        renamed.name = "Renamed computer".into();
+        f.s.setup_refresh_self_then(renamed, || Ok(()), || {})
+            .await?;
+        assert!(
+            f.s.setup_state()
+                .roster
+                .iter()
+                .find(|m| m.device_id == id(2))
+                .unwrap()
+                .hlc
+                > baseline + 1
+        );
+        // Reopen the serialized state before installation, as on reconnect/startup.
+        drop(f.s);
+        let store = Store::open(&f._dir.path().join("state.sqlite3"))?;
+        if deferred {
+            store
+                .setup_reconcile_candidates(id(2), vec![], |_| {})
+                .await?;
+        } else {
+            store
+                .members_merge(f.f.clone(), member(2), snapshot, vec![], |_| {})
+                .await?;
+        }
+        let devices = store
+            .call(|c| {
+                let mut q = c.prepare("SELECT device FROM setup_notices ORDER BY device")?;
+                Ok(q.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .await?;
+        assert_eq!(devices, vec![id(4).to_string()], "deferred={deferred}");
+        assert!(store.peers().await?.values().any(|id_| *id_ == id(3)));
+    }
     Ok(())
 }

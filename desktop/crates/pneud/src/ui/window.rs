@@ -20,13 +20,15 @@ use std::{
 slint::slint! {
     export {
         PneuWindow, Ui, WindowFocus, Page, Dialog, CodeState, ScanState, DeviceItem, RecentItem, SettingItem,
-        PickItem, RecipientItem, Message, Summary, Tone, Tube, LinkState, LinkTile, DropItem, DropGeometry
+        PickItem, RecipientItem, Message, Summary, Tone, Tube, LinkState, LinkTile, DropItem, DropGeometry,
+        TopKind, TopCard, LinkRow, DeviceLink
     } from "../../ui/window.slint";
     export { Palette } from "std-widgets.slint";
     export { Pneu } from "../../ui/theme.slint";
 }
 
 pub(crate) use super::send_request::SendRequest;
+use super::window_setup::{self as setup, Remembered, Removal, Row, Setup, Top};
 
 /// The download page, shown as a code on Add Device → Phone (window.slint
 /// copies it too, and prints it without the scheme).
@@ -180,6 +182,9 @@ struct View {
     add_tab: i32,
     // The bindings displayed by this UI frame, including queued callbacks.
     targets: Option<Vec<SendTarget>>,
+    // State installed with the displayed frame, carried through queued actions.
+    setup: Arc<Setup>,
+    top: Arc<Top>,
 }
 
 // Status updates may change connectivity while a picker is open. They do not
@@ -230,8 +235,15 @@ enum Action {
     PasteLink(String),
     ScannedLink(String),
     Probed(String),
-    OfferPair,
+    OfferPair(bool),
     OfferDismiss,
+    ConfirmJoin(bool),
+    TopCard(bool),
+    TopCardClose,
+    LinkDevice(String),
+    Answer(String, bool),
+    Removing(String),
+    Remove(String),
     Message(String, bool),
     GetTailscale,
 }
@@ -350,6 +362,9 @@ impl Peer {
     }
     pub(crate) fn paused(&self) -> bool {
         self.health == Health::Paused
+    }
+    fn never_connected(&self) -> bool {
+        self.health == Health::Offline && self.last_seen == 0
     }
     pub(crate) fn lost(&self) -> bool {
         self.health.lost()
@@ -1015,6 +1030,11 @@ struct Frame {
     device_action: String,
     device_settings: Vec<SettingItem>,
     device_note: String,
+    device_link: DeviceLink,
+    top: TopCard,
+    link_full: bool,
+    paired_detail: String,
+    paired_only: bool,
     first_run: bool,
     network: bool,
     pairing: String,
@@ -1048,9 +1068,16 @@ struct Join {
     cancel_requested: bool,
     // The offer card's attempt is a preview the user hasn't chosen yet.
     offer: bool,
+    // Also link with your other devices, frozen when the user confirms.
+    #[serde(default = "linked_by_default")]
+    link: bool,
     #[serde(skip)]
     origin: View,
     reported: String,
+}
+
+fn linked_by_default() -> bool {
+    true
 }
 
 struct Paired {
@@ -1553,7 +1580,26 @@ fn connect(
     ui.on_send_clipboard(send(|| Action::SendClipboard));
     ui.on_show_code(send(|| Action::ShowCode));
     ui.on_new_code(send(|| Action::NewCode));
-    ui.on_offer_pair(send(|| Action::OfferPair));
+    let c = commands.clone();
+    ui.on_offer_pair(move |link| {
+        let _ = c.send(Action::OfferPair(link));
+    });
+    let c = commands.clone();
+    ui.on_confirm_join(move |link| {
+        let _ = c.send(Action::ConfirmJoin(link));
+    });
+    let c = commands.clone();
+    ui.on_top_action(move |yes| {
+        let _ = c.send(Action::TopCard(yes));
+    });
+    ui.on_top_close(send(|| Action::TopCardClose));
+    ui.on_link_device(with(Action::LinkDevice));
+    let c = commands.clone();
+    ui.on_answer(move |device, allow| {
+        let _ = c.send(Action::Answer(device.into(), allow));
+    });
+    ui.on_removing(with(Action::Removing));
+    ui.on_remove(with(Action::Remove));
     ui.on_offer_dismiss(send(|| Action::OfferDismiss));
     ui.on_picker_cancel(send(|| Action::PickerCancel));
     ui.on_get_tailscale(send(|| Action::GetTailscale));
@@ -1620,6 +1666,8 @@ fn connect(
             device: ui.get_device_id().into(),
             add_tab: ui.get_add_tab(),
             targets: current.targets.clone(),
+            setup: current.setup.clone(),
+            top: current.top.clone(),
         };
         drop(current);
         #[cfg(target_os = "macos")]
@@ -1635,6 +1683,11 @@ type Chosen = (
     View,
     Option<Vec<PathBuf>>,
 );
+
+/// Window choices about linking that outlive the window (window_setup.rs).
+fn setup_state_path(paths: &Paths) -> PathBuf {
+    paths.data.join("pneu-window-linking.json")
+}
 
 fn join_journal_path(paths: &Paths) -> PathBuf {
     #[cfg(windows)]
@@ -1715,6 +1768,15 @@ struct Worker {
     last_view: View,
     requested_page: Option<Page>,
     tailscale: Option<(bool, Instant)>,
+    setup: Setup,
+    remembered: Remembered,
+    // Remove from all devices, as the confirmation showed it.
+    removal: Option<Removal>,
+    // Your devices when a pairing page opened, for "Also linked".
+    known_roster: HashSet<String>,
+    removed_shown: Option<u64>,
+    // A notification's Remove… asked for this device's confirmation.
+    remove_request: Option<String>,
 }
 
 impl Worker {
@@ -1724,6 +1786,7 @@ impl Worker {
         view: Arc<Mutex<View>>,
         request: u64,
     ) -> Self {
+        let remembered = Remembered::load(&setup_state_path(&paths));
         Self {
             paths,
             weak,
@@ -1768,6 +1831,12 @@ impl Worker {
             peer_settings: None,
             requested_page: None,
             tailscale: None,
+            setup: Setup::default(),
+            remembered,
+            removal: None,
+            known_roster: HashSet::new(),
+            removed_shown: None,
+            remove_request: None,
             last_view: View {
                 page: Page::Main,
                 ..Default::default()
@@ -2300,7 +2369,20 @@ impl Worker {
                     self.paste(text, true).await;
                 }
             }
-            Action::OfferPair => self.confirm_join().await,
+            Action::OfferPair(link) | Action::ConfirmJoin(link) => {
+                if let Some(join) = &mut self.join {
+                    join.link = link;
+                }
+                self.confirm_join().await
+            }
+            Action::TopCard(yes) => self.top_action(yes).await,
+            Action::TopCardClose => self.top_close(),
+            Action::LinkDevice(device) => {
+                self.link(&device).await;
+            }
+            Action::Answer(device, allow) => self.answer(&[device], allow).await,
+            Action::Removing(device) => self.removal = self.origin.setup.removal(&device),
+            Action::Remove(device) => self.remove(&device).await,
             Action::OfferDismiss => {
                 if let Some(join) = self.join.take() {
                     self.dismissed_offer = Some(join.uri.clone());
@@ -2323,6 +2405,10 @@ impl Worker {
                         self.cancel_join(&join).await;
                     }
                 }
+                "removed-ok" => {
+                    let generation = self.setup.generation;
+                    self.remember(|r| r.removed = Some(generation));
+                }
                 _ => {}
             },
         }
@@ -2343,6 +2429,7 @@ impl Worker {
         let previous = std::mem::replace(&mut self.last_view, view.clone());
         if is_pairing_page(view.page) && !is_pairing_page(previous.page) {
             self.known = self.device_ids();
+            self.known_roster = self.setup.roster_ids();
             self.lost = self.lost_ids();
             self.paired = None;
             self.probed = false;
@@ -2371,6 +2458,13 @@ impl Worker {
         }
         if view.page == Page::Device {
             self.peer_settings = None;
+        }
+        if self
+            .remove_request
+            .as_ref()
+            .is_some_and(|d| view.page != Page::Device || view.device != *d)
+        {
+            self.remove_request = None;
         }
     }
     fn lost_ids(&self) -> HashSet<String> {
@@ -2721,9 +2815,12 @@ impl Worker {
                 confirmed: false,
                 cancel_requested: false,
                 offer,
+                link: true,
                 origin: self.view(),
                 reported: String::new(),
             });
+            // Every confirmation starts with the switch on.
+            self.ui(|w| w.global::<Ui>().set_link_on(true));
             if let Some(join) = &self.join
                 && let Err(error) = self.save_join(join)
             {
@@ -2741,18 +2838,23 @@ impl Worker {
                     self.ui(|w| w.invoke_open_add(1));
                 }
             } else {
-                self.message(
-                    format!("Pair with {name}?"),
-                    String::new(),
-                    1,
-                    "Cancel",
-                    "Pair",
-                    "join-confirm",
-                );
+                self.ask_pair(&name, true);
             }
         } else if !offer {
             self.join_message(state, &name);
         }
+    }
+    /// The joining computer's confirmation, with Also link with your other devices.
+    fn ask_pair(&self, name: &str, link: bool) {
+        self.ui(move |w| w.global::<Ui>().set_link_on(link));
+        self.message(
+            format!("Pair with {name}?"),
+            String::new(),
+            1,
+            "Cancel",
+            "Pair",
+            "join-confirm",
+        );
     }
     fn join_message(&self, state: &str, name: &str) {
         let (title, text, tile, secondary, primary, action) = match state {
@@ -2890,8 +2992,9 @@ impl Worker {
             return;
         }
         let reply = self
-            .command(ipc::Command::JoinConfirm {
+            .command(ipc::Command::JoinConfirmScoped {
                 attempt: join.attempt.clone(),
+                enabled: join.link,
             })
             .await;
         if !self.current() {
@@ -2911,6 +3014,220 @@ impl Worker {
             }
         }
     }
+    // ---------- Linking your devices (window_setup.rs) ----------
+
+    fn remember(&mut self, change: impl FnOnce(&mut Remembered)) {
+        change(&mut self.remembered);
+        if let Err(error) = self.remembered.save(&setup_state_path(&self.paths)) {
+            eprintln!("pneud window: couldn't keep a linking choice: {error:#}");
+        }
+    }
+    async fn top_action(&mut self, yes: bool) {
+        match self.origin.top.as_ref().clone() {
+            Top::Offer { device } if yes && self.setup.requests().is_empty() => {
+                if self.link(&device).await {
+                    self.remember(|r| r.offer = Some(setup::LINKED.into()));
+                }
+            }
+            Top::Request { devices, .. } => {
+                self.answer_from(&self.origin.setup.clone(), &devices, yes)
+                    .await;
+            }
+            _ => {}
+        }
+    }
+    /// ✕ hides the offer for good; a request waits until Pneu restarts.
+    fn top_close(&mut self) {
+        match self.origin.top.as_ref().clone() {
+            Top::Offer { .. } => self.remember(|r| r.offer = Some(setup::DISMISSED.into())),
+            Top::Waiting { .. } => self.remember(|r| r.offer = Some(setup::DONE.into())),
+            Top::Request { devices, .. } => {
+                let keys: Vec<String> = devices
+                    .iter()
+                    .filter_map(|d| self.origin.setup.link(d))
+                    .map(|l| setup::request_key(&self.origin.setup, l))
+                    .collect();
+                self.remember(|r| r.close(keys));
+            }
+            Top::None => {}
+        }
+    }
+    /// Link covers every pairing here that isn't decided yet, and this one.
+    async fn link(&mut self, device: &str) -> bool {
+        let shown = &self.origin.setup;
+        let Some(binding) = shown.binding_generations.get(device).copied().flatten() else {
+            return false;
+        };
+        let Some(scope) = shown.link(device).and_then(|link| {
+            serde_json::from_value::<pneu_proto::SetupScope>(json!(link.scope)).ok()
+        }) else {
+            return false;
+        };
+        let result = match pneu_proto::Id::new(device) {
+            Ok(device) => {
+                self.command(ipc::Command::LinkExistingDevice {
+                    device,
+                    binding_generation: Some(binding),
+                    expected_scope: Some(scope),
+                })
+                .await
+            }
+            Err(error) => Err(error.into()),
+        };
+        match result {
+            Ok(reply) => reply != json!(false),
+            Err(error) => {
+                self.fail("Couldn't link", error);
+                false
+            }
+        }
+    }
+    /// Allow answers every device that asked, and the daemon also links this
+    /// device's other undecided pairings. Don't allow answers only these.
+    async fn answer(&mut self, devices: &[String], allow: bool) {
+        self.answer_from(&self.origin.setup.clone(), devices, allow)
+            .await;
+    }
+    async fn answer_from(&mut self, shown: &Setup, devices: &[String], allow: bool) {
+        let mut answered = false;
+        let mut failure = None;
+        for device in devices {
+            if !shown.link(device).is_some_and(|l| l.prompt) {
+                continue;
+            }
+            let binding = shown.binding_generations.get(device).copied().flatten();
+            let setup_generation = shown.generation;
+            let result = async {
+                let command = ipc::Command::SetupDecision {
+                    device: pneu_proto::Id::new(device.as_str())?,
+                    setup_generation,
+                    binding_generation: binding.context("pairing changed")?,
+                    allow,
+                };
+                self.command(command).await
+            }
+            .await;
+            match result {
+                Ok(_) => answered = true,
+                Err(error) => failure = Some(error),
+            }
+        }
+        if let (false, Some(error)) = (answered, failure) {
+            let message = if allow {
+                "Couldn't link"
+            } else {
+                "Couldn't save the answer"
+            };
+            self.fail(message, error);
+        }
+    }
+    /// Remove from all devices, exactly as the confirmation showed it. The
+    /// daemon refuses a changed membership, so nothing is claimed then.
+    async fn remove(&mut self, device: &str) {
+        let Some(removal) = self.removal.take().filter(|r| r.device == device) else {
+            return;
+        };
+        let name = peers(&self.snapshot, &[])
+            .into_iter()
+            .find(|p| p.id == device)
+            .map(|p| p.name)
+            .unwrap_or_else(|| "the device".into());
+        let result = async {
+            let command = ipc::Command::RemoveFromSetup {
+                device: pneu_proto::Id::new(removal.device.as_str())?,
+                setup_generation: removal.setup_generation,
+                binding_generation: removal.binding_generation,
+                fingerprint: pneu_proto::Hash::new(removal.fingerprint.as_str())?,
+            };
+            self.command(command).await
+        }
+        .await;
+        match result {
+            // The page closes and the row goes; nothing follows later.
+            Ok(_) => self.ui(|w| w.invoke_go(Page::Main)),
+            Err(error) if daemon_rejection(&error) => {
+                eprintln!("pneud window: couldn't remove: {error:#}");
+                self.message(
+                    format!("Couldn't remove {name}"),
+                    "Nothing was changed. Try again.".into(),
+                    0,
+                    "",
+                    "OK",
+                    "ok",
+                );
+            }
+            // A lost reply says nothing about whether it was removed.
+            Err(error) => self.fail(&format!("Couldn't remove {name}"), error),
+        }
+    }
+    fn device_link(&self, peer: &Peer) -> DeviceLink {
+        let row = setup::row(&self.setup, peer);
+        let (title, sub) = setup::row_text(row, &peer.name);
+        let member = self.setup.member(&peer.id).is_some();
+        let via = self
+            .setup
+            .link(&peer.id)
+            .and_then(|l| l.introducer_name.as_deref())
+            .filter(|_| member)
+            .map(display_peer_text)
+            .unwrap_or_default();
+        let waiting = self
+            .transfers
+            .iter()
+            .filter(|t| t.device == peer.id && !t.incoming() && t.state == "waiting_for_device")
+            .map(artifact_key)
+            .collect::<HashSet<_>>()
+            .len();
+        DeviceLink {
+            row: match row {
+                Row::None => LinkRow::None,
+                Row::Link => LinkRow::Link,
+                Row::Waiting => LinkRow::Waiting,
+                Row::Theirs => LinkRow::Theirs,
+                Row::Asked => LinkRow::Asked,
+                Row::Update => LinkRow::Update,
+                Row::Separate => LinkRow::Separate,
+            },
+            title: title.into(),
+            sub: sub.into(),
+            via: via.into(),
+            member,
+            waiting: waiting as i32,
+        }
+    }
+    fn top_card(&self, peers: &[Peer]) -> TopCard {
+        match setup::top(&self.setup, peers, &self.remembered) {
+            Top::None => TopCard::default(),
+            Top::Offer { .. } => TopCard {
+                kind: TopKind::Offer,
+                title: "Link your devices".into(),
+                phone: false,
+            },
+            Top::Waiting { title } => TopCard {
+                kind: TopKind::Waiting,
+                title: title.into(),
+                phone: false,
+            },
+            Top::Request { title, phone, .. } => TopCard {
+                kind: TopKind::Request,
+                title: title.into(),
+                phone,
+            },
+        }
+    }
+    /// The done screen: what the new device linked with, or why it didn't.
+    fn paired_detail(&self) -> (String, bool) {
+        let Some(device) = self.paired.as_ref().and_then(|p| p.device.as_deref()) else {
+            return Default::default();
+        };
+        if self.setup.link(device).is_some_and(|l| l.separate()) {
+            return (setup::OWN.into(), true);
+        }
+        let me = self.status["self_id"].as_str().unwrap_or_default();
+        let learned = self.setup.learned(&self.known_roster, &[device, me]);
+        (setup::also_linked(&learned), false)
+    }
+
     async fn cancel_join(&self, join: &Join) {
         let mut cancellation = join.clone();
         cancellation.cancel_requested = true;
@@ -2957,15 +3274,8 @@ impl Worker {
             "pairing" => {}
             "confirmation" => {
                 join.confirmed = false;
-                let name = join.name.clone();
-                self.message(
-                    format!("Pair with {name}?"),
-                    String::new(),
-                    1,
-                    "Cancel",
-                    "Pair",
-                    "join-confirm",
-                );
+                let (name, link) = (join.name.clone(), join.link);
+                self.ask_pair(&name, link);
             }
             "paired" => {
                 // Only the daemon's authenticated outcome identifies this peer.
@@ -3069,6 +3379,7 @@ impl Worker {
         }
         let initial_status = self.status.is_null();
         self.status = value;
+        self.setup = Setup::parse(&self.status);
         let saved_join = if initial_status || self.join.is_none() {
             self.load_join()
         } else {
@@ -3097,21 +3408,30 @@ impl Worker {
                 && !join.confirmed
                 && !join.offer
             {
-                self.message(
-                    format!("Pair with {}?", join.name),
-                    String::new(),
-                    1,
-                    "Cancel",
-                    "Pair",
-                    "join-confirm",
-                );
+                self.ask_pair(&join.name, join.link);
             }
         }
         let first_run = self.snapshot.devices.is_empty();
         let current = self.status["window_request"].as_u64().unwrap_or(0);
         let add_device = self.status["add_device"].as_bool().unwrap_or(false);
-        if !self.restored_join && (current != self.request || (initial_status && add_device)) {
+        // A joined notification's Remove… also applies when this child was
+        // launched with the same request number in PNEU_WINDOW_REQUEST.
+        let remove_device = self.status["remove_device"]
+            .as_str()
+            .filter(|id| pneu_proto::Id::new(*id).is_ok())
+            .filter(|id| {
+                self.snapshot
+                    .devices
+                    .iter()
+                    .any(|d| d.device.as_str() == *id)
+            })
+            .map(String::from);
+        if !self.restored_join
+            && (current != self.request
+                || (initial_status && (add_device || remove_device.is_some())))
+        {
             self.request = current;
+            self.remove_request = remove_device.clone();
             let was_visible = visible.swap(true, Ordering::SeqCst);
             let choose_folder = current & 1 != 0;
             let preserve_send = !self.status["pending_send"].is_null()
@@ -3132,7 +3452,12 @@ impl Worker {
                     return;
                 }
                 // A Windows tray click presents the existing page and its state.
-                if cfg!(windows) && was_visible && !choose_folder && !add_device {
+                if cfg!(windows)
+                    && was_visible
+                    && !choose_folder
+                    && !add_device
+                    && remove_device.is_none()
+                {
                     return;
                 }
                 // Reopening starts at the top: Add Device without devices, else
@@ -3140,7 +3465,9 @@ impl Worker {
                 if preserve_send {
                     return;
                 }
-                if first_run || add_device {
+                if let Some(device) = remove_device {
+                    w.invoke_open_device(device.into());
+                } else if first_run || add_device {
                     w.invoke_open_add(0);
                 } else if choose_folder {
                     w.invoke_go(Page::Settings);
@@ -3167,6 +3494,30 @@ impl Worker {
             // Unpairing the last device returns to Add Device.
             self.ui(|w| w.invoke_open_add(0));
             return Ok(());
+        }
+        // A removed device says so once, then shows what it has left.
+        let generation = self.setup.generation;
+        if self.setup.withdrawn
+            && self.remembered.removed != Some(generation)
+            && self.removed_shown != Some(generation)
+            && self.join.is_none()
+            && !self.picker_active
+        {
+            self.removed_shown = Some(generation);
+            let this = this_computer();
+            self.message(
+                format!("T{} was removed from your devices", &this[1..]),
+                String::new(),
+                0,
+                "",
+                "OK",
+                "removed-ok",
+            );
+        }
+        if self.remembered.offer.as_deref() == Some(setup::LINKED)
+            && self.setup.unanswered().is_empty()
+        {
+            self.remember(|r| r.offer = Some(setup::DONE.into()));
         }
         if let Ok(request) =
             serde_json::from_value::<SendRequest>(self.status["pending_send"].clone())
@@ -3287,6 +3638,10 @@ impl Worker {
             && let Some(peer) = peers.iter().find(|p| {
                 (!self.known.contains(&p.id) || (self.lost.contains(&p.id) && !p.health.lost()))
                     && !p.name.is_empty()
+                    && self
+                        .setup
+                        .link(&p.id)
+                        .is_none_or(|link| link.introduced_by.is_none())
             })
         {
             self.paired = Some(Paired {
@@ -3365,12 +3720,34 @@ impl Worker {
             now,
         );
         let targets = contract::list::<SendTarget>(&self.status, "send_targets");
-        if self.pushed.as_ref() != Some(&frame) || self.view().targets.as_ref() != Some(&targets) {
+        let view = self.view();
+        let remove = frame.device_link.member
+            && view.page == Page::Device
+            && self.remove_request.as_ref() == Some(&view.device);
+        if remove {
+            self.remove_request = None;
+        }
+        let shown_setup = Arc::new(self.setup.clone());
+        let shown_top = Arc::new(setup::top(&self.setup, &peers, &self.remembered));
+        if self.pushed.as_ref() != Some(&frame)
+            || self.view().setup != shown_setup
+            || self.view().top != shown_top
+            || self.view().targets.as_ref() != Some(&targets)
+            || remove
+        {
             self.pushed = Some(frame.clone());
             let view = self.view.clone();
             self.ui(move |w| {
-                view.lock().expect("window view").targets = Some(targets);
+                {
+                    let mut shown = view.lock().expect("window view");
+                    shown.targets = Some(targets);
+                    shown.setup = shown_setup;
+                    shown.top = shown_top;
+                }
                 apply(w, frame);
+                if remove {
+                    w.invoke_prepare_remove();
+                }
             });
         }
         Ok(())
@@ -3432,6 +3809,7 @@ impl Worker {
             CodeState::Expired
         };
         let left = self.code.expires_at.saturating_sub(now).div_ceil(1000);
+        let (paired_detail, paired_only) = self.paired_detail();
         let (device_item, device_summary, device_action, device_settings, device_note) =
             match device {
                 Some(peer) => {
@@ -3449,7 +3827,22 @@ impl Worker {
         Frame {
             error,
             summary: summary(peers, &self.transfers),
-            devices: peers.iter().map(Peer::item).collect(),
+            devices: peers
+                .iter()
+                .map(|p| {
+                    let mut item = p.item();
+                    // Added via another device: it keeps trying, never an error.
+                    if p.never_connected()
+                        && self
+                            .setup
+                            .link(&p.id)
+                            .is_some_and(|l| l.introducer_name.is_some())
+                    {
+                        item.status = "Not connected yet".into();
+                    }
+                    item
+                })
+                .collect(),
             recent: recent(peers, &self.transfers),
             manual_clipboard: mode == ClipboardMode::Manual,
             motion: animations_enabled(&super::palette::globals()),
@@ -3458,6 +3851,11 @@ impl Worker {
             device_action,
             device_settings,
             device_note,
+            device_link: device.map(|p| self.device_link(p)).unwrap_or_default(),
+            top: self.top_card(peers),
+            link_full: self.setup.full(),
+            paired_detail,
+            paired_only,
             first_run,
             network: !self.phone_failed,
             pairing,
@@ -3510,6 +3908,11 @@ fn apply(w: &PneuWindow, frame: Frame) {
     ui.set_device_action(frame.device_action.into());
     sync(ui.get_device_settings(), &frame.device_settings);
     ui.set_device_note(frame.device_note.into());
+    ui.set_device_link(frame.device_link);
+    ui.set_top(frame.top);
+    ui.set_link_full(frame.link_full);
+    ui.set_paired_detail(frame.paired_detail.into());
+    ui.set_paired_only(frame.paired_only);
     ui.set_first_run(frame.first_run);
     ui.set_network(frame.network);
     ui.set_pairing(frame.pairing.into());
@@ -4446,7 +4849,7 @@ mod tests {
                     Some("join") => {
                         json!({"state":"confirmation", "attempt":"first-scan", "name":"Other Mac"})
                     }
-                    Some("join_confirm") => json!({"state":"pairing"}),
+                    Some("join_confirm_scoped") => json!({"state":"pairing"}),
                     Some("join_status") => json!({"state":"paired", "device":id(2)}),
                     _ => Value::Null,
                 };
@@ -4505,7 +4908,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .iter()
-                    .any(|r| r["command"] == "join_confirm")
+                    .any(|r| r["command"] == "join_confirm_scoped")
             );
             // Match the confirmation buttons: dismiss the popup and submit its choice.
             window.global::<Ui>().set_dialog(Dialog::None);
@@ -4557,7 +4960,7 @@ mod tests {
             assert_eq!(
                 requests
                     .iter()
-                    .filter(|r| r["command"] == "join_confirm")
+                    .filter(|r| r["command"] == "join_confirm_scoped")
                     .count(),
                 usize::from(confirm)
             );
@@ -4914,7 +5317,11 @@ mod tests {
             requests.iter().filter(|r| r["command"] == "join").count(),
             5
         );
-        assert!(!requests.iter().any(|r| r["command"] == "join_confirm"));
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r["command"] == "join_confirm_scoped")
+        );
         Ok(())
     }
     #[tokio::test]
@@ -5446,13 +5853,14 @@ mod tests {
             confirmed: false,
             cancel_requested: false,
             offer: false,
+            link: true,
             origin: worker.view(),
             reported: String::new(),
         });
         let journal = worker.journal_path();
         let mut polls = 0;
         let mock = mock_ipc(&worker.paths.socket, move |command| {
-            if command["command"] == "join_confirm" {
+            if command["command"] == "join_confirm_scoped" {
                 assert!(journal.exists());
                 return (true, json!({"state":"pairing"}));
             }
@@ -5512,7 +5920,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|c| c["command"] == "join_confirm")
+                .filter(|c| c["command"] == "join_confirm_scoped")
                 .count(),
             1
         );
@@ -5610,6 +6018,7 @@ mod tests {
             confirmed: true,
             cancel_requested: false,
             offer: false,
+            link: true,
             origin: worker.view(),
             reported: String::new(),
         };
@@ -6130,6 +6539,812 @@ mod tests {
         Ok(())
     }
 
+    fn linked_status(worker: &Worker, setup: &Value) -> Value {
+        let mut value = status_value(worker);
+        value["setup"] = setup.clone();
+        value["self_id"] = json!(id(9));
+        value
+    }
+    async fn drain(
+        worker: &mut Worker,
+        actions: &mut tokio::sync::mpsc::UnboundedReceiver<Action>,
+    ) {
+        flush_ui();
+        while let Ok(action) = actions.try_recv() {
+            act_with_ui(worker, action).await;
+        }
+    }
+    /// Draw once so popups exist, then let them focus their default button.
+    fn settle(surface: &slint::platform::software_renderer::MinimalSoftwareWindow) {
+        surface.request_redraw();
+        surface.draw_if_needed(|renderer| {
+            let mut pixels = vec![
+                    slint::platform::software_renderer::PremultipliedRgbaColor::default();
+                    400 * 720
+                ];
+            renderer.render(&mut pixels, 400);
+        });
+        advance_ui();
+    }
+    fn sent(mock: &MockIpc, command: &str) -> Vec<Value> {
+        mock.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["command"] == command)
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn pairing_switch_is_frozen_into_the_confirmation() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::pairing_switch_is_frozen_into_the_confirmation",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        use slint::platform::Key;
+        let surface = headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        let mock = mock_ipc(&worker.paths.socket, |command| {
+            let reply = match command["command"].as_str() {
+                Some("join") => {
+                    json!({"state":"confirmation", "attempt":"popup", "name":"MJStanton-Desktop"})
+                }
+                Some("join_confirm_scoped") => json!({"state":"pairing"}),
+                Some("join_status") => json!({"state":"confirmation"}),
+                _ => Value::Null,
+            };
+            (true, reply)
+        })?;
+        let ui = window.global::<Ui>();
+        ui.set_motion(false);
+        window.show()?;
+        surface.set_size(slint::PhysicalSize::new(400, 720));
+        window
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::WindowActiveChanged(true));
+        window.invoke_open_add(1);
+        drain(&mut worker, &mut actions).await;
+
+        // Paste Link: the popup asks, with the switch on.
+        worker.paste(sample_uri(), false).await;
+        flush_ui();
+        assert_eq!(ui.get_dialog(), Dialog::Message);
+        assert_eq!(ui.get_message().action, "join-confirm");
+        assert!(ui.get_link_on());
+        settle(&surface);
+        // Cancel has focus. Shift+Tab reaches the switch; Return turns it off,
+        // then Pair confirms with the switch as shown.
+        key(&window, Key::Backtab);
+        key(&window, Key::Return);
+        assert!(!ui.get_link_on());
+        key(&window, Key::Tab);
+        key(&window, Key::Tab);
+        key(&window, Key::Return);
+        assert_eq!(ui.get_dialog(), Dialog::None);
+        drain(&mut worker, &mut actions).await;
+        let confirmed = sent(&mock, "join_confirm_scoped");
+        assert_eq!(confirmed.len(), 1);
+        assert_eq!(confirmed[0]["attempt"], "popup");
+        assert_eq!(confirmed[0]["enabled"], false);
+        assert!(!worker.load_join().unwrap().link);
+
+        // Turning the switch on afterwards changes nothing: asked again, the
+        // popup shows the choice that was frozen.
+        ui.set_link_on(true);
+        worker.poll_join().await;
+        flush_ui();
+        assert_eq!(ui.get_dialog(), Dialog::Message);
+        assert!(!ui.get_link_on());
+        ui.set_dialog(Dialog::None);
+        ui.invoke_message_action("join-confirm".into(), false);
+        drain(&mut worker, &mut actions).await;
+        settle(&surface);
+
+        // At the limit the switch is off and disabled; Pair makes a plain pairing.
+        worker.paste(sample_uri(), false).await;
+        flush_ui();
+        ui.set_link_full(true);
+        settle(&surface);
+        key(&window, Key::Tab);
+        key(&window, Key::Return);
+        drain(&mut worker, &mut actions).await;
+        let confirmed = sent(&mock, "join_confirm_scoped");
+        assert_eq!(confirmed.len(), 2);
+        assert_eq!(confirmed[1]["enabled"], false);
+        assert!(
+            ui.get_link_on(),
+            "the limit doesn't change the user's choice"
+        );
+        ui.set_link_full(false);
+        worker.join = None;
+
+        // Link on the clipboard pairs without the popup, with its own switch.
+        worker.paste(sample_uri(), true).await;
+        flush_ui();
+        assert!(worker.join.as_ref().is_some_and(|j| j.offer));
+        assert!(ui.get_link_on());
+        ui.set_link_on(false);
+        ui.invoke_offer_pair(ui.get_link_on() && !ui.get_link_full());
+        drain(&mut worker, &mut actions).await;
+        let confirmed = sent(&mock, "join_confirm_scoped");
+        assert_eq!(confirmed.len(), 3);
+        assert_eq!(confirmed[2]["enabled"], false);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn requests_offer_and_device_rows_answer_and_link() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::requests_offer_and_device_rows_answer_and_link",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        std::fs::create_dir_all(&worker.paths.data)?;
+        let mock = mock_ipc(&worker.paths.socket, |_| (true, Value::Null))?;
+        let ui = window.global::<Ui>();
+        let visible = AtomicBool::new(true);
+        let mut devices = trio();
+        devices.push(device(4, "Office-PC", false, "connected", 0));
+        state(&mut worker, devices, Vec::new());
+        let asked = |n| with(link_of(n, "ask"), "prompt", json!(true));
+
+        // One device asked: Allow answers it and nothing else.
+        let setup = setup_json(vec![asked(1), link_of(2, "ask"), link_of(4, "ask")], &[]);
+        worker
+            .refresh(linked_status(&worker, &setup), &visible)
+            .await?;
+        flush_ui();
+        let top = ui.get_top();
+        assert_eq!(top.kind, TopKind::Request);
+        assert_eq!(top.title, "Galaxy S25+ wants to link your devices");
+        assert!(top.phone);
+        ui.invoke_top_action(true);
+        drain(&mut worker, &mut actions).await;
+        let answers = sent(&mock, "setup_decision");
+        assert_eq!(answers.len(), 1);
+        assert_eq!(
+            answers[0],
+            json!({"command":"setup_decision", "device": id(1), "setup_generation": 2,
+                "binding_generation": 3, "allow": true})
+        );
+
+        // Two asked: Don't Allow answers both, and only them.
+        let setup = setup_json(vec![asked(1), asked(2), link_of(4, "ask")], &[]);
+        worker
+            .refresh(linked_status(&worker, &setup), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(
+            ui.get_top().title,
+            "Galaxy S25+ and MacBook Air want to link your devices"
+        );
+        ui.invoke_top_action(false);
+        drain(&mut worker, &mut actions).await;
+        let answers = sent(&mock, "setup_decision");
+        assert_eq!(answers.len(), 3);
+        assert!(answers[1..].iter().all(|a| a["allow"] == false));
+        assert_eq!(answers[1]["device"], json!(id(1)));
+        assert_eq!(answers[2]["device"], json!(id(2)));
+
+        // ✕ leaves them waiting; a third device asking shows the card again.
+        ui.invoke_top_close();
+        drain(&mut worker, &mut actions).await;
+        worker
+            .refresh(linked_status(&worker, &setup), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(ui.get_top().kind, TopKind::None);
+        let three = setup_json(vec![asked(1), asked(2), asked(4)], &[]);
+        worker
+            .refresh(linked_status(&worker, &three), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(
+            ui.get_top().title,
+            "Galaxy S25+ and 2 other devices want to link your devices"
+        );
+        // Closing is kept until Pneu restarts, even after the window does.
+        ui.invoke_top_close();
+        drain(&mut worker, &mut actions).await;
+        let reopened = Worker::new(
+            worker.paths.clone(),
+            window.as_weak(),
+            worker.view.clone(),
+            0,
+        );
+        assert_eq!(
+            setup::top(
+                &Setup::parse(&json!({"setup": three})),
+                &peers(&worker.snapshot, &[]),
+                &reopened.remembered
+            ),
+            Top::None
+        );
+        let mut restarted = reopened.remembered.clone();
+        restarted.daemon = "an earlier run".into();
+        assert!(matches!(
+            setup::top(
+                &Setup::parse(&json!({"setup": three})),
+                &peers(&worker.snapshot, &[]),
+                &restarted
+            ),
+            Top::Request { .. }
+        ));
+
+        // The offer: Link covers every undecided pairing, then says where to finish.
+        let undecided = setup_json(
+            vec![link_of(1, "ask"), link_of(2, "ask"), link_of(4, "ask")],
+            &[],
+        );
+        worker
+            .refresh(linked_status(&worker, &undecided), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(ui.get_top().kind, TopKind::Offer);
+        assert_eq!(ui.get_top().title, "Link your devices");
+        ui.invoke_top_action(true);
+        drain(&mut worker, &mut actions).await;
+        assert_eq!(
+            sent(&mock, "link_existing_device"),
+            vec![json!({"command":"link_existing_device", "device": id(1),
+                "binding_generation": 3, "expected_scope": "ask"})]
+        );
+        assert_eq!(worker.remembered.offer.as_deref(), Some(setup::LINKED));
+        let waiting = |n: u8| with(link_of(n, "enabled"), "participating", json!(false));
+        let linking_now = setup_json(
+            vec![link_of(1, "enabled"), waiting(2), waiting(4)],
+            &[(1, "Galaxy S25+")],
+        );
+        worker
+            .refresh(linked_status(&worker, &linking_now), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(ui.get_top().kind, TopKind::Waiting);
+        assert_eq!(
+            ui.get_top().title,
+            "Allow linking on MacBook Air and Office-PC"
+        );
+        // When the last one answers, the card goes for good.
+        let linked = setup_json(
+            vec![
+                link_of(1, "enabled"),
+                link_of(2, "enabled"),
+                link_of(4, "enabled"),
+            ],
+            &[(1, "Galaxy S25+"), (2, "MacBook Air"), (4, "Office-PC")],
+        );
+        worker
+            .refresh(linked_status(&worker, &linked), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(ui.get_top().kind, TopKind::None);
+        assert_eq!(worker.remembered.offer.as_deref(), Some(setup::DONE));
+
+        // ✕ on a fresh offer hides it for good, across windows.
+        worker.remembered = Remembered::default();
+        worker
+            .refresh(linked_status(&worker, &undecided), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(ui.get_top().kind, TopKind::Offer);
+        ui.invoke_top_close();
+        drain(&mut worker, &mut actions).await;
+        let reopened = Worker::new(
+            worker.paths.clone(),
+            window.as_weak(),
+            worker.view.clone(),
+            0,
+        );
+        assert_eq!(reopened.remembered.offer.as_deref(), Some(setup::DISMISSED));
+
+        // A device page links or answers just that pairing.
+        ui.invoke_link_device(id(2).as_str().into());
+        drain(&mut worker, &mut actions).await;
+        assert_eq!(
+            sent(&mock, "link_existing_device")[1]["device"],
+            json!(id(2))
+        );
+        worker
+            .refresh(linked_status(&worker, &three), &visible)
+            .await?;
+        flush_ui();
+        ui.invoke_answer(id(4).as_str().into(), true);
+        drain(&mut worker, &mut actions).await;
+        let answers = sent(&mock, "setup_decision");
+        assert_eq!(answers.last().unwrap()["device"], json!(id(4)));
+        assert_eq!(answers.last().unwrap()["allow"], true);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remove_from_all_devices_confirms_what_it_showed() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::remove_from_all_devices_confirms_what_it_showed",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        use slint::platform::Key;
+        let surface = headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        let refuse = Arc::new(AtomicBool::new(false));
+        let refusing = refuse.clone();
+        let mock = mock_ipc(&worker.paths.socket, move |command| {
+            if command["command"] == "remove_from_setup" && refusing.load(Ordering::SeqCst) {
+                (false, json!("stale setup removal confirmation"))
+            } else {
+                (true, Value::Null)
+            }
+        })?;
+        let ui = window.global::<Ui>();
+        ui.set_motion(false);
+        window.show()?;
+        surface.set_size(slint::PhysicalSize::new(400, 720));
+        window
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::WindowActiveChanged(true));
+        let visible = AtomicBool::new(true);
+        state(&mut worker, trio(), Vec::new());
+        let via = with(
+            link_of(2, "enabled"),
+            "introducer_name",
+            json!("Galaxy S25+"),
+        );
+        let setup = setup_json(
+            vec![link_of(1, "enabled"), via],
+            &[(1, "Galaxy S25+"), (2, "MacBook Air")],
+        );
+        window.invoke_open_device(id(2).as_str().into());
+        drain(&mut worker, &mut actions).await;
+        worker
+            .refresh(linked_status(&worker, &setup), &visible)
+            .await?;
+        flush_ui();
+        let link = ui.get_device_link();
+        assert!(link.member);
+        assert_eq!(link.via, "Galaxy S25+");
+        assert_eq!(link.row, LinkRow::None);
+
+        // Cancel has focus: Return keeps the device.
+        window.invoke_prepare_remove();
+        settle(&surface);
+        assert_eq!(ui.get_dialog(), Dialog::Remove);
+        assert_eq!(ui.get_remove_name(), "MacBook Air");
+        key(&window, Key::Return);
+        assert_eq!(ui.get_dialog(), Dialog::None);
+        drain(&mut worker, &mut actions).await;
+        assert!(sent(&mock, "remove_from_setup").is_empty());
+        // Let the closed popup leave the component tree before reopening.
+        settle(&surface);
+
+        // Couldn't remove: nothing changed, and it says so.
+        refuse.store(true, Ordering::SeqCst);
+        window.invoke_prepare_remove();
+        settle(&surface);
+        key(&window, Key::Tab);
+        key(&window, Key::Return);
+        drain(&mut worker, &mut actions).await;
+        assert_eq!(ui.get_dialog(), Dialog::Message);
+        let message = ui.get_message();
+        assert_eq!(message.title, "Couldn't remove MacBook Air");
+        assert_eq!(message.text, "Nothing was changed. Try again.");
+        assert_eq!(message.primary, "OK");
+        assert_eq!(worker.view().page, Page::Device);
+        ui.set_dialog(Dialog::None);
+        settle(&surface);
+
+        // Remove sends the membership the confirmation showed, even when the
+        // status changes before even the queued popup-open action is processed.
+        refuse.store(false, Ordering::SeqCst);
+        window.invoke_prepare_remove();
+        let mut newer = setup.clone();
+        newer["generation"] = json!(5);
+        newer["binding_generations"][id(2).as_str()] = json!(9);
+        newer["roster"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|m| m["device_id"] == json!(id(2)))
+            .unwrap()["fingerprint"] = json!("09".repeat(32));
+        worker
+            .refresh(linked_status(&worker, &newer), &visible)
+            .await?;
+        settle(&surface);
+        key(&window, Key::Tab);
+        key(&window, Key::Return);
+        drain(&mut worker, &mut actions).await;
+        let removed = sent(&mock, "remove_from_setup");
+        assert_eq!(removed.len(), 2);
+        assert_eq!(
+            removed[1],
+            json!({"command":"remove_from_setup", "device": id(2), "setup_generation": 2,
+                "binding_generation": 3, "fingerprint": "02".repeat(32)})
+        );
+        assert_eq!(worker.view().page, Page::Main);
+        assert_eq!(ui.get_dialog(), Dialog::None);
+        // Plain pairings keep Unpair….
+        assert!(sent(&mock, "unpair").is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn top_card_queued_actions_keep_displayed_askers_and_fences() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::top_card_queued_actions_keep_displayed_askers_and_fences",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        std::fs::create_dir_all(&worker.paths.data)?;
+        let mock = mock_ipc(&worker.paths.socket, |_| (true, Value::Null))?;
+        let ui = window.global::<Ui>();
+        let visible = AtomicBool::new(true);
+        state(&mut worker, trio(), vec![]);
+        let asked = |n| with(link_of(n, "ask"), "prompt", json!(true));
+        let shown = setup_json(vec![asked(1), link_of(2, "ask")], &[]);
+        let mut newer = setup_json(vec![asked(1), asked(2)], &[]);
+        newer["generation"] = json!(5);
+        newer["binding_generations"][id(1).as_str()] = json!(9);
+        for allow in [false, true] {
+            worker
+                .refresh(linked_status(&worker, &shown), &visible)
+                .await?;
+            flush_ui();
+            worker
+                .refresh(linked_status(&worker, &newer), &visible)
+                .await?;
+            // The worker refreshed; its new frame has not reached the UI yet.
+            ui.invoke_top_action(allow);
+            drain(&mut worker, &mut actions).await;
+        }
+        let decisions = sent(&mock, "setup_decision");
+        assert_eq!(decisions.len(), 2);
+        for (decision, allow) in decisions.iter().zip([false, true]) {
+            assert_eq!(
+                *decision,
+                json!({"command":"setup_decision", "device":id(1), "setup_generation":2, "binding_generation":3, "allow":allow})
+            );
+        }
+        worker
+            .refresh(linked_status(&worker, &shown), &visible)
+            .await?;
+        flush_ui();
+        ui.invoke_top_close();
+        worker
+            .refresh(linked_status(&worker, &newer), &visible)
+            .await?;
+        drain(&mut worker, &mut actions).await;
+        assert!(worker.remembered.closed(&format!("{}/2/3", id(1))));
+        assert!(!worker.remembered.closed(&format!("{}/5/9", id(1))));
+        assert!(!worker.remembered.closed(&format!("{}/5/3", id(2))));
+        worker
+            .refresh(linked_status(&worker, &newer), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(ui.get_top().kind, TopKind::Request);
+
+        // An offer click must not become an implicit Allow of a new asker.
+        worker.remembered = Remembered::default();
+        let offer = setup_json(vec![link_of(1, "ask"), link_of(2, "ask")], &[]);
+        worker
+            .refresh(linked_status(&worker, &offer), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(ui.get_top().kind, TopKind::Offer);
+        ui.invoke_top_action(true);
+        worker
+            .refresh(linked_status(&worker, &newer), &visible)
+            .await?;
+        drain(&mut worker, &mut actions).await;
+        assert!(sent(&mock, "link_existing_device").is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn device_page_queued_answer_keeps_displayed_prompt_fences() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::device_page_queued_answer_keeps_displayed_prompt_fences",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        let mock = mock_ipc(&worker.paths.socket, |_| (true, Value::Null))?;
+        let ui = window.global::<Ui>();
+        let visible = AtomicBool::new(true);
+        state(&mut worker, trio(), vec![]);
+        window.invoke_open_device(id(1).as_str().into());
+        drain(&mut worker, &mut actions).await;
+        let shown = setup_json(vec![with(link_of(1, "ask"), "prompt", json!(true))], &[]);
+        for (generation, binding) in [(2, 9), (5, 3)] {
+            for allow in [false, true] {
+                worker
+                    .refresh(linked_status(&worker, &shown), &visible)
+                    .await?;
+                flush_ui();
+                assert_eq!(ui.get_device_link().row, LinkRow::Asked);
+                let mut newer = shown.clone();
+                newer["generation"] = json!(generation);
+                newer["binding_generations"][id(1).as_str()] = json!(binding);
+                worker
+                    .refresh(linked_status(&worker, &newer), &visible)
+                    .await?;
+                // The refreshed frame has not yet reached the device page.
+                ui.invoke_answer(id(1).as_str().into(), allow);
+                drain(&mut worker, &mut actions).await;
+            }
+        }
+        let decisions = sent(&mock, "setup_decision");
+        assert_eq!(decisions.len(), 4);
+        for (decision, allow) in decisions.iter().zip([false, true, false, true]) {
+            assert_eq!(
+                *decision,
+                json!({"command":"setup_decision", "device":id(1),
+                "setup_generation":2, "binding_generation":3, "allow":allow})
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queued_link_actions_keep_displayed_binding_and_scope() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::queued_link_actions_keep_displayed_binding_and_scope",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        std::fs::create_dir_all(&worker.paths.data)?;
+        let mock = mock_ipc(&worker.paths.socket, |_| (true, json!(false)))?;
+        let ui = window.global::<Ui>();
+        let visible = AtomicBool::new(true);
+        state(&mut worker, trio(), vec![]);
+        let shown = setup_json(vec![link_of(1, "ask"), link_of(2, "ask")], &[]);
+        for top in [true, false] {
+            if !top {
+                window.invoke_open_device(id(1).as_str().into());
+                drain(&mut worker, &mut actions).await;
+            }
+            worker
+                .refresh(linked_status(&worker, &shown), &visible)
+                .await?;
+            flush_ui();
+            let mut newer = shown.clone();
+            newer["binding_generations"][id(1).as_str()] = json!(9);
+            newer["links"][0]["scope"] = json!("disabled");
+            worker
+                .refresh(linked_status(&worker, &newer), &visible)
+                .await?;
+            if top {
+                ui.invoke_top_action(true);
+            } else {
+                ui.invoke_link_device(id(1).as_str().into());
+            }
+            drain(&mut worker, &mut actions).await;
+            assert_ne!(worker.remembered.offer.as_deref(), Some(setup::LINKED));
+            assert_eq!(ui.get_dialog(), Dialog::None);
+        }
+        let links = sent(&mock, "link_existing_device");
+        assert_eq!(links.len(), 2);
+        for link in links {
+            assert_eq!(
+                link,
+                json!({"command":"link_existing_device", "device":id(1),
+                "binding_generation":3, "expected_scope":"ask"})
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn introduced_peer_does_not_complete_pairing_but_is_also_linked() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::introduced_peer_does_not_complete_pairing_but_is_also_linked",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        let _mock = mock_ipc(&worker.paths.socket, |_| (true, Value::Null))?;
+        let visible = AtomicBool::new(true);
+        state(
+            &mut worker,
+            vec![device(1, "Galaxy S25+", true, "connected", 0)],
+            vec![],
+        );
+        let initial = setup_json(vec![link_of(1, "enabled")], &[(1, "Galaxy S25+")]);
+        worker
+            .refresh(linked_status(&worker, &initial), &visible)
+            .await?;
+        flush_ui();
+        window.invoke_open_add(1);
+        drain(&mut worker, &mut actions).await;
+        let introduced = with(link_of(2, "enabled"), "introduced_by", json!(id(1)));
+        let mut roster = setup_json(
+            vec![link_of(1, "enabled"), introduced.clone()],
+            &[(1, "Galaxy S25+"), (2, "MacBook Air")],
+        );
+        state(&mut worker, trio(), vec![]);
+        worker
+            .refresh(linked_status(&worker, &roster), &visible)
+            .await?;
+        flush_ui();
+        assert!(
+            worker.paired.is_none(),
+            "introduction is not a pairing result"
+        );
+        let mut devices = trio();
+        devices.push(device(3, "New computer", false, "connected", 0));
+        state(&mut worker, devices, vec![]);
+        roster = setup_json(
+            vec![link_of(1, "enabled"), introduced, link_of(3, "enabled")],
+            &[(1, "Galaxy S25+"), (2, "MacBook Air"), (3, "New computer")],
+        );
+        worker
+            .refresh(linked_status(&worker, &roster), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(
+            worker.paired.as_ref().and_then(|p| p.device.as_deref()),
+            Some(id(3).as_str())
+        );
+        assert_eq!(
+            worker.paired_detail(),
+            ("Also linked: MacBook Air".into(), false)
+        );
+        assert!(
+            worker.setup.notices.is_empty(),
+            "done screen uses the roster"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn removed_computer_and_joined_remove_request() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::removed_computer_and_joined_remove_request",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        std::fs::create_dir_all(&worker.paths.data)?;
+        let _mock = mock_ipc(&worker.paths.socket, |_| (true, Value::Null))?;
+        let ui = window.global::<Ui>();
+        let visible = AtomicBool::new(true);
+
+        // Removed with nothing left: back on Add Device, saying so once.
+        state(&mut worker, Vec::new(), Vec::new());
+        let mut withdrawn = setup_json(vec![], &[]);
+        withdrawn["withdrawn"] = json!(true);
+        withdrawn["generation"] = json!(4);
+        for _ in 0..2 {
+            worker
+                .refresh(linked_status(&worker, &withdrawn), &visible)
+                .await?;
+            drain(&mut worker, &mut actions).await;
+        }
+        assert_eq!(worker.view().page, Page::Add);
+        assert_eq!(ui.get_dialog(), Dialog::Message);
+        let message = ui.get_message();
+        assert_eq!(message.title, "This computer was removed from your devices");
+        assert_eq!(
+            (message.text.as_str(), message.primary.as_str()),
+            ("", "OK")
+        );
+        ui.set_dialog(Dialog::None);
+        worker
+            .refresh(linked_status(&worker, &withdrawn), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(ui.get_dialog(), Dialog::None, "said once per window");
+        ui.invoke_message_action("removed-ok".into(), true);
+        drain(&mut worker, &mut actions).await;
+        let mut reopened = Worker::new(
+            worker.paths.clone(),
+            window.as_weak(),
+            worker.view.clone(),
+            0,
+        );
+        assert_eq!(reopened.remembered.removed, Some(4));
+        state(&mut reopened, Vec::new(), Vec::new());
+        reopened
+            .refresh(linked_status(&reopened, &withdrawn), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(ui.get_dialog(), Dialog::None, "said once across windows");
+
+        // A joined notification's Remove… opens that page with its confirmation.
+        state(&mut worker, trio(), Vec::new());
+        let setup = setup_json(
+            vec![
+                link_of(1, "enabled"),
+                with(
+                    link_of(2, "enabled"),
+                    "introducer_name",
+                    json!("Galaxy S25+"),
+                ),
+            ],
+            &[(1, "Galaxy S25+"), (2, "MacBook Air")],
+        );
+        let mut status = linked_status(&worker, &setup);
+        status["window_request"] = json!(2);
+        status["remove_device"] = json!(id(2));
+        for fresh in [false, true] {
+            if fresh {
+                ui.set_dialog(Dialog::None);
+                window.invoke_go(Page::Main);
+                drain(&mut worker, &mut actions).await;
+                worker = Worker::new(
+                    worker.paths.clone(),
+                    window.as_weak(),
+                    worker.view.clone(),
+                    2,
+                );
+                state(&mut worker, trio(), vec![]);
+                worker.status = Value::Null;
+            }
+            worker.refresh(status.clone(), &visible).await?;
+            drain(&mut worker, &mut actions).await;
+            assert_eq!(worker.view().page, Page::Device, "fresh={fresh}");
+            assert_eq!(worker.view().device, id(2).as_str());
+            worker.refresh(status.clone(), &visible).await?;
+            drain(&mut worker, &mut actions).await;
+            assert_eq!(ui.get_dialog(), Dialog::Remove);
+            assert_eq!(ui.get_remove_name(), "MacBook Air");
+            assert_eq!(
+                worker.removal.as_ref().map(|r| r.device.as_str()),
+                Some(id(2).as_str())
+            );
+        }
+        Ok(())
+    }
+
     /// Every page and popup, rendered with the software renderer. Each must
     /// stay 400 px wide and at most 720 px tall. With PNEU_WINDOW_SHOTS set to
     /// a folder, the renders are also saved there as PNG files.
@@ -6559,7 +7774,7 @@ mod tests {
             transfer("s", 2, "report.pdf", "sending", 31_000_000, 40_000_000),
         ];
         sending.extend(recent_items());
-        vec![
+        let mut list = vec![
             scene(
                 "40-main-status-unavailable",
                 |w| {
@@ -6931,6 +8146,7 @@ mod tests {
                         confirmed: false,
                         cancel_requested: false,
                         offer: true,
+                        link: true,
                         origin: View::default(),
                         reported: String::new(),
                     });
@@ -6948,6 +8164,7 @@ mod tests {
                         confirmed: true,
                         cancel_requested: false,
                         offer: false,
+                        link: true,
                         origin: View::default(),
                         reported: String::new(),
                     });
@@ -7415,6 +8632,512 @@ mod tests {
                     w.global::<Ui>().set_is_mac(true);
                     w.global::<Ui>().set_scan_state(ScanState::Scanning);
                 },
+            ),
+        ];
+        list.extend(linking_scenes());
+        list
+    }
+
+    // ---------- Pair once, join your devices ----------
+
+    /// MJStanton-Desktop (this computer) with Galaxy S25+ and MacBook Air.
+    fn trio() -> Vec<crate::core::mesh::DeviceSnapshot> {
+        vec![
+            device(1, "Galaxy S25+", true, "connected", 0),
+            device(2, "MacBook Air", false, "connected", 0),
+        ]
+    }
+    /// MacBook Air (this Mac) with Galaxy S25+ and MJStanton-Desktop.
+    fn mac_trio() -> Vec<crate::core::mesh::DeviceSnapshot> {
+        vec![
+            device(1, "Galaxy S25+", true, "connected", 0),
+            device(3, "MJStanton-Desktop", false, "connected", 0),
+        ]
+    }
+    fn link_of(n: u8, scope: &str) -> Value {
+        json!({"device": id(n), "scope": scope, "prompt": false, "introduced_by": null,
+            "introducer_name": null, "outcome": null, "negotiated": true,
+            "participating": scope == "enabled"})
+    }
+    fn with(mut link: Value, key: &str, value: Value) -> Value {
+        link[key] = value;
+        link
+    }
+    /// The daemon's setup status (setup.rs). `members` are your other devices;
+    /// this device (9) joins the roster when there are any.
+    fn linking(w: &mut Worker, links: Vec<Value>, members: &[(u8, &str)]) {
+        w.status["self_id"] = json!(id(9));
+        w.status["setup"] = setup_json(links, members);
+        w.setup = Setup::parse(&w.status);
+    }
+    fn setup_json(links: Vec<Value>, members: &[(u8, &str)]) -> Value {
+        let member = |n: u8, name: &str, hlc: u64| {
+            json!({"device_id": id(n), "fingerprint": format!("{n:02x}").repeat(32),
+                "role": "computer", "name": name, "status": "member", "hlc": hlc,
+                "writer_device": id(n)})
+        };
+        let mut roster = Vec::new();
+        if !members.is_empty() {
+            roster.push(member(9, "This computer", 10));
+            roster.extend(
+                members
+                    .iter()
+                    .map(|(n, name)| member(*n, name, 20 + u64::from(*n))),
+            );
+        }
+        let generations: serde_json::Map<String, Value> = links
+            .iter()
+            .map(|l| (l["device"].as_str().unwrap().to_owned(), json!(3)))
+            .collect();
+        json!({"generation": 2, "withdrawn": false, "roster": roster,
+            "links": links, "pending_link": false, "waiting_for": null,
+            "binding_generations": generations, "notices": []})
+    }
+    fn mac(ui: impl Fn(&PneuWindow) + 'static) -> impl Fn(&PneuWindow) + 'static {
+        move |w: &PneuWindow| {
+            ui(w);
+            w.global::<Ui>().set_is_mac(true);
+        }
+    }
+    fn device_page(w: &mut Worker, n: u8) {
+        let (me, it) = (id(9), id(n));
+        open(w, Page::Device, n, 0);
+        w.peer_settings = Some((
+            it.as_str().into(),
+            json!({"can_sync": true, "settings": [
+                {"key": format!("{me}/{it}/clipboard"), "enabled": true, "pending": false},
+                {"key": format!("{it}/{me}/clipboard"), "enabled": true, "pending": false},
+            ]}),
+            Instant::now(),
+        ));
+    }
+    fn join_confirm(link: bool) -> impl Fn(&PneuWindow) {
+        move |w: &PneuWindow| {
+            message(w, "Pair with MJStanton-Desktop?", "", 1, "Cancel", "Pair");
+            let ui = w.global::<Ui>();
+            let mut m = ui.get_message();
+            m.action = "join-confirm".into();
+            ui.set_message(m);
+            ui.set_link_on(link);
+        }
+    }
+    fn offer_card(w: &mut Worker) {
+        w.join = Some(Join {
+            attempt: "a".into(),
+            uri: String::new(),
+            name: "MJStanton-Desktop".into(),
+            confirmed: false,
+            cancel_requested: false,
+            offer: true,
+            link: true,
+            origin: View::default(),
+            reported: String::new(),
+        });
+    }
+    fn removed(w: &PneuWindow) {
+        let ui = w.global::<Ui>();
+        go(Page::Add, 0, 0)(w);
+        let title = if ui.get_is_mac() {
+            "This Mac was removed from your devices"
+        } else {
+            "This computer was removed from your devices"
+        };
+        ui.set_message(Message {
+            title: title.into(),
+            text: "".into(),
+            tile: 0,
+            primary: "OK".into(),
+            secondary: "".into(),
+            action: "removed-ok".into(),
+        });
+        ui.set_dialog(Dialog::Message);
+    }
+    fn full(w: &mut Worker) {
+        let others: Vec<(u8, String)> = (20..36).map(|n| (n, format!("Lab-PC-{n}"))).collect();
+        let others: Vec<(u8, &str)> = others.iter().map(|(n, s)| (*n, s.as_str())).collect();
+        linking(w, vec![], &others);
+    }
+    fn paired_with(w: &mut Worker, n: u8, name: &str) {
+        w.paired = Some(Paired {
+            origin: w.view(),
+            name: name.into(),
+            device: Some(id(n).as_str().into()),
+            at: Instant::now(),
+        });
+    }
+    fn linking_scenes() -> Vec<Scene> {
+        let both = || vec![link_of(1, "ask"), link_of(2, "ask")];
+        let member = |link: Value| {
+            move |w: &mut Worker| {
+                state(w, trio(), Vec::new());
+                linking(
+                    w,
+                    vec![link_of(1, "enabled"), link.clone()],
+                    &[(1, "Galaxy S25+"), (2, "MacBook Air")],
+                );
+                device_page(w, 2);
+            }
+        };
+        let plain = |link: Value| {
+            move |w: &mut Worker| {
+                state(w, trio(), Vec::new());
+                linking(w, vec![link_of(1, "ask"), link.clone()], &[]);
+                device_page(w, 2);
+            }
+        };
+        let via = with(
+            link_of(2, "enabled"),
+            "introducer_name",
+            json!("Galaxy S25+"),
+        );
+        let separate = with(link_of(2, "disabled"), "outcome", json!(setup::SEPARATE));
+        vec![
+            scene(
+                "60-main-link-offer",
+                move |w| {
+                    state(w, trio(), Vec::new());
+                    linking(w, both(), &[]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "60-main-link-offer-mac",
+                |w| {
+                    state(w, mac_trio(), Vec::new());
+                    linking(w, vec![link_of(1, "ask"), link_of(3, "ask")], &[]);
+                },
+                mac(go(Page::Main, 0, 0)),
+            ),
+            scene(
+                "61-main-link-waiting",
+                |w| {
+                    state(w, trio(), Vec::new());
+                    linking(w, vec![link_of(1, "enabled"), link_of(2, "enabled")], &[]);
+                    for link in &mut w.setup.links {
+                        link.participating = false;
+                    }
+                    w.remembered.offer = Some(setup::LINKED.into());
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "62-main-link-request",
+                |w| {
+                    state(w, trio(), Vec::new());
+                    linking(
+                        w,
+                        vec![
+                            with(link_of(1, "ask"), "prompt", json!(true)),
+                            link_of(2, "ask"),
+                        ],
+                        &[],
+                    );
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "62-main-link-request-mac",
+                |w| {
+                    state(w, mac_trio(), Vec::new());
+                    let asked = |n| with(link_of(n, "ask"), "prompt", json!(true));
+                    linking(w, vec![asked(1), asked(3)], &[]);
+                },
+                mac(go(Page::Main, 0, 0)),
+            ),
+            scene(
+                "62-main-link-request-many",
+                |w| {
+                    let mut devices = trio();
+                    devices.push(device(4, "Office-PC", false, "connected", 0));
+                    state(w, devices, Vec::new());
+                    let asked = |n| with(link_of(n, "ask"), "prompt", json!(true));
+                    linking(w, vec![asked(1), asked(2), asked(4)], &[]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "60-main-new-device-connecting",
+                |w| {
+                    let mut desktop = device(3, "MJStanton-Desktop", false, "connecting", 0);
+                    desktop.route = None;
+                    state(
+                        w,
+                        vec![device(1, "Galaxy S25+", true, "connected", 0), desktop],
+                        Vec::new(),
+                    );
+                    let introduced = with(
+                        link_of(3, "enabled"),
+                        "introducer_name",
+                        json!("Galaxy S25+"),
+                    );
+                    linking(
+                        w,
+                        vec![link_of(1, "enabled"), introduced],
+                        &[(1, "Galaxy S25+"), (3, "MJStanton-Desktop")],
+                    );
+                },
+                mac(go(Page::Main, 0, 0)),
+            ),
+            scene(
+                "60-main-new-device-not-yet",
+                |w| {
+                    let desktop = device(3, "MJStanton-Desktop", false, "disconnected", 0);
+                    state(
+                        w,
+                        vec![device(1, "Galaxy S25+", true, "connected", 0), desktop],
+                        Vec::new(),
+                    );
+                    let introduced = with(
+                        link_of(3, "enabled"),
+                        "introducer_name",
+                        json!("Galaxy S25+"),
+                    );
+                    linking(
+                        w,
+                        vec![link_of(1, "enabled"), introduced],
+                        &[(1, "Galaxy S25+"), (3, "MJStanton-Desktop")],
+                    );
+                },
+                mac(go(Page::Main, 0, 0)),
+            ),
+            scene(
+                "63-device-linked",
+                member(link_of(2, "enabled")),
+                go(Page::Device, 2, 0),
+            ),
+            scene(
+                "63-device-linked-via",
+                member(via.clone()),
+                go(Page::Device, 2, 0),
+            ),
+            scene(
+                "64-device-member-link-mac",
+                |w| {
+                    state(w, mac_trio(), Vec::new());
+                    linking(
+                        w,
+                        vec![link_of(1, "enabled"), link_of(3, "disabled")],
+                        &[(1, "Galaxy S25+"), (3, "MJStanton-Desktop")],
+                    );
+                    device_page(w, 3);
+                },
+                mac(go(Page::Device, 3, 0)),
+            ),
+            scene(
+                "64-device-asked-mac",
+                |w| {
+                    state(w, mac_trio(), Vec::new());
+                    linking(
+                        w,
+                        vec![
+                            link_of(1, "ask"),
+                            with(link_of(3, "ask"), "prompt", json!(true)),
+                        ],
+                        &[],
+                    );
+                    device_page(w, 3);
+                },
+                mac(go(Page::Device, 3, 0)),
+            ),
+            scene(
+                "65-device-link",
+                plain(link_of(2, "ask")),
+                go(Page::Device, 2, 0),
+            ),
+            scene(
+                "65-device-waiting",
+                plain(with(link_of(2, "enabled"), "participating", json!(false))),
+                go(Page::Device, 2, 0),
+            ),
+            scene(
+                "65-device-theirs",
+                plain(with(
+                    with(link_of(2, "enabled"), "participating", json!(false)),
+                    "remote_scope",
+                    json!("disabled"),
+                )),
+                go(Page::Device, 2, 0),
+            ),
+            scene(
+                "65-device-update",
+                plain(with(link_of(2, "ask"), "negotiated", json!(false))),
+                go(Page::Device, 2, 0),
+            ),
+            scene(
+                "65-device-separate",
+                plain(separate.clone()),
+                go(Page::Device, 2, 0),
+            ),
+            scene(
+                "65-device-separate-mac",
+                |w| {
+                    let mut devices = mac_trio();
+                    devices.push(device(4, "Office-PC", false, "connected", 0));
+                    state(w, devices, Vec::new());
+                    let separate = with(link_of(4, "disabled"), "outcome", json!(setup::SEPARATE));
+                    linking(
+                        w,
+                        vec![link_of(1, "enabled"), link_of(3, "enabled"), separate],
+                        &[(1, "Galaxy S25+"), (3, "MJStanton-Desktop")],
+                    );
+                    device_page(w, 4);
+                },
+                mac(go(Page::Device, 4, 0)),
+            ),
+            scene("66-remove-confirm", member(via.clone()), |w| {
+                go(Page::Device, 2, 0)(w);
+                w.invoke_prepare_remove();
+            }),
+            scene(
+                "66-remove-confirm-waiting",
+                {
+                    let via = via.clone();
+                    move |w: &mut Worker| {
+                        member(via.clone())(w);
+                        w.transfers = vec![
+                            transfer("w1", 2, "notes.md", "waiting_for_device", 0, 9),
+                            transfer("w2", 2, "report.pdf", "waiting_for_device", 0, 9),
+                            transfer("w3", 2, "Screenshot.png", "waiting_for_device", 0, 9),
+                        ];
+                    }
+                },
+                |w| {
+                    go(Page::Device, 2, 0)(w);
+                    w.invoke_prepare_remove();
+                },
+            ),
+            scene(
+                "66-remove-confirm-mac",
+                |w| {
+                    state(w, mac_trio(), Vec::new());
+                    let via = with(
+                        link_of(3, "enabled"),
+                        "introducer_name",
+                        json!("Galaxy S25+"),
+                    );
+                    linking(
+                        w,
+                        vec![link_of(1, "enabled"), via],
+                        &[(1, "Galaxy S25+"), (3, "MJStanton-Desktop")],
+                    );
+                    device_page(w, 3);
+                },
+                mac(|w| {
+                    go(Page::Device, 3, 0)(w);
+                    w.invoke_prepare_remove();
+                }),
+            ),
+            scene("66-remove-failed", member(via.clone()), |w| {
+                go(Page::Device, 2, 0)(w);
+                let ui = w.global::<Ui>();
+                ui.set_message(Message {
+                    title: "Couldn't remove MacBook Air".into(),
+                    text: "Nothing was changed. Try again.".into(),
+                    tile: 0,
+                    primary: "OK".into(),
+                    secondary: "".into(),
+                    action: "ok".into(),
+                });
+                ui.set_dialog(Dialog::Message);
+            }),
+            scene("67-removed", |w| state(w, Vec::new(), Vec::new()), removed),
+            scene(
+                "67-removed-mac",
+                |w| state(w, Vec::new(), Vec::new()),
+                |w| {
+                    w.global::<Ui>().set_is_mac(true);
+                    removed(w);
+                },
+            ),
+            scene(
+                "68-join-confirm-link",
+                |w| state(w, two(), Vec::new()),
+                join_confirm(true),
+            ),
+            scene(
+                "68-join-confirm-plain",
+                |w| state(w, two(), Vec::new()),
+                join_confirm(false),
+            ),
+            scene(
+                "68-join-confirm-limit",
+                |w| {
+                    state(w, two(), Vec::new());
+                    full(w);
+                },
+                join_confirm(true),
+            ),
+            scene(
+                "69-add-computer-offer-mac",
+                |w| {
+                    state(w, two(), Vec::new());
+                    offer_card(w);
+                },
+                mac(|w| {
+                    go(Page::Add, 0, 1)(w);
+                    w.global::<Ui>().set_camera_available(true);
+                }),
+            ),
+            scene(
+                "69-add-computer-offer-limit",
+                |w| {
+                    state(w, two(), Vec::new());
+                    full(w);
+                    offer_card(w);
+                },
+                go(Page::Add, 0, 1),
+            ),
+            scene(
+                "70-paired-also",
+                |w| {
+                    let mut desktop = device(3, "MJStanton-Desktop", false, "connecting", 0);
+                    desktop.route = None;
+                    state(
+                        w,
+                        vec![device(1, "Galaxy S25+", true, "connected", 0), desktop],
+                        Vec::new(),
+                    );
+                    linking(
+                        w,
+                        vec![link_of(1, "enabled"), link_of(3, "enabled")],
+                        &[(1, "Galaxy S25+"), (3, "MJStanton-Desktop")],
+                    );
+                    paired_with(w, 1, "Galaxy S25+");
+                },
+                mac(go(Page::Add, 0, 0)),
+            ),
+            scene(
+                "70-paired-also-many",
+                |w| {
+                    state(w, trio(), Vec::new());
+                    linking(
+                        w,
+                        vec![link_of(1, "enabled"), link_of(2, "enabled")],
+                        &[
+                            (1, "Galaxy S25+"),
+                            (2, "MacBook Air"),
+                            (4, "Office-PC"),
+                            (5, "Living-Room-HTPC"),
+                            (6, "Studio Mac mini"),
+                        ],
+                    );
+                    paired_with(w, 2, "MacBook Air");
+                },
+                go(Page::Add, 0, 1),
+            ),
+            scene(
+                "71-paired-only",
+                |w| {
+                    state(
+                        w,
+                        vec![device(1, "Galaxy S25+", true, "connected", 0)],
+                        Vec::new(),
+                    );
+                    let separate = with(link_of(1, "disabled"), "outcome", json!(setup::SEPARATE));
+                    linking(w, vec![separate], &[]);
+                    paired_with(w, 1, "Galaxy S25+");
+                },
+                go(Page::Add, 0, 0),
             ),
         ]
     }

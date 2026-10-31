@@ -109,6 +109,8 @@ struct AbandonedClaim {
 #[derive(Clone)]
 pub struct Store {
     pub(crate) setup: Arc<Mutex<Option<members::SetupState>>>,
+    // Last authenticated HELLO scope, tied to the binding incarnation. UI only.
+    pub(crate) setup_remote_scopes: Arc<Mutex<HashMap<Id, (u64, pneu_proto::SetupScope)>>>,
     pub(crate) setup_changed: tokio::sync::watch::Sender<u64>,
     connection: Arc<Mutex<Connection>>,
     clipboard_history_revision: Arc<AtomicU64>,
@@ -688,6 +690,7 @@ impl Store {
         folder.file.sync_all()?;
         Ok(Self {
             setup: Arc::new(Mutex::new(Some(setup))),
+            setup_remote_scopes: Arc::new(Mutex::new(HashMap::new())),
             setup_changed: tokio::sync::watch::channel(0).0,
             connection: Arc::new(Mutex::new(conn)),
             pair_settings: Arc::new(Mutex::new(pair_settings)),
@@ -1160,6 +1163,12 @@ impl Store {
                 if route_proven&&!addresses.is_empty() {tx.execute("UPDATE setup_links SET route_proven=1 WHERE device=?",[device.as_str()])?;}
                 let setup = members::state(&tx)?;
                 tx.commit()?;
+                let mut remote_scopes = store.setup_remote_scopes.lock().expect("remote setup scopes");
+                remote_scopes.remove(&device);
+                if let Some(remote) = hello.as_ref().filter(|h| h.capabilities.iter().any(|c| c == "setup")).and_then(|h| h.setup.as_ref()) {
+                    remote_scopes.insert(device.clone(), (generation as u64, remote.scope));
+                }
+                drop(remote_scopes);
                 *store.setup.lock().expect("setup") = Some(setup);
                 store.setup_changed.send_modify(|n|*n=n.wrapping_add(1));
                 store.generations.lock().expect("peer generations").insert(device, generation as u64);
@@ -1211,6 +1220,11 @@ impl Store {
                 )?;
                 let setup = members::state(&tx)?;
                 tx.commit()?;
+                store
+                    .setup_remote_scopes
+                    .lock()
+                    .expect("remote setup scopes")
+                    .remove(&device);
                 *store.setup.lock().expect("setup") = Some(setup);
                 store.setup_changed.send_modify(|n| *n = n.wrapping_add(1));
                 store

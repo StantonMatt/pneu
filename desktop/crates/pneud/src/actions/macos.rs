@@ -19,6 +19,7 @@ struct Target {
     url: Option<String>,
     retry: Option<(pneu_proto::Id, pneu_proto::Id, pneu_proto::Id)>,
     actions: Vec<String>,
+    device: Option<pneu_proto::Id>,
 }
 struct NotificationRecord {
     target: Target,
@@ -123,6 +124,7 @@ impl DesktopActions {
                 url,
                 retry: None,
                 actions: Vec::new(),
+                device: None,
             },
             replaces,
         )
@@ -144,6 +146,7 @@ impl DesktopActions {
         };
         anyhow::ensure!(id != 0, "notification identifier exhausted");
         target.actions = notice.actions.iter().map(|(id, _)| (*id).into()).collect();
+        target.device = notice.device.clone();
         let notification = Notification {
             id,
             namespace: self.namespace.clone(),
@@ -309,6 +312,11 @@ impl DesktopActions {
             }
             "folder" => core.request_window(true),
             "pair" => core.request_add_device(),
+            "remove" => {
+                if let Some(device) = target.device {
+                    core.request_remove_window(device, None);
+                }
+            }
             "retry" => {
                 if let Some((operation, artifact, device)) = target.retry {
                     core.retry_transfer_artifact(operation, Some(artifact), device)
@@ -588,6 +596,7 @@ impl PcActions for DesktopActions {
                     url: None,
                     retry,
                     actions: Vec::new(),
+                    device: None,
                 },
                 0,
             )
@@ -720,6 +729,7 @@ impl PcActions for DesktopActions {
                     url: None,
                     retry: None,
                     actions: Vec::new(),
+                    device: None,
                 },
                 replaces,
             )

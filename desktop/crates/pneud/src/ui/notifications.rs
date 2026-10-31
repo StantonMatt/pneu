@@ -9,6 +9,8 @@ pub struct Notice {
     pub transient: bool,
     pub expires: i32,
     pub urls: Vec<String>,
+    /// The device an action such as Remove… is about.
+    pub device: Option<pneu_proto::Id>,
 }
 impl Notice {
     pub fn new(summary: impl Into<String>) -> Self {
@@ -20,6 +22,7 @@ impl Notice {
             transient: false,
             expires: -1,
             urls: Vec::new(),
+            device: None,
         }
     }
     pub fn file(
@@ -126,6 +129,14 @@ impl Notice {
         n.transient = true;
         n.urgency = 0;
         n.expires = 4000;
+        n
+    }
+    /// Once per device another of your devices added: "MacBook Air joined".
+    pub fn joined(device: pneu_proto::Id, name: &str, via: &str) -> Self {
+        let mut n = Self::new(format!("{} joined", label(name)));
+        n.body = format!("Added via {}", escape(&label(via)));
+        n.actions.push(("remove", "Remove…"));
+        n.device = Some(device);
         n
     }
     pub fn unpaired(device: &str) -> Self {
@@ -355,6 +366,18 @@ mod tests {
         assert_eq!(failed.body, "MacBook Air's disk is full");
         assert_eq!(failed.actions, vec![("retry", "Retry")]);
         assert!(!failed.transient);
+        let joined = Notice::joined(
+            pneu_proto::Id::from_bytes([7; 16]),
+            "MacBook\nAir",
+            "Galaxy <S25+>",
+        );
+        assert_eq!(
+            (joined.summary.as_str(), joined.body.as_str()),
+            ("MacBook Air joined", "Added via Galaxy &lt;S25+&gt;")
+        );
+        assert_eq!(joined.actions, vec![("remove", "Remove…")]);
+        assert_eq!(joined.device, Some(pneu_proto::Id::from_bytes([7; 16])));
+        assert!(!joined.transient);
         assert_eq!(
             Notice::unpaired("Office-PC").summary,
             if cfg!(target_os = "macos") {

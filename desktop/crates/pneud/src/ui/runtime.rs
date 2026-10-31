@@ -81,6 +81,7 @@ pub async fn run(
     if core.paired_devices().is_empty() {
         core.request_window(false);
     }
+    post_joined(&core, &actions).await;
     loop {
         if *stop.borrow() {
             break;
@@ -116,6 +117,7 @@ pub async fn run(
                     if !core.window_focused() {let _=actions.notice(Notice::paired(&name),Vec::new(),None,0,None).await;}
                 },
                 Ok(Event::RemoteUnpaired {name})=>{let _=actions.notice(Notice::unpaired(&name),Vec::new(),None,0,None).await;},
+                Ok(Event::Paired {..})=>post_joined(&core,&actions).await,
                 Ok(event @ (Event::ConnectionChanged {..}|Event::PhonePaused {..}|Event::ConfigChanged))=>clipboard_policy_event(&core,&event),
                 Err(tokio::sync::broadcast::error::RecvError::Closed)=>break,
                 Ok(event)=>update_tray=event_updates_tray(&event),
@@ -150,6 +152,7 @@ pub async fn run(
                     sending.spawn(async move { if let Err(error)=core.retry_transfer_artifact(operation,Some(artifact),device).await {eprintln!("pneud: retry: {error:#}"); if core.present_send_error(error.to_string()).is_err() {core.notify_send_admission_failure(&error.to_string()).await;}} });
                 },
                 Some(Command::AddDevice {activation_token})=>core.request_add_device_with_activation(activation_token),
+                Some(Command::RemoveDevice {device,activation_token})=>core.request_remove_window(device,activation_token),
                 None=>break,
             },
         }
@@ -266,6 +269,15 @@ impl ThemeRefresh {
     }
     fn changed(&mut self, now: Instant) {
         self.next = now + Duration::from_secs(5);
+    }
+}
+/// "{device} joined" for each device another of your devices added.
+async fn post_joined(core: &Core, actions: &DesktopActions) {
+    for joined in super::window_setup::joined(core).await {
+        let result = actions
+            .notice(joined.notice.clone(), Vec::new(), None, 0, None)
+            .await;
+        joined.posted(core, result).await;
     }
 }
 fn event_updates_tray(event: &Event) -> bool {

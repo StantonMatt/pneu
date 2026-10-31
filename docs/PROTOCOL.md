@@ -1213,7 +1213,8 @@ silently upgrades an `ask` link or refreshes a live attempt's captured fence.
    without advancing generations or repeating user notifications.
 10. Publish admission-map and worker changes only from committed state, then
     ACK `deduplicated=false`. A crash after commit but before ACK replays safely.
-    Notify once per newly installed binding: **<name> joined**, **Added via
+    Notify once per newly installed binding, except on the joining device for
+    members already there: **<name> joined**, **Added via
     <introducer>**, with Remove. Persist the authenticated immediate introducer's
     ID and display-name hint for the device page, including third-device gossip;
     this is how it arrived here, not an authenticated original signer. Never

@@ -729,6 +729,8 @@ impl Outbox {
         Ok(())
     }
     pub(crate) async fn reconcile(&self) -> Result<()> {
+        #[cfg(test)]
+        self.store.fault("outbox_reconcile")?;
         let this = self.clone();
         self.store
             .blocking(move |_| {

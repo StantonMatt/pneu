@@ -131,6 +131,10 @@ pub enum Command {
     SetupStatus,
     LinkExistingDevice {
         device: Id,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binding_generation: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_scope: Option<pneu_proto::SetupScope>,
     },
     SetupDecision {
         device: Id,
@@ -479,7 +483,11 @@ async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
         Command::JoinConfirmScoped { attempt, enabled } => core.confirm_join_scoped(&attempt,enabled).await?,
         Command::PairingScope { enabled } => {core.set_pairing_scope(enabled).await?;serde_json::Value::Null},
         Command::SetupStatus => core.setup_status().await?,
-        Command::LinkExistingDevice {device} => {core.link_existing_device(device).await?;serde_json::Value::Null},
+        Command::LinkExistingDevice {device,binding_generation,expected_scope} => {
+            ensure!(binding_generation.is_some()==expected_scope.is_some(),"incomplete setup link expectation");
+            let linked=core.link_existing_device(device,binding_generation.zip(expected_scope)).await?;
+            if binding_generation.is_some() {serde_json::json!(linked)} else {serde_json::Value::Null}
+        },
         Command::SetupDecision {device,setup_generation,binding_generation,allow} => {core.decide_setup(device,setup_generation,binding_generation,allow).await?;serde_json::Value::Null},
         Command::RemoveFromSetup {device,setup_generation,binding_generation,fingerprint} => {core.remove_setup_device_confirmed(device,setup_generation,binding_generation,fingerprint).await?;serde_json::Value::Null},
         Command::DismissSetupNotice {device,binding_generation} => {core.dismiss_setup_notice(device,binding_generation).await?;serde_json::Value::Null},
@@ -500,7 +508,7 @@ async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
         #[cfg(windows)]
         Command::WindowClosed { request } => { core.window_closed(request); serde_json::Value::Null },
         Command::WindowFocus { request, focused } => { core.set_window_focus(request, focused); serde_json::Value::Null },
-        Command::UiStatus => { let (revision, invitation) = core.pairing_status(); let snapshot = core.ui_snapshot(); let (window_request, activation_token) = core.window_request_with_activation(); serde_json::json!({"device":snapshot.device, "snapshot":snapshot, "config": core.config(), "window_request":window_request,"add_device":core.window_add_device(window_request),"activation_token":activation_token,"invitation_revision":revision,"invitation":invitation,"pending_send":core.pending_send(),"setup":core.setup_status().await?}) },
+        Command::UiStatus => { let (revision, invitation) = core.pairing_status(); let snapshot = core.ui_snapshot(); let (window_request, activation_token) = core.window_request_with_activation(); serde_json::json!({"device":snapshot.device, "snapshot":snapshot, "config": core.config(), "window_request":window_request,"add_device":core.window_add_device(window_request),"remove_device":core.window_remove_device(window_request),"self_id":core.identity.device_id,"activation_token":activation_token,"invitation_revision":revision,"invitation":invitation,"pending_send":core.pending_send(),"setup":core.setup_status().await?}) },
         Command::AddDevice => { core.request_add_device(); serde_json::Value::Null },
         Command::ShowWindow { choose_folder } => { core.request_window(choose_folder); serde_json::Value::Null },
         Command::Status => {
@@ -783,6 +791,24 @@ fn parse_send_command(args: &[String], validate_files: bool) -> Result<Command> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_existing_device_accepts_legacy_and_fenced_requests() -> Result<()> {
+        let device = Id::from_bytes([1; 16]);
+        for extra in [
+            serde_json::json!({}),
+            serde_json::json!({"binding_generation":3,"expected_scope":"ask"}),
+        ] {
+            let mut request = serde_json::json!({"command":"link_existing_device","device":device});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let command: Command = serde_json::from_value(request.clone())?;
+            assert_eq!(serde_json::to_value(command)?, request);
+        }
+        Ok(())
+    }
 
     #[cfg(unix)]
     struct NoActions;

@@ -12,7 +12,7 @@ import { Link, LinkState, LinkTile, Tube } from "link.slint";
 export { WindowFocus, Tone, Tube, LinkState, LinkTile }
 
 export enum Page { main, device, add, code, settings, scan }
-export enum Dialog { none, unpair, rename, picker, message, details, help }
+export enum Dialog { none, unpair, remove, rename, picker, message, details, help }
 export enum CodeState { showing, expired, offline, pairing, paired }
 export enum ScanState { requesting, scanning, denied, unavailable, failed }
 
@@ -68,6 +68,14 @@ export struct Message { title: string, text: string, tile: int, primary: string,
 
 export struct Summary { title: string, detail: string, link: LinkState }
 
+// Pair once, join your devices (window_setup.rs). The screens say "your
+// devices" and "linked", never "setup".
+export enum TopKind { none, offer, waiting, request }
+export struct TopCard { kind: TopKind, title: string, phone: bool }
+export enum LinkRow { none, link, waiting, theirs, asked, update, separate }
+// The device page's last card: the row above Unpair or Remove from all devices.
+export struct DeviceLink { row: LinkRow, title: string, sub: string, via: string, member: bool, waiting: int }
+
 export struct DropItem { name: string, enabled: bool }
 export struct DropGeometry { x: float, y: float, width: float, height: float, scroll: float }
 
@@ -109,6 +117,8 @@ export global Ui {
     in property <string> device-action;
     in property <[SettingItem]> device-settings;
     in property <string> device-note;
+    in property <DeviceLink> device-link;
+    in property <TopCard> top;
 
     in property <bool> first-run;
     in property <image> qr;
@@ -119,6 +129,11 @@ export global Ui {
     in property <string> pairing;
     in property <string> paired;
     in property <string> offer;
+    // Also link with your other devices, on every pairing confirmation.
+    in-out property <bool> link-on: true;
+    in property <bool> link-full;
+    in property <string> paired-detail;
+    in property <bool> paired-only;
 
     in property <image> code-qr;
     in property <CodeState> code-state;
@@ -139,6 +154,9 @@ export global Ui {
 
     in-out property <string> unpair-id;
     in-out property <string> unpair-name;
+    in-out property <string> remove-id;
+    in-out property <string> remove-name;
+    in-out property <int> remove-waiting;
     in-out property <string> rename-text;
     in property <string> picker-title;
     in-out property <[PickItem]> picks;
@@ -175,7 +193,17 @@ export global Ui {
     callback scanned-link(string);
     // Add Device reads the clipboard once for a link from another computer.
     callback probed(string);
-    callback offer-pair();
+    callback offer-pair(bool);
+    // A pairing confirmation's Pair, with its switch.
+    callback confirm-join(bool);
+    // The top card: Link or Allow (true), Don't Allow (false), and ✕.
+    callback top-action(bool);
+    callback top-close();
+    callback link-device(string);
+    callback answer(string, bool);
+    // Remove from all devices: shown, then confirmed.
+    callback removing(string);
+    callback remove(string);
     callback offer-dismiss();
     callback message-action(string, bool);
     callback picker-send();
@@ -293,6 +321,9 @@ component RecentRow inherits NavRow {
 
 component Done inherits VerticalLayout {
     in property <string> name;
+    // "Also linked: …", or why it was paired with that device only.
+    in property <string> detail;
+    in property <bool> only;
     alignment: center; spacing: 14px;
     HorizontalLayout {
         alignment: center;
@@ -301,9 +332,13 @@ component Done inherits VerticalLayout {
             Image { accessible-role: none; x: 12px; y: 12px; width: 32px; height: 32px; source: Icons.check; colorize: white; }
         }
     }
-    Text {
-        text: "Paired with " + root.name; font-weight: 600; color: Pneu.text;
-        horizontal-alignment: center; overflow: elide;
+    VerticalLayout {
+        spacing: 2px;
+        Text {
+            text: "Paired with " + root.name + (root.only ? " only" : ""); font-weight: 600; color: Pneu.text;
+            horizontal-alignment: center; overflow: elide;
+        }
+        if root.detail != "": Text { text: root.detail; color: Pneu.text2; horizontal-alignment: center; wrap: word-wrap; }
     }
 }
 
@@ -323,9 +358,63 @@ component Notice inherits VerticalLayout {
     Text { text: root.text; color: Pneu.text; horizontal-alignment: center; wrap: word-wrap; }
 }
 
+// Also link with your other devices: off and disabled at the limit.
+component LinkSwitch inherits Rectangle {
+    in property <bool> dialog-control;
+    background: Pneu.button; border-radius: 10px;
+    SwitchRow {
+        dialog-control: root.dialog-control;
+        label: "Also link with your other devices";
+        sub: Ui.link-full ? "Your devices are at the limit of 17" : "";
+        checked: Ui.link-on && !Ui.link-full; enabled: !Ui.link-full;
+        toggled(on) => { Ui.link-on = on; }
+    }
+}
+
+// The main page's top card: the one-time offer, what's left after Link, or a request.
+component LinkCardTop inherits Card {
+    in property <TopCard> card;
+    callback act(bool);
+    callback close();
+    border-width: 1.5px; border-color: Pneu.accent;
+    HorizontalLayout {
+        padding-top: 12px; padding-bottom: 12px; padding-left: 12px; padding-right: 8px; spacing: 12px;
+        VerticalLayout {
+            alignment: start;
+            Tile {
+                icon: root.card.kind == TopKind.request ? (root.card.phone ? Icons.smartphone : Icons.computer) : Icons.link;
+                tone: root.card.kind == TopKind.waiting ? Tone.neutral : Tone.accent;
+            }
+        }
+        VerticalLayout {
+            alignment: start; horizontal-stretch: 1; spacing: 1px;
+            Text { text: root.card.title; font-weight: 600; color: Pneu.text; wrap: word-wrap; }
+            Text { text: "New devices then pair just once."; font-size: Pneu.label-size; color: Pneu.text2; wrap: word-wrap; }
+            if root.card.kind != TopKind.waiting: HorizontalLayout {
+                padding-top: 10px; spacing: 8px; alignment: end;
+                if root.card.kind == TopKind.request: PneuButton { text: "Don't Allow"; clicked => { root.act(false); } }
+                PneuButton {
+                    text: root.card.kind == TopKind.request ? "Allow" : "Link"; kind: ButtonKind.primary;
+                    clicked => { root.act(true); }
+                }
+            }
+        }
+        VerticalLayout {
+            alignment: start;
+            IconButton { icon: Icons.close; label: "Close"; clicked => { root.close(); } }
+        }
+    }
+}
+
+// The open popup's full height, so a short page grows to show all of it.
+global Popup { in-out property <length> needed; }
+
 component PopupCard inherits Rectangle {
     in property <length> card-width: 320px;
     in property <length> limit;
+    private property <length> needed: body.preferred-height + 32px;
+    init => { Popup.needed = self.needed; }
+    changed needed => { Popup.needed = self.needed; }
     background: Pneu.dim;
     TouchArea {}
     Card {
@@ -384,10 +473,14 @@ export component PneuWindow inherits Window {
     private property <string> copied;
     private property <bool> device-ready: Ui.device.id == Ui.device-id && Ui.device-id != "" && Ui.device-revision == Ui.navigation-revision;
     private property <bool> modal-open: Ui.dialog != Dialog.none;
-    changed modal-open => { Interaction.modal-open = root.modal-open; }
+    changed modal-open => {
+        Interaction.modal-open = root.modal-open;
+        if !root.modal-open { Popup.needed = 0; }
+    }
     min-width: window-width; max-width: window-width;
     out property <length> content-height: min(max(body.preferred-height,
-        Ui.page == Page.add && Ui.add-tab == 0 ? phone-page-height : 0px), max-window-height);
+        Ui.page == Page.add && Ui.add-tab == 0 ? phone-page-height : 0px,
+        Ui.dialog != Dialog.none ? Popup.needed : 0px), max-window-height);
     min-height: content-height;
     max-height: content-height;
 
@@ -449,6 +542,19 @@ export component PneuWindow inherits Window {
         Ui.unpair(Ui.unpair-id);
         keys.focus();
     }
+    public function prepare-remove() {
+        if !root.device-ready || !Ui.device-link.member { return; }
+        Ui.remove-id = Ui.device-id;
+        Ui.remove-name = Ui.device.name;
+        Ui.remove-waiting = Ui.device-link.waiting;
+        Ui.removing(Ui.device-id);
+        Ui.dialog = Dialog.remove;
+    }
+    public function submit-remove() {
+        Ui.dialog = Dialog.none;
+        Ui.remove(Ui.remove-id);
+        keys.focus();
+    }
     function dismiss() {
         if Ui.dialog == Dialog.message {
             Ui.message-action(Ui.message.action, Ui.message.secondary == "");
@@ -507,6 +613,11 @@ export component PneuWindow inherits Window {
                 // ---- Main page ----
                 if Ui.page == Page.main: VerticalLayout {
                     spacing: 12px;
+                    if Ui.top.kind != TopKind.none: LinkCardTop {
+                        card: Ui.top;
+                        act(yes) => { Ui.top-action(yes); }
+                        close => { Ui.top-close(); }
+                    }
                     LinkCard {
                         summary: Ui.summary; motion: Ui.motion;
                         text-line: text-line.preferred-height; title-line: title-line.preferred-height;
@@ -619,7 +730,43 @@ export component PneuWindow inherits Window {
                         }
                     }
                     Card {
-                        PneuButton { enabled: root.device-ready; text: "Unpair…"; kind: ButtonKind.row; clicked => { root.prepare-unpair(); } }
+                        VerticalLayout {
+                            if Ui.device-link.row != LinkRow.none: Row {
+                                VerticalLayout {
+                                    alignment: center; horizontal-stretch: 1; spacing: 1px;
+                                    Text {
+                                        text: Ui.device-link.title; wrap: word-wrap;
+                                        color: Ui.device-link.row == LinkRow.update ? Pneu.text2 : Pneu.text;
+                                    }
+                                    if Ui.device-link.sub != "": Text {
+                                        text: Ui.device-link.sub; font-size: Pneu.label-size; color: Pneu.text2; wrap: word-wrap;
+                                    }
+                                }
+                                if Ui.device-link.row == LinkRow.link: VerticalLayout {
+                                    alignment: center;
+                                    PneuButton { enabled: root.device-ready; text: "Link"; clicked => { Ui.link-device(Ui.device-id); } }
+                                }
+                                if Ui.device-link.row == LinkRow.asked: HorizontalLayout {
+                                    alignment: center; spacing: 8px;
+                                    VerticalLayout { alignment: center;
+                                        PneuButton { enabled: root.device-ready; text: "Don't Allow"; clicked => { Ui.answer(Ui.device-id, false); } }
+                                    }
+                                    VerticalLayout { alignment: center;
+                                        PneuButton { enabled: root.device-ready; text: "Allow"; kind: ButtonKind.primary; clicked => { Ui.answer(Ui.device-id, true); } }
+                                    }
+                                }
+                            }
+                            if Ui.device-link.row != LinkRow.none: Divider {}
+                            if Ui.device-link.via != "": Row {
+                                Text { text: "Added via " + Ui.device-link.via; color: Pneu.text2; overflow: elide; horizontal-stretch: 1; }
+                            }
+                            if Ui.device-link.via != "": Divider {}
+                            PneuButton {
+                                enabled: root.device-ready; kind: ButtonKind.row;
+                                text: Ui.device-link.member ? "Remove from All Devices…" : "Unpair…";
+                                clicked => { if Ui.device-link.member { root.prepare-remove(); } else { root.prepare-unpair(); } }
+                            }
+                        }
                     }
                 }
 
@@ -634,6 +781,7 @@ export component PneuWindow inherits Window {
                     }
                     if Ui.paired != "": Done {
                         height: root.pairing-height + (Ui.add-tab == 0 ? root.phone-link-height : 0px); name: Ui.paired;
+                        detail: Ui.paired-detail; only: Ui.paired-only;
                     }
                     if Ui.paired == "" && Ui.pairing != "": Busy {
                         height: root.pairing-height + (Ui.add-tab == 0 ? root.phone-link-height : 0px);
@@ -698,10 +846,12 @@ export component PneuWindow inherits Window {
                                     horizontal-alignment: center; overflow: elide;
                                 }
                                 Text { text: "Link on the clipboard"; color: Pneu.text2; horizontal-alignment: center; }
+                                // This card pairs without the popup, so it carries the switch itself.
+                                VerticalLayout { padding-top: 14px; LinkSwitch {} }
                                 HorizontalLayout {
-                                    padding-top: 14px; spacing: 8px; alignment: center;
+                                    padding-top: 12px; spacing: 8px; alignment: center;
                                     PneuButton { text: "Not Now"; clicked => { Ui.offer-dismiss(); } }
-                                    PneuButton { text: "Pair"; kind: ButtonKind.primary; clicked => { Ui.offer-pair(); } }
+                                    PneuButton { text: "Pair"; kind: ButtonKind.primary; clicked => { Ui.offer-pair(Ui.link-on && !Ui.link-full); } }
                                 }
                             }
                         }
@@ -765,7 +915,7 @@ export component PneuWindow inherits Window {
                 if Ui.is-mac && Ui.page == Page.scan: VerticalLayout {
                     spacing: 12px;
                     Header { title: "Scan QR Code"; go-back => { root.back(); } }
-                    if Ui.paired != "": Done { height: root.pairing-height; name: Ui.paired; }
+                    if Ui.paired != "": Done { height: root.pairing-height; name: Ui.paired; detail: Ui.paired-detail; only: Ui.paired-only; }
                     if Ui.paired == "" && (Ui.scan-state == ScanState.requesting || Ui.scan-state == ScanState.scanning): VerticalLayout {
                         spacing: 12px;
                         Rectangle {
@@ -835,7 +985,7 @@ export component PneuWindow inherits Window {
                     if Ui.code-state == CodeState.pairing: Busy {
                         height: root.pairing-height; motion: Ui.motion; text: "Pairing with " + Ui.pairing + "…";
                     }
-                    if Ui.code-state == CodeState.paired: Done { height: root.pairing-height; name: Ui.paired; }
+                    if Ui.code-state == CodeState.paired: Done { height: root.pairing-height; name: Ui.paired; detail: Ui.paired-detail; only: Ui.paired-only; }
                 }
 
                 // ---- Settings ----
@@ -1021,6 +1171,29 @@ export component PneuWindow inherits Window {
                 PneuButton { dialog-control: true; text: "Unpair"; kind: ButtonKind.danger; clicked => { root.submit-unpair(); } }
             }
         }
+        if Ui.dialog == Dialog.remove: PopupCard {
+            card-width: 352px;
+            limit: root.height - 32px;
+            Text {
+                text: "Remove " + Ui.remove-name + " from all devices?";
+                font-size: Pneu.title-size; font-weight: 700; color: Pneu.text; wrap: word-wrap;
+            }
+            Rectangle { height: 6px; }
+            // Removed here now; the others remove it as they connect. Nothing claims more.
+            Text {
+                text: "It's removed from " + (Ui.is-mac ? "this Mac" : "this computer")
+                    + " now, and from your other devices when they next connect."
+                    + (Ui.remove-waiting == 1 ? " 1 waiting item won't be sent to it."
+                        : Ui.remove-waiting > 1 ? " " + Ui.remove-waiting + " waiting items won't be sent to it." : "");
+                color: Pneu.text2; wrap: word-wrap;
+            }
+            Rectangle { height: 18px; }
+            HorizontalLayout {
+                spacing: 8px; alignment: end;
+                PneuButton { dialog-control: true; text: "Cancel"; autofocus: true; clicked => { root.dismiss(); } }
+                PneuButton { dialog-control: true; text: "Remove"; kind: ButtonKind.danger; clicked => { root.submit-remove(); } }
+            }
+        }
         if Ui.dialog == Dialog.rename: PopupCard {
             limit: root.height - 32px;
             Text { text: Ui.is-mac ? "Rename This Mac" : "Rename this computer"; font-size: Pneu.title-size; font-weight: 700; color: Pneu.text; }
@@ -1116,6 +1289,8 @@ export component PneuWindow inherits Window {
             Text { text: Ui.message.title; font-size: Pneu.title-size; font-weight: 700; color: Pneu.text; wrap: word-wrap; }
             if Ui.message.text != "": Rectangle { height: 6px; }
             if Ui.message.text != "": Text { text: Ui.message.text; color: Pneu.text2; wrap: word-wrap; }
+            // The joining computer's confirmation. The computer showing the code has none.
+            if Ui.message.action == "join-confirm": VerticalLayout { padding-top: 14px; LinkSwitch { dialog-control: true; } }
             Rectangle { height: 18px; }
             HorizontalLayout {
                 spacing: 8px; alignment: end;
@@ -1127,7 +1302,12 @@ export component PneuWindow inherits Window {
                 PneuButton { dialog-control: true;
                     text: Ui.message.primary; kind: ButtonKind.primary;
                     autofocus: Ui.message.secondary == "";
-                    clicked => { Ui.dialog = Dialog.none; Ui.message-action(Ui.message.action, true); keys.focus(); }
+                    clicked => {
+                        Ui.dialog = Dialog.none;
+                        if Ui.message.action == "join-confirm" { Ui.confirm-join(Ui.link-on && !Ui.link-full); }
+                        else { Ui.message-action(Ui.message.action, true); }
+                        keys.focus();
+                    }
                 }
             }
         }

@@ -83,6 +83,130 @@ async fn pair(a: &Core, b: &Core, scope: bool) -> Result<()> {
     })
     .await
 }
+
+#[tokio::test]
+async fn setup_remote_scope_status_drives_existing_window_states() -> Result<()> {
+    use crate::store::members::SetupFence;
+    use crate::ui::window_setup::{Remembered, Row, Setup, Top};
+    let a = Running::new().await?;
+    let device = Id::from_bytes([3; 16]);
+    let pin = Hash::new(format!("{:064x}", 3))?;
+    a.core.store.pair(device.clone(), pin.clone()).await?;
+    let status = a.core.setup_status().await?;
+    assert!(status["links"][0].get("remote_scope").is_none());
+
+    let mut hello = a.core.computer_hello();
+    hello.device_id = device.clone();
+    hello.name = "Other computer".into();
+    hello.setup = Some(SetupHello {
+        scope: SetupScope::Disabled,
+        setup_id: None,
+    });
+    a.core
+        .store
+        .pair_then_hello_scoped(
+            device.clone(),
+            pin.clone(),
+            Some(hello),
+            Some(a.core.self_member()),
+            SetupScope::Enabled,
+            false,
+            || {},
+        )
+        .await?;
+    // Recovery preserves the previous local Ask decision; opt in locally.
+    a.core
+        .store
+        .setup_link(device.clone(), SetupScope::Enabled)
+        .await?;
+    let status = a.core.setup_status().await?;
+    assert_eq!(status["links"][0]["remote_scope"], "disabled");
+
+    let mut snapshot = crate::ui::Snapshot::default();
+    snapshot.devices.push(mesh::DeviceSnapshot {
+        device: device.clone(),
+        name: "Other computer".into(),
+        role: "computer".into(),
+        state: "connected".into(),
+        last_seen: 0,
+        dialer: None,
+        route: None,
+    });
+    let peers = crate::ui::window::peers(&snapshot, &[]);
+    let remembered = Remembered {
+        offer: Some(crate::ui::window_setup::LINKED.into()),
+        ..Remembered::default()
+    };
+    let current = Arc::new(AtomicU64::new(1));
+    for (scope, text, row) in [
+        (SetupScope::Disabled, "disabled", Row::Theirs),
+        (SetupScope::Ask, "ask", Row::Waiting),
+        (SetupScope::Enabled, "enabled", Row::None),
+    ] {
+        let fence = SetupFence {
+            generation: a.core.store.setup_state().generation,
+            binding_generation: a.core.store.pairing_generation(&device).unwrap(),
+            device: device.clone(),
+            fingerprint: pin.clone(),
+            connection: 1,
+            current: current.clone(),
+        };
+        let remote = Member {
+            device_id: device.clone(),
+            fingerprint: pin.clone(),
+            role: DeviceRole::Computer,
+            name: "Other computer".into(),
+            status: MemberStatus::Member,
+            hlc: 0,
+            writer_device: device.clone(),
+            reach: None,
+        };
+        a.core
+            .store
+            .setup_activate(
+                fence,
+                a.core.self_member(),
+                remote,
+                SetupHello {
+                    scope,
+                    setup_id: (scope == SetupScope::Enabled).then(|| Id::from_bytes([4; 16])),
+                },
+                |_| {},
+            )
+            .await?;
+        let status = a.core.setup_status().await?;
+        assert_eq!(status["links"][0]["remote_scope"], text);
+        assert_eq!(status["links"][0]["scope"], "enabled");
+        let setup = Setup::parse(&serde_json::json!({"setup": status}));
+        assert_eq!(crate::ui::window_setup::row(&setup, &peers[0]), row);
+        assert_eq!(
+            setup.unanswered().len(),
+            usize::from(scope == SetupScope::Ask)
+        );
+        let top = crate::ui::window_setup::top(&setup, &peers, &remembered);
+        assert_eq!(matches!(top, Top::Waiting { .. }), scope == SetupScope::Ask);
+    }
+    assert_eq!(
+        crate::ui::window_setup::row_text(Row::Theirs, "Other computer").1,
+        "Link on Other computer too"
+    );
+    let fence = SetupFence {
+        generation: a.core.store.setup_state().generation,
+        binding_generation: a.core.store.pairing_generation(&device).unwrap(),
+        device,
+        fingerprint: pin,
+        connection: 1,
+        current,
+    };
+    a.core.store.setup_legacy_ready(fence).await?;
+    assert!(
+        a.core.setup_status().await?["links"][0]
+            .get("remote_scope")
+            .is_none()
+    );
+    a.stop().await
+}
+
 #[tokio::test]
 async fn setup_three_daemons_join_through_member_and_remove_from_all() -> Result<()> {
     let a = Running::new().await?;
@@ -244,7 +368,7 @@ async fn setup_three_device_migration_ask_prompts_allow_without_resets() -> Resu
         )
         .await?;
     a.core
-        .link_existing_device(b.core.identity.device_id.clone())
+        .link_existing_device(b.core.identity.device_id.clone(), None)
         .await?;
     until(|| a.core.store.setup_state().setup_id.is_some()).await?;
     for target in [&b.core, &c.core] {
@@ -1044,4 +1168,60 @@ async fn setup_advisory_remove_bindingless_member_fences_absence_and_cancels_pre
     a.stop().await?;
     b.stop().await?;
     c.stop().await
+}
+
+#[tokio::test]
+async fn setup_joined_notice_failed_post_releases_claim_and_keeps_durable_notice() -> Result<()> {
+    let a = Running::new().await?;
+    let device = Id::from_bytes([93; 16]);
+    a.core
+        .store
+        .pair(device.clone(), Hash::new(format!("{:064x}", 93))?)
+        .await?;
+    let device_for_row = device.clone();
+    a.core.store.call(move |c| {
+        c.execute("INSERT INTO setup_notices VALUES(?,1,?)", rusqlite::params![device_for_row.as_str(), serde_json::json!({"device":device_for_row,"name":"New device","introducer_name":"Other device"}).to_string()])?;
+        Ok(())
+    }).await?;
+    let mut first = crate::ui::window_setup::joined(&a.core).await;
+    assert_eq!(first.len(), 1);
+    assert!(
+        crate::ui::window_setup::joined(&a.core).await.is_empty(),
+        "in-flight claim"
+    );
+    first
+        .pop()
+        .unwrap()
+        .posted(&a.core, Err(anyhow::anyhow!("UI child not ready")))
+        .await;
+    drop(first);
+    let mut retry = crate::ui::window_setup::joined(&a.core).await;
+    assert_eq!(
+        retry.len(),
+        1,
+        "failed post remains durable and claim is released"
+    );
+    retry.pop().unwrap().posted(&a.core, Ok(1)).await;
+    drop(retry);
+    assert!(crate::ui::window_setup::joined(&a.core).await.is_empty());
+    a.stop().await
+}
+
+#[tokio::test]
+async fn setup_committed_removal_succeeds_when_outbox_cleanup_fails() -> Result<()> {
+    let a = Running::new().await?;
+    let b = Running::new().await?;
+    pair(&a.core, &b.core, true).await?;
+    until(|| a.core.store.setup_state().roster.len() == 2).await?;
+    a.core.store.fail_next("outbox_reconcile", 1);
+    a.core
+        .remove_setup_device(b.core.identity.device_id.clone())
+        .await?;
+    assert_eq!(a.core.store.faults_remaining("outbox_reconcile"), 0);
+    assert!(!a.core.paired_devices().contains(&b.core.identity.device_id));
+    assert!(a.core.store.setup_state().setup_id.is_none());
+    // Cleanup remains idempotent on the next ordinary reconcile.
+    a.core.outbox.reconcile().await?;
+    a.stop().await?;
+    b.stop().await
 }

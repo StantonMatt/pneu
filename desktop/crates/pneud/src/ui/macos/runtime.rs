@@ -90,6 +90,8 @@ pub async fn run(
                         if !ui.swept && let Ok(wait) = actions.clear_stale_native_notifications() {
                             ui.swept = true;
                             notices.spawn(async move { let _ = wait.await; });
+                            // Joined notices left from before the menu bar was ready.
+                            queue_joined(&mut notices, core.clone(), actions.clone());
                         }
                     }
                     match ui.child.try_wait() {
@@ -131,6 +133,7 @@ pub async fn run(
                 }
                 Ok(Event::ComputerPaired {name,..})=>if !core.window_focused(){queue_notice(&mut notices,actions.clone(),Notice::paired(&name));},
                 Ok(Event::RemoteUnpaired {name})=>queue_notice(&mut notices,actions.clone(),Notice::unpaired(&name)),
+                Ok(event @ Event::Paired {..})=>{queue_joined(&mut notices,core.clone(),actions.clone());clipboard_policy_event(&core,&event);},
                 Ok(event)=>clipboard_policy_event(&core,&event),
                 Err(tokio::sync::broadcast::error::RecvError::Closed)=>break,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_))=>for device in core.paired_devices() {core.cancel_automatic_clipboard(&device);},
@@ -147,6 +150,30 @@ pub async fn run(
     actions.clear_notifications().await;
     watcher.shutdown().await;
     Ok(())
+}
+/// "{device} joined" for each device another of your devices added.
+fn queue_joined(
+    jobs: &mut tokio::task::JoinSet<()>,
+    core: Arc<Core>,
+    actions: Arc<DesktopActions>,
+) {
+    // The existing child-ready pass queues these again after startup.
+    if require_ui(&core).is_err() {
+        return;
+    }
+    while jobs.try_join_next().is_some() {}
+    if jobs.len() >= crate::ui::portal::Interactions::LIMIT {
+        eprintln!("pneud: notification submission capacity exhausted");
+        return;
+    }
+    jobs.spawn(async move {
+        for joined in crate::ui::window_setup::joined(&core).await {
+            let result = actions
+                .notice(joined.notice.clone(), Vec::new(), None, 0, None)
+                .await;
+            joined.posted(&core, result).await;
+        }
+    });
 }
 fn queue_notice(jobs: &mut tokio::task::JoinSet<()>, actions: Arc<DesktopActions>, notice: Notice) {
     while jobs.try_join_next().is_some() {}
