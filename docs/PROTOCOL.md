@@ -277,12 +277,14 @@ receiver retains one durable prompt per binding/setup generation:
 compatibility and atomically enables; Deny disables. Dismissal retains
 the prompt across restart. Capability changes never reset consent; fresh token
 pairing after removal creates a new decision. A disabled remote requires its
-own explicit opt-in; HELLO or MEMBERS never prompts it.
+own explicit opt-in; HELLO or MEMBERS never prompts it. These migration
+prompts/actions exclude all re-admission records described below.
 
-Link and Allow are device-wide consent. **Link existing device** enables every
-local `ask` binding; Allow on any prompt does the same and resolves this
-device's other pending prompts as allowed. `disabled` bindings are never
-enabled in bulk. Each binding still activates on its own: the compatibility
+Migration Link and Allow are device-wide consent; re-admission Allow below is
+per exact key and never enables other bindings. **Link existing device** enables
+every local `ask` binding; Allow on any migration prompt does the same and
+resolves this device's other pending migration prompts as allowed. `disabled`
+bindings are never enabled in bulk. Each binding still activates on its own: the compatibility
 table applies per link (an S/T link alone stays direct), its remote endpoint
 needs its own enabled scope, and activations serialize as above. Thus a fully
 paired phone, PC and Mac need one Link and one Allow on each other device.
@@ -1095,22 +1097,84 @@ This exception is necessary to make concurrent add/remove and stale replay safe.
 It also applies to an unknown or currently absent binding. Gossip the retained
 removed value, not a suppressed newer member value.
 
-Only a **fresh, successful local token pairing** under the existing install
-fences can clear that endpoint's deny record for that key. Allocate its new
-member stamp strictly after all locally observed stamps, including the retained
-removal; retain a durable removal high-water mark so older removed snapshots
+A **fresh, successful local token pairing** under the existing install fences
+or an explicit local **re-admission Allow** below can clear that endpoint's deny
+record for that key. For token pairing, allocate its new member stamp strictly
+after all locally observed stamps, including the retained removal; retain a
+durable removal high-water mark so older removed snapshots
 cannot undo that fresh local pairing. A removal with a tuple greater than that
 high-water mark establishes a new deny record. Here fresh local token pairing
 means a newly user-confirmed local attempt created after the removal and fenced
 to that removal revision, or a newly validated token on the acceptor. The normal
 known-certificate response to that new attempt is unchanged. Retransmission or
 recovery of a pre-removal attempt, a token-independent reconnect without a new
-local confirmation, HELLO, clock changes, or a received member value cannot clear
-it. Retain the removed value's metadata with the high-water mark for conflict
-checking. A member advertised by another device does not prove fresh pairing;
-other endpoints that hold a tombstone require their own fresh local token pair.
-Thus re-enrolling a removed certificate is deliberately not automatic everywhere.
-A changed certificate still cannot replace a locally known ID by introduction.
+local confirmation, HELLO, clock changes, or a received member value alone cannot
+clear it. Retain the removed value's metadata with the high-water mark for
+conflict checking. A member advertised by another device does not prove fresh
+pairing; other endpoints that hold a tombstone require their own fresh local token pair
+or re-admission Allow. Re-enrolling a removed certificate is never automatic.
+Only a retained removal is the removal high-water mark: even a newer fresh-pair
+member cannot suppress a previously unseen removal. That removal establishes a
+deny without retroactively prompting from the earlier member observation; a
+subsequent eligible member merge may offer re-admission. A changed certificate
+still cannot replace a locally known ID by introduction.
+
+**Re-admission asks once per removal barrier**, without new wire fields. In an
+otherwise eligible MEMBERS merge (all validation, scope, setup ID, receipt and
+sender-deny checks below), a `member` value for a locally denied exact `(id, pin)`
+with tuple strictly greater than retained removal R records a local re-admission.
+Never prompt for a tuple at/below R, the receiver's own key, a new pin lacking
+its own denied barrier, or a retained receipt replay. The stamp is ordering evidence, not proof of token
+use: concurrent unseen values or a rename can also trigger the question.
+
+Persist at most one record per `(id, pin, R tuple)` atomically with the merge:
+the retained member value, authenticated immediate sender ID/name as introducer,
+local setup generation and pending/decided state. Keep the first introducer;
+merge later eligible observations by tuple-max membership value and the ordinary
+independent reach rule, without reopening a decision or creating another prompt.
+Do not use `writer_device` as the introducer. Until Allow, retain/gossip R, never
+the suppressed member. Recording/updating the observation or Keep removed changes
+no wire roster and MUST NOT schedule unchanged MEMBERS resends. Dismissal leaves
+pending state durable across restart. A newer removal replaces R and drops its
+record; fresh local token pairing drops the record for the paired key. Retirement
+on dissolution/withdrawal drops pending prompts but retains decisions with their
+barriers across setup generations; a new generation cannot reopen a decision.
+
+Show **{X} was removed from this {phone/computer}. {Y} added it again** with
+**Keep removed** and **Allow**; X comes from R's retained name, Y from the
+authenticated introducer. Keep removed has initial focus on computers. In-app
+and notification actions carry the same key, R and setup-generation fences.
+
+* **Allow** is explicit local consent for this key only, never migration/bulk
+  consent. Under the lifecycle gate, recheck assigned/not withdrawn state, the
+  pending record's setup generation, and the same still-denied R. Recheck steps
+  5/6 below and all capacity limits at commit. For this exact-key Allow only, the
+  step-5 deny check exempts R and historical barriers for other pins of this ID;
+  those other denies remain intact. Atomically clear this key's deny, retain R as
+  removal high-water, mark the decision allowed, and install the retained member
+  value as an ordinary introduction, preserving its writer/stamp and reach; do not mint a local member stamp. Use the retained introducer, one new
+  binding generation, enabled scope and normal PEER_SETTINGS bootstrap; phone
+  subjects remain metadata only. Publish workers/admission and gossip only after
+  durable commit, with **no joined notice**. Repeated/stale actions are no-ops.
+  A live matching attempt defers Allow until it ends; an identity/pin conflict
+  blocks it with a visible diagnostic. Capacity/storage failure leaves the deny
+  and pending record intact with a visible error; no partial install. An old R
+  replay cannot undo Allow; a greater removal establishes a new deny.
+* **Keep removed** durably decides this barrier, retains its deny and hides the
+  prompt. It authors no membership/removal value and propagates nothing; ordinary
+  snapshots still carry R. No newer member or different introducer re-asks for
+  this R, including after restart or retirement/rejoin. Direct token pairing is
+  the way back after this decision unless a newer removal replaces the barrier
+  and a member newer than that removal triggers a new question.
+
+A `member` with no locally denied barrier for its exact key, but a locally denied
+barrier under a **different pin** of the same ID, MUST NOT auto-install or offer
+exact-key Allow. Keep the old barrier and show **{device} has a different
+certificate · Pair with it directly**; direct pairing under the existing
+replacement rules is required. If the exact key itself is denied, use the
+re-admission rule above: historical barriers for other pins of that ID do not
+veto its prompt or explicit Allow. Historical barriers whose deny was already
+cleared do not impose the new-pin guard.
 
 On setup assignment, create a local self member entry with a fresh local
 stamp and, for a computer, a self-written reach record with its current listening
@@ -1170,10 +1234,12 @@ silently upgrades an `ask` link or refreshes a live attempt's captured fence.
    candidates.
 5. For each winning candidate, insert a trust binding **only** if: no row exists
    for that device ID; its pin is not bound to another ID; no terminal deny record
-   exists for that key; and no live local direct pairing attempt targets that ID
-   **or** fingerprint. A preview/unresolved attempt counts; match by pin even
-   before HELLO reveals its ID. Recheck these conditions at commit. A known ID
-   with a different pin, or a pin already owned by another ID, is a blocked
+   exists for that key or a different pin under that ID; and no live local direct
+   pairing attempt targets that ID **or** fingerprint. A denied exact key with a
+   newer member records only the re-admission above, not an installation. A
+   preview/unresolved attempt counts; match by pin even before HELLO reveals its
+   ID. Recheck these conditions at commit. A known ID with a different pin, or a
+   pin already owned by another ID, is a blocked
    introduction, never replacement, UNPAIR or a revocation error. Expose a
    conflict and do not dial it locally. Do not replace a retained
    active identity or publish two active pins for one ID; conflicting candidates
@@ -1203,9 +1269,10 @@ silently upgrades an `ask` link or refreshes a live attempt's captured fence.
    capacity in UI; retry on the normal 60 s storage cadence. On durable failure
    use the same NACK without partial merge. Do not report a capacity problem as
    unauthorized, evict entries, or partially install a prefix of the roster.
-9. Commit winning state, deny/high-water records, clock observation, introduced
-   bindings, provenance, generation changes, teardown/reset intents and the
-   receipt atomically. Where Android DataStore and Room cannot share a transaction,
+9. Commit winning state, deny/high-water and re-admission records, clock
+   observation, introduced bindings, provenance, generation changes, teardown/reset
+   intents and the receipt atomically. Where Android DataStore and Room cannot
+   share a transaction,
    persist an idempotent recovery intent with the authoritative binding update;
    fence removed generations immediately and finish dependent cleanup before ACK.
    Startup MUST finish committed intents before enabling affected workers/content.
@@ -1213,9 +1280,10 @@ silently upgrades an `ask` link or refreshes a live attempt's captured fence.
    without advancing generations or repeating user notifications.
 10. Publish admission-map and worker changes only from committed state, then
     ACK `deduplicated=false`. A crash after commit but before ACK replays safely.
-    Notify once per newly installed binding: **<name> joined**, **Added via
-    <introducer>**, with Remove. Persist the authenticated immediate introducer's
-    ID and display-name hint for the device page, including third-device gossip;
+    Except for re-admission Allow, notify once per newly installed binding:
+    **<name> joined**, **Added via <introducer>**, with Remove. Persist the
+    authenticated immediate introducer's ID and display-name hint for the device
+    page, including third-device gossip;
     this is how it arrived here, not an authenticated original signer. Never
     change it on unchanged replay. Schedule full snapshots to other enabled,
     capable links when the union changes; do not echo unchanged state indefinitely.
@@ -1274,6 +1342,22 @@ provisional pairing refusal while a window is open); retain the introduced row,
 retry with the existing network backoff and continue gossip through any member.
 Do not send PAIR_REQUEST unless a real local attempt exists. Do not infer consent
 or capabilities of an introduced peer until its direct HELLO is authenticated.
+Internal `participating`/`negotiated` flags on introduced bindings remain
+protection flags against destructive failure handling, not connection evidence.
+Expose a separate **HELLO-seen** signal scoped to the current binding generation;
+UI participation/capability claims require that authenticated evidence. **Also
+linked** MUST include a device only after its direct link reached READY in the
+current binding generation; roster installation, HELLO alone and intermediary
+ACKs do not qualify. A never-connected row stays **Not connected yet**; absence
+of HELLO is not evidence that the peer needs an update.
+
+An authenticated `unauthorized` from an introduced peer, before or after READY,
+shows **{device} doesn't recognize this {phone/computer} · Pair with it directly**
+without deleting trust, clearing scope or authoring a removal. Fence that status
+to the captured binding generation; clear it on a successful direct READY.
+Timeouts, route/TLS failures and unauthenticated refusals MUST NOT produce this
+diagnostic. Without authenticated refusal, retain ordinary connection status;
+there is no new admission exception to obtain one.
 
 Readiness evidence starts at zero for introductions and is durable per generation.
 Establish it only by proof of the remote binding's persistence: a known-client
@@ -1309,8 +1393,9 @@ atomically dissolves the setup: clear ID/positive roster, advance setup generati
 retain tombstones/deny history and high-water marks outside peer-cascade deletion.
 Retired history stays local, never exported under a new ID; exact-key barriers
 remain. The device may join or found again; v1 has no **Leave setup** UI.
-Only fresh local token pairing as defined above clears a tombstone; this never
-extends known-certificate recovery to an absent/removed binding.
+Only fresh local token pairing or a local re-admission Allow as defined above
+clears a deny; both retain the removal high-water mark. Neither extends
+known-certificate recovery to an absent/removed binding.
 
 If a still-authorized, authenticated member delivers a tombstone naming the
 receiver's current exact identity, or UNPAIR on a scoped link, the receiver
@@ -1332,8 +1417,9 @@ Offline members learn removals/additions from **any** current scoped member,
 not only the original introducer. A device that has not received the tombstone
 still trusts the removed device. An authorized compromised member can introduce
 more devices until its removal arrives; v1 has no signatures or admin veto.
-A removal is visible and reversible by fresh pairing, not instantaneous global
-revocation or rollback of previously shared content. A per-link MEMBERS ACK
+A removal is visible and reversible by fresh pairing or a local re-admission
+Allow on each holder; it is not instantaneous global revocation or rollback of
+previously shared content. A per-link MEMBERS ACK
 proves durable receipt by that endpoint only, not delivery to every device or
 that a forwarded entry has reached its subject. The UI MAY show waits for known
 unacknowledged members, but MUST NOT claim globally completed removal from those

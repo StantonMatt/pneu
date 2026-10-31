@@ -40,6 +40,7 @@ migration offers only join an advertised ID through an authenticated, mutually
 enabled link; absent/absent does nothing. There is no migration proposer: any
 enabled member advertising S can supply the join. A self-only Link-founded setup
 is normally assigned, with no special replaceability; dissolution is unchanged.
+These migration prompts and bulk actions exclude re-admission records below.
 A token pairing enables only its new link; if it completes while a migration
 join commits on the same device, serialized activation and the MEMBERS ID
 backstop keep conflicting assignments as a direct link, never a merge.
@@ -63,9 +64,38 @@ and introduction, terminal removal takes precedence regardless of a purported
 newer add. Otherwise concurrent additions could defeat removal. A newly
 user-confirmed *local* token attempt after removal (or freshly validated token
 on the acceptor) creates a newer member stamp and retains the removal high-water
-mark;
-no unsigned remote entry proves that fresh pairing occurred. Other devices with
-the tombstone therefore need their own fresh pairing to that same identity.
+mark; no unsigned remote entry proves that fresh pairing occurred. Other holders
+need their own fresh pairing or explicit local **re-admission Allow** for that exact
+key. An eligible MEMBERS member tuple > retained removal R records one durable
+question per `(id, pin, R tuple)`, with the authenticated sender as introducer and
+the tuple-max retained member (reach merges independently). Older/equal members,
+own key and retained receipt replays never prompt. The pending prompt/actions
+are setup-generation fenced; decisions survive restart and retirement/rejoin.
+Dismissal stays pending. Newer removal drops the record; fresh local token
+pairing drops that key's record; retirement discards pending prompts only.
+
+Copy: **{X} was removed from this {phone/computer}. {Y} added it again · Keep
+removed · Allow** (Keep removed initially focused on computers). Allow is per key,
+never bulk migration consent: recheck the same denied R, pending record, setup
+generation, assignment, steps 5/6 and capacity at commit. For this exact-key Allow
+only, exempt R and historical barriers for other pins of this ID from the step-5
+deny check; leave those other denies intact. Clear this key's deny, retain R as
+high-water and install the retained value as an introduction without restamping
+or a joined notice. Commit/worker publication/recovery is atomic as for MEMBERS.
+Keep removed stores a durable decision, authors/propagates nothing and never
+re-asks for R, even on newer members from other senders. Only a newer removal
+then a newer member can ask again; direct pairing remains available. Observing
+or deciding the question alone does not change the gossiped removed value or
+schedule a roster resend. A member lacking its own denied barrier, under an ID
+with a still-denied barrier for another pin, cannot auto-install or prompt for
+exact-key Allow: show **{device} has a different certificate · Pair with it
+directly** and require direct pairing. When the exact key itself is denied,
+historical barriers for other pins do not veto its re-admission prompt or Allow.
+
+Removal still wins if first learned after a newer member or fresh pairing: only
+retained removals, not member stamps, form the removal high-water. If member
+arrives before removal, do not retroactively turn that earlier observation into
+a prompt; a subsequent eligible member merge can ask once for the new barrier.
 Scoped UNPAIR and an own-key tombstone cause only local withdrawal, never a
 reciprocal global removal. A withdrawn device stops sending membership, including
 pending snapshots; peers that already deny its exact key ignore its MEMBERS.
@@ -81,6 +111,15 @@ writer equals the subject ID. Intermediaries preserve it; in v1 an authorized
 malicious intermediary could forge this unsigned assertion. Normal TLS pin
 checks still gate application traffic. Future relay descriptors need a separate
 capability/spec; the currently required empty opaque array reserves their place.
+
+Introduced `participating`/`negotiated` flags remain protection flags. UI uses a
+separate current-binding-generation HELLO-seen signal for participation and
+capabilities, and includes **Also linked** only after direct READY in that
+generation. Never-connected rows say **Not connected yet**, without an inferred
+update warning. Authenticated `unauthorized` from an introduced peer shows
+**{device} doesn't recognize this {phone/computer} · Pair with it directly**,
+keeping trust; timeouts/TLS/route failures do not. Status is generation-fenced
+and clears on direct READY. This adds local state/UI only, no wire change.
 
 ## Current implementation boundaries
 
@@ -181,6 +220,15 @@ for readability; comparison sorts entries by `(device_id, fingerprint)`, ignores
 unknown fields, compares known values and preserves address order. These test
 serialization choices are not a JSON signing/canonicalization scheme.
 
+The supplemental `readmit-vectors.json` sequence snippet accompanies this spec
+change because this branch has neither shared implementation vector file. It
+contains literal MEMBERS payloads plus labeled local actions/expected state
+(test metadata, never wire fields). Its additional D=32 `4`s, pin 64 `d`s (Other PC), is an independently
+authenticated enabled sender already bound at B; `readmission-from-D` proves
+that another sender updates the retained value without replacing introducer A.
+Run the same payloads and sequence assertions on both platforms when importing
+into their shared vector files.
+
 ### setup-id-compatibility
 
 These are nested `setup` HELLO objects, not MEMBERS frames. Both sides evaluate
@@ -227,7 +275,10 @@ A relays B's original writer; writer need not equal transport sender.
 After remove, this higher-HLC add MUST NOT recreate C, advance its binding
 generation, reset unrelated state or clear the terminal barrier. Record a new
 membership receipt (ACK false), retain/gossip removed C at stamp 1800000000010.
-Receiving remove after this vector has the same final removed outcome.
+Also record exactly one pending re-admission for C's key and R, introducer A,
+retained member stamp 1800000000020. Duplicate gossip/restart cannot create a
+second question. Receiving remove after this vector still removes C, but does
+not itself create a question; a subsequent eligible newer member merge does.
 
 ```json
 {"transfer_id":"66666666666666666666666666666666","setup_id":"00000000000000000000000000000000","members":[{"device_id":"11111111111111111111111111111111","fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","role":"phone","name":"Phone","status":"member","hlc":1800000000001,"writer_device":"11111111111111111111111111111111"},{"device_id":"22222222222222222222222222222222","fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","role":"computer","name":"Office PC","status":"member","hlc":1800000000002,"writer_device":"11111111111111111111111111111111"},{"device_id":"33333333333333333333333333333333","fingerprint":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","role":"computer","name":"Laptop","status":"member","hlc":1800000000020,"writer_device":"11111111111111111111111111111111","reach":{"addresses":["192.168.1.12:47821"],"relay":[],"hlc":1800000000004,"writer_device":"33333333333333333333333333333333"}}]}
@@ -330,8 +381,17 @@ unrelated peer isolation. A static codec pass is not runtime pairing proof.
 | --- | --- | --- |
 | Full flow | A paired with B; new C pairs with A using switch on | A exports C only after reciprocal enabled scope; C and B learn each other through A; direct B↔C eventually READY with PEER_SETTINGS defaults. Content still direct. |
 | Stale replay after removal | join → remove → join (retained and evicted receipts) | C stays removed; retained replay ACK true, evicted replay ACK false; no install, settings bootstrap or notice. |
-| Concurrent add/remove | Apply remove and later-introduction in both orders, across restart | Terminal removed result in both orders; a newer add cannot defeat removal. Competing removal stamps use tuple max. Equal tuple/different status malformed with no partial merge. |
-| Fresh re-pair | remove → fresh local token pair C → replay old remove | Local deny cleared only under frozen pairing fence; new member stamp newer; old removal at/below retained high-water ignored. A genuinely newer removal revokes again. A remote higher member alone cannot clear another device's deny. |
+| Concurrent add/remove | Apply remove and later-introduction in both orders, across restart | Deny/removed roster in both orders; removal → member records one pending question without install. Member → previously unseen removal revokes even a newer fresh-pair member; no question until a subsequent eligible member merge (retained receipt replay has no effects). Competing removals use tuple max; equal tuple/different status malformed atomically. |
+| Fresh re-pair | remove → fresh local token pair C → replay old remove | Fresh pairing clears local deny only under its frozen pairing fence and drops that key's re-admission record; new member stamp newer; old removal at/below retained high-water ignored. A genuinely newer removal revokes again. A remote higher member alone cannot clear another device's deny. |
+| Re-admission prompt once | remove → later-introduction; duplicate/new-ID gossip from A and another sender, restart, dismiss/reopen; stale member ≤ R | One durable record/question for R; first authenticated introducer retained, membership tuple-max/reach merged; no install, binding-generation/reset/notice or wire-roster change. Stale/equal member never prompts; retained replay ACK true with no effects, new receipt ACK false. |
+| Re-admission Allow | Pending → Allow twice; replay members and R; greater removal; fail each commit/recovery stage | Install once as introduced, enabled, one generation, original value stamp/provenance and settings defaults, no joined notice. R retained as high-water; replays no-op, greater removal revokes and drops record. Crash recovery never duplicates install or publication. |
+| Allow commit guards | Capacity full; ID/pin conflict; live attempt by ID or pin; action/notification races newer removal or leave/rejoin (including same setup ID) | No partial deny clear/install; capacity/storage failure visible and pending retained; conflict diagnostic; live attempt defers until completion. Stale key/R/generation actions do nothing; notification and in-app actions use identical fences. Phone subjects remain metadata only. |
+| Keep removed | Pending → Keep removed; newer members from multiple senders; restart; dissolve/rejoin; fresh pair; separately removal@…030 → member@…040 | Durable decision never re-asks for R across generations, keeps deny/gossiped R; no authored value or outgoing snapshot from the decision. Fresh pair drops record. Newer removal drops old decision; newer member asks once for the new R. |
+| New-pin guard | Denied C/old pin; member C/new pin without its own denied barrier or a binding; restart/replay; direct pair | No automatic install/dial or exact-key prompt; retain old barrier, diagnose different certificate and require direct pairing under existing replacement/capacity rules. Already-cleared historical barrier alone does not block introduction. |
+| Exact-key Allow after replacement | Join C/old pin → direct token replacement with new pin → remove new pin → newer member for new pin → restart → Allow | Old-pin deny remains throughout. New-pin barrier records one prompt; explicit Allow installs only the new pin, clears only its deny, retains its removal high-water and preserves the old-pin barrier; no joined notice. |
+| Own key never prompts | Own exact-key removal then fresh rejoin; own member with tuple > retained own removal; historical own pins | No re-admission record/prompt or local identity mutation. Current own-key removal withdraws; different-pin own member remains malformed. |
+| Re-admission retirement | Pending and decided records; dissolution/withdrawal then join another or same ID | Pending work discarded/fenced; decisions retained with barriers without retired roster export. New gossip cannot reopen a decided R. |
+| Honest introduced status | Introduce without HELLO; HELLO before READY; READY then reconnect/replacement; authenticated unauthorized; timeout/TLS failure | Protection flags remain effective throughout. UI requires HELLO-seen for participation/capabilities; Also linked requires READY in current binding generation. Unauthorized gives direct-pair diagnostic without trust deletion; timeout/TLS does not. Old-generation events cannot affect replacement; direct READY clears refusal. |
 | Recovery is not fresh consent | Cancelled/lost-result old attempt, known-cert recovery, HELLO after removal | Old attempts/reconnects cannot clear a tombstone or recreate a removed binding; a fresh post-removal locally confirmed token attempt can; no recovery UNPAIR or refreshed install fence. |
 | Reused ID | C exists; incoming same ID/different pin, then removed old pin with newer replacement present | Introduction cannot replace; old-key removal cannot delete replacement. No queue, generation or pin change. |
 | Historical self pins | receiver-certificate-replacement at B; replay/reorder across restart; sender also includes its own old-pin tombstone | Full snapshot accepted, exact old-key barriers retained, current identity/binding unchanged and no withdrawal. Historical role/name may differ. Different-pin member for receiver or mismatched sender member still malformed. Current-key tombstone still withdraws. |
