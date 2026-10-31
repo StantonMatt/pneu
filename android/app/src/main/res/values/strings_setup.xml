@@ -36,7 +36,7 @@
 <string name="setup_phones_dont_connect_page">Phones don\'t connect to each other.</string>
 <string name="setup_paired_only">Paired with %1$s only. It already has its own linked devices.</string>
 <string name="setup_not_linked">%1$s wasn\'t linked. It already has its own linked devices.</string>
-<string name="device_not_connected_yet">Not connected yet</string>
+<string name="device_not_connected_yet">Hasn\'t connected</string>
 <string name="ui_error_link">Couldn\'t link your devices</string>
     <string name="setup_readmission">%1$s was removed from this phone. %2$s added it again</string>
     <string name="setup_readmission_title">%1$s was removed from this phone</string>
@@ -48,4 +48,5 @@
     <string name="setup_readmission_conflict">Device identity already bound · Pair with it directly</string>
     <string name="setup_readmission_attempt">Finish pairing before allowing this device</string>
     <string name="setup_different_certificate">%1$s has a different certificate · Pair with it directly</string>
+    <string name="setup_silent_hint">Open Pneu on %1$s, or pair with it directly</string>
 </resources>

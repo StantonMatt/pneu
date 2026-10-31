@@ -9,30 +9,41 @@ internal object SetupTransactions {
     private val revision=longPreferencesKey("pairingRevision")
     private val deviceId=stringPreferencesKey("deviceId")
     private fun member(p:MutablePreferences,id:String,pin:String,role:String,name:String,now:Long)=
-        MeshClock.next(p,p[deviceId].orEmpty(),false,now).let {SetupMember(id,pin,role,name,"member",it.hlc.toString(),it.source)}
+        MeshClock.next(p,p[deviceId].orEmpty(),false,now).let {
+            val claim=SetupStorage.read(p).barriers["$id/$pin"]?.pairingReadmits
+            SetupMember(id,pin,role,name,"member",it.hlc.toString(),it.source,readmits=claim)
+        }
     fun paired(p:MutablePreferences,state:SetupState,peer:Peer,prior:Peer?,choice:Boolean,fresh:Boolean,selfPin:String?=null,now:Long=System.currentTimeMillis()) {
         require(state.roster.none {it.active && it.fingerprint==peer.pin && it.deviceId!=peer.deviceId}) {"Conflicting peer identity"}
         val key="${peer.deviceId}/${peer.pin}"
         // A confirmed direct pairing supersedes introduction provenance only.
         var next=state.copy(provenance=state.provenance-key)
-        if(state.denies(peer.deviceId,peer.pin)) {
-            check(fresh) {"A fresh confirmed pairing is required after removal"}
-            next=next.copy(barriers=next.barriers+(key to next.barriers.getValue(key).copy(cleared=true,readmission=null)))
+        if(fresh) {
+            // The token path alone originates this assertion, including a cleared high-water.
+            state.barriers[key]?.let {barrier->
+                val claim=MemberReadmits(barrier.removed.hlc,barrier.removed.writer)
+                MeshClock.retain(p,barrier.removed.hlc.toBigInteger())
+                next=next.copy(barriers=next.barriers+(key to barrier.clear().copy(readmission=null,pairingReadmits=claim)))
+                next.member(peer.deviceId)?.takeIf {it.key==key}?.let {old->
+                    val stamp=MeshClock.next(p,p[deviceId].orEmpty(),false,now)
+                    next=next.copy(roster=next.roster.map {if(it.key==key)old.copy(hlc=stamp.hlc.toString(),writer=stamp.source,readmits=listOfNotNull(old.readmits,claim).maxBy {SetupReconcile.stamp(it)}) else it})
+                }
+            }
         }
-        if(fresh && next.barriers[key]?.readmission!=null)
-            next=next.copy(barriers=next.barriers+(key to next.barriers.getValue(key).copy(readmission=null)))
+        if(state.denies(peer.deviceId,peer.pin))check(fresh) {"A fresh confirmed pairing is required after removal"}
         if(next.withdrawn) {
             check(fresh) {"A fresh confirmed pairing is required after withdrawal"}
             val ownKey="${p[deviceId]}/$selfPin"
             val own=next.barriers[ownKey]
-            next=next.copy(withdrawn=false,barriers=if(own!=null)next.barriers+(ownKey to own.copy(cleared=true,readmission=null)) else next.barriers)
+            own?.let {MeshClock.retain(p,it.removed.hlc.toBigInteger())}
+            next=next.copy(withdrawn=false,barriers=if(own!=null)next.barriers+(ownKey to own.clear().copy(readmission=null,pairingReadmits=MemberReadmits(own.removed.hlc,own.removed.writer))) else next.barriers)
         }
         if(prior!=null && prior.pin!=peer.pin && next.member(prior.deviceId)?.fingerprint==prior.pin) {
             val old=next.member(prior.deviceId)!!
             val stamp=MeshClock.next(p,p[deviceId].orEmpty(),false,now)
-            val removal=old.copy(status="removed",hlc=stamp.hlc.toString(),writer=stamp.source,reach=null)
-            next=next.copy(roster=next.roster.filter {it.key!=old.key}+removal,
-                barriers=next.barriers+(old.key to RemovalBarrier(removal)))
+            val removal=old.copy(status="removed",hlc=stamp.hlc.toString(),writer=stamp.source,reach=null,readmits=null)
+            next=next.copy(notices=next.notices.filterNot {it.peerId==old.deviceId},roster=next.roster.filter {it.key!=old.key}+removal,
+                barriers=next.barriers+(old.key to RemovalBarrier(removal,authored=false,revoked_binding=true)))
         }
         // A fresh pair may clear the local deny, but only the authenticated
         // reciprocal HELLO below authorizes exporting the new binding.
@@ -171,7 +182,7 @@ internal object SetupTransactions {
         val installed=plan.installed.associate {peer->peer.deviceId to peer.copy(generation=Math.addExact(generation,1).also {generation=it})}
         val peers=plan.peers.map {installed[it.deviceId] ?: it}
         val notices=installed.values.filter {plan.notifyJoined}.map {peer->SetupNotice("${plan.state.generation}/${peer.deviceId}/${peer.generation}",peer.deviceId,peer.name,
-            peer.addedViaId ?: requireNotNull(sender).deviceId,peer.addedViaName ?: requireNotNull(sender).name,plan.alsoLinked)}
+            peer.addedViaId ?: requireNotNull(sender).deviceId,peer.addedViaName ?: requireNotNull(sender).name,plan.alsoLinked || plan.state.provenance["${peer.deviceId}/${peer.pin}"]?.alsoLinked==true)}
         // A notice belongs to its installed generation, including after remove
         // and re-admission. An old unseen join must never reappear on Allow.
         val retainedNotices=plan.state.notices.filter {notice->peers.any {peer->
@@ -192,8 +203,8 @@ internal object SetupTransactions {
         val target=state.roster.single {it.key==key && it.active}
         check(target.deviceId!=p[deviceId]) {"Cannot remove this device locally"}
         val stamp=MeshClock.next(p,p[deviceId].orEmpty(),false,now)
-        val removed=target.copy(status="removed",hlc=stamp.hlc.toString(),writer=stamp.source,reach=null)
-        var next=state.copy(roster=state.roster.map {if(it.key==key)removed else it},barriers=state.barriers+(key to RemovalBarrier(removed)))
+        val removed=target.copy(status="removed",hlc=stamp.hlc.toString(),writer=stamp.source,reach=null,readmits=null)
+        var next=state.copy(notices=state.notices.filterNot {it.peerId==target.deviceId},roster=state.roster.map {if(it.key==key)removed else it},barriers=state.barriers+(key to RemovalBarrier(removed,authored=true,revoked_binding=true)))
         if(next.roster.none {it.active && it.deviceId!=p[deviceId]})next=SetupReconcile.retire(next,false)
         val peers=PeerRegistry.read(p);val forgotten=peers.filter {it.deviceId==target.deviceId && it.pin==target.fingerprint}
         SetupReconcile.capacity(next,peers-forgotten.toSet())

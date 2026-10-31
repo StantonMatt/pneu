@@ -52,7 +52,7 @@ class SetupReconcileTest {
         assertThrows(IllegalStateException::class.java) {SetupTransactions.paired(p,removed.state,peer,null,true,false,now=now)}
         SetupTransactions.paired(p,removed.state,peer,null,true,true,now=now)
         val revived=SetupStorage.read(p).copy(roster=removed.state.roster.filterNot {it.deviceId==c}+
-            join.members[2].copy(hlc="1800000000021"))
+            join.members[2].copy(hlc="1800000000021",readmits=MemberReadmits("1800000000010",b)))
         val old=plan(revived,listOf(sender,peer),vectors.getValue("remove"))
         assertFalse(old.state.denies(c,pc));assertTrue(old.peers.any {it.deviceId==c})
         val newer=vectors.getValue("remove").copy(members=vectors.getValue("remove").members.map {if(it.deviceId==c)it.copy(hlc="1800000000040") else it})

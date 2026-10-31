@@ -10,13 +10,16 @@ data class SetupHello(val scope:SetupScope,val setupId:String?=null) {
 data class MemberReach(val addresses:List<String>,val hlc:String,val writer:String) {
     fun json()=json("addresses" to addresses,"relay" to emptyList<String>(),"hlc" to hlc.toBigInteger(),"writer_device" to writer)
 }
+data class MemberReadmits(val hlc:String,val writer:String) {
+    fun json()=json("hlc" to hlc.toBigInteger(),"writer_device" to writer)
+}
 data class SetupMember(val deviceId:String,val fingerprint:String,val role:String,val name:String,
-                       val status:String,val hlc:String,val writer:String,val reach:MemberReach?=null) {
+                       val status:String,val hlc:String,val writer:String,val reach:MemberReach?=null,val readmits:MemberReadmits?=null) {
     val key get()="$deviceId/$fingerprint"
     val active get()=status=="member"
     fun json()=json("device_id" to deviceId,"fingerprint" to fingerprint,"role" to role,"name" to name,
-        "status" to status,"hlc" to hlc.toBigInteger(),"writer_device" to writer).apply {reach?.let {add("reach",it.json())}}
-    fun value()=copy(reach=null)
+        "status" to status,"hlc" to hlc.toBigInteger(),"writer_device" to writer).apply {reach?.let {add("reach",it.json())};readmits?.let {add("readmits",it.json())}}
+    fun value()=copy(reach=null,readmits=null)
 }
 data class MembersSnapshot(val transferId:String,val setupId:String,val members:List<SetupMember>) {
     fun json()=json("transfer_id" to transferId,"setup_id" to setupId).apply {
@@ -28,7 +31,8 @@ data class MembersSnapshot(val transferId:String,val setupId:String,val members:
 internal object SetupWire {
     val helloFields=setOf("scope","setup_id")
     val reachFields=setOf("addresses","relay","hlc","writer_device")
-    val memberFields=setOf("device_id","fingerprint","role","name","status","hlc","writer_device","reach")
+    val readmitsFields=setOf("hlc","writer_device")
+    val memberFields=setOf("device_id","fingerprint","role","name","status","hlc","writer_device","reach","readmits")
     private fun text(e:JsonElement?,max:Int,min:Int=1):String {
         require(e is JsonPrimitive && e.isString)
         return e.asString.also {s->
@@ -72,7 +76,12 @@ internal object SetupWire {
                 val relay=r["relay"];require(relay is JsonArray && relay.size()==0)
                 MemberReach(addresses,clock(r["hlc"]),hex(r["writer_device"],32).also {require(it==device)})
             } else null
-            SetupMember(device,pin,role,name,status,hlc,writer,reach)
+            val readmits=if(raw.has("readmits")) {
+                require(status=="member")
+                val r=raw["readmits"];require(r is JsonObject)
+                MemberReadmits(clock(r["hlc"]),hex(r["writer_device"],32))
+            } else null
+            SetupMember(device,pin,role,name,status,hlc,writer,reach,readmits)
         }
         require(members.map {it.key}.distinct().size==members.size)
         require(members.count {it.active}<=17)

@@ -113,7 +113,7 @@ class SetupNotificationsTest {
     @Test fun readmissionNotificationCarriesExactBarrierFencesAndStaleActionsDoNothing()=runBlocking<Unit> {
         fixture {app,p->
             val removed=io.github.stantonmatt.pneu.protocol.SetupMember("e".repeat(32),"e".repeat(64),"computer","Old laptop","removed","10",peer.deviceId)
-            val observation=Readmission(removed.copy(status="member",hlc="20"),peer.deviceId,peer.name,3)
+            val observation=Readmission(removed.copy(status="member",hlc="20",readmits=io.github.stantonmatt.pneu.protocol.MemberReadmits(removed.hlc,removed.writer)),peer.deviceId,peer.name,3)
             val state=p.membership.copy(setupId="f".repeat(32),generation=3,barriers=mapOf(removed.key to RemovalBarrier(removed,readmission=observation)),notices=emptyList())
             app.preferences.edit {SetupStorage.write(it,state)}
             val current=app.preferences.read();val prompt=SetupPresentation.readmissions(current).single()
@@ -163,7 +163,7 @@ class SetupNotificationsTest {
             scheduler.runCurrent()
             val removed=io.github.stantonmatt.pneu.protocol.SetupMember("e".repeat(32),"e".repeat(64),"computer","Old laptop","removed","10",peer.deviceId)
             val state=p.membership.copy(setupId="f".repeat(32),generation=3,roster=listOf(removed),
-                barriers=mapOf(removed.key to RemovalBarrier(removed,readmission=Readmission(removed.copy(status="member",hlc="20"),peer.deviceId,peer.name,3))))
+                barriers=mapOf(removed.key to RemovalBarrier(removed,readmission=Readmission(removed.copy(status="member",hlc="20",readmits=io.github.stantonmatt.pneu.protocol.MemberReadmits(removed.hlc,removed.writer)),peer.deviceId,peer.name,3))))
             app.preferences.edit {SetupStorage.write(it,state)}
             val current=app.preferences.read();val prompt=SetupPresentation.readmissions(current).single()
             SetupNotifications.postReadmission(c,current,prompt)

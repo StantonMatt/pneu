@@ -9,6 +9,7 @@ import androidx.core.content.edit
 import kotlinx.coroutines.flow.MutableStateFlow
 
 /** The row above Remove from all devices or Unpair on a device page. */
+enum class IntroducedStatus { NONE, SILENT, REFUSED }
 enum class LinkRow { NONE, LINK, PENDING, THEIRS, ASKED, UPDATE, SEPARATE }
 /** key: the roster key when the device is one of your devices (Remove from all devices), else a plain pairing. */
 data class SetupPage(val key:String?,val addedVia:String?,val row:LinkRow) {val member get()=key!=null}
@@ -33,6 +34,12 @@ data class SetupUiState(val bannerDismissed:Boolean=false,val linkStarted:Boolea
 
 /** Maps the core's setup state to what the screens show. Pure, so tests can drive every state. */
 internal object SetupPresentation {
+    fun introducedStatus(peer:Peer)=when {
+        peer.addedViaId==null->IntroducedStatus.NONE
+        peer.setupRefused->IntroducedStatus.REFUSED
+        !peer.helloSeen->IntroducedStatus.SILENT
+        else->IntroducedStatus.NONE
+    }
     const val LIMIT=17
     /** Only for wording a separate-setup outcome after a recent pairing, never for join notices. */
     const val PAIR_OUTCOME_WINDOW_MS=10*60*1000L

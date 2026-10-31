@@ -50,7 +50,7 @@ class SetupStorageTest {
     }
     @Test fun readmissionAllowRollsBackEveryStageAndResumesCommittedResetWithoutDuplicatePublication()=runBlocking<Unit>(Dispatchers.IO) {
         val removal=newRow.copy(status="removed",hlc="15",reach=null)
-        val observation=Readmission(newRow.copy(hlc="20"),b,"PC",1)
+        val observation=Readmission(newRow.copy(hlc="20",readmits=io.github.stantonmatt.pneu.protocol.MemberReadmits(removal.hlc,removal.writer)),b,"PC",1)
         val pending=initial.copy(roster=initial.roster+removal,barriers=mapOf(removal.key to RemovalBarrier(removal,readmission=observation)))
         val prompt=SetupReconcile.readmissions(pending).single()
         for(stage in listOf("membersClockStaged","membersPeersStaged","membersResetsStaged","readmissionStaged"))fixture(pending) {p,_->
@@ -194,7 +194,7 @@ class SetupStorageTest {
             receive(p,q);finish(p,q);val installed=p.read()
             val reordered=join.copy(members=join.members.reversed())
             assertTrue(receive(p,q,reordered).first);assertEquals(installed,p.read())
-            for(changed in listOf(newRow.copy(name="Changed"),newRow.copy(hlc="30"),newRow.copy(reach=newRow.reach!!.copy(addresses=listOf("192.168.1.4:47821"))))) {
+            for(changed in listOf(newRow.copy(name="Changed"),newRow.copy(hlc="30"),newRow.copy(readmits=MemberReadmits("15",a)),newRow.copy(reach=newRow.reach!!.copy(addresses=listOf("192.168.1.4:47821"))))) {
                 try {receive(p,q,join.copy(members=listOf(selfRow,senderRow,changed)));fail("Expected ID conflict")}catch(_:SetupReceiptConflict) {}
                 assertEquals(installed,p.read())
             }
@@ -417,6 +417,69 @@ class SetupStorageTest {
             assertEquals("",p.read().membership.sends.getValue(b).pending)
             assertEquals(cSnapshot.toString(),p.read().membership.sends.getValue(c).pending)
             assertEquals("",p.read().membership.sends.getValue(c).acknowledged)
+        }
+    }
+
+    @Test fun inheritedFollowAndBarrierOriginsRollbackAtomicallyAndRecoverWithoutDuplicateInstall()=runBlocking<Unit>(Dispatchers.IO) {
+        val removal=newRow.copy(status="removed",hlc="15",reach=null)
+        val claimed=join.copy(members=listOf(selfRow,senderRow,newRow.copy(hlc="20",readmits=MemberReadmits("15",b))))
+        val inherited=initial.copy(roster=initial.roster+removal,barriers=mapOf(removal.key to RemovalBarrier(removal,authored=false,revoked_binding=false)))
+        for(stage in listOf("membersClockStaged","membersPeersStaged","membersResetsStaged","membersReceiptStaged","membersCommittedInEdit"))fixture(inherited) {p,q->
+            val before=p.read();p.beforeMutation={if(it==stage)error("Injected")}
+            assertThrows(IllegalStateException::class.java) {runBlocking {receive(p,q,claimed)}}
+            p.beforeMutation={};assertEquals(before,p.read())
+        }
+        fixture(inherited) {p,q->
+            p.beforeMutation={if(it=="membersCommitted")error("Crash after commit")}
+            assertThrows(IllegalStateException::class.java) {runBlocking {receive(p,q,claimed)}}
+            p.beforeMutation={};val committed=p.read()
+            assertFalse(committed.membership.denies(c,pc));assertEquals(1,committed.membership.notices.size)
+            assertTrue(SetupReconcile.readmissions(committed.membership).isEmpty())
+            val barrier=committed.membership.barriers.getValue(removal.key)
+            assertEquals(false,barrier.authored);assertEquals(false,barrier.revoked_binding)
+            finish(p,q);assertTrue(receive(p,q,claimed).first)
+            assertEquals(committed.devices,p.read().devices);assertEquals(committed.membership.notices,p.read().membership.notices)
+        }
+        fixture {p,q->
+            val removedSnapshot=join.copy(members=listOf(selfRow,senderRow,removal))
+            val before=p.read();p.beforeMutation={if(it=="membersCommittedInEdit")error("Injected")}
+            assertThrows(IllegalStateException::class.java) {runBlocking {receive(p,q,removedSnapshot)}}
+            p.beforeMutation={};assertEquals(before,p.read())
+            receive(p,q,removedSnapshot)
+            assertEquals(false,p.read().membership.barriers.getValue(removal.key).authored)
+            assertEquals(false,p.read().membership.barriers.getValue(removal.key).revoked_binding)
+        }
+    }
+    @Test fun receiptIdentityIncludesIgnoredSenderClaimAndFutureClaimValidationIsAtomic()=runBlocking<Unit>(Dispatchers.IO) {
+        fixture {p,q->
+            receive(p,q);finish(p,q);val before=p.read()
+            val selfClaim=join.copy(members=join.members.map {if(it.deviceId==b)it.copy(readmits=MemberReadmits("15",a)) else it})
+            assertThrows(SetupReceiptConflict::class.java) {runBlocking {receive(p,q,selfClaim)}}
+            assertEquals(before,p.read())
+            val valid=selfClaim.copy(transferId="5".repeat(32))
+            receive(p,q,valid);finish(p,q)
+            assertNull(p.read().membership.member(b)!!.readmits)
+            val after=p.read();val receipts=q.receiptCount()
+            val future=valid.copy(transferId="6".repeat(32),members=valid.members.map {
+                if(it.deviceId==b)it.copy(readmits=MemberReadmits((now+60001).toString(),a)) else it})
+            assertThrows(MeshViolation::class.java) {runBlocking {receive(p,q,future)}}
+            assertEquals(after,p.read());assertEquals(receipts,q.receiptCount())
+        }
+    }
+
+    @Test fun localRemovalCommitsOriginAndTrustRevocationInTheSameEdit()=runBlocking<Unit>(Dispatchers.IO) {
+        fixture(initial.copy(roster=initial.roster+newRow)) {p,_->
+            val before=p.read()
+            assertThrows(IllegalStateException::class.java) {runBlocking {
+                p.edit {data->SetupTransactions.remove(data,senderRow.key,1,now);error("Fail after staged removal")}
+            }}
+            assertEquals(before,p.read())
+            p.edit {SetupTransactions.remove(it,senderRow.key,1,now)}
+            val removed=p.read()
+            assertTrue(removed.devices.isEmpty())
+            val barrier=removed.membership.barriers.getValue(senderRow.key)
+            assertEquals(true,barrier.authored);assertEquals(true,barrier.revoked_binding)
+            assertTrue(removed.membership.denies(b,pb));assertNull(barrier.removed.readmits)
         }
     }
 

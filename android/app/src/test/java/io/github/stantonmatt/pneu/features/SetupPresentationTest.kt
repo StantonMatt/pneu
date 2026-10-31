@@ -68,7 +68,7 @@ class SetupPresentationTest {
     }
     @Test fun readmissionCopyUsesRemovalNameAndAuthenticatedIntroducer() {
         val removed=member('c',"Old laptop",status="removed")
-        val observation=Readmission(member('c',"Renamed laptop").copy(hlc="2"),pc.deviceId,pc.name,3)
+        val observation=Readmission(member('c',"Renamed laptop").copy(hlc="2",readmits=io.github.stantonmatt.pneu.protocol.MemberReadmits(removed.hlc,removed.writer)),pc.deviceId,pc.name,3)
         val p=prefs(pc,state=linked().copy(barriers=mapOf(removed.key to RemovalBarrier(removed,readmission=observation))))
         val prompt=SetupPresentation.readmissions(p).single()
         assertEquals("Old laptop was removed from this phone. MJStanton-Desktop added it again",SetupPresentation.readmissionText(r,p,prompt))
@@ -220,4 +220,20 @@ class SetupPresentationTest {
         assertTrue(SetupPresentation.atLimit(prefs(state=SetupState("f".repeat(32),1,sixteen+me))))
         assertFalse(SetupPresentation.atLimit(prefs(state=SetupState("f".repeat(32),1,sixteen.map {it.copy(status="removed")}+me))))
     }
+    @Test fun inheritedAndUnclaimedBarriersNeverShowAQuestionAndSilentPeersStayNeutral() {
+        val removed=member('c',"MacBook Air",status="removed")
+        val claimed=member('c',"MacBook Air").copy(hlc="2",readmits=io.github.stantonmatt.pneu.protocol.MemberReadmits(removed.hlc,removed.writer))
+        val record=Readmission(claimed,pc.deviceId,pc.name,3)
+        val inherited=linked().copy(barriers=mapOf(removed.key to RemovalBarrier(removed,readmission=record,authored=false,revoked_binding=true)))
+        assertTrue(SetupPresentation.readmissions(prefs(pc,state=inherited)).isEmpty())
+        val unclaimed=inherited.copy(barriers=mapOf(removed.key to RemovalBarrier(removed,readmission=record.copy(member=claimed.copy(readmits=null)),authored=true)))
+        assertTrue(SetupPresentation.readmissions(prefs(pc,state=unclaimed)).isEmpty())
+        val silent=mac.copy(addedViaId=pc.deviceId,setupSupported=false)
+        assertEquals(IntroducedStatus.SILENT,SetupPresentation.introducedStatus(silent))
+        assertEquals(LinkRow.NONE,SetupPresentation.page(prefs(silent,state=linked(claimed)),silent).row)
+        assertEquals("Hasn't connected",r.getString(io.github.stantonmatt.pneu.R.string.device_not_connected_yet))
+        assertEquals("Open Pneu on MacBook Air, or pair with it directly",r.getString(io.github.stantonmatt.pneu.R.string.setup_silent_hint,mac.name))
+        assertEquals(IntroducedStatus.REFUSED,SetupPresentation.introducedStatus(silent.copy(setupRefused=true)))
+    }
+
 }

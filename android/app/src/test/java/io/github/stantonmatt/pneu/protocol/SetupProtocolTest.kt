@@ -1,6 +1,7 @@
 package io.github.stantonmatt.pneu.protocol
 
 import com.google.gson.*
+import io.github.stantonmatt.pneu.data.*
 import org.junit.Test
 import org.junit.Assert.*
 import java.io.*
@@ -31,6 +32,38 @@ class SetupProtocolTest {
             val payload=fixture.asJsonObject["payload"].toString()
             assertEquals(name,SetupWire.decode(read(payload).body),SetupWire.decode(JsonParser.parseString(payload).asJsonObject))
         }
+    }
+    @Test fun allSharedInvalidClaimsAreRejectedIncludingIgnoredSenderClaims() {
+        val shared=JsonParser.parseReader(javaClass.getResourceAsStream("/readmit-vectors.json")!!.reader()).asJsonObject
+        val base=SetupWire.decode(shared.getAsJsonObject("fixtures").getAsJsonObject("join").getAsJsonObject("payload"))
+        val selfRow=base.members.single {it.deviceId=="2".repeat(32)}
+        val self=SetupIdentity(selfRow.deviceId,selfRow.fingerprint,selfRow.name,selfRow.role)
+        for(raw in shared.getAsJsonArray("invalid_readmits_entries")) {
+            val invalid=raw.asJsonObject
+            for(senderSelf in if(invalid["also_validate_on_sender_self_row"].asBoolean)listOf(false,true) else listOf(false)) {
+                val row=base.members.single {it.deviceId==(if(senderSelf)"3" else "1").repeat(32)}
+                val sender=Peer(row.name,row.fingerprint,row.deviceId,emptyList(),role=row.role,setupDecision=SetupScope.ENABLED)
+                val entries=base.members.filter {it.deviceId!="3".repeat(32)}.joinToString(",") {it.json().toString()}+","+invalid["raw_entry"].asString
+                val payload="""{"transfer_id":"${"f".repeat(32)}","setup_id":"${base.setupId}","members":[$entries]}"""
+                assertThrows("${invalid["name"]} senderSelf=$senderSelf",Exception::class.java) {
+                    SetupReconcile.validate(SetupWire.decode(read(payload).body),self,sender,shared["clock_ms"].asLong)
+                }
+            }
+        }
+    }
+    @Test fun claimsHaveCanonicalEncodingAndIndependentSemanticIdentity() {
+        val shared=JsonParser.parseReader(javaClass.getResourceAsStream("/readmit-vectors.json")!!.reader()).asJsonObject
+        val body=shared.getAsJsonObject("fixtures").getAsJsonObject("later-introduction-claimed").getAsJsonObject("payload")
+        val original=SetupWire.decode(read(body.toString()).body)
+        val member=original.members.single {it.deviceId=="3".repeat(32)}
+        val claim=member.readmits!!
+        assertEquals("""{"hlc":${claim.hlc},"writer_device":"${claim.writer}"}""",claim.json().toString())
+        val reordered=body.toString().replace(claim.json().toString(),"""{ "writer_device" : "${claim.writer}", "future": 1, "hlc": ${claim.hlc} }""")
+        assertEquals(original.canonical(),SetupWire.decode(read(reordered).body).canonical())
+        val unclaimed=original.copy(members=original.members.map {it.copy(readmits=null)})
+        assertNotEquals(original.canonical(),unclaimed.canonical())
+        assertEquals(member.value(),member.copy(readmits=null).value())
+        assertFalse(unclaimed.json().toString().contains("readmits"))
     }
     @Test fun literalInvalidNestedVectorsAreRejectedBeforeMapParsing() {
         val invalid=vectors["invalid"].asJsonArray.map {it.asString}

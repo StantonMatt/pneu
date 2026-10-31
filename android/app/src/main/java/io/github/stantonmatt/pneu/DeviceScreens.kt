@@ -51,7 +51,7 @@ internal data class DeviceLine(val text:String,val tone:LinkTone,val color:Color
         link.connectionStatus==ConnectionStatus.CONNECTING->DeviceLine(resources.getString(R.string.status_connecting),LinkTone.Neutral,c.text2)
         link.connectionStatus==ConnectionStatus.WAITING_WIFI || link.connectionStatus==ConnectionStatus.NO_NETWORK->DeviceLine(UiPresentation.status(context,link.connectionStatus),LinkTone.Neutral,c.text2)
         // Added via another device and not reached yet: it keeps trying, never an error.
-        state.lastSeen==0L && state.peer.addedViaId!=null->DeviceLine(resources.getString(R.string.device_not_connected_yet),LinkTone.Neutral,c.text2)
+        SetupPresentation.introducedStatus(state.peer)==IntroducedStatus.SILENT->DeviceLine(resources.getString(R.string.device_not_connected_yet),LinkTone.Neutral,c.text2)
         else->DeviceLine(lastSeen(context,state.lastSeen),LinkTone.Neutral,c.text2)
     }
 }
@@ -135,7 +135,8 @@ private fun automaticKinds(context:android.content.Context,p:Prefs):String? {
                 val address=UiPresentation.pairedAddress(peer.addresses,link.route)
                 val hint=unreachableHint(status==ConnectionStatus.UNREACHABLE,listOf(peer),p.tailscale)
                 var anywhere by rememberSaveable {mutableStateOf(false)}
-                val detail=if(peer.setupRefused)"" else when(status) {
+                val detail=if(peer.setupRefused)"" else if(SetupPresentation.introducedStatus(peer)==IntroducedStatus.SILENT && status==ConnectionStatus.UNREACHABLE)
+                    resources.getString(R.string.setup_silent_hint,peer.name) else when(status) {
                     ConnectionStatus.PAIRING_LOST->resources.getString(R.string.detail_pairing_lost,peer.name)
                     ConnectionStatus.UPDATE_REQUIRED->resources.getString(R.string.device_update_detail,peer.name)
                     ConnectionStatus.CONNECTED->listOfNotNull(link.route.takeIf(String::isNotEmpty)?.let {UiPresentation.status(context,it)},address).joinToString(" · ")

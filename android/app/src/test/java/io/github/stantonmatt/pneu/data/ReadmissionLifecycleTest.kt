@@ -13,7 +13,7 @@ class ReadmissionLifecycleTest {
     private val self=SetupIdentity(b,"b".repeat(64),"Phone")
     private val sender=Peer("Introducer","a".repeat(64),a,emptyList(),setupDecision=SetupScope.ENABLED)
     private val removal=SetupMember(c,pin,"computer","Laptop","removed","10",b)
-    private val member=removal.copy(status="member",hlc="20",writer=c,reach=MemberReach(listOf("192.168.1.2:47821"),"21",c))
+    private val member=removal.copy(status="member",hlc="20",writer=c,reach=MemberReach(listOf("192.168.1.2:47821"),"21",c),readmits=MemberReadmits(removal.hlc,removal.writer))
     private val base=SetupState("0".repeat(32),7,listOf(SetupMember(b,self.pin,"phone","Phone","member","1",b),SetupMember(a,sender.pin,"computer",sender.name,"member","2",a),removal),
         barriers=mapOf(removal.key to RemovalBarrier(removal)))
     private fun observe(state:SetupState=base,m:SetupMember=member)=SetupReconcile.plan(state,listOf(sender),self,sender,
@@ -109,4 +109,114 @@ class ReadmissionLifecycleTest {
             assertEquals(peer.copy(addedViaId=null),refusedPeer(peer.copy(addedViaId=null),binding,true))
         }
     }
+    @Test fun inheritedFollowDefersBothAttemptTargetsAndReconcilesOnceWithOriginalIntroducer() {
+        val inherited=base.copy(barriers=mapOf(removal.key to RemovalBarrier(removal,authored=false,revoked_binding=true)))
+        for(target in listOf(SetupAttemptTarget(c,"d".repeat(64)),SetupAttemptTarget(null,pin))) {
+            val blocked=SetupReconcile.plan(inherited,listOf(sender),self,sender,
+                MembersSnapshot("f".repeat(32),inherited.setupId!!,listOf(inherited.member(a)!!,member)),target,100)
+            assertTrue(blocked.state.denies(c,pin));assertTrue(blocked.installed.isEmpty())
+            assertTrue(SetupReconcile.readmissions(blocked.state).isEmpty())
+            assertEquals(inherited.roster.toSet(),blocked.state.roster.toSet())
+            val prefs=mutablePreferencesOf(stringPreferencesKey("deviceId") to b)
+            PeerRegistry.write(prefs,listOf(sender));SetupStorage.write(prefs,blocked.state)
+            val released=SetupReconcile.retained(SetupStorage.read(prefs),listOf(sender),b,null)
+            assertFalse(released.state.denies(c,pin));assertEquals(member,released.state.member(c))
+            assertEquals(a,released.installed.single().addedViaId)
+            assertEquals(removal,released.state.barriers.getValue(removal.key).removed)
+            assertEquals(false,released.state.barriers.getValue(removal.key).authored)
+            assertEquals(false,released.state.barriers.getValue(removal.key).revoked_binding)
+            SetupTransactions.commit(prefs,released)
+            assertEquals(1,SetupStorage.read(prefs).notices.size)
+            assertTrue(SetupReconcile.retained(SetupStorage.read(prefs),PeerRegistry.read(prefs),b,null).installed.isEmpty())
+            assertThrows(SetupUnavailable::class.java) {SetupReconcile.retained(SetupReconcile.retire(blocked.state,true),listOf(sender),b,null)}
+        }
+    }
+    @Test fun inheritedFollowKeepsDenyOnConflictsAndCapacityFailureAndHonorsInitialJoinException() {
+        val inherited=base.copy(barriers=mapOf(removal.key to RemovalBarrier(removal,authored=false,revoked_binding=false)))
+        val snapshot=MembersSnapshot("f".repeat(32),inherited.setupId!!,listOf(inherited.member(a)!!,member))
+        for(peer in listOf(Peer("Other ID",pin,"4".repeat(32),emptyList()),Peer("Other pin","d".repeat(64),c,emptyList()))) {
+            val blocked=SetupReconcile.plan(inherited,listOf(sender,peer),self,sender,snapshot,now=100)
+            assertTrue(blocked.state.denies(c,pin));assertTrue(blocked.installed.isEmpty())
+            assertTrue(blocked.state.conflicts.isNotEmpty());assertTrue(SetupReconcile.readmissions(blocked.state).isEmpty())
+        }
+        val full=inherited.copy(roster=inherited.roster+(4..18).map {n->
+            SetupMember(n.toString(16).padStart(32,'0'),n.toString(16).padStart(64,'0'),"phone","Extra","member","1",b)})
+        assertThrows(SetupCapacity::class.java) {SetupReconcile.plan(full,listOf(sender),self,sender,snapshot,now=100)}
+        assertTrue(full.denies(c,pin))
+        val initial=SetupReconcile.plan(inherited.copy(initialSnapshotPending=true),listOf(sender),self,sender,snapshot,now=100)
+        assertTrue(initial.alsoLinked);assertEquals(1,initial.installed.size)
+    }
+    @Test fun retainedOwnClaimProtectsIdentityFromDelayedRemovalWithoutWithdrawal() {
+        val own=base.member(b)!!.copy(readmits=MemberReadmits("10",a))
+        val state=base.copy(roster=listOf(own,base.member(a)!!),barriers=emptyMap())
+        val removed=own.copy(status="removed",hlc="10",writer=a,readmits=null)
+        val plan=SetupReconcile.plan(state,listOf(sender),self,sender,
+            MembersSnapshot("f".repeat(32),state.setupId!!,listOf(state.member(a)!!,removed)),now=100)
+        assertFalse(plan.state.withdrawn);assertEquals(state.setupId,plan.state.setupId)
+        assertFalse(plan.state.denies(b,self.pin));assertEquals(own,plan.state.member(b))
+        assertTrue(plan.removed.isEmpty());assertTrue(plan.removedKeys.isEmpty())
+    }
+    @Test fun freshPairClaimSurvivesDelayedRemovalBeforeReciprocalHello() {
+        val prefs=mutablePreferencesOf(stringPreferencesKey("deviceId") to b)
+        PeerRegistry.write(prefs,listOf(sender));SetupStorage.write(prefs,base)
+        val subject=Peer(member.name,pin,c,emptyList(),setupDecision=SetupScope.ENABLED)
+        SetupTransactions.paired(prefs,base,subject,null,true,true,now=100)
+        val staged=SetupStorage.read(prefs)
+        assertFalse(staged.denies(c,pin));assertNull(staged.member(c))
+        val delayed=SetupReconcile.plan(staged,listOf(sender,subject),self,sender,
+            MembersSnapshot("f".repeat(32),staged.setupId!!,listOf(staged.member(a)!!,removal)),now=100)
+        assertFalse(delayed.state.denies(c,pin));assertTrue(delayed.removedKeys.isEmpty())
+        SetupTransactions.commit(prefs,delayed,sender)
+        SetupTransactions.tokenHello(prefs,DeliveryBinding(b,pin,c,subject.generation),SetupHello(SetupScope.ENABLED,base.setupId),self,100)
+        assertEquals(MemberReadmits("10",b),SetupStorage.read(prefs).member(c)!!.readmits)
+    }
+
+    @Test fun allowedRecordCannotRollBackLaterMemberOrClaimRegisters() {
+        val asked=pending
+        val allowed=SetupReconcile.answer(asked,listOf(sender),b,prompt(asked),true)!!
+        val renamed=member.copy(hlc="25",name="Renamed",readmits=MemberReadmits("12",a))
+        val latest=SetupReconcile.plan(allowed.state,allowed.peers,self,sender,
+            MembersSnapshot("e".repeat(32),base.setupId!!,listOf(base.member(a)!!,renamed)),now=100)
+        val stale=member.copy(hlc="21",readmits=null)
+        val replay=SetupReconcile.plan(latest.state,latest.peers,self,sender,
+            MembersSnapshot("d".repeat(32),base.setupId!!,listOf(base.member(a)!!,stale)),now=100)
+        assertEquals(renamed,replay.state.member(c))
+        assertEquals(latest.peers,replay.peers)
+    }
+
+    @Test fun deferredInitialInheritedFollowRemembersTheJoiningDeviceNoticeException() {
+        val inherited=base.copy(initialSnapshotPending=true,barriers=mapOf(removal.key to RemovalBarrier(removal,authored=false,revoked_binding=false)))
+        val blocked=SetupReconcile.plan(inherited,listOf(sender),self,sender,
+            MembersSnapshot("f".repeat(32),inherited.setupId!!,listOf(inherited.member(a)!!,member)),SetupAttemptTarget(null,pin),100)
+        val prefs=mutablePreferencesOf(stringPreferencesKey("deviceId") to b)
+        PeerRegistry.write(prefs,listOf(sender));SetupStorage.write(prefs,blocked.state)
+        val released=SetupReconcile.retained(SetupStorage.read(prefs),listOf(sender),b,null)
+        SetupTransactions.commit(prefs,released)
+        assertTrue(SetupStorage.read(prefs).notices.single().alsoLinked)
+    }
+
+    @Test fun freshPairWithClearedHighWaterPreservesAHigherIndependentAcceptedClaim() {
+        val accepted=member.copy(readmits=MemberReadmits("30",a))
+        val state=base.copy(roster=base.roster.filterNot {it.key==member.key}+accepted,
+            barriers=mapOf(removal.key to RemovalBarrier(removal,true,authored=false,revoked_binding=false)))
+        val prefs=mutablePreferencesOf(stringPreferencesKey("deviceId") to b)
+        PeerRegistry.write(prefs,listOf(sender));SetupStorage.write(prefs,state)
+        SetupTransactions.paired(prefs,state,Peer(member.name,pin,c,emptyList()),null,true,true,now=100)
+        assertEquals(accepted.readmits,SetupStorage.read(prefs).member(c)!!.readmits)
+    }
+
+    @Test fun freshPairOrdersAfterRetainedHistoryEvenIfTheWallClockMovedBackwards() {
+        val high=removal.copy(hlc="1000000")
+        val state=base.copy(roster=base.roster.filterNot {it.key==high.key}+high,barriers=mapOf(high.key to RemovalBarrier(high)))
+        val prefs=mutablePreferencesOf(stringPreferencesKey("deviceId") to b)
+        PeerRegistry.write(prefs,listOf(sender));SetupStorage.write(prefs,state)
+        val subject=Peer(member.name,pin,c,emptyList(),setupDecision=SetupScope.ENABLED)
+        SetupTransactions.paired(prefs,state,subject,null,true,true,now=0)
+        PeerRegistry.write(prefs,listOf(sender,subject))
+        SetupTransactions.tokenHello(prefs,DeliveryBinding(b,pin,c,subject.generation),SetupHello(SetupScope.ENABLED,state.setupId),self,0)
+        val admitted=SetupStorage.read(prefs).member(c)!!
+        assertEquals(MemberReadmits(high.hlc,high.writer),admitted.readmits)
+        assertTrue(SetupReconcile.stamp(admitted)>SetupReconcile.stamp(high))
+    }
+
 }

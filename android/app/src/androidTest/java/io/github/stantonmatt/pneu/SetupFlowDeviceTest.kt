@@ -95,11 +95,54 @@ class SetupFlowDeviceTest {
         setup {peers,state->
             val generation=state.generation+1
             val removed=SetupMember(mac,"c".repeat(64),"computer","MacBook Air","removed","10",me.deviceId)
-            val retained=removed.copy(status="member",hlc="20",writer=pc,reach=MemberReach(listOf("127.0.0.1:1"),"21",mac))
+            val retained=removed.copy(status="member",hlc="20",writer=pc,reach=MemberReach(listOf("127.0.0.1:1"),"21",mac),readmits=MemberReadmits(removed.hlc,removed.writer))
             peers to state.copy(setupId="f".repeat(32),generation=generation,roster=listOf(me,member(peers.single()),removed),
                 barriers=mapOf(removed.key to RemovalBarrier(removed,readmission=Readmission(retained,pc,"MJStanton-Desktop",generation))))
         }
         return SetupPresentation.readmissions(app.preferences.read()).single()
+    }
+    @Test(timeout=90000) fun unclaimedNewerMemberNeverAsksAndOnlyAuthoredClaimAsks()=runBlocking<Unit> {
+        val prompt=arrangeReadmission()
+        setup {peers,state->peers.map {it.copy(setupDecision=SetupScope.ENABLED)} to state.copy(
+            barriers=state.barriers.mapValues {(_,barrier)->barrier.copy(readmission=null,authored=true,revoked_binding=true)})}
+        val p=app.preferences.read();val sender=p.devices.single();val identity=app.setupIdentity(p)
+        val candidate=prompt.removal.copy(status="member",hlc="20",writer=pc)
+        suspend fun receive(m:SetupMember) {
+            val snap=MembersSnapshot(randomId(),p.membership.setupId!!,listOf(p.membership.member(p.deviceId)!!,member(sender),m))
+            app.receiveSetupMembers(DeliveryBinding(p.deviceId,sender.pin,pc,sender.generation),p.membership.generation,snap.setupId,snap.json(),identity) {true}
+        }
+        launch();waitFor("MJStanton-Desktop")
+        receive(candidate)
+        assertTrue(SetupPresentation.readmissions(app.preferences.read()).isEmpty())
+        compose.waitForIdle();compose.onNodeWithText("Keep removed").assertDoesNotExist()
+        receive(candidate.copy(readmits=MemberReadmits(prompt.removal.hlc,prompt.removal.writer)))
+        waitFor("MacBook Air was removed from this phone. MJStanton-Desktop added it again")
+        compose.onNodeWithText("Keep removed").assertIsDisplayed()
+        compose.onNodeWithText("Allow").assertIsDisplayed()
+    }
+    @Test(timeout=90000) fun inheritedClaimInstallsWithoutDialogAndOldRemovalKeepsTheSameBinding()=runBlocking<Unit> {
+        val prompt=arrangeReadmission()
+        setup {peers,state->peers.map {it.copy(setupDecision=SetupScope.ENABLED)} to state.copy(
+            barriers=state.barriers.mapValues {(_,barrier)->barrier.copy(readmission=null,authored=false,revoked_binding=true)})}
+        val p=app.preferences.read();val sender=p.devices.single();val identity=app.setupIdentity(p)
+        val candidate=prompt.removal.copy(status="member",hlc="20",writer=pc,readmits=MemberReadmits(prompt.removal.hlc,prompt.removal.writer))
+        suspend fun receive(m:SetupMember) {
+            val snap=MembersSnapshot(randomId(),p.membership.setupId!!,listOf(p.membership.member(p.deviceId)!!,member(sender),m))
+            app.receiveSetupMembers(DeliveryBinding(p.deviceId,sender.pin,pc,sender.generation),p.membership.generation,snap.setupId,snap.json(),identity) {true}
+        }
+        receive(candidate)
+        val admitted=app.preferences.read();val peer=admitted.devices.single {it.deviceId==mac}
+        assertEquals(pc,peer.addedViaId);assertFalse(peer.readyObserved)
+        assertFalse(admitted.membership.denies(mac,peer.pin));assertTrue(SetupPresentation.readmissions(admitted).isEmpty())
+        receive(prompt.removal)
+        assertEquals(peer,app.preferences.read().devices.single {it.deviceId==mac})
+        launch();waitFor("MacBook Air")
+        compose.onNodeWithText("Keep removed").assertDoesNotExist()
+        openDevice("MacBook Air")
+        waitFor("Hasn't connected")
+        compose.onNodeWithText("Open Pneu on MacBook Air, or pair with it directly").assertIsDisplayed()
+        compose.onNodeWithText("MacBook Air doesn't recognize this phone",substring=true).assertDoesNotExist()
+        capture("flow-inherited-claim-neutral-page")
     }
     @Test(timeout=90000) fun dismissedMigrationRequestDoesNotHideReadmission()=runBlocking<Unit> {
         arrangeReadmission();askedBy(pc)

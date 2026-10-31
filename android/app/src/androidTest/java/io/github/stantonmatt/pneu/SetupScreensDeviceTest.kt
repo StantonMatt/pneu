@@ -68,6 +68,16 @@ class SetupScreensDeviceTest {
         compose.onNodeWithText("Keep removed").performClick();assertEquals(1,kept);assertEquals(0,allowed)
         compose.onNodeWithText("Allow").performClick();assertEquals(1,allowed)
     }
+    @Test(timeout=60000) fun silentIntroducedPeerHasNeutralCopyWithoutRefusalInBothThemes()=runBlocking<Unit> {
+        val silent=mac.copy(lastConnected=0,addedViaId=pc.deviceId,addedViaName=pc.name,setupSupported=false)
+        val p=prefs(pc,silent,state=linked(member(pc),member(silent)))
+        show {Device(p,silent,LinkState())}
+        compose.onNodeWithText("Hasn't connected").assertIsDisplayed()
+        compose.onNodeWithText("Open Pneu on MacBook Air, or pair with it directly").assertIsDisplayed()
+        compose.onNodeWithText("MacBook Air doesn't recognize this phone",substring=true).assertDoesNotExist()
+        compose.onNodeWithText("Update Pneu on MacBook Air",substring=true).assertDoesNotExist()
+        bothThemes("silent-introduced-page")
+    }
     @Test(timeout=60000) fun authenticatedRefusedIntroducedRowAndPageKeepTrust()=runBlocking<Unit> {
         val refused=mac.copy(lastConnected=0,addedViaId=pc.deviceId,addedViaName=pc.name,setupSupported=false,setupRefused=true)
         val p=prefs(pc,refused,state=linked(member(pc),member(refused)))
@@ -83,7 +93,7 @@ class SetupScreensDeviceTest {
     }
     @Test(timeout=60000) fun readmissionNotificationUsesTheLinkRequestsChannel()=runBlocking<Unit> {
         val removed=member(mac).copy(status="removed",hlc="10",reach=null)
-        val state=linked(member(pc),removed).copy(barriers=mapOf(removed.key to RemovalBarrier(removed,readmission=Readmission(member(mac).copy(hlc="20"),pc.deviceId,pc.name,3))))
+        val state=linked(member(pc),removed).copy(barriers=mapOf(removed.key to RemovalBarrier(removed,readmission=Readmission(member(mac).copy(hlc="20",readmits=io.github.stantonmatt.pneu.protocol.MemberReadmits(removed.hlc,removed.writer)),pc.deviceId,pc.name,3))))
         val p=prefs(pc,state=state);val prompt=SetupPresentation.readmissions(p).single()
         // Give the notification collector the same durable state as the fixture.
         app.preferences.store.edit {SetupStorage.write(it,state)}
@@ -266,7 +276,7 @@ class SetupScreensDeviceTest {
         compose.onNodeWithText("Phones don't connect to each other").assertIsDisplayed()
         bothThemes("home-also-linked")
         links=mapOf(pc.deviceId to wifi);compose.waitForIdle()
-        compose.onNodeWithText("Not connected yet").assertIsDisplayed()
+        compose.onNodeWithText("Hasn't connected").assertIsDisplayed()
         bothThemes("home-not-connected-yet")
     }
     @Test(timeout=60000) fun requestDialogNamesEveryDeviceThatAsked()=runBlocking<Unit> {

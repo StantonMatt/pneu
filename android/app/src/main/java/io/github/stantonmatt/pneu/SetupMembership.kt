@@ -106,7 +106,7 @@ internal suspend fun AppGraph.reconcileSetupCandidatesLocked() {
     if(state.setupId==null || state.withdrawn)return
     val attempt=connection.attempt.value?.let {SetupAttemptTarget(it.deviceId,it.invitation.fingerprint)}
     val plan=SetupReconcile.retained(state,p.devices,p.deviceId,attempt)
-    if(plan.installed.isEmpty())return
+    if(plan.installed.isEmpty() && plan.state==state)return
     preferences.policy.locked {preferences.edit {data->
         val current=SetupStorage.read(data)
         if(current.generation!=state.generation)return@edit

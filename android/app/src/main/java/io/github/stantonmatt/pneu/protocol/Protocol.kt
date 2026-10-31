@@ -109,6 +109,7 @@ object Protocol {
                 val nested=when(name.takeIf {fields!=null && name in fields}) {
                     "setup" -> SetupWire.helloFields
                     "reach" -> SetupWire.reachFields
+                    "readmits" -> SetupWire.readmitsFields
                     else -> null
                 }
                 val value=readValue(reader,nested,if(fields!=null && name in fields)name else "")

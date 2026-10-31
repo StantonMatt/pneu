@@ -288,7 +288,7 @@ class SetupFixesTest {
                     if(fresh) {
                         assertNotNull("Fresh confirmation must survive dial reconciliation",graph.connection.attempt.value)
                         assertTrue(graph.installBinding(invitation,b))
-                        assertEquals(barrier.copy(cleared=true),p.read().membership.barriers.getValue(remote.key))
+                        assertEquals(barrier.clear().copy(pairingReadmits=MemberReadmits(barrier.removed.hlc,barrier.removed.writer)),p.read().membership.barriers.getValue(remote.key))
                         assertEquals(peer.pin,p.read().devices.single {it.deviceId==b}.pin)
                     } else {
                         assertNull("Pre-removal attempt must be cancelled",graph.connection.attempt.value)
