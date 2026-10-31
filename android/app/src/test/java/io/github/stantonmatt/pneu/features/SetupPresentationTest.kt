@@ -102,11 +102,27 @@ class SetupPresentationTest {
         // The PC linked; the Mac hasn't answered yet.
         val oneLeft=after.copy(membership=linked(member('b',pc.name),generation=4))
         assertEquals(LinkBanner.Waiting(listOf(mac.name)),SetupPresentation.banner(oneLeft,SetupUiState(linkStarted=true)))
-        val done=after.copy(membership=linked(member('b',pc.name),member('c',mac.name),generation=4))
+        val done=after.copy(peers=after.devices.map {it.copy(remoteSetupScope=SetupScope.ENABLED)},membership=linked(member('b',pc.name),member('c',mac.name),generation=4))
         assertNull(SetupPresentation.banner(done,SetupUiState(linkStarted=true)))
         assertEquals(SetupNews.Linked,SetupPresentation.news(done,SetupUiState(linkStarted=true),0))
         assertNull(SetupPresentation.news(done,SetupUiState(),0))
         assertNull("Still waiting",SetupPresentation.news(oneLeft,SetupUiState(linkStarted=true),0))
+    }
+    @Test fun theLastDeclineSettlesTheLinkWithoutClaimingSuccess() {
+        val start=prefs(pc,mac)
+        val ui=SetupUiState(linkStarted=true,linkTargets=SetupPresentation.linkTargets(start,pc.deviceId))
+        val allowed=pc.copy(setupDecision=SetupScope.ENABLED,remoteSetupScope=SetupScope.ENABLED)
+        val declined=mac.copy(setupDecision=SetupScope.ENABLED,remoteSetupScope=SetupScope.DISABLED)
+        val p=prefs(allowed,declined,state=linked(member('b',pc.name)))
+        assertTrue(SetupPresentation.linkSettled(p))
+        assertNull(SetupPresentation.banner(p,ui))
+        assertNull(SetupPresentation.news(p,ui,0))
+        // Even a retained roster member or a removed target cannot turn a decline into success.
+        assertNull(SetupPresentation.news(p.copy(membership=linked(member('b',pc.name),member('c',mac.name))),ui,0))
+        assertFalse(SetupPresentation.linkSucceeded(p.copy(peers=listOf(allowed)),ui))
+        val all=prefs(allowed,declined.copy(remoteSetupScope=SetupScope.ENABLED),state=linked(member('b',pc.name),member('c',mac.name)))
+        assertEquals(SetupNews.Linked,SetupPresentation.news(all,ui,0))
+        assertFalse(SetupPresentation.linkSucceeded(all.copy(peers=all.devices.map {it.copy(remoteSetupScope=null)}),ui))
     }
     @Test fun requestsNameTheDevicesThatAsked() {
         assertEquals("MJStanton-Desktop wants to link your devices",SetupPresentation.requestTitle(r,listOf(pc.name)))

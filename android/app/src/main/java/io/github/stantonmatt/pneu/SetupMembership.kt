@@ -23,12 +23,12 @@ suspend fun AppGraph.linkExistingDevice(confirmed:ConfirmedBinding,displayedProm
     preferences.requestSetupLink(confirmed,displayedPrompts);retrySetupLinks()
 }}
 suspend fun AppGraph.answerSetupPrompt(prompt:SetupPrompt,allow:Boolean)=withContext(Dispatchers.IO) {withBindingLifecycle {
-    preferences.answerSetupPrompt(prompt,allow);if(allow)retrySetupLinks() else connection.retryPeer(prompt.pin)
+    preferences.answerSetupPrompt(prompt,allow);if(allow)retrySetupLinks() else connection.refreshSetupPeer(prompt.pin)
 }}
 private const val LINK_DISCOVERY_MS=3000L
 internal suspend fun AppGraph.retrySetupLinks() {
     val p=preferences.read()
-    p.devices.filter {peer->peer.setupScope==SetupScope.ENABLED || p.membership.prompts.any {it.allowRequested && it.peerId==peer.deviceId}}.forEach {connection.retryPeer(it.pin)}
+    p.devices.filter {peer->peer.setupScope==SetupScope.ENABLED || p.membership.prompts.any {it.allowRequested && it.peerId==peer.deviceId}}.forEach {connection.refreshSetupPeer(it.pin)}
 }
 /** One task per durable action. Restart gives it a new full discovery window;
  * observations do not restart the timer, and no lifecycle lock spans the delay. */

@@ -75,10 +75,10 @@ class FifteenthReviewDeviceTest {
     @Test(timeout=25000) fun addingDialogAndRetryKeepTheConfirmedBinding()=runBlocking<Unit> {
         val proposed=raw("Proposed",'e')
         c.startActivity(Intent(Intent.ACTION_VIEW,Uri.parse(proposed),c,MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
-        assertTrue(visible("Add Proposed?"));bind("Replacement",'c');val replacement=app.preferences.read();delay(200)
-        assertTrue(visible("Add Proposed?"));click("Add")
+        assertTrue(visible("Pair with Proposed?"));bind("Replacement",'c');val replacement=app.preferences.read();delay(200)
+        assertTrue(visible("Pair with Proposed?"));click("Pair")
         assertTrue(visible("Couldn't start pairing"));assertNull(app.connection.attempt.value?.invitation);assertEquals(replacement.peer,app.preferences.read().peer)
-        click("Try again");assertTrue(visible("Add Proposed?"));click("Cancel")
+        click("Try again");assertTrue(visible("Pair with Proposed?"));click("Cancel")
     }
     @Test(timeout=15000) fun queueActionsNeverExpandTheirSelectionOrRemoveNewerRows()=runBlocking<Unit> {
         val first=item();val second=item();val selected=ConfirmedQueue.from(app.preferences.read(),listOf(first,second));val later=item()

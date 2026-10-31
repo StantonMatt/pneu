@@ -85,7 +85,7 @@ internal data class HomeSetup(val banner:LinkBanner?=null,val phones:List<PhoneM
         when(page.row) {
             LinkRow.LINK->line(link,titleColor=c.accentText,click=actions.link)
             LinkRow.PENDING->line(link,resources.getString(R.string.setup_row_pending,name))
-            LinkRow.THEIRS->line(resources.getString(R.string.setup_row_theirs,name))
+            LinkRow.THEIRS->line(link,resources.getString(R.string.setup_row_theirs,name))
             LinkRow.ASKED->line(resources.getString(R.string.setup_row_asked)) {
                 Text(resources.getString(R.string.action_allow),Modifier.clip(RoundedCornerShape(10.dp)).pneuClick(onClick=actions.allow)
                     .heightIn(min=48.dp).padding(horizontal=10.dp).wrapContentHeight().semantics {role=Role.Button},style=PneuType.button,color=c.accentText)

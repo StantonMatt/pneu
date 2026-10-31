@@ -61,9 +61,8 @@ class MultiComputerReviewTest {
             assertEquals(200L,preferences.read().lastConnected)
         }finally {owner.cancel();owner.coroutineContext[Job]?.join();file.delete()}
     }
-    @Test fun pairingUsesAddWordingAndNeverPromisesToReplaceAnotherDevice()=runBlocking<Unit>(Dispatchers.IO) {
-        assertEquals("Add B?",context.getString(R.string.pair_add_title,"B"))
-        assertEquals("Add",context.getString(R.string.action_add))
+    @Test fun pairingUsesPairWordingAndNeverPromisesToReplaceAnotherDevice()=runBlocking<Unit>(Dispatchers.IO) {
+        assertEquals("Pair",context.getString(R.string.action_pair))
         assertEquals("Pair with B?",context.getString(R.string.pair_confirm_title,"B"))
         assertEquals(a.generation,ConfirmedBinding.from(prefs).revision)
         assertEquals(b.generation,ConfirmedBinding.from(prefs,b.deviceId).revision)

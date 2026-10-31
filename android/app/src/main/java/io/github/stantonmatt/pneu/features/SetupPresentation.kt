@@ -29,7 +29,7 @@ sealed interface SetupNews {
 
 /** UI-only memory. The core's durable state stays authoritative for what is linked. */
 data class SetupUiState(val bannerDismissed:Boolean=false,val linkStarted:Boolean=false,
-    val joinedPin:String="",val joinedAt:Long=0,val seenWithdrawal:Long=0,val announcedSeparate:Set<String> = emptySet())
+    val linkTargets:Set<String> = emptySet(),val joinedPin:String="",val joinedAt:Long=0,val seenWithdrawal:Long=0,val announcedSeparate:Set<String> = emptySet())
 
 /** Maps the core's setup state to what the screens show. Pure, so tests can drive every state. */
 internal object SetupPresentation {
@@ -84,6 +84,14 @@ internal object SetupPresentation {
     fun linked(p:Prefs)=active(p) && p.membership.roster.any {it.active && it.deviceId!=p.deviceId}
     /** A Link this phone started has nothing left to wait for. */
     fun linkSettled(p:Prefs)=waiting(p).isEmpty() && undecided(p).isEmpty() && prompts(p).isEmpty()
+    private fun linkKey(peer:Peer)="${peer.deviceId}/${peer.pin}/${peer.generation}"
+    fun linkTargets(p:Prefs,selected:String?)=p.devices.filter {it.setupScope==SetupScope.ASK || it.setupScope==SetupScope.ENABLED || it.deviceId==selected}.map(::linkKey).toSet()
+    /** Every binding included in this Link must actually participate; a decline is settled, not success. */
+    fun linkSucceeded(p:Prefs,ui:SetupUiState):Boolean {
+        val targets=ui.linkTargets.ifEmpty {p.devices.filter {it.setupScope==SetupScope.ENABLED}.map(::linkKey).toSet()}
+        return targets.isNotEmpty() && targets.all {key->p.devices.any {peer->linkKey(peer)==key &&
+            peer.setupScope==SetupScope.ENABLED && peer.remoteSetupScope==SetupScope.ENABLED && participating(p,peer)}}
+    }
     fun atLimit(p:Prefs)=p.membership.roster.count {it.active}>=LIMIT
     fun notices(p:Prefs)=p.membership.notices.filter {notice->notice.peerId !in p.resetPeers && p.devices.any {it.deviceId==notice.peerId}}
     private fun recentPairVia(p:Prefs,ui:SetupUiState,now:Long)=
@@ -102,7 +110,7 @@ internal object SetupPresentation {
             val peer=p.devices.find {it.deviceId==notice.peerId}
             return SetupNews.Joined(notice,peer?.let {memberKey(p,it)})
         }
-        return if(ui.linkStarted && linkSettled(p) && linked(p))SetupNews.Linked else null
+        return if(ui.linkStarted && linkSettled(p) && linkSucceeded(p,ui))SetupNews.Linked else null
     }
 
     fun names(r:Resources,names:List<String>)=when(names.size) {
@@ -141,12 +149,12 @@ internal class SetupUiStore private constructor(context:Context) {
         presentedNotices.value=next
     }
     private fun read()=SetupUiState(prefs.getBoolean("bannerDismissed",false),prefs.getBoolean("linkStarted",false),
-        prefs.getString("joinedPin","").orEmpty(),prefs.getLong("joinedAt",0),prefs.getLong("seenWithdrawal",0),prefs.getStringSet("announcedSeparate",emptySet()).orEmpty().toSet())
+        prefs.getStringSet("linkTargets",emptySet()).orEmpty().toSet(),prefs.getString("joinedPin","").orEmpty(),prefs.getLong("joinedAt",0),prefs.getLong("seenWithdrawal",0),prefs.getStringSet("announcedSeparate",emptySet()).orEmpty().toSet())
     @Synchronized fun update(change:(SetupUiState)->SetupUiState) {
         val next=change(state.value)
         if(next==state.value)return
         prefs.edit {
-            putBoolean("bannerDismissed",next.bannerDismissed);putBoolean("linkStarted",next.linkStarted)
+            putBoolean("bannerDismissed",next.bannerDismissed);putBoolean("linkStarted",next.linkStarted);putStringSet("linkTargets",next.linkTargets)
             putString("joinedPin",next.joinedPin);putLong("joinedAt",next.joinedAt);putLong("seenWithdrawal",next.seenWithdrawal)
             putStringSet("announcedSeparate",next.announcedSeparate)
         }

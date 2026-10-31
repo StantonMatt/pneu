@@ -1,4 +1,5 @@
 <resources>
+<string name="channel_setup_requests">Link requests</string>
 <!-- Pair once, join your devices. The screens never say "setup": they say "your devices" and "linked". -->
 <string name="setup_link_switch">Also link with your other devices</string>
 <string name="setup_link_limit">Your devices are at the limit of %1$d</string>

@@ -55,6 +55,8 @@ class SetupNotificationsTest {
             assertEquals(listOf(notice),app.preferences.read().membership.notices)
             assertTrue(posted.isEmpty());assertTrue(c.setupUi.notifiedPrompts.value.isEmpty());assertEquals(0,shadow.size())
             shadow.setNotificationsEnabled(true)
+            nm.deleteNotificationChannel("setup_requests")
+            nm.createNotificationChannel(NotificationChannel("setup_requests","Link requests",NotificationManager.IMPORTANCE_NONE))
             nm.deleteNotificationChannel("alerts")
             nm.createNotificationChannel(NotificationChannel("alerts","Alerts",NotificationManager.IMPORTANCE_NONE))
             assertFalse(SetupNotifications.canPost(c))
@@ -85,6 +87,17 @@ class SetupNotificationsTest {
             resetUiStore() // A recreated store must still suppress the displayed notice.
             assertTrue(notice.id in c.setupUi.presentedNotices.value)
         }
+    }
+    @Test fun requestsHaveTheirOwnExplicitGroupAndKeepBothActions() {
+        SetupNotifications.channel(c)
+        val prompt=SetupPrompt(peer.deviceId,peer.pin,1,0,peer.name)
+        SetupNotifications.postRequest(c,Prefs(peers=listOf(peer)),listOf(prompt))
+        val n=shadow.getNotification(SetupNotifications.REQUEST,0)
+        assertEquals("setup_requests",n.group)
+        assertEquals("setup_requests",n.channelId)
+        assertEquals(NotificationManager.IMPORTANCE_HIGH,nm.getNotificationChannel(n.channelId).importance)
+        assertFalse(n.flags and Notification.FLAG_GROUP_SUMMARY!=0)
+        assertEquals(listOf("Allow","Don't allow"),n.actions.map {it.title.toString()})
     }
     @Test fun repeatedJoinPostsUseTheSameIdentityAndOnlyAlertOnce() {
         SetupNotifications.channel(c)

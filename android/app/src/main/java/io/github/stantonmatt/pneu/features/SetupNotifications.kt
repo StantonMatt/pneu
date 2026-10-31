@@ -14,16 +14,20 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 
 /** Joins and link requests. With Pneu in front it shows them itself (Home's snackbar, the
- * request dialog); otherwise they are notifications on the existing Alerts channel. */
+ * request dialog); link requests have a separate, prominent channel so warnings cannot bury their actions. */
 internal object SetupNotifications {
     private const val CHANNEL="alerts"
+    private const val REQUEST_CHANNEL="setup_requests"
     const val REQUEST="setup_request"
     const val ACTION_ALLOW="io.github.stantonmatt.pneu.SETUP_ALLOW"
     const val ACTION_DENY="io.github.stantonmatt.pneu.SETUP_DENY"
     const val ACTION_DISMISS="io.github.stantonmatt.pneu.SETUP_DISMISS"
     fun joinedTag(id:String)="setup_joined:$id"
-    fun channel(context:Context)=context.getSystemService(NotificationManager::class.java)
-        .createNotificationChannel(NotificationChannel(CHANNEL,context.getString(R.string.channel_alerts),NotificationManager.IMPORTANCE_DEFAULT))
+    fun channel(context:Context) {
+        val nm=context.getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannel(NotificationChannel(CHANNEL,context.getString(R.string.channel_alerts),NotificationManager.IMPORTANCE_DEFAULT))
+        nm.createNotificationChannel(NotificationChannel(REQUEST_CHANNEL,context.getString(R.string.channel_setup_requests),NotificationManager.IMPORTANCE_HIGH))
+    }
     /** Opens a page in Pneu; remove also asks to remove the device, cancel clears this notification. */
     fun pageIntent(context:Context,page:String,remove:String?=null,cancel:String?=null)=Intent(context,MainActivity::class.java)
         .setIdentifier("setup:$page:${remove.orEmpty()}:${cancel.orEmpty()}").putExtra("page",page).putExtra("remove",remove).putExtra("cancel",cancel)
@@ -52,7 +56,7 @@ internal object SetupNotifications {
         if(!p.loaded)return
         val prompts=SetupPresentation.prompts(p);val keys=prompts.map(SetupPresentation::promptKey)
         if(prompts.isEmpty()) {nm.cancel(REQUEST,0);ui.notifiedPrompts.value=emptySet()}
-        else if(canPost(context) && !front && keys.any {it !in dismissed} && keys.toSet()!=ui.notifiedPrompts.value) {
+        else if(canPost(context,REQUEST_CHANNEL) && !front && keys.any {it !in dismissed} && keys.toSet()!=ui.notifiedPrompts.value) {
             postRequest(context,p,prompts)
             ui.notifiedPrompts.value=keys.toSet()
         }
@@ -66,16 +70,17 @@ internal object SetupNotifications {
             app.dismissSetupNotices(setOf(notice.id))
         }
     }
-    internal fun canPost(context:Context)=NotificationManagerCompat.from(context).areNotificationsEnabled() &&
-        (context.getSystemService(NotificationManager::class.java).getNotificationChannel(CHANNEL)?.importance ?: NotificationManager.IMPORTANCE_NONE)>NotificationManager.IMPORTANCE_NONE
+    internal fun canPost(context:Context,channel:String=CHANNEL)=NotificationManagerCompat.from(context).areNotificationsEnabled() &&
+        (context.getSystemService(NotificationManager::class.java).getNotificationChannel(channel)?.importance ?: NotificationManager.IMPORTANCE_NONE)>NotificationManager.IMPORTANCE_NONE
     /** {device} wants to link your devices · Allow · Don't allow. Swiping it away leaves it waiting. */
     fun postRequest(context:Context,p:Prefs,prompts:List<SetupPrompt>) {
         val keys=prompts.map(SetupPresentation::promptKey)
         val title=SetupPresentation.requestTitle(context.resources,SetupPresentation.promptNames(p,prompts))
         val text=context.getString(R.string.setup_request_text)
-        context.getSystemService(NotificationManager::class.java).notify(REQUEST,0,NotificationCompat.Builder(context,CHANNEL).setSmallIcon(R.drawable.ic_stat_pneu).setColor(0xFF4F5BFF.toInt())
+        context.getSystemService(NotificationManager::class.java).notify(REQUEST,0,NotificationCompat.Builder(context,REQUEST_CHANNEL).setSmallIcon(R.drawable.ic_stat_pneu).setColor(0xFF4F5BFF.toInt())
             .setContentTitle(title).setContentText(text).setStyle(NotificationCompat.BigTextStyle().setBigContentTitle(title).bigText(text))
             .setContentIntent(activity(context,Intent(context,MainActivity::class.java).putExtra("home",true)))
+            .setPriority(NotificationCompat.PRIORITY_HIGH).setGroup("setup_requests").setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_ALL)
             .setDeleteIntent(broadcast(context,ACTION_DISMISS,keys)).setOnlyAlertOnce(true).setAutoCancel(true)
             .addAction(0,context.getString(R.string.action_allow),broadcast(context,ACTION_ALLOW,keys))
             .addAction(0,context.getString(R.string.action_dont_allow),broadcast(context,ACTION_DENY,keys)).build())

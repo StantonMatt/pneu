@@ -21,6 +21,7 @@ internal class LocalPeerFixture(private val app:AppGraph,
     private val capabilities:Set<String> = setOf("files","clipboard_text","clipboard_image"),
     private val helloVersion:Int=1,
     private val helloError:String?=null,
+    private val beforeHello:()->Unit={},
     private val handle:(Frame.Control,(Frame.Control)->Unit)->Boolean={_,_->false}):AutoCloseable {
     private val alias=TlsIdentity.aliasFor(randomId())
     private val identity=TlsIdentity(alias,create=true)
@@ -73,7 +74,7 @@ internal class LocalPeerFixture(private val app:AppGraph,
             ssl.enabledProtocols=arrayOf("TLSv1.3");ssl.useClientMode=false;ssl.needClientAuth=true;ssl.soTimeout=30000;ssl.startHandshake()
             val hello=Protocol.read(ssl.inputStream) as Frame.Control
             check(hello.type==Type.HELLO)
-            hellos.incrementAndGet()
+            hellos.incrementAndGet();beforeHello()
             val selected=requireNotNull(peer)
             val output=ssl.outputStream
             val send:(Frame.Control)->Unit={frame->synchronized(output) {Protocol.write(output,frame)}}

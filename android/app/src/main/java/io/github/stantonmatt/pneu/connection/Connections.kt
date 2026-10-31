@@ -25,6 +25,8 @@ class Connections(private val app:AppGraph) {
     @Volatile private var pairingResult:LinkState?=null
     @Volatile private var pairingPin:String?=null
     private var job:Job?=null
+    private var owner:CoroutineScope?=null
+    private val setupRefresh=SetupRefreshDisplay()
     private val watchers=mutableMapOf<String,Job>()
     private var stopped:List<ConnectionManager> = emptyList()
     val connected get()=workers.values.any {it.connected}
@@ -45,11 +47,16 @@ class Connections(private val app:AppGraph) {
     fun cellular()=connectivity().mobile
     private fun publish() {
         val p=app.prefs.value
-        devices.value=p.devices.associate {it.deviceId to (workers[it.pin]?.state?.value ?: LinkState(if(it.pairingLost)"Pairing lost" else "PC unreachable"))}
-        state.value=LinkProjection.aggregate(p,workers.mapValues {it.value.state.value},pairingResult,pairingPin,attempt.value)
+        val display=p.devices.associate {peer->
+            val live=workers[peer.pin]?.state?.value ?: LinkState(if(peer.pairingLost)"Pairing lost" else "PC unreachable")
+            peer.pin to if(peer.deviceId in p.resetPeers)live else setupRefresh.project(peer,live,android.os.SystemClock.elapsedRealtime())
+        }
+        devices.value=p.devices.associate {it.deviceId to display.getValue(it.pin)}
+        state.value=LinkProjection.aggregate(p,workers.mapValues {it.value.state.value}+display,pairingResult,pairingPin,attempt.value)
     }
     fun start(scope:CoroutineScope) {
         if(job?.isActive==true) {publish();return}
+        owner=scope
         val previous=job
         job=scope.launch {
             previous?.join();workers=emptyMap();watchers.clear();app.initialized.await()
@@ -81,6 +88,15 @@ class Connections(private val app:AppGraph) {
     fun kick()=workers.values.forEach {it.kick()}
     fun retry()=workers.values.forEach {it.retry()}
     fun retryPeer(pin:String?) {workers[pin]?.retry()}
+    internal fun expectSetupRefresh(pin:String?) {
+        val peer=app.prefs.value.devices.find {it.pin==pin} ?: return
+        val worker=workers[peer.pin] ?: return
+        if(!worker.connected)return
+        if(setupRefresh.begin(peer,worker.state.value,android.os.SystemClock.elapsedRealtime()))owner?.launch {
+            delay(SetupRefreshDisplay.GRACE_MS);publish()
+        }
+    }
+    internal fun refreshSetupPeer(pin:String) {expectSetupRefresh(pin);retryPeer(pin)}
     internal fun pairingFailed(status:ConnectionStatus) {pairingResult=LinkState.pairingFailure(status);publish()}
     internal fun pairingFailed(message:String) {pairingResult=LinkState(pairing=message);publish()}
     internal fun clearPairingResult(pin:String?=null) {
@@ -101,7 +117,7 @@ class Connections(private val app:AppGraph) {
     fun cancelTransfer(mediaId:String,peerId:String?=null)=workers.filterKeys {peerId==null || app.prefs.value.devices.find {peer->peer.deviceId==peerId}?.pin==it}.values.forEach {it.cancelTransfer(mediaId)}
     suspend fun unpair(expected:ConfirmedBinding=ConfirmedBinding.from(app.prefs.value),setupMember:ConfirmedSetupMember?=null):Boolean =
         workers[expected.pin]?.unpair(expected,setupMember) ?: app.forgetBinding(confirmed=expected,setupMember=setupMember)
-    fun stop() {stopped=workers.values.toList();stopped.forEach {it.stop()};job?.cancel();workers=emptyMap();publish()}
+    fun stop() {setupRefresh.clear();stopped=workers.values.toList();stopped.forEach {it.stop()};job?.cancel();workers=emptyMap();publish()}
     internal suspend fun awaitStopped() {job?.join();stopped.forEach {it.awaitStopped()}}
     internal val discoveryActive get()=workers.values.any {it.discoveryActive}
     internal val multicastHeld get()=workers.values.any {it.multicastHeld}

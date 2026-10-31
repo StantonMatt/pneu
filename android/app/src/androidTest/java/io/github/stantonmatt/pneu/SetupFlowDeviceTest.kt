@@ -81,6 +81,7 @@ class SetupFlowDeviceTest {
     }
     @After fun cleanup()=runBlocking<Unit> {
         scenario?.close();device.pressHome()
+        device.executeShellCommand("cmd uimode night no")
         c.getSystemService(NotificationManager::class.java).cancelAll()
         app.cancelPairing()
         DeviceFixture.stopPneuService();app.connection.stop();app.connection.awaitStopped()
@@ -180,17 +181,48 @@ class SetupFlowDeviceTest {
         waitFor("Link your devices, so new ones pair just once")
         capture("flow-after-dont-allow")
     }
+    @Test(timeout=90000) fun lastDeclineDropsTheBannerWithoutSuccess()=runBlocking<Unit> {
+        bind(pc,"MJStanton-Desktop",'b');bind(mac,"MacBook Air",'c')
+        setup {peers,state->peers.map {it.copy(setupDecision=SetupScope.ASK,setupSupported=true)} to state}
+        val before=app.preferences.read()
+        val targets=SetupPresentation.linkTargets(before,pc)
+        linkedWith(pc)
+        setup {peers,state->peers.map {it.copy(remoteSetupScope=if(it.deviceId==pc)SetupScope.ENABLED else SetupScope.ASK)} to state}
+        c.setupUi.update {it.copy(linkStarted=true,linkTargets=targets)}
+        launch();waitFor("Allow linking on MacBook Air")
+        setup {peers,state->peers.map {if(it.deviceId==mac)it.copy(remoteSetupScope=SetupScope.DISABLED) else it} to state}
+        compose.waitUntil(5000) {compose.onAllNodesWithText("Allow linking on MacBook Air").fetchSemanticsNodes().isEmpty()}
+        compose.waitUntil(5000) {!c.setupUi.state.value.linkStarted}
+        for(night in listOf(false,true)) {
+            device.executeShellCommand("cmd uimode night ${if(night)"yes" else "no"}")
+            compose.waitForIdle();delay(700)
+            compose.onNodeWithText("Your devices are linked").assertDoesNotExist()
+            capture("flow-last-decline-${if(night)"dark" else "light"}")
+        }
+        scenario!!.recreate();waitFor("MacBook Air")
+        compose.onNodeWithText("Your devices are linked").assertDoesNotExist()
+        device.executeShellCommand("cmd uimode night no")
+    }
     @Test(timeout=90000) fun notificationAllowAnswersTheRequest()=runBlocking<Unit> {
         bind(pc,"MJStanton-Desktop",'b')
         askedBy(pc)
         val p=app.preferences.read()
         SetupNotifications.channel(c)
-        SetupNotifications.postRequest(c,p,SetupPresentation.prompts(p))
+        // Post into an already open shade, as in the notification screenshot test.
+        // This avoids Android 17's heads-up reparenting animation retaining stale hit bounds.
         device.openNotification()
+        SetupNotifications.postRequest(c,p,SetupPresentation.prompts(p))
         assertTrue(device.wait(Until.hasObject(By.text("MJStanton-Desktop wants to link your devices")),5000))
-        val allow=device.wait(Until.findObject(By.text("Allow")),5000) ?: device.wait(Until.findObject(By.text("ALLOW")),2000)
-        assertNotNull("Allow action",allow);allow!!.click()
-        withTimeout(10000) {app.prefs.first {it.membership.prompts.isNotEmpty() && it.membership.prompts.all {prompt->prompt.allowRequested}}}
+        device.waitForIdle()
+        try {
+            val allow=device.wait(Until.findObject(By.text("Allow")),5000) ?: device.wait(Until.findObject(By.text("ALLOW")),2000)
+            assertNotNull("Allow action",allow);allow!!.click()
+            withTimeout(10000) {app.prefs.first {it.membership.prompts.isNotEmpty() && it.membership.prompts.all {prompt->prompt.allowRequested}}}
+        }catch(e:Throwable) {
+            capture("flow-notification-allow-timeout")
+            device.dumpWindowHierarchy(File(c.filesDir,"setup-screens/notification-allow-timeout.xml"))
+            throw e
+        }
         device.pressHome()
     }
     @Test(timeout=90000) fun staleNotificationActionCannotCancelANewerRequest()=runBlocking<Unit> {

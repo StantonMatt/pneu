@@ -201,7 +201,8 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
     fun askRemove(key:String) {removing=runCatching {devicesModel.confirmRemoveFromAllDevices(key)}.getOrNull()}
     fun linkDevices(confirmed:ConfirmedBinding,displayedPrompts:List<SetupPrompt>) {
         setupStore.update {it.copy(joinedPin="",joinedAt=0)}
-        scope.launch {if(actions.run(resources.getString(R.string.ui_error_link)) {devicesModel.linkExistingDevice(confirmed,displayedPrompts)})setupStore.update {it.copy(linkStarted=true)}}
+        val targets=SetupPresentation.linkTargets(p,confirmed.pcId)
+        scope.launch {if(actions.run(resources.getString(R.string.ui_error_link)) {devicesModel.linkExistingDevice(confirmed,displayedPrompts)})setupStore.update {it.copy(linkStarted=true,linkTargets=targets)}}
     }
     /** One Allow covers every device that asked, and this phone's other undecided pairings. */
     fun answer(prompts:List<SetupPrompt>,allow:Boolean) {
@@ -332,8 +333,8 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
             offerPair(null)
         }}
         if(proposed!=null && pairingTarget!=null && p.deviceId.isNotEmpty())PneuTheme(dark=if(screen=="pair")true else dark) {PairConfirmDialog(
-            resources.getString(if(p.devices.isEmpty() || p.devices.any {it.pin==proposed.fingerprint})R.string.pair_confirm_title else R.string.pair_add_title,proposed.name),
-            if(networkSettings)resources.getString(R.string.action_open_settings) else resources.getString(if(p.devices.isEmpty() || p.devices.any {it.pin==proposed.fingerprint})R.string.action_pair else R.string.action_add),
+            resources.getString(R.string.pair_confirm_title,proposed.name),
+            if(networkSettings)resources.getString(R.string.action_open_settings) else resources.getString(R.string.action_pair),
             if(offersLink)alsoLink else null,atLimit,{alsoLink=it},{offerPair(null)}) {
                 if(!pairingTarget.matches(p))actionError=UiFeedback(resources.getString(R.string.ui_error_pairing)) to {confirmationAttempt++;offerPair(candidate)}
                 else if(Build.VERSION.SDK_INT>=37 && !context.granted(Manifest.permission.ACCESS_LOCAL_NETWORK)) {
@@ -404,7 +405,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
         LaunchedEffect(p.membership,p.devices,setupUi.linkStarted) {
             val separate=p.membership.separateLinks
             setupStore.update {it.copy(announcedSeparate=it.announcedSeparate.intersect(separate),
-                linkStarted=it.linkStarted && !(SetupPresentation.linkSettled(p) && !SetupPresentation.linked(p)))}
+                linkStarted=it.linkStarted && !(SetupPresentation.linkSettled(p) && !SetupPresentation.linkSucceeded(p,setupUi)))}
         }
         actionError?.let {error->PneuTheme(dark=if(screen=="pair")true else dark) {PneuDialog(onDismissRequest={actionError=null},title={Text(error.first.message)},
             confirmButton={PneuTextButton(onClick={actionError=null;error.second?.invoke()}) {Text(if(error.second!=null)resources.getString(R.string.action_try_again) else resources.getString(R.string.action_close))}},

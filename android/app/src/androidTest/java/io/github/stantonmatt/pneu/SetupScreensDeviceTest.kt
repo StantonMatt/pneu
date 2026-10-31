@@ -135,8 +135,8 @@ class SetupScreensDeviceTest {
         show {
             if(overHome)Home(home,mapOf(pc.deviceId to wifi)) else Scanner(first)
             PneuTheme(dark=if(overHome)dark else true) {
-                PairConfirmDialog(context.getString(if(overHome)R.string.pair_add_title else R.string.pair_confirm_title,"MacBook Air"),
-                    context.getString(if(overHome)R.string.action_add else R.string.action_pair),on,limit,{on=it},{}) {}
+                PairConfirmDialog(context.getString(R.string.pair_confirm_title,"MacBook Air"),
+                    context.getString(R.string.action_pair),on,limit,{on=it},{}) {}
             }
         }
         compose.onNodeWithText("Also link with your other devices").assertIsDisplayed()
@@ -148,7 +148,7 @@ class SetupScreensDeviceTest {
         compose.onNode(isToggleable()).assertIsOff().assertIsNotEnabled()
         capture("confirm-limit-scanner-dark")
         limit=false;overHome=true;compose.waitForIdle()
-        compose.onNodeWithText("Add MacBook Air?").assertIsDisplayed()
+        compose.onNodeWithText("Pair with MacBook Air?").assertIsDisplayed()
         bothThemes("confirm-over-home")
         limit=true;compose.waitForIdle()
         bothThemes("confirm-limit-over-home")
@@ -174,6 +174,20 @@ class SetupScreensDeviceTest {
         finished=true;compose.waitForIdle()
         compose.onNodeWithText("Your devices are linked").assertIsDisplayed()
         bothThemes("home-linked")
+    }
+    @Test(timeout=60000) fun plannedSetupRefreshKeepsTheConnectedPresentation()=runBlocking<Unit> {
+        val p=prefs(pc,state=linked(member(pc)))
+        val display=io.github.stantonmatt.pneu.connection.SetupRefreshDisplay()
+        assertTrue(display.begin(pc,wifi,0))
+        val refreshing=display.project(pc,LinkState("Connecting…"),1)
+        var page by mutableStateOf(false)
+        show {if(page)Device(p,pc,refreshing) else Home(p,mapOf(pc.deviceId to refreshing))}
+        compose.onNodeWithText("Not connected",substring=true).assertDoesNotExist()
+        bothThemes("setup-refresh-home")
+        page=true;compose.waitForIdle()
+        compose.onNodeWithText("Can't connect?",substring=true).assertDoesNotExist()
+        compose.onNodeWithText("Not connected",substring=true).assertDoesNotExist()
+        bothThemes("setup-refresh-page")
     }
     @Test(timeout=60000) fun aPhoneThatJoinedListsTheOthersAndAnotherPhoneIsGrey()=runBlocking<Unit> {
         val added=mac.copy(addedViaId=pc.deviceId,addedViaName=pc.name,lastConnected=0)
@@ -227,6 +241,7 @@ class SetupScreensDeviceTest {
             val bottom=if(case.first.membership.member(case.second.deviceId)!=null)"Remove from all devices" else "Unpair"
             compose.onNodeWithText(bottom).performScrollTo().assertIsDisplayed()
             compose.onNodeWithText(expected.getValue(name)).assertIsDisplayed()
+            if(name=="page-theirs")compose.onNodeWithText("Link with your other devices").assertIsDisplayed()
             bothThemes(name)
         }
         compose.onNodeWithText("Remove from all devices").assertIsDisplayed()
@@ -313,8 +328,16 @@ class SetupScreensDeviceTest {
             assertTrue(device.wait(Until.hasObject(By.text("MacBook Air joined")),5000))
             Thread.sleep(800);shade("notification-joined-$suffix")
             context.getSystemService(NotificationManager::class.java).cancelAll()
+            repeat(3) {warning->
+                context.getSystemService(NotificationManager::class.java).notify(700+warning,
+                    androidx.core.app.NotificationCompat.Builder(context,"alerts").setSmallIcon(R.drawable.ic_stat_pneu)
+                        .setContentTitle("Pneu warning $warning").build())
+            }
             SetupNotifications.postRequest(context,asked,SetupPresentation.prompts(asked))
             assertTrue(device.wait(Until.hasObject(By.text("MJStanton-Desktop wants to link your devices")),5000))
+            shade("notification-request-$suffix")
+            assertTrue("Allow stays visible beside warnings",device.wait(Until.hasObject(By.text("Allow")),5000))
+            assertTrue("Don't allow stays visible beside warnings",device.wait(Until.hasObject(By.text("Don't allow")),5000))
             Thread.sleep(800);shade("notification-request-$suffix")
             context.getSystemService(NotificationManager::class.java).cancelAll()
             device.pressBack();device.pressHome()

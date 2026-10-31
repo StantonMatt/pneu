@@ -177,7 +177,12 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                     previousAttempt=a?.id
                     val old = previous; previous = p
                     ensureDiscovery(p)
-                    if (old != null && (changedAttempt || BindingTransitions.restart(old,p,authenticatedBinding))) retry()
+                    if (old != null && (changedAttempt || BindingTransitions.restart(old,p,authenticatedBinding))) {
+                        if(!changedAttempt && old.peer?.generation==p.peer?.generation &&
+                            (old.membership.generation!=p.membership.generation || old.peer?.setupScope!=p.peer?.setupScope))
+                            app.connection.expectSetupRefresh(peerPin)
+                        retry()
+                    }
                     if (old != null && old.paused != p.paused && ready) runCatching { send(Frame.Control(Type.STATUS, json("paused" to p.paused))) }
                 }
             }
