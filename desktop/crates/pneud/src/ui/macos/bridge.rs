@@ -52,6 +52,13 @@ impl Notification {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum Request {
+    PhoneNotification {
+        id: String,
+        notice: Option<crate::ui::notifications::PhoneNotice>,
+    },
+    WithdrawPhoneNotifications {
+        ids: Vec<String>,
+    },
     Notify(Notification),
     Open {
         name: String,
@@ -285,6 +292,13 @@ impl Session {
                 Duration::from_secs(5)
             };
         let id = session.sequence.fetch_add(1, Ordering::Relaxed);
+        let mirror = matches!(
+            request,
+            Request::PhoneNotification {
+                notice: Some(_),
+                ..
+            }
+        );
         let (sender, reply) = oneshot::channel();
         {
             let mut pending = session.pending.lock().expect("UI replies");
@@ -307,6 +321,7 @@ impl Session {
         struct Guard {
             session: Arc<Session>,
             id: u64,
+            mirror: bool,
         }
         impl Drop for Guard {
             fn drop(&mut self) {
@@ -320,7 +335,10 @@ impl Session {
                     .get_mut(&self.id)
                     .and_then(|p| p.reply.take())
                     .is_some();
-                if pending
+                // Mirrored notices remain cancellation-owned even after the
+                // channel reader has consumed their successful acknowledgement.
+                // Only the worker accepting that result transfers ownership.
+                if (pending || self.mirror)
                     && self
                         .session
                         .output
@@ -332,13 +350,20 @@ impl Session {
                 }
             }
         }
-        let guard = Guard { session, id };
+        let guard = Guard {
+            session,
+            id,
+            mirror,
+        };
         Ok(Box::pin(async move {
-            let guard = guard;
-            let _guard = guard;
-            reply
+            let mut guard = guard;
+            let result = reply
                 .await
-                .context("UI acknowledgement timed out or child exited")?
+                .context("UI acknowledgement timed out or child exited")?;
+            if result.is_ok() {
+                guard.mirror = false;
+            }
+            result
         }))
     }
 }
@@ -617,6 +642,82 @@ pub(crate) mod tests {
         assert!(!session.ready.load(Ordering::Acquire));
         assert!(session.begin(Request::Test("ping".into()), None).is_err());
         session.close();
+        Ok(())
+    }
+    #[tokio::test]
+    async fn phone_notifications_bulk_withdrawal_fits_one_bridge_slot() -> Result<()> {
+        let _serial = SERIAL.lock().await;
+        let (parent, mut child) = UnixStream::pair()?;
+        let (events, _) = tokio::sync::mpsc::channel(2);
+        let session = Session::start(parent, "b".repeat(64), events)?;
+        handshake(&mut child, &"b".repeat(64))?;
+        ready(&session).await;
+        let mut waits = Vec::new();
+        // Keep 31 requests outstanding, leaving exactly one admission slot.
+        for _ in 0..31 {
+            waits.push(session.begin(Request::Test("busy".into()), None)?);
+            let _: (Frame, _) = transport::receive(&mut child)?;
+        }
+        let ids: Vec<_> = (0..128).map(|key| format!("session-{key}")).collect();
+        let wait = session.begin(
+            Request::WithdrawPhoneNotifications { ids: ids.clone() },
+            None,
+        )?;
+        let (
+            Frame::Request {
+                id,
+                request: Request::WithdrawPhoneNotifications { ids: received },
+            },
+            file,
+        ) = transport::receive::<Frame>(&mut child)?
+        else {
+            panic!("bulk withdrawal request")
+        };
+        assert!(file.is_none());
+        assert_eq!(received, ids);
+        assert_eq!(session.pending.lock().unwrap().len(), 32);
+        transport::send(&mut child, &Frame::Reply { id, error: None }, None)?;
+        wait.await?;
+        session.close();
+        drop(waits);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn phone_notifications_unobserved_success_still_cancels_native_notice() -> Result<()> {
+        let _serial = SERIAL.lock().await;
+        let (parent, mut child) = UnixStream::pair()?;
+        child.set_read_timeout(Some(Duration::from_secs(1)))?;
+        let (events, _) = tokio::sync::mpsc::channel(2);
+        let session = Session::start(parent, "f".repeat(64), events)?;
+        handshake(&mut child, &"f".repeat(64))?;
+        ready(&session).await;
+        let wait = session.begin(
+            Request::PhoneNotification {
+                id: "session-key".into(),
+                notice: Some(crate::ui::notifications::PhoneNotice {
+                    app: "Chat".into(),
+                    title: None,
+                    text: None,
+                    icon: None,
+                }),
+            },
+            None,
+        )?;
+        let (Frame::Request { id, .. }, _) = transport::receive::<Frame>(&mut child)? else {
+            panic!("phone request")
+        };
+        transport::send(&mut child, &Frame::Reply { id, error: None }, None)?;
+        // Force the reader to consume success before its owner is disconnected.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while session.pending.lock().unwrap().contains_key(&id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        drop(wait);
+        let cancelled = transport::receive::<Frame>(&mut child);
+        session.close();
+        assert!(matches!(cancelled?, (Frame::Cancel { id: cancelled }, None) if cancelled == id));
         Ok(())
     }
     #[tokio::test]

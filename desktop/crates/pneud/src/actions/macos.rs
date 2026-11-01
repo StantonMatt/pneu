@@ -348,6 +348,47 @@ impl DesktopActions {
 }
 #[async_trait]
 impl PcActions for DesktopActions {
+    async fn show_phone_notification(
+        &self,
+        id: &str,
+        notice: &crate::ui::notifications::PhoneNotice,
+        replaces: u32,
+    ) -> Result<u32> {
+        self.begin_phone_notification(id, notice, replaces)
+            .await?
+            .await
+    }
+    async fn begin_phone_notification<'a>(
+        &'a self,
+        id: &'a str,
+        notice: &'a crate::ui::notifications::PhoneNotice,
+        _replaces: u32,
+    ) -> Result<super::PhoneAcknowledgement<'a>> {
+        let wait = bridge::begin(
+            Request::PhoneNotification {
+                id: id.into(),
+                notice: Some(notice.clone()),
+            },
+            None,
+        )?;
+        Ok(Box::pin(async move {
+            wait.await?;
+            Ok(0)
+        }))
+    }
+    async fn remove_phone_notification(&self, id: &str, _handle: u32) -> Result<()> {
+        self.remove_phone_notifications(&[(id.into(), 0)]).await
+    }
+    async fn remove_phone_notifications(&self, handles: &[(String, u32)]) -> Result<()> {
+        bridge::begin(
+            Request::WithdrawPhoneNotifications {
+                ids: handles.iter().map(|(id, _)| id.clone()).collect(),
+            },
+            None,
+        )?
+        .await
+    }
+
     async fn ui_test_notification(&self, transient: bool) -> Result<u32> {
         if transient {
             let mut notice = Notice::text("https://example.com/Pneu-test");

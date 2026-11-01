@@ -1,5 +1,7 @@
 #[path = "clipboard_actor.rs"]
 pub(crate) mod clipboard_actor;
+#[path = "phone_notifications.rs"]
+mod phone_notifications;
 use crate::{
     Config, Paths,
     actions::{PcActions, ReceivedFile},
@@ -194,10 +196,15 @@ impl ActionScope {
         }
     }
     /// Native notification submission is gated; its acknowledgement is not.
-    async fn notification<F, Fut>(&self, origin: &ActionOrigin, issue: F) -> Option<Result<()>>
+    async fn notification<F, Fut, Ack, T>(
+        &self,
+        origin: &ActionOrigin,
+        issue: F,
+    ) -> Option<Result<T>>
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<crate::ui::portal::Interaction>>,
+        Fut: std::future::Future<Output = Result<Ack>>,
+        Ack: std::future::Future<Output = Result<T>>,
     {
         let mut cancelled = self.cancelled.subscribe();
         let mut generation = self.generation_changed.subscribe();
@@ -1042,6 +1049,7 @@ impl Core {
         config.clipboard_sync_to_phone = config.clipboard_mode != crate::config::ClipboardMode::Off;
         config.validate_with_cache(&paths.cache)?;
         paths.prepare()?;
+        phone_notifications::prepare_icons(&paths.cache)?;
         let store = Store::open(&paths.data.join("state.sqlite3"))?;
         let identity = Identity::load_or_create(&paths.data)?;
         if let Some(own) = store.setup_state().roster.iter().find(|m| {
@@ -3935,6 +3943,7 @@ impl Core {
         let text_writer = write_tx.clone();
         let text_close = close_tx.clone();
         let text_store = store.clone();
+        let mirror_scope = action_scope.clone();
         let text_task = tokio::spawn(Box::pin(async move {
             let mut incoming = None;
             while let Some(message) = text_rx.recv().await {
@@ -3992,6 +4001,8 @@ impl Core {
         let mut members_retry: Option<Instant> = None;
         let mut members_blocked=false;
         let mut members_init_retry: Option<Instant> = None;
+        let mut phone_notices = phone_notifications::Worker::start(self.clone(), store.clone(), hello.device_id.clone(), mirror_scope, close.clone());
+        let mut notice_stream = phone_notifications::Stream::default();
         let setup_negotiated=hello.capabilities.iter().any(|c|c=="setup");
         // Legacy READY evidence is bookkeeping, not a prerequisite for control
         // traffic. Poll one bounded store job alongside the control loop; drop
@@ -4180,6 +4191,14 @@ impl Core {
                                 }
                                 break;
                             },
+                            Message::NotificationEvent(event)=>{
+                                if !store.mesh || hello.role != Some(DeviceRole::Phone)
+                                    || notice_stream.accept(&event).is_err()
+                                    || phone_notices.send(event).is_err() {
+                                    close_tx.send_replace(Some(CloseReason::Error(ErrorCode::UnexpectedMessage)));
+                                    break;
+                                }
+                            },
                             Message::Status(status)=>{self.set_phone_paused(&hello.device_id,store.connection_id.expect("connection id"),status.paused);},
                             Message::Unpair(_) if hello.capabilities.iter().any(|c|c=="setup") && self.withdraw_setup(&store,hello).await?=>{break;},
                             Message::Unpair(_)=>{
@@ -4306,6 +4325,7 @@ impl Core {
         {
             let _ = close_tx.send(Some(CloseReason::Error(processing_error_code(error))));
         }
+        phone_notices.stop().await;
         workers.reader.abort();
         workers.heartbeat.abort();
         let _=(&mut workers.heartbeat).await;
@@ -8069,7 +8089,7 @@ mod tests {
         core.shutdown_actions().await
     }
     #[tokio::test]
-    async fn protocol_extensions_are_not_advertised_or_admitted() -> Result<()> {
+    async fn unimplemented_protocol_extensions_are_not_advertised_or_admitted() -> Result<()> {
         let (_dir, core, peer) = fixture(Arc::new(NoActions)).await?;
         let hello = core.computer_hello();
         assert_eq!(
@@ -8079,7 +8099,8 @@ mod tests {
                 "clipboard_text",
                 "clipboard_image",
                 "mesh",
-                "setup"
+                "setup",
+                "notifications_v1"
             ]
         );
         let mut incoming = None;

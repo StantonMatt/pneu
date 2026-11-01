@@ -144,6 +144,9 @@ impl Sender {
             receive.await.context("toast submission ended")?
         }))
     }
+    pub fn remove_tag(&self, tag: String, group: String) {
+        let _ = self.0.send(Command::Remove { tag, group });
+    }
     pub fn remove(&self, id: u32, group: &str) {
         let _ = self.0.send(Command::Remove {
             tag: id.to_string(),
@@ -196,6 +199,19 @@ impl Host {
                     } else {
                         ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(AUMID))?
                     };
+                    let group = HSTRING::from(crate::ui::windows_toast_model::PHONE_GROUP);
+                    if ToastNotificationManager::History()
+                        .and_then(|history| {
+                            if packaged {
+                                history.RemoveGroup(&group)
+                            } else {
+                                history.RemoveGroupWithId(&group, &HSTRING::from(AUMID))
+                            }
+                        })
+                        .is_err()
+                    {
+                        eprintln!("pneud: mirrored notification cleanup unavailable");
+                    }
                     let _ = ready.take().unwrap().send(Ok(()));
                     eprintln!("pneud: toast activator ready packaged={packaged}");
                     loop {

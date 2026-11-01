@@ -252,6 +252,7 @@ impl Core {
                 "clipboard_image".into(),
                 "mesh".into(),
                 "setup".into(),
+                pneu_proto::CAP_NOTIFICATIONS.into(),
             ],
         };
         #[cfg(test)]

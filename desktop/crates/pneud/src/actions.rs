@@ -8,6 +8,10 @@ use std::{
     sync::Arc,
 };
 
+pub type PhoneAcknowledgement<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<u32>> + Send + 'a>>;
+pub(crate) const PHONE_WITHDRAW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArrivalSource {
     pub device: pneu_proto::Id,
@@ -249,6 +253,41 @@ impl PreparedClipboard {
 }
 #[async_trait]
 pub trait PcActions: Send + Sync {
+    /// Submit under the authority gate, then await native acknowledgement
+    /// outside it. Native backends retain cancellation ownership in this future.
+    async fn begin_phone_notification<'a>(
+        &'a self,
+        id: &'a str,
+        notice: &'a crate::ui::notifications::PhoneNotice,
+        replaces: u32,
+    ) -> Result<PhoneAcknowledgement<'a>> {
+        // Synchronous/lightweight backends retain their completion semantics.
+        let handle = self.show_phone_notification(id, notice, replaces).await?;
+        Ok(Box::pin(async move { Ok(handle) }))
+    }
+    /// Mirror handles belong only to the current phone connection. No actions.
+    async fn show_phone_notification(
+        &self,
+        _id: &str,
+        _notice: &crate::ui::notifications::PhoneNotice,
+        _replaces: u32,
+    ) -> Result<u32> {
+        anyhow::bail!("phone notifications unavailable")
+    }
+    async fn remove_phone_notification(&self, _id: &str, _handle: u32) -> Result<()> {
+        Ok(())
+    }
+    /// Native backends with a bulk API can withdraw a full connection in one request.
+    async fn remove_phone_notifications(&self, handles: &[(String, u32)]) -> Result<()> {
+        let results = futures_util::future::join_all(
+            handles
+                .iter()
+                .map(|(id, handle)| self.remove_phone_notification(id, *handle)),
+        )
+        .await;
+        results.into_iter().collect()
+    }
+
     #[cfg(target_os = "macos")]
     async fn ui_test_notification(&self, _transient: bool) -> Result<u32> {
         anyhow::bail!("UI test notifications unavailable")
