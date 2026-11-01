@@ -32,16 +32,22 @@ data class ConfirmedItem(val mediaId:String,val transferId:String,val revision:L
     fun matches(row:Outgoing)=peerId==row.peerId && generation==row.bindingGeneration && mediaId==row.mediaId && transferId==row.transferId && revision==row.revision && row.state in setOf("waiting","sending","failed")
     companion object {fun from(row:Outgoing)=ConfirmedItem(row.mediaId,row.transferId,row.revision,row.peerId,row.bindingGeneration)}
 }
-data class ConfirmedQueue(val binding:ConfirmedBinding,val items:List<ConfirmedItem>) {
+data class ConfirmedQueue(val binding:ConfirmedBinding,val items:List<ConfirmedItem>,val replacementTargets:Map<String,DeliveryBinding> = emptyMap()) {
     fun matches(p:Prefs)=p.loaded && binding.phoneId==p.deviceId && items.all {item->
         if(item.peerId.isEmpty())binding.matches(p) else
-            DeliveryBinding.from(p,item.peerId)?.generation==item.generation
+            DeliveryBinding.from(p,item.peerId)?.generation==item.generation ||
+            p.replacements.replacement(item.peerId,item.generation)!=null
     }
     fun resolve(rows:List<Outgoing>):List<Outgoing>? = items.map {item->
         rows.find {it.peerId==item.peerId && it.mediaId==item.mediaId}?.takeIf(item::matches) ?: return null
     }
     companion object {
-        fun from(p:Prefs,rows:List<Outgoing>)=ConfirmedQueue(ConfirmedBinding.from(p),rows.filter {it.state in setOf("waiting","sending","failed")}.map(ConfirmedItem::from))
+        fun items(p:Prefs,items:List<ConfirmedItem>)=ConfirmedQueue(ConfirmedBinding.from(p),items,items.mapNotNull {item->
+            p.replacements.replacement(item.peerId,item.generation)?.fresh?.let {target->
+                item.peerId to DeliveryBinding(target.phoneId,requireNotNull(target.pin),requireNotNull(target.pcId),target.revision)
+            }
+        }.toMap())
+        fun from(p:Prefs,rows:List<Outgoing>)=items(p,rows.filter {it.state in setOf("waiting","sending","failed")}.map(ConfirmedItem::from))
         fun artifact(p:Prefs,item:ConfirmedItem,rows:List<Outgoing>):ConfirmedQueue =
             from(p,rows.filter {it.mediaId==item.mediaId && it.transferId==item.transferId}).let {
                 if(item in it.items)it

@@ -12,7 +12,8 @@ data class PairingAttempt internal constructor(
     internal val scanned:Prefs,
     internal val revisions:Map<String,Long>,
     val deviceId:String?=null,
-    val setupEnabled:Boolean=true
+    val setupEnabled:Boolean=true,
+    val replaceOld:ConfirmedBinding?=null
 ) {
     val targetId get()=deviceId ?: scanned.devices.find {it.pin==invitation.fingerprint}?.deviceId
     internal val prior get()=deviceId?.let {id->scanned.devices.find {it.deviceId==id}}

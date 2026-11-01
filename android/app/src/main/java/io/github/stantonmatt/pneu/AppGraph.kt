@@ -19,6 +19,7 @@ class PneuApp : Application() {
 val Context.graph get() = (applicationContext as PneuApp).graph
 class AppGraph(val context: Context,val preferences: Preferences=Preferences(context),
                val scope:CoroutineScope=CoroutineScope(SupervisorJob() + Dispatchers.IO)) {
+    var replacementNotificationAction=ReplacementNotificationAction {}
     private val snapshots=PreferenceSnapshots(preferences.flow,scope)
     val prefs=snapshots.state
     suspend fun awaitPrefs():Prefs=snapshots.awaitLoaded()
@@ -124,7 +125,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
         enqueueLocked(row,binding,preferences.read())
     }
     /** Caller holds the queue lock, and for automatic work also the policy lock. */
-    private suspend fun enqueueLocked(row:Outgoing,binding:DeliveryBinding?,p:Prefs):Boolean {
+    private suspend fun enqueueLocked(row:Outgoing,binding:DeliveryBinding?,p:Prefs,maintain:Boolean=true):Boolean {
         if(row.automatic && (row.state=="skipped" || row.recipients?.isEmpty()==true)) {
             if(binding==null || !binding.matches(p))return false
             QueueAdmission.retireAutomatic(database,row);return true
@@ -147,7 +148,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
         }
         val inserted=try {QueueAdmission.admit(database,row)}
         catch(e:LocalCapacityException) {preferences.toggle("localCapacity",true);throw e}
-        maintainTerminalLocked()
+        if(maintain)maintainTerminalLocked()
         return inserted
     }
     fun maintainTerminalLocked()=PostCommit.maintain {pruneTerminalLocked()}
@@ -176,7 +177,11 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
     }
     private suspend fun clearPeerDelivery(peerId:String)=queueMutex.withLock {
         receivedFiles.forget(peerId)
-        database.runInTransaction {queue.clearPeer(peerId)}
+        val replacement=preferences.read().replacements.replaced.lastOrNull {it.old.pcId==peerId}
+        database.runInTransaction {
+            if(replacement!=null)queue.cancelReplacedPeer(peerId,replacement.old.revision)
+            queue.clearPeer(peerId)
+        }
         pruneOrphansLocked()
         releaseTerminalBytesLocked()
     }
@@ -216,7 +221,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
     }
     suspend fun updateDelivery(row:Outgoing):Boolean=queueMutex.withLock {
         val current=queue.delivery(row.mediaId,row.peerId)
-        if(current==null || current.state in setOf("discarded","skipped","sent","superseded") || current.revision!=row.revision || current.transferId!=row.transferId || current.bindingGeneration!=row.bindingGeneration)false
+        if(current==null || current.error==ReinstallReplacement.CANCELLED || current.state in setOf("discarded","skipped","sent","superseded") || current.revision!=row.revision || current.transferId!=row.transferId || current.bindingGeneration!=row.bindingGeneration)false
         else {
             if(row.kind=="text" && row.state in setOf("waiting","failed") && queue.newerPeerText(row.peerId,row.orderId)>0)row.state="superseded"
             queue.update(row);maintainTerminalLocked();true
@@ -257,6 +262,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
     )
     internal suspend fun completePeerReset(id:String)=deliveryResets.peer(id)
     suspend fun reconcileDelivery()=withContext(Dispatchers.IO) {bindingMutex.withLock {
+        finishImpliedReplacementsLocked()
         preferences.migrateSettingsReceipts(queue)
         deliveryResets.reconcile()
         preferences.finishMembersIntents(queue)
@@ -277,10 +283,10 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
         completePeerReset(expected.deviceId)
         true
     }}
-    suspend fun requestPairing(uri:String,expected:ConfirmedBinding,setupEnabled:Boolean=true):Boolean = withContext(Dispatchers.IO) {bindingMutex.withLock {
+    suspend fun requestPairing(uri:String,expected:ConfirmedBinding,setupEnabled:Boolean=true,replaceOld:ConfirmedBinding?=null):Boolean = withContext(Dispatchers.IO) {bindingMutex.withLock {
         val p=preferences.read()
         if(!expected.matches(p))return@withLock false
-        startPairing(uri,p,setupEnabled)
+        startPairing(uri,p,setupEnabled,replaceOld)
     }}
 
     // Fixture callers explicitly supply their already-selected pin.
@@ -290,7 +296,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
         startPairing(uri,p)
     }}
 
-    private fun startPairing(uri:String,p:Prefs,setupEnabled:Boolean=true):Boolean {
+    private fun startPairing(uri:String,p:Prefs,setupEnabled:Boolean=true,replaceOld:ConfirmedBinding?=null):Boolean {
         if(connection.attempt.value!=null)return false
         val invitation=io.github.stantonmatt.pneu.protocol.Invitation.parse(uri)
         val prior=p.devices.find {it.pin==invitation.fingerprint}
@@ -300,7 +306,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
             return true
         }
         prior?.let {invalidateOutcomes(it.deviceId)}
-        connection.setAttempt(PairingAttempt(io.github.stantonmatt.pneu.protocol.randomId(),invitation,p,lifecycle.toMap(),setupEnabled=setupEnabled && p.membership.roster.count {it.active}<17))
+        connection.setAttempt(PairingAttempt(io.github.stantonmatt.pneu.protocol.randomId(),invitation,p,lifecycle.toMap(),setupEnabled=setupEnabled && p.membership.roster.count {it.active}<17,replaceOld=replaceOld))
         // Invalidates the old transport before any further outcome can commit.
         connection.retryPeer(invitation.fingerprint)
         return true
@@ -377,11 +383,13 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
                         addresses=(h.remoteAddresses+peer.addresses).distinct().take(16)) else peer})
                 SetupTransactions.tokenHello(data,binding,h.remote,h.self)
             }
+            if(current.prior==null)ReinstallReplacement.paired(data,binding,current.replaceOld,connection::connected)
         }) {installed=it;onInstalled(it)})return@withLock null
         // Durable installation consumed the attempt. Cleanup retries use resetPeers;
         // neither cleanup failure nor a lost READY can install it again.
         connection.installed(current,requireNotNull(installed))
         connection.setAttempt(null)
+        finishImpliedReplacementsLocked()
         if(current.prior?.let {it.pin!=current.invitation.fingerprint}==true || current.prior==null)
             p.devices.find {it.deviceId==pcId}?.let(::changed) ?: invalidateOutcomes(pcId)
         onOutcome(ConnectionOutcome(pcId,outcomes[pcId] ?: 0))
@@ -466,7 +474,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
         if(!selected.matches(preferences.read()))return@withLock false
         val removed=queueMutex.withLock commit@{
             val rows=selected.items.map {item->queue.delivery(item.mediaId,item.peerId)?.takeIf(item::matches) ?: return@commit false}
-            database.runInTransaction {rows.forEach {it.state="discarded";it.revision++;queue.update(it)}}
+            database.runInTransaction {rows.forEach {it.state="discarded";if(it.error==ReinstallReplacement.CANCELLED)it.error="";it.revision++;queue.update(it)}}
             rows.forEach {connection.cancelTransfer(it.mediaId,it.peerId);if(queue.hasPath(it.path)==0)java.io.File(it.path).delete()}
             maintainTerminalLocked();true
         }
@@ -474,20 +482,59 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
         removed
     }}
     suspend fun discardAll(selected:ConfirmedQueue=ConfirmedQueue.from(prefs.value,work.value)):Boolean=discard(selected,clearCapacity=true)
-    suspend fun retry(id:String,expected:ConfirmedQueue?=null):Boolean=withContext(Dispatchers.IO) {bindingMutex.withLock {
-        if(expected!=null && !expected.matches(preferences.read()))return@withLock false
-        val retried=queueMutex.withLock commit@{
-            if(expected!=null && (expected.items.isEmpty() || expected.items.any {it.mediaId!=id}))return@commit false
-            val rows=if(expected!=null)expected.resolve(queue.deliveries(id)) ?: return@commit false
+    suspend fun retry(id:String,expected:ConfirmedQueue?=null):Boolean=withContext(Dispatchers.IO) {
+        // Startup reconciliation also takes bindingMutex; finish it before
+        // reserving a new-send stamp while holding that gate.
+        initialized.await()
+        bindingMutex.withLock retry@{
+        if(expected!=null && !expected.matches(preferences.read()))return@retry false
+        val selected=queueMutex.withLock {
+            if(expected!=null && (expected.items.isEmpty() || expected.items.any {it.mediaId!=id}))return@retry false
+            val rows=if(expected!=null)expected.resolve(queue.deliveries(id)) ?: return@retry false
                 else queue.deliveries(id).filter {it.state in setOf("waiting","failed")}
-            val retryable=rows.filter {it.state in setOf("waiting","failed")}
-            if(retryable.isEmpty())return@commit false
-            database.runInTransaction {retryable.forEach {row->
-                row.state=if(row.kind=="text" && queue.newerPeerText(row.peerId,row.orderId)>0)"superseded" else "waiting"
-                row.error="";row.nextAttempt=0;row.mismatches=0;row.revision++;row.rejectedCapabilities=""
-                queue.update(row)
-            }}
-            maintainTerminalLocked();true
+            rows.filter {it.state in setOf("waiting","failed")}
+        }
+        if(selected.isEmpty())return@retry false
+        val p=preferences.read()
+        val replacements=selected.filter {it.error==ReinstallReplacement.CANCELLED}.associateWith {row->
+            val target=expected?.replacementTargets?.get(row.peerId) ?: return@retry false
+            if(!target.matches(p))return@retry false
+            target
+        }
+        // Reserve ordinary new-send stamps outside queueMutex (policy -> queue
+        // is the lock order). Admission below assigns a fresh durable order.
+        val resends=replacements.map { (row,target)->
+            val (stamp,time)=newTextOrder(apply=row.kind in setOf("text","clipboard_image"))
+            row to Outgoing().apply {
+                mediaId="manual:${io.github.stantonmatt.pneu.protocol.randomId()}"
+                transferId=io.github.stantonmatt.pneu.protocol.randomId()
+                kind=row.kind;origin=row.origin;text=row.text;sensitive=row.sensitive
+                path=row.path;fileName=row.fileName;mime=row.mime;size=row.size;hash=row.hash
+                sourceHash=row.sourceHash;optimized=row.optimized;automatic=false;createdAt=time
+                recipients=listOf(target)
+                if(kind in setOf("text","clipboard_image") || mime.startsWith("image/")) {
+                    hlc=stamp.hlc.toString();sourceDevice=stamp.source
+                }
+            }
+        }
+        val retried=staging.withResendPayloads(resends.map {it.second}) {
+            queueMutex.withLock commit@{
+                if(selected.any {row->queue.delivery(row.mediaId,row.peerId)?.let(ConfirmedItem.from(row)::matches)!=true})return@commit false
+                database.withTransaction {
+                    if(resends.isNotEmpty()) {
+                        for((old,resend) in resends) {
+                            if(!enqueueLocked(resend,null,preferences.read(),maintain=false))error("Replacement changed")
+                            queue.deleteDelivery(old.mediaId,old.peerId)
+                        }
+                    } else selected.forEach {row->
+                        row.state=if(row.kind=="text" && queue.newerPeerText(row.peerId,row.orderId)>0)"superseded" else "waiting"
+                        row.error="";row.nextAttempt=0;row.mismatches=0;row.revision++;row.rejectedCapabilities=""
+                        queue.update(row)
+                    }
+                }
+                if(resends.isNotEmpty())PostCommit.maintain {pruneOrphansLocked();releaseTerminalBytesLocked()}
+                maintainTerminalLocked();true
+            }
         }
         if(retried)connection.kick()
         retried
