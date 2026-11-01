@@ -21,6 +21,7 @@ async fn storage_ping(tls: &mut TlsStream<TcpStream>) -> Result<()> {
 }
 fn storage_text(peer: &Id) -> Clipboard {
     Clipboard {
+            sensitive: false,
         transfer_id: Id::from_bytes(rand::random()),
         text: "storage fault test".into(),
         created_at: crate::now_ms(),
@@ -31,6 +32,7 @@ fn storage_text(peer: &Id) -> Clipboard {
 }
 fn storage_file(peer: &Id) -> FileBegin {
     FileBegin {
+            sensitive: false,
         transfer_id: Id::from_bytes(rand::random()),
         file_name: "clipboard.png".into(),
         mime: "image/png".into(),

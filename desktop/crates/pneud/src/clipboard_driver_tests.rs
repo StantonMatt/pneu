@@ -66,6 +66,9 @@ async fn scenario(mode: u8) -> Result<()> {
     let token = handle.token();
     let content = Content::Text("remote".into());
     let operation = Operation {
+        sensitive: false,
+        history: None,
+        history_id: None,
         token,
         id: Id::from_bytes([10; 16]),
         source: Id::from_bytes([2; 16]),
@@ -132,6 +135,7 @@ fn watcher_flood_has_bounded_admission() {
     let (handle, rx) = Handle::channel();
     for token in 1..=100_000 {
         handle.event(Event::Observe {
+            history: None,
             token,
             id: Id::from_bytes([1; 16]),
             offer: None,
@@ -147,6 +151,7 @@ async fn watcher_coalescing_cancels_reads_and_preserves_marker_and_completion_or
     let (handle, mut rx) = Handle::channel();
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     handle.event(Event::Observe {
+        history: None,
         token: 1,
         id: Id::from_bytes([1; 16]),
         offer: None,
@@ -165,6 +170,7 @@ async fn watcher_coalescing_cancels_reads_and_preserves_marker_and_completion_or
     handle.event(Event::Stopped(42));
     for token in 2..=100_000 {
         handle.event(Event::Observe {
+            history: None,
             token,
             id: Id::from_bytes([1; 16]),
             offer: None,
@@ -226,6 +232,7 @@ async fn queued_request_during_persistent_clock_failure_times_out_and_shutdown_d
         .fail_next("local_observation_checked", usize::MAX);
     let observation = handle.token();
     handle.event(Event::Observe {
+        history: None,
         token: observation,
         id: Id::from_bytes([12; 16]),
         offer: None,
@@ -241,6 +248,9 @@ async fn queued_request_during_persistent_clock_failure_times_out_and_shutdown_d
     let content = Content::Text("queued remote".into());
     let token = handle.token();
     let operation = Operation {
+        sensitive: false,
+        history: None,
+        history_id: None,
         token,
         id: Id::from_bytes([11; 16]),
         source: Id::from_bytes([2; 16]),
@@ -350,6 +360,9 @@ async fn retired_marker_scenario(legacy: bool) -> Result<()> {
             .clipboard
             .submit(
                 Operation {
+                    sensitive: false,
+                    history: None,
+                    history_id: None,
                     token,
                     id: Id::from_bytes([n; 16]),
                     source: Id::from_bytes([2; 16]),
@@ -495,6 +508,9 @@ async fn submit_payload(core: &Arc<Core>, content: &Content) -> Result<Outcome> 
         ),
     };
     let operation = Operation {
+        sensitive: false,
+        history: None,
+        history_id: None,
         token,
         id: Id::from_bytes([token as u8; 16]),
         source: source.clone(),
@@ -625,6 +641,9 @@ async fn recovery_fixture() -> Result<(tempfile::TempDir, Arc<Core>)> {
 fn receive_operation(token: Token, text: &pneu_proto::Clipboard) -> Operation {
     let content = Content::Text(text.text.clone());
     Operation {
+        sensitive: false,
+        history: None,
+        history_id: None,
         token,
         id: text.transfer_id.clone(),
         source: text.source_device.clone().unwrap(),
@@ -657,6 +676,7 @@ async fn watcher_clock_and_all_sixteen_real_claims_complete_before_request_deadl
                 .pair(peer.clone(), pneu_proto::Hash::new(format!("{n:064x}"))?)
                 .await?;
             let text = pneu_proto::Clipboard {
+                sensitive: false,
                 transfer_id: Id::from_bytes([n + 20; 16]),
                 text: format!("incoming-{n}"),
                 created_at: n as u64,
@@ -672,6 +692,7 @@ async fn watcher_clock_and_all_sixteen_real_claims_complete_before_request_deadl
         let token = handle.token();
         let observed = handle.waiter(token);
         handle.event(Event::Observe {
+            history: None,
             token,
             id: Id::from_bytes([1; 16]),
             offer: None,
@@ -739,6 +760,7 @@ async fn transient_watcher_clock_failure_recovers_without_another_observation() 
     let token = handle.token();
     let observed = handle.waiter(token);
     handle.event(Event::Observe {
+        history: None,
         token,
         id: Id::from_bytes([1; 16]),
         offer: None,
@@ -752,6 +774,7 @@ async fn transient_watcher_clock_failure_recovers_without_another_observation() 
         debounce: false,
     });
     let text = pneu_proto::Clipboard {
+        sensitive: false,
         transfer_id: Id::from_bytes([2; 16]),
         text: "incoming after recovery".into(),
         created_at: 100,
@@ -796,6 +819,7 @@ async fn lost_read_completion_expires_and_releases_the_actor_without_user_activi
     let observed = handle.waiter(token);
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     handle.event(Event::Observe {
+        history: None,
         token,
         id: Id::from_bytes([1; 16]),
         offer: None,
@@ -807,6 +831,7 @@ async fn lost_read_completion_expires_and_releases_the_actor_without_user_activi
         .send(Message::ReadHandle(token, cancel.clone()))
         .unwrap();
     let text = pneu_proto::Clipboard {
+        sensitive: false,
         transfer_id: Id::from_bytes([2; 16]),
         text: "incoming after read timeout".into(),
         created_at: 100,
@@ -1217,4 +1242,336 @@ async fn manual_share_verifies_file_backed_image_against_captured_representation
         core.shutdown_actions().await?;
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn history_records_new_local_copies_with_sharing_off_but_not_initial_sensitive_or_owned_changes()
+-> Result<()> {
+    let (_dir, core, _actions) = history_fixture().await?;
+    core.set_setting("clipboard_mode".into(), serde_json::json!("off"))
+        .await?;
+    core.set_setting("clipboard_history".into(), true.into())
+        .await?;
+    let (_, initial) = core.observe_watched_clipboard_kind(false, false, true);
+    core.clipboard_test_read(initial, Some(Content::Text("already present".into())))
+        .await;
+    assert!(core.store.history_items().is_empty());
+    let (_, local) = core.observe_watched_clipboard(false);
+    core.clipboard_test_read(local, Some(Content::Text("human copy".into())))
+        .await;
+    core.clipboard_test_idle().await;
+    assert_eq!(core.store.history_items()[0].title, "human copy");
+    let (_, secret) = core.observe_watched_clipboard(false);
+    core.clipboard_test_read(secret, None).await; // Native watchers refuse sensitive bytes.
+    let (_, owned) = core.observe_watched_clipboard(true);
+    core.clipboard_observed(owned, Some(Content::Text("owned echo".into())), false);
+    core.clipboard_test_idle().await;
+    assert_eq!(core.store.history_items().len(), 1);
+    let id = core.store.history_items()[0].id.clone();
+    core.copy_clipboard_history(id.clone()).await?;
+    assert_eq!(core.store.history_items()[0].id, id);
+    assert_eq!(core.store.history_items()[0].origin, None);
+    core.delete_clipboard_history(Some(id)).await?;
+    core.clipboard_test_idle().await;
+    assert!(core.store.history_items().is_empty());
+    core.shutdown_actions().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn received_sensitive_items_apply_without_history_and_manager_echo_preserves_remote_origin()
+-> Result<()> {
+    let (_dir, core, actions) = history_fixture().await?;
+    core.set_setting("clipboard_history".into(), true.into())
+        .await?;
+    for (n, sensitive) in [(1, false), (2, true)] {
+        let text = format!("received {n}");
+        let content = Content::Text(text.clone());
+        let operation = Operation {
+            token: core.clipboard.token(),
+            id: Id::from_bytes([n; 16]),
+            source: Id::from_bytes([99; 16]),
+            key: Some(Key {
+                hlc: crate::now_ms() + 10_000 + n as u64,
+                source: Id::from_bytes([99; 16]),
+            }),
+            created_at: 1,
+            hashes: hashes(&content),
+            content: Some(content),
+            payload: None,
+            offer: None,
+            received: true,
+            legacy: false,
+            restore: false,
+            repair: false,
+            observation: None,
+            sensitive,
+            history: core.store.history_generation(),
+            history_id: None,
+        };
+        let (reply, _) = oneshot::channel();
+        let result = core
+            .clipboard
+            .submit(
+                operation,
+                Request {
+                    input: ClipboardInput::Text(text),
+                    claim: None,
+                    store: core.store.clone(),
+                    authority: None,
+                    kind: None,
+                    policy: Vec::new(),
+                    reply,
+                },
+            )
+            .await?;
+        assert!(result.applied);
+        assert_eq!(*actions.text.lock().unwrap(), format!("received {n}"));
+        assert_eq!(actions.sensitive.lock().unwrap().last(), Some(&sensitive));
+        assert_eq!(core.store.history_items().len(), 1);
+    }
+    assert!(core.store.history_items()[0].origin.is_some());
+    let id = core.store.history_items()[0].id.clone();
+    let (_, token) = core.observe_watched_clipboard(false);
+    core.clipboard_test_read(token, Some(Content::Text("received 1".into())))
+        .await;
+    core.clipboard_test_idle().await;
+    assert_eq!(core.store.history_items()[0].id, id);
+    assert!(core.store.history_items()[0].origin.is_some());
+    core.delete_clipboard_history(Some(id)).await?;
+    let (_, token) = core.observe_watched_clipboard(false);
+    core.clipboard_test_read(token, Some(Content::Text("received 1".into())))
+        .await;
+    core.clipboard_test_idle().await;
+    assert!(
+        core.store.history_items().is_empty(),
+        "manager echo resurrected deleted history"
+    );
+    core.shutdown_actions().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn history_restore_is_local_even_when_the_outbound_representation_is_unusable() -> Result<()>
+{
+    use crate::core::{CloseReason, Session};
+    for (image, include_images, image_peer, publish) in [
+        (true, true, false, false),
+        (true, false, true, false),
+        (false, true, false, false),
+        (true, true, true, true),
+    ] {
+        let (_dir, core, actions) = history_fixture().await?;
+        core.set_setting("clipboard_history".into(), true.into())
+            .await?;
+        core.set_setting("clipboard_include_images".into(), include_images.into())
+            .await?;
+        let peer = Id::from_bytes([9; 16]);
+        let fp = pneu_proto::Hash::new("9".repeat(64))?;
+        core.store.pair(peer.clone(), fp.clone()).await?;
+        core.admission
+            .lock()
+            .unwrap()
+            .peers
+            .insert(fp, peer.clone());
+        let (close, _rx) = watch::channel::<Option<CloseReason>>(None);
+        core.sessions.lock().unwrap().sessions.insert(
+            peer.clone(),
+            Session {
+                device: peer.clone(),
+                id: 1,
+                close,
+                wake: Arc::new(tokio::sync::Notify::new()),
+                paused: false,
+                capabilities: if image_peer {
+                    vec!["clipboard_text".into(), "clipboard_image".into()]
+                } else {
+                    vec!["clipboard_text".into()]
+                },
+                outbound: false,
+                mesh: false,
+                role: "phone".into(),
+                phone: Default::default(),
+            },
+        );
+        assert!(core.automatic_target().is_some());
+        let text = "\u{1}".repeat(pneu_proto::MAX_CLIPBOARD_BYTES);
+        let input = if image {
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(1, 1).write_to(&mut png, image::ImageFormat::Png)?;
+            ClipboardInput::Bytes {
+                bytes: png.into_inner(),
+                mime: "image/png".into(),
+                cache: core.paths.cache.clone(),
+            }
+        } else {
+            ClipboardInput::Text(text.clone())
+        };
+        core.store
+            .history_record(input, None, core.store.history_generation().unwrap())
+            .await?;
+        let id = core.store.history_items()[0].id.clone();
+        core.copy_clipboard_history(id).await?;
+        core.clipboard_test_idle().await;
+        if image {
+            assert_eq!(actions.images.load(Ordering::SeqCst), 1);
+        } else {
+            assert_eq!(*actions.text.lock().unwrap(), text);
+        }
+        assert_eq!(
+            core.automatic
+                .lock()
+                .unwrap()
+                .selections
+                .contains_key(&peer),
+            publish
+        );
+        core.shutdown_actions().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn history_disable_checks_daemon_items_and_fences_queued_captures() -> Result<()> {
+    let (_dir, core, _actions) = history_fixture().await?;
+    core.set_setting("clipboard_history".into(), true.into())
+        .await?;
+    let generation = core.store.history_generation().unwrap();
+    core.store
+        .history_record(
+            ClipboardInput::Text("not in the window snapshot".into()),
+            None,
+            generation,
+        )
+        .await?;
+    assert_eq!(core.disable_empty_clipboard_history().await?, 1);
+    assert!(core.config().clipboard_history);
+    assert_eq!(core.store.history_items().len(), 1);
+    core.set_setting("clipboard_history".into(), false.into())
+        .await?; // Confirmed Turn Off.
+    assert!(core.store.history_items().is_empty());
+    core.set_setting("clipboard_history".into(), true.into())
+        .await?;
+    let generation = core.store.history_generation().unwrap();
+    assert_eq!(core.disable_empty_clipboard_history().await?, 0);
+    core.store
+        .history_record(
+            ClipboardInput::Text("late capture".into()),
+            None,
+            generation,
+        )
+        .await?;
+    assert!(!core.config().clipboard_history);
+    assert!(core.store.history_items().is_empty());
+    core.shutdown_actions().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn history_work_keeps_one_active_and_only_the_latest_waiting_payload() -> Result<()> {
+    let (_dir, core, actions) = history_fixture().await?;
+    core.set_setting("clipboard_history".into(), true.into())
+        .await?;
+    let generation = core.store.history_generation().unwrap();
+    let (handle, _rx) = Handle::channel();
+    let mut driver = Driver {
+        core: Arc::downgrade(&core),
+        actions,
+        state: State::default(),
+        handle,
+        requests: HashMap::new(),
+        shares: HashMap::new(),
+        admissions: HashMap::new(),
+        helpers: HashMap::new(),
+        reads: HashMap::new(),
+        jobs: tokio::task::JoinSet::new(),
+        job_failures: HashMap::new(),
+        stopping: None,
+        barriers: Vec::new(),
+        waiters: HashMap::new(),
+        timers: Vec::new(),
+        clock_jobs: HashMap::new(),
+        share_jobs: HashMap::new(),
+        history_revision: 0,
+        record_job: None,
+        pending_record: None,
+    };
+    // Do not yield to the storage jobs until the whole burst is queued.
+    for n in 0..100 {
+        driver.effects(vec![Effect::RecordHistory {
+            generation,
+            content: Content::Text(format!("copy {n}")),
+        }]);
+        assert_eq!(driver.jobs.len(), 1);
+    }
+    assert!(
+        matches!(&driver.pending_record, Some((Content::Text(t), g)) if t == "copy 99" && *g == generation)
+    );
+    while let Some(result) = driver.jobs.join_next_with_id().await {
+        driver.joined(result);
+    }
+    assert!(driver.record_job.is_none());
+    assert!(driver.pending_record.is_none());
+    assert_eq!(
+        core.store
+            .history_items()
+            .iter()
+            .map(|i| i.title.as_str())
+            .collect::<Vec<_>>(),
+        ["copy 99", "copy 0"]
+    );
+    core.shutdown_actions().await?;
+    Ok(())
+}
+
+#[derive(Default)]
+struct HistoryActions {
+    images: std::sync::atomic::AtomicUsize,
+    text: std::sync::Mutex<String>,
+    sensitive: std::sync::Mutex<Vec<bool>>,
+}
+#[async_trait]
+impl PcActions for HistoryActions {
+    async fn clipboard_text(&self, text: &str) -> Result<()> {
+        *self.text.lock().unwrap() = text.into();
+        Ok(())
+    }
+    async fn clipboard_image(&self, _: &Path, _: &str) -> Result<()> {
+        self.images.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn notify(&self, _: &Path, _: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn open(&self, _: &Path) -> Result<()> {
+        Ok(())
+    }
+    async fn prepare_clipboard_sensitive(
+        &self,
+        input: ClipboardInput,
+        _: u128,
+        sensitive: bool,
+    ) -> Result<PreparedClipboard> {
+        self.sensitive.lock().unwrap().push(sensitive);
+        PreparedClipboard::immediate(input)
+    }
+}
+async fn history_fixture() -> Result<(tempfile::TempDir, Arc<Core>, Arc<HistoryActions>)> {
+    let dir = crate::test_support::scratch()?;
+    let actions = Arc::new(HistoryActions::default());
+    let core = Core::new(
+        Paths {
+            data: dir.path().join("data"),
+            cache: dir.path().join("cache"),
+            config: dir.path().join("config/config.toml"),
+            socket: dir.path().join("socket"),
+        },
+        Config {
+            save_path: dir.path().join("saved"),
+            ..Config::default()
+        },
+        actions.clone(),
+    )
+    .await?;
+    Ok((dir, core, actions))
 }

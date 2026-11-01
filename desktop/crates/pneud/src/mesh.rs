@@ -3897,6 +3897,7 @@ mod tests {
             Some(Message::PairRequest(p)) if p.token == uri.token
         ));
         let clip = Clipboard {
+            sensitive: false,
             transfer_id: Id::new(crate::random_hex(16))?,
             text: "buffer me".into(),
             created_at: crate::now_ms(),

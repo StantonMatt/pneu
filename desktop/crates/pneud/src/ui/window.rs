@@ -19,7 +19,7 @@ use std::{
 
 slint::slint! {
     export {
-        PneuWindow, Ui, WindowFocus, Page, Dialog, CodeState, ScanState, DeviceItem, RecentItem, SettingItem,
+        PneuWindow, Ui, WindowFocus, Page, Dialog, CodeState, ScanState, DeviceItem, RecentItem, HistoryItem, SettingItem,
         PickItem, RecipientItem, Message, Summary, Tone, Tube, LinkState, LinkTile, DropItem, DropGeometry,
         TopKind, TopCard, LinkRow, DeviceLink
     } from "../../ui/window.slint";
@@ -218,6 +218,10 @@ enum Action {
     PickerSend(Vec<String>),
     PickerCancel,
     SendClipboard,
+    CopyHistory(String),
+    DisableEmptyHistory,
+    DeleteHistory(String),
+    ClearHistory,
     Cancel(String),
     Retry(String),
     Dismiss(String),
@@ -1036,6 +1040,8 @@ struct Frame {
     summary: SummaryData,
     devices: Vec<DeviceItem>,
     recent: Vec<RecentItem>,
+    history: Vec<crate::store::history::Item>,
+    keep_history: bool,
     manual_clipboard: bool,
     pair_again: bool,
     motion: bool,
@@ -1562,6 +1568,7 @@ fn connect(
     let ui = window.global::<Ui>();
     ui.set_devices(ModelRc::new(VecModel::<DeviceItem>::default()));
     ui.set_recent(ModelRc::new(VecModel::<RecentItem>::default()));
+    ui.set_history(ModelRc::new(VecModel::<HistoryItem>::default()));
     ui.set_recipients(ModelRc::new(VecModel::<RecipientItem>::default()));
     ui.set_device_settings(ModelRc::new(VecModel::<SettingItem>::default()));
     // High error correction keeps the code readable under Pneu's icon.
@@ -1598,6 +1605,10 @@ fn connect(
     }
     ui.on_choose_folder(send(|| Action::Folder));
     ui.on_send_clipboard(send(|| Action::SendClipboard));
+    ui.on_copy_history(with(Action::CopyHistory));
+    ui.on_disable_empty_history(send(|| Action::DisableEmptyHistory));
+    ui.on_delete_history(with(Action::DeleteHistory));
+    ui.on_clear_history(send(|| Action::ClearHistory));
     ui.on_show_code(send(|| Action::ShowCode));
     ui.on_new_code(send(|| Action::NewCode));
     let c = commands.clone();
@@ -1770,6 +1781,7 @@ struct Worker {
     status_error: String,
     status: Value,
     snapshot: super::Snapshot,
+    history_order: Vec<String>,
     transfers: Vec<Transfer>,
     pushed: Option<Frame>,
     phone_token: Option<pneu_proto::Hash>,
@@ -1833,6 +1845,7 @@ impl Worker {
             status_error: String::new(),
             status: Value::Null,
             snapshot: Default::default(),
+            history_order: Vec::new(),
             transfers: Vec::new(),
             pushed: None,
             phone_token: None,
@@ -2003,7 +2016,10 @@ impl Worker {
                 // eventual UI feedback is still gated by the originating view.
                 let global_write = matches!(
                     *action,
-                    Action::SetMode(_) | Action::SetFlag(_, _) | Action::Rename(_)
+                    Action::SetMode(_)
+                        | Action::SetFlag(_, _)
+                        | Action::Rename(_)
+                        | Action::DisableEmptyHistory
                 );
                 if self.view() != view && !global_write {
                     return;
@@ -2187,6 +2203,52 @@ impl Worker {
                 };
                 if let Err(error) = result {
                     self.fail("Couldn't complete the menu action", error);
+                }
+            }
+            Action::DisableEmptyHistory => {
+                match self
+                    .command(ipc::Command::DisableEmptyClipboardHistory)
+                    .await
+                {
+                    Ok(count) => {
+                        let Some(count) = count.as_u64() else {
+                            self.fail(
+                                "Couldn't save setting",
+                                anyhow::anyhow!("invalid history count"),
+                            );
+                            return;
+                        };
+                        if count > 0 {
+                            self.ui(move |w| {
+                                let ui = w.global::<Ui>();
+                                ui.set_history_off_count(count.min(i32::MAX as u64) as i32);
+                                ui.set_dialog(Dialog::HistoryOff);
+                            });
+                        }
+                    }
+                    Err(error) => self.fail("Couldn't save setting", error),
+                }
+            }
+            Action::CopyHistory(id) => {
+                match self
+                    .command(ipc::Command::CopyClipboardHistory { id: id.clone() })
+                    .await
+                {
+                    Ok(_) => self.ui(move |w| w.invoke_history_copied(id.into())),
+                    Err(error) => self.fail("Couldn't copy", error),
+                }
+            }
+            Action::DeleteHistory(id) => {
+                if let Err(error) = self
+                    .command(ipc::Command::DeleteClipboardHistory { id })
+                    .await
+                {
+                    self.fail("Couldn't delete", error);
+                }
+            }
+            Action::ClearHistory => {
+                if let Err(error) = self.command(ipc::Command::ClearClipboardHistory).await {
+                    self.fail("Couldn't clear history", error);
                 }
             }
             Action::SendClipboard => {
@@ -2430,6 +2492,15 @@ impl Worker {
     }
 
     async fn navigated(&mut self, probe_clipboard: bool) {
+        if self.view().page == Page::History {
+            self.history_order = self
+                .snapshot
+                .clipboard_history
+                .iter()
+                .map(|i| i.id.clone())
+                .collect();
+        }
+
         let view = self.view();
         self.pushed = None;
         self.action_error.clear();
@@ -2490,6 +2561,7 @@ impl Worker {
                     | "notification_preview"
                     | "copy_image_to_clipboard"
                     | "open_in_viewer"
+                    | "clipboard_history"
                     | "clipboard_include_images"
             ),
             "unknown setting {key}"
@@ -3422,6 +3494,19 @@ impl Worker {
         self.status_error.clear();
         self.invitation_revision = value["invitation_revision"].as_u64().unwrap_or(0);
         self.transfers = snapshot.transfers.iter().map(Transfer::from).collect();
+        if self.view().page != Page::History {
+            self.history_order.clear();
+        }
+        self.history_order
+            .retain(|id| snapshot.clipboard_history.iter().any(|i| &i.id == id));
+        let mut new: Vec<_> = snapshot
+            .clipboard_history
+            .iter()
+            .filter(|i| !self.history_order.contains(&i.id))
+            .map(|i| i.id.clone())
+            .collect();
+        new.append(&mut self.history_order);
+        self.history_order = new;
         self.snapshot = snapshot;
         #[cfg(target_os = "macos")]
         {
@@ -3468,6 +3553,8 @@ impl Worker {
         let first_run = self.snapshot.devices.is_empty();
         let current = self.status["window_request"].as_u64().unwrap_or(0);
         let add_device = self.status["add_device"].as_bool().unwrap_or(false);
+        let history_page =
+            config.clipboard_history && self.status["history_page"].as_bool().unwrap_or(false);
         // A joined notification's Remove… also applies when this child was
         // launched with the same request number in PNEU_WINDOW_REQUEST.
         let remove_device = self.status["remove_device"]
@@ -3482,7 +3569,7 @@ impl Worker {
             .map(String::from);
         if !self.restored_join
             && (current != self.request
-                || (initial_status && (add_device || remove_device.is_some())))
+                || (initial_status && (add_device || history_page || remove_device.is_some())))
         {
             self.request = current;
             self.remove_request = remove_device.clone();
@@ -3501,6 +3588,10 @@ impl Worker {
                 super::macos::native::activate(w);
                 #[cfg(windows)]
                 super::windows_window::activate(w);
+                if history_page {
+                    w.invoke_go(Page::History);
+                    return;
+                }
                 if let Some(page) = requested_page {
                     w.invoke_go(page);
                     return;
@@ -3543,7 +3634,7 @@ impl Worker {
         if first_run
             && !is_pairing_page(view.page)
             && self.paired.is_none()
-            && !(cfg!(target_os = "macos") && view.page == Page::Settings)
+            && !matches!(view.page, Page::Settings | Page::History)
         {
             // Unpairing the last device returns to Add Device.
             self.ui(|w| w.invoke_open_add(0));
@@ -3635,6 +3726,9 @@ impl Worker {
             && !peers.iter().any(|p| p.id == view.device)
             && self.paired.is_none()
         {
+            self.ui(|w| w.invoke_go(Page::Main));
+        }
+        if view.page == Page::History && !config.clipboard_history {
             self.ui(|w| w.invoke_go(Page::Main));
         }
         let now = crate::now_ms();
@@ -4004,6 +4098,18 @@ impl Worker {
             summary: hero,
             devices: peers.iter().map(|p| self.device_item(p)).collect(),
             recent: recent(peers, &self.transfers),
+            history: self
+                .history_order
+                .iter()
+                .filter_map(|id| {
+                    self.snapshot
+                        .clipboard_history
+                        .iter()
+                        .find(|i| &i.id == id)
+                        .cloned()
+                })
+                .collect(),
+            keep_history: config.clipboard_history,
             manual_clipboard: mode == ClipboardMode::Manual,
             pair_again,
             motion: animations_enabled(&super::palette::globals()),
@@ -4062,6 +4168,36 @@ fn apply(w: &PneuWindow, frame: Frame) {
     ui.set_pair_again(frame.pair_again);
     sync(ui.get_devices(), &frame.devices);
     sync(ui.get_recent(), &frame.recent);
+    ui.set_keep_history(frame.keep_history);
+    let history: Vec<_> = frame
+        .history
+        .iter()
+        .map(|item| HistoryItem {
+            id: item.id.clone().into(),
+            title: item.title.clone().into(),
+            url: item.url,
+            picture: item.image,
+            detail: format!(
+                "{} · {}",
+                item.origin
+                    .as_ref()
+                    .map(|o| format!("From {}", display_peer_text(o)))
+                    .unwrap_or_else(|| if cfg!(target_os = "macos") {
+                        "This Mac".into()
+                    } else {
+                        "This computer".into()
+                    }),
+                seen(item.at)
+            )
+            .into(),
+            thumbnail: item
+                .thumbnail
+                .as_ref()
+                .and_then(|p| slint::Image::load_from_path(p).ok())
+                .unwrap_or_default(),
+        })
+        .collect();
+    sync(ui.get_history(), &history);
     ui.set_manual_clipboard(frame.manual_clipboard);
     ui.set_motion(frame.motion);
     ui.set_device_revision(ui.get_navigation_revision());
@@ -8105,6 +8241,7 @@ mod tests {
             let ui = window.global::<Ui>();
             ui.set_dialog(Dialog::None);
             ui.set_is_mac(false);
+            ui.set_history_copied("".into());
             ui.set_download(false);
             ui.set_qr(slint::Image::from_rgba8(qr_pixels(&sample_uri())?));
             ui.set_code_qr(slint::Image::from_rgba8(qr_pixels(&sample_uri())?));
@@ -8146,7 +8283,7 @@ mod tests {
             }
             let size = slint::LogicalSize::new(400.0, height).to_physical(scale);
             surface.set_size(size);
-            if scene.name.ends_with("-copied") {
+            if scene.name.ends_with("-copied") && !scene.name.contains("history") {
                 // Click the address, which sits just above Pairing Code.
                 let position =
                     slint::LogicalPosition::new(200.0, height - 16.0 - 24.0 - 4.0 - 12.0);
@@ -9343,8 +9480,208 @@ mod tests {
                 },
             ),
         ];
+        list.extend(history_scenes());
         list.extend(linking_scenes());
         list
+    }
+
+    #[tokio::test]
+    async fn history_keyboard_copies_deletes_and_confirmations_default_to_cancel() -> Result<()> {
+        if in_offscreen_child("ui::window::tests::history_keyboard_copies_deletes_and_confirmations_default_to_cancel",&[]).await? {return Ok(());}
+        let surface = headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut rx) = model_worker(&window, dir.path());
+        let ui = window.global::<Ui>();
+        ui.set_keep_history(true);
+        ui.set_motion(false);
+        let row = HistoryItem {
+            id: "row".into(),
+            title: "A saved copy".into(),
+            detail: "This computer · 10:41".into(),
+            ..Default::default()
+        };
+        sync(ui.get_history(), &[row]);
+        window.invoke_go(Page::History);
+        window.show()?;
+        surface.set_size(slint::PhysicalSize::new(400, 400));
+        window
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::WindowActiveChanged(true));
+        let draw = || {
+            surface.request_redraw();
+            surface.draw_if_needed(|renderer| {
+                let mut pixels = vec![
+                        slint::platform::software_renderer::PremultipliedRgbaColor::default();
+                        400 * 400
+                    ];
+                renderer.render(&mut pixels, 400);
+            });
+            advance_ui();
+        };
+        draw();
+        key(&window, slint::platform::Key::Tab);
+        key(&window, slint::platform::Key::Tab);
+        key(&window, slint::platform::Key::Tab);
+        key(&window, slint::platform::Key::Return);
+        key(&window, slint::platform::Key::Delete);
+        let mut copied = 0;
+        let mut deleted = 0;
+        while let Ok(Action::Scoped(_, action)) = rx.try_recv() {
+            match *action {
+                Action::CopyHistory(ref id) if id == "row" => copied += 1,
+                Action::DeleteHistory(ref id) if id == "row" => deleted += 1,
+                _ => {}
+            }
+        }
+        assert_eq!((copied, deleted), (1, 1));
+        for dialog in [Dialog::HistoryClear, Dialog::HistoryOff] {
+            ui.set_dialog(dialog);
+            draw();
+            key(&window, slint::platform::Key::Return);
+            assert_eq!(ui.get_dialog(), Dialog::None);
+            assert!(ui.get_keep_history());
+            ui.set_dialog(dialog);
+            draw();
+            key(&window, slint::platform::Key::Escape);
+            assert_eq!(ui.get_dialog(), Dialog::None);
+            assert!(ui.get_keep_history());
+        }
+        assert!(rx.try_recv().is_err());
+        window.invoke_history_copied("row".into());
+        assert_eq!(ui.get_history_copied(), "row");
+        flush_ui();
+        std::thread::sleep(Duration::from_millis(1200));
+        flush_ui();
+        window.invoke_history_copied("another row".into());
+        flush_ui();
+        std::thread::sleep(Duration::from_millis(1100));
+        flush_ui();
+        assert_eq!(
+            ui.get_history_copied(),
+            "another row",
+            "second copy did not restart timer"
+        );
+        std::thread::sleep(Duration::from_millis(1000));
+        flush_ui();
+        assert_eq!(ui.get_history_copied(), "");
+        key(&window, slint::platform::Key::Escape);
+        assert_eq!(ui.get_page(), Page::Main);
+        // The empty window model must still ask the daemon before disabling.
+        sync(ui.get_history(), &[]);
+        let mock = mock_ipc(&worker.paths.socket, |command| {
+            assert_eq!(command["command"], "disable_empty_clipboard_history");
+            (true, json!(2))
+        })?;
+        ui.invoke_disable_empty_history();
+        while let Ok(action) = rx.try_recv() {
+            if matches!(&action, Action::Scoped(_, action) if matches!(**action, Action::DisableEmptyHistory))
+            {
+                act_with_ui(&mut worker, action).await;
+            }
+        }
+        assert_eq!(ui.get_dialog(), Dialog::HistoryOff);
+        assert_eq!(ui.get_history_off_count(), 2);
+        assert!(ui.get_keep_history());
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+        Ok(())
+    }
+
+    fn history_fixture(w: &mut Worker, empty: bool) {
+        state(w, trio(), recent_items());
+        w.status["config"]["clipboard_history"] = json!(true);
+        let at = crate::now_ms() - 60_000;
+        w.snapshot.clipboard_history = if empty {
+            vec![]
+        } else {
+            [
+            ("Remember to bring the keys",None,false),
+            ("example.org/plans?view=week",Some("Galaxy S25+"),false),
+            ("Image",Some("MacBook Air"),true),
+            ("The meeting has moved to Thursday. Please send the updated notes before lunch so everyone has time to read them.",None,false),
+            ("averylongwordwithoutanyspaces".repeat(8).as_str(),Some("The computer with an unusually long device name that must be elided"),false),
+        ].into_iter().enumerate().map(|(i,(text,origin,image))|crate::store::history::Item {id:format!("{i:032x}"),title:text.into(),url:i==1,image,origin:origin.map(str::to_owned),at,thumbnail:None}).collect()
+        };
+        w.history_order = w
+            .snapshot
+            .clipboard_history
+            .iter()
+            .map(|i| i.id.clone())
+            .collect();
+    }
+    fn history_scenes() -> Vec<Scene> {
+        vec![
+            scene(
+                "80-history-main",
+                |w| history_fixture(w, false),
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "81-history-items",
+                |w| history_fixture(w, false),
+                go(Page::History, 0, 0),
+            ),
+            scene(
+                "82-history-empty",
+                |w| history_fixture(w, true),
+                go(Page::History, 0, 0),
+            ),
+            scene(
+                "83-history-copied",
+                |w| history_fixture(w, false),
+                |w| {
+                    go(Page::History, 0, 0)(w);
+                    w.invoke_history_copied(format!("{:032x}", 1).into());
+                },
+            ),
+            scene(
+                "84-history-clear",
+                |w| history_fixture(w, false),
+                |w| {
+                    go(Page::History, 0, 0)(w);
+                    w.global::<Ui>().set_dialog(Dialog::HistoryClear);
+                },
+            ),
+            scene(
+                "85-history-turn-off",
+                |w| history_fixture(w, false),
+                |w| {
+                    go(Page::Settings, 0, 0)(w);
+                    w.global::<Ui>().set_history_off_count(5);
+                    w.global::<Ui>().set_dialog(Dialog::HistoryOff);
+                },
+            ),
+            scene(
+                "86-history-setting",
+                |w| history_fixture(w, true),
+                go(Page::Settings, 0, 0),
+            ),
+            scene(
+                "87-history-image",
+                |w| history_fixture(w, false),
+                |w| {
+                    go(Page::History, 0, 0)(w);
+                    let mut pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(72, 72);
+                    for (i, pixel) in pixels.make_mut_slice().iter_mut().enumerate() {
+                        *pixel = slint::Rgba8Pixel {
+                            r: (i % 72 * 3) as u8,
+                            g: (i / 72 * 3) as u8,
+                            b: 145,
+                            a: 255,
+                        };
+                    }
+                    let model = w.global::<Ui>().get_history();
+                    if let Some(mut row) = model.row_data(2) {
+                        row.thumbnail = slint::Image::from_rgba8(pixels);
+                        model
+                            .as_any()
+                            .downcast_ref::<VecModel<HistoryItem>>()
+                            .unwrap()
+                            .set_row_data(2, row);
+                    }
+                },
+            ),
+        ]
     }
 
     // ---------- Pair once, join your devices ----------

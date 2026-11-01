@@ -54,6 +54,15 @@ fn check_client(stream: &ServerStream) -> Result<()> {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Command {
+    ShowClipboardHistory,
+    CopyClipboardHistory {
+        id: String,
+    },
+    DeleteClipboardHistory {
+        id: String,
+    },
+    ClearClipboardHistory,
+    DisableEmptyClipboardHistory,
     SendFiles {
         paths: Vec<std::path::PathBuf>,
         targets: crate::outbox::Targets,
@@ -247,7 +256,8 @@ impl Command {
         }
         matches!(
             self,
-            Self::AddDevice
+            Self::ShowClipboardHistory
+                | Self::AddDevice
                 | Self::ShowWindow { .. }
                 | Self::PresentFiles { .. }
                 | Self::PresentSendError { .. }
@@ -480,6 +490,11 @@ async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
         Command::DismissTransfer{operation,artifact}=>{core.dismiss_transfer_artifact(operation,artifact).await?;serde_json::Value::Null},
         Command::CancelTransfer{operation,artifact,device}=>{core.cancel_transfer_artifact(operation,artifact,device).await?;serde_json::Value::Null},
         Command::RetryTransfer{operation,artifact,device}=>{core.retry_transfer_artifact(operation,artifact,device).await?;serde_json::Value::Null},
+        Command::ShowClipboardHistory=>{core.request_history_window();serde_json::Value::Null},
+        Command::CopyClipboardHistory{id}=>{core.copy_clipboard_history(id).await?;serde_json::Value::Null},
+        Command::DeleteClipboardHistory{id}=>{core.delete_clipboard_history(Some(id)).await?;serde_json::Value::Null},
+        Command::DisableEmptyClipboardHistory=>serde_json::json!(core.disable_empty_clipboard_history().await?),
+        Command::ClearClipboardHistory=>{core.delete_clipboard_history(None).await?;serde_json::Value::Null},
         Command::SetSetting{key,value}=>{core.set_setting(key,value).await?;serde_json::Value::Null},
         Command::Rename{name}=>{core.rename(name).await?;serde_json::Value::Null},
         Command::SendClipboard{targets:crate::outbox::Targets::All(_)} if ask=>core.present_send(crate::ui::window::SendRequest {
@@ -522,7 +537,7 @@ async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
         #[cfg(windows)]
         Command::WindowClosed { request } => { core.window_closed(request); serde_json::Value::Null },
         Command::WindowFocus { request, focused } => { core.set_window_focus(request, focused); serde_json::Value::Null },
-        Command::UiStatus => { let (revision, invitation) = core.pairing_status(); let snapshot = core.ui_snapshot(); let (window_request, activation_token) = core.window_request_with_activation(); serde_json::json!({"device":snapshot.device, "snapshot":snapshot, "config": core.config(), "window_request":window_request,"add_device":core.window_add_device(window_request),"remove_device":core.window_remove_device(window_request),"self_id":core.identity.device_id,"activation_token":activation_token,"invitation_revision":revision,"invitation":invitation,"pending_send":core.pending_send(),"setup":core.setup_status().await?}) },
+        Command::UiStatus => { let (revision, invitation) = core.pairing_status(); let snapshot = core.ui_snapshot(); let (window_request, activation_token) = core.window_request_with_activation(); serde_json::json!({"device":snapshot.device, "snapshot":snapshot, "config": core.config(), "window_request":window_request,"history_page":core.window_history(window_request),"add_device":core.window_add_device(window_request),"remove_device":core.window_remove_device(window_request),"self_id":core.identity.device_id,"activation_token":activation_token,"invitation_revision":revision,"invitation":invitation,"pending_send":core.pending_send(),"setup":core.setup_status().await?}) },
         Command::AddDevice => { core.request_add_device(); serde_json::Value::Null },
         Command::ShowWindow { choose_folder } => { core.request_window(choose_folder); serde_json::Value::Null },
         Command::Status => {

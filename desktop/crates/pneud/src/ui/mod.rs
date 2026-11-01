@@ -96,6 +96,8 @@ pub struct PairingCompletion {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub clipboard_history: Vec<crate::store::history::Item>,
     /// Last locally consumed invitation, published with Event::Paired.
     #[serde(default)]
     pub pairing_completion: Option<PairingCompletion>,
@@ -522,6 +524,8 @@ pub(crate) fn captured_authorities(snapshot: &Snapshot) -> Vec<crate::outbox::Au
 }
 #[derive(Clone, Debug)]
 pub enum Command {
+    ShowClipboardHistory,
+    CopyClipboardHistory(String),
     SetupDecision {
         requests: Vec<window_setup::Decision>,
         allow: bool,

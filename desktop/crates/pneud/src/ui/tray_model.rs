@@ -151,6 +151,38 @@ pub fn render_svg(svg: &[u8], size: u32) -> Result<Vec<u8>> {
     Ok(pixmap.take())
 }
 
+pub(crate) fn history_label(item: &crate::store::history::Item, kde: bool) -> String {
+    let label = if item.image {
+        format!("Image · {}", super::last_seen(item.at))
+    } else {
+        item.title.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    let label = if label.chars().count() > 40 {
+        format!("{}…", label.chars().take(39).collect::<String>())
+    } else {
+        label
+    };
+    if kde { label.replace('_', "__") } else { label }
+}
+#[cfg(target_os = "linux")]
+pub(crate) fn history_icon(item: &crate::store::history::Item) -> Vec<u8> {
+    let Some(path) = item.thumbnail.as_ref() else {
+        return Vec::new();
+    };
+    (|| -> Result<Vec<u8>> {
+        let bytes = crate::storage::read_bounded(path, 128 * 1024)?;
+        let image = image::load_from_memory(&bytes)?.resize_exact(
+            16,
+            16,
+            image::imageops::FilterType::Triangle,
+        );
+        let mut png = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut png, image::ImageFormat::Png)?;
+        Ok(png.into_inner())
+    })()
+    .unwrap_or_default()
+}
+
 // The native Windows menu uses the same presentation projection and captured
 // authorities as ksni. Native menu IDs are never reused across rebuilds.
 #[cfg(any(windows, test))]
@@ -189,6 +221,34 @@ pub(super) fn menu(snapshot: &Snapshot, config: &crate::Config) -> Vec<MenuEntry
             enabled,
             checked: Some(toggle.checked(config)),
             command: Some(Command::Toggle(toggle)),
+        }
+    }
+    fn history(snapshot: &Snapshot) -> MenuEntry {
+        let mut items: Vec<_> = snapshot
+            .clipboard_history
+            .iter()
+            .take(10)
+            .map(|i| {
+                item(
+                    history_label(i, false),
+                    Command::CopyClipboardHistory(i.id.clone()),
+                )
+            })
+            .collect();
+        if items.is_empty() {
+            items.push(Item {
+                label: "Nothing copied yet".into(),
+                enabled: false,
+                checked: None,
+                command: None,
+            });
+        } else {
+            items.push(Separator);
+            items.push(item("Show All", Command::ShowClipboardHistory));
+        }
+        Submenu {
+            label: "Clipboard History".into(),
+            items,
         }
     }
     let transfers = snapshot
@@ -269,6 +329,9 @@ pub(super) fn menu(snapshot: &Snapshot, config: &crate::Config) -> Vec<MenuEntry
                 Command::SendClipboard(super::captured_authorities(snapshot)),
             ));
         }
+        if config.clipboard_history {
+            items.push(history(snapshot));
+        }
         items.extend([item("Open Received Files", Command::OpenFolder), Separator]);
         let mut modes = [
             ("Share Automatically", ClipboardMode::Automatic),
@@ -304,6 +367,9 @@ pub(super) fn menu(snapshot: &Snapshot, config: &crate::Config) -> Vec<MenuEntry
             .collect(),
         });
         items.push(Separator);
+    }
+    if peers.is_empty() && config.clipboard_history {
+        items.push(history(snapshot));
     }
     items.extend([
         item(
@@ -488,5 +554,75 @@ mod tests {
         }
         assert!(render_svg(ICONS[0].1.as_bytes(), 0).is_err());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    fn entry(text: &str) -> crate::store::history::Item {
+        crate::store::history::Item {
+            id: "1".repeat(32),
+            title: crate::store::history::title(text),
+            url: crate::store::history::is_url(text),
+            image: false,
+            origin: None,
+            at: 1,
+            thumbnail: None,
+        }
+    }
+    #[test]
+    fn history_labels_collapse_whitespace_trim_urls_limit_unicode_and_escape_kde_mnemonics() {
+        assert_eq!(
+            history_label(&entry(" \n https://example.org/a_b \t"), false),
+            "example.org/a_b"
+        );
+        assert_eq!(
+            history_label(&entry("line_1\n\tline_2"), true),
+            "line__1 line__2"
+        );
+        assert_eq!(
+            history_label(&entry(&"é".repeat(40)), false),
+            "é".repeat(40)
+        );
+        assert_eq!(
+            history_label(&entry(&"é".repeat(41)), false),
+            format!("{}…", "é".repeat(39))
+        );
+        assert!(
+            history_label(
+                &crate::store::history::Item {
+                    image: true,
+                    ..entry("")
+                },
+                false
+            )
+            .starts_with("Image · ")
+        );
+    }
+    #[test]
+    fn history_menu_is_hidden_when_off_disabled_when_empty_and_has_ten_latest_plus_show_all() {
+        let mut snapshot = Snapshot::default();
+        let mut config = crate::Config::default();
+        fn history(items: Vec<MenuEntry>) -> Option<Vec<MenuEntry>> {
+            items.into_iter().find_map(|i| match i {
+                MenuEntry::Submenu { label, items } if label == "Clipboard History" => Some(items),
+                _ => None,
+            })
+        }
+        assert!(history(menu(&snapshot, &config)).is_none());
+        config.clipboard_history = true;
+        let empty = history(menu(&snapshot, &config)).unwrap();
+        assert_eq!(empty.len(), 1);
+        assert!(
+            matches!(&empty[0],MenuEntry::Item {label,enabled:false,command:None,..} if label=="Nothing copied yet")
+        );
+        snapshot.clipboard_history = (0..11).map(|i| entry(&format!("text {i}"))).collect();
+        let items = history(menu(&snapshot, &config)).unwrap();
+        assert_eq!(items.len(), 12);
+        assert!(matches!(&items[9],MenuEntry::Item {label,..} if label=="text 9"));
+        assert!(
+            matches!(&items[11],MenuEntry::Item {label,command:Some(super::super::Command::ShowClipboardHistory),..} if label=="Show All")
+        );
     }
 }

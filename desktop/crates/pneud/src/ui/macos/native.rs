@@ -366,6 +366,56 @@ impl State {
             let _: () = msg_send![menu, addItem: &*separator];
         }
     }
+    fn add_history(&mut self, menu: &AnyObject) {
+        if !self.config.clipboard_history {
+            return;
+        }
+        unsafe {
+            let submenu = new_menu("Clipboard History");
+            let entries: Vec<_> = self
+                .snapshot
+                .clipboard_history
+                .iter()
+                .take(10)
+                .cloned()
+                .collect();
+            if entries.is_empty() {
+                self.add(&submenu, "Nothing copied yet", None, None, false);
+            } else {
+                for entry in entries {
+                    let item = self.add(
+                        &submenu,
+                        &crate::ui::tray_model::history_label(&entry, false),
+                        Some(command(
+                            serde_json::json!({"command":"copy_clipboard_history","id":entry.id}),
+                        )),
+                        None,
+                        true,
+                    );
+                    if let Some(path) = entry.thumbnail {
+                        let allocated: Allocated<AnyObject> = msg_send![class!(NSImage), alloc];
+                        let image: Option<Retained<AnyObject>> = msg_send![allocated,initWithContentsOfFile:&*NSString::from_str(&path.to_string_lossy())];
+                        if let Some(image) = image {
+                            let _: () = msg_send![&*image,setSize:objc2_foundation::NSSize {width:16.0,height:16.0}];
+                            let _: () = msg_send![&*item,setImage:&*image];
+                        }
+                    }
+                }
+                Self::separator(&submenu);
+                self.add(
+                    &submenu,
+                    "Show All",
+                    Some(command(
+                        serde_json::json!({"command":"show_clipboard_history"}),
+                    )),
+                    None,
+                    true,
+                );
+            }
+            let parent = self.add(menu, "Clipboard History", None, None, true);
+            let _: () = msg_send![&*parent,setSubmenu:&*submenu];
+        }
+    }
     fn rebuild(&mut self) {
         main_thread();
         unsafe {
@@ -383,6 +433,9 @@ impl State {
             let status = crate::ui::tray_model::status(&self.snapshot, &peers, &transfers);
             self.add(&menu, &status, None, None, false);
             Self::separator(&menu);
+            if peers.is_empty() {
+                self.add_history(&menu);
+            }
             if !peers.is_empty() {
                 let submenu = new_menu("Send Files To");
                 let all = crate::file_recipients::resolve(
@@ -442,6 +495,7 @@ impl State {
                         true,
                     );
                 }
+                self.add_history(&menu);
                 self.add(&menu, "Open Folder", Some(MenuAction::Folder), None, true);
                 Self::separator(&menu);
                 let clipboard = new_menu("Clipboard");

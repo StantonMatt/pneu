@@ -1,6 +1,8 @@
 //! Paired peers, completed file receipts, bounded clipboard history, latest outgoing text.
 #[path = "store_clipboard.rs"]
 mod clipboard;
+#[path = "store_history.rs"]
+pub(crate) mod history;
 #[path = "store_members.rs"]
 pub(crate) mod members;
 #[path = "outbox.rs"]
@@ -41,6 +43,8 @@ pub(crate) fn normalize_legacy_hello(hello: &mut pneu_proto::Hello, outbound: bo
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextReceipt {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sensitive: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hlc: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -54,6 +58,7 @@ pub struct TextReceipt {
 impl From<&Clipboard> for TextReceipt {
     fn from(text: &Clipboard) -> Self {
         Self {
+            sensitive: text.sensitive,
             hlc: text.hlc,
             source_device: text.source_device.clone(),
             transfer_id: text.transfer_id.clone(),
@@ -113,6 +118,9 @@ pub struct Store {
     pub(crate) setup_remote_scopes: Arc<Mutex<HashMap<Id, (u64, pneu_proto::SetupScope)>>>,
     pub(crate) setup_changed: tokio::sync::watch::Sender<u64>,
     connection: Arc<Mutex<Connection>>,
+    history: Arc<Mutex<history::State>>,
+    history_folder: PathBuf,
+    history_gate: Arc<tokio::sync::Mutex<()>>,
     clipboard_history_revision: Arc<AtomicU64>,
     clipboard_clock_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) clipboard_fingerprint_key: crate::clipboard_fingerprint::FingerprintKey,
@@ -656,6 +664,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS settings_outgoing(device TEXT PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS settings_replay(device TEXT PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS settings_confirmed(device TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,key TEXT NOT NULL,enabled INTEGER NOT NULL,hlc TEXT NOT NULL,writer_device TEXT NOT NULL,PRIMARY KEY(device,key));")?;
+        history::migrate(&tx)?;
         outbox::migrate(&tx)?;
         let setup = members::migrate(&tx)?;
         // Policy is authoritative before Core can expose any clipboard offers.
@@ -696,6 +705,12 @@ impl Store {
             setup_remote_scopes: Arc::new(Mutex::new(HashMap::new())),
             setup_changed: tokio::sync::watch::channel(0).0,
             connection: Arc::new(Mutex::new(conn)),
+            history: Arc::new(Mutex::new(history::State::default())),
+            history_folder: path
+                .parent()
+                .context("database parent")?
+                .join("clipboard-history"),
+            history_gate: Arc::new(tokio::sync::Mutex::new(())),
             pair_settings: Arc::new(Mutex::new(pair_settings)),
             settings_changed: tokio::sync::watch::channel(0).0,
             settings_generations: Arc::new(Mutex::new(HashMap::new())),
@@ -1664,6 +1679,7 @@ impl Store {
                     |r| r.get(0),
                 )?;
                 let text = Clipboard {
+                    sensitive: false,
                     hlc: None,
                     source_device: None,
                     transfer_id: Id::new(crate::random_hex(16))?,
@@ -2063,6 +2079,7 @@ mod tests {
     }
     fn begin(bytes: &[u8]) -> FileBegin {
         FileBegin {
+            sensitive: false,
             hlc: None,
             source_device: None,
             transfer_id: Id::new(crate::random_hex(16)).unwrap(),
@@ -2147,6 +2164,7 @@ mod tests {
 
     fn text(created_at: u64) -> Clipboard {
         Clipboard {
+            sensitive: false,
             hlc: None,
             source_device: None,
             transfer_id: Id::new(crate::random_hex(16)).unwrap(),

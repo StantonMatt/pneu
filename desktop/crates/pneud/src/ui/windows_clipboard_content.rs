@@ -9,7 +9,7 @@ pub(super) const IGNORE: &str = "Clipboard Viewer Ignore";
 pub(super) const HISTORY: &str = "CanIncludeInClipboardHistory";
 pub(super) const CLOUD: &str = "CanUploadToCloudClipboard";
 pub(super) const MAX_DIB: usize = 64 * 1024 * 1024 + 2048;
-pub(super) const OUTPUT_CAP: usize = MAX_IMAGE * 5 + pneu_proto::MAX_CLIPBOARD_BYTES * 6 + 4096;
+pub(super) const OUTPUT_CAP: usize = MAX_IMAGE * 5 + crate::store::history::MAX_TEXT * 6 + 4096;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Classification {
@@ -87,7 +87,7 @@ pub(super) fn parse_output(bytes: Vec<u8>) -> Result<Snapshot> {
     Ok(result)
 }
 pub(super) fn valid_text(text: &str) -> bool {
-    text.len() <= pneu_proto::MAX_CLIPBOARD_BYTES && !text.contains('\0')
+    text.len() <= crate::store::history::MAX_TEXT && !text.contains('\0')
 }
 pub(super) fn combine(text: Option<String>, png: Option<Vec<u8>>) -> Option<Content> {
     match (text, png) {
@@ -248,7 +248,7 @@ mod tests {
         assert!(parse_output(serde_json::to_vec(&output)?).is_ok());
         for content in [
             Content::Text("a\0b".into()),
-            Content::Text("a".repeat(pneu_proto::MAX_CLIPBOARD_BYTES + 1)),
+            Content::Text("a".repeat(crate::store::history::MAX_TEXT + 1)),
             Content::Image(vec![0; MAX_IMAGE + 1]),
         ] {
             assert!(

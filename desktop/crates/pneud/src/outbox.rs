@@ -547,7 +547,8 @@ impl Outbox {
                 loop {ensure!(!this.admission_cancelled(&operation),"operation cancelled");let n=source.read(&mut buffer)?;if n==0 {break;} copied+=n as u64;ensure!(copied<=size,"source grew while staging");ensure!(this.folder.space()?.saturating_sub(n as u64)>=this.reserve,"outbox disk reserve");staged.write_all(&buffer[..n])?;hash.update(&buffer[..n]);}
                 ensure!(copied==size,"source changed while staging");
                 platform_fs::set_read_only(&staged)?;staged.sync_all()?;this.folder.file.sync_all()?;
-                let begin=FileBegin{transfer_id:id.clone(),file_name:path.file_name().and_then(|s|s.to_str()).context("file name must be UTF-8")?.to_owned(),mime:mime(&path).into(),size,sha256:Hash::new(hex::encode(hash.finalize()))?,kind:FileKind::File,created_at:stamp.as_ref().map_or_else(crate::now_ms, |s| s.created_at),source_media_id:None,hlc:stamp.as_ref().map(|s| s.hlc),source_device:stamp.map(|s| s.source_device)};
+                let begin=FileBegin{
+            sensitive: false,transfer_id:id.clone(),file_name:path.file_name().and_then(|s|s.to_str()).context("file name must be UTF-8")?.to_owned(),mime:mime(&path).into(),size,sha256:Hash::new(hex::encode(hash.finalize()))?,kind:FileKind::File,created_at:stamp.as_ref().map_or_else(crate::now_ms, |s| s.created_at),source_media_id:None,hlc:stamp.as_ref().map(|s| s.hlc),source_device:stamp.map(|s| s.source_device)};
                 pneu_proto::encode_frame(&Message::FileBegin(begin.clone()))?;
                 this.store.locked(|c| {let tx=c.transaction()?;
                     this.select_recipients(&tx,&operation,size,&mut recipients,&mut rejected)?;
@@ -1222,7 +1223,8 @@ mod tests {
         );
         let authority = peers[0].clone();
         q.store.call(move |c| {let tx=c.transaction()?;
-            let begin=FileBegin{transfer_id:id(50),file_name:"full".into(),mime:"application/octet-stream".into(),size:PEER_BYTES,sha256:Hash::new("0".repeat(64))?,kind:FileKind::File,created_at:0,source_media_id:None,hlc:None,source_device:None};
+            let begin=FileBegin{
+            sensitive: false,transfer_id:id(50),file_name:"full".into(),mime:"application/octet-stream".into(),size:PEER_BYTES,sha256:Hash::new("0".repeat(64))?,kind:FileKind::File,created_at:0,source_media_id:None,hlc:None,source_device:None};
             tx.execute("INSERT INTO outbox_artifacts(id,operation,meta,staged) VALUES(?,?,?,1)",params![id(50).as_str(),id(51).as_str(),serde_json::to_string(&begin)?])?;
             tx.execute("INSERT INTO outbox_deliveries(artifact,device,generation,fingerprint) VALUES(?,?,?,?)",params![id(50).as_str(),authority.device.as_str(),authority.generation as i64,authority.fingerprint.as_str()])?;
             assert!(!Outbox::peer_has_capacity(&tx,1,&authority)?);
@@ -1355,6 +1357,7 @@ mod regression_tests {
         // 65 two-recipient terminal operations previously kept half of the
         // oldest operation at the independent 128-row projection boundary.
         let metadata = FileBegin {
+            sensitive: false,
             transfer_id: id(100),
             file_name: "history".into(),
             mime: "text/plain".into(),
@@ -1391,7 +1394,8 @@ mod admission_regression_tests {
             let count=if by_bytes {1} else {PEER_DELIVERIES};
             for n in 0..count {
                 let artifact=Id::new(format!("{:032x}",1000+n))?;
-                let begin=FileBegin {transfer_id:artifact.clone(),file_name:"existing.bin".into(),mime:"application/octet-stream".into(),size:if by_bytes {PEER_BYTES} else {0},sha256:Hash::new("ab".repeat(32))?,kind:FileKind::File,created_at:0,source_media_id:None,hlc:None,source_device:None};
+                let begin=FileBegin {
+            sensitive: false,transfer_id:artifact.clone(),file_name:"existing.bin".into(),mime:"application/octet-stream".into(),size:if by_bytes {PEER_BYTES} else {0},sha256:Hash::new("ab".repeat(32))?,kind:FileKind::File,created_at:0,source_media_id:None,hlc:None,source_device:None};
                 tx.execute("INSERT INTO outbox_artifacts(id,operation,meta) VALUES(?,?,?)",params![artifact.as_str(),id(80).as_str(),serde_json::to_string(&begin)?])?;
                 tx.execute("INSERT INTO outbox_deliveries(artifact,device,generation,fingerprint) VALUES(?,?,?,?)",params![artifact.as_str(),peer.device.as_str(),peer.generation as i64,peer.fingerprint.as_str()])?;
             }

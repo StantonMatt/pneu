@@ -139,6 +139,14 @@ impl DesktopActions {
         *self.commands.lock().expect("UI commands") = Some(commands);
     }
     async fn prepare_copy(&self, input: ClipboardInput, ticket: u128) -> Result<PreparedClipboard> {
+        self.prepare_copy_sensitive(input, ticket, false).await
+    }
+    async fn prepare_copy_sensitive(
+        &self,
+        input: ClipboardInput,
+        ticket: u128,
+        sensitive: bool,
+    ) -> Result<PreparedClipboard> {
         let (mime, bytes) = match &input {
             ClipboardInput::Text(text) => (
                 "text/plain;charset=utf-8".to_owned(),
@@ -147,7 +155,7 @@ impl DesktopActions {
             ClipboardInput::Image(file, mime) => {
                 let file = file.clone();
                 let bytes = crate::work::blocking(self.jobs.clone(), move || {
-                    file.read_bounded(16 * 1024 * 1024)
+                    file.read_bounded(crate::store::history::MAX_IMAGE)
                 })
                 .await??;
                 (mime.clone(), bytes)
@@ -171,6 +179,10 @@ impl DesktopActions {
             .arg(mime)
             .arg(ticket.to_string())
             .env("TMPDIR", &self.cache)
+            .env(
+                "PNEU_CLIPBOARD_SENSITIVE",
+                if sensitive { "1" } else { "0" },
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -586,6 +598,14 @@ impl PcActions for DesktopActions {
         ticket: u128,
     ) -> Result<PreparedClipboard> {
         self.prepare_copy(input, ticket).await
+    }
+    async fn prepare_clipboard_sensitive(
+        &self,
+        input: ClipboardInput,
+        ticket: u128,
+        sensitive: bool,
+    ) -> Result<PreparedClipboard> {
+        self.prepare_copy_sensitive(input, ticket, sensitive).await
     }
     async fn install_clipboard(&self, prepared: &mut PreparedClipboard) -> Result<()> {
         prepared
@@ -1163,7 +1183,7 @@ fn clipboard_sources(
         anyhow::ensure!(bytes.len() >= 8, "invalid clipboard formats header");
         let length = u64::from_be_bytes(bytes[..8].try_into()?) as usize;
         anyhow::ensure!(
-            length <= pneu_proto::MAX_CLIPBOARD_BYTES && bytes.len() >= 8 + length,
+            length <= crate::store::history::MAX_TEXT && bytes.len() >= 8 + length,
             "invalid clipboard formats length"
         );
         let text = std::str::from_utf8(&bytes[8..8 + length])?;
@@ -1205,13 +1225,13 @@ pub fn clipboard_helper(mime: String, ticket: u128) -> Result<()> {
     input.read_exact(&mut length)?;
     let length = u64::from_be_bytes(length);
     anyhow::ensure!(
-        length <= 16 * 1024 * 1024,
+        length <= (crate::store::history::MAX_IMAGE + crate::store::history::MAX_TEXT + 8) as u64,
         "clipboard helper input too large"
     );
     input.by_ref().take(length).read_to_end(&mut bytes)?;
     anyhow::ensure!(bytes.len() as u64 == length, "truncated helper input");
     anyhow::ensure!(
-        bytes.len() <= 16 * 1024 * 1024,
+        bytes.len() <= crate::store::history::MAX_IMAGE + crate::store::history::MAX_TEXT + 8,
         "clipboard helper input too large"
     );
     let mut options = wl_clipboard_rs::copy::Options::new();
@@ -1236,6 +1256,14 @@ pub fn clipboard_helper(mime: String, ticket: u128) -> Result<()> {
         })
         .collect::<Vec<_>>()
         .join(" ");
+    if std::env::var("PNEU_CLIPBOARD_SENSITIVE").as_deref() == Ok("1") {
+        sources.push(wl_clipboard_rs::copy::MimeSource {
+            source: wl_clipboard_rs::copy::Source::Bytes(b"secret".to_vec().into()),
+            mime_type: wl_clipboard_rs::copy::MimeType::Specific(
+                "x-kde-passwordManagerHint".into(),
+            ),
+        });
+    }
     // The daemon's ordered watcher is the sole installation witness.
     let marker = crate::ui::clipboard::install_marker(ticket);
     sources.push(wl_clipboard_rs::copy::MimeSource {
@@ -2705,6 +2733,7 @@ mod tests {
             assert_eq!(&*startup_id.lock().unwrap(), token.unwrap_or_default());
         }
         let metadata = pneu_proto::FileBegin {
+            sensitive: false,
             hlc: None,
             source_device: None,
             transfer_id: pneu_proto::Id::from_bytes([7; 16]),

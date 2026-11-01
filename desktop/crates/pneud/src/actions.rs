@@ -171,7 +171,9 @@ impl PreparedClipboard {
                 (ClipboardInput::Text(text), hashes)
             }
             ClipboardInput::Image(file, mime) => {
-                let hashes = vec![Sha256::digest(file.read_bounded(16 * 1024 * 1024)?).into()];
+                let hashes = vec![
+                    Sha256::digest(file.read_bounded(crate::store::history::MAX_IMAGE)?).into(),
+                ];
                 (ClipboardInput::Image(file, mime), hashes)
             }
             ClipboardInput::Bytes { bytes, mime, cache } => {
@@ -272,6 +274,14 @@ pub trait PcActions: Send + Sync {
         _ticket: u128,
     ) -> Result<PreparedClipboard> {
         tokio::task::spawn_blocking(move || PreparedClipboard::immediate(input)).await?
+    }
+    async fn prepare_clipboard_sensitive(
+        &self,
+        input: ClipboardInput,
+        ticket: u128,
+        _sensitive: bool,
+    ) -> Result<PreparedClipboard> {
+        self.prepare_clipboard(input, ticket).await
     }
     async fn install_clipboard(&self, prepared: &mut PreparedClipboard) -> Result<()> {
         match &prepared.input {

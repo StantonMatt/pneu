@@ -387,8 +387,16 @@ impl PcActions for DesktopActions {
         input: ClipboardInput,
         ticket: u128,
     ) -> Result<PreparedClipboard> {
+        self.prepare_clipboard_sensitive(input, ticket, false).await
+    }
+    async fn prepare_clipboard_sensitive(
+        &self,
+        input: ClipboardInput,
+        ticket: u128,
+        sensitive: bool,
+    ) -> Result<PreparedClipboard> {
         crate::work::blocking(self.jobs.clone(), move || {
-            let native = Offer::prepare(&input, ticket)?;
+            let native = Offer::prepare_sensitive(&input, ticket, sensitive)?;
             Ok(PreparedClipboard {
                 hashes: native.hashes(),
                 marker_confirmation: true,

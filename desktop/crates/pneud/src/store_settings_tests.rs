@@ -167,6 +167,7 @@ async fn pair_settings_receipts_are_bounded_indexed_and_share_content_namespace(
     s.settings_merge(local.clone(), peer.clone(), false, first.clone())
         .await?;
     let text = Clipboard {
+        sensitive: false,
         transfer_id: first.transfer_id.clone(),
         text: "collision".into(),
         hlc: None,

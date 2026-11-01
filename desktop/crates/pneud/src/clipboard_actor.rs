@@ -45,6 +45,9 @@ pub(super) enum Payload {
 #[derive(Clone, Debug)]
 pub(super) struct Operation {
     pub token: Token,
+    pub sensitive: bool,
+    pub history: Option<u64>,
+    pub history_id: Option<String>,
     pub id: Id,
     pub source: Id,
     pub key: Option<Key>,
@@ -105,6 +108,7 @@ pub(super) enum Event {
         offer: Option<ClipboardOffer>,
         origin: bool,
         clear: bool,
+        history: Option<u64>,
     },
     Read {
         token: Token,
@@ -156,6 +160,10 @@ pub(super) enum Event {
 }
 #[derive(Clone, Debug)]
 pub(super) enum Effect {
+    RecordHistory {
+        content: Content,
+        generation: u64,
+    },
     /// Local UI hint, independent from the ordinary sharing classification.
     PairingLink(Option<String>),
     LoadShare {
@@ -198,6 +206,7 @@ pub(super) enum Effect {
 }
 #[derive(Clone, Debug)]
 struct Observation {
+    history: Option<u64>,
     token: Token,
     id: Id,
     offer: Option<ClipboardOffer>,
@@ -358,10 +367,15 @@ impl State {
             self.known_hash(&self.fingerprint_key.digest(&Sha256::digest(bytes).into()))
         };
         match content {
-            Some(Content::Text(text)) => (!known(text.as_bytes())).then_some(Content::Text(text)),
+            Some(Content::Text(text)) => (!known(text.as_bytes())
+                && text.len() <= pneu_proto::MAX_CLIPBOARD_BYTES)
+                .then_some(Content::Text(text)),
             Some(Content::Image(image)) => (!known(&image)).then_some(Content::Image(image)),
             Some(Content::Formats(text, image)) => {
-                match (!known(text.as_bytes()), !known(&image)) {
+                match (
+                    !known(text.as_bytes()) && text.len() <= pneu_proto::MAX_CLIPBOARD_BYTES,
+                    !known(&image),
+                ) {
                     (true, true) => Some(Content::Formats(text, image)),
                     (true, false) => Some(Content::Text(text)),
                     (false, true) => Some(Content::Image(image)),
@@ -727,6 +741,9 @@ impl State {
                 // publication. Its historical key must stay intact: an older
                 // echo is not a repair payload for the register winner.
                 self.current = Some(Operation {
+                    sensitive: false,
+                    history: None,
+                    history_id: None,
                     token,
                     id: fingerprint.id,
                     source: fingerprint.key.source.clone(),
@@ -782,6 +799,9 @@ impl State {
         self.invalidate_publications(effects);
         let hashes = content.as_ref().map(|c| self.hashes(c)).unwrap_or_default();
         let operation = Operation {
+            sensitive: false,
+            history: None,
+            history_id: None,
             token,
             id: observation.id,
             source: self
@@ -941,7 +961,11 @@ impl State {
                 self.clocking = Some(operation);
                 return;
             }
-            if (equal || !operation.received) && !operation.repair {
+            if (equal || !operation.received)
+                && !operation.sensitive
+                && !operation.repair
+                && operation.history_id.is_none()
+            {
                 // No OS write means the previous offer still serves every one
                 // of its representations. Carry them into the new provenance,
                 // including formats absent from the incoming operation.
@@ -1122,6 +1146,7 @@ impl State {
                     || !self.held_observations.is_empty()
                     || offer.recipients.is_empty()
                     || payload.is_none()
+                    || self.current.as_ref().is_some_and(|o| o.sensitive)
                     || self.pending_count() >= 61
                 {
                     effects.push(Effect::Reply {
@@ -1132,6 +1157,9 @@ impl State {
                     });
                 } else if let Some(payload) = payload {
                     let operation = Operation {
+                        sensitive: false,
+                        history: None,
+                        history_id: None,
                         token,
                         id,
                         source,
@@ -1217,6 +1245,7 @@ impl State {
                 offer,
                 origin,
                 clear,
+                history,
             } => {
                 effects.push(Effect::PairingLink(None));
                 if clear
@@ -1259,6 +1288,7 @@ impl State {
                         .is_some_and(|i| i.phase == Phase::Authorized)
                         || !self.stopping_markers.is_empty();
                     self.observation = Some(Observation {
+                        history,
                         token,
                         id,
                         offer: if self.mode == ClipboardMode::Automatic {
@@ -1291,6 +1321,23 @@ impl State {
                         text.filter(|text| text.starts_with("pneu://pair") && text.len() <= 16384)
                             .map(str::to_owned),
                     ));
+                }
+                // Apply the same received-fingerprint exclusion as resolve_read,
+                // while keeping local history capture independent of debounce.
+                let echo = if fingerprints.is_empty() {
+                    content.as_ref().is_some_and(|content| self.echo(content))
+                } else {
+                    self.fingerprint_key
+                        .hashes(&fingerprints)
+                        .iter()
+                        .all(|hash| self.known_hash(hash))
+                };
+                let history = self.read_slot(token).and_then(|o| o.history.take());
+                if !echo && let (Some(generation), Some(content)) = (history, content.as_ref()) {
+                    effects.push(Effect::RecordHistory {
+                        generation,
+                        content: content.clone(),
+                    });
                 }
                 if let Some(observation) = self.read_slot(token) {
                     observation.read = Some((content, fingerprints));
@@ -1333,7 +1380,7 @@ impl State {
                 }
             }
             Event::Submit(mut operation) => {
-                if !operation.received && !operation.repair {
+                if !operation.received && !operation.repair && operation.history_id.is_none() {
                     if self.mode != ClipboardMode::Automatic
                         && (self.mode == ClipboardMode::Off || operation.observation.is_some())
                     {
@@ -1675,6 +1722,7 @@ impl State {
             Event::Persisted { token, success } => {
                 if let Some(pending) = self.persistence.remove(&token) {
                     let explicit = !pending.operation.received
+                        && pending.operation.history_id.is_none()
                         && !pending.operation.repair
                         && pending.operation.observation.is_none();
                     let publish = success

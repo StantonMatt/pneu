@@ -286,6 +286,7 @@ mod tests {
             FileKind::ClipboardImage,
         ] {
             let m = FileBegin {
+                sensitive: false,
                 hlc: None,
                 source_device: None,
                 transfer_id: Id::from_bytes([0; 16]),

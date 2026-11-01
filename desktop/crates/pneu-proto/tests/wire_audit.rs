@@ -77,8 +77,8 @@ fn every_known_field_rejects_wrong_types_null_and_duplicates() {
                     && match type_id {
                         0x01 => matches!(field.as_str(), "paused" | "role" | "addresses"),
                         0x03 | 0x14 | 0x7f => field == "message",
-                        0x10 => field == "source_media_id",
-                        0x20 => field == "origin",
+                        0x10 => matches!(field.as_str(), "source_media_id" | "sensitive"),
+                        0x20 => matches!(field.as_str(), "origin" | "sensitive"),
                         _ => false,
                     };
                 let mut missing = object.clone();
@@ -154,12 +154,15 @@ fn every_known_field_rejects_wrong_types_null_and_duplicates() {
         (0x06, "paused"),
         (
             0x10,
-            "transfer_id file_name mime size sha256 kind created_at source_media_id hlc source_device",
+            "transfer_id file_name mime size sha256 kind created_at source_media_id hlc source_device sensitive",
         ),
         (0x12, "transfer_id"),
         (0x13, "transfer_id deduplicated"),
         (0x14, "transfer_id code retryable message"),
-        (0x20, "transfer_id text created_at origin hlc source_device"),
+        (
+            0x20,
+            "transfer_id text created_at origin hlc source_device sensitive",
+        ),
         (0x21, "transfer_id settings"),
         (0x7f, "code message supported_version"),
     ];

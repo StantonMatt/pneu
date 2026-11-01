@@ -502,7 +502,8 @@ unique known fields or filename safety).
         "created_at":{"$ref":"#/$defs/timestamp"},
         "source_media_id":{"type":"string","minLength":1},
         "hlc":{"$ref":"#/$defs/hlc"},
-        "source_device":{"$ref":"#/$defs/id"}
+        "source_device":{"$ref":"#/$defs/id"},
+        "sensitive":{"type":"boolean"}
       },
       "dependentRequired":{"hlc":["source_device"],"source_device":["hlc"]}
     },
@@ -525,7 +526,7 @@ unique known fields or filename safety).
     },
     "clipboard": {
       "type":"object","required":["transfer_id","text","created_at"],
-      "properties":{"transfer_id":{"$ref":"#/$defs/id"},"text":{"type":"string"},"created_at":{"$ref":"#/$defs/timestamp"},"origin":{"enum":["clipboard","share"]},"hlc":{"$ref":"#/$defs/hlc"},"source_device":{"$ref":"#/$defs/id"}},
+      "properties":{"transfer_id":{"$ref":"#/$defs/id"},"text":{"type":"string"},"created_at":{"$ref":"#/$defs/timestamp"},"origin":{"enum":["clipboard","share"]},"hlc":{"$ref":"#/$defs/hlc"},"source_device":{"$ref":"#/$defs/id"},"sensitive":{"type":"boolean"}},
       "dependentRequired":{"hlc":["source_device"],"source_device":["hlc"]}
     },
     "hlc":{"type":"integer","minimum":0,"maximum":18446744073709551615},
@@ -673,6 +674,17 @@ was applied and its bounded dedupe history committed, or it was stale/duplicate.
 OS denial produces `clipboard_unavailable` and retains no pending text. Clipboard
 application is a best-effort side effect, not an exactly-once OS guarantee.
 Suppress clipboard watchers for received operations; never echo them with new IDs.
+
+CLIPBOARD and FILE_BEGIN with `kind=clipboard_image` MAY carry an optional boolean
+`sensitive` (default false). Senders MUST include `"sensitive":true` when the
+source clipboard is marked sensitive and MUST omit the field otherwise. Computer
+senders MUST continue to skip sensitive local clipboard content entirely.
+Receivers MUST apply a sensitive item as usual, MUST NOT retain it in user-visible
+clipboard history, and SHOULD mark the resulting clipboard sensitive where the
+platform permits it: KDE `x-kde-passwordManagerHint=secret`, macOS
+`org.nspasteboard.ConcealedType`, Windows exclusion formats, and Android
+`ClipDescription.EXTRA_IS_SENSITIVE`. The field has no meaning for other file
+kinds. Older peers ignore this additive field under the unknown-field rule.
 
 ## Connection and pairing state machines
 

@@ -280,6 +280,7 @@ impl Phone {
             hash.update(&buf[..n]);
         }
         let begin = FileBegin {
+            sensitive: false,
             hlc: None,
             source_device: None,
             transfer_id: Id::new(crate::random_hex(16))?,
@@ -301,6 +302,7 @@ impl Phone {
     }
     pub fn text(&self, text: String, origin: ClipboardOrigin) -> Result<Clipboard> {
         let mut text = Clipboard {
+            sensitive: false,
             hlc: None,
             source_device: None,
             transfer_id: Id::new(crate::random_hex(16))?,
@@ -695,6 +697,7 @@ mod tests {
         let clock = phone.directory.join("clipboard-clock.json");
         atomic_private(&clock, &serde_json::to_vec(&(MAX_TIMESTAMP - 1))?)?;
         let mut text = Clipboard {
+            sensitive: false,
             hlc: None,
             source_device: None,
             transfer_id: Id::from_bytes([1; 16]),
@@ -826,6 +829,7 @@ mod tests {
             if matches!(scenario, Scenario::ClipboardOrder) {
                 for (timestamp, deduplicated) in [(2, false), (1, true), (3, false), (3, true)] {
                     let text = Clipboard {
+                        sensitive: false,
                         hlc: None,
                         source_device: None,
                         transfer_id: Id::new(crate::random_hex(16))?,
@@ -849,6 +853,7 @@ mod tests {
             }
             if matches!(scenario, Scenario::PausedClipboard) {
                 let text = Clipboard {
+                    sensitive: false,
                     hlc: None,
                     source_device: None,
                     transfer_id: id,
@@ -945,6 +950,7 @@ mod tests {
             let (mut connection, pc) =
                 mock_pc(directory.path(), scenario.clone(), id.clone()).await?;
             let text = Clipboard {
+                sensitive: false,
                 hlc: None,
                 source_device: None,
                 transfer_id: id.clone(),

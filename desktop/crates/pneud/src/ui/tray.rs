@@ -20,6 +20,7 @@ pub struct Tray {
     pub named_icons: bool,
     pub commands: mpsc::Sender<Command>,
     device_slots: Mutex<Vec<String>>,
+    history_menu: Option<Vec<crate::store::history::Item>>,
 }
 impl Tray {
     fn send(&self, command: Command) {
@@ -27,6 +28,50 @@ impl Tray {
     }
     fn transfers(&self) -> Vec<Transfer> {
         self.snapshot.transfers.iter().map(Transfer::from).collect()
+    }
+    fn history_menu(&self) -> ksni::MenuItem<Self> {
+        let history = self
+            .history_menu
+            .as_ref()
+            .unwrap_or(&self.snapshot.clipboard_history);
+        let mut submenu: Vec<_> = history
+            .iter()
+            .take(10)
+            .map(|entry| {
+                let id = entry.id.clone();
+                StandardItem {
+                    label: super::tray_model::history_label(entry, true),
+                    icon_data: super::tray_model::history_icon(entry),
+                    activate: Box::new(move |s: &mut Self| {
+                        s.send(Command::CopyClipboardHistory(id.clone()))
+                    }),
+                    ..Default::default()
+                }
+                .into()
+            })
+            .collect();
+        if submenu.is_empty() {
+            submenu.push(
+                StandardItem {
+                    label: "Nothing copied yet".into(),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            );
+        } else {
+            submenu.push(ksni::MenuItem::Separator);
+            submenu.push(item("Show All", "", |s: &mut Self| {
+                s.send(Command::ShowClipboardHistory)
+            }));
+        }
+        SubMenu {
+            label: "Clipboard History".into(),
+            icon_name: "edit-paste".into(),
+            submenu,
+            ..Default::default()
+        }
+        .into()
     }
     fn clipboard_mode(&self) -> ClipboardMode {
         let config = serde_json::to_value(&self.config).unwrap_or_default();
@@ -114,6 +159,9 @@ impl ksni::Tray for Tray {
         self.send(Command::Window {
             activation_token: None,
         });
+    }
+    fn menu_about_to_show(&mut self) {
+        self.history_menu = Some(self.snapshot.clipboard_history.clone());
     }
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         let transfers = self.transfers();
@@ -205,6 +253,9 @@ impl ksni::Tray for Tray {
                     s.send(Command::SendClipboard(captured.clone()))
                 }));
             }
+            if self.config.clipboard_history {
+                items.push(self.history_menu());
+            }
             items.push(item("Open Folder", "folder-open", |s: &mut Self| {
                 s.send(Command::OpenFolder)
             }));
@@ -275,6 +326,14 @@ impl ksni::Tray for Tray {
                 .into(),
             );
             items.push(ksni::MenuItem::Separator);
+        }
+        if peers.is_empty() && self.config.clipboard_history {
+            items.push(item("Open Pneu", "", |s: &mut Self| {
+                s.send(Command::Window {
+                    activation_token: None,
+                })
+            }));
+            items.push(self.history_menu());
         }
         items.push(item("Add Device…", "list-add", |s: &mut Self| {
             s.send(Command::AddDevice {
@@ -349,6 +408,7 @@ pub async fn start(
         pixmaps: pixmaps()?,
         named_icons,
         commands,
+        history_menu: None,
         device_slots: Mutex::new(Vec::new()),
     }
     .assume_sni_available(true)
@@ -458,6 +518,7 @@ mod tests {
             pixmaps: Vec::new(),
             named_icons: false,
             commands,
+            history_menu: None,
             device_slots: Mutex::new(Vec::new()),
         };
         tray.snapshot.send_targets = tray
@@ -525,6 +586,7 @@ mod tests {
             pixmaps: Vec::new(),
             named_icons: false,
             commands,
+            history_menu: None,
             device_slots: Mutex::new(Vec::new()),
         };
         let authority = crate::outbox::Authority {

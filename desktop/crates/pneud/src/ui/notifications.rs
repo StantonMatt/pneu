@@ -259,6 +259,7 @@ mod tests {
     use super::*;
     fn metadata(kind: FileKind) -> FileBegin {
         FileBegin {
+            sensitive: false,
             hlc: None,
             source_device: None,
             transfer_id: pneu_proto::Id::from_bytes([0; 16]),

@@ -400,6 +400,8 @@ object_struct! {
             skip_serializing_if = "Option::is_none"
         )]
         pub source_device: Option<Id>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub sensitive: bool,
     }
 }
 object_struct! {
@@ -495,6 +497,8 @@ object_struct! {
             skip_serializing_if = "Option::is_none"
         )]
         pub source_device: Option<Id>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub sensitive: bool,
     }
 }
 

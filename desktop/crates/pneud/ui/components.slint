@@ -12,6 +12,8 @@ component FocusTarget inherits FocusScope {
     in property <bool> active: true;
     in-out property <bool> ring;
     callback activate();
+    in property <bool> delete-enabled;
+    callback deleted();
     enabled: active;
     changed active => { if !self.active { self.ring = false; } }
     focus-gained(reason) => {
@@ -23,6 +25,7 @@ component FocusTarget inherits FocusScope {
         self.ring = false;
     }
     key-pressed(event) => {
+        if event.text == Key.Delete && root.delete-enabled { root.deleted(); return accept; }
         if event.text == Key.Return || event.text == " " { self.activate(); return accept; }
         return reject;
     }
@@ -350,13 +353,15 @@ export component NavRow inherits Rectangle {
     in property <bool> enabled: true;
     in property <bool> highlighted;
     callback clicked();
+    in property <bool> delete-enabled;
+    callback deleted();
     accessible-enabled: root.enabled && root.interactive;
     accessible-role: button;
     accessible-action-default => { if root.enabled && root.interactive { root.clicked(); } }
     forward-focus: fs;
     background: highlighted ? Pneu.button : touch.pressed ? Pneu.pressed : touch.has-hover && enabled ? Pneu.hover : transparent;
     if fs.ring: Rectangle { border-radius: 4px; border-width: 1px; border-color: Pneu.accent; }
-    fs := FocusTarget { active: root.enabled && root.interactive; activate => { root.clicked(); } }
+    fs := FocusTarget { active: root.enabled && root.interactive; delete-enabled: root.delete-enabled; deleted => {root.deleted();} activate => { root.clicked(); } }
     touch := TouchArea { enabled: root.enabled && root.interactive; clicked => { fs.ring = false; fs.focus(); root.clicked(); } }
     @children
 }

@@ -1177,3 +1177,17 @@ async fn native_clipboard_delayed_history_never_blocks_watcher() -> Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn sensitive_received_offer_requires_marker_confirmation_without_accessing_clipboard()
+-> Result<()> {
+    let actions = DesktopActions::new("unused".into());
+    let prepared = actions
+        .prepare_clipboard_sensitive(ClipboardInput::Text("received secret".into()), 1, true)
+        .await?;
+    assert!(
+        prepared.marker_confirmation,
+        "sensitive install must await its marker"
+    );
+    Ok(())
+}

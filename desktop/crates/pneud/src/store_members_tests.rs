@@ -279,7 +279,7 @@ async fn setup_unchanged_and_reach_replay_preserves_all_peer_owned_state() -> Re
     f.s.remember_route(id(3), "127.0.0.1:49999".into()).await?;
     // Real schema rows cover durable file/text receipts and a waiting delivery.
     f.s.call(|c| {
-        let meta=serde_json::to_string(&Metadata::Text(TextReceipt {hlc:Some(1),source_device:Some(id(3)),transfer_id:id(70),sha256:member(9).fingerprint,created_at:1,origin:ClipboardOrigin::Clipboard}))?;
+        let meta=serde_json::to_string(&Metadata::Text(TextReceipt {sensitive:false,hlc:Some(1),source_device:Some(id(3)),transfer_id:id(70),sha256:member(9).fingerprint,created_at:1,origin:ClipboardOrigin::Clipboard}))?;
         c.execute("INSERT INTO clipboard_recent VALUES(?,?,?)",params![id(3).as_str(),id(70).as_str(),meta])?;
         c.execute("INSERT INTO receipts VALUES(?,?,?,'saved.bin')",params![id(3).as_str(),id(71).as_str(),serde_json::to_string(&Metadata::Settings(PeerSettings {transfer_id:id(71),settings:vec![]}))?])?;
         c.execute("INSERT INTO outbox_artifacts(id,operation,meta) VALUES('artifact','operation','{}')",[])?;

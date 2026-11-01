@@ -1010,6 +1010,7 @@ pub struct Core {
     shutdown: watch::Sender<bool>,
     port: AtomicU16,
     window_request: Mutex<(u64, Option<String>, bool)>,
+    window_history: AtomicU64,
     // The window request whose device page opens with Remove from all devices.
     window_remove: Mutex<Option<(u64, Id)>>,
     pending_sends: Mutex<std::collections::VecDeque<crate::ui::window::SendRequest>>,
@@ -1128,6 +1129,8 @@ impl Core {
         }
         let mesh = mesh::Mesh::new(store.peer_info().await?);
         let (clipboard, clipboard_rx) = clipboard_driver::Handle::channel();
+        let history_enabled = config.borrow().clipboard_history;
+        store.history_configure(history_enabled, true).await?;
         let (register, legacy, history) = store.clipboard_snapshot().await?;
         let mut clipboard_state = clipboard_actor::State::load(
             register,
@@ -1187,6 +1190,7 @@ impl Core {
             shutdown,
             port: AtomicU16::new(port),
             window_request: Mutex::new((0, None, false)),
+            window_history: AtomicU64::new(0),
             window_remove: Mutex::new(None),
             pending_sends: Mutex::default(),
             window_focus: Mutex::new(None),
@@ -1330,6 +1334,115 @@ impl Core {
     pub fn bound_port(&self) -> u16 {
         self.port.load(Ordering::SeqCst)
     }
+    pub(crate) fn request_history_window(&self) {
+        if !self.config().clipboard_history {
+            return;
+        }
+        let mut request = self.window_request.lock().expect("window request");
+        request.0 = ((request.0 >> 1) + 1) * 2;
+        request.1 = None;
+        request.2 = false;
+        self.window_history.store(request.0, Ordering::SeqCst);
+    }
+    pub(crate) fn window_history(&self, request: u64) -> bool {
+        request != 0
+            && self.window_history.load(Ordering::SeqCst) == request
+            && self.config().clipboard_history
+    }
+    pub(crate) async fn disable_empty_clipboard_history(&self) -> Result<usize> {
+        let guard = self.config_gate.clone().lock_owned().await;
+        let mut config = self.config();
+        if !config.clipboard_history {
+            return Ok(0);
+        }
+        let count = self.store.history_disable_if_empty().await;
+        if count == 0 {
+            config.clipboard_history = false;
+            if let Err(error) = self.persist_config(config, guard).await {
+                self.store.history_configure(true, true).await?;
+                return Err(error);
+            }
+        }
+        Ok(count)
+    }
+    pub(crate) async fn delete_clipboard_history(&self, id: Option<String>) -> Result<()> {
+        self.store.history_delete(id).await
+    }
+    pub(crate) async fn copy_clipboard_history(&self, id: String) -> Result<()> {
+        ensure!(self.config().clipboard_history, "clipboard history is off");
+        let (input, generation) = self.store.history_input(id.clone()).await?;
+        let content = self
+            .outbox
+            .file_io({
+                let input = input.clone();
+                move || {
+                    Ok(match input {
+                        crate::actions::ClipboardInput::Text(text) => {
+                            crate::ui::clipboard::Content::Text(text)
+                        }
+                        crate::actions::ClipboardInput::Image(file, _) => {
+                            crate::ui::clipboard::Content::Image(
+                                file.read_bounded(crate::store::history::MAX_IMAGE)?,
+                            )
+                        }
+                        _ => anyhow::bail!("invalid history input"),
+                    })
+                }
+            })
+            .await?;
+        let token = self.clipboard.token();
+        let offer = if self.config().clipboard_mode == crate::config::ClipboardMode::Automatic {
+            self.automatic_target()
+        } else {
+            None
+        };
+        let mut operation = ClipboardOperation {
+            token,
+            id: Id::new(crate::random_hex(16))?,
+            source: self.identity.device_id.clone(),
+            key: None,
+            created_at: 0,
+            hashes: clipboard_actor::hashes(&content),
+            content: Some(content),
+            payload: None,
+            offer,
+            received: false,
+            legacy: false,
+            restore: true,
+            repair: false,
+            observation: None,
+            sensitive: false,
+            history: Some(generation),
+            history_id: Some(id),
+        };
+        // Restoring is local even when peers cannot accept this representation.
+        // The largest clock also accounts for JSON framing overhead.
+        if operation.offer.is_some()
+            && self
+                .clipboard_frames(&operation, pneu_proto::MAX_TIMESTAMP)
+                .is_err()
+        {
+            operation.offer = None;
+        }
+        let (reply, _) = tokio::sync::oneshot::channel();
+        let outcome = self
+            .clipboard
+            .submit(
+                operation,
+                clipboard_driver::Request {
+                    input,
+                    claim: None,
+                    store: self.store.clone(),
+                    authority: None,
+                    kind: None,
+                    policy: Vec::new(),
+                    reply,
+                },
+            )
+            .await?;
+        ensure!(outcome.applied, "clipboard copy was superseded");
+        Ok(())
+    }
     pub fn request_window(&self, choose_folder: bool) {
         self.request_window_with_activation(choose_folder, None);
     }
@@ -1419,6 +1532,7 @@ impl Core {
         let mut ui = self.ui.lock().expect("UI state");
         select_display(&sessions, &admission, &mut ui);
         let mut snapshot = ui.snapshot.clone();
+        snapshot.clipboard_history = self.store.history_items();
         snapshot.setup_refusal_since = self.setup_refusal_since();
         snapshot.devices = self.device_snapshots(&sessions, &admission, &ui);
         snapshot.send_targets = self.file_targets(&snapshot.devices, &sessions, &admission);
@@ -1834,6 +1948,39 @@ impl Core {
         let saved = config.clone();
         #[cfg(test)]
         let save_store = self.store.clone();
+        let history_change = previous.clipboard_history != config.clipboard_history;
+        let history_enabled = config.clipboard_history;
+        let history_store = self.store.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let (complete, completed) = tokio::sync::oneshot::channel();
+        let publish = move || {
+            let _guard = guard;
+            let mut automatic = automatic.lock().expect("automatic clipboard");
+            if cancel_automatic {
+                // Fence effects computed before this change, even if their
+                // publication runs after the existing queue is invalidated.
+                config_epoch.fetch_add(1, Ordering::SeqCst);
+                automatic.invalidate();
+                clipboard.event(ClipboardEvent::Policy {
+                    allowed: Vec::new(),
+                });
+            }
+            settings.send_replace(config);
+            clipboard.event(ClipboardEvent::Mode(
+                if settings.borrow().clipboard_sync_to_phone {
+                    settings.borrow().clipboard_mode
+                } else {
+                    crate::config::ClipboardMode::Off
+                },
+            ));
+            drop(automatic);
+            if clear_error {
+                let mut ui = ui.lock().expect("UI state");
+                ui.snapshot
+                    .clear_destination(crate::ui::ReceiveDestination::SaveFolder, None);
+            }
+            let _ = events.send(Event::ConfigChanged);
+        };
         self.store
             .setup_refresh_self_then(
                 member,
@@ -1843,36 +1990,29 @@ impl Core {
                     saved.save(&path)
                 },
                 move || {
-                    let _guard = guard;
-                    let mut automatic = automatic.lock().expect("automatic clipboard");
-                    if cancel_automatic {
-                        // Fence effects computed before this change, even if their
-                        // publication runs after the existing queue is invalidated.
-                        config_epoch.fetch_add(1, Ordering::SeqCst);
-                        automatic.invalidate();
-                        clipboard.event(ClipboardEvent::Policy {
-                            allowed: Vec::new(),
+                    if history_change {
+                        runtime.spawn(async move {
+                            let result = history_store
+                                .history_configure(history_enabled, false)
+                                .await;
+                            if result.is_ok() {
+                                publish();
+                            }
+                            let _ = complete.send(result);
                         });
+                    } else {
+                        publish();
+                        let _ = complete.send(Ok(()));
                     }
-                    settings.send_replace(config);
-                    clipboard.event(ClipboardEvent::Mode(
-                        if settings.borrow().clipboard_sync_to_phone {
-                            settings.borrow().clipboard_mode
-                        } else {
-                            crate::config::ClipboardMode::Off
-                        },
-                    ));
-                    drop(automatic);
-                    if clear_error {
-                        let mut ui = ui.lock().expect("UI state");
-                        ui.snapshot
-                            .clear_destination(crate::ui::ReceiveDestination::SaveFolder, None);
-                    }
-                    let _ = events.send(Event::ConfigChanged);
                 },
             )
+            .await?;
+        completed
             .await
+            .context("configuration publication stopped")??;
+        Ok(())
     }
+
     pub async fn send_clipboard(&self, device: Id, text: String) -> Result<Id> {
         self.send_observed_formats(self.explicit_clipboard_offer_for(device)?, Some(text), None)
             .await
@@ -1923,6 +2063,7 @@ impl Core {
         let guard = self.config_gate.clone().lock_owned().await;
         let mut config = self.config();
         match key.as_str() {
+            "clipboard_history" => config.clipboard_history = serde_json::from_value(value)?,
             "clipboard_mode" => config.clipboard_mode = serde_json::from_value(value)?,
             "choose_devices_each_time" => {
                 config.choose_devices_each_time = serde_json::from_value(value)?
@@ -2069,6 +2210,15 @@ impl Core {
         clear: bool,
         initial: bool,
     ) -> (Option<ClipboardOffer>, u64) {
+        self.observe_watched_clipboard_metadata(origin, clear, initial, false)
+    }
+    pub(crate) fn observe_watched_clipboard_metadata(
+        &self,
+        origin: bool,
+        clear: bool,
+        initial: bool,
+        owned: bool,
+    ) -> (Option<ClipboardOffer>, u64) {
         let token = self.clipboard.token();
         // A watcher's first event describes existing content, not a new copy.
         // Classify it for explicit sharing, but never freeze automatic recipients.
@@ -2081,6 +2231,9 @@ impl Core {
                 offer
             });
         self.clipboard.event(ClipboardEvent::Observe {
+            history: (!initial && !owned)
+                .then(|| self.store.history_generation())
+                .flatten(),
             token,
             id: Id::new(crate::random_hex(16)).expect("random id"),
             offer: offer.clone(),
@@ -2426,6 +2579,9 @@ impl Core {
         let id = Id::new(crate::random_hex(16))?;
         let input = self.clipboard_input(Some(content.clone()))?;
         let operation = ClipboardOperation {
+            sensitive: false,
+            history: None,
+            history_id: None,
             token,
             id: id.clone(),
             source: self.identity.device_id.clone(),
@@ -2497,8 +2653,9 @@ impl Core {
             Some(Content::Formats(text, bytes)) => (Some(text.clone()), Some(bytes.clone())),
             None => (None, None),
         };
-        let text = text.map(|text| {
+        let text = text.filter(|t| t.len() <= MAX_CLIPBOARD_BYTES).map(|text| {
             OutgoingSelection::Text(Clipboard {
+                sensitive: false,
                 transfer_id: operation.id.clone(),
                 text,
                 created_at: hlc,
@@ -2510,6 +2667,7 @@ impl Core {
         let image = image.map(|bytes| {
             OutgoingSelection::Image(
                 FileBegin {
+                    sensitive: false,
                     transfer_id: operation.id.clone(),
                     file_name: "clipboard.png".into(),
                     mime: "image/png".into(),
@@ -4756,6 +4914,9 @@ impl Core {
                     let token = self.clipboard.token();
                     let content = crate::ui::clipboard::Content::Text(text.text.clone());
                     let operation = ClipboardOperation {
+                        sensitive: text.sensitive,
+                        history: self.store.history_generation(),
+                        history_id: None,
                         token,
                         id: text.transfer_id.clone(),
                         source: device.clone(),
@@ -5065,6 +5226,9 @@ impl Core {
             store.mesh = job.origin.mesh;
             let token = self.clipboard.token();
             let operation = ClipboardOperation {
+                sensitive: job.metadata.kind == FileKind::ClipboardImage && job.metadata.sensitive,
+                history: self.store.history_generation(),
+                history_id: None,
                 token,
                 id: job.metadata.transfer_id.clone(),
                 source: job.origin.device.clone(),
@@ -5840,6 +6004,7 @@ mod tests {
             let mut events = core.subscribe();
             let (tx, mut rx) = mpsc::channel(8);
             let winner = Clipboard {
+                sensitive: false,
                 transfer_id: Id::from_bytes([10; 16]),
                 text: "winner".into(),
                 created_at: 200,
@@ -6014,6 +6179,7 @@ mod tests {
         actions.delay.store(true, Ordering::SeqCst);
         let (_dir, core, device) = fixture(actions.clone()).await?;
         let text = Clipboard {
+            sensitive: false,
             transfer_id: Id::from_bytes(rand::random()),
             text: "older remote".into(),
             hlc: Some(crate::now_ms()),
@@ -6053,6 +6219,7 @@ mod tests {
             &core.store,
             &device,
             Message::Clipboard(Clipboard {
+                sensitive: false,
                 transfer_id: Id::from_bytes(rand::random()),
                 text: "next winner".into(),
                 hlc: Some(seen.parse::<u64>()? + 1),
@@ -6089,6 +6256,7 @@ mod tests {
                 &c.store,
                 &d,
                 Message::Clipboard(Clipboard {
+                    sensitive: false,
                     transfer_id: Id::from_bytes(rand::random()),
                     text: "legacy now".into(),
                     hlc: None,
@@ -7874,6 +8042,7 @@ mod tests {
             .unwrap()
             .mesh = true;
         let mut wire = Clipboard {
+            sensitive: false,
             transfer_id: Id::from_bytes([0; 16]),
             text: "\u{1}".repeat(10_800),
             created_at: crate::now_ms(),
@@ -9609,6 +9778,7 @@ mod tests {
             .await?;
         let bytes = b"original bytes";
         let begin = FileBegin {
+            sensitive: false,
             hlc: None,
             source_device: None,
             transfer_id: Id::new(crate::random_hex(16))?,
@@ -9835,6 +10005,7 @@ mod tests {
 
     fn test_begin(bytes: &[u8]) -> FileBegin {
         FileBegin {
+            sensitive: false,
             hlc: None,
             source_device: None,
             transfer_id: Id::new(crate::random_hex(16)).unwrap(),
@@ -9950,6 +10121,7 @@ mod tests {
                     &text_core.store,
                     &text_device,
                     Message::Clipboard(Clipboard {
+                        sensitive: false,
                         hlc: None,
                         source_device: None,
                         transfer_id: Id::new(crate::random_hex(16))?,
@@ -10007,6 +10179,7 @@ mod tests {
         core.update_config(config).await?;
         let begin = test_begin(b"file");
         let text = Clipboard {
+            sensitive: false,
             hlc: None,
             source_device: None,
             transfer_id: begin.transfer_id.clone(),
@@ -10092,6 +10265,7 @@ mod tests {
         let mut store = core.store.with_current_pairing();
         store.connection_id = Some(1);
         let text = Clipboard {
+            sensitive: false,
             hlc: None,
             source_device: None,
             transfer_id: Id::new(crate::random_hex(16))?,
@@ -10426,6 +10600,7 @@ mod tests {
                     Some(&worker_scope),
                     &device,
                     Message::Clipboard(Clipboard {
+                        sensitive: false,
                         hlc: None,
                         source_device: None,
                         transfer_id: Id::new(crate::random_hex(16))?,
@@ -11786,6 +11961,7 @@ mod tests {
                 &core.store,
                 device,
                 Message::Clipboard(Clipboard {
+                    sensitive: false,
                     hlc: None,
                     source_device: None,
                     transfer_id: shared.clone(),
@@ -11810,6 +11986,7 @@ mod tests {
             &core.store,
             &a,
             Message::Clipboard(Clipboard {
+                sensitive: false,
                 hlc: None,
                 source_device: None,
                 transfer_id: Id::from_bytes([4; 16]),
@@ -12714,6 +12891,7 @@ mod tests {
     }
     fn held_clipboard_publication(core: &Core) -> OutgoingSelection {
         OutgoingSelection::Text(Clipboard {
+            sensitive: false,
             transfer_id: Id::from_bytes([70; 16]),
             text: "already computed publication".into(),
             origin: ClipboardOrigin::Clipboard,

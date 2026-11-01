@@ -61,6 +61,7 @@ pub struct Config {
     pub open_in_viewer: bool,
     pub clipboard_sync_to_phone: bool,
     pub clipboard_include_images: bool,
+    pub clipboard_history: bool,
     pub port: u16,
     /// Cache only: completed files can expire; dedupe records never expire.
     pub cache_retention_days: u32,
@@ -81,6 +82,7 @@ impl Default for Config {
             open_in_viewer: false,
             clipboard_sync_to_phone: true,
             clipboard_include_images: true,
+            clipboard_history: false,
             port: pneu_proto::DEFAULT_PORT,
             cache_retention_days: 1,
             max_file_bytes: pneu_proto::MAX_FILE_SIZE,

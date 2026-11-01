@@ -147,6 +147,8 @@ struct Driver {
     clock_jobs: HashMap<Token, tokio::task::AbortHandle>,
     share_jobs: HashMap<Token, tokio::task::AbortHandle>,
     history_revision: u64,
+    record_job: Option<tokio::task::Id>,
+    pending_record: Option<(Content, u64)>,
 }
 impl Driver {
     fn spawn(
@@ -159,6 +161,19 @@ impl Driver {
         task
     }
     fn joined(&mut self, result: Result<(tokio::task::Id, ()), tokio::task::JoinError>) {
+        let id = match &result {
+            Ok((id, ())) => *id,
+            Err(error) => error.id(),
+        };
+        if self.record_job == Some(id) {
+            self.record_job = None;
+            if let Some((content, generation)) = self.pending_record.take() {
+                self.effects(vec![Effect::RecordHistory {
+                    content,
+                    generation,
+                }]);
+            }
+        }
         match result {
             Ok((id, ())) => {
                 self.job_failures.remove(&id);
@@ -225,6 +240,28 @@ impl Driver {
                 continue;
             };
             match effect {
+                Effect::RecordHistory {
+                    content,
+                    generation,
+                } => {
+                    // Keep one active write and only the latest waiting payload.
+                    // Never block the actor control lane on history storage.
+                    if self.record_job.is_some() {
+                        self.pending_record = Some((content, generation));
+                        continue;
+                    }
+                    let input = core.clipboard_input(Some(content));
+                    if let Ok(input) = input {
+                        let job = self.spawn(Vec::new(), async move {
+                            if let Err(error) =
+                                core.store.history_record(input, None, generation).await
+                            {
+                                eprintln!("pneud: clipboard history unavailable: {error}");
+                            }
+                        });
+                        self.record_job = Some(job.id());
+                    }
+                }
                 Effect::PairingLink(uri) => {
                     let mut ui = core.ui.lock().expect("UI state");
                     ui.snapshot.pairing_clipboard = uri;
@@ -423,7 +460,7 @@ impl Driver {
                             let result = tokio::select! {biased;
                                 _=stopped.changed()=>None,
                                 _=&mut revoked=>{ handle.event(Event::Revoked(token)); None },
-                                result=actions.prepare_clipboard(input,ticket)=>Some(result),
+                                result=actions.prepare_clipboard_sensitive(input,ticket,operation.sensitive)=>Some(result),
                             };
                             let Some(result) = result else {
                                 actions.drain_clipboard().await;
@@ -574,6 +611,28 @@ impl Driver {
                         async move {
                             let result = async {
                                 history_job.await?;
+                                if applied
+                                    && !operation.repair
+                                    && !operation.sensitive
+                                    && let Some(generation) = operation.history
+                                {
+                                    if let Some(id) = operation.history_id.clone() {
+                                        store.history_touch(id, generation).await?;
+                                    } else if operation.received {
+                                        let input = match operation.payload.as_deref() {
+                                            Some(Payload::Input(input)) => Some(input.clone()),
+                                            Some(Payload::Content(content)) => {
+                                                core.clipboard_input(Some(content.clone())).ok()
+                                            }
+                                            None => None,
+                                        };
+                                        if let Some(input) = input {
+                                            let origin =
+                                                Some(core.arrival_source(&operation.source).name);
+                                            store.history_record(input, origin, generation).await?;
+                                        }
+                                    }
+                                }
                                 // Repair any earlier successful OS effect whose DB
                                 // commit failed before accepting a later receipt.
                                 if let Some(register) = register {
@@ -719,6 +778,8 @@ pub(in crate::core) async fn run(
         clock_jobs: HashMap::new(),
         share_jobs: HashMap::new(),
         history_revision: 0,
+        record_job: None,
+        pending_record: None,
     };
     loop {
         let due = driver
@@ -753,7 +814,7 @@ pub(in crate::core) async fn run(
                     #[cfg(test)]
                     Message::Wait(token,reply)=>{driver.waiters.insert(token,reply);continue;}
                     #[cfg(test)]
-                    Message::Barrier(reply)=>{driver.barriers.push(reply);if driver.state.idle() {for reply in driver.barriers.drain(..){let _=reply.send(());}}continue;}
+                    Message::Barrier(reply)=>{driver.barriers.push(reply);if driver.state.idle() && driver.record_job.is_none() {for reply in driver.barriers.drain(..){let _=reply.send(());}}continue;}
                     Message::Stop(reply)=>{driver.handle.admission.close();driver.stopping=Some(reply);Event::Shutdown}
                 };
                 if let Event::Read{token,..}=&event {driver.reads.remove(token);}
@@ -823,7 +884,7 @@ pub(in crate::core) async fn run(
             }
             break;
         }
-        if driver.state.idle() {
+        if driver.state.idle() && driver.record_job.is_none() {
             for reply in driver.barriers.drain(..) {
                 let _ = reply.send(());
             }

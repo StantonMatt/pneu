@@ -357,6 +357,7 @@ fn assert_simulator_rejection(error: &anyhow::Error) {
 
 fn metadata(id: Id, bytes: &[u8]) -> FileBegin {
     FileBegin {
+        sensitive: false,
         hlc: None,
         source_device: None,
         transfer_id: id,
@@ -418,6 +419,7 @@ async fn pair_file_durable_ack_duplicate_and_clipboard() -> Result<()> {
     .await?;
     assert_eq!(h.actions.notices.lock().unwrap().len(), 1);
     let text = Clipboard {
+        sensitive: false,
         hlc: None,
         source_device: None,
         transfer_id: Id::from_bytes(rand::random()),
@@ -1030,6 +1032,7 @@ async fn paired_reconnect_survives_lost_pair_result_and_daemon_restart() -> Resu
         .connect(&invitation.addresses, invitation.fingerprint.clone(), None)
         .await?;
     let text = Clipboard {
+        sensitive: false,
         hlc: None,
         source_device: None,
         transfer_id: Id::from_bytes(rand::random()),
@@ -1166,6 +1169,7 @@ async fn hello_and_status_report_pause_without_receipts_and_keep_manual_sends() 
     assert!(matches!(c.read(Duration::from_secs(3)).await?, Message::Pong(p) if p.nonce == nonce));
     assert!(c.read(Duration::from_millis(100)).await.is_err());
     let manual = Clipboard {
+        sensitive: false,
         hlc: None,
         source_device: None,
         transfer_id: Id::from_bytes(rand::random()),
@@ -1290,6 +1294,7 @@ async fn file_kind_and_clipboard_origin_survive_receipts_dedupe_and_events() -> 
     assert_eq!(h.actions.text.lock().unwrap().len(), 1);
     // Omission and explicit clipboard have the same semantic default for dedupe.
     let text = Clipboard {
+        sensitive: false,
         hlc: None,
         source_device: None,
         transfer_id: Id::from_bytes(rand::random()),
@@ -1312,6 +1317,7 @@ async fn incoming_unpair_clears_pairing_receipts_and_active_staging() -> Result<
     let mut c = h.pair(&phone).await?;
     let device = &phone.identity.device_id;
     let text = Clipboard {
+        sensitive: false,
         hlc: None,
         source_device: None,
         transfer_id: Id::from_bytes(rand::random()),
@@ -1379,6 +1385,7 @@ async fn incoming_unpair_clears_pairing_receipts_and_active_staging() -> Result<
     tokio::time::sleep(Duration::from_secs(1)).await;
     let mut c = h.pair(&phone).await?;
     let text = Clipboard {
+        sensitive: false,
         hlc: None,
         source_device: None,
         transfer_id: partial.transfer_id,
@@ -1451,6 +1458,7 @@ async fn missing_uncreatable_save_folder_retains_cache_and_retries_without_recei
     ));
     assert_eq!(std::fs::read(&blocker)?, b"keep me");
     let conflicting_text = Clipboard {
+        sensitive: false,
         hlc: None,
         source_device: None,
         transfer_id: meta.transfer_id.clone(),
@@ -2047,6 +2055,7 @@ async fn immediate_disconnect_after_receipt_preserves_text_link_and_failure_noti
                 .denied
                 .store(failed, std::sync::atomic::Ordering::SeqCst);
             c.write(&Message::Clipboard(Clipboard {
+                sensitive: false,
                 hlc: None,
                 source_device: None,
                 transfer_id: Id::from_bytes(rand::random()),
@@ -3308,6 +3317,7 @@ async fn two_phones_receive_automatic_clipboard_and_unpair_independently() -> Re
     );
     assert!(
         !b.send_text(Clipboard {
+            sensitive: false,
             hlc: None,
             source_device: None,
             transfer_id: Id::from_bytes(rand::random()),
@@ -4762,6 +4772,7 @@ async fn peer_settings_receiver_rejects_disabled_text_and_drains_automatic_media
     write_frame(
         &mut tls,
         &Message::Clipboard(Clipboard {
+            sensitive: false,
             transfer_id: id.clone(),
             text: "malicious disabled send".into(),
             created_at: 1,
@@ -4803,6 +4814,7 @@ async fn peer_settings_receiver_rejects_disabled_text_and_drains_automatic_media
     .await?;
     let bytes = b"not saved";
     let begin = FileBegin {
+        sensitive: false,
         transfer_id: Id::from_bytes(rand::random()),
         file_name: "photo.png".into(),
         mime: "image/png".into(),
@@ -5027,6 +5039,7 @@ async fn duplicate_mesh_replacement_preserves_image_frames_and_completed_deferre
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let bytes = b"\x89PNG\r\n\x1a\nincoming";
     let image = FileBegin {
+        sensitive: false,
         transfer_id: Id::from_bytes(rand::random()),
         file_name: "clipboard.png".into(),
         mime: "image/png".into(),
@@ -5175,6 +5188,7 @@ async fn peer_settings_disable_revalidates_already_prepared_clipboard_image_at_e
     let local = h.core.identity.device_id.clone();
     let bytes = b"\x89PNG\r\n\x1a\nclipboard image";
     let image = FileBegin {
+        sensitive: false,
         transfer_id: Id::from_bytes(rand::random()),
         file_name: "clipboard.png".into(),
         mime: "image/png".into(),
@@ -5556,6 +5570,7 @@ async fn mesh_upgrade_discards_legacy_text_that_would_exceed_mesh_frame_size() -
     let peer = phone.identity.device_id.clone();
     let mut legacy = h.pair(&phone).await?;
     let mut text = Clipboard {
+        sensitive: false,
         transfer_id: Id::from_bytes([0; 16]),
         text: "\u{1}".repeat(10_800),
         created_at: pneud::now_ms(),
@@ -5779,6 +5794,7 @@ async fn rejected_mesh_ipc_preserves_clock_and_valid_deferred_text() -> Result<(
         .block_text
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let valid = Clipboard {
+        sensitive: false,
         transfer_id: Id::from_bytes(rand::random()),
         text: "valid incoming clipboard".into(),
         created_at: 1,
@@ -5831,6 +5847,7 @@ async fn retained_mesh_text_receipt_precedes_disabled_direction_policy() -> Resu
     let mut tls = mesh_phone(&h, &phone).await?;
     let peer = phone.identity.device_id.clone();
     let text = Clipboard {
+        sensitive: false,
         transfer_id: Id::from_bytes(rand::random()),
         text: "accepted before disabling".into(),
         created_at: 1,
@@ -5918,6 +5935,7 @@ async fn probe_authorized_mesh_install_after_disable() -> Result<()> {
         .block_install
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let text = Clipboard {
+        sensitive: false,
         transfer_id: Id::from_bytes([86; 16]),
         text: "disabled mesh effect".into(),
         created_at: 1,

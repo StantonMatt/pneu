@@ -10,8 +10,8 @@ import { Link, LinkState, LinkTile, Tube } from "link.slint";
 
 export { WindowFocus, Tone, Tube, LinkState, LinkTile }
 
-export enum Page { main, device, add, code, settings, scan }
-export enum Dialog { none, unpair, remove, rename, picker, message, details, help }
+export enum Page { main, device, add, code, settings, scan, history }
+export enum Dialog { none, unpair, remove, rename, picker, message, details, help, history-clear, history-off }
 export enum CodeState { showing, expired, offline, pairing, paired }
 export enum ScanState { requesting, scanning, denied, unavailable, failed }
 
@@ -27,6 +27,9 @@ export struct DeviceItem {
     connected: bool,
 }
 
+export struct HistoryItem {
+    id: string, title: string, detail: string, url: bool, picture: bool, thumbnail: image,
+}
 export struct RecentItem {
     id: string,
     batch: bool,
@@ -143,6 +146,14 @@ export global Ui {
 
     in property <int> clipboard-mode;
     in property <bool> include-images;
+    in property <bool> keep-history;
+    in property <[HistoryItem]> history;
+    in-out property <string> history-copied;
+    callback copy-history(string);
+    callback delete-history(string);
+    callback clear-history();
+    callback disable-empty-history();
+    in-out property <int> history-off-count;
     in property <bool> choose-each-time;
     in property <bool> queue-offline;
     in property <bool> save-to-folder;
@@ -319,6 +330,46 @@ component RecentRow inherits NavRow {
             alignment: center;
             IconButton { icon: Icons.close; label: root.item.batch ? "Remove batch" : "Remove"; clicked => { root.dismiss(); } }
         }
+    }
+}
+
+component HistoryRow inherits NavRow {
+    in property <HistoryItem> item;
+    in property <length> line-height;
+    callback copy();
+    callback remove();
+    min-height: 56px;
+    accessible-label: item.title + ", " + item.detail;
+    delete-enabled: true;
+    clicked => {root.copy();}
+    deleted => {root.remove();}
+    HorizontalLayout {
+        padding-top: 10px; padding-bottom: 10px; padding-left: 12px; padding-right: 12px; spacing: 12px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 36px; height: 36px; border-radius: 8px; background: Pneu.button; clip: true;
+                if root.item.thumbnail.width > 0: Image { accessible-role: none; width: 36px; height: 36px; source: root.item.thumbnail; image-fit: cover; }
+                if root.item.thumbnail.width == 0: Image {
+                    accessible-role: none; x: 9px; y: 9px; width: 18px; height: 18px; colorize: Pneu.text2;
+                    source: root.item.picture ? Icons.picture : root.item.url ? Icons.link : Icons.paste;
+                }
+            }
+        }
+        VerticalLayout {
+            alignment: center; spacing: 0px; horizontal-stretch: 1;
+            Text {
+                text: root.item.title; color: Pneu.text; overflow: elide;
+                wrap: root.item.url || root.item.picture ? no-wrap : word-wrap;
+                min-height: 0px; max-height: root.line-height * 2;
+            }
+            HorizontalLayout {
+                spacing: 4px;
+                if Ui.history-copied == root.item.id: VerticalLayout {alignment: center; Image {accessible-role: none; width: 14px; height: 14px; source: Icons.check; colorize: Pneu.accent-text;} }
+                Text {text: Ui.history-copied == root.item.id ? "Copied" : root.item.detail; font-size: Pneu.label-size; overflow: elide; color: Ui.history-copied == root.item.id ? Pneu.accent-text : Pneu.text2; horizontal-stretch: 1;}
+            }
+        }
+        VerticalLayout {alignment: center; IconButton {icon: Icons.close; label: "Delete"; clicked => {root.remove();}} }
     }
 }
 
@@ -502,6 +553,12 @@ export component PneuWindow inherits Window {
         Ui.navigated();
         keys.focus();
     }
+    public function history-copied(id: string) {
+        Ui.history-copied = id;
+        history-copy-timer.running = true;
+        history-copy-timer.restart();
+    }
+    history-copy-timer := Timer {interval: 2s; running: false; triggered => {Ui.history-copied = "";self.running = false;} }
     public function open-device(id: string) {
         Ui.device-id = id;
         root.go(Page.device);
@@ -683,6 +740,17 @@ export component PneuWindow inherits Window {
                         }
                     }
                     Card {
+                        VerticalLayout {
+                        if Ui.keep-history: NavRow {
+                            accessible-label: "Clipboard History";
+                            clicked => {root.go(Page.history);}
+                            Row {
+                                VerticalLayout {alignment: center; Image {accessible-role: none; width: 18px; height: 18px; source: Icons.paste; colorize: Pneu.text2;} }
+                                Text {text: "Clipboard History"; color: Pneu.text; vertical-alignment: center; horizontal-stretch: 1;}
+                                VerticalLayout {alignment: center; Image {accessible-role: none; width: 16px; height: 16px; source: Icons.chevron-right; colorize: Pneu.text2;} }
+                            }
+                        }
+                        if Ui.keep-history: Divider {}
                         NavRow {
                             accessible-label: "Settings";
                             clicked => { root.go(Page.settings); }
@@ -692,6 +760,7 @@ export component PneuWindow inherits Window {
                                 Text { text: "Settings"; color: Pneu.text; vertical-alignment: center; horizontal-stretch: 1; }
                                 VerticalLayout { alignment: center; Image { accessible-role: none; width: 16px; height: 16px; source: Icons.chevron-right; colorize: Pneu.text2; } }
                             }
+                        }
                         }
                     }
                 }
@@ -992,6 +1061,30 @@ export component PneuWindow inherits Window {
                     if Ui.code-state == CodeState.paired: Done { height: root.pairing-height; name: Ui.paired; detail: Ui.paired-detail; only: Ui.paired-only; }
                 }
 
+                if Ui.page == Page.history && Ui.keep-history: VerticalLayout {
+                    spacing: 14px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Header {title: "Clipboard History"; horizontal-stretch: 1; go-back => {root.back();} }
+                        if Ui.history.length > 0: PneuButton {text: "Clear All…"; clicked => { Ui.dialog = Dialog.history-clear;} }
+                    }
+                    Card {
+                        VerticalLayout {
+                            spacing: 0px;
+                            if Ui.history.length == 0: VerticalLayout {
+                                height: 132px; alignment: center; spacing: 8px;
+                                HorizontalLayout {alignment: center; Image {accessible-role: none; width: 28px; height: 28px; source: Icons.paste; colorize: Pneu.text2;} }
+                                Text {text: "Nothing copied yet"; color: Pneu.text2; horizontal-alignment: center;}
+                            }
+                            for item[i] in Ui.history: VerticalLayout {
+                                spacing: 0px;
+                                if i > 0: Divider {}
+                                HistoryRow {item: item; line-height: text-line.preferred-height; copy => {Ui.copy-history(item.id);} remove => {Ui.delete-history(item.id);} }
+                            }
+                        }
+                    }
+                }
+
                 // ---- Settings ----
                 if Ui.page == Page.settings: VerticalLayout {
                     spacing: 12px;
@@ -1015,6 +1108,14 @@ export component PneuWindow inherits Window {
                                 SwitchRow {
                                     label: "Include images"; checked: Ui.include-images; enabled: Ui.clipboard-mode != 2;
                                     toggled(on) => { Ui.set-flag("clipboard_include_images", on); }
+                                }
+                                Divider {}
+                                SwitchRow {
+                                    label: "Keep history"; checked: Ui.keep-history;
+                                    toggled(on) => {
+                                        if on {Ui.set-flag("clipboard_history",true);}
+                                        else {Ui.disable-empty-history();}
+                                    }
                                 }
                             }
                         }
@@ -1161,6 +1262,25 @@ export component PneuWindow inherits Window {
         }
 
         // ---- Popups ----
+        if Ui.dialog == Dialog.history-clear || Ui.dialog == Dialog.history-off: PopupCard {
+            limit: root.height - 32px;
+            Text {text: Ui.dialog == Dialog.history-off ? "Turn off clipboard history?" : "Clear clipboard history?";font-size: Pneu.title-size;font-weight: 700;color: Pneu.text;wrap: word-wrap;}
+            Rectangle {height: 8px;}
+            Text {
+                private property <int> count: Ui.dialog == Dialog.history-off ? Ui.history-off-count : Ui.history.length;
+                text: self.count == 1 ? "This deletes 1 saved item." : "This deletes " + self.count + " saved items.";color: Pneu.text2;wrap: word-wrap;}
+            Rectangle {height: 20px;}
+            HorizontalLayout {
+                spacing: 8px; alignment: end;
+                PneuButton {dialog-control: true;text: "Cancel";autofocus: true;focus-key: Ui.dialog == Dialog.history-off ? "off" : "clear";clicked => {root.dismiss();} }
+                PneuButton {dialog-control: true;text: Ui.dialog == Dialog.history-off ? "Turn Off" : "Clear";kind: ButtonKind.danger;
+                    clicked => {
+                        if Ui.dialog == Dialog.history-off {Ui.set-flag("clipboard_history",false);} else {Ui.clear-history();}
+                        Ui.dialog = Dialog.none;keys.focus();
+                    }
+                }
+            }
+        }
         if Ui.dialog == Dialog.unpair: PopupCard {
             limit: root.height - 32px;
             Text {

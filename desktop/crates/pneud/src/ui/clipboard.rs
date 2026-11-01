@@ -578,9 +578,11 @@ fn read_payloads_bounded(
             let limit = if observe && reader.mime == "image/png" {
                 32 * 1024 * 1024
             } else if observe && IMAGE_MIMES.contains(&reader.mime) {
-                16 * 1024 * 1024
+                crate::store::history::MAX_IMAGE
             } else if reader.mime == "image/png" {
                 MAX_IMAGE
+            } else if observe {
+                crate::store::history::MAX_TEXT
             } else {
                 pneu_proto::MAX_CLIPBOARD_BYTES
             };
@@ -590,7 +592,27 @@ fn read_payloads_bounded(
                     let is_image = image_header(reader.mime, &bytes);
                     let content = if reader.mime == "image/png" || TEXT_MIMES.contains(&reader.mime)
                     {
-                        decode_payload(reader.mime, bytes.clone(), true)
+                        if observe && TEXT_MIMES.contains(&reader.mime) {
+                            String::from_utf8(bytes.clone())
+                                .ok()
+                                .filter(|s| !s.contains('\0'))
+                                .map(Content::Text)
+                        } else {
+                            decode_payload(reader.mime, bytes.clone(), true)
+                        }
+                    } else if observe && is_image && bytes.len() <= crate::store::history::MAX_IMAGE
+                    {
+                        (|| -> Result<Content> {
+                            let image = crate::actions::decode_image(&bytes)?;
+                            let mut png = std::io::Cursor::new(Vec::new());
+                            image.write_to(&mut png, image::ImageFormat::Png)?;
+                            ensure!(
+                                png.get_ref().len() <= crate::store::history::MAX_IMAGE,
+                                "history image limit"
+                            );
+                            Ok(Content::Image(png.into_inner()))
+                        })()
+                        .ok()
                     } else {
                         None
                     };
@@ -689,10 +711,11 @@ impl Watch {
                     if marker.is_none() && mimes.iter().any(|mime| mime == ORIGIN_MIME) {
                         continue;
                     }
-                    let (_target, token) = core.observe_watched_clipboard_kind(
+                    let (_target, token) = core.observe_watched_clipboard_metadata(
                         false,
                         !matches!(&event, ClipboardEvent::Changed { .. }),
                         initial,
+                        marker.is_some(),
                     );
                     let selection = Selection {
                         observation: Some(token),

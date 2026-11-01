@@ -82,6 +82,8 @@ pub async fn run(
             Some(command) = rx.recv() => match command {
                 Command::SetupDecision { requests, allow } => super::window_setup::decide(&core, &requests, allow).await,
                 Command::Window { .. } => core.request_window(false),
+                Command::ShowClipboardHistory => core.request_history_window(),
+                Command::CopyClipboardHistory(id) => {let core=core.clone();jobs.spawn(async move {if let Err(error)=core.copy_clipboard_history(id).await {eprintln!("pneud: clipboard copy failed: {error}");}});},
                 Command::ChooseFolder => core.request_window(true),
                 Command::AddDevice { .. } => core.request_add_device_with_activation(None),
                 Command::RemoveDevice { device, .. } => core.request_remove_window(device, None),
