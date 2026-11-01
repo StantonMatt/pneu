@@ -1365,6 +1365,9 @@ impl Core {
         }
         Ok(count)
     }
+    pub(crate) async fn pin_clipboard_history(&self, id: String, pinned: bool) -> Result<()> {
+        self.store.history_pin(id, pinned).await
+    }
     pub(crate) async fn delete_clipboard_history(&self, id: Option<String>) -> Result<()> {
         self.store.history_delete(id).await
     }
