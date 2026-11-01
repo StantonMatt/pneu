@@ -1558,6 +1558,64 @@ impl UiSender {
     }
 }
 
+// Slint 1.15 elides horizontal overflow but silently drops extra wrapped lines.
+// Use its renderer for the exact window font, fallback fonts and scale. These
+// internals are available through Slint's re-exports; Slint is pinned to 1.15.1.
+fn history_text_size(window: &PneuWindow, text: &str, width: f32) -> (f32, f32) {
+    use slint::private_unstable_api::re_exports::{
+        ComplexText, ItemRc, LogicalLength, TextWrap, WindowInner,
+    };
+    let inner = WindowInner::from_pub(window.window());
+    let adapter = inner.window_adapter();
+    let item = ItemRc::new(inner.component(), 0);
+    let probe = std::pin::pin!(ComplexText::default());
+    probe.text.set(text.into());
+    let size = adapter.renderer().text_size(
+        probe.as_ref(),
+        &item,
+        Some(LogicalLength::new(width)),
+        TextWrap::WordWrap,
+    );
+    (size.width, size.height)
+}
+
+fn history_title(window: &PneuWindow, text: &str, width: f32, height: f32) -> SharedString {
+    if width <= 0.0 || height <= 0.0 {
+        return SharedString::default();
+    }
+    fit_history_title(text, |candidate| {
+        let (w, h) = history_text_size(window, candidate, width.floor());
+        w <= width && h.ceil() <= height
+    })
+    .into()
+}
+
+fn fit_history_title(text: &str, mut fits: impl FnMut(&str) -> bool) -> String {
+    use slint::private_unstable_api::re_exports::UnicodeSegmentation;
+    if fits(text) {
+        return text.into();
+    }
+    if !fits("…") {
+        return String::new();
+    }
+    // Search complete graphemes, including the ellipsis in every measurement.
+    let ends: Vec<_> = text.grapheme_indices(true).map(|(i, _)| i).collect();
+    let mut low = 0;
+    let mut high = ends.len();
+    let mut result = String::from("…");
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let candidate = format!("{}…", text[..ends[mid]].trim_end());
+        if fits(&candidate) {
+            result = candidate;
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    result
+}
+
 fn connect(
     window: &PneuWindow,
     commands: &tokio::sync::mpsc::UnboundedSender<Action>,
@@ -1571,6 +1629,12 @@ fn connect(
     ui.set_devices(ModelRc::new(VecModel::<DeviceItem>::default()));
     ui.set_recent(ModelRc::new(VecModel::<RecentItem>::default()));
     ui.set_history(ModelRc::new(VecModel::<HistoryItem>::default()));
+    let weak = window.as_weak();
+    ui.on_elide_history_title(move |text, width, height| {
+        weak.upgrade()
+            .map(|window| history_title(&window, &text, width, height))
+            .unwrap_or_default()
+    });
     ui.set_recipients(ModelRc::new(VecModel::<RecipientItem>::default()));
     ui.set_device_settings(ModelRc::new(VecModel::<SettingItem>::default()));
     // High error correction keeps the code readable under Pneu's icon.
@@ -9783,6 +9847,80 @@ mod tests {
         assert_eq!(ui.get_history_off_count(), 2);
         assert!(ui.get_keep_history());
         assert_eq!(mock.requests.lock().unwrap().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn history_title_search_keeps_graphemes_and_measures_the_ellipsis() {
+        use slint::private_unstable_api::re_exports::UnicodeSegmentation;
+        let fits = |text: &str| text.graphemes(true).count() <= 6;
+        assert_eq!(fit_history_title("", fits), "");
+        assert_eq!(fit_history_title("Short", fits), "Short");
+        assert_eq!(fit_history_title("Exact!", fits), "Exact!");
+        assert_eq!(fit_history_title("A e\u{301}👩‍💻XYZ", fits), "A e\u{301}👩‍💻X…");
+        assert_eq!(fit_history_title("abcd efghi", fits), "abcd…");
+        assert_eq!(
+            fit_history_title("WWWiiii", |text| {
+                text.chars()
+                    .map(|c| match c {
+                        'W' => 4,
+                        '…' => 2,
+                        _ => 1,
+                    })
+                    .sum::<usize>()
+                    <= 10
+            }),
+            "WW…"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_titles_fit_two_lines_after_width_and_scale_changes() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::history_titles_fit_two_lines_after_width_and_scale_changes",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        let surface = headless()?;
+        let window = PneuWindow::new()?;
+        connect(
+            &window,
+            &tokio::sync::mpsc::unbounded_channel().0,
+            &Arc::new(Mutex::new(View::default())),
+        );
+        window.show()?;
+        for scale in [1.0, 2.0] {
+            surface.dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged {
+                scale_factor: scale,
+            });
+            for width in [240.0, 480.0, 120.0, 240.0] {
+                let line_height = history_text_size(&window, "Ag", width).1.ceil();
+                for text in [
+                    "The meeting has moved to Thursday. Please send the updated notes before lunch. ".repeat(6),
+                    "W".repeat(160),
+                    "é👩‍💻界".repeat(100),
+                ] {
+                    let result = window.global::<Ui>().invoke_elide_history_title(text.clone().into(), width, line_height * 2.0);
+                    assert!(result.ends_with('…'), "{width}px at {scale}x: {result}");
+                    assert!(text.starts_with(result.trim_end_matches('…')));
+                    let (w, h) = history_text_size(&window, &result, width);
+                    assert!(w <= width && h.ceil() <= line_height * 2.0,
+                        "{width}px at {scale}x: {w}x{h}: {result}");
+                    assert!(h > line_height, "long text should use its second line: {result}");
+                }
+                assert_eq!(
+                    window.global::<Ui>().invoke_elide_history_title(
+                        "Short".into(),
+                        width,
+                        line_height * 2.0
+                    ),
+                    "Short"
+                );
+            }
+        }
         Ok(())
     }
 

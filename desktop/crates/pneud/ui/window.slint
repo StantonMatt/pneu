@@ -148,6 +148,7 @@ export global Ui {
     in property <bool> include-images;
     in property <bool> keep-history;
     in property <[HistoryItem]> history;
+    pure callback elide-history-title(string, length, length) -> string;
     in-out property <string> history-copied;
     callback copy-history(string);
     callback delete-history(string);
@@ -359,10 +360,18 @@ component HistoryRow inherits NavRow {
         }
         VerticalLayout {
             alignment: center; spacing: 0px; horizontal-stretch: 1;
-            Text {
-                text: root.item.title; color: Pneu.text; overflow: elide;
-                wrap: root.item.url || root.item.picture ? no-wrap : word-wrap;
-                min-height: 0px; max-height: root.line-height * 2;
+            // Keep horizontal layout independent of the fitted text, whose
+            // measurement depends on the width assigned by that layout.
+            Rectangle {
+                min-width: 0px; preferred-width: 0px;
+                height: min(title.preferred-height, root.line-height * 2);
+                title := Text {
+                    x: 0px; y: 0px; width: parent.width; height: parent.height;
+                    text: root.item.url || root.item.picture ? root.item.title
+                        : Ui.elide-history-title(root.item.title, self.width, root.line-height * 2);
+                    color: Pneu.text; overflow: elide;
+                    wrap: root.item.url || root.item.picture ? no-wrap : word-wrap;
+                }
             }
             HorizontalLayout {
                 spacing: 4px;
