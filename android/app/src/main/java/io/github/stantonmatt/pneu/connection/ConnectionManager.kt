@@ -367,7 +367,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
         val localScope=attempt?.prior?.setupScope ?: attempt?.let {if(it.setupEnabled)SetupScope.ENABLED else SetupScope.DISABLED} ?: p.peer?.setupScope ?: SetupScope.ASK
         val localSetup=p.membership.hello(localScope)
         val hello=phase(ssl,10000) {
-        send(Frame.Control(Type.HELLO, json("version" to 1, "device_id" to p.deviceId, "name" to utf8Prefix(name,128).ifEmpty {"Pneu"}, "capabilities" to LEGACY_PHONE_CAPABILITIES,"role" to "phone", "paused" to p.paused).apply {add("setup",localSetup.json())}))
+        send(Frame.Control(Type.HELLO, json("version" to 1, "device_id" to p.deviceId, "name" to utf8Prefix(name,128).ifEmpty {"Pneu"}, "capabilities" to phoneComputerCapabilities(p.allowRinging),"role" to "phone", "paused" to p.paused).apply {add("setup",localSetup.json())}))
         readControl(ssl)
         }
         if (hello.type == Type.ERROR) throw RemoteError(hello.body["code"].asString)
@@ -487,6 +487,34 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
 
         val network = RoutePolicy.active(cm)
         state.value = LinkState("Connected", network.label(endpoint.tailscale), if (attempt != null) "Paired with ${attempt.invitation.name}" else "",cellular=network.mobile,pairingPin=if(attempt!=null)attempt.invitation.fingerprint else "",pairingGeneration=sessionBinding.generation,capabilities=capabilities)
+        val phoneAuthority=requireNotNull(freezeSession(sessionBinding))
+        val ringNegotiated=mesh && CAP_RING in capabilities && p.allowRinging
+        val batterySender=if(mesh && CAP_BATTERY in capabilities)launch {
+            publishBattery(combine(phoneBattery(context),app.prefs.filter {it.loaded}) {sample,prefs->
+                if(prefs.showBatteryLevel && !prefs.paused)sample else BatteryState()
+            }.distinctUntilChanged(),SystemClock::elapsedRealtime) {sample->
+                send(Frame.Control(Type.BATTERY_STATE,if(sample.level==null)json() else json("level" to sample.level,"charging" to requireNotNull(sample.charging))),phoneAuthority=phoneAuthority)
+            }
+        } else null
+        val ringSender=if(ringNegotiated)launch {
+            app.ringing.state.map {it.ringing}.distinctUntilChanged().collect {ringing->
+                send(Frame.Control(Type.RING_STATE,json("ringing" to ringing)),phoneAuthority=phoneAuthority)
+            }
+        } else null
+        val ringPolicy=launch {
+            app.prefs.filter {it.loaded}.map {it.allowRinging}.distinctUntilChanged().collect {allowed->
+                if(allowed!=p.allowRinging) {
+                    // Stop and flush false using the old negotiation before reconnecting.
+                    if(!allowed) {
+                        withContext(Dispatchers.Main.immediate) {app.ringing.stop(RingStopSource.DISABLED)}
+                        if(ringNegotiated)withTimeoutOrNull(2000) {send(Frame.Control(Type.RING_STATE,json("ringing" to false)),phoneAuthority=phoneAuthority)}
+                    }
+                    // Prefer a frame boundary; a stalled writer must not keep
+                    // obsolete ring willingness advertised indefinitely.
+                    if(withTimeoutOrNull(2000) {writes.withLock {retry()};true}!=true)retry()
+                }
+            }
+        }
         val ping = PingDeadline(30_000, SystemClock::elapsedRealtime)
         val livenessWake = Channel<Unit>(Channel.CONFLATED)
         val writeWatchdog = launch {
@@ -783,6 +811,18 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                         else app.forgetBinding(boundPeer,sessionBinding.phoneId,internalOutcome=sessionOutcome,remoteUnpair=true)
                         throw RemoteError("closing")
                     }
+                    Type.RING -> {
+                        if(!ringNegotiated) {
+                            send(Frame.Control(Type.ERROR,json("code" to "unexpected_message")))
+                            throw RemoteError("unexpected_message")
+                        }
+                        val before=app.ringing.state.value.ringing
+                        val result=app.withBinding(sessionBinding) {
+                            if(!ownsSession(phoneAuthority))throw RemoteError("closing")
+                            app.ringing.command(frame.body["action"].asString=="start",hello.body["name"].asString) {ownsSession(phoneAuthority)}
+                        } ?: throw RemoteError("closing")
+                        if(before==result)send(Frame.Control(Type.RING_STATE,json("ringing" to result)),phoneAuthority=phoneAuthority)
+                    }
                     Type.ERROR -> throw RemoteError(frame.body["code"].asString)
                     Type.STATUS -> Unit
                     Type.CLIPBOARD,Type.PEER_SETTINGS,Type.MEMBERS -> content(frame)
@@ -790,7 +830,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                     else -> { send(Frame.Control(Type.ERROR, json("code" to "unexpected_message"))); throw RemoteError("unexpected_message") }
                 }
             }
-        } finally { closeSocket(ssl); monitor.cancel(); sender.cancel(); textSender.cancel(); writeWatchdog.cancel();settingsSender?.cancel();membersSender?.cancel();receiveWatchdog.cancel();receiveWake.close()
+        } finally { batterySender?.cancel();ringSender?.cancel();ringPolicy.cancel();closeSocket(ssl); monitor.cancel(); sender.cancel(); textSender.cancel(); writeWatchdog.cancel();settingsSender?.cancel();membersSender?.cancel();receiveWatchdog.cancel();receiveWake.close()
             withContext(NonCancellable) {
                 state.update {it.copy(incoming=null)}
                 runCatching {receiver.disconnect()}
@@ -892,7 +932,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
     }
     internal var beforeFirstFrame:suspend (Outgoing)->Unit={}
     internal suspend fun withWriteLockForTest(body:suspend ()->Unit)=writes.withLock {body()}
-    private suspend fun send(frame: Frame,emission:QueuedEmission?=null):Boolean {
+    private suspend fun send(frame: Frame,emission:QueuedEmission?=null,phoneAuthority:DeliveryBinding?=null):Boolean {
         // Validate local fields/encoding before touching a wire frame.
         SendFailures.local("invalid_payload") {Protocol.write(java.io.OutputStream.nullOutputStream(),frame)}
         if(emission!=null)beforeFirstFrame(emission.row)
@@ -927,6 +967,34 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                 state.update {it.copy(sent=0,total=row.size,transferMediaId=row.mediaId,transferKind=row.kind,transferFileName=row.fileName)}
             }
         }
+        if(phoneAuthority!=null) {
+            // Commit emission authority after waiting for the writer, just like
+            // beginDelivery above. Never retain privacy/lifecycle locks across I/O.
+            val outgoing=app.withBinding(phoneAuthority.copy(sessionId=null)) {
+                app.preferences.computerPolicy.withLock {
+                    if(!ownsSession(phoneAuthority) || "mesh" !in capabilities)return@withBinding null
+                    val current=readPrefs()
+                    if(activeEndpoint?.let {endpointAllowed(current,it)}!=true)return@withBinding null
+                    val control=frame as Frame.Control
+                    when(control.type) {
+                        Type.BATTERY_STATE -> {
+                            if(CAP_BATTERY !in capabilities)return@withBinding null
+                            if(!current.showBatteryLevel || current.paused)Frame.Control(Type.BATTERY_STATE,json()) else control
+                        }
+                        Type.RING_STATE -> {
+                            if(CAP_RING !in capabilities)return@withBinding null
+                            Frame.Control(Type.RING_STATE,json("ringing" to (current.allowRinging && !current.paused && app.ringing.state.value.ringing)))
+                        }
+                        else->return@withBinding null
+                    }
+                }
+            } ?: return@withLock false
+            transmit(s,outgoing);return@withLock true
+        }
+        transmit(s,frame);true
+        }
+    }
+    private suspend fun transmit(s:Socket,frame:Frame) {
         writing.progress(); writeWake.trySend(Unit)
         try { withContext(Dispatchers.IO) { Protocol.write(ProgressOutput(s.getOutputStream()) {writing.progress();writeWake.trySend(Unit)},frame) }; txAt = SystemClock.elapsedRealtime() }
         catch(e:CancellationException) {closeSocket(s);throw e}
@@ -944,9 +1012,8 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
             throw TransportFailure(e)
         }
         finally { writing.complete(); writeWake.trySend(Unit) }
-        true
-        }
     }
+
     private suspend fun lost(expected:Peer?,phoneId:String,outcome:ConnectionOutcome?) {if(app.loseBinding(expected,phoneId,outcome))state.value=LinkState("Pairing lost")}
     fun bindingChanged(lost: Boolean=false) { lastIssue=null;admissionSession=null;ready=false;capabilities=emptySet();rejections.clear();state.value=LinkState(if(lost)"Pairing lost" else "PC unreachable") }
     fun retry() { admissionSession=null;dialEpoch.incrementAndGet();closeSocket(); wake.trySend(Unit) }

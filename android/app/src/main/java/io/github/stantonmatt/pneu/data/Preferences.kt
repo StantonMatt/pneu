@@ -7,6 +7,7 @@ import io.github.stantonmatt.pneu.protocol.*
 import io.github.stantonmatt.pneu.connection.TlsIdentity
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 private val Context.pneuDataStore by preferencesDataStore("pneu")
 data class Peer(val name: String, val pin: String, val deviceId: String, val addresses: List<Endpoint>,
@@ -46,7 +47,8 @@ data class Prefs(
     val recentClipboardHashes:List<String> = emptyList(),val legacyQueuePeer:String="",val legacyQueueGeneration:Long=0,val selfName:String="",val chooseDevicesEachTime:Boolean=false,val lastReceivedSource:String="",
     val recentClipboardSources:Map<String,String> = emptyMap(),
     val automaticRevocations:Map<String,Long> = emptyMap(),
-    val membership:SetupState=SetupState()
+    val membership:SetupState=SetupState(),
+    val showBatteryLevel:Boolean=true,val allowRinging:Boolean=true
 ) {
     fun automaticRevocation(kind:String)=automaticRevocations[when(kind) {"photo"->"photos";"recording"->"recordings";else->"screenshots"}] ?: 0
     // Compatibility projection for the existing single-computer screens/fixtures.
@@ -64,6 +66,8 @@ class Preferences(private val context:Context,internal val store:androidx.datast
     @Volatile internal var beforeReadStart:suspend ()->Unit={}
     @Volatile internal var readBoundary:suspend (Boolean)->Long={MediaCatalog.latest(context,it)}
     internal val policy=AdmissionPolicy()
+    /** Serializes computer-feature effects with local permission/pause commits. */
+    internal val computerPolicy=Mutex()
     @Volatile internal var readCatalogVersion:suspend ()->String={MediaCatalog.version(context)}
     @Volatile internal var pairingBoundary:suspend ()->CatalogBoundary={MediaCatalog.boundary(context)}
     @Volatile internal var readSnapshot:suspend ()->CatalogSnapshot={MediaCatalog.snapshot(context)}
@@ -122,6 +126,7 @@ class Preferences(private val context:Context,internal val store:androidx.datast
             pairingRevision=l(p,"pairingRevision"),lastReceivedSource=s(p,"lastReceivedSource"),resetPeers=PeerRegistry.resets(p),
             legacyQueuePeer=s(p,"legacyQueuePeer"),legacyQueueGeneration=l(p,"legacyQueueGeneration"),
             recentClipboardHashes=s(p,"recentClipboardHashes").split('|').filter {it.isNotEmpty()},recentClipboardSources=ClipboardHistory.read(p),selfName=s(p,"selfName"),chooseDevicesEachTime=b(p,"chooseDevicesEachTime"),
+            showBatteryLevel=b(p,"showBatteryLevel",true),allowRinging=b(p,"allowRinging",true),
             membership=SetupStorage.read(p),automaticRevocations=listOf("screenshots","photos","recordings").associateWith {l(p,it+"AdmissionEpoch")}.filterValues {it!=0L})
     }
     val flow=raw.recoverReads()
@@ -191,7 +196,8 @@ class Preferences(private val context:Context,internal val store:androidx.datast
                 it[booleanPreferencesKey(key)]=value
             }
         }
-        if(key in policyKeys)policy.locked {apply()} else apply()
+        suspend fun mutate() {if(key in policyKeys)policy.locked {apply()} else apply()}
+        if(key in setOf("showBatteryLevel","allowRinging","paused"))computerPolicy.withLock {mutate()} else mutate()
     }
     /** Automatic bytes/skips are published only under the same policy boundary.
      * Reading the live namespace here rejects URI reuse after a catalog rebuild. */

@@ -58,6 +58,7 @@ class PneuService : Service() {
     }
     private fun startWork() {
         workStarted=true
+        graph.ringing.attach(scope)
         val nm=getSystemService(NotificationManager::class.java)
         observer=ScreenshotObserver(graph)
         initialization=ServiceInitialization(scope,attempt={
@@ -171,7 +172,7 @@ class PneuService : Service() {
             }
         }
     }
-    override fun onDestroy() {scope.cancel();if(workStarted) {ServiceEvidence.stop(this);observer?.stop();graph.connection.stop()};super.onDestroy() }
+    override fun onDestroy() {if(workStarted)graph.ringing.detach();scope.cancel();if(workStarted) {ServiceEvidence.stop(this);observer?.stop();graph.connection.stop()};super.onDestroy() }
     override fun onBind(intent: Intent?): IBinder? = null
     companion object {
         const val ACTION_PAUSE="io.github.stantonmatt.pneu.PAUSE"

@@ -40,7 +40,7 @@ class Connections(private val app:AppGraph) {
     private val generations=java.util.concurrent.ConcurrentHashMap<DeliveryBinding,String>()
     internal fun generation(binding:DeliveryBinding)=generations[binding.copy(sessionId=null)]
     internal fun admitted(binding:DeliveryBinding,token:String) {generations[binding.copy(sessionId=null)]=token}
-    internal fun revoked(peer:Peer) {generations.keys.removeAll {it.pcId==peer.deviceId && it.generation==peer.generation}}
+    internal fun revoked(peer:Peer) {app.scope.launch(Dispatchers.Main.immediate) {app.ringing.stop(io.github.stantonmatt.pneu.features.RingStopSource.REVOKED)};generations.keys.removeAll {it.pcId==peer.deviceId && it.generation==peer.generation}}
     fun clipboardAvailable(p:Prefs=app.prefs.value)=
         app.recipients(p,"text").isNotEmpty() || app.recipients(p,"clipboard_image").isNotEmpty()
     fun connectivity()=RoutePolicy.active(app.context.getSystemService(android.net.ConnectivityManager::class.java)).connectivity
