@@ -34,6 +34,75 @@ class ClipboardHistoryDeviceTest {
     private fun settings() {compose.onNodeWithContentDescription("Settings").performClick();waitText("Settings");compose.onNodeWithText("Keep history").performScrollTo()}
     private fun history() {compose.onNodeWithContentDescription("Clipboard history").performClick();waitText("Clipboard history")}
     private fun keepHistory()=compose.onNodeWithText("Keep history")
+    @Test fun longPressPinsSearchFiltersBothGroupsAndLeavingClearsSearch()=runBlocking<Unit> {
+        app.savedClips.setEnabled(true);app.savedClips.recordText("Café meeting");app.savedClips.recordText("Other note")
+        launch();history()
+        compose.onNodeWithText("Café meeting").performTouchInput {longClick()}
+        compose.onNodeWithText("Pin").assertIsDisplayed().performClick();waitText("Pinned")
+        assertTrue(app.savedClips.state.value.items.first {it.text=="Café meeting"}.pinned)
+        compose.onNodeWithContentDescription("Search").performTextInput("CAFE")
+        compose.onNodeWithText("Café meeting").assertIsDisplayed();compose.onNodeWithText("Other note").assertDoesNotExist()
+        compose.onNodeWithText("Clear all").assertDoesNotExist()
+        app.savedClips.recordText("cafe arrival");waitText("cafe arrival")
+        compose.onNodeWithContentDescription("Search").performTextReplacement("invoice")
+        compose.onNodeWithText("No matches").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Clear search").performClick()
+        compose.onNodeWithText("Other note").assertIsDisplayed()
+        compose.onNodeWithText("Café meeting").performTouchInput {longClick()}
+        compose.onNodeWithText("Unpin").assertIsDisplayed().performClick()
+        compose.waitUntil(5000) {app.savedClips.state.value.items.none {it.pinned}}
+        compose.onNodeWithText("Pinned").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Search").performTextInput("invoice")
+        compose.onNodeWithContentDescription("Back").performClick();history()
+        compose.onNodeWithText("Other note").assertIsDisplayed()
+    }
+    @Test fun lastSearchResultScrollsAboveVisibleKeyboard()=runBlocking<Unit> {
+        app.savedClips.setEnabled(true)
+        app.savedClips.recordText("Keyboard result 01 - final row")
+        for(n in 2..20)app.savedClips.recordText("Keyboard result ${n.toString().padStart(2,'0')}")
+        launch();history()
+        compose.onNodeWithContentDescription("Search").performClick()
+        compose.onNodeWithContentDescription("Search").performTextInput("Keyboard result")
+        activity!!.onActivity {it.window.insetsController!!.show(android.view.WindowInsets.Type.ime())}
+        var keyboardTop=0
+        compose.waitUntil(10000) {
+            var visible=false
+            activity!!.onActivity {a->
+                val insets=a.window.decorView.rootWindowInsets
+                visible=insets?.isVisible(android.view.WindowInsets.Type.ime())==true
+                if(visible)keyboardTop=a.window.decorView.height-insets!!.getInsets(android.view.WindowInsets.Type.ime()).bottom
+            }
+            visible
+        }
+        val last=compose.onNodeWithText("Keyboard result 01 - final row")
+        compose.onNode(hasScrollToIndexAction()).performScrollToNode(hasText("Keyboard result 01 - final row"))
+        last.assertIsDisplayed()
+        assertTrue("Final result must be completely above the keyboard",last.fetchSemanticsNode().boundsInWindow.bottom<=keyboardTop)
+        // Optional host screenshot barrier, after the real IME and final row assertions.
+        if(InstrumentationRegistry.getArguments().getString("imeScreenshot")=="true") {
+            val marker=java.io.File(c.filesDir,"ime-capture-ready");val ack=java.io.File(c.filesDir,"ime-capture-ack")
+            try {
+                ack.delete();marker.writeText("final-row-above-ime")
+                withTimeout(120000) {while(!ack.exists())delay(50)}
+            } finally {marker.delete();ack.delete()}
+        }
+    }
+    @Test fun clearKeepsPinsAndTurningOffCountsAndDeletesThem()=runBlocking<Unit> {
+        app.savedClips.setEnabled(true);app.savedClips.recordText("pinned note")
+        app.savedClips.setPinned(app.savedClips.state.value.items.single().id,true)
+        app.savedClips.recordText("recent note")
+        launch();history();compose.onNodeWithText("Clear all").performClick()
+        compose.onNodeWithText("This deletes 1 saved item. Pinned items stay.").assertIsDisplayed()
+        compose.onNodeWithText("Clear").performClick();compose.onNodeWithText("pinned note").assertIsDisplayed()
+        compose.onNodeWithText("Clear all").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Back").performClick();settings();keepHistory().performClick()
+        compose.onNodeWithText("This deletes 1 pinned item.").assertIsDisplayed()
+        compose.onNodeWithText("Cancel").performClick();keepHistory().assertIsOn()
+        app.savedClips.recordText("another recent")
+        keepHistory().performClick();compose.onNodeWithText("This deletes 2 saved items, including 1 pinned.").assertIsDisplayed()
+        compose.onNodeWithText("Turn off").performClick()
+        compose.waitUntil(5000) {!app.savedClips.state.value.enabled};assertTrue(app.savedClips.state.value.items.isEmpty())
+    }
     @Test fun settingStartsOffHomeIconIsConditionalAndEmptyTurnOffHasNoDialog()=runBlocking<Unit> {
         launch();compose.onNodeWithContentDescription("Clipboard history").assertDoesNotExist()
         settings();keepHistory().assertIsOff().performClick()

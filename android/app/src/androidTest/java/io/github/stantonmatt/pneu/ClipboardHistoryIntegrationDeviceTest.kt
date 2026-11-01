@@ -36,6 +36,53 @@ class ClipboardHistoryIntegrationDeviceTest {
         activity=ActivityScenario.launch(Intent(c,MainActivity::class.java).putExtra("home",true))
     }
     @After fun cleanup()=runBlocking<Unit> {activity?.close();peer?.close();owned.forEach {c.contentResolver.delete(it,null,null)};app.savedClips.setEnabled(false);java.io.File(c.filesDir,"clipboard-snapshot").deleteRecursively();DeviceFixture.reset()}
+    @Test fun oversizedClipboardImageIsRejectedBeforeStagingButShareSheetFilesRemainAllowed()=runBlocking<Unit> {
+        val began=LinkedBlockingQueue<com.google.gson.JsonObject>()
+        val fixture=LocalPeerFixture(app,handle={frame,send->when(frame.type) {
+            Type.FILE_BEGIN->{began.offer(frame.body);true}
+            Type.FILE_END->{send(Frame.Control(Type.ACK,json("transfer_id" to frame.body["transfer_id"].asString,"deduplicated" to false)));true}
+            else->false
+        }});peer=fixture;fixture.connect(holdFirstFrame=false)
+        val uri=requireNotNull(c.contentResolver.insert(android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI,ContentValues().apply {
+            put(android.provider.MediaStore.Images.Media.DISPLAY_NAME,"pneu-oversized-fixture.png")
+            put(android.provider.MediaStore.Images.Media.MIME_TYPE,"image/png")
+            put(android.provider.MediaStore.Images.Media.IS_PENDING,1)
+        }));owned+=uri
+        c.contentResolver.openOutputStream(uri)!!.use {output->
+            val block=ByteArray(65536);repeat(SavedClips.MAX_IMAGE/block.size) {output.write(block)};output.write(0)
+        }
+        c.contentResolver.update(uri,ContentValues().apply {put(android.provider.MediaStore.Images.Media.IS_PENDING,0)},null,null)
+        val clip=ClipData("oversized fixture",arrayOf("image/png"),ClipData.Item(uri))
+        var staged=false;app.staging.beforePayloadWrite={staged=true}
+        try {
+            val operation=ManualEntryViewModel(c.applicationContext as Application)
+            operation.captureClipboardAdmission(app.captureAdmission());operation.clipboard(clip)
+            val result=withTimeout(10000) {operation.result.filterNotNull().first()}
+            assertEquals("Image over 20 MB. Not sent.",result.message)
+            assertTrue(operation.completed.isEmpty());assertFalse("No staging before rejection",staged)
+            assertTrue(app.savedClips.state.value.items.isEmpty());assertNull(began.poll())
+            // The share sheet passes kind=file, even when its MIME is image/*.
+            val file=ManualEntries.file(app,uri,"file")
+            assertEquals(SavedClips.MAX_IMAGE+1L,file.size);assertTrue(staged)
+            withTimeout(15000) {while(app.queue.find(file.mediaId)?.state!="sent")delay(20)}
+            assertEquals("file",began.poll(5,TimeUnit.SECONDS)!!["kind"].asString)
+        } finally {app.staging.beforePayloadWrite={}}
+    }
+    @Test fun unknownSizeClipboardImageIsBoundedDuringItsOnlyStagingCopy()=runBlocking<Unit> {
+        val fixture=LocalPeerFixture(app,handle={_,_->false});peer=fixture;fixture.connect(holdFirstFrame=false)
+        val provider=android.net.Uri.parse("content://io.github.stantonmatt.pneu.test.review")
+        c.contentResolver.call(provider,"reset",null,null)
+        val uri=provider.buildUpon().appendPath("unknown-oversized-image").build()
+        var staged=0L;app.staging.beforePayloadWrite={staged+=it}
+        try {
+            try {ManualEntries.file(app,uri,"clipboard_image");fail("Oversized stream accepted")}
+            catch(e:ShareFailure) {assertEquals("image_too_large",e.reason)}
+            assertEquals(SavedClips.MAX_IMAGE.toLong(),staged)
+            assertEquals("Payload must be opened only once",1,c.contentResolver.call(provider,"stats",null,null)!!.getInt("opens"))
+            assertTrue(app.queue.all().isEmpty())
+            assertTrue(java.io.File(c.filesDir,"outgoing").listFiles().orEmpty().none {it.extension=="part" || it.extension=="bin"})
+        } finally {app.staging.beforePayloadWrite={}}
+    }
     @Test fun receivedTextRecordsSenderAndSensitiveTextAppliesFlagWithoutSaving()=runBlocking<Unit> {
         val delivery=ClipboardDelivery(app)
         fun message(text:String,sensitive:Boolean,time:Long)=json("transfer_id" to randomId(),"text" to text,"created_at" to time).apply {if(sensitive)addProperty("sensitive",true)}

@@ -43,6 +43,46 @@ class SavedClipsTest {
         val bitmap=Bitmap.createBitmap(12,10,Bitmap.Config.ARGB_8888).apply {eraseColor(Color.BLUE)}
         return ByteArrayOutputStream().also {bitmap.compress(format,100,it);bitmap.recycle()}.toByteArray()
     }
+    @Test fun pinsHaveIndependentOrderAndDedupePreservesPinAndRefreshesTime()=runBlocking {
+        store.setEnabled(true);store.recordText("first");val first=items.single().id
+        store.recordText("second");val second=items.first().id
+        assertTrue(store.setPinned(first,true));assertTrue(store.setPinned(second,true))
+        val order=listOf(second,first);val time=items.last().copiedAt
+        val position=items.last().pinPosition
+        store.recordText("first","new sender")
+        assertEquals(order,items.map {it.id});assertTrue(items.all {it.pinned})
+        assertEquals(position,items.last().pinPosition);assertTrue(items.last().copiedAt>time)
+        assertEquals("new sender",items.last().sender)
+        store.copy(first) {};assertEquals(order,items.map {it.id})
+        assertTrue(store.setPinned(first,false));assertFalse(items.last().pinned)
+        assertEquals(first,items.last().id)
+    }
+    @Test fun twentyFivePinsDoNotCountTowardRecentCapacityOrGetEvicted()=runBlocking {
+        store.setEnabled(true)
+        repeat(25) {index->store.recordText("pin $index");assertTrue(store.setPinned(items.first {it.text=="pin $index"}.id,true))}
+        repeat(70) {store.recordText("recent $it")}
+        assertEquals(75,items.size);assertEquals(25,items.count {it.pinned})
+        val recent=items.first {!it.pinned};assertFalse(store.setPinned(recent.id,true))
+        assertEquals(25,items.count {it.pinned});assertTrue(items.any {it.id==recent.id && !it.pinned})
+        assertEquals((69 downTo 20).map {"recent $it"},items.filterNot {it.pinned}.map {it.text})
+    }
+    @Test fun unpinProtectsAnOldItemAndReturnsItByTimeEvenWhenRecentIsFull()=runBlocking {
+        store.setEnabled(true);store.recordText("old pin");val id=items.single().id
+        store.setPinned(id,true);repeat(50) {store.recordText("recent $it")}
+        val display=items.map {it.id};val arrivals=store.state.value.arrivals
+        assertTrue(store.setPinned(id,false));assertEquals(50,items.size)
+        assertEquals("old pin",items.last().text);assertFalse(items.any {it.text=="recent 0"})
+        assertEquals(items.map {it.id},historyDisplayOrder(display,items,arrivals,store.state.value.arrivals,mapOf(id to true)))
+    }
+    @Test fun clearKeepsPinnedImagesAndOffDeletesEverythingIncludingPins()=runBlocking {
+        store.setEnabled(true);val bytes=image();store.recordImage("image/png") {bytes.inputStream()}
+        val id=items.single().id;store.setPinned(id,true);store.recordText("recent")
+        store.clear();assertEquals(id,items.single().id);assertTrue(items.single().pinned)
+        assertEquals(2,directory.listFiles()!!.size)
+        val restored=SavedClips(context,scope,db);restored.recordText(" ")
+        assertTrue(restored.state.value.items.single().pinned)
+        restored.setEnabled(false);assertTrue(restored.state.value.items.isEmpty());assertTrue(directory.listFiles()!!.isEmpty())
+    }
     @Test fun optInStartsEmptyAndNeverImportsAnExistingClipboard()=runBlocking {
         context.getSystemService(android.content.ClipboardManager::class.java).setPrimaryClip(android.content.ClipData.newPlainText("existing","private"))
         store.recordText("off");assertTrue(items.isEmpty());assertFalse(store.state.value.enabled)

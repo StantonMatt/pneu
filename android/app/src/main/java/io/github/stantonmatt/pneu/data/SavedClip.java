@@ -12,6 +12,8 @@ public class SavedClip {
     /** Empty for this phone; otherwise the sender's name at receipt time. */
     @NonNull public String sender="";
     @NonNull public String source="";
+    @ColumnInfo(defaultValue="0") public boolean pinned;
+    @ColumnInfo(defaultValue="0") public long pinPosition;
     public long copiedAt;
     public long position;
 }

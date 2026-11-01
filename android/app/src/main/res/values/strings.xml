@@ -309,4 +309,24 @@
         <item quantity="one">This deletes %d saved item.</item>
         <item quantity="other">This deletes %d saved items.</item>
     </plurals>
+    <string name="history_search">Search</string>
+    <string name="history_clear_search">Clear search</string>
+    <string name="history_pinned">Pinned</string>
+    <string name="history_pin">Pin</string>
+    <string name="history_unpin">Unpin</string>
+    <string name="history_no_matches">No matches</string>
+    <string name="history_pin_limit">You can pin up to 25 items</string>
+    <string name="toast_image_too_large">Image over 20 MB. Not sent.</string>
+    <plurals name="history_delete_count_keep_pins">
+        <item quantity="one">This deletes %d saved item. Pinned items stay.</item>
+        <item quantity="other">This deletes %d saved items. Pinned items stay.</item>
+    </plurals>
+    <plurals name="history_delete_count_with_pins">
+        <item quantity="one">This deletes %1$d saved item, including %2$d pinned.</item>
+        <item quantity="other">This deletes %1$d saved items, including %2$d pinned.</item>
+    </plurals>
+    <plurals name="history_delete_pinned">
+        <item quantity="one">This deletes %d pinned item.</item>
+        <item quantity="other">This deletes %d pinned items.</item>
+    </plurals>
 </resources>

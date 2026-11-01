@@ -69,6 +69,9 @@ class Staging(private val app: AppGraph, private val deleteCommittedSource:(File
                     catch(e:Exception) {if(!row.automatic)throw ShareFailure("open_failed",e) else throw e}
                     sources.add(asset)
                     try {asset.use {source->
+                    // Cancellation closes even a stalled descriptor off the caller's
+                    // thread. A late open observes the already-cancelled signal here.
+                    signal.setOnCancelListener {runCatching {source.close()}}
                     progress()
                     val digest=MessageDigest.getInstance("SHA-256");var count=0L
                     val fd=source.fileDescriptor
@@ -78,7 +81,8 @@ class Staging(private val app: AppGraph, private val deleteCommittedSource:(File
                         val buffer=ByteArray(CHUNK_SIZE)
                         while(range.remaining!=0L) {
                             if(signal.isCanceled)throw java.io.IOException("Copy abandoned")
-                            val n=try {android.system.Os.read(fd,buffer,0,range.limit(buffer.size))}
+                            val limit=range.limit(buffer.size).let {if(row.kind=="clipboard_image")ClipboardImageSize.readLimit(count,it) else it}
+                            val n=try {android.system.Os.read(fd,buffer,0,limit)}
                             catch(e:android.system.ErrnoException) {
                                 if(e.errno!=android.system.OsConstants.EAGAIN)throw e
                                 val poll=android.system.StructPollfd().apply {this.fd=fd;events=android.system.OsConstants.POLLIN.toShort()}
@@ -86,6 +90,7 @@ class Staging(private val app: AppGraph, private val deleteCommittedSource:(File
                             }
                             if(!range.consume(n))break
                             progress();count+=n;require(count<=MAX_FILE)
+                            if(row.kind=="clipboard_image")ClipboardImageSize.requireAllowed(count)
                             output.write(buffer,0,n);digest.update(buffer,0,n)
                         }
                         source.parcelFileDescriptor.checkError()

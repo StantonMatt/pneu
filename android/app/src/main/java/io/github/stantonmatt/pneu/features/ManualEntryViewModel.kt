@@ -201,7 +201,7 @@ internal class ManualEntryViewModel(application:Application):AndroidViewModel(ap
                     }}
                     EntryResult()
                 }
-            }catch(e:CancellationException) {throw e}catch(e:Exception) {Log.w("Pneu","manual_entry_rejected: ${(e as? ShareFailure)?.reason ?: "read_failed"}");EntryResult(app.context.getString(if((e as? ShareFailure)?.reason=="no_recipient")R.string.toast_no_recipient else R.string.toast_not_sent))}
+            }catch(e:CancellationException) {throw e}catch(e:Exception) {Log.w("Pneu","manual_entry_rejected: ${(e as? ShareFailure)?.reason ?: "read_failed"}");EntryResult(app.context.getString(when((e as? ShareFailure)?.reason) {"no_recipient"->R.string.toast_no_recipient;"image_too_large"->R.string.toast_image_too_large;else->R.string.toast_not_sent}))}
         }
     }
 }
