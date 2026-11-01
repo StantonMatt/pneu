@@ -54,6 +54,11 @@ fn check_client(stream: &ServerStream) -> Result<()> {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Command {
+    Ring {
+        device: pneu_proto::Id,
+        connection: u64,
+        action: pneu_proto::RingAction,
+    },
     ShowClipboardHistory,
     CopyClipboardHistory {
         id: String,
@@ -227,6 +232,8 @@ pub enum Command {
     WindowFocus {
         request: u64,
         focused: bool,
+        #[serde(default)]
+        visible: bool,
     },
     AddDevice,
     ShowWindow {
@@ -506,6 +513,7 @@ async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
         Command::DismissTransfer{operation,artifact}=>{core.dismiss_transfer_artifact(operation,artifact).await?;serde_json::Value::Null},
         Command::CancelTransfer{operation,artifact,device}=>{core.cancel_transfer_artifact(operation,artifact,device).await?;serde_json::Value::Null},
         Command::RetryTransfer{operation,artifact,device}=>{core.retry_transfer_artifact(operation,artifact,device).await?;serde_json::Value::Null},
+        Command::Ring {device,connection,action}=>{core.ring_phone(device,connection,action)?;serde_json::Value::Null},
         Command::ShowClipboardHistory=>{core.request_history_window();serde_json::Value::Null},
         Command::CopyClipboardHistory{id}=>{core.copy_clipboard_history(id).await?;serde_json::Value::Null},
         Command::DeleteClipboardHistory{id}=>{core.delete_clipboard_history(Some(id)).await?;serde_json::Value::Null},
@@ -564,7 +572,7 @@ async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
         Command::DiscardClipboard {device} => { core.discard_clipboard(device).await?; serde_json::Value::Null },
         #[cfg(windows)]
         Command::WindowClosed { request } => { core.window_closed(request); serde_json::Value::Null },
-        Command::WindowFocus { request, focused } => { core.set_window_focus(request, focused); serde_json::Value::Null },
+        Command::WindowFocus { request, focused, visible } => { core.set_window_visible(request, visible); core.set_window_focus(request, focused); serde_json::Value::Null },
         Command::UiStatus => { let (revision, invitation) = core.pairing_status(); let snapshot = core.ui_snapshot(); let (window_request, activation_token) = core.window_request_with_activation(); serde_json::json!({"device":snapshot.device, "snapshot":snapshot, "config": core.config(), "window_request":window_request,"history_page":core.window_history(window_request),"add_device":core.window_add_device(window_request),"remove_device":core.window_remove_device(window_request),"self_id":core.identity.device_id,"activation_token":activation_token,"invitation_revision":revision,"invitation":invitation,"pending_send":core.pending_send(),"setup":core.setup_status().await?}) },
         Command::AddDevice => { core.request_add_device(); serde_json::Value::Null },
         Command::ShowWindow { choose_folder } => { core.request_window(choose_folder); serde_json::Value::Null },

@@ -17,6 +17,71 @@ pub(crate) fn history_entries(
     entries.extend(recent.into_iter().take(10).map(Some));
     entries
 }
+pub(crate) fn phone_name(name: &str) -> String {
+    if name.chars().count() > 40 {
+        format!("{}…", name.chars().take(39).collect::<String>().trim_end())
+    } else {
+        name.to_owned()
+    }
+}
+pub(crate) fn battery_lines(peers: &[Peer]) -> Vec<String> {
+    peers
+        .iter()
+        .filter_map(|p| {
+            p.battery.map(|level| {
+                format!(
+                    "{} · Battery {level}%{}",
+                    phone_name(&p.name),
+                    if p.charging { ", charging" } else { "" }
+                )
+            })
+        })
+        .collect()
+}
+pub(crate) struct RingItem {
+    pub label: String,
+    pub device: pneu_proto::Id,
+    pub connection: Option<u64>,
+    pub action: pneu_proto::RingAction,
+}
+#[cfg(target_os = "macos")]
+impl RingItem {
+    pub fn request(&self) -> serde_json::Value {
+        serde_json::json!({"command":"ring", "device":self.device, "connection":self.connection, "action":self.action})
+    }
+}
+pub(crate) fn ring_items(peers: &[Peer]) -> Vec<RingItem> {
+    let phones: Vec<_> = peers
+        .iter()
+        .filter(|p| p.phone && p.ring_supported)
+        .collect();
+    phones
+        .iter()
+        .filter_map(|p| {
+            Some(RingItem {
+                device: pneu_proto::Id::new(&p.id).ok()?,
+                connection: p.ring_connection,
+                action: if p.ringing {
+                    pneu_proto::RingAction::Stop
+                } else {
+                    pneu_proto::RingAction::Start
+                },
+                label: if phones.len() == 1 {
+                    if p.ringing {
+                        "Stop Ringing"
+                    } else {
+                        "Ring Phone"
+                    }
+                    .into()
+                } else if p.ringing {
+                    format!("Stop Ringing {}", phone_name(&p.name))
+                } else {
+                    phone_name(&p.name)
+                },
+            })
+        })
+        .collect()
+}
 /// The tray's first line, which also starts its tooltip.
 pub(crate) fn status(snapshot: &Snapshot, peers: &[Peer], transfers: &[Transfer]) -> String {
     let sending: Vec<&str> = peers
@@ -311,6 +376,17 @@ pub(super) fn menu(snapshot: &Snapshot, config: &crate::Config) -> Vec<MenuEntry
             },
         ),
     ];
+    for (index, label) in battery_lines(&peers).into_iter().enumerate() {
+        items.insert(
+            1 + index,
+            Item {
+                label,
+                enabled: false,
+                checked: None,
+                command: None,
+            },
+        );
+    }
     if !peers.is_empty() {
         let recipients = |device: Option<&pneu_proto::Id>| {
             let ids = device.map(|id| [id.clone()]);
@@ -382,6 +458,27 @@ pub(super) fn menu(snapshot: &Snapshot, config: &crate::Config) -> Vec<MenuEntry
         }
         if config.clipboard_history {
             items.push(history(snapshot));
+        }
+        let rings = ring_items(&peers)
+            .into_iter()
+            .map(|ring| Item {
+                label: ring.label,
+                enabled: ring.connection.is_some(),
+                checked: None,
+                command: ring.connection.map(|connection| Command::Ring {
+                    device: ring.device,
+                    connection,
+                    action: ring.action,
+                }),
+            })
+            .collect::<Vec<_>>();
+        if rings.len() == 1 {
+            items.extend(rings);
+        } else if !rings.is_empty() {
+            items.push(Submenu {
+                label: "Ring Phone".into(),
+                items: rings,
+            });
         }
         items.extend([item("Open Received Files", Command::OpenFolder), Separator]);
         let mut modes = [

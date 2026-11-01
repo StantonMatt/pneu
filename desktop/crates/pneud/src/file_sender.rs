@@ -534,7 +534,7 @@ pub(super) async fn transmit_file<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     mut work: FileWrite,
     priority: &mut mpsc::Receiver<Message>,
-    normal: &mut mpsc::Receiver<Message>,
+    normal: &mut phone_controls::FrameQueue,
     text: &mut mpsc::Receiver<AutomaticWrite>,
     reports: &mpsc::Sender<WriteReport>,
 ) -> Result<bool> {
@@ -596,7 +596,7 @@ pub(super) async fn transmit_file<W: tokio::io::AsyncWrite + Unpin>(
         }
         let n = file.read(&mut buffer).await?;
         ensure!(n > 0, "staged file truncated");
-        send_pending_messages(&mut *writer.writer, priority, normal, Some(reports)).await?;
+        send_pending_messages(core, &mut *writer.writer, priority, normal, Some(reports)).await?;
         send_pending_clipboard_text(
             core,
             &mut *writer.writer,

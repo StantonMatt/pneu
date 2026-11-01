@@ -139,6 +139,7 @@ pub async fn run(
             command=rx.recv()=>match command {
                 Some(Command::SetupDecision {requests, allow})=>super::window_setup::decide(&core, &requests, allow).await,
                 Some(Command::Window { activation_token })=>core.request_window_with_activation(false, activation_token),
+                Some(Command::Ring {device,connection,action})=>{if let Err(error)=core.ring_phone(device,connection,action) { eprintln!("pneud: ring unavailable: {error}"); }},
                 Some(Command::ShowClipboardHistory)=>core.request_history_window(),
                 Some(Command::CopyClipboardHistory(id))=>{if let Err(error)=core.copy_clipboard_history(id).await {eprintln!("pneud: clipboard copy failed: {error}");}},
                 Some(Command::ChooseFolder)=>core.request_window(true),

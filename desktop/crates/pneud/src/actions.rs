@@ -456,6 +456,9 @@ pub trait PcActions: Send + Sync {
     async fn notify_clipboard_too_large(&self) -> Result<()> {
         Ok(())
     }
+    async fn notify_ring_failure(&self, _phone: &str) -> Result<()> {
+        Ok(())
+    }
     async fn notify_send_admission_failure(&self, _reason: &str) -> Result<()> {
         Ok(())
     }
