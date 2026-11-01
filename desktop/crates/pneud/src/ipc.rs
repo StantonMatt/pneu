@@ -79,7 +79,7 @@ pub enum Command {
     UiTest {
         action: String,
     },
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     PresentPicker {
         #[serde(default)]
         paths: Option<Vec<std::path::PathBuf>>,
@@ -256,7 +256,7 @@ impl Command {
         if matches!(self, Self::UiTest { .. }) {
             return true;
         }
-        #[cfg(any(target_os = "macos", windows))]
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         if matches!(self, Self::PresentPicker { .. }) {
             return true;
         }
@@ -463,7 +463,7 @@ async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
     )?;
     let ask = core.config().choose_devices_each_time;
     let desktop_send = match &request {
-        #[cfg(any(target_os = "macos", windows))]
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         Command::PresentPicker {..} => true,
         Command::PresentFiles {..} | Command::PresentSendError {..} => true,
         Command::SendFiles {targets,..} | Command::SendClipboard {targets} => !matches!(targets, crate::outbox::Targets::Captured(_)),
@@ -485,7 +485,7 @@ async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
             else if action=="open-test" {core.ui_test_open().await?;serde_json::Value::Null}
             else {crate::ui::child_bridge::begin(crate::ui::child_bridge::Request::Test(action),None)?.await?;serde_json::Value::Null}
         },
-        #[cfg(any(target_os = "macos", windows))]
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         Command::PresentPicker {paths,targets,clipboard,targeted} => {
             anyhow::ensure!(paths.as_ref().is_none_or(|paths|!clipboard && !paths.is_empty() && paths.len()<=128),"choose 1 to 128 files");
             core.present_send(crate::ui::window::SendRequest {id:crate::random_hex(16),paths,targets,clipboard,targeted,error:None})?
@@ -1035,6 +1035,16 @@ mod tests {
                         paths: vec![],
                         targets: all(),
                         request_id: None,
+                    },
+                    true,
+                ),
+                #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+                (
+                    Command::PresentPicker {
+                        paths: Some(vec!["/private/scratch-file".into()]),
+                        targets: Vec::new(),
+                        clipboard: false,
+                        targeted: true,
                     },
                     true,
                 ),
