@@ -31,6 +31,8 @@ object UiPresentation {
     fun recentOutcome(context:android.content.Context,item:RecentItem):String =when {
         item.failed.size==1 -> item.failed.single().let {failed->
             val name=failed.name.ifEmpty {context.getString(R.string.computer)}
+            if(failed.error=="connection_lost")return@let context.getString(R.string.item_failed_on_reason,name,
+                connectionLost(context,failed.resumable,failed.sent,failed.total))
             failureReason(failed.error)?.let {context.getString(R.string.item_failed_on_reason,name,context.getString(it))} ?: context.getString(R.string.item_failed_on,name)
         }
         item.failed.isNotEmpty() -> context.resources.getQuantityString(R.plurals.item_failed_computers,item.failed.size,item.failed.size)
@@ -93,6 +95,14 @@ object UiPresentation {
             else->context.getString(R.string.notif_sending_screenshot)
         }
     }
+
+    fun connectionLostFailure(context:android.content.Context,state:String,error:String,resumable:Boolean,sent:Long,total:Long):String? =
+        if(state=="failed" && error=="connection_lost")connectionLost(context,resumable,sent,total) else null
+
+    fun connectionLost(context:android.content.Context,resumable:Boolean,sent:Long,total:Long):String =
+        if(resumable && sent>0)context.getString(R.string.item_connection_lost_progress,
+            android.text.format.Formatter.formatShortFileSize(context,sent),android.text.format.Formatter.formatShortFileSize(context,total))
+        else context.getString(R.string.item_connection_lost)
 
     fun failedItem(error:String):Int = when(error) {
         "disk_full" -> R.string.item_failed_disk

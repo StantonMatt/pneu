@@ -741,12 +741,14 @@ internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired
                             val clipboard=row.kind=="clipboard_image" || row.kind=="text" && row.origin=="clipboard"
                             val time=lastConnectedLabel(context,row.createdAt)
                             val failing=outcome?.failed?.isNotEmpty()==true
+                            val connectionLost=UiPresentation.connectionLostFailure(context,row.state,row.error,row.resumable,row.sentBytes,row.size)
                             val supporting=when {
                                 outcome?.received!=null -> UiPresentation.recentReceived(context,outcome,time,p.devices.size)!!
                                 several && settled -> UiPresentation.recentSent(context,outcome,clipboard,time) ?: time
                                 several && failing -> UiPresentation.recentOutcome(context,outcome!!)
                                 progress -> if(multi)UiPresentation.recentOutcome(context,outcome!!) else resources.getString(R.string.item_sending,android.text.format.Formatter.formatShortFileSize(context,sent),android.text.format.Formatter.formatShortFileSize(context,total))
                                 row.state=="sent" -> if(clipboard)resources.getString(R.string.item_clipboard_time,time) else time
+                                connectionLost!=null -> connectionLost
                                 row.state=="failed" -> resources.getString(UiPresentation.failedItem(row.error))
                                 DeliveryPolicy.hold(row.kind,row.automatic,false,network.mobile,p.originals,row.attempted,row.optimized) -> resources.getString(R.string.item_waiting_wifi)
                                 several -> UiPresentation.recentOutcome(context,outcome!!)

@@ -126,6 +126,9 @@ class Connections(private val app:AppGraph) {
     internal var openPayload:(File)->java.io.FileInputStream={it.inputStream()}
     internal var beforeFirstFrame:suspend (Outgoing)->Unit={}
     internal var beforeUnpairRemoval:suspend ()->Unit={}
+    internal fun receiveChunkHookForTest(hook:suspend ()->Unit) {requireNotNull(workers.values.firstOrNull()).beforeReceiveChunk=hook}
+    internal fun fileReceiptWaitHookForTest(hook:suspend ()->Unit) {requireNotNull(workers.values.firstOrNull()).beforeFileReceiptWait=hook}
+    internal fun frameFlushedHookForTest(hook:(String)->Unit) {requireNotNull(workers.values.firstOrNull()).afterFileFrameFlushed=hook}
     internal suspend fun withWriteLockForTest(body:suspend ()->Unit)=requireNotNull(workers.values.firstOrNull()).withWriteLockForTest(body)
     internal fun candidates(p:Prefs)=workers[attempt.value?.invitation?.fingerprint ?: p.peer?.pin]?.candidates(p) ?: ConnectionManager(app).candidates(p)
 }

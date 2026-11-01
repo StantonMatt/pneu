@@ -13,6 +13,8 @@ public class Delivery {
     @ColumnInfo(defaultValue = "0") public boolean attempted;
     @ColumnInfo(defaultValue = "0") public long revision;
     @NonNull @ColumnInfo(defaultValue = "''") public String rejectedCapabilities = "";
+    @ColumnInfo(defaultValue="0") public long sentBytes;
+    @ColumnInfo(defaultValue="0") public boolean resumable;
     public long nextAttempt;
     public int mismatches;
     public static Delivery from(Outgoing row) {

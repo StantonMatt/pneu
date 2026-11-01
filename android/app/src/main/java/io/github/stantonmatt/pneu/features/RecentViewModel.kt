@@ -10,7 +10,7 @@ import io.github.stantonmatt.pneu.data.*
 import kotlinx.coroutines.flow.*
 
 /** [item] identifies this one delivery, so a details sheet can stop or retry it alone. */
-data class RecipientOutcome(val peerId:String,val name:String,val state:String,val error:String,val sent:Long,val total:Long,val active:Boolean=false,val item:ConfirmedItem?=null) {
+data class RecipientOutcome(val peerId:String,val name:String,val state:String,val error:String,val sent:Long,val total:Long,val active:Boolean=false,val item:ConfirmedItem?=null,val resumable:Boolean=false) {
     val pending get()=state in setOf("waiting","sending")
     val retryable get()=state=="failed"
     val actionable get()=pending || retryable
@@ -41,8 +41,8 @@ internal object RecentProjection {
         RecentItem(row,deliveries.map {delivery->
             val link=links[delivery.peerId]?.takeIf {it.connectionStatus==ConnectionStatus.CONNECTED && it.transferMediaId==delivery.mediaId && delivery.state=="sending"}
             val total=maxOf(delivery.size,link?.total ?: 0).coerceAtLeast(0)
-            val sent=if(delivery.state=="sent")total else (link?.sent ?: 0).coerceIn(0,total)
-            RecipientOutcome(delivery.peerId,p.devices.find {it.deviceId==delivery.peerId}?.name.orEmpty(),delivery.state,delivery.error,sent,total,link!=null,ConfirmedItem.from(delivery))
+            val sent=if(delivery.state=="sent")total else (link?.sent ?: delivery.sentBytes).coerceIn(0,total)
+            RecipientOutcome(delivery.peerId,p.devices.find {it.deviceId==delivery.peerId}?.name.orEmpty(),delivery.state,delivery.error,sent,total,link!=null,ConfirmedItem.from(delivery),delivery.resumable)
         })
     }.sortedWith(compareBy<RecentItem> {if(it.row.state=="sent")1 else 0}
         .thenBy {if(it.row.state=="sent")-it.row.orderId else it.row.orderId}.thenBy {it.row.mediaId})

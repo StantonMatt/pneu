@@ -98,6 +98,10 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
     private val rejections = RejectionStreak()
     internal var onUnauthorized:(()->Unit)?=null
     @Volatile private var activeReceipt: Pair<String, CompletableDeferred<Frame.Control>>? = null
+    private val fileFrameWriter=FileFrameWriter()
+    @Volatile private var cancelFlush:Job?=null
+    @Volatile private var filePhase:FileSendPhase?=null
+    private val cancelledFiles=java.util.concurrent.ConcurrentHashMap<String,FileSendPhase>()
     @Volatile private var fileEmission:QueuedEmission?=null
     @Volatile private var receiptReady = false
     @Volatile private var textReceipt: Pair<String,CompletableDeferred<Frame.Control>>?=null
@@ -367,7 +371,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
         val localScope=attempt?.prior?.setupScope ?: attempt?.let {if(it.setupEnabled)SetupScope.ENABLED else SetupScope.DISABLED} ?: p.peer?.setupScope ?: SetupScope.ASK
         val localSetup=p.membership.hello(localScope)
         val hello=phase(ssl,10000) {
-        send(Frame.Control(Type.HELLO, json("version" to 1, "device_id" to p.deviceId, "name" to utf8Prefix(name,128).ifEmpty {"Pneu"}, "capabilities" to LEGACY_PHONE_CAPABILITIES,"role" to "phone", "paused" to p.paused).apply {add("setup",localSetup.json())}))
+        send(Frame.Control(Type.HELLO, json("version" to 1, "device_id" to p.deviceId, "name" to utf8Prefix(name,128).ifEmpty {"Pneu"}, "capabilities" to (LEGACY_PHONE_CAPABILITIES+CAP_FILE_RESUME),"role" to "phone", "paused" to p.paused).apply {add("setup",localSetup.json())}))
         readControl(ssl)
         }
         if (hello.type == Type.ERROR) throw RemoteError(hello.body["code"].asString)
@@ -652,6 +656,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                 LaneWait.await(work,waitMillis)
                 var selected:Outgoing?=null
                 try {
+                if(!text)cancelFlush?.join()
                 val prefs=readPrefs()
                 if(!settingsReady) {waitMillis=1000;continue}
                 if(text && prefs.peer?.clipboardSend!=true)app.queueMutex.withLock {app.queue.supersedeBoundText(sessionBinding.pcId,sessionBinding.generation)}
@@ -705,10 +710,20 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                 }
             }} finally {events.cancel();work.close()}
         }
+        // Flush durable mid-frame/offline cancels before any new file BEGIN.
+        suspend fun flushCancels() {
+            if(CAP_FILE_RESUME !in capabilities)return
+            for(intent in app.queue.pendingCancels(sessionBinding.pcId)) {
+                if(intent.generation==sessionBinding.generation && intent.pin==sessionBinding.pin)
+                    send(Frame.Control(Type.CANCEL,json("transfer_id" to intent.transferId)))
+                app.queue.deletePendingCancel(intent.peerId,intent.transferId)
+            }
+        }
+        flushCancels()
         val sender=launchSender(false)
         val textSender=launchSender(true)
         val receiveSession=admissionSession
-        val receiver=app.receivedFiles.connection(CapturedAuthority(sessionBinding,requireNotNull(receiveSession)),mesh) {ready && admissionSession==receiveSession && authenticatedBinding==sessionBinding}
+        val receiver=app.receivedFiles.connection(CapturedAuthority(sessionBinding,requireNotNull(receiveSession)),mesh,CAP_FILE_RESUME in capabilities) {ready && admissionSession==receiveSession && authenticatedBinding==sessionBinding}
         val receiveProgress=ProgressDeadline(60_000,SystemClock::elapsedRealtime)
         val receiveWake=Channel<Unit>(Channel.CONFLATED)
         val receiveWatchdog=launch(Dispatchers.Default) {
@@ -723,32 +738,103 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                 }
             }
         }
+        val fileLane=FileReceiveLane(receiver::requestFailure)
+        val incomingPhase=FileReceiveState()
+        // Cleanup owns an ID only while queued/running (at most 65 IDs).
+        // Keep it fenced until both the file worker and purge have retired it.
+        val cancelPurges=Channel<String>(64)
+        val purgingCancels=java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+        val cancelPurger=app.scope.launch(Dispatchers.IO) {
+            for(id in cancelPurges)try {PostCommit.maintainSuspending {receiver.purgeCancelled(id)}}
+                finally {purgingCancels.remove(id)}
+        }
+        val fileWorker=launch(Dispatchers.IO) {
+            try {
+                while(isActive) {
+                    val frame=fileLane.receive()
+                    val id=when(frame) {is Frame.Chunk->frame.id;is Frame.Control->frame.body["transfer_id"].asString}
+                    if(receiver.isCancelled(id) && !(frame is Frame.Control && frame.type==Type.CANCEL))continue
+                    try {
+                        when(frame) {
+                            is Frame.Chunk->{beforeReceiveChunk();receiver.chunk(frame);state.update {it.copy(incoming=it.incoming?.copy(received=receiver.receivedBytes))}}
+                            is Frame.Control->when(frame.type) {
+                                Type.FILE_BEGIN->{
+                                    val reply=withTimeoutOrNull(90_000) {receiver.begin(frame.body)}
+                                    if(!receiver.isCancelled(id)) {
+                                        if(reply?.type==Type.NACK) {if(incomingPhase.clear(id))receiveProgress.complete()}
+                                        else {
+                                            receiveProgress.progress(120_000)
+                                            state.update {it.copy(incoming=receiver.metadata?.let {meta->IncomingTransfer(pcId,meta.id,meta.name,receiver.receivedBytes,meta.size)})}
+                                        }
+                                        receiveWake.trySend(Unit)
+                                        reply?.let {response->
+                                            if(response.type==Type.FILE_READY)incomingPhase.ready(id,response.body["offset"].asLong) {send(response)}
+                                            else send(response)
+                                        }
+                                        if(frame.body["resume"]?.asBoolean==true && reply==null)throw RemoteError("timeout")
+                                    }
+                                }
+                                Type.FILE_END->{
+                                    val reply=withTimeoutOrNull(120_000) {receiver.end(id)} ?: throw RemoteError("timeout")
+                                    if(incomingPhase.clear(id))receiveProgress.complete();receiveWake.trySend(Unit)
+                                    state.update {it.copy(incoming=null)}
+                                    if(!receiver.isCancelled(id))send(reply)
+                                }
+                                Type.CANCEL->{receiver.cancel(id);state.update {it.copy(incoming=it.incoming?.takeUnless {transfer->transfer.transferId==id})}}
+                                else->throw ReceiveViolation()
+                            }
+                        }
+                    }catch(e:ReceiveViolation) {
+                        if(!receiver.isCancelled(id)) {send(Frame.Control(Type.ERROR,json("code" to e.code)));throw RemoteError(e.code)}
+                    }
+                }
+            }finally {closeSocket(ssl);withContext(NonCancellable) {receiver.disconnect()}}
+        }
         suspend fun receiveFile(frame:Frame) {
-            if(frame is Frame.Control && frame.type == Type.FILE_BEGIN &&
-                (frame.body["resume"]?.asBoolean == true || frame.body.has("folder"))) {
-                send(Frame.Control(Type.ERROR,json("code" to "unexpected_message")))
-                throw RemoteError("unexpected_message")
-            }
             if(recoveryFiles.active) {
                 recoveryFile(frame)
                 if(recoveryFiles.active)receiveProgress.progress() else receiveProgress.complete()
-                receiveWake.trySend(Unit)
-                return
+                receiveWake.trySend(Unit);return
             }
             try {
                 when(frame) {
-                    is Frame.Chunk->{receiver.chunk(frame);state.update {it.copy(incoming=it.incoming?.copy(received=receiver.receivedBytes))};receiveProgress.progress();receiveWake.trySend(Unit)}
+                    is Frame.Chunk->{
+                        incomingPhase.chunk(frame)
+                        receiveProgress.progress();receiveWake.trySend(Unit)
+                    }
                     is Frame.Control->when(frame.type) {
-                        Type.FILE_BEGIN->{receiveProgress.progress();receiveWake.trySend(Unit);receiver.begin(frame.body)
-                            state.update {it.copy(incoming=receiver.metadata?.let {meta->IncomingTransfer(pcId,meta.id,meta.name,0,meta.size)})}}
+                        Type.FILE_BEGIN->{
+                            val resume=frame.body["resume"]?.asBoolean==true
+                            if((resume && CAP_FILE_RESUME !in capabilities) || frame.body.has("folder"))throw ReceiveViolation()
+                            val id=frame.body["transfer_id"].asString
+                            if(receiver.isPending(id) || id in purgingCancels)throw ReceiveViolation()
+                            incomingPhase.begin(id,frame.body["size"].asLong,resume)
+                            receiver.register(id)
+                            receiveProgress.progress(90_000);receiveWake.trySend(Unit)
+                        }
                         Type.FILE_END->{
-                            receiveProgress.complete();receiveWake.trySend(Unit)
-                            val deadline=launch(Dispatchers.Default) {delay(120000);closeSocket(ssl)}
-                            try {send(receiver.end(frame.body["transfer_id"].asString))}finally {deadline.cancel();state.update {it.copy(incoming=null)}}
+                            incomingPhase.end(frame.body["transfer_id"].asString)
+                            receiveProgress.progress(120_000);receiveWake.trySend(Unit)
+                        }
+                        Type.CANCEL->{
+                            if(CAP_FILE_RESUME !in capabilities)throw ReceiveViolation()
+                            val id=frame.body["transfer_id"].asString
+                            val pending=receiver.requestCancel(id)
+                            if(incomingPhase.clear(id))receiveProgress.complete()
+                            receiveWake.trySend(Unit)
+                            // Do not queue deletion behind prefix hashing or provider copy.
+                            val partial=if(pending)true else app.queue.receivedFile(pcId,id)?.let {it.generation==sessionBinding.generation && it.state=="writing"}==true
+                            if(partial && purgingCancels.add(id) && cancelPurges.trySend(id).isFailure) {
+                                purgingCancels.remove(id);throw ReceiveViolation()
+                            }
+                            // Inactive durable partials need deletion, but no queued
+                            // operation or tombstone. Repeated CANCEL is a no-op.
+                            if(!pending)return
                         }
                         else->throw ReceiveViolation()
                     }
                 }
+                fileLane.offer(frame)
             }catch(e:ReceiveViolation) {send(Frame.Control(Type.ERROR,json("code" to e.code)));throw RemoteError(e.code)}
         }
         if(recoveryFiles.active) {receiveProgress.progress();receiveWake.trySend(Unit)}
@@ -762,9 +848,20 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                     Type.PONG -> {
                         if(ping.pong(frame.body["nonce"].asString)) livenessWake.trySend(Unit)
                     }
-                    Type.ACK, Type.NACK -> {
-                        val receipt = activeReceipt
+                    Type.FILE_READY -> {
+                        if(CAP_FILE_RESUME !in capabilities)throw RemoteError("unexpected_message")
                         val id=frame.body["transfer_id"].asString
+                        val phase=filePhase?.takeIf {it.id==id} ?: cancelledFiles[id] ?: throw RemoteError("unexpected_message")
+                        try {phase.response(frame)}catch(e:FilePhaseViolation) {send(Frame.Control(Type.ERROR,json("code" to e.code)));throw RemoteError(e.code)}
+                    }
+                    Type.ACK, Type.NACK -> {
+                        val id=frame.body["transfer_id"].asString
+                        val phase=filePhase?.takeIf {it.id==id} ?: cancelledFiles[id]
+                        if(phase!=null) {
+                            try {phase.response(frame)}catch(e:FilePhaseViolation) {send(Frame.Control(Type.ERROR,json("code" to e.code)));throw RemoteError(e.code)}
+                            continue
+                        }
+                        val receipt = activeReceipt
                         val target=if(receiptReady && receipt?.first==id)receipt else textReceipt?.takeIf {it.first==id} ?: settingsReceipt?.takeIf {it.first==id} ?: membersReceipt?.takeIf {it.first==id}
                         if(target!=null && target===membersReceipt) {
                             val fence=membersFence ?: throw RemoteError("closing")
@@ -786,14 +883,15 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                     Type.ERROR -> throw RemoteError(frame.body["code"].asString)
                     Type.STATUS -> Unit
                     Type.CLIPBOARD,Type.PEER_SETTINGS,Type.MEMBERS -> content(frame)
-                    Type.FILE_BEGIN,Type.FILE_END -> receiveFile(frame)
+                    Type.FILE_BEGIN,Type.FILE_END,Type.CANCEL -> receiveFile(frame)
                     else -> { send(Frame.Control(Type.ERROR, json("code" to "unexpected_message"))); throw RemoteError("unexpected_message") }
                 }
             }
-        } finally { closeSocket(ssl); monitor.cancel(); sender.cancel(); textSender.cancel(); writeWatchdog.cancel();settingsSender?.cancel();membersSender?.cancel();receiveWatchdog.cancel();receiveWake.close()
+        } finally { closeSocket(ssl); monitor.cancel(); sender.cancel(); textSender.cancel(); writeWatchdog.cancel();settingsSender?.cancel();membersSender?.cancel();receiveWatchdog.cancel();receiveWake.close();fileLane.close();fileWorker.cancel()
             withContext(NonCancellable) {
                 state.update {it.copy(incoming=null)}
-                runCatching {receiver.disconnect()}
+                runCatching {fileWorker.join()};cancelledFiles.clear()
+                cancelPurges.close();runCatching {cancelPurger.join()}
                 runCatching {app.preferences.connected(sessionBinding,endpoint)}
             }
         }
@@ -814,21 +912,40 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                 input.channel.position(0)
             }
             if(digest.digest().hex()!=row.hash) {localMismatch(row,"hash_mismatch",retries);return true}
-            val receipt=CompletableDeferred<Frame.Control>();activeReceipt=row.transferId to receipt
+            val resume=CAP_FILE_RESUME in capabilities && "files" in capabilities && !row.sensitive
+            val phase=FileSendPhase(row.transferId,row.size,resume);filePhase=phase
+            row.resumable=resume
+            val receipt=phase.receipt;activeReceipt=row.transferId to receipt
             val emission=QueuedEmission(row,binding);fileEmission=emission
-            if(!send(Frame.Control(Type.FILE_BEGIN,Staging.metadata(row).apply {if("mesh" in capabilities && row.hlc.isNotEmpty()) {addProperty("hlc",row.hlc.toBigInteger());addProperty("source_device",row.sourceDevice)}}),emission))return false
+            if(!send(Frame.Control(Type.FILE_BEGIN,Staging.metadata(row).apply {if(resume)addProperty("resume",true);if("mesh" in capabilities && row.hlc.isNotEmpty()) {addProperty("hlc",row.hlc.toBigInteger());addProperty("source_device",row.sourceDevice)}}),emission))return false
             began=true
-            val buffer=ByteArray(CHUNK_SIZE);var offset=0L
-            while(offset<row.size) {
+            val readiness=if(resume)withTimeoutOrNull(120_000) {phase.readiness.await()} ?: throw TransportFailure(java.net.SocketTimeoutException("READY deadline expired")) else null
+            if(phase.cancelled)return true
+            val early=readiness?.takeIf {it.type==Type.NACK}
+            var offset=readiness?.takeIf {it.type==Type.FILE_READY}?.body?.get("offset")?.asLong ?: 0L
+            if(early==null)SendFailures.local("local_read") {input.channel.position(offset)}
+            row.sentBytes=offset
+            state.update {it.copy(sent=offset)}
+            val buffer=ByteArray(CHUNK_SIZE)
+            var durableSent=offset
+            while(early==null && offset<row.size) {
                 currentCoroutineContext().ensureActive()
+                if(phase.cancelled)return true
                 val n=SendFailures.local("local_read") {input.read(buffer,0,minOf(buffer.size.toLong(),row.size-offset).toInt()).also {if(it<=0)throw java.io.EOFException()}}
                 send(Frame.Chunk(row.transferId,offset,buffer.copyOf(n)));offset+=n
+                row.sentBytes=offset
+                if(offset-durableSent>=ReceiveSpool.CHECKPOINT_BYTES) {PostCommit.maintainSuspending {updateRow(row)};durableSent=offset}
                 state.update {it.copy(sent=offset)}
                 yield()
             }
-            receiptReady=true
-            send(Frame.Control(Type.FILE_END,json("transfer_id" to row.transferId)));ended=true
-            val response=awaitReceipt(receipt)
+            if(phase.cancelled)return true
+            val response=if(early!=null)early else {
+                phase.ending();receiptReady=true
+                send(Frame.Control(Type.FILE_END,json("transfer_id" to row.transferId)));ended=true
+                beforeFileReceiptWait()
+                awaitReceipt(receipt)
+            }
+            if(phase.cancelled)return true
             if(response.type==Type.ACK) {
                 if(row.kind=="clipboard_image")PostCommit.maintainSuspending {app.savedClips.recordImage(row.mime,sensitive=row.sensitive) {file.inputStream()}}
                 row.state="sent";row.error="";app.staging.completeFile(row)
@@ -845,17 +962,21 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
             if(began && !ended) {
                 // A local read failed between complete frames. END with fewer bytes is
                 // normative NACK size_mismatch and returns the peer's file lane to IDLE.
-                receiptReady=true
+                filePhase?.ending();receiptReady=true
                 send(Frame.Control(Type.FILE_END,json("transfer_id" to row.transferId)))
                 awaitReceipt(requireNotNull(activeReceipt).second)
             }
             throw e
         } catch(e:TransportFailure) {
-            if(app.queue.delivery(row.mediaId,row.peerId)?.state!="discarded") {row.state="waiting";runCatching {updateRow(row)}}
+            if(app.queue.delivery(row.mediaId,row.peerId)?.state!="discarded") {row.state=if(!row.resumable || app.preferences.read().queue)"waiting" else "failed";row.error="connection_lost";row.nextAttempt=if(row.state=="failed")Long.MAX_VALUE else 0;runCatching {updateRow(row)}}
             throw e
         } finally {
             runCatching {input.close()}
-            activeReceipt=null;receiptReady=false;fileEmission=null
+            if(began && row.state=="sending" && filePhase?.cancelled!=true)withContext(NonCancellable) {
+                if(app.queue.delivery(row.mediaId,row.peerId)?.state!="discarded") {row.state=if(!row.resumable || app.preferences.read().queue)"waiting" else "failed";row.error="connection_lost";row.nextAttempt=if(row.state=="failed")Long.MAX_VALUE else 0;runCatching {updateRow(row)}}
+            }
+            filePhase?.takeIf {it.cancelled}?.let {cancelledFiles[it.id]=it}
+            filePhase=null;activeReceipt=null;receiptReady=false;fileEmission=null
             state.update {it.copy(sent=0,total=0,transferMediaId="",transferKind="",transferFileName="")}
         }
     }
@@ -891,12 +1012,16 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
         row.state="failed";row.error=code;row.mismatches=decision.mismatches;retries.retryAfter(row,decision.waitMillis);updateRow(row)
     }
     internal var beforeFirstFrame:suspend (Outgoing)->Unit={}
+    internal var beforeFileReceiptWait:suspend ()->Unit={}
+    internal var beforeReceiveChunk:suspend ()->Unit={}
+    internal var afterFileFrameFlushed:(String)->Unit={}
     internal suspend fun withWriteLockForTest(body:suspend ()->Unit)=writes.withLock {body()}
-    private suspend fun send(frame: Frame,emission:QueuedEmission?=null):Boolean {
+    private suspend fun send(frame: Frame,emission:QueuedEmission?=null,expectedSession:String?=null,onWritten:(()->Unit)?=null):Boolean {
         // Validate local fields/encoding before touching a wire frame.
         SendFailures.local("invalid_payload") {Protocol.write(java.io.OutputStream.nullOutputStream(),frame)}
         if(emission!=null)beforeFirstFrame(emission.row)
         return writes.withLock {
+        if(expectedSession!=null && (!ready || admissionSession!=expectedSession))return@withLock false
         val s = socket ?: throw TransportFailure(java.io.IOException("Disconnected"))
         if(frame is Frame.Control && frame.type==Type.MEMBERS) {
             val fence=membersFence ?: throw SetupUnavailable()
@@ -904,6 +1029,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
             if(!ready || !fence.first.matches(current) || current.membership.generation!=fence.second ||
                 current.membership.setupId!=fence.third || current.membership.withdrawn || current.peer?.setupScope!=SetupScope.ENABLED)throw SetupUnavailable()
         }
+        if(frame is Frame.Chunk && cancelledFiles.containsKey(frame.id) || frame is Frame.Control && frame.type==Type.FILE_END && cancelledFiles.containsKey(frame.body["transfer_id"].asString))return@withLock false
         if(unpairing)throw TransportFailure(java.io.IOException("Unpairing"))
         if(frame is Frame.Chunk || (frame is Frame.Control && frame.type in setOf(Type.FILE_BEGIN,Type.CLIPBOARD))) {
             val current=SendFailures.local("local_storage") {readPrefs()}
@@ -927,8 +1053,16 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                 state.update {it.copy(sent=0,total=row.size,transferMediaId=row.mediaId,transferKind=row.kind,transferFileName=row.fileName)}
             }
         }
+        val writingTransferId=when(frame) {is Frame.Chunk->frame.id;is Frame.Control->if(frame.type in setOf(Type.FILE_BEGIN,Type.FILE_END))frame.body["transfer_id"].asString else null}
         writing.progress(); writeWake.trySend(Unit)
-        try { withContext(Dispatchers.IO) { Protocol.write(ProgressOutput(s.getOutputStream()) {writing.progress();writeWake.trySend(Unit)},frame) }; txAt = SystemClock.elapsedRealtime() }
+        try { withContext(Dispatchers.IO) {
+            fileFrameWriter.write(writingTransferId,{
+                Protocol.write(ProgressOutput(s.getOutputStream()) {writing.progress();writeWake.trySend(Unit)},frame)
+            },{
+                onWritten?.invoke()
+                writingTransferId?.let {afterFileFrameFlushed(it)}
+            })
+        }; txAt = SystemClock.elapsedRealtime() }
         catch(e:CancellationException) {closeSocket(s);throw e}
         catch(e:Exception) {
             val unauthorized=try {
@@ -952,9 +1086,37 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
     fun retry() { admissionSession=null;dialEpoch.incrementAndGet();closeSocket(); wake.trySend(Unit) }
     internal fun refreshSetup() {setupRefreshRedial.set(true);retry()}
     fun cancelTransfer(mediaId: String) {
-        fileEmission?.takeIf {it.row.mediaId==mediaId}?.let {if(it.cancel())retry()}
-        // Already-emitted text must consume its ACK/NACK without resetting the
-        // independent file lane. Queued text is cancelled before CLIPBOARD.
+        val binding=authenticatedBinding
+        val session=admissionSession
+        val flush=if(binding!=null && session!=null && ready && CAP_FILE_RESUME in capabilities) {
+            app.scope.launch(start=CoroutineStart.LAZY) {
+                try {
+                    for(intent in app.queue.pendingCancels(binding.pcId)) {
+                        if(intent.generation!=binding.generation || intent.pin!=binding.pin)continue
+                        if(send(Frame.Control(Type.CANCEL,json("transfer_id" to intent.transferId)),expectedSession=session)) {
+                            app.queue.deletePendingCancel(intent.peerId,intent.transferId)
+                            cancelledFiles[intent.transferId]?.let {phase->
+                                phase.readiness.complete(Frame.Control(Type.CANCEL,json("transfer_id" to phase.id)))
+                                phase.receipt.complete(Frame.Control(Type.CANCEL,json("transfer_id" to phase.id)))
+                            }
+                        }
+                    }
+                }catch(_:Exception) {if(admissionSession==session)retry()}
+            }.also {cancelFlush=it}
+        } else null
+        // Publish the flush barrier before waking/stopping the active operation.
+        val emission=fileEmission?.takeIf {it.row.mediaId==mediaId}
+        if(emission!=null && emission.cancel()) {
+            val phase=filePhase
+            if(phase!=null && CAP_FILE_RESUME in capabilities) {
+                phase.cancel();cancelledFiles[phase.id]=phase
+                // A torn frame cannot carry a following control message. The
+                // durable intent is flushed by the next capable session.
+                if(fileFrameWriter.cancel(phase.id))retry()
+            } else retry()
+        }
+        flush?.start()
+        // Already-emitted text consumes its own ACK/NACK without resetting files.
         textEmission?.takeIf {it.row.mediaId==mediaId}?.cancel()
     }
     internal var beforeUnpairRemoval:suspend ()->Unit={}

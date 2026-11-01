@@ -140,7 +140,7 @@ class ReceiveJournalTest {
         try {
             val q=room.queue();val storage=Storage();val journal=ReceiveJournal(q,storage)
             val original=reserve(journal,storage,q)
-            val mutations=listOf<(ReceivedFile)->Unit>({it.generation++},{it.uri="replacement"},{it.metadata="replacement"},{it.catalogVersion="replacement"},{it.state="verified"},{it.state="complete"})
+            val mutations=listOf<(ReceivedFile)->Unit>({it.stagePath="replacement-spool"},{it.generation++},{it.uri="replacement"},{it.metadata="replacement"},{it.catalogVersion="replacement"},{it.state="verified"},{it.state="complete"})
             for(mutate in mutations) {
                 val replacement=q.receivedFile(a,metadata.id);mutate(replacement);q.updateReceivedFile(replacement)
                 assertFalse(q.abandonReceivedFile(original));assertNotNull(q.receivedFile(a,metadata.id));assertNotNull(q.receipt(a,metadata.id))

@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import io.github.stantonmatt.pneu.features.*
+import io.github.stantonmatt.pneu.protocol.CAP_FILE_RESUME
 
 class PneuApp : Application() {
     lateinit var graph: AppGraph
@@ -51,7 +52,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
             db.execSQL("UPDATE receipts SET state='applied' WHERE state='complete'")
             db.execSQL("UPDATE outgoing SET state='superseded' WHERE kind='text' AND state IN ('waiting','sending','failed') AND orderId < (SELECT MAX(orderId) FROM outgoing WHERE kind='text' AND state IN ('waiting','sending','failed'))")
         }
-    }, QueueMigrations.clipboardWindow, QueueMigrations.outboundWindow, QueueMigrations.recipients, QueueMigrations.peerWatermarks, QueueMigrations.pendingAdmissions, QueueMigrations.receivedFiles, QueueMigrations.sensitiveClips).addCallback(object : androidx.room.RoomDatabase.Callback() {
+    }, QueueMigrations.clipboardWindow, QueueMigrations.outboundWindow, QueueMigrations.recipients, QueueMigrations.peerWatermarks, QueueMigrations.pendingAdmissions, QueueMigrations.receivedFiles, QueueMigrations.sensitiveClips, QueueMigrations.fileResume).addCallback(object : androidx.room.RoomDatabase.Callback() {
         override fun onOpen(db: androidx.sqlite.db.SupportSQLiteDatabase) { db.execSQL("PRAGMA synchronous=FULL") }
     }).build()
     val queue = database.queue()
@@ -154,12 +155,16 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
     fun invalidateSleeping() {scope.launch {PostCommit.maintainSuspending {preferences.toggle("neverSleeping",false)}}}
     suspend fun recoverOutgoing()=withContext(Dispatchers.IO) {queueMutex.withLock {
         queue.forgetManualSources("")
+        queue.recoverResumable("",0,preferences.read().queue)
         queue.recover();maintainTerminalLocked()
     }}
     /** A serial sender calls this only between transfers, never during its own receipt wait.
      * Preserve the other lane's active slot. Avoid no-op writes/Room wakeups when idle. */
     internal suspend fun recoverDeliveryLane(text:Boolean,binding:DeliveryBinding)=queueMutex.withLock {
-        if(queue.sendingBoundLane(binding.pcId,binding.generation,text)>0)queue.recoverBound(binding.pcId,binding.generation,text)
+        if(queue.sendingBoundLane(binding.pcId,binding.generation,text)>0) {
+            if(!text)queue.recoverResumable(binding.pcId,binding.generation,preferences.read().queue)
+            queue.recoverBound(binding.pcId,binding.generation,text)
+        }
     }
     @androidx.annotation.VisibleForTesting
     suspend fun recoverDeliveryLane(text:Boolean,peerId:String) {
@@ -175,7 +180,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
         evicted.forEach {if(it.path.isNotEmpty())java.io.File(it.path).delete()}
     }
     private suspend fun clearPeerDelivery(peerId:String)=queueMutex.withLock {
-        receivedFiles.forget(peerId)
+        receivedFiles.forget(peerId);queue.deletePeerCancels(peerId)
         database.runInTransaction {queue.clearPeer(peerId)}
         pruneOrphansLocked()
         releaseTerminalBytesLocked()
@@ -189,7 +194,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
     @androidx.annotation.VisibleForTesting
     internal suspend fun clearDelivery()=queueMutex.withLock {
         queue.all().forEach {if(it.path.isNotEmpty())java.io.File(it.path).delete()}
-        receivedFiles.forgetAll();queue.clear();queue.clearReceipts();staging.clearThumbnails()
+        receivedFiles.forgetAll();queue.clearPendingCancels();queue.clear();queue.clearReceipts();staging.clearThumbnails()
     }
     @androidx.annotation.VisibleForTesting
     internal suspend fun recoverDeliveryLane(text:Boolean)=recoverDeliveryLane(text,preferences.read().peer?.deviceId.orEmpty())
@@ -448,6 +453,13 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
                 }
             }
         }
+        scope.launch {
+            initialized.await()
+            while(isActive) {
+                delay(60000)
+                PostCommit.maintainSuspending {receivedFiles.maintainPartials()}
+            }
+        }
         resumeSetupLinkDiscovery()
         scope.launch { prefs.filter {it.loaded && it.deviceId.isNotEmpty()}.distinctUntilChangedBy {Triple(it.peer,it.shareSheet,it.pairingLost)}.collect {p->PostCommit.maintain {
             ManualEntries.configureShareTarget(context,p.shareSheet)
@@ -463,10 +475,14 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
     }}
     /** No later query may expand the set the user selected or target a newer row. */
     suspend fun discard(selected:ConfirmedQueue,clearCapacity:Boolean=false):Boolean=withContext(Dispatchers.IO) {bindingMutex.withLock {
-        if(!selected.matches(preferences.read()))return@withLock false
+        val currentPrefs=preferences.read()
+        if(!selected.matches(currentPrefs))return@withLock false
         val removed=queueMutex.withLock commit@{
             val rows=selected.items.map {item->queue.delivery(item.mediaId,item.peerId)?.takeIf(item::matches) ?: return@commit false}
-            database.runInTransaction {rows.forEach {it.state="discarded";it.revision++;queue.update(it)}}
+            database.runInTransaction {rows.forEach {if(it.kind!="text" && it.attempted && (it.resumable || CAP_FILE_RESUME in connection.devices.value[it.peerId]?.capabilities.orEmpty()))queue.insertPendingCancel(PendingCancel().apply {
+                peerId=it.peerId;transferId=it.transferId;generation=it.bindingGeneration
+                pin=currentPrefs.devices.find {peer->peer.deviceId==it.peerId}?.pin.orEmpty()
+            });it.state="discarded";it.revision++;queue.update(it)}}
             rows.forEach {connection.cancelTransfer(it.mediaId,it.peerId);if(queue.hasPath(it.path)==0)java.io.File(it.path).delete()}
             maintainTerminalLocked();true
         }
