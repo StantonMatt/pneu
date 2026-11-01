@@ -925,12 +925,14 @@ impl ClipboardDelivery {
 struct ApplicationMessage {
     message: Message,
     refusal: Option<NackCode>,
+    resume_cancel: Option<Arc<watch::Sender<bool>>>,
 }
 impl From<Message> for ApplicationMessage {
     fn from(message: Message) -> Self {
         Self {
             message,
             refusal: None,
+            resume_cancel: None,
         }
     }
 }
@@ -1054,6 +1056,7 @@ impl Core {
             config.save(&paths.config)?;
         }
         let outbox = crate::outbox::Outbox::open(store.clone(), &paths.data.join("outbox"))?;
+        outbox.recover_startup(config.queue_offline).await?;
         let admission = Arc::new(Mutex::new(Admission {
             peers: store.peers().await?,
             ..Default::default()
@@ -1945,6 +1948,7 @@ impl Core {
         let clipboard = self.clipboard.clone();
         let ui = self.ui.clone();
         let settings = self.config.clone();
+        let retry_disconnected = self.outbox.retry_disconnected.clone();
         let events = self.events.clone();
         let mut member = self.self_member();
         member.name = config.name.clone();
@@ -1968,6 +1972,7 @@ impl Core {
                     allowed: Vec::new(),
                 });
             }
+            retry_disconnected.store(config.queue_offline, Ordering::SeqCst);
             settings.send_replace(config);
             clipboard.event(ClipboardEvent::Mode(
                 if settings.borrow().clipboard_sync_to_phone {
@@ -2792,12 +2797,14 @@ impl Core {
         let mut prune = tokio::time::interval(Duration::from_secs(3600));
         let mut discovery = tokio::time::interval(Duration::from_secs(60));
         let mut recovery_tick = tokio::time::interval(Duration::from_secs(1));
+        let mut partial_tick = tokio::time::interval(Duration::from_secs(60));
         loop {
             if *shutdown.borrow() {
                 break;
             }
             tokio::select! {
                 _ = shutdown.changed() => break,
+                _ = partial_tick.tick()=>{if let Err(error)=self.store.maintain_partials().await {self.error(None,format!("resume maintenance deferred: {error}"));}},
                 _ = recovery_tick.tick() => {if let Err(error)=self.outbox.retry_recovery().await {self.error(None,format!("outbox recovery deferred: {error}"));}},
                 _ = discovery.tick(), if advertise => {
                     match crate::discovery::candidates() {
@@ -3431,6 +3438,8 @@ impl Core {
             .as_ref()
             .map(|scope| scope.connection_generation.load(Ordering::SeqCst));
         store.mesh = hello.capabilities.iter().any(|c| c == "mesh");
+        store.file_resume = hello.capabilities.iter().any(|c| c == "file_resume_v1")
+            && hello.capabilities.iter().any(|c| c == "files");
         store.local_device = Some(self.identity.device_id.clone());
         store.setup_generation = Some(self.store.setup_state().generation);
         let result = if persisted {
@@ -3984,6 +3993,10 @@ impl Core {
         };
         let mut writer_finished = false;
         let mut file_pending: Option<crate::outbox::Delivery> = None;
+        let mut file_ready: Option<(Id,u64,tokio::sync::oneshot::Sender<Option<u64>>)> = None;
+        let mut cancelled_files=HashMap::<Id,(bool,bool)>::new();
+        let mut file_receipt_ready:Option<Arc<AtomicBool>>=None;
+        let mut queued_cancels=HashSet::new();
         let mut file_preparations = JoinSet::new();
         let mut file_poll = Instant::now();
         let generation = store.pairing_generation(&hello.device_id).context("pairing changed")?;
@@ -4063,7 +4076,20 @@ impl Core {
                     let synchronized=settings_received && settings_pending.is_none() && settings_confirmed.as_ref()==Some(&fields);
                     self.publish_settings_ready(&store, &hello.device_id, synchronized);
                 }
-                if file_pending.is_some() && !self.outbox.current(file_pending.as_ref().expect("pending file")) {break;}
+                if file_pending.as_ref().is_some_and(|d|!self.outbox.current(d)) {
+                    let delivery=file_pending.take().expect("pending file");
+                    if !store.file_resume {break;}
+                    cancelled_files.insert(delivery.begin.transfer_id.clone(),(file_ready.is_some(),file_receipt_ready.as_ref().is_some_and(|p|p.load(Ordering::SeqCst))));
+                    if let Some((_,_,ready))=file_ready.take(){let _=ready.send(None);}
+                    pending=None;
+                }
+                // Reserve one writer slot in select! below, alongside reports.
+                // Filling the queue here can deadlock against the writer's
+                // bounded report queue during a bulk reconnect cancellation.
+                let next_cancel=if store.file_resume {
+                    self.outbox.pending_cancels(hello.device_id.clone(),generation).await?
+                        .into_iter().find(|id|!queued_cancels.contains(id))
+                } else {None};
                 if pending.is_none() && self.outbox.has_work(&hello.device_id) && Instant::now()>=file_poll && self.content_ready(&store,&hello.device_id)
                     && hello.capabilities.iter().any(|c|c=="files") {
                     file_poll=Instant::now()+Duration::from_secs(1);
@@ -4076,14 +4102,10 @@ impl Core {
                             // writer continues servicing heartbeat and text.
                             let core=self.clone();let preparing=delivery.clone();let connection=store.connection_id.expect("connection id");let mesh=store.mesh;
                             file_preparations.spawn(async move {
-                                match core.outbox.reader(preparing.clone()).await {
-                                    Ok(file)=>Ok(FileWrite {delivery:preparing,connection,mesh,file:Some(file)}),
-                                    Err(error)=>{
-                                        if let Err(storage)=core.outbox.fail(preparing.clone(),error.to_string()).await {core.error(None,format!("outbox failure persistence deferred: {storage}"));}
-                                        core.delivery_finished(&preparing);Err(error)
-                                    }
-                                }
+                                let result=core.outbox.reader(preparing.clone()).await.map(|file|FileWrite {delivery:preparing.clone(),connection,mesh,file:Some(file),ready:None,receipt_ready:Arc::new(AtomicBool::new(false))});
+                                (preparing,result)
                             });
+                            file_receipt_ready=None;
                             file_pending=Some(delivery);pending=Some(PendingOutgoing::queued(id));
                         },
                         Ok(None)=>{},
@@ -4119,6 +4141,7 @@ impl Core {
                     _=&mut legacy_ready,if legacy_ready_pending=>{legacy_ready_pending=false;},
                     Some(report)=reports_rx.recv()=>{
                         match report {
+                            WriteReport::CancelSent(id) => {self.outbox.cancel_sent(hello.device_id.clone(),id,generation).await?;}
                             WriteReport::Canceled(id) => {
                                 if pending.as_ref().is_some_and(|p| p.id == id) { pending=None; }
                                 if text_pending.as_ref().is_some_and(|p| p.id == id) { text_pending=None; }
@@ -4131,8 +4154,36 @@ impl Core {
                             }
                         }
                     },
+                    permit=write_tx.reserve(),if next_cancel.is_some()=>{
+                        let id=next_cancel.expect("pending cancel");
+                        queued_cancels.insert(id.clone());
+                        cancelled_files.entry(id.clone()).or_insert((false,false));
+                        permit?.send(Message::Cancel(Cancel{transfer_id:id}));
+                    },
                     prepared=file_preparations.join_next(),if !file_preparations.is_empty()=>{
-                        let work=prepared.context("file preparation missing")???;
+                        let (delivery,prepared)=prepared.context("file preparation missing")??;
+                        let id=delivery.begin.transfer_id.clone();
+                        let mut work=match self.outbox.preparation_result(&delivery,prepared) {
+                            Ok(Some(work))=>work,
+                            Ok(None)=>{
+                                self.delivery_finished(&delivery);
+                                if pending.as_ref().is_some_and(|p|p.id==id) {pending=None;}
+                                if file_pending.as_ref().is_some_and(|p|p.begin.transfer_id==id) {file_pending=None;}
+                                continue;
+                            }
+                            Err(error)=>{
+                                if let Err(storage)=self.outbox.fail(delivery.clone(),error.to_string()).await {self.error(None,format!("outbox failure persistence deferred: {storage}"));}
+                                self.delivery_finished(&delivery);
+                                return Err(error);
+                            }
+                        };
+                        if !self.outbox.current(&work.delivery) {continue;}
+                        self.outbox.negotiate_resume(work.delivery.clone(),store.file_resume).await?;
+                        file_receipt_ready=Some(work.receipt_ready.clone());
+                        if store.file_resume {
+                            let (tx,rx)=tokio::sync::oneshot::channel();
+                            file_ready=Some((work.delivery.begin.transfer_id.clone(),work.delivery.begin.size,tx));work.ready=Some(rx);
+                        }
                         if !enqueue(&outbox_tx,work,&mut close,Some(Instant::now()+Duration::from_secs(60))).await? {break;}
                     },
                     writer=&mut workers.writer=>{writer_finished=true;if close.borrow().is_none() {writer??;}break;},
@@ -4171,6 +4222,14 @@ impl Core {
                             refusal = Some(NackCode::StorageFailed);
                         }
                         match message {
+                            Message::FileReady(ready)=>{
+                                ensure!(store.file_resume,"unnegotiated FILE_READY");
+                                if let Some((allowed,_))=cancelled_files.get_mut(&ready.transfer_id) {ensure!(*allowed,"duplicate or unsolicited cancelled FILE_READY");*allowed=false;continue;}
+                                let (id,size,reply)=file_ready.take().context("unsolicited FILE_READY")?;
+                                ensure!(id==ready.transfer_id,"wrong FILE_READY ID");
+                                if ready.offset>size {close_tx.send_replace(Some(CloseReason::Error(ErrorCode::MalformedMessage)));bail!("FILE_READY offset exceeds size");}
+                                let _=reply.send(Some(ready.offset));
+                            },
                             Message::Error(error)=>{
                                 if error.code == ErrorCode::Closing && hello.capabilities.iter().any(|c| c == "setup") && self.connection_current(&store, &hello.device_id) {
                                     self.ui.lock().expect("UI state").refreshing_scope(&hello.device_id);
@@ -4236,6 +4295,9 @@ impl Core {
                                 if !enqueue(&write_tx,response,&mut close,Some(receipt_deadline.min(Instant::now()+Duration::from_secs(60)))).await? {break;}
                             },
                             Message::Ack(ack)=>{
+                                if let Some((_,allowed))=cancelled_files.get_mut(&ack.transfer_id){ensure!(*allowed,"unsolicited cancelled ACK");*allowed=false;continue;}
+                                if file_pending.as_ref().is_some_and(|d|d.begin.transfer_id==ack.transfer_id){ensure!(file_receipt_ready.as_ref().is_some_and(|p|p.load(Ordering::SeqCst)),"ACK before END");}
+                                ensure!(!file_ready.as_ref().is_some_and(|(id,_,_)|id==&ack.transfer_id),"ACK before FILE_READY");
                                 if members_pending.as_ref().is_some_and(|p|p.id==ack.transfer_id) {
                                     members_pending=None;
                                     let fence=members_fence.as_ref().context("missing membership fence")?;
@@ -4273,6 +4335,9 @@ impl Core {
                                 self.connection_event(&store,&hello.device_id,Event::ClipboardSent {device:hello.device_id.clone(),transfer_id:id});
                             },
                             Message::Nack(nack)=>{
+                                if let Some((ready,receipt))=cancelled_files.get_mut(&nack.transfer_id){ensure!(*ready||*receipt,"unsolicited cancelled NACK");*ready=false;*receipt=false;continue;}
+                                if file_pending.as_ref().is_some_and(|d|d.begin.transfer_id==nack.transfer_id) && file_ready.is_none(){ensure!(file_receipt_ready.as_ref().is_some_and(|p|p.load(Ordering::SeqCst)),"NACK before END");}
+                                if file_ready.as_ref().is_some_and(|(id,_,_)|id==&nack.transfer_id) && let Some((_,_,reply))=file_ready.take(){let _=reply.send(None);}
                                 if members_pending.as_ref().is_some_and(|p|p.id==nack.transfer_id) {
                                     members_pending=None;members_snapshot=None;members_confirmed=None;
                                     members_blocked = !nack.retryable;
@@ -4303,7 +4368,15 @@ impl Core {
 
                                 self.error(Some(hello.device_id.clone()),format!("clipboard delivery rejected: {:?}",nack.code));
                             },
-                            m @ (Message::FileBegin(_)|Message::FileChunk(_)|Message::FileEnd(_))=>{if !enqueue(&file_tx,ApplicationMessage { message: m, refusal },&mut close,pending.as_ref().and_then(|p|p.deadline)).await? {break;}},
+                            Message::Cancel(cancel)=>{
+                                ensure!(store.file_resume,"unnegotiated CANCEL");
+                                store.signal_cancel(&hello.device_id,&cancel.transfer_id);
+                                if !enqueue(&file_tx,ApplicationMessage {message:Message::Cancel(cancel),refusal:None,resume_cancel:None},&mut close,None).await?{break;}
+                            },
+                            m @ (Message::FileBegin(_)|Message::FileChunk(_)|Message::FileEnd(_))=>{
+                                let resume_cancel=match &m {Message::FileBegin(b) if b.resume==Some(true)=>Some(store.register_resume_begin(&hello.device_id,&b.transfer_id)),_=>None};
+                                if !enqueue(&file_tx,ApplicationMessage { message: m, refusal, resume_cancel },&mut close,pending.as_ref().and_then(|p|p.deadline)).await? {break;}
+                            },
                             m @ Message::Clipboard(_)=>{if !enqueue(&text_tx,m,&mut close,pending.as_ref().and_then(|p|p.deadline)).await? {break;}},
                             _=>bail!("unexpected READY frame"),
                         }
@@ -4319,12 +4392,13 @@ impl Core {
         workers.reader.abort();
         workers.heartbeat.abort();
         let _=(&mut workers.heartbeat).await;
-        workers.file.abort();
+        drop(file_tx);
+        let file_finished=tokio::time::timeout(Duration::from_secs(2),&mut workers.file).await.is_ok();
+        if !file_finished {workers.file.abort();}
         workers.text.abort();
         let _ = (&mut workers.reader).await;
-        let _ = (&mut workers.file).await;
+        if !file_finished {let _ = (&mut workers.file).await;}
         let _ = (&mut workers.text).await;
-        drop(file_tx);
         drop(text_tx);
         drop(write_tx);
         drop(automatic_tx);
@@ -4337,6 +4411,11 @@ impl Core {
         {
             workers.writer.abort();
             let _ = (&mut workers.writer).await;
+        }
+        // The writer may have been cancelled mid-frame. Its UI offset is
+        // useful on disconnect, but never authorizes a future resume offset.
+        if store.file_resume && let Some(delivery)=file_pending.as_ref() {
+            self.optional(self.outbox.checkpoint_progress(delivery.clone()).await,"outbox progress checkpoint");
         }
         file_preparations.abort_all();
         while file_preparations.join_next().await.is_some() {}
@@ -4397,7 +4476,7 @@ impl Core {
             let mut progress = Instant::now();
             let result: Result<()> = async {
                 loop {
-                    let deadline = progress + Duration::from_secs(60);
+                    let deadline = progress + Duration::from_secs(if incoming.as_ref().is_some_and(|s:&Incoming|s.first_chunk&&s.begin.resume==Some(true)){120}else{60});
                     let message = if incoming.is_some() {
                         tokio::time::timeout_at(deadline, messages.recv()).await?
                     } else {
@@ -4407,7 +4486,9 @@ impl Core {
                         break;
                     };
                     let message: ApplicationMessage = message.into();
-                    let deadline = if matches!(message.message, Message::FileEnd(_)) {
+                    let deadline = if matches!(message.message, Message::FileBegin(ref b) if b.resume==Some(true)) {
+                        Instant::now()+Duration::from_secs(90)
+                    } else if matches!(message.message, Message::FileEnd(_)) {
                         Instant::now() + Duration::from_secs(120)
                     } else if incoming.is_some() {
                         deadline
@@ -4437,7 +4518,33 @@ impl Core {
             if let Some(mut state) = incoming {
                 state.file.take();
                 if let Some(stage) = state.stage.take() {
-                    self.optional(store.discard_stage(stage).await, "staging cleanup");
+                    if state.begin.resume == Some(true)
+                        && !state.begin.sensitive
+                        && state.save_error.is_none()
+                        && state.receipt.is_none()
+                    {
+                        self.optional(
+                            store
+                                .checkpoint(
+                                    device.clone(),
+                                    state.begin,
+                                    stage,
+                                    state.received,
+                                    state.hash,
+                                    true,
+                                )
+                                .await,
+                            "resume checkpoint",
+                        );
+                    } else {
+                        self.optional(
+                            store
+                                .purge_partial(device.clone(), state.begin.transfer_id.clone())
+                                .await,
+                            "resume cleanup",
+                        );
+                        self.optional(store.discard_stage(stage).await, "staging cleanup");
+                    }
                 }
             }
             result
@@ -4453,16 +4560,32 @@ impl Core {
         incoming: &mut Option<Incoming>,
         tx: &mpsc::Sender<Message>,
     ) -> Result<()> {
-        let ApplicationMessage { message, refusal } = message.into();
-        Box::pin(async move {
+        let ApplicationMessage {
+            message,
+            refusal,
+            resume_cancel,
+        } = message.into();
+        let resume_cancel = resume_cancel.or_else(|| match &message {
+            Message::FileBegin(b) if b.resume == Some(true) => {
+                Some(store.register_resume_begin(device, &b.transfer_id))
+            }
+            _ => None,
+        });
+        let mut cancelled = resume_cancel.as_ref().map(|c| c.subscribe());
+        let receive = Box::pin(async move {
             match message {
                 Message::FileBegin(begin) => {
-                    ensure!(begin.resume != Some(true) && begin.folder.is_none(), "unnegotiated file extension");
+                    ensure!(
+                        (begin.resume != Some(true) || (store.file_resume && !begin.sensitive))
+                            && begin.folder.is_none(),
+                        "unnegotiated file extension"
+                    );
                     ensure!(incoming.is_none(), "second FILE_BEGIN");
                     let config = self.config();
                     let mut state = Incoming {
                         begin: begin.clone(),
                         received: 0,
+                        first_chunk: true,
                         hash: Sha256::new(),
                         file: None,
                         stage: None,
@@ -4485,7 +4608,9 @@ impl Core {
                         .await
                     {
                         Ok(Some((meta, complete))) => {
-                            if matches!(&meta, Metadata::File(retained) if retained.content_eq(&begin)) && complete {
+                            if matches!(&meta, Metadata::File(retained) if retained.content_eq(&begin))
+                                && complete
+                            {
                                 state.admission = FileAdmission::RetainedReplay;
                                 state.deduplicated = true;
                             } else {
@@ -4508,11 +4633,137 @@ impl Core {
                             } else if !self.incoming_kind_allowed(store, device, begin.kind) {
                                 state.receipt = Some(NackCode::UnsupportedKind);
                             } else if begin.size <= state.config.max_file_bytes {
-                                self.prepare_incoming(store, &mut state).await;
+                                if begin.resume == Some(true) && !begin.sensitive {
+                                    match store
+                                        .resume_stage_cancellable(
+                                            device.clone(),
+                                            begin.clone(),
+                                            resume_cancel
+                                                .as_ref()
+                                                .expect("resume cancellation")
+                                                .clone(),
+                                        )
+                                        .await
+                                    {
+                                        Ok(Some((stage, offset, hash))) => {
+                                            let root = stage.0.folder.path()?;
+                                            if root != self.paths.cache {
+                                                if crate::config::save_folder_overlaps_cache(
+                                                    &root,
+                                                    &self.paths.cache,
+                                                ) {
+                                                    store
+                                                        .purge_partial(
+                                                            device.clone(),
+                                                            begin.transfer_id.clone(),
+                                                        )
+                                                        .await?;
+                                                    self.prepare_incoming(store, &mut state).await;
+                                                } else {
+                                                    state.config.save_to_folder = true;
+                                                    state.config.save_path = root;
+                                                    state.storage_kind =
+                                                        crate::ui::ReceiveDestination::SaveFolder;
+                                                    state.file = Some(tokio::fs::File::from_std(
+                                                        stage.0.file.try_clone()?,
+                                                    ));
+                                                    state.destination =
+                                                        Some(stage.destination_path()?);
+                                                    state.stage = Some(stage);
+                                                    state.received = offset;
+                                                    state.hash = hash;
+                                                }
+                                            } else {
+                                                state.config.save_to_folder = false;
+                                                state.storage_kind =
+                                                    crate::ui::ReceiveDestination::Cache;
+                                                state.file = Some(tokio::fs::File::from_std(
+                                                    stage.0.file.try_clone()?,
+                                                ));
+                                                state.destination = Some(stage.destination_path()?);
+                                                state.stage = Some(stage);
+                                                state.received = offset;
+                                                state.hash = hash;
+                                            }
+                                        }
+                                        Ok(None) => self.prepare_incoming(store, &mut state).await,
+                                        Err(error) => {
+                                            state.receipt = Some(
+                                                if error
+                                                    .downcast_ref::<crate::store::ReceiptConflict>()
+                                                    .is_some()
+                                                {
+                                                    NackCode::IdConflict
+                                                } else {
+                                                    crate::store::save_failure_code(&error)
+                                                },
+                                            )
+                                        }
+                                    }
+                                } else {
+                                    match store
+                                        .discard_legacy_partial(device.clone(), begin.clone())
+                                        .await
+                                    {
+                                        Ok(()) => self.prepare_incoming(store, &mut state).await,
+                                        Err(error) => {
+                                            state.receipt = Some(
+                                                if error
+                                                    .downcast_ref::<crate::store::ReceiptConflict>()
+                                                    .is_some()
+                                                {
+                                                    NackCode::IdConflict
+                                                } else {
+                                                    crate::store::save_failure_code(&error)
+                                                },
+                                            )
+                                        }
+                                    }
+                                }
                             } else {
                                 state.receipt = Some(NackCode::StorageFailed);
                             }
                         }
+                    }
+                    if begin.resume == Some(true) {
+                        // A failed requested save must never become a successful
+                        // cache-only completion when this BEGIN is retried.
+                        if let Some(code) = state.save_error {
+                            state.file.take();
+                            if let Some(stage) = state.stage.take() {
+                                store.discard_stage(stage).await?;
+                            }
+                            state.receipt = Some(code);
+                        }
+                        if state.receipt.is_none()
+                            && !state.deduplicated
+                            && !begin.sensitive
+                            && let Some(stage) = &state.stage
+                            && let Err(error) = store
+                                .checkpoint(
+                                    device.clone(),
+                                    begin.clone(),
+                                    stage.clone(),
+                                    state.received,
+                                    state.hash.clone(),
+                                    true,
+                                )
+                                .await
+                        {
+                            state.receipt = Some(crate::store::save_failure_code(&error));
+                        }
+                        if let Some(code) = state.receipt {
+                            tx.send(nack(begin.transfer_id.clone(), code)).await?;
+                            return Ok(());
+                        }
+                        if state.deduplicated {
+                            state.received = begin.size;
+                        }
+                        tx.send(Message::FileReady(pneu_proto::FileReady {
+                            transfer_id: begin.transfer_id.clone(),
+                            offset: state.received,
+                        }))
+                        .await?;
                     }
                     self.connection_event(
                         store,
@@ -4522,10 +4773,23 @@ impl Core {
                             metadata: begin,
                         },
                     );
+                    if state.begin.resume == Some(true) {
+                        self.connection_event(
+                            store,
+                            device,
+                            Event::TransferProgress {
+                                device: device.clone(),
+                                transfer_id: state.begin.transfer_id.clone(),
+                                received: state.received,
+                                total: state.begin.size,
+                            },
+                        );
+                    }
                     *incoming = Some(state);
                 }
                 Message::FileChunk(chunk) => {
                     let state = incoming.as_mut().context("chunk without BEGIN")?;
+                    state.first_chunk = false;
                     ensure!(
                         chunk.transfer_id == state.begin.transfer_id
                             && chunk.offset == state.received
@@ -4558,7 +4822,7 @@ impl Core {
                                 && state.begin.kind != FileKind::ClipboardImage
                                 && matches!(code, NackCode::NotWritable | NackCode::DiskFull)
                                 && self
-                                    .fallback_cache(store, state, code, state.received)
+                                    .fallback_cache(store, device, state, code, state.received)
                                     .await
                                     .map_err(|error| {
                                         state.receipt =
@@ -4583,6 +4847,24 @@ impl Core {
                         }
                     }
                     state.received += chunk.data.len() as u64;
+                    if state.begin.resume == Some(true)
+                        && state.save_error.is_none()
+                        && state.receipt.is_none()
+                        && !state.begin.sensitive
+                        && let Some(stage) = &state.stage
+                        && let Err(error) = store
+                            .checkpoint(
+                                device.clone(),
+                                state.begin.clone(),
+                                stage.clone(),
+                                state.received,
+                                state.hash.clone(),
+                                false,
+                            )
+                            .await
+                    {
+                        state.receipt = Some(crate::store::save_failure_code(&error));
+                    }
                     self.connection_event(
                         store,
                         device,
@@ -4593,6 +4875,23 @@ impl Core {
                             total: state.begin.size,
                         },
                     );
+                }
+                Message::Cancel(cancel) => {
+                    ensure!(store.file_resume, "unnegotiated CANCEL");
+                    if incoming
+                        .as_ref()
+                        .is_some_and(|s| s.begin.transfer_id == cancel.transfer_id)
+                    {
+                        let mut state = incoming.take().expect("matching transfer");
+                        state.file.take();
+                        if let Some(stage) = state.stage.take() {
+                            store.discard_stage(stage).await?;
+                        }
+                        self.finish_transfer_activity(store, device, &cancel.transfer_id);
+                    }
+                    store
+                        .purge_partial(device.clone(), cancel.transfer_id)
+                        .await?;
                 }
                 Message::FileEnd(end) => {
                     ensure!(
@@ -4687,7 +4986,7 @@ impl Core {
                                 && state.begin.kind != FileKind::ClipboardImage
                                 && matches!(code, NackCode::NotWritable | NackCode::DiskFull)
                                 && self
-                                    .fallback_cache(store, state, code, state.received)
+                                    .fallback_cache(store, device, state, code, state.received)
                                     .await
                                     .map_err(|error| {
                                         state.receipt =
@@ -4731,6 +5030,17 @@ impl Core {
                         }
                     }
                     state.file.take();
+                    if state.begin.resume == Some(true) {
+                        if state.receipt.is_some() || state.save_error.is_some() {
+                            store
+                                .purge_partial(device.clone(), state.begin.transfer_id.clone())
+                                .await?;
+                        } else {
+                            store
+                                .forget_partial(device.clone(), state.begin.transfer_id.clone())
+                                .await?;
+                        }
+                    }
                     if let Some(stage) = state.stage.take() {
                         self.optional(store.discard_stage(stage).await, "staging cleanup");
                     }
@@ -5024,14 +5334,19 @@ impl Core {
                 _ => bail!("unexpected application message"),
             }
             Ok(())
-        })
-        .await
+        });
+        tokio::select! {
+            biased;
+            _=async {if let Some(cancel)=&mut cancelled {let _=cancel.wait_for(|b|*b).await;}else{std::future::pending::<()>().await;} }=>Ok(()),
+            result=receive=>result,
+        }
     }
     /// Recover the already received prefix through its retained descriptor,
     /// then keep streaming in cache. Never resolve the selected folder again.
     async fn fallback_cache(
         &self,
         store: &Store,
+        device: &Id,
         state: &mut Incoming,
         code: NackCode,
         prefix: u64,
@@ -5063,6 +5378,11 @@ impl Core {
         state.destination = Some(stage.destination_path()?);
         state.file = Some(tokio::fs::File::from_std(stage.0.file.try_clone()?));
         state.stage = Some(stage);
+        if state.begin.resume == Some(true) {
+            store
+                .purge_partial(device.clone(), state.begin.transfer_id.clone())
+                .await?;
+        }
         let _ = store.discard_stage(source).await;
         Ok(())
     }
@@ -5592,6 +5912,7 @@ impl PendingOutgoing {
 #[derive(Debug, PartialEq, Eq)]
 enum WriteReport {
     Canceled(Id),
+    CancelSent(Id),
     Sent { id: Id, at: Instant },
 }
 fn frame_receipt_id(message: &Message) -> Option<Id> {
@@ -5604,6 +5925,11 @@ fn frame_receipt_id(message: &Message) -> Option<Id> {
     }
 }
 async fn report_frame(reports: &mpsc::Sender<WriteReport>, message: &Message) {
+    if let Message::Cancel(cancel) = message {
+        let _ = reports
+            .send(WriteReport::CancelSent(cancel.transfer_id.clone()))
+            .await;
+    }
     if let Some(id) = frame_receipt_id(message) {
         let _ = reports
             .send(WriteReport::Sent {
@@ -5667,7 +5993,8 @@ async fn writer_loop<W: tokio::io::AsyncWrite + Unpin>(
                         let id=work.delivery.begin.transfer_id.clone();
                         let result=tokio::select! {biased;_=writer_close.changed()=>None,result=transmit_file(&core,writer,work,&mut priority_rx,&mut write_rx,&mut text_rx,&reports_tx)=>Some(result)};
                         match result {
-                            Some(Ok(()))=>{let _=reports_tx.send(WriteReport::Sent{id,at:Instant::now()}).await;},
+                            Some(Ok(true))=>{let _=reports_tx.send(WriteReport::Sent{id,at:Instant::now()}).await;},
+                            Some(Ok(false))=>{let _=reports_tx.send(WriteReport::Canceled(id)).await;},
                             Some(Err(error))=>{core.error(None,format!("file send interrupted: {error}"));return crate::transport::close(writer,&[]).await;},
                             None=>return crate::transport::close(writer,&[]).await,
                         }
@@ -5721,6 +6048,7 @@ enum FileAdmission {
 struct Incoming {
     begin: FileBegin,
     received: u64,
+    first_chunk: bool,
     hash: Sha256,
     file: Option<tokio::fs::File>,
     stage: Option<Stage>,
@@ -8079,13 +8407,14 @@ mod tests {
         core.shutdown_actions().await
     }
     #[tokio::test]
-    async fn protocol_extensions_are_not_advertised_or_admitted() -> Result<()> {
+    async fn resume_is_advertised_but_requires_peer_negotiation() -> Result<()> {
         let (_dir, core, peer) = fixture(Arc::new(NoActions)).await?;
         let hello = core.computer_hello();
         assert_eq!(
             hello.capabilities,
             [
                 "files",
+                "file_resume_v1",
                 "clipboard_text",
                 "clipboard_image",
                 "mesh",
@@ -9757,6 +10086,7 @@ mod tests {
         let mut state = Incoming {
             begin,
             received: 0,
+            first_chunk: true,
             hash: Sha256::new(),
             file: None,
             stage: None,
@@ -12843,6 +13173,8 @@ mod tests {
                 connection: 1,
                 mesh: false,
                 file: Some(preparing.await??),
+                ready: None,
+                receipt_ready: Arc::new(AtomicBool::new(false)),
             })
             .await
             .map_err(|_| anyhow::anyhow!("writer stopped"))?;
@@ -13264,6 +13596,7 @@ mod tests {
         core.shutdown_actions().await?;
         Ok(())
     }
+    include!("resume_tests.rs");
 }
 
 #[cfg(all(test, windows))]

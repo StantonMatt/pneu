@@ -777,12 +777,9 @@ fn recipient_details(peers: &[Peer], transfers: &[Transfer], key: &str) -> Vec<R
                 "sending" => format!("Sending · {}", size_pair(t.sent, t.size)),
                 "staging" => "Preparing…".into(),
                 "queued" | "waiting_for_device" => "Waiting · not connected".into(),
-                "failed" => format!(
-                    "Failed · {}",
-                    super::notifications::send_failure_reason(
-                        peer.map(|p| p.name.as_str()).unwrap_or("a removed device"),
-                        t.error.as_deref().unwrap_or_default(),
-                    )
+                "failed" => transfer_failure(
+                    t,
+                    peer.map(|p| p.name.as_str()).unwrap_or("a removed device"),
                 ),
                 "sent" => t
                     .finished_at
@@ -815,6 +812,21 @@ fn recipient_details(peers: &[Peer], transfers: &[Transfer], key: &str) -> Vec<R
             }
         })
         .collect()
+}
+
+fn transfer_failure(t: &Transfer, name: &str) -> String {
+    if matches!(
+        t.error.as_deref(),
+        Some("Connection lost" | "Connection interrupted")
+    ) {
+        if t.sent > 0 {
+            format!("Connection lost · {} sent", size_pair(t.sent, t.size))
+        } else {
+            "Connection lost".into()
+        }
+    } else {
+        super::notifications::send_failure_reason(name, t.error.as_deref().unwrap_or_default())
+    }
 }
 
 /// Recent: active, waiting and failed items first, then the last three done.
@@ -936,10 +948,7 @@ fn recent(peers: &[Peer], transfers: &[Transfer]) -> Vec<RecentItem> {
                     .error
                     .clone()
                     .unwrap_or_else(|| "Couldn't send this item".into()),
-                [one] => super::notifications::send_failure_reason(
-                    &name(&one.device),
-                    one.error.as_deref().unwrap_or_default(),
-                ),
+                [one] => transfer_failure(one, &name(&one.device)),
                 many => format!("Failed on {} devices", distinct_recipients(many)),
             }
             .into();
@@ -1013,7 +1022,7 @@ fn size_pair(sent: u64, size: u64) -> String {
     };
     let number = |bytes: u64| {
         let value = bytes as f64 / scale;
-        if value < 10.0 && scale > 1.0 && value.fract() >= 0.05 {
+        if value < 10.0 && scale > 1.0 && (unit == "GB" || value.fract() >= 0.05) {
             format!("{value:.1}")
         } else {
             format!("{value:.0}")
@@ -4687,6 +4696,38 @@ async fn choose_files_on(
 mod tests {
     use super::*;
     #[test]
+    fn resume_recent_failure_and_retry_strings() {
+        let ps = peers(&snapshot(two()), &[]);
+        let mut failed = transfer(
+            "resume",
+            1,
+            "Recording.mp4",
+            "failed",
+            1_200_000_000,
+            4_000_000_000,
+        );
+        failed.error = Some("Connection lost".into());
+        assert_eq!(
+            transfer_failure(&failed, "Desktop"),
+            format!(
+                "Connection lost · {} sent",
+                size_pair(failed.sent, failed.size)
+            )
+        );
+        assert!(
+            recent(&ps, &[failed.clone()])[0]
+                .detail
+                .contains("Connection lost ·")
+        );
+        failed.sent = 0;
+        assert_eq!(recent(&ps, &[failed.clone()])[0].detail, "Connection lost");
+        failed.state = "sending".into();
+        failed.sent = 1_200_000_000;
+        let rows = recent(&ps, &[failed]);
+        assert_eq!(rows[0].progress, 0.3);
+        assert!(rows[0].detail.starts_with("Sending ·"));
+    }
+    #[test]
     fn peer_labels_normalize_a_protocol_limit_name_and_unicode_line_breaks() {
         let name = format!("{}xy", "Phone\n".repeat(21));
         assert_eq!(name.len(), 128);
@@ -5219,6 +5260,7 @@ mod tests {
         assert_eq!(size_pair(12_000_000, 40_000_000), "12 of 40 MB");
         assert_eq!(size_pair(1_200_000, 2_400_000), "1.2 of 2.4 MB");
         assert_eq!(size_pair(320, 900), "320 of 900 B");
+        assert_eq!(size_pair(1_200_000_000, 4_000_000_000), "1.2 of 4.0 GB");
         assert_eq!(
             files_title(&[PathBuf::from("/a/report.pdf")], "Send"),
             "Send report.pdf to"
@@ -9173,6 +9215,166 @@ mod tests {
                     );
                     w.status["config"]["clipboard_mode"] = json!("manual");
                     w.action_error = "Couldn't send the clipboard. The image is over 20 MB.".into();
+                },
+                go(Page::Main, 0, 0),
+            ),
+            device(1, "Galaxy S25+", true, "connected", 0),
+            device(2, "MacBook Air", false, "connected", 0),
+            device(
+                3,
+                "Matthew’s MacBook Pro (Studio, 16-inch) with a very long name",
+                false,
+                "connected",
+                0,
+            ),
+            device(4, "Living-Room-HTPC", false, "connected", 0),
+            device(
+                5,
+                "Office-PC",
+                false,
+                "disconnected",
+                crate::now_ms() - 86_400_000,
+            ),
+            device(6, "Old Laptop", false, "update_required", 0),
+            device(7, "Pixel 6a", true, "unauthorized", 0),
+        ];
+        list.extend(
+            (8..=16).map(|n| device(n, &format!("Lab-PC-{n:02}"), false, "disconnected", 0)),
+        );
+        list
+    }
+    fn picks(w: &PneuWindow, devices: &[(u8, &str, bool, bool, bool, &str)]) {
+        let picks: Vec<PickItem> = devices
+            .iter()
+            .map(|(n, name, phone, connected, eligible, status)| PickItem {
+                id: id(*n).as_str().into(),
+                name: (*name).into(),
+                phone: *phone,
+                tone: if *connected {
+                    Tone::Accent
+                } else if *eligible {
+                    Tone::Neutral
+                } else {
+                    Tone::Danger
+                },
+                connected: *connected,
+                eligible: *eligible,
+                status: (*status).into(),
+                checked: *connected && *eligible,
+            })
+            .collect();
+        let ui = w.global::<Ui>();
+        ui.set_picker_count(picks.iter().filter(|p| p.checked).count() as i32);
+        ui.set_picks(ModelRc::new(VecModel::from(picks)));
+        ui.set_dialog(Dialog::Picker);
+    }
+    fn offline_phone(w: &mut Worker) {
+        let mut phone = device(1, "Galaxy S25+", true, "disconnected", 0);
+        phone.last_seen = crate::now_ms() - 7_200_000;
+        let waiting = transfer("w", 1, "notes.md", "waiting_for_device", 0, 9);
+        state(w, vec![phone], vec![waiting]);
+    }
+    fn offline_devices(w: &mut Worker) {
+        let mut list = vec![
+            transfer("w", 1, "notes.md", "waiting_for_device", 0, 9),
+            transfer("w", 2, "notes.md", "waiting_for_device", 0, 9),
+        ];
+        list.extend(recent_items()[..1].to_vec());
+        state(
+            w,
+            vec![
+                device(
+                    1,
+                    "Galaxy S25+",
+                    true,
+                    "disconnected",
+                    crate::now_ms() - 7_200_000,
+                ),
+                device(
+                    2,
+                    "MacBook Air",
+                    false,
+                    "disconnected",
+                    crate::now_ms() - 9_000_000,
+                ),
+            ],
+            list,
+        );
+    }
+    fn help(w: &PneuWindow) {
+        go(Page::Main, 0, 0)(w);
+        w.global::<Ui>().set_dialog(Dialog::Help);
+    }
+    fn download(tab: i32, mac: bool) -> impl Fn(&PneuWindow) {
+        move |w: &PneuWindow| {
+            go(Page::Add, 0, tab)(w);
+            w.global::<Ui>().set_is_mac(mac);
+            w.global::<Ui>().set_download(true);
+        }
+    }
+    fn scenes() -> Vec<Scene> {
+        let peer = |device: u8, pending: bool| {
+            let (me, it) = (id(9), id(device));
+            json!({"can_sync": true, "settings": [
+                {"key": format!("{me}/{it}/clipboard"), "enabled": true, "pending": false},
+                {"key": format!("{it}/{me}/clipboard"), "enabled": !pending, "pending": pending},
+            ]})
+        };
+        let phone_settings = || {
+            let (me, it) = (id(9), id(1));
+            json!({"can_sync": true, "settings": [
+                {"key": format!("{me}/{it}/clipboard"), "enabled": true, "pending": false},
+                {"key": format!("{it}/{me}/clipboard"), "enabled": true, "pending": false},
+                {"key": format!("{it}/{me}/automatic_media"), "enabled": true, "pending": false},
+            ]})
+        };
+        let mut sending = vec![
+            transfer("s", 1, "report.pdf", "sending", 12_000_000, 40_000_000),
+            transfer("s", 2, "report.pdf", "sending", 31_000_000, 40_000_000),
+        ];
+        sending.extend(recent_items());
+        let mut list = vec![
+            scene(
+                "resume-failed",
+                |w| {
+                    let mut row = transfer(
+                        "resume",
+                        1,
+                        "Recording.mp4",
+                        "failed",
+                        1_200_000_000,
+                        4_000_000_000,
+                    );
+                    row.error = Some("Connection lost".into());
+                    state(w, two(), vec![row]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "resume-retry",
+                |w| {
+                    state(
+                        w,
+                        two(),
+                        vec![transfer(
+                            "resume",
+                            1,
+                            "Recording.mp4",
+                            "sending",
+                            1_200_000_000,
+                            4_000_000_000,
+                        )],
+                    )
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "resume-legacy-failed",
+                |w| {
+                    let mut row =
+                        transfer("legacy", 1, "Recording.mp4", "failed", 0, 4_000_000_000);
+                    row.error = Some("Connection lost".into());
+                    state(w, two(), vec![row]);
                 },
                 go(Page::Main, 0, 0),
             ),

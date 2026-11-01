@@ -7,11 +7,13 @@ pub(crate) mod history;
 pub(crate) mod members;
 #[path = "outbox.rs"]
 pub mod outbox;
+#[path = "store_resume.rs"]
+pub(crate) mod resume;
 #[path = "store_settings.rs"]
 mod settings;
 pub(crate) use settings::{SettingsMalformed, SettingsUnexpected};
 
-use crate::storage::{Folder, Stage, VerifiedFile, clean_staging, staging_directory};
+use crate::storage::{Folder, Stage, VerifiedFile, staging_directory};
 use crate::work::{Reservation, Work, start_blocking};
 use anyhow::{Context, Result, ensure};
 use pneu_proto::{Clipboard, ClipboardOrigin, FileBegin, Hash, Id, NackCode};
@@ -141,6 +143,8 @@ pub struct Store {
     pub(crate) local_device: Option<Id>,
     generations: Arc<Mutex<HashMap<Id, u64>>>,
     peer_generations: Option<HashMap<Id, u64>>,
+    pub(crate) resume: Arc<Mutex<resume::Runtime>>,
+    pub(crate) file_resume: bool,
     staging_ready: Arc<Mutex<HashSet<crate::platform::fs::Identity>>>,
     // Nonpersistent, bounded metadata proof for failed-save previews (no file FDs). A restart or
     // eviction deliberately leaves retirement to normal cache pruning.
@@ -209,7 +213,7 @@ impl std::fmt::Display for ClipboardStorageFailure {
 impl std::error::Error for ClipboardStorageFailure {}
 
 #[derive(Debug)]
-struct ReceiptConflict;
+pub(crate) struct ReceiptConflict;
 impl std::fmt::Display for ReceiptConflict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("receipt ID conflict")
@@ -529,6 +533,9 @@ impl Store {
           CREATE TABLE IF NOT EXISTS outgoing(seq INTEGER PRIMARY KEY AUTOINCREMENT,device TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,payload TEXT NOT NULL,retry_at INTEGER NOT NULL DEFAULT 0);
           CREATE TABLE IF NOT EXISTS clipboard_recent(device TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,id TEXT NOT NULL,meta TEXT NOT NULL,PRIMARY KEY(device,id));
           CREATE TABLE IF NOT EXISTS failed_cache(device TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,id TEXT NOT NULL,meta TEXT NOT NULL,destination TEXT NOT NULL,PRIMARY KEY(device,id));
+          CREATE TABLE IF NOT EXISTS file_partials(device TEXT NOT NULL,id TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(device,id));
+          CREATE TABLE IF NOT EXISTS file_stage_protected(root TEXT NOT NULL,name TEXT NOT NULL,PRIMARY KEY(root,name));
+          CREATE TABLE IF NOT EXISTS resume_clock(singleton INTEGER PRIMARY KEY CHECK(singleton=1),wall INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS staging_folders(path TEXT PRIMARY KEY);
           CREATE TABLE IF NOT EXISTS clipboard_fingerprints(seq INTEGER PRIMARY KEY,meta TEXT NOT NULL);")?;
         // Keep earlier folder hints before retiring receipt recovery columns.
@@ -728,6 +735,8 @@ impl Store {
             local_device: None,
             generations: Arc::new(Mutex::new(generations)),
             peer_generations: None,
+            resume: Arc::default(),
+            file_resume: false,
             staging_ready: Arc::new(Mutex::new(HashSet::new())),
             cache_owners: Arc::new(Mutex::new(HashMap::new())),
             clipboard_history_revision: Arc::new(AtomicU64::new(0)),
@@ -1267,6 +1276,9 @@ impl Store {
             });
             // The callback owns lifecycle restoration and the pairing gate even
             // when the awaiting async command has been canceled.
+            if result.is_ok() {
+                let _ = store.purge_revoked_partials();
+            }
             finish(result.is_ok());
             result
         });
@@ -1310,7 +1322,7 @@ impl Store {
             let mut ready = store.staging_ready.lock().expect("staging readiness");
             let identity = folder.identity()?;
             if !ready.contains(&identity) {
-                clean_staging(&folder)?;
+                store.reconcile_resume_folder(&folder)?;
             }
             let directory = staging_directory(&folder)?;
             let stage = Stage::create(folder, directory, destination, size)?;
@@ -1345,7 +1357,7 @@ impl Store {
                 let result = Folder::open(&path, false).and_then(|folder| {
                     let identity = folder.identity()?;
                     if !ready.contains(&identity) {
-                        clean_staging(&folder)?;
+                        store.reconcile_resume_folder(&folder)?;
                     }
                     Ok(identity)
                 });
@@ -1554,6 +1566,7 @@ impl Store {
                     "text cleanup capacity exhausted"
                 );
                 store.peer_write(epoch.clone(), |tx| {
+                    reject_partial_id(tx, &device, &text.transfer_id)?;
                     let expected =
                         Metadata::Text(keyed_text_receipt(&store.clipboard_fingerprint_key, &text));
                     let cached: bool = tx.query_row(
@@ -1790,6 +1803,15 @@ fn validate_failed_file(c: &Connection, device: &Id, begin: &FileBegin) -> Resul
             ReceiptConflict
         );
     }
+    Ok(())
+}
+fn reject_partial_id(c: &Connection, device: &Id, id: &Id) -> Result<()> {
+    let partial: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM file_partials f JOIN peers p ON p.id=f.device AND p.generation=json_extract(f.record,'$.generation') WHERE f.device=? AND f.id=?)",
+        params![device.as_str(), id.as_str()],
+        |r| r.get(0),
+    )?;
+    ensure!(!partial, ReceiptConflict);
     Ok(())
 }
 fn receipt_row(c: &Connection, device: &str, id: &str) -> Result<Option<(Metadata, bool)>> {
@@ -2086,7 +2108,7 @@ mod tests {
         }
         Ok(())
     }
-    fn begin(bytes: &[u8]) -> FileBegin {
+    pub(super) fn begin(bytes: &[u8]) -> FileBegin {
         FileBegin {
             resume: None,
             folder: None,
@@ -2105,7 +2127,7 @@ mod tests {
     }
     // Join completion can precede runtime teardown of the job's lock-owning
     // environment. Restart fixtures wait for every owner, not just the result.
-    async fn close_for_restart(store: Store) -> Result<()> {
+    pub(super) async fn close_for_restart(store: Store) -> Result<()> {
         store.drain().await;
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while Arc::strong_count(&store._ownership) != 1 {

@@ -765,7 +765,7 @@ fn database_lock(file: &File) -> Result<()> {
     }
     .context("data store is already owned by another daemon")
 }
-fn single_link(file: &File) -> Result<()> {
+pub(crate) fn single_link(file: &File) -> Result<()> {
     let info: FILE_STANDARD_INFO = query(file, FileStandardInfo)?;
     ensure!(
         info.NumberOfLinks == 1 && !info.DeletePending,
@@ -967,6 +967,9 @@ pub(crate) fn open_secret(path: &Path) -> std::io::Result<File> {
 pub(crate) fn open_read_at(parent: &File, name: impl AsRef<OsStr>) -> Result<File> {
     open_at(parent, name.as_ref(), READ, false, None)
 }
+pub(crate) fn open_read_write_at(parent: &File, name: impl AsRef<OsStr>) -> Result<File> {
+    open_at(parent, name.as_ref(), WRITE, false, Some(false))
+}
 pub(crate) fn open_journal_at(parent: &File, name: impl AsRef<OsStr>) -> Result<File> {
     open_read_at(parent, name)
 }
@@ -1058,7 +1061,7 @@ pub(crate) fn rename(
     parent.sync_all()?;
     Ok(())
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Identity(u64, [u8; 16]);
 pub(crate) fn identity(file: &File) -> Result<Identity> {
     let info: FILE_ID_INFO = query(file, FileIdInfo)?;

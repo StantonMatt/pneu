@@ -2,7 +2,7 @@
 use super::*;
 use crate::file_recipients::{Selection, resolve};
 use crate::outbox::{self, Authority, Delivery, Targets};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 impl Core {
     pub(super) fn file_targets(
@@ -353,6 +353,9 @@ impl Core {
             }
         }
         self.outbox.dismiss(operation, artifact).await?;
+        for session in self.sessions.lock().expect("sessions").sessions.values() {
+            session.wake.notify_one();
+        }
         let _ = self.events.send(Event::ConfigChanged);
         Ok(())
     }
@@ -368,8 +371,8 @@ impl Core {
         self.outbox
             .change(operation, artifact, device.clone(), false)
             .await?;
-        // A partially emitted file has no wire cancellation frame. Close just
-        // the affected lane's connection, so the receiver drops its partial.
+        // Wake the session to flush durable CANCEL intents. A partial frame
+        // still closes the lane; the intent survives until the next connection.
         let sessions = self.sessions.lock().expect("sessions");
         for s in sessions
             .sessions
@@ -449,6 +452,8 @@ pub(super) struct FileWrite {
     pub connection: u64,
     pub mesh: bool,
     pub file: Option<tokio::fs::File>,
+    pub ready: Option<tokio::sync::oneshot::Receiver<Option<u64>>>,
+    pub receipt_ready: Arc<AtomicBool>,
 }
 /// The first accepted byte must still have the captured binding and capability,
 /// even if the socket previously returned Pending. Later cancellation closes
@@ -457,6 +462,7 @@ struct FileWriter<'a, W> {
     core: &'a Core,
     writer: &'a mut W,
     work: &'a FileWrite,
+    frame_written: usize,
 }
 impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for FileWriter<'_, W> {
     fn poll_write(
@@ -479,7 +485,11 @@ impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for FileWriter<'_, 
         if !valid {
             return std::task::Poll::Ready(Err(std::io::Error::other("file delivery cancelled")));
         }
-        std::pin::Pin::new(&mut *this.writer).poll_write(cx, bytes)
+        let result = std::pin::Pin::new(&mut *this.writer).poll_write(cx, bytes);
+        if let std::task::Poll::Ready(Ok(n)) = &result {
+            this.frame_written += n;
+        }
+        result
     }
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
@@ -494,6 +504,31 @@ impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for FileWriter<'_, 
         std::pin::Pin::new(&mut *self.writer).poll_shutdown(cx)
     }
 }
+impl<W: tokio::io::AsyncWrite + Unpin> FileWriter<'_, W> {
+    async fn frame(&mut self, message: &Message, resumable: bool) -> Result<bool> {
+        self.frame_written = 0;
+        match send(self, message).await {
+            Ok(()) => Ok(true),
+            Err(_)
+                if self.frame_written == 0
+                    && resumable
+                    && !self
+                        .core
+                        .file_current(&self.work.delivery, self.work.connection) =>
+            {
+                send(
+                    &mut *self.writer,
+                    &Message::Cancel(Cancel {
+                        transfer_id: self.work.delivery.begin.transfer_id.clone(),
+                    }),
+                )
+                .await?;
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
 pub(super) async fn transmit_file<W: tokio::io::AsyncWrite + Unpin>(
     core: &Core,
     writer: &mut W,
@@ -502,9 +537,13 @@ pub(super) async fn transmit_file<W: tokio::io::AsyncWrite + Unpin>(
     normal: &mut mpsc::Receiver<Message>,
     text: &mut mpsc::Receiver<AutomaticWrite>,
     reports: &mpsc::Sender<WriteReport>,
-) -> Result<()> {
+) -> Result<bool> {
     let mut file = work.file.take().context("verified file reader")?;
     let mut begin = work.delivery.begin.clone();
+    let resumable = work.ready.is_some();
+    if resumable {
+        begin.resume = Some(true);
+    }
     if !work.mesh {
         if let Some(hlc) = begin.hlc {
             begin.created_at = hlc;
@@ -512,22 +551,51 @@ pub(super) async fn transmit_file<W: tokio::io::AsyncWrite + Unpin>(
         begin.hlc = None;
         begin.source_device = None;
     }
-    pneu_proto::encode_frame(&Message::FileBegin(begin.clone()))?;
+    let mut ready = work.ready.take();
     let mut writer = FileWriter {
         core,
         writer,
         work: &work,
+        frame_written: 0,
     };
-    send(&mut writer, &Message::FileBegin(begin)).await?;
+    if !writer.frame(&Message::FileBegin(begin), resumable).await? {
+        return Ok(false);
+    }
     let mut offset = 0;
+    if let Some(ready) = ready.as_mut() {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            tokio::select! { biased;
+                value=&mut *ready=>{let Some(value)=value? else{return Ok(false)};offset=value;break;},
+                _=tokio::time::sleep_until(deadline)=>bail!("FILE_READY timeout"),
+                Some(message)=priority.recv()=>{send(&mut *writer.writer,&message).await?;report_frame(reports,&message).await;},
+                Some(message)=normal.recv()=>{send(&mut *writer.writer,&message).await?;report_frame(reports,&message).await;},
+                Some(work)=text.recv()=>{let id=work.selection.id().clone();
+                    let sent=transmit_automatic(core,&mut *writer.writer,work,priority,normal,None,Some(reports)).await?;
+                    reports.send(if sent {WriteReport::Sent{id,at:Instant::now()}} else {WriteReport::Canceled(id)}).await?;},
+            }
+        }
+    }
+    file.seek(std::io::SeekFrom::Start(offset)).await?;
+    core.outbox.progress(&work.delivery, offset);
+    let mut checkpoint = outbox::ProgressCheckpoint::new(offset);
     let mut buffer = vec![0; CHUNK_SIZE];
     while offset < work.delivery.begin.size {
+        if !core.file_current(&work.delivery, work.connection) {
+            if resumable {
+                send(
+                    &mut *writer.writer,
+                    &Message::Cancel(pneu_proto::Cancel {
+                        transfer_id: work.delivery.begin.transfer_id.clone(),
+                    }),
+                )
+                .await?;
+                return Ok(false);
+            }
+            bail!("file delivery cancelled");
+        }
         let n = file.read(&mut buffer).await?;
         ensure!(n > 0, "staged file truncated");
-        ensure!(
-            core.file_current(&work.delivery, work.connection),
-            "file delivery cancelled"
-        );
         send_pending_messages(&mut *writer.writer, priority, normal, Some(reports)).await?;
         send_pending_clipboard_text(
             core,
@@ -538,27 +606,58 @@ pub(super) async fn transmit_file<W: tokio::io::AsyncWrite + Unpin>(
             Some(reports),
         )
         .await?;
+        if !writer
+            .frame(
+                &Message::FileChunk(FileChunk {
+                    transfer_id: work.delivery.begin.transfer_id.clone(),
+                    offset,
+                    data: buffer[..n].to_vec(),
+                }),
+                resumable,
+            )
+            .await?
+        {
+            return Ok(false);
+        }
+        offset += n as u64;
+        core.outbox.progress(&work.delivery, offset);
+        if resumable && checkpoint.due(offset) {
+            core.optional(
+                core.outbox.checkpoint_progress(work.delivery.clone()).await,
+                "outbox progress checkpoint",
+            );
+        }
+        let _ = core.events.send(Event::ConfigChanged);
+    }
+    if !core.file_current(&work.delivery, work.connection) && resumable {
         send(
-            &mut writer,
-            &Message::FileChunk(FileChunk {
+            &mut *writer.writer,
+            &Message::Cancel(pneu_proto::Cancel {
                 transfer_id: work.delivery.begin.transfer_id.clone(),
-                offset,
-                data: buffer[..n].to_vec(),
             }),
         )
         .await?;
-        offset += n as u64;
-        core.outbox.progress(&work.delivery, offset);
-        let _ = core.events.send(Event::ConfigChanged);
+        return Ok(false);
     }
-    send(
-        &mut writer,
-        &Message::FileEnd(FileEnd {
-            transfer_id: work.delivery.begin.transfer_id.clone(),
-        }),
-    )
-    .await?;
-    Ok(())
+    if resumable {
+        core.optional(
+            core.outbox.checkpoint_progress(work.delivery.clone()).await,
+            "outbox progress checkpoint",
+        );
+    }
+    work.receipt_ready.store(true, Ordering::SeqCst);
+    if !writer
+        .frame(
+            &Message::FileEnd(FileEnd {
+                transfer_id: work.delivery.begin.transfer_id.clone(),
+            }),
+            resumable,
+        )
+        .await?
+    {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 pub(super) struct SessionRecovery {
@@ -573,7 +672,7 @@ impl Drop for SessionRecovery {
             self.device.clone(),
             self.generation,
             self.session,
-            Some("Connection interrupted".into()),
+            Some("Connection lost".into()),
         );
     }
 }
@@ -584,6 +683,9 @@ impl Core {
         generation: u64,
         session: u64,
     ) -> SessionRecovery {
+        self.outbox
+            .retry_disconnected
+            .store(self.config().queue_offline, Ordering::SeqCst);
         SessionRecovery {
             outbox: self.outbox.clone(),
             device,
