@@ -432,6 +432,7 @@ impl Core {
             })
             .await
     }
+    #[cfg(target_os = "linux")]
     pub(crate) async fn quiet_blocked_notice(&self, pin: Hash) -> Result<bool> {
         Ok(self.store.setup_quiet_reconnect(pin.clone()).await?
             || self

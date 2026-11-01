@@ -39,7 +39,7 @@ pub(in crate::core) enum Message {
     ReadHandle(Token, Arc<std::sync::atomic::AtomicBool>),
     #[cfg(test)]
     Barrier(oneshot::Sender<()>),
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     Wait(Token, oneshot::Sender<Result<Outcome>>),
     Stop(oneshot::Sender<()>),
 }
@@ -102,7 +102,7 @@ impl Handle {
             let _ = rx.await;
         }
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn waiter(&self, token: Token) -> oneshot::Receiver<Result<Outcome>> {
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(Message::Wait(token, tx));
@@ -811,7 +811,7 @@ pub(in crate::core) async fn run(
                         driver.requests.insert(operation.token,*request);
                         Event::Submit(operation)
                     }
-                    #[cfg(test)]
+                    #[cfg(all(test, unix))]
                     Message::Wait(token,reply)=>{driver.waiters.insert(token,reply);continue;}
                     #[cfg(test)]
                     Message::Barrier(reply)=>{driver.barriers.push(reply);if driver.state.idle() && driver.record_job.is_none() {for reply in driver.barriers.drain(..){let _=reply.send(());}}continue;}

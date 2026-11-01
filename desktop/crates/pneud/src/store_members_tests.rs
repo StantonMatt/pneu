@@ -2139,6 +2139,10 @@ async fn setup_advisory_conflicts_coalesce_bound_and_clear_on_resolution() -> Re
     let status_dir = crate::test_support::scratch()?;
     let root = status_dir.path();
     let copy = root.join("state.sqlite3");
+    // VACUUM INTO accepts an empty destination. Precreate it with the same
+    // private owner and protected DACL required of every Windows store DB.
+    #[cfg(windows)]
+    assert!(crate::config::atomic_private_new(&copy, &[])?);
     f.s.call(move |c| {
         c.execute("VACUUM INTO ?", [copy.to_str().unwrap()])?;
         Ok(())

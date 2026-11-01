@@ -262,6 +262,7 @@ pub(crate) fn atomic_private_in(
 }
 /// First-writer-wins publication for durable secrets. A racing creator loads
 /// the winner instead of replacing a key another process may already use.
+#[cfg(any(unix, test))]
 pub(crate) fn atomic_private_new(path: &Path, bytes: &[u8]) -> Result<bool> {
     #[cfg(windows)]
     platform_fs::validate_path(path)?;

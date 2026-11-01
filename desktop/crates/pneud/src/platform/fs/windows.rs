@@ -247,9 +247,11 @@ pub(crate) mod private {
         }
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn check_path(path: &Path) -> Result<()> {
         check(&open_read(path)?)
     }
+    #[cfg(test)]
     pub(crate) fn open(path: &Path) -> Result<File> {
         open_lock(path)
     }
@@ -277,7 +279,7 @@ fn drive_root(path: &Path) -> Result<PathBuf> {
         matches!(prefix.kind(), Prefix::Disk(_)) && parts.next() == Some(Component::RootDir),
         "Windows path must be an absolute local drive path; UNC, verbatim and device namespaces are forbidden"
     );
-    Ok(PathBuf::from(prefix.as_os_str()).join(r"\"))
+    Ok(path.components().take(2).collect())
 }
 pub(crate) fn validate_path(path: &Path) -> Result<()> {
     drive_root(path)?;
@@ -958,6 +960,7 @@ pub(crate) fn open_regular_file(path: &Path) -> Result<File> {
 pub(crate) fn open_read(path: &Path) -> Result<File> {
     path_open(path, READ)
 }
+#[cfg(test)]
 pub(crate) fn open_secret(path: &Path) -> std::io::Result<File> {
     open_read(path).map_err(io_error)
 }
@@ -966,10 +969,6 @@ pub(crate) fn open_read_at(parent: &File, name: impl AsRef<OsStr>) -> Result<Fil
 }
 pub(crate) fn open_journal_at(parent: &File, name: impl AsRef<OsStr>) -> Result<File> {
     open_read_at(parent, name)
-}
-#[cfg(test)]
-pub(crate) fn open_read_write_at(parent: &File, name: impl AsRef<OsStr>) -> Result<File> {
-    open_at(parent, name.as_ref(), WRITE, false, None)
 }
 pub(crate) fn metadata_file(parent: &File, name: impl AsRef<OsStr>) -> Result<File> {
     open_read_at(parent, name)
@@ -1175,6 +1174,7 @@ pub(crate) fn is_private_file(file: &File) -> Result<bool> {
     Ok(file.metadata()?.is_file() && private::check(file).is_ok())
 }
 // Existing objects are checked, never repaired after possible exposure.
+#[cfg(test)]
 pub(crate) fn set_private_file(path: &Path) -> std::io::Result<()> {
     private::check_path(path).map_err(io_error)
 }

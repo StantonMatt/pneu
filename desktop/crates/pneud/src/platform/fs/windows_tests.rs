@@ -459,6 +459,8 @@ fn short_renames_support_fresh_collision_replace_and_read_only() -> Result<()> {
             // the source frozen, and use a writable destination for replacement.
             if readonly {
                 let mut p = source.metadata()?.permissions();
+                // Windows clears a DOS attribute here, not Unix access bits.
+                #[allow(clippy::permissions_set_readonly_false)]
                 p.set_readonly(false);
                 source.set_permissions(p)?;
             }
@@ -1169,7 +1171,7 @@ fn database_and_sidecar_hardlinks_are_rejected_before_writes() -> Result<()> {
 }
 #[test]
 fn database_lock_byte_coexists_with_sqlite_operations_and_reader() -> Result<()> {
-    assert!(STORE_LOCK_OFFSET >= (1u64 << 63));
+    const { assert!(STORE_LOCK_OFFSET >= (1u64 << 63)) };
     let (temp, _) = fixture()?;
     let (conn, lock, _parent) = open_database(&temp.path().join("state.sqlite3"))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE proof(x); INSERT INTO proof VALUES(42); PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE; INSERT INTO proof VALUES(99); PRAGMA journal_mode=WAL; VACUUM;")?;

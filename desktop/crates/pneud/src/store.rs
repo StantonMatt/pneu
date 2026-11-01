@@ -157,7 +157,10 @@ struct PeerWriteBarrier {
 /// the child briefly inherits the same flock/open-file description before exec.
 /// Release explicitly when the final daemon owner ends, even if a child still
 /// holds an inherited descriptor. Remaining Store jobs keep this Arc alive.
-struct StoreOwnership(fs::File);
+struct StoreOwnership(
+    // Windows releases the byte-range lock when this retained DB handle closes.
+    #[cfg_attr(windows, allow(dead_code))] fs::File,
+);
 impl Drop for StoreOwnership {
     fn drop(&mut self) {
         #[cfg(unix)]
@@ -869,7 +872,7 @@ impl Store {
     pub(crate) fn active_jobs(&self) -> usize {
         self.work.active()
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn admitted_jobs(&self) -> usize {
         self.work.admitted()
     }

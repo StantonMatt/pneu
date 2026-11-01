@@ -2301,7 +2301,7 @@ impl Core {
     pub(crate) async fn clipboard_test_idle(&self) {
         self.clipboard.barrier().await;
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn clipboard_test_read(
         &self,
         token: u64,
@@ -2315,7 +2315,7 @@ impl Core {
     async fn wait_clipboard_observation(&self) {
         self.clipboard.barrier().await;
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn observe_local_clipboard_offer(&self) -> Result<Option<ClipboardOffer>> {
         let (offer, token) = self.observe_watched_clipboard(false);
         let reply = self.clipboard.waiter(token);
@@ -2385,7 +2385,7 @@ impl Core {
             .expect("automatic clipboard")
             .invalidate_peer(device);
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn take_automatic(&self, device: &Id, connection: u64) -> Option<AutomaticWrite> {
         self.take_automatic_lanes(device, connection, true, true)
     }
@@ -3128,7 +3128,7 @@ impl Core {
         })
         .await
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     #[allow(clippy::too_many_arguments)]
     async fn register(
         self: Arc<Self>,
@@ -3155,7 +3155,7 @@ impl Core {
         )
         .await
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     #[allow(clippy::too_many_arguments)]
     async fn register_buffered(
         self: Arc<Self>,
@@ -3555,7 +3555,7 @@ impl Core {
             Ok(())
         }
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     async fn finish_pairing(
         &self,
         device: &Id,
@@ -3566,7 +3566,7 @@ impl Core {
             .await
             .map(|_| ())
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     async fn finish_pairing_captured(
         &self,
         device: &Id,
@@ -3638,7 +3638,7 @@ impl Core {
         .await
         .map_err(|_| PairCode::StorageFailed)
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     async fn persist_pairing(
         &self,
         device: &Id,

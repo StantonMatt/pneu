@@ -4,7 +4,9 @@
 use crate::platform::fs as platform_fs;
 use anyhow::{Context, Result, ensure};
 use ring::hmac;
-use std::{io::Read, path::Path};
+use std::io::Read;
+#[cfg(unix)]
+use std::path::Path;
 
 #[derive(Clone)]
 pub(crate) struct FingerprintKey([u8; 32]);
@@ -41,6 +43,7 @@ impl FingerprintKey {
         file.read_exact(&mut key)?;
         Ok(Self(key))
     }
+    #[cfg(unix)]
     pub(crate) fn load_or_create(path: &Path) -> Result<Self> {
         let file = platform_fs::open_secret(path);
         let mut file = match file {
@@ -75,6 +78,7 @@ impl FingerprintKey {
     }
     /// Called only under Store's exclusive ownership lock, before creation.
     /// Never sweep another concurrent startup's in-progress key write.
+    #[cfg(unix)]
     pub(crate) fn cleanup_temporary(path: &Path) -> Result<()> {
         let parent = path.parent().context("key parent")?;
         let folder = crate::storage::Folder::open(parent, false)?;
