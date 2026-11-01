@@ -44,11 +44,14 @@ internal data class DeviceLine(val text:String,val tone:LinkTone,val color:Color
     val context=LocalContext.current;val resources=LocalResources.current;val c=LocalPneuColors.current;val link=state.connection
     return when {
         state.peer.pairingLost->DeviceLine(resources.getString(R.string.status_pairing_lost),LinkTone.Danger,c.danger)
+        state.peer.setupRefused->DeviceLine(resources.getString(R.string.setup_refused,state.peer.name),LinkTone.Warn,c.warn)
         link.connectionStatus==ConnectionStatus.FINGERPRINT_MISMATCH->DeviceLine(resources.getString(R.string.status_fingerprint_mismatch),LinkTone.Danger,c.danger)
         link.connectionStatus==ConnectionStatus.UPDATE_REQUIRED->DeviceLine(resources.getString(R.string.device_update_required),LinkTone.Warn,c.warn)
         connected(p,state)->DeviceLine(if(link.route.isEmpty())resources.getString(R.string.status_connected) else resources.getString(R.string.device_connected,UiPresentation.status(context,link.route)),LinkTone.On,c.text2)
         link.connectionStatus==ConnectionStatus.CONNECTING->DeviceLine(resources.getString(R.string.status_connecting),LinkTone.Neutral,c.text2)
         link.connectionStatus==ConnectionStatus.WAITING_WIFI || link.connectionStatus==ConnectionStatus.NO_NETWORK->DeviceLine(UiPresentation.status(context,link.connectionStatus),LinkTone.Neutral,c.text2)
+        // Added via another device and not reached yet: it keeps trying, never an error.
+        SetupPresentation.introducedStatus(state.peer)==IntroducedStatus.SILENT->DeviceLine(resources.getString(R.string.device_not_connected_yet),LinkTone.Neutral,c.text2)
         else->DeviceLine(lastSeen(context,state.lastSeen),LinkTone.Neutral,c.text2)
     }
 }
@@ -64,15 +67,15 @@ private fun lastSeen(context:android.content.Context,timestamp:Long):String {
     when {state.peer.pairingLost->LinkTone.Danger;p.paused->LinkTone.Neutral;else->deviceLine(p,state).tone}
 }
 
-@Composable private fun DeviceTile(tone:LinkTone,ghost:Boolean=false) {
+@Composable private fun DeviceTile(tone:LinkTone,ghost:Boolean=false,icon:Int=R.drawable.ic_computer) {
     val c=LocalPneuColors.current
     val (fill,ink)=when(tone) {LinkTone.On->c.accentSoft to c.onAccentSoft;LinkTone.Warn->c.warnSoft to c.warn;LinkTone.Danger->c.dangerSoft to c.danger;else->c.fill to c.text2}
     if(ghost)Box(Modifier.size(36.dp).border(1.5.dp,c.text3,RoundedCornerShape(11.dp)),contentAlignment=Alignment.Center) {Symbol(R.drawable.ic_add,modifier=Modifier.size(20.dp),tint=c.accentText)}
-    else Box(Modifier.size(36.dp).background(fill,RoundedCornerShape(11.dp)),contentAlignment=Alignment.Center) {Symbol(R.drawable.ic_computer,modifier=Modifier.size(20.dp),tint=ink)}
+    else Box(Modifier.size(36.dp).background(fill,RoundedCornerShape(11.dp)),contentAlignment=Alignment.Center) {Symbol(icon,modifier=Modifier.size(20.dp),tint=ink)}
 }
 
-/** Home → Devices: one row per device, then Add device. */
-@Composable internal fun DevicesCard(p:Prefs,devices:List<DeviceState>,open:(String)->Unit,add:()->Unit) {
+/** Home → Devices: one row per device, other phones in your devices (grey), then Add device. */
+@Composable internal fun DevicesCard(p:Prefs,devices:List<DeviceState>,open:(String)->Unit,add:()->Unit,phones:List<PhoneMember> = emptyList(),openPhone:(String)->Unit={}) {
     val c=LocalPneuColors.current;val resources=LocalResources.current
     Text(resources.getString(R.string.group_devices),Modifier.padding(start=16.dp,top=20.dp,bottom=8.dp),style=PneuType.section,color=c.text2)
     PneuCard {
@@ -82,12 +85,22 @@ private fun lastSeen(context:android.content.Context,timestamp:Long):String {
                 DeviceTile(line.tone)
                 Column(Modifier.weight(1f)) {
                     Text(state.peer.name,style=PneuType.body,maxLines=1,overflow=TextOverflow.Ellipsis)
-                    Text(line.text,style=PneuType.subhead,color=line.color,maxLines=1,overflow=TextOverflow.Ellipsis)
+                    Text(line.text,style=PneuType.subhead,color=line.color,maxLines=if(state.peer.setupRefused)Int.MAX_VALUE else 1,overflow=TextOverflow.Ellipsis)
                 }
                 Symbol(R.drawable.ic_chevron_right,modifier=Modifier.size(20.dp),tint=c.text3)
             }
         }
-        Row(Modifier.fillMaxWidth().pneuRow(devices.isNotEmpty(),66.dp).pneuClick(onClick=add).heightIn(min=56.dp).padding(horizontal=16.dp,vertical=10.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(14.dp)) {
+        phones.forEachIndexed {i,phone->
+            Row(Modifier.fillMaxWidth().pneuRow(devices.isNotEmpty() || i>0,66.dp).pneuClick {openPhone(phone.key)}.heightIn(min=68.dp).padding(horizontal=16.dp,vertical=10.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(14.dp)) {
+                DeviceTile(LinkTone.Neutral,icon=R.drawable.ic_smartphone)
+                Column(Modifier.weight(1f)) {
+                    Text(phone.name,style=PneuType.body,maxLines=1,overflow=TextOverflow.Ellipsis)
+                    Text(resources.getString(R.string.setup_phones_dont_connect),style=PneuType.subhead,color=c.text2,maxLines=1,overflow=TextOverflow.Ellipsis)
+                }
+                Symbol(R.drawable.ic_chevron_right,modifier=Modifier.size(20.dp),tint=c.text3)
+            }
+        }
+        Row(Modifier.fillMaxWidth().pneuRow(devices.isNotEmpty() || phones.isNotEmpty(),66.dp).pneuClick(onClick=add).heightIn(min=56.dp).padding(horizontal=16.dp,vertical=10.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(14.dp)) {
             DeviceTile(LinkTone.Neutral,ghost=true)
             Text(resources.getString(R.string.action_add_device),Modifier.weight(1f),style=PneuType.body.copy(fontWeight=androidx.compose.ui.text.font.FontWeight.Medium),color=c.accentText)
         }
@@ -101,9 +114,9 @@ private fun automaticKinds(context:android.content.Context,p:Prefs):String? {
     return text.replaceFirstChar {it.uppercase()}
 }
 
-/** One pair: status card, the pair's sharing switches, then Unpair. */
+/** One pair: status card, the pair's sharing switches, then linking and Remove from all devices or Unpair. */
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable internal fun DeviceScreen(p:Prefs,state:DeviceState,back:()->Unit,pair:()->Unit,unpair:()->Unit,sendFiles:()->Unit,setSwitch:(String,Boolean)->Unit) {
+@Composable internal fun DeviceScreen(p:Prefs,state:DeviceState,back:()->Unit,pair:()->Unit,unpair:()->Unit,sendFiles:()->Unit,setup:SetupActions=SetupActions(),setSwitch:(String,Boolean)->Unit) {
     val context=LocalContext.current;val resources=LocalResources.current;val c=LocalPneuColors.current
     val peer=state.peer;val link=state.connection;val online=connected(p,state)
     val scroll=rememberScrollState()
@@ -118,14 +131,17 @@ private fun automaticKinds(context:android.content.Context,p:Prefs):String? {
             Column(Modifier.widthIn(max=600.dp).fillMaxWidth().verticalScroll(scroll).navigationBarsPadding().padding(horizontal=16.dp)) {
                 Text(peer.name,Modifier.onSizeChanged {titleHeight=it.height}.padding(start=4.dp,end=4.dp,top=6.dp,bottom=14.dp).semantics {heading()},style=PneuType.largeTitle,maxLines=2,overflow=TextOverflow.Ellipsis)
                 val status=when {peer.pairingLost->ConnectionStatus.PAIRING_LOST;online->ConnectionStatus.CONNECTED;else->link.connectionStatus}
-                val title=when(status) {ConnectionStatus.UNREACHABLE->resources.getString(R.string.device_not_connected);ConnectionStatus.UPDATE_REQUIRED->resources.getString(R.string.device_update_required);else->UiPresentation.status(context,status)}
+                val title=if(peer.setupRefused)resources.getString(R.string.setup_refused,peer.name) else if(peer.addedViaId!=null && !peer.established && status==ConnectionStatus.UNREACHABLE)resources.getString(R.string.device_not_connected_yet) else when(status) {ConnectionStatus.UNREACHABLE->resources.getString(R.string.device_not_connected);ConnectionStatus.UPDATE_REQUIRED->resources.getString(R.string.device_update_required);else->UiPresentation.status(context,status)}
                 val address=UiPresentation.pairedAddress(peer.addresses,link.route)
-                val detail=when(status) {
+                val hint=unreachableHint(status==ConnectionStatus.UNREACHABLE,listOf(peer),p.tailscale)
+                var anywhere by rememberSaveable {mutableStateOf(false)}
+                val detail=if(peer.setupRefused)resources.getString(R.string.setup_refused_hint,peer.name) else if(SetupPresentation.introducedStatus(peer)==IntroducedStatus.SILENT && status==ConnectionStatus.UNREACHABLE)
+                    resources.getString(R.string.setup_silent_hint,peer.name) else when(status) {
                     ConnectionStatus.PAIRING_LOST->resources.getString(R.string.detail_pairing_lost,peer.name)
                     ConnectionStatus.UPDATE_REQUIRED->resources.getString(R.string.device_update_detail,peer.name)
                     ConnectionStatus.CONNECTED->listOfNotNull(link.route.takeIf(String::isNotEmpty)?.let {UiPresentation.status(context,it)},address).joinToString(" · ")
                     ConnectionStatus.WAITING_WIFI->resources.getString(R.string.detail_mobile_data_off)
-                    else->if(state.lastSeen>0)resources.getString(R.string.detail_last_connected,lastConnectedLabel(context,state.lastSeen)) else ""
+                    else->hint?.let {unreachableDetail(context,it,listOf(peer))} ?: if(state.lastSeen>0)resources.getString(R.string.detail_last_connected,lastConnectedLabel(context,state.lastSeen)) else ""
                 }
                 Surface(shape=RoundedCornerShape(24.dp),border=if(c.dark)BorderStroke(1.dp,c.hairline)else null,color=c.surface,modifier=Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(start=20.dp,end=20.dp,top=22.dp,bottom=20.dp),horizontalAlignment=Alignment.CenterHorizontally) {
@@ -135,14 +151,19 @@ private fun automaticKinds(context:android.content.Context,p:Prefs):String? {
                             if(detail.isNotEmpty())Text(detail,Modifier.padding(top=4.dp),style=PneuType.subhead,color=c.text2,maxLines=2,overflow=TextOverflow.Ellipsis,textAlign=TextAlign.Center)
                         }
                         Spacer(Modifier.height(20.dp))
-                        if(peer.pairingLost)PneuButton(pair,Modifier.fillMaxWidth().height(48.dp)) {Symbol(R.drawable.ic_qr_code_scanner,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_pair_again))}
-                        else PneuTonalButton(sendFiles,Modifier.fillMaxWidth().height(48.dp)) {Symbol(R.drawable.ic_upload,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_send_files))}
+                        if(peer.pairingLost || peer.setupRefused || SetupPresentation.introducedStatus(peer)==IntroducedStatus.SILENT && status==ConnectionStatus.UNREACHABLE)PneuButton(pair,Modifier.fillMaxWidth().height(48.dp)) {Symbol(R.drawable.ic_qr_code_scanner,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_pair_again))}
+                        // Unreachable: the Link card's action first, then Send files (files wait for the device).
+                        else PneuButtonPair(Modifier.fillMaxWidth()) {
+                            if(hint?.hasAction()==true)UnreachableAction(hint,Modifier.height(48.dp)) {anywhere=true}
+                            PneuTonalButton(sendFiles,Modifier.height(48.dp)) {Symbol(R.drawable.ic_upload,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_send_files),maxLines=1,overflow=TextOverflow.Ellipsis)}
+                        }
+                        if(anywhere)ConnectAnywhereSheet(p.tailscale,listOf(peer)) {anywhere=false}
                     }
                 }
                 if(!peer.pairingLost) {
                     Text(resources.getString(R.string.group_sharing),Modifier.padding(start=16.dp,top=22.dp,bottom=8.dp),style=PneuType.section,color=c.text2)
                     val pending=resources.getString(R.string.switch_pending,peer.name)
-                    fun note(key:String)=if(key in state.pendingSwitches && state.settingsSupported!=false)pending else null
+                    fun note(key:String)=if(!online && key in state.pendingSwitches && state.settingsSupported!=false)pending else null
                     val kinds=automaticKinds(context,p)
                     PneuCard {
                         SwitchRow(resources.getString(R.string.pref_send_clipboard),peer.clipboardSend,note("sendClipboard"),divider=false) {setSwitch("sendClipboard",it)}
@@ -150,14 +171,10 @@ private fun automaticKinds(context:android.content.Context,p:Prefs):String? {
                         if(kinds==null)SwitchRow(resources.getString(R.string.pref_automatic_sending),false,resources.getString(R.string.auto_off_all),enabled=false) {}
                         else SwitchRow(resources.getString(R.string.pref_automatic_sending),peer.automaticMedia,note("automaticMedia") ?: kinds) {setSwitch("automaticMedia",it)}
                     }
-                    if(state.settingsSupported==false)Text(resources.getString(R.string.sharing_needs_update,peer.name),Modifier.padding(start=16.dp,end=16.dp,top=8.dp),style=PneuType.subhead,color=c.text2)
+                    if(peer.helloSeen && state.settingsSupported==false)Text(resources.getString(R.string.sharing_needs_update,peer.name),Modifier.padding(start=16.dp,end=16.dp,top=8.dp),style=PneuType.subhead,color=c.text2)
                 }
                 Spacer(Modifier.height(12.dp))
-                PneuCard {
-                    Row(Modifier.fillMaxWidth().pneuClick(onClick=unpair).heightIn(min=56.dp).padding(horizontal=16.dp,vertical=12.dp),verticalAlignment=Alignment.CenterVertically) {
-                        Text(resources.getString(R.string.action_unpair),style=PneuType.body,color=c.danger)
-                    }
-                }
+                SetupPageCard(peer.name,SetupPresentation.page(p,peer),setup,unpair)
                 Spacer(Modifier.height(24.dp))
             }
         }
@@ -294,3 +311,7 @@ internal fun sendFilesTo(activity:android.app.Activity,authority:CapturedAuthori
     val list=peers ?: return
     PneuTheme {TargetPicker(list,links,{operation.selectTargets(it)}) {operation.cancelTargetSelection()}}
 }
+
+internal val ConfirmedSetupMemberSaver=androidx.compose.runtime.saveable.Saver<ConfirmedSetupMember?,String>(
+    save={it?.let {confirmed->com.google.gson.Gson().toJson(confirmed)}},
+    restore={runCatching {com.google.gson.Gson().fromJson(it,ConfirmedSetupMember::class.java)}.getOrNull()})

@@ -199,6 +199,7 @@ class Staging(private val app: AppGraph, private val deleteCommittedSource:(File
         try {android.system.Os.fsync(fd)} finally {android.system.Os.close(fd)}
     }
     companion object {
-        fun metadata(row: Outgoing)=json("transfer_id" to row.transferId,"file_name" to row.fileName,"mime" to row.mime,"size" to row.size,"sha256" to row.hash,"kind" to row.kind,"created_at" to row.createdAt,"source_media_id" to row.mediaId)
+        fun clipboardMetadata(row:Outgoing)=json("transfer_id" to row.transferId,"text" to row.text,"created_at" to row.createdAt,"origin" to row.origin).apply {if(row.sensitive)addProperty("sensitive",true)}
+        fun metadata(row: Outgoing)=json("transfer_id" to row.transferId,"file_name" to row.fileName,"mime" to row.mime,"size" to row.size,"sha256" to row.hash,"kind" to row.kind,"created_at" to row.createdAt,"source_media_id" to row.mediaId).apply {if(row.kind=="clipboard_image" && row.sensitive)addProperty("sensitive",true)}
     }
 }

@@ -63,7 +63,7 @@ class FourthReviewUiDeviceTest {
         val code=old.replace("Trusted%20PC","New%20PC").replace("a".repeat(64),"c".repeat(64))
         try {
             c.startActivity(Intent(Intent.ACTION_VIEW,Uri.parse(code),c,MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
-            assertTrue(visible("Add New PC?"));assertNull(app.connection.attempt.value?.invitation)
+            assertTrue(visible("Pair with New PC?"));assertNull(app.connection.attempt.value?.invitation)
             device.findObject(UiSelector().text("Open settings")).click()
             assertTrue(device.wait(Until.hasObject(By.pkg("com.android.settings")),4000));assertNull(app.connection.attempt.value?.invitation)
             grant(Manifest.permission.ACCESS_LOCAL_NETWORK);device.pressBack()

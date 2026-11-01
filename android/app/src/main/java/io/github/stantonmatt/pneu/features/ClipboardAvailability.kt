@@ -41,13 +41,12 @@ private data class ClipboardMime(val type:String?)
 @Composable internal fun clipboardAvailable(clip:ClipData?,p:Prefs,links:Map<String,LinkState>,resolve:(Uri)->String?):Boolean {
     val uri=clip?.takeIf {it.itemCount>0}?.getItemAt(0)?.uri
     val identity=uri?.let {ClipboardIdentity(it,requireNotNull(clip).description.timestamp,clip.description.label?.toString())}
-    val sensitive=clip?.description?.extras?.getBoolean(ClipDescription.EXTRA_IS_SENSITIVE)==true
-    val mime by key(identity,sensitive) {
+    val mime by key(identity) {
         produceState<ClipboardMime?>(null) {
-            if(!sensitive)value=try {ClipboardMime(uri?.let {source->ProviderReads.call {resolve(source)}})}
+            value=try {ClipboardMime(uri?.let {source->ProviderReads.call {resolve(source)}})}
                 catch(e:CancellationException) {throw e}
                 catch(_:Exception) {null}
         }
     }
-    return !sensitive && mime!=null && ClipboardSendPolicy.available(clip,p,links,mime?.type)
+    return mime!=null && ClipboardSendPolicy.available(clip,p,links,mime?.type)
 }

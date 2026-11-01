@@ -79,7 +79,7 @@ object UiPresentation {
         else->value
     }
     fun pairing(context:android.content.Context,value:UiFeedback):String=
-        value.status?.let {status(context,it)} ?: if(value.issue==PairingIssue.CLOCK)context.getString(R.string.pair_clock_ahead) else value.message
+        value.status?.let {status(context,it)} ?: when(value.issue) {PairingIssue.CLOCK->context.getString(R.string.pair_clock_ahead);PairingIssue.EXPIRED->context.getString(R.string.pair_expired);else->value.message}
     fun recentReceived(context:android.content.Context,item:RecentItem,time:String,pairedCount:Int):String?=
         item.received?.let {if(pairedCount>1)context.getString(R.string.recent_from_computer,it.senderName,time) else time}
 

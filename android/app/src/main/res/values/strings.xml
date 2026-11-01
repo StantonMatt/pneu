@@ -17,17 +17,31 @@
 <string name="action_settings">Settings</string>
 <string name="action_continue">Continue</string>
 <string name="pair_title">Add device</string>
-<string name="pair_instruction">Scan the QR code on your computer</string>
+<string name="pair_instruction">Scan the QR code in Pneu on your computer</string>
 <string name="pair_allow_camera">Allow camera</string>
 <string name="pair_camera_off">Camera access is off</string>
 <string name="action_open_settings">Open settings</string>
 <string name="pair_not_pneu">That isn\'t a Pneu code</string>
+<string name="pair_download_code">That\'s the download code. On your computer, click Pairing Code.</string>
 <string name="pair_expired">This code expired. Scan the new one.</string>
 <string name="pair_pairing">Pairing…</string>
 <string name="pair_already_paired">Already paired with %1$s</string>
 <string name="pair_success">Paired with %1$s</string>
-<string name="pair_unreachable_title">Can\'t reach your computer</string>
-<string name="pair_unreachable_text">Make sure both are on the same Wi-Fi, or that Tailscale is connected.</string>
+<string name="pair_unreachable_title">Can\'t reach %1$s</string>
+<string name="pair_unreachable_text">Make sure %1$s is on this Wi-Fi.</string>
+<string name="pair_unreachable_tailscale">Make sure %1$s is on this Wi-Fi, or that Tailscale is on for both.</string>
+<string name="pair_not_on_wifi">Your phone isn\'t on Wi-Fi. Connect it to the same Wi-Fi as %1$s.</string>
+<string name="pair_your_computer">your computer</string>
+<string name="pair_expired_title">This code expired</string>
+<string name="pair_expired_text">Scan the new one.</string>
+<string name="pair_get_pneu">Get Pneu for your computer</string>
+<string name="get_pneu_platforms">For Windows, Mac and Linux.</string>
+<string name="download_url" translatable="false">https://stantonmatt.github.io/pneu/</string>
+<string name="download_url_label" translatable="false">stantonmatt.github.io/pneu</string>
+<string name="action_share_link">Share link</string>
+<string name="cd_copy_link">Copy link</string>
+<string name="action_wifi_settings">Wi-Fi settings</string>
+<string name="action_ok">OK</string>
 <string name="action_try_again">Try again</string>
 <string name="action_cancel">Cancel</string>
 <string name="home_title">Pneu</string>
@@ -42,7 +56,10 @@
 <string name="detail_wifi">%1$s · Wi-Fi</string>
 <string name="detail_tailscale">%1$s · Tailscale</string>
 <string name="detail_last_connected">Last connected %1$s</string>
-<string name="detail_tailscale_off">Tailscale isn\'t connected</string>
+<string name="detail_tailscale_off">Tailscale is off</string>
+<string name="detail_same_wifi">Connects on the same Wi-Fi</string>
+<string name="detail_off_or_other_wifi">%1$s may be off or on another Wi-Fi</string>
+<string name="detail_devices_off_or_other_wifi">Your devices may be off or on another Wi-Fi</string>
 <string name="detail_mobile_data_off">Mobile data is off in settings</string>
 <string name="detail_paused">Automatic sending is off</string>
 <string name="detail_pairing_lost">%1$s doesn\'t recognize this phone</string>
@@ -51,6 +68,16 @@
 <string name="action_pause">Pause</string>
 <string name="action_resume">Resume</string>
 <string name="action_open_tailscale">Open Tailscale</string>
+<string name="action_connect_anywhere">Connect anywhere</string>
+<string name="anywhere_title">Connect from anywhere</string>
+<string name="anywhere_text">On the same Wi-Fi, Pneu connects by itself. Away from it, it needs one of these on this phone and your computers.</string>
+<string name="anywhere_tailscale_detail">Free app · install on each device</string>
+<string name="anywhere_not_on_computer">Not on %1$s yet</string>
+<string name="anywhere_not_on_computers">Not on your computers yet</string>
+<string name="anywhere_not_on_all_computers">Not on all your computers yet</string>
+<string name="action_get">Get</string>
+<string name="action_turn_on">Turn on</string>
+<string name="status_on">On</string>
 <string name="action_pair_again">Pair again</string>
 <string name="action_fix">Fix</string>
 <string name="banner_photos">Pneu can\'t see new screenshots</string>
@@ -187,6 +214,10 @@
 <string name="ui_error_cancel_pairing">Couldn\'t cancel pairing</string>
 <string name="ui_error_connection">Couldn\'t start connection</string>
 <string name="ui_error_privacy">Couldn\'t open privacy policy</string>
+<string name="ui_error_share">Couldn\'t share link</string>
+<string name="ui_error_wifi_settings">Couldn\'t open Wi-Fi settings</string>
+<string name="ui_error_tailscale">Couldn\'t open Tailscale</string>
+<string name="ui_error_play">Couldn\'t open Google Play</string>
 <string name="not_paired">Not paired</string>
 <string name="tile_mobile">Mobile data</string>
 <string name="toast_sensitive">Sensitive clipboard. Not sent.</string>
@@ -261,4 +292,21 @@
     <string name="delivery_stopped">Stopped</string>
     <string name="delivery_superseded">Replaced by a newer item</string>
     <string name="delivery_skipped">Skipped</string>
+    <string name="pref_keep_history">Keep history</string>
+    <string name="history_title">Clipboard history</string>
+    <string name="history_clear_all">Clear all</string>
+    <string name="history_this_phone">This phone</string>
+    <string name="history_origin_time">%1$s · %2$s</string>
+    <string name="history_from">From %1$s</string>
+    <string name="history_copied">Copied</string>
+    <string name="history_delete">Delete</string>
+    <string name="history_empty">Nothing sent or received yet</string>
+    <string name="history_clear_title">Clear clipboard history?</string>
+    <string name="history_off_title">Turn off clipboard history?</string>
+    <string name="history_clear">Clear</string>
+    <string name="history_turn_off">Turn off</string>
+    <plurals name="history_delete_count">
+        <item quantity="one">This deletes %d saved item.</item>
+        <item quantity="other">This deletes %d saved items.</item>
+    </plurals>
 </resources>

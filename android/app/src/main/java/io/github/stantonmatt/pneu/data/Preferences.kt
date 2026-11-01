@@ -15,7 +15,14 @@ data class Peer(val name: String, val pin: String, val deviceId: String, val add
     val settings:Map<String,PairField> = emptyMap(),val pendingSettings:String="",val confirmedSettings:String="",
     private val settingsReceipts:Map<String,String>? = null,
     @com.google.gson.annotations.SerializedName("localSettingsEdits") private val localEdits:Set<String>? = null,val settingsSupported:Boolean?=null,
-    private val acknowledgedSettings:String?=null) {
+    private val acknowledgedSettings:String?=null,
+    @com.google.gson.annotations.SerializedName("setupScope") private val setupDecision:SetupScope?=null,
+    val addedViaId:String?=null,val addedViaName:String?=null,val established:Boolean=false,val setupSupported:Boolean=false,
+    /** Last authenticated HELLO observation for this binding; never local consent. */
+    val remoteSetupScope:SetupScope?=null,val helloObserved:Boolean=false,val setupRefused:Boolean=false,val readyObserved:Boolean=false) {
+    val helloSeen get()=helloObserved || remoteSetupScope!=null || lastConnected>0
+    val setupScope get()=setupDecision ?: SetupScope.ASK
+    val setupScoped get()=addedViaId!=null || setupScope==SetupScope.ENABLED && setupSupported
     internal val acknowledgedSnapshot get()=acknowledgedSettings.orEmpty()
     val localSettingsEdits get()=localEdits.orEmpty()
     internal val legacySettingsReceipts get()=settingsReceipts.orEmpty()
@@ -38,12 +45,13 @@ data class Prefs(
     val peers:List<Peer> = emptyList(), val resetPeers:Set<String> = emptySet(),
     val recentClipboardHashes:List<String> = emptyList(),val legacyQueuePeer:String="",val legacyQueueGeneration:Long=0,val selfName:String="",val chooseDevicesEachTime:Boolean=false,val lastReceivedSource:String="",
     val recentClipboardSources:Map<String,String> = emptyMap(),
-    val automaticRevocations:Map<String,Long> = emptyMap()
+    val automaticRevocations:Map<String,Long> = emptyMap(),
+    val membership:SetupState=SetupState()
 ) {
     fun automaticRevocation(kind:String)=automaticRevocations[when(kind) {"photo"->"photos";"recording"->"recordings";else->"screenshots"}] ?: 0
     // Compatibility projection for the existing single-computer screens/fixtures.
     val devices get()=peers.ifEmpty {listOfNotNull(peer)}
-    fun installedAfter(revision:Long):DeliveryBinding? = devices.filter {it.generation>revision}.maxByOrNull {it.generation}?.let {DeliveryBinding.from(this,it.deviceId)}
+    fun installedAfter(revision:Long,pin:String?=null):DeliveryBinding? = devices.filter {it.generation>revision && (pin==null || it.pin==pin)}.maxByOrNull {it.generation}?.let {DeliveryBinding.from(this,it.deviceId)}
     fun forPeer(id:String):Prefs {
         val selected=devices.find {it.deviceId==id}
         return copy(peer=selected,lastLan=selected?.lastLan.orEmpty(),lastConnected=selected?.lastConnected ?: 0,
@@ -87,7 +95,7 @@ class Preferences(private val context:Context,internal val store:androidx.datast
     }
     /** Any successful settings write also persists abandoned clipboard effects.
      * Remove the in-memory fence only after the DataStore commit has succeeded. */
-    private suspend fun edit(body:suspend (MutablePreferences)->Unit) {
+    internal suspend fun edit(body:suspend (MutablePreferences)->Unit) {
         var effects=emptyList<ClipboardEffect>()
         store.edit {p->
             effects=unfinishedEffects.values.toList()
@@ -114,7 +122,7 @@ class Preferences(private val context:Context,internal val store:androidx.datast
             pairingRevision=l(p,"pairingRevision"),lastReceivedSource=s(p,"lastReceivedSource"),resetPeers=PeerRegistry.resets(p),
             legacyQueuePeer=s(p,"legacyQueuePeer"),legacyQueueGeneration=l(p,"legacyQueueGeneration"),
             recentClipboardHashes=s(p,"recentClipboardHashes").split('|').filter {it.isNotEmpty()},recentClipboardSources=ClipboardHistory.read(p),selfName=s(p,"selfName"),chooseDevicesEachTime=b(p,"chooseDevicesEachTime"),
-            automaticRevocations=listOf("screenshots","photos","recordings").associateWith {l(p,it+"AdmissionEpoch")}.filterValues {it!=0L})
+            membership=SetupStorage.read(p),automaticRevocations=listOf("screenshots","photos","recordings").associateWith {l(p,it+"AdmissionEpoch")}.filterValues {it!=0L})
     }
     val flow=raw.recoverReads()
     suspend fun read():Prefs=kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {storageDeadline {beforeReadStart();raw.first()}}
@@ -196,7 +204,17 @@ class Preferences(private val context:Context,internal val store:androidx.datast
     suspend fun setLong(key: String, value: Long) { edit { it[longPreferencesKey(key)] = value } }
     suspend fun setString(key: String, value: String) {
         if(key in setOf("deviceId","tlsAlias"))policy.locked {edit {if(s(it,key)!=value)advanceEpoch(it);it[stringPreferencesKey(key)]=value}}
-        else edit {it[stringPreferencesKey(key)]=value}
+        else edit {p->
+            if(key=="selfName") {
+                val state=SetupStorage.read(p);val own=state.member(s(p,"deviceId"))
+                if(own!=null && own.name!=value) {
+                    val stamp=MeshClock.next(p,s(p,"deviceId"),false)
+                    val next=state.copy(roster=state.roster.map {if(it.key==own.key)it.copy(name=value,hlc=stamp.hlc.toString(),writer=stamp.source) else it})
+                    SetupReconcile.capacity(next,PeerRegistry.read(p));SetupStorage.write(p,next)
+                }
+            }
+            p[stringPreferencesKey(key)]=value
+        }
     }
     /** Old sessions cannot repopulate a replacement PC's connection cache. */
     internal suspend fun connected(binding:DeliveryBinding,endpoint:Endpoint,at:Long=System.currentTimeMillis()):Boolean {
@@ -204,13 +222,13 @@ class Preferences(private val context:Context,internal val store:androidx.datast
         edit {
             val peers=PeerRegistry.read(it);val peer=peers.find {peer->peer.deviceId==binding.pcId} ?: return@edit
             if(s(it,"deviceId")!=binding.phoneId || peer.pin!=binding.pin || peer.generation!=binding.generation || peer.deviceId in PeerRegistry.resets(it) || peer.pairingLost)return@edit
-            PeerRegistry.write(it,peers.map {if(it==peer)it.copy(lastLan=if(endpoint.tailscale)it.lastLan else endpoint.toString(),lastConnected=at) else it})
+            PeerRegistry.write(it,peers.map {if(it==peer)it.copy(established=true,readyObserved=true,setupRefused=false,lastLan=if(endpoint.tailscale)it.lastLan else endpoint.toString(),lastConnected=at) else it})
             recorded=true
         }
         return recorded
     }
     suspend fun paired(invitation: Invitation, pcId: String,
-                       replacement:ConfirmedBinding?=null,onInstalled:(DeliveryBinding)->Unit={}): Boolean=policy.locked {
+                       replacement:ConfirmedBinding?=null,setupChoice:Boolean=true,setupFence:SetupState?=null,beforeInstall:(MutablePreferences,DeliveryBinding)->Unit={_,_->},onInstalled:(DeliveryBinding)->Unit={}): Boolean=policy.locked {
         val boundary=if(read().devices.isEmpty())pairingBoundary() else null;var installed:DeliveryBinding?=null
         edit {
             val peers=PeerRegistry.read(it)
@@ -221,15 +239,21 @@ class Preferences(private val context:Context,internal val store:androidx.datast
             if(replacement!=null && (prior==null || !replacement.matches(current)))return@edit
             require(pcId!=s(it,"deviceId")) {"Remote device ID is the phone's own ID"}
             if(prior!=null && prior.pin!=invitation.fingerprint && !prior.pairingLost)return@edit
+            val setup=SetupStorage.read(it)
+            if(setupFence!=null && (setup.withdrawalRevision!=setupFence.withdrawalRevision || setup.barriers["$pcId/${invitation.fingerprint}"]?.pairingFence()!=setupFence.barriers["$pcId/${invitation.fingerprint}"]?.pairingFence()))return@edit
             val first=peers.isEmpty()
             val unchanged=prior!=null && !PairingIdentity.changes(prior,invitation,pcId)
             val generation=if(unchanged)requireNotNull(prior).generation else Math.addExact(l(it,"pairingRevision"),1)
             if(!unchanged)it[longPreferencesKey("pairingRevision")]=generation
-            val peer=if(unchanged)requireNotNull(prior).copy(name=invitation.name,addresses=invitation.addresses,pairingLost=false) else Peer(invitation.name,invitation.fingerprint,pcId,invitation.addresses,generation=generation,
+            var peer=if(unchanged)requireNotNull(prior).copy(name=invitation.name,addresses=invitation.addresses,pairingLost=false) else Peer(invitation.name,invitation.fingerprint,pcId,invitation.addresses,generation=generation,
                 lastLan=prior?.takeIf {it.deviceId==pcId && it.pin==invitation.fingerprint}?.lastLan.orEmpty(),
                 lastConnected=prior?.takeIf {it.deviceId==pcId && it.pin==invitation.fingerprint}?.lastConnected ?: 0,
                 clipboardSend=prior?.clipboardSend ?: true,clipboardReceive=prior?.clipboardReceive ?: true,automaticMedia=prior?.automaticMedia ?: true,
                 settings=prior?.takeIf {it.deviceId==pcId}?.settings.orEmpty(),localEdits=prior?.takeIf {it.deviceId==pcId}?.localSettingsEdits.orEmpty(),settingsSupported=prior?.settingsSupported)
+            peer=peer.copy(setupDecision=prior?.setupScope ?: if(setupChoice)SetupScope.ENABLED else SetupScope.DISABLED,
+                addedViaId=null,addedViaName=null)
+            SetupTransactions.paired(it,setup,peer,prior,setupChoice,setupFence!=null,
+                selfPin=if(setup.withdrawn)sha256(TlsIdentity(s(it,"tlsAlias")).certificate.encoded) else null)
             PeerRegistry.write(it,if(prior==null)peers+peer else peers.map {p->if(p==prior)peer else p})
             if(prior!=null && !unchanged)PeerRegistry.reset(it,prior.deviceId)
             it[booleanPreferencesKey("pairingLost")]=false;it.remove(stringPreferencesKey("lostPcName"))
@@ -248,6 +272,7 @@ class Preferences(private val context:Context,internal val store:androidx.datast
             }
             it[longPreferencesKey("mediaSince")]=System.currentTimeMillis()/1000
             installed=DeliveryBinding(s(it,"deviceId"),peer.pin,peer.deviceId,peer.generation)
+            beforeInstall(it,requireNotNull(installed))
             onInstalled(requireNotNull(installed))
         }
         installed!=null
@@ -406,9 +431,13 @@ class Preferences(private val context:Context,internal val store:androidx.datast
         }
     }
     internal class SettingsConflict:Exception()
-    internal suspend fun hello(binding:DeliveryBinding,name:String,addresses:List<Endpoint>,mesh:Boolean=true) {edit {p->
+    internal suspend fun hello(binding:DeliveryBinding,name:String,addresses:List<Endpoint>,mesh:Boolean=true,setup:Boolean=false,remoteSetupScope:SetupScope?=null) {edit {p->
         PeerRegistry.write(p,PeerRegistry.read(p).map {if(it.deviceId==binding.pcId && it.generation==binding.generation && it.pin==binding.pin)
-            it.copy(name=name,settingsSupported=mesh,addresses=if(addresses.isEmpty())it.addresses else (addresses+it.addresses).distinct().take(8)) else it})
+            it.copy(name=name,helloObserved=true,settingsSupported=mesh,setupSupported=setup,remoteSetupScope=remoteSetupScope.takeIf {setup},
+                addresses=if(addresses.isEmpty())it.addresses else (addresses+it.addresses).distinct().take(16)) else it})
+    }}
+    internal suspend fun introducedRefusal(binding:DeliveryBinding,authenticated:Boolean) {edit {p->
+        PeerRegistry.write(p,PeerRegistry.read(p).map {peer->refusedPeer(peer,binding,authenticated)})
     }}
     suspend fun finishPeerReset(peerId:String) {edit {PeerRegistry.finishReset(it,peerId)}}
     suspend fun forget(lostPcName:String?=null,peerId:String?=null):Unit=policy.locked {
@@ -419,7 +448,10 @@ class Preferences(private val context:Context,internal val store:androidx.datast
             val target=peers.find {peer->peer.deviceId==(peerId ?: peers.firstOrNull()?.deviceId)}
             if(target!=null) {
                 if(lostPcName!=null)PeerRegistry.write(it,peers.map {peer->if(peer==target)peer.copy(pairingLost=true) else peer})
-                else PeerRegistry.remove(it,target.deviceId)
+                else {
+                    PeerRegistry.remove(it,target.deviceId)
+                    SetupStorage.write(it,SetupStorage.read(it))
+                }
                 PeerRegistry.reset(it,target.deviceId)
                 it.remove(longPreferencesKey("legacyImageTime:${target.deviceId}"))
                 it.remove(longPreferencesKey("legacyImageGeneration:${target.deviceId}"))
@@ -431,3 +463,7 @@ class Preferences(private val context:Context,internal val store:androidx.datast
         }
     }
 }
+
+internal fun refusedPeer(peer:Peer,binding:DeliveryBinding,authenticated:Boolean)=
+    if(authenticated && peer.addedViaId!=null && peer.deviceId==binding.pcId && peer.pin==binding.pin && peer.generation==binding.generation)
+        peer.copy(setupRefused=true) else peer

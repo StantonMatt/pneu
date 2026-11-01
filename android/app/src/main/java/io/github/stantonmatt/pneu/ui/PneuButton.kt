@@ -10,6 +10,9 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.*
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 
 // The wrappers keep the existing screen callbacks and semantics intact.
@@ -38,3 +41,18 @@ internal val LocalButtonKind=staticCompositionLocalOf {ButtonKind.Text}
 }
 @Composable fun PneuTonalButton(onClick:()->Unit,modifier:Modifier=Modifier,enabled:Boolean=true,contentPadding:PaddingValues=PaddingValues(horizontal=12.dp),content:@Composable RowScope.()->Unit)=PneuButton(onClick,modifier,enabled,ButtonKind.Tonal,contentPadding,content)
 @Composable fun PneuNeutralButton(onClick:()->Unit,modifier:Modifier=Modifier,content:@Composable RowScope.()->Unit)=PneuButton(onClick,modifier,kind=ButtonKind.Neutral,content=content)
+
+/** Buttons in equal columns, or one full-width row each, in order, when any label wouldn't fit its column. */
+@Composable fun PneuButtonPair(modifier:Modifier=Modifier,gap:Dp=10.dp,content:@Composable ()->Unit) {
+    Layout(content,modifier) {children,constraints->
+        val space=gap.roundToPx();val width=constraints.maxWidth
+        val column=if(children.isEmpty())width else (width-space*(children.size-1))/children.size
+        val beside=children.all {it.maxIntrinsicWidth(Constraints.Infinity)<=column}
+        val placeables=children.map {it.measure(constraints.copy(minWidth=if(beside)column else width,maxWidth=if(beside)column else width,minHeight=0))}
+        val height=if(beside)placeables.maxOfOrNull {it.height} ?: 0 else placeables.sumOf {it.height}+space*(placeables.size-1).coerceAtLeast(0)
+        layout(width,height) {
+            var offset=0
+            placeables.forEach {if(beside) {it.placeRelative(offset,0);offset+=column+space} else {it.placeRelative(0,offset);offset+=it.height+space}}
+        }
+    }
+}

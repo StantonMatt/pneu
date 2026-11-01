@@ -221,6 +221,8 @@ def authenticated(rows, digest):
 
 
 LOCAL_TESTS = (
+    'ClipboardHistoryDeviceTest', 'ClipboardHistoryIntegrationDeviceTest', 'ClipboardHistoryMigrationDeviceTest',
+    'ClipboardHistoryScreensDeviceTest',
     'Sweep4RegressionDeviceTest',
     'ReceiveStorageDeviceTest', 'DeviceScreensDeviceTest', 'Sweep3RegressionDeviceTest', 'OperationFeedbackDeviceTest',
     'AdmissionFenceDeviceTest', 'MergeRegressionDeviceTest',
@@ -235,6 +237,8 @@ LOCAL_TESTS = (
     'FourteenthReviewDeviceTest', 'FifteenthReviewDeviceTest',
     'SixteenthReviewDeviceTest', 'SixteenthRecentDeviceTest', 'EighteenthReviewUiDeviceTest',
     'TwentiethReviewDeviceTest', 'TwentyFirstPolicyDeviceTest', 'TwentySecondReviewDeviceTest',
+    'OnboardingDeviceTest',
+    'SetupFlowDeviceTest', 'SetupScreensDeviceTest',
 )
 
 
@@ -246,6 +250,8 @@ def local_case(test):
         screenshots('files/fifth-review-screens', 'screens')
         if test == 'V2ScreensDeviceTest':
             screenshots('files/v2-screens', 'screens')
+        if test in ('SetupFlowDeviceTest', 'SetupScreensDeviceTest'):
+            screenshots('files/setup-screens', 'setup-screens')
         if test == 'DeviceScreensDeviceTest':
             screenshots('files/device-screens', 'device-screens')
         if test == 'SixteenthRecentDeviceTest':

@@ -4,6 +4,15 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
 object QueueMigrations {
+    val sensitiveClips=object : Migration(11,12) {
+        override fun migrate(db:SupportSQLiteDatabase) {
+            db.execSQL("DROP VIEW outgoing")
+            db.execSQL("ALTER TABLE artifacts ADD COLUMN sensitive INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE receipts ADD COLUMN sensitive INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("CREATE VIEW `outgoing` AS "+OutgoingView.SQL)
+        }
+    }
+
     val receivedFiles=object : Migration(10,11) {
         override fun migrate(db:SupportSQLiteDatabase) {
             db.execSQL("CREATE TABLE received_files (peerId TEXT NOT NULL,transferId TEXT NOT NULL,metadata TEXT NOT NULL,uri TEXT NOT NULL,catalogVersion TEXT NOT NULL,fileName TEXT NOT NULL,mime TEXT NOT NULL,kind TEXT NOT NULL,senderName TEXT NOT NULL,state TEXT NOT NULL,generation INTEGER NOT NULL,size INTEGER NOT NULL,receivedAt INTEGER NOT NULL,PRIMARY KEY(peerId,transferId))")

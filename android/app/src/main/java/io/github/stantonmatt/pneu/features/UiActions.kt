@@ -10,13 +10,13 @@ class UiActions(private val failure:(String,(() -> Unit)?)->Unit) {
             android.os.Handler(android.os.Looper.getMainLooper()).post {android.widget.Toast.makeText(context,message,android.widget.Toast.LENGTH_LONG).show()}
         }
     }
-    suspend fun run(message:String,retry:(()->Unit)?=null,body:suspend ()->Unit):Boolean = try {
+    suspend fun run(message:String,retry:(()->Unit)?=null,errorMessage:(Exception)->String={message},body:suspend ()->Unit):Boolean = try {
         body();true
     } catch(e:Exception) {
         if(e is CancellationException)throw e
         // Class only: provider/database messages can contain user content or paths.
         runCatching {android.util.Log.w("PneuUiAction",e.javaClass.simpleName)}
-        failure(message,retry);false
+        failure(errorMessage(e),retry);false
     }
 }
 val LocalUiActions=staticCompositionLocalOf<UiActions> {error("Missing UI action boundary")}

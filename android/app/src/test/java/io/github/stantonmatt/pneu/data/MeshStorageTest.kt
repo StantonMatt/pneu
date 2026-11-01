@@ -73,7 +73,7 @@ class MeshStorageTest {
             override fun onUpgrade(db:SupportSQLiteDatabase,oldVersion:Int,newVersion:Int)=error("Unexpected upgrade")
         }).build())
         helper.writableDatabase;helper.close()
-        val room=Room.databaseBuilder(context,QueueDatabase::class.java,name).addMigrations(QueueMigrations.recipients,QueueMigrations.peerWatermarks,QueueMigrations.pendingAdmissions,QueueMigrations.receivedFiles).build()
+        val room=Room.databaseBuilder(context,QueueDatabase::class.java,name).addMigrations(QueueMigrations.recipients,QueueMigrations.peerWatermarks,QueueMigrations.pendingAdmissions,QueueMigrations.receivedFiles,QueueMigrations.sensitiveClips).build()
         try {
             val queue=room.queue();val row=queue.all().single {it.mediaId=="old"}
             assertEquals("Unfenced clipboard work cannot survive upgrade", "superseded",queue.find("old-text").state)
@@ -182,7 +182,7 @@ class MeshStorageTest {
         catch(_:java.io.IOException) {}
         assertNull(prefs.store.data.first()[stringPreferencesKey("peers")])
         val migrated=prefs.read();assertEquals(pc,migrated.devices.single().deviceId)
-        prefs.store.edit {PeerRegistry.write(it,PeerRegistry.read(it)+peer(other))}
+        prefs.store.edit {PeerRegistry.write(it,PeerRegistry.read(it)+peer(other).copy(pin="e".repeat(64)))}
         prefs.forget(peerId=pc)
         val remaining=prefs.read()
         assertEquals(listOf(other),remaining.devices.map {it.deviceId});assertEquals(setOf(pc),remaining.resetPeers)

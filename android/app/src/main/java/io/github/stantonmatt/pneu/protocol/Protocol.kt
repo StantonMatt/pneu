@@ -16,7 +16,7 @@ const val CHUNK_SIZE = 262_144
 
 enum class Type(val wire: Int) {
     HELLO(1), PAIR_REQUEST(2), PAIR_RESULT(3), PING(4), PONG(5), STATUS(6), UNPAIR(7),
-    FILE_BEGIN(16), FILE_CHUNK(17), FILE_END(18), ACK(19), NACK(20), CLIPBOARD(32), PEER_SETTINGS(33), ERROR(127);
+    FILE_BEGIN(16), FILE_CHUNK(17), FILE_END(18), ACK(19), NACK(20), CLIPBOARD(32), PEER_SETTINGS(33), MEMBERS(34), ERROR(127);
     val label get() = name.lowercase()
 }
 sealed interface Frame {
@@ -36,14 +36,15 @@ fun strictUtf8(bytes: ByteArray): String = Charsets.UTF_8.newDecoder()
 
 object Protocol {
     private val known = mapOf(
-        Type.HELLO to setOf("version", "device_id", "name", "capabilities", "paused", "role", "addresses"),
+        Type.HELLO to setOf("version", "device_id", "name", "capabilities", "paused", "role", "addresses", "setup"),
         Type.PAIR_REQUEST to setOf("token"), Type.PAIR_RESULT to setOf("accepted", "code", "message"),
         Type.PING to setOf("nonce"), Type.PONG to setOf("nonce"), Type.STATUS to setOf("paused"), Type.UNPAIR to emptySet(),
-        Type.FILE_BEGIN to setOf("transfer_id", "file_name", "mime", "size", "sha256", "kind", "created_at", "source_media_id", "hlc", "source_device"),
+        Type.FILE_BEGIN to setOf("transfer_id", "file_name", "mime", "size", "sha256", "kind", "created_at", "source_media_id", "hlc", "source_device", "sensitive"),
         Type.FILE_END to setOf("transfer_id"), Type.ACK to setOf("transfer_id", "deduplicated"),
         Type.NACK to setOf("transfer_id", "code", "retryable", "message"),
-        Type.CLIPBOARD to setOf("transfer_id", "text", "created_at", "origin", "hlc", "source_device"),
+        Type.CLIPBOARD to setOf("transfer_id", "text", "created_at", "origin", "hlc", "source_device", "sensitive"),
         Type.PEER_SETTINGS to setOf("transfer_id", "settings"),
+        Type.MEMBERS to setOf("transfer_id", "setup_id", "members"),
         Type.ERROR to setOf("code", "message", "supported_version")
     )
     val nackCodes = setOf("hash_mismatch", "size_mismatch", "storage_failed", "disk_full", "not_writable", "unsupported_kind", "id_conflict", "clipboard_unavailable")
@@ -58,7 +59,7 @@ object Protocol {
             else require(!c.isLowSurrogate())
         }
     }
-    private fun validateAddress(value: String) {
+    internal fun validateAddress(value: String) {
         val endpoint = Endpoint.parse(value)
         if (':' in endpoint.host) {
             // Java also permits overlong hex groups padded with leading zeroes.
@@ -92,36 +93,43 @@ object Protocol {
         require(!text.startsWith('\uFEFF'))
         val reader = JsonReader(StringReader(text)).apply { strictness = Strictness.STRICT }
         require(reader.peek() == JsonToken.BEGIN_OBJECT)
-        val result = JsonObject(); val seen = mutableSetOf<String>()
-        reader.beginObject()
-        while (reader.hasNext()) {
-            val name = reader.nextName().also(::validateUnicode)
-            require(name !in known.getValue(type) || seen.add(name)) { "Duplicate field" }
-            val value = if (type == Type.PEER_SETTINGS && name == "settings") readSettings(reader) else JsonParser.parseReader(reader)
-            if (name in known.getValue(type)) result.add(name, value)
-        }
-        reader.endObject(); require(reader.peek() == JsonToken.END_DOCUMENT)
+        val result = readValue(reader, known.getValue(type)).asJsonObject
+        require(reader.peek() == JsonToken.END_DOCUMENT)
         validate(type, result)
         return Frame.Control(type, result)
     }
-    private fun readSettings(reader: JsonReader): JsonArray {
-        require(reader.peek() == JsonToken.BEGIN_ARRAY)
-        val result=JsonArray()
-        val fields=setOf("key", "enabled", "hlc", "writer_device")
-        reader.beginArray()
-        while(reader.hasNext()) {
-            require(result.size() < 3 && reader.peek() == JsonToken.BEGIN_OBJECT)
-            val item=JsonObject();val seen=mutableSetOf<String>()
-            reader.beginObject()
+    // Stream every object before Gson can discard duplicate fields. Unknown
+    // values still get Unicode member-name validation recursively.
+    private fun readValue(reader: JsonReader, fields: Set<String>? = null, context: String = ""): JsonElement = when(reader.peek()) {
+        JsonToken.BEGIN_OBJECT -> JsonObject().apply {
+            val seen=mutableSetOf<String>();reader.beginObject()
             while(reader.hasNext()) {
                 val name=reader.nextName().also(::validateUnicode)
-                require(name !in fields || seen.add(name)) { "Duplicate settings field" }
-                val value=JsonParser.parseReader(reader)
-                if(name in fields)item.add(name,value)
+                require(fields==null || name !in fields || seen.add(name)) { "Duplicate field" }
+                val nested=when(name.takeIf {fields!=null && name in fields}) {
+                    "setup" -> SetupWire.helloFields
+                    "reach" -> SetupWire.reachFields
+                    "readmits" -> SetupWire.readmitsFields
+                    else -> null
+                }
+                val value=readValue(reader,nested,if(fields!=null && name in fields)name else "")
+                if(fields==null || name in fields)add(name,value)
             }
-            reader.endObject();result.add(item)
+            reader.endObject()
         }
-        reader.endArray();return result
+        JsonToken.BEGIN_ARRAY -> JsonArray().apply {
+            reader.beginArray()
+            while(reader.hasNext()) {
+                val itemFields=when(context) {
+                    "members" -> SetupWire.memberFields
+                    "settings" -> setOf("key","enabled","hlc","writer_device")
+                    else -> null
+                }
+                add(readValue(reader,itemFields))
+            }
+            reader.endArray()
+        }
+        else -> JsonParser.parseReader(reader)
     }
     fun write(output: OutputStream, frame: Frame) {
         val stream = DataOutputStream(output)
@@ -172,6 +180,7 @@ object Protocol {
                 val caps = o.get("capabilities"); require(caps is JsonArray && caps.size() <= 16)
                 val names = caps.map { string(it,64) }
                 require(names.distinct().size == names.size && ("clipboard_image" !in names || "files" in names))
+                SetupWire.validateHello(o,names)
                 optional("paused") { bool("paused") }
                 optional("role") { require(str("role",8) in setOf("phone","computer")) }
                 optional("addresses") {
@@ -190,14 +199,14 @@ object Protocol {
                 val name = str("file_name", 255); require(name !in setOf(".", "..") && '/' !in name && '\\' !in name)
                 val mime = str("mime", 255); val kind = str("kind", 32)
                 require(kind in setOf("screenshot", "photo", "recording", "file", "clipboard_image"))
-                if (kind == "clipboard_image") require(mime.startsWith("image/") && mime.length > 6)
+                if (kind == "clipboard_image") {require(mime.startsWith("image/") && mime.length > 6);optional("sensitive") {bool("sensitive")}}
                 optional("source_media_id") { str("source_media_id", 256) }
                 clipboardClock();require(!o.has("hlc") || (mime.startsWith("image/") && mime.length > 6))
             }
             Type.FILE_END -> hex("transfer_id", 32)
             Type.ACK -> { hex("transfer_id", 32); bool("deduplicated") }
             Type.NACK -> { hex("transfer_id", 32); val code = str("code", 64); require(code in nackCodes); require(bool("retryable") == (code !in setOf("unsupported_kind", "id_conflict"))) }
-            Type.CLIPBOARD -> { hex("transfer_id", 32); str("text", 16384, 0); num("created_at", MAX_TIMESTAMP); optional("origin") { require(str("origin", 16) in setOf("clipboard", "share")) };clipboardClock() }
+            Type.CLIPBOARD -> { optional("sensitive") {bool("sensitive")};hex("transfer_id", 32); str("text", 16384, 0); num("created_at", MAX_TIMESTAMP); optional("origin") { require(str("origin", 16) in setOf("clipboard", "share")) };clipboardClock() }
             Type.PEER_SETTINGS -> {
                 hex("transfer_id",32)
                 val settings=o.get("settings");require(settings is JsonArray && settings.size() in 1..3)
@@ -213,6 +222,7 @@ object Protocol {
                     require(string(entry.get("writer_device"),32) in parts.take(2))
                 }
             }
+            Type.MEMBERS -> { SetupWire.decode(o) }
             Type.ERROR -> { val code = str("code", 64); require(code in errors); if (code == "version_mismatch") num("supported_version", 4294967295, 1) else require(!o.has("supported_version")) }
             Type.FILE_CHUNK -> error("Binary only")
         }

@@ -62,7 +62,7 @@ object ManualEntries {
         val captured=admission.await()
         return text(app,text,origin,captured.binding,captured.text,order)
     }
-    suspend fun text(app: AppGraph,text: String,origin: String,binding:DeliveryBinding?,targets:List<DeliveryBinding>?=null,order:Pair<ClipboardStamp,Long>?=null,provenance:SendProvenance?=null): Outgoing {
+    suspend fun text(app: AppGraph,text: String,origin: String,binding:DeliveryBinding?,targets:List<DeliveryBinding>?=null,order:Pair<ClipboardStamp,Long>?=null,provenance:SendProvenance?=null,sensitive:Boolean=false): Outgoing {
         val captured=targets ?: listOfNotNull(binding?.let {app.connection.freezeSession(it)})
         val (stamp,timestamp)=order ?: shareStep("settings") {app.newTextOrder()}
         val current=shareStep("settings") {app.preferences.read()}
@@ -73,7 +73,7 @@ object ManualEntries {
         val recipients=ClipboardSendPolicy.targets(current,captured,source)
             .filter {app.recipientCurrent(it,current) && eligible.any {target->target.pcId==it.pcId}}
         if(recipients.isEmpty())throw ShareFailure("no_recipient")
-        val row=Outgoing().apply {mediaId="manual:${randomId()}";transferId=randomId();kind="text";automatic=false;this.text=text;this.origin=origin;createdAt=timestamp;mime="text/plain";this.recipients=recipients;sendProvenance=source;hlc=stamp.hlc.toString();sourceDevice=stamp.source}
+        val row=Outgoing().apply {mediaId="manual:${randomId()}";transferId=randomId();kind="text";automatic=false;this.text=text;this.origin=origin;this.sensitive=sensitive;createdAt=timestamp;mime="text/plain";this.recipients=recipients;sendProvenance=source;hlc=stamp.hlc.toString();sourceDevice=stamp.source}
         shareStep("invalid_text") {
             Protocol.validate(Type.CLIPBOARD,json("transfer_id" to row.transferId,"text" to text,"created_at" to row.createdAt,"origin" to origin))
             Protocol.write(java.io.ByteArrayOutputStream(),Frame.Control(Type.CLIPBOARD,json("transfer_id" to row.transferId,"text" to text,"created_at" to row.createdAt,"origin" to origin)))
@@ -87,7 +87,7 @@ object ManualEntries {
         val captured=admission.await()
         return file(app,uri,kind,captured.binding,targets=captured.targets(kind),order=order)
     }
-    suspend fun file(app: AppGraph,uri: Uri,kind: String,binding:DeliveryBinding?,resolvedMime:String?=null,targets:List<DeliveryBinding>?=null,order:Pair<ClipboardStamp,Long>?=null,provenance:SendProvenance?=null): Outgoing {
+    suspend fun file(app: AppGraph,uri: Uri,kind: String,binding:DeliveryBinding?,resolvedMime:String?=null,targets:List<DeliveryBinding>?=null,order:Pair<ClipboardStamp,Long>?=null,provenance:SendProvenance?=null,sensitive:Boolean=false): Outgoing {
         val captured=targets ?: listOfNotNull(if(kind=="clipboard_image")binding?.let {app.connection.freezeSession(it)} else binding)
         // MIME lookup is untrusted provider work. Reserve even when the type is
         // unknown, and retain this order if it turns out to be an image.
@@ -101,9 +101,10 @@ object ManualEntries {
         val recipients=ClipboardSendPolicy.targets(current,captured,source)
             .filter {app.recipientCurrent(it,current) && eligible.any {target->target.pcId==it.pcId}}
         if(recipients.isEmpty())throw ShareFailure("no_recipient")
-        shareStep("metadata_failed") {ShareAdmission.rejection(app.context,uri)}?.let {throw ShareFailure(it)}
+        if(kind!="clipboard_image" || !app.savedClips.ownsImage(uri))
+            shareStep("metadata_failed") {ShareAdmission.rejection(app.context,uri)}?.let {throw ShareFailure(it)}
         val type=resolvedMime ?: shareStep("metadata_failed") {ProviderReads.call {app.context.contentResolver.getType(uri)}}
-        val row=Outgoing().apply {mediaId="manual:${randomId()}";transferId=randomId();this.uri=uri.toString();this.kind=kind;automatic=false;createdAt=timestamp;mime=type ?: "application/octet-stream";fileName=app.context.getString(R.string.shared_item);this.recipients=recipients;sendProvenance=source}
+        val row=Outgoing().apply {mediaId="manual:${randomId()}";transferId=randomId();this.uri=uri.toString();this.kind=kind;this.sensitive=kind=="clipboard_image" && sensitive;automatic=false;createdAt=timestamp;mime=type ?: "application/octet-stream";fileName=app.context.getString(R.string.shared_item);this.recipients=recipients;sendProvenance=source}
         if(row.mime.startsWith("image/")) {row.hlc=stamp.hlc.toString();row.sourceDevice=stamp.source}
         row.fileName=shareStep("metadata_failed") {ProviderReads.call {signal->app.context.contentResolver.query(uri,arrayOf(OpenableColumns.DISPLAY_NAME),null,null,null,signal)?.use {if(it.moveToFirst())it.getString(0) else null}}} ?: row.fileName
         row.fileName=safeFilename(row.fileName)
@@ -200,7 +201,7 @@ class ShareActivity : ManualEntryActivity() {
             }
             // The bounded provider open/read proves access, including chooser
             // grants or our media permission. Keep temporary grants service-owned.
-            val request=ShareRequest(binding,items,texts,admission)
+            val request=ShareRequest(binding,items,texts,admission,sensitive=intent.clipData?.description?.extras?.getBoolean(ClipDescription.EXTRA_IS_SENSITIVE)==true)
             failureReason="service_start"
             ShareAdmissionService.start(this,operation,request)
         }catch(_:Exception) {ShareAdmission.warn(failureReason);operation.failure(getString(R.string.toast_cant_read),failureReason)}

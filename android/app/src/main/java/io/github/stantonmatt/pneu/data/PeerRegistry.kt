@@ -14,7 +14,7 @@ internal object PeerRegistry {
     private val gson=Gson()
     fun read(p:androidx.datastore.preferences.core.Preferences):List<Peer> =
         p[key]?.let {requireNotNull(gson.fromJson<List<Peer>>(it,object:TypeToken<List<Peer>>(){}.type)).also {peers->require(peers.size<=MAX_PEERS)}} ?: emptyList()
-    fun write(p:MutablePreferences,peers:List<Peer>) {require(peers.size<=MAX_PEERS);require(peers.map {it.deviceId}.distinct().size==peers.size);val encoded=gson.toJsonTree(peers.map {PairSettings.initialize(it,p[stringPreferencesKey("deviceId")].orEmpty())}).asJsonArray
+    fun write(p:MutablePreferences,peers:List<Peer>) {require(peers.size<=MAX_PEERS);require(peers.map {it.deviceId}.distinct().size==peers.size);require(peers.map {it.pin}.distinct().size==peers.size);val encoded=gson.toJsonTree(peers.map {PairSettings.initialize(it,p[stringPreferencesKey("deviceId")].orEmpty())}).asJsonArray
         encoded.forEach {if(it.asJsonObject["settingsReceipts"]?.asJsonObject?.size().let {size->size==null || size==0})it.asJsonObject.remove("settingsReceipts")}
         p[key]=gson.toJson(encoded)}
     fun resets(p:androidx.datastore.preferences.core.Preferences)=p[resetKey].orEmpty()

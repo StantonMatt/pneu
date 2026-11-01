@@ -1,0 +1,119 @@
+{
+  "vectors": [
+    {
+      "name": "join",
+      "payload": "{\"transfer_id\":\"44444444444444444444444444444444\",\"setup_id\":\"00000000000000000000000000000000\",\"members\":[{\"device_id\":\"11111111111111111111111111111111\",\"fingerprint\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"role\":\"phone\",\"name\":\"Phone\",\"status\":\"member\",\"hlc\":1800000000001,\"writer_device\":\"11111111111111111111111111111111\"},{\"device_id\":\"22222222222222222222222222222222\",\"fingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"role\":\"computer\",\"name\":\"Office PC\",\"status\":\"member\",\"hlc\":1800000000002,\"writer_device\":\"11111111111111111111111111111111\"},{\"device_id\":\"33333333333333333333333333333333\",\"fingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"role\":\"computer\",\"name\":\"Laptop\",\"status\":\"member\",\"hlc\":1800000000003,\"writer_device\":\"11111111111111111111111111111111\",\"reach\":{\"addresses\":[\"192.168.1.12:47821\"],\"relay\":[],\"hlc\":1800000000004,\"writer_device\":\"33333333333333333333333333333333\"}}]}",
+      "prefix": "000003e222"
+    },
+    {
+      "name": "remove",
+      "payload": "{\"transfer_id\":\"55555555555555555555555555555555\",\"setup_id\":\"00000000000000000000000000000000\",\"members\":[{\"device_id\":\"11111111111111111111111111111111\",\"fingerprint\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"role\":\"phone\",\"name\":\"Phone\",\"status\":\"member\",\"hlc\":1800000000001,\"writer_device\":\"11111111111111111111111111111111\"},{\"device_id\":\"22222222222222222222222222222222\",\"fingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"role\":\"computer\",\"name\":\"Office PC\",\"status\":\"member\",\"hlc\":1800000000002,\"writer_device\":\"11111111111111111111111111111111\"},{\"device_id\":\"33333333333333333333333333333333\",\"fingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"role\":\"computer\",\"name\":\"Laptop\",\"status\":\"removed\",\"hlc\":1800000000010,\"writer_device\":\"22222222222222222222222222222222\"}]}",
+      "prefix": "0000036422"
+    },
+    {
+      "name": "later-introduction",
+      "payload": "{\"transfer_id\":\"66666666666666666666666666666666\",\"setup_id\":\"00000000000000000000000000000000\",\"members\":[{\"device_id\":\"11111111111111111111111111111111\",\"fingerprint\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"role\":\"phone\",\"name\":\"Phone\",\"status\":\"member\",\"hlc\":1800000000001,\"writer_device\":\"11111111111111111111111111111111\"},{\"device_id\":\"22222222222222222222222222222222\",\"fingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"role\":\"computer\",\"name\":\"Office PC\",\"status\":\"member\",\"hlc\":1800000000002,\"writer_device\":\"11111111111111111111111111111111\"},{\"device_id\":\"33333333333333333333333333333333\",\"fingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"role\":\"computer\",\"name\":\"Laptop\",\"status\":\"member\",\"hlc\":1800000000020,\"writer_device\":\"11111111111111111111111111111111\",\"reach\":{\"addresses\":[\"192.168.1.12:47821\"],\"relay\":[],\"hlc\":1800000000004,\"writer_device\":\"33333333333333333333333333333333\"}}]}",
+      "prefix": "000003e222"
+    },
+    {
+      "name": "reach-refresh",
+      "payload": "{\"transfer_id\":\"77777777777777777777777777777777\",\"setup_id\":\"00000000000000000000000000000000\",\"members\":[{\"device_id\":\"11111111111111111111111111111111\",\"fingerprint\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"role\":\"phone\",\"name\":\"Phone\",\"status\":\"member\",\"hlc\":1800000000001,\"writer_device\":\"11111111111111111111111111111111\"},{\"device_id\":\"22222222222222222222222222222222\",\"fingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"role\":\"computer\",\"name\":\"Office PC\",\"status\":\"member\",\"hlc\":1800000000002,\"writer_device\":\"11111111111111111111111111111111\"},{\"device_id\":\"33333333333333333333333333333333\",\"fingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"role\":\"computer\",\"name\":\"Laptop\",\"status\":\"member\",\"hlc\":1800000000003,\"writer_device\":\"11111111111111111111111111111111\",\"reach\":{\"addresses\":[\"192.168.1.13:47821\"],\"relay\":[],\"hlc\":1800000000030,\"writer_device\":\"33333333333333333333333333333333\"}}]}",
+      "prefix": "000003e222"
+    },
+    {
+      "name": "targeted-withdrawal",
+      "payload": "{\"transfer_id\":\"88888888888888888888888888888888\",\"setup_id\":\"00000000000000000000000000000000\",\"members\":[{\"device_id\":\"11111111111111111111111111111111\",\"fingerprint\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"role\":\"phone\",\"name\":\"Phone\",\"status\":\"member\",\"hlc\":1800000000001,\"writer_device\":\"11111111111111111111111111111111\"},{\"device_id\":\"22222222222222222222222222222222\",\"fingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"role\":\"computer\",\"name\":\"Office PC\",\"status\":\"removed\",\"hlc\":1800000000010,\"writer_device\":\"11111111111111111111111111111111\"},{\"device_id\":\"33333333333333333333333333333333\",\"fingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"role\":\"computer\",\"name\":\"Laptop\",\"status\":\"member\",\"hlc\":1800000000003,\"writer_device\":\"11111111111111111111111111111111\",\"reach\":{\"addresses\":[\"192.168.1.12:47821\"],\"relay\":[],\"hlc\":1800000000004,\"writer_device\":\"33333333333333333333333333333333\"}}]}",
+      "prefix": "000003e322"
+    },
+    {
+      "name": "receiver-certificate-replacement",
+      "payload": "{\"transfer_id\":\"99999999999999999999999999999999\",\"setup_id\":\"00000000000000000000000000000000\",\"members\":[{\"device_id\":\"11111111111111111111111111111111\",\"fingerprint\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"role\":\"phone\",\"name\":\"Phone\",\"status\":\"member\",\"hlc\":1800000000001,\"writer_device\":\"11111111111111111111111111111111\"},{\"device_id\":\"22222222222222222222222222222222\",\"fingerprint\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"role\":\"computer\",\"name\":\"Office PC\",\"status\":\"member\",\"hlc\":1800000000020,\"writer_device\":\"11111111111111111111111111111111\"},{\"device_id\":\"22222222222222222222222222222222\",\"fingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"role\":\"computer\",\"name\":\"Office PC\",\"status\":\"removed\",\"hlc\":1800000000010,\"writer_device\":\"11111111111111111111111111111111\"},{\"device_id\":\"33333333333333333333333333333333\",\"fingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"role\":\"computer\",\"name\":\"Laptop\",\"status\":\"member\",\"hlc\":1800000000003,\"writer_device\":\"11111111111111111111111111111111\",\"reach\":{\"addresses\":[\"192.168.1.12:47821\"],\"relay\":[],\"hlc\":1800000000004,\"writer_device\":\"33333333333333333333333333333333\"}}]}",
+      "prefix": "000004e322"
+    }
+  ],
+  "compatibility": [
+    {
+      "stage": "A-B token pairing mutual opt-in",
+      "left": {
+        "scope": "enabled"
+      },
+      "right": {
+        "scope": "enabled"
+      },
+      "expected": "absent/absent: lower authenticated ID founds random S; other waits for HELLO"
+    },
+    {
+      "stage": "B-C migration mutual opt-in before assignment",
+      "left": {
+        "scope": "enabled"
+      },
+      "right": {
+        "scope": "enabled"
+      },
+      "expected": "absent/absent: no founding; wait for either endpoint to advertise an ID"
+    },
+    {
+      "stage": "A-C mutual opt-in",
+      "left": {
+        "scope": "enabled",
+        "setup_id": "00000000000000000000000000000000"
+      },
+      "right": {
+        "scope": "enabled"
+      },
+      "expected": "S/absent: C joins S, reconnects before synchronization"
+    },
+    {
+      "stage": "C-A mutual opt-in",
+      "left": {
+        "scope": "enabled"
+      },
+      "right": {
+        "scope": "enabled",
+        "setup_id": "00000000000000000000000000000000"
+      },
+      "expected": "absent/S: C joins S, reconnects before synchronization"
+    },
+    {
+      "stage": "B-C before roster catch-up",
+      "left": {
+        "scope": "enabled",
+        "setup_id": "00000000000000000000000000000000"
+      },
+      "right": {
+        "scope": "enabled",
+        "setup_id": "00000000000000000000000000000000"
+      },
+      "expected": "S/S: synchronize without exact-member evidence"
+    },
+    {
+      "stage": "A-C separate bootstraps",
+      "left": {
+        "scope": "ask",
+        "setup_id": "00000000000000000000000000000000"
+      },
+      "right": {
+        "scope": "ask",
+        "setup_id": "ffffffffffffffffffffffffffffffff"
+      },
+      "expected": "S/T: keep direct; no offer or roster exchange"
+    },
+    {
+      "stage": "Allow after separate assignments while prompt pending",
+      "left": {
+        "scope": "enabled",
+        "setup_id": "ffffffffffffffffffffffffffffffff"
+      },
+      "right": {
+        "scope": "ask",
+        "setup_id": "00000000000000000000000000000000"
+      },
+      "expected": "T/S: resolve prompt; keep direct without enabling"
+    }
+  ],
+  "invalid": [
+    "{\"device_id\":\"33333333333333333333333333333333\",\"fingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"role\":\"computer\",\"name\":\"Laptop\",\"status\":\"member\",\"hlc\":1,\"hlc\":2,\"writer_device\":\"11111111111111111111111111111111\"}",
+    "{\"device_id\":\"33333333333333333333333333333333\",\"fingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"role\":\"computer\",\"name\":\"Laptop\",\"status\":\"member\",\"hlc\":1e0,\"writer_device\":\"11111111111111111111111111111111\"}",
+    "{\"scope\":\"enabled\",\"setup_id\":null}"
+  ]
+}
