@@ -16,6 +16,7 @@ import io.github.stantonmatt.pneu.protocol.randomId
 
 internal interface ReceiveStorage {
     fun version():String=""
+    fun checkSpace(bytes:Long,reserve:Long) {}
     fun create(metadata:ReceivedMetadata):Pair<String,String>
     fun open(uri:String):ReceiveOutput
     /** null = missing, true = pending, false = published. */
@@ -34,6 +35,9 @@ internal interface ReceiveOutput:AutoCloseable {
 internal class ReceivedMediaStore(private val context:Context):ReceiveStorage {
     private val resolver=context.contentResolver
     override fun version()=MediaStore.getVersion(context,MediaCatalog.VOLUME)
+    override fun checkSpace(bytes:Long,reserve:Long) {
+        if(bytes>StatFs(Environment.getExternalStorageDirectory().absolutePath).availableBytes-reserve)throw ReceiveStorageException("disk_full")
+    }
     private fun collection(mime:String)=when {
         mime.startsWith("image/",ignoreCase=true)->MediaStore.Images.Media.getContentUri(MediaCatalog.VOLUME)
         mime.startsWith("video/",ignoreCase=true)->MediaStore.Video.Media.getContentUri(MediaCatalog.VOLUME)
@@ -63,7 +67,9 @@ internal class ReceivedMediaStore(private val context:Context):ReceiveStorage {
         val suffix="-${randomId()}$extension"
         return utf8Prefix(stem,255-suffix.toByteArray().size)+suffix
     }
-    override fun create(metadata:ReceivedMetadata):Pair<String,String> {
+    // Resume publication copies run outside the policy fence. Keep allocation
+    // atomic across peers: two pending inserts must never alias one URI.
+    @Synchronized override fun create(metadata:ReceivedMetadata):Pair<String,String> {
         if(metadata.size>StatFs(Environment.getExternalStorageDirectory().absolutePath).availableBytes)throw ReceiveStorageException("disk_full")
         val values=ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME,uniqueName(metadata))

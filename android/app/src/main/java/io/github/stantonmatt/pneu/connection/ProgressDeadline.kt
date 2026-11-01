@@ -6,12 +6,12 @@ import java.util.concurrent.atomic.AtomicReference
  * Expiry must claim the exact snapshot: a completed or progressing write wins over
  * a monitor that computed a deadline from stale state. Clock is monotonic. */
 internal class ProgressDeadline(private val timeout: Long, private val clock: () -> Long) {
-    class Snapshot(val at: Long)
+    class Snapshot(val at: Long,val timeout:Long)
     private val current = AtomicReference<Snapshot?>(null)
-    fun progress() { current.set(Snapshot(clock())) }
+    fun progress(timeoutMillis:Long=timeout) { current.set(Snapshot(clock(),timeoutMillis)) }
     fun complete() { current.set(null) }
     fun snapshot(): Snapshot? = current.get()
-    fun remaining(snapshot: Snapshot): Long = timeout - (clock() - snapshot.at)
+    fun remaining(snapshot: Snapshot): Long = snapshot.timeout - (clock() - snapshot.at)
     fun expire(snapshot: Snapshot): Boolean = remaining(snapshot) <= 0 && current.compareAndSet(snapshot, null)
 }
 

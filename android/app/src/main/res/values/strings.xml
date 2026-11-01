@@ -309,4 +309,6 @@
         <item quantity="one">This deletes %d saved item.</item>
         <item quantity="other">This deletes %d saved items.</item>
     </plurals>
+    <string name="item_connection_lost">Connection lost</string>
+    <string name="item_connection_lost_progress">Connection lost · %1$s of %2$s sent</string>
 </resources>

@@ -58,6 +58,9 @@ internal class LocalPeerFixture(private val app:AppGraph,
     val pairRequests=java.util.concurrent.atomic.AtomicInteger()
     val hellos=java.util.concurrent.atomic.AtomicInteger()
     val activeConnections get()=clients.size
+    @Volatile private var frameSender:((Frame)->Unit)?=null
+    @Volatile var observeFrame:(Frame)->Unit={}
+    fun sendFrame(frame:Frame)=checkNotNull(frameSender)(frame)
     @Volatile private var controlSender:((Frame.Control)->Unit)?=null
     fun sendControl(frame:Frame.Control)=checkNotNull(controlSender)(frame)
     fun disconnect() {clients.forEach {it.close()}}
@@ -82,6 +85,7 @@ internal class LocalPeerFixture(private val app:AppGraph,
             val selected=requireNotNull(peer)
             val output=ssl.outputStream
             val send:(Frame.Control)->Unit={frame->synchronized(output) {Protocol.write(output,frame)}}
+            frameSender={frame->synchronized(output) {Protocol.write(output,frame)}}
             controlSender=send
             helloError?.let {send(Frame.Control(Type.ERROR,json("code" to it,"supported_version" to 1)));return}
             send(Frame.Control(Type.HELLO,json("version" to helloVersion,"device_id" to selected.deviceId,"name" to selected.name,"capabilities" to capabilities.toList(),"role" to "computer").apply {
@@ -89,6 +93,7 @@ internal class LocalPeerFixture(private val app:AppGraph,
             }))
             while(!closed) {
                 val frame=Protocol.read(ssl.inputStream)
+                observeFrame(frame)
                 if(frame is Frame.Control && !handle(frame,send))when(frame.type) {
                     Type.PING->send(Frame.Control(Type.PONG,frame.body))
                     Type.PAIR_REQUEST->{

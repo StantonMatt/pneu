@@ -6,7 +6,7 @@ internal enum class FileAdmission { RETAINED_REPLAY, RETAINED_CONFLICT, NEW, UNF
 /** Files and text/settings reserve the same sender-scoped ID namespace. Full
  * semantic metadata lives in received_files; the shared reservation prevents a
  * text/settings race without putting file IDs in clipboard pruning. */
-internal class ReceiveJournal(private val queue:QueueDao,private val storage:ReceiveStorage,private val peerLimit:Int=QueueDao.RECEIVE_PEER_LIMIT,private val globalLimit:Int=QueueDao.RECEIVE_GLOBAL_LIMIT) {
+internal class ReceiveJournal(private val queue:QueueDao,private val storage:ReceiveStorage,private val peerLimit:Int=QueueDao.RECEIVE_PEER_LIMIT,private val globalLimit:Int=QueueDao.RECEIVE_GLOBAL_LIMIT,private val deleteStage:(ReceivedFile)->Unit={}) {
     fun admission(peer:String,metadata:ReceivedMetadata):FileAdmission {
         val receipt=queue.receipt(peer,metadata.id)
         val file=queue.receivedFile(peer,metadata.id)
@@ -25,7 +25,11 @@ internal class ReceiveJournal(private val queue:QueueDao,private val storage:Rec
     /** The verified record and destination URI precede IS_PENDING=0. Recovery can
      * query that exact URI and finish the receipt after a crash in either window. */
     private fun pending(row:ReceivedFile)=if(row.catalogVersion==storage.version())storage.pending(row.uri) else null
-    fun deletePartial(row:ReceivedFile) {if(row.state!="complete" && row.uri.isNotEmpty() && row.catalogVersion==storage.version())storage.deletePending(row.uri)}
+    fun deletePartial(row:ReceivedFile) {
+        if(row.state=="complete")return
+        if(row.uri.isNotEmpty() && row.catalogVersion==storage.version())storage.deletePending(row.uri)
+        if(row.stagePath.isNotEmpty())deleteStage(row)
+    }
     fun publish(row:ReceivedFile) {
         check(row.state=="verified")
         when(pending(row)) {
@@ -41,7 +45,7 @@ internal class ReceiveJournal(private val queue:QueueDao,private val storage:Rec
             true->if(allowPublication)publish(row) else {
                 deletePartial(row);queue.abandonReceivedFile(row)
             }
-            null->queue.abandonReceivedFile(row)
+            null->{if(row.stagePath.isNotEmpty())deleteStage(row);queue.abandonReceivedFile(row)}
         } else if(row.state!="complete")abandon(row)
     }
     fun abandon(row:ReceivedFile) {

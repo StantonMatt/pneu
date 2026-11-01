@@ -22,6 +22,25 @@ class RecentProjectionTest {
     private fun delivery(peer:Peer,state:String,id:String="artifact",order:Long=1)=Outgoing().apply {
         mediaId=id;peerId=peer.deviceId;transferId=id;this.state=state;size=100;orderId=order;error=if(state=="failed")"disk_full" else ""
     }
+    @Test fun automaticConnectionLostRetryKeepsWaitingCopyInHomeAndRecipientRows() {
+        val context=RuntimeEnvironment.getApplication()
+        val delivery=delivery(a,"waiting").apply {error="connection_lost";resumable=true;sentBytes=40}
+        val item=RecentProjection.items(listOf(delivery),p,emptyMap()).single()
+        val recipient=item.recipients.single()
+        assertEquals("Waiting",UiPresentation.recentOutcome(context,item))
+        assertNull(UiPresentation.connectionLostFailure(context,delivery.state,delivery.error,delivery.resumable,delivery.sentBytes,delivery.size))
+        assertNull(UiPresentation.connectionLostFailure(context,recipient.state,recipient.error,recipient.resumable,recipient.sent,recipient.total))
+        assertNotNull(UiPresentation.connectionLostFailure(context,"failed",recipient.error,true,40,100))
+    }
+    @Test fun multiDeviceHomeNamesTheConnectionLostRecipientAndRetainedProgress() {
+        val context=RuntimeEnvironment.getApplication()
+        val failed=delivery(b,"failed").apply {error="connection_lost";resumable=true;sentBytes=40}
+        val item=RecentProjection.items(listOf(delivery(a,"sent"),failed),p,emptyMap()).single()
+        assertEquals("Failed on MacBook · "+UiPresentation.connectionLost(context,true,40,100),UiPresentation.recentOutcome(context,item))
+        failed.resumable=false
+        assertEquals("Failed on MacBook · "+context.getString(io.github.stantonmatt.pneu.R.string.item_connection_lost),
+            UiPresentation.recentOutcome(context,RecentProjection.items(listOf(failed),p,emptyMap()).single()))
+    }
     @Test fun progressCombinesCompletedAndConcurrentRecipientsAndKeepsFailures()=runBlocking<Unit>(Dispatchers.IO) {
         val context=RuntimeEnvironment.getApplication()
         val unmatched=RecentProjection.items(listOf(delivery(a,"sending"),delivery(b,"sending")),p,emptyMap()).single()
@@ -105,6 +124,19 @@ class RecentProjectionTest {
         }
         val failed=RecentProjection.items(listOf(delivery(a,"failed"),delivery(b,"discarded")),p,emptyMap()).single()
         assertFalse(failed.pending);assertTrue(failed.actionable);assertTrue(failed.recipients.first().retryable)
+    }
+
+    @Test fun lostConnectionShowsSenderCountAndRetryUsesCurrentReceiverProgress() {
+        val context=RuntimeEnvironment.getApplication()
+        val row=delivery(a,"failed").apply {error="connection_lost";resumable=true;sentBytes=40}
+        val lost=RecentProjection.items(listOf(row),p,emptyMap()).single().recipients.single()
+        assertEquals(40L,lost.sent)
+        assertTrue(UiPresentation.connectionLost(context,lost.resumable,lost.sent,lost.total).startsWith("Connection lost · "))
+        assertEquals("Connection lost",UiPresentation.connectionLost(context,false,40,100))
+        assertEquals("Connection lost",UiPresentation.connectionLost(context,true,0,100))
+        row.state="sending"
+        val resumed=RecentProjection.items(listOf(row),p,mapOf(a.deviceId to LinkState("Connected",sent=20,total=100,transferMediaId=row.mediaId))).single()
+        assertEquals(20L,resumed.sent)
     }
 
 }

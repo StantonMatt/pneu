@@ -206,12 +206,14 @@ private fun automaticKinds(context:android.content.Context,p:Prefs):String? {
             item.recipients.forEachIndexed {i,recipient->
                 val online=devices[recipient.peerId]==true
                 val sending=recipient.state=="sending" && recipient.active
+                val connectionLost=UiPresentation.connectionLostFailure(context,recipient.state,recipient.error,recipient.resumable,recipient.sent,recipient.total)
                 val (line,color)=when {
                     recipient.state=="sent"->resources.getString(R.string.delivery_sent,lastConnectedLabel(context,item.row.createdAt)) to c.text2
                     recipient.state in setOf("discarded","superseded","skipped")->resources.getString(when(recipient.state) {
                         "discarded"->R.string.delivery_stopped;"superseded"->R.string.delivery_superseded;else->R.string.delivery_skipped
                     }) to c.text2
                     sending->resources.getString(R.string.item_sending,android.text.format.Formatter.formatShortFileSize(context,recipient.sent),android.text.format.Formatter.formatShortFileSize(context,recipient.total)) to c.accentText
+                    connectionLost!=null->connectionLost to c.danger
                     recipient.state=="failed"->(UiPresentation.failureReason(recipient.error)?.let {resources.getString(R.string.delivery_failed,resources.getString(it))} ?: resources.getString(R.string.item_failed)) to c.danger
                     !online->resources.getString(R.string.delivery_waiting_offline) to c.text2
                     else->resources.getString(R.string.item_waiting) to c.text2

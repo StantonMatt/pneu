@@ -4,12 +4,25 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
 object QueueMigrations {
+    private val legacyView get()=OutgoingView.SQL.replace("d.sentBytes AS sentBytes, d.resumable AS resumable, ","")
+    val fileResume=object : Migration(12,13) {
+        override fun migrate(db:SupportSQLiteDatabase) {
+            for(column in listOf("stagePath","stageIdentity","checkpointHash"))db.execSQL("ALTER TABLE received_files ADD COLUMN $column TEXT NOT NULL DEFAULT ''")
+            for(column in listOf("checkpoint","progressWall","wallHighWater"))db.execSQL("ALTER TABLE received_files ADD COLUMN $column INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE deliveries ADD COLUMN sentBytes INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE deliveries ADD COLUMN resumable INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("CREATE TABLE pending_cancels (peerId TEXT NOT NULL,transferId TEXT NOT NULL,pin TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(peerId,transferId))")
+            db.execSQL("DROP VIEW outgoing")
+            db.execSQL("CREATE VIEW `outgoing` AS "+OutgoingView.SQL)
+        }
+    }
+
     val sensitiveClips=object : Migration(11,12) {
         override fun migrate(db:SupportSQLiteDatabase) {
             db.execSQL("DROP VIEW outgoing")
             db.execSQL("ALTER TABLE artifacts ADD COLUMN sensitive INTEGER NOT NULL DEFAULT 0")
             db.execSQL("ALTER TABLE receipts ADD COLUMN sensitive INTEGER NOT NULL DEFAULT 0")
-            db.execSQL("CREATE VIEW `outgoing` AS "+OutgoingView.SQL)
+            db.execSQL("CREATE VIEW `outgoing` AS "+legacyView)
         }
     }
 
@@ -27,7 +40,7 @@ object QueueMigrations {
             // They cannot acquire authority merely because a computer reconnects.
             db.execSQL("UPDATE deliveries SET state='superseded',revision=revision+1 WHERE state IN ('waiting','sending','failed') AND mediaId IN (SELECT mediaId FROM artifacts WHERE kind IN ('text','clipboard_image'))")
             db.execSQL("DROP VIEW outgoing")
-            db.execSQL("CREATE VIEW `outgoing` AS ${OutgoingView.SQL}")
+            db.execSQL("CREATE VIEW `outgoing` AS $legacyView")
         }
     }
     val peerWatermarks=object:Migration(8,9) {
