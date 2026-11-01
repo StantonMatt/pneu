@@ -41,6 +41,8 @@ export component PneuButton inherits Rectangle {
     private property <bool> interactive: !Interaction.modal-open || dialog-control;
     in property <string> text;
     in property <image> icon;
+    in property <length> icon-size: 16px;
+    in property <length> font-size <=> label.font-size;
     in property <ButtonKind> kind: neutral;
     in property <bool> enabled: true;
     in property <bool> wide;
@@ -91,7 +93,7 @@ export component PneuButton inherits Rectangle {
         spacing: 6px;
         if root.icon.width > 0: VerticalLayout {
             alignment: center;
-            Image { accessible-role: none; width: 16px; height: 16px; source: root.icon; colorize: label.color; }
+            Image { accessible-role: none; width: root.icon-size; height: root.icon-size; source: root.icon; colorize: label.color; }
         }
         label := Text {
             text: root.text; vertical-alignment: center;

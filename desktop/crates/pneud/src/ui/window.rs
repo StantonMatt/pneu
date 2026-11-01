@@ -213,6 +213,7 @@ enum Action {
     },
     Navigated,
     Folder,
+    OpenFolder,
     Unpair(String),
     SendFiles(String),
     PickerSend(Vec<String>),
@@ -1236,6 +1237,7 @@ pub fn run(paths: Paths) -> Result<()> {
                     _ = async {invitation_job.as_mut().expect("invitation subscription").await} => {invitation_job=None;},
                     _ = timer.tick() => {},
                     result = job_result(&mut worker.folder_job) => { worker.folder_job = None; if let Some(origin) = worker.folder_origin.take() { worker.origin = origin; if let Err(error) = result { worker.fail("Couldn't change the folder", error); } } },
+                    result = job_result(&mut worker.open_folder_job) => { worker.opened_folder(result); },
                     result = job_result(&mut worker.open_job) => { worker.open_job = None; if let Some(origin) = worker.open_origin.take() { worker.origin = origin; if let Err(error) = result { let message = if error.is::<crate::actions::FileUnavailable>() { "The file was moved or deleted" } else { "Couldn't open it" }; worker.fail(message, error); } } },
                     result = job_result(&mut worker.chooser) => { worker.chooser = None; if let Some(origin) = worker.chooser_origin.take() { worker.origin = origin; if worker.current() { worker.chosen(result).await; } } },
                     command = rx.recv() => {
@@ -1604,6 +1606,7 @@ fn connect(
         });
     }
     ui.on_choose_folder(send(|| Action::Folder));
+    ui.on_open_folder(send(|| Action::OpenFolder));
     ui.on_send_clipboard(send(|| Action::SendClipboard));
     ui.on_copy_history(with(Action::CopyHistory));
     ui.on_disable_empty_history(send(|| Action::DisableEmptyHistory));
@@ -1762,6 +1765,8 @@ struct Worker {
     invitation_revision: u64,
     folder_job: Option<futures_util::future::BoxFuture<'static, Result<()>>>,
     folder_origin: Option<View>,
+    open_folder_job: Option<futures_util::future::BoxFuture<'static, Result<()>>>,
+    open_folder_origin: Option<(View, PathBuf)>,
     open_job: Option<futures_util::future::BoxFuture<'static, Result<()>>>,
     open_origin: Option<View>,
     chooser_origin: Option<View>,
@@ -1826,6 +1831,8 @@ impl Worker {
             invitation_revision: 0,
             folder_job: None,
             folder_origin: None,
+            open_folder_job: None,
+            open_folder_origin: None,
             open_job: None,
             open_origin: None,
             chooser_origin: None,
@@ -1931,6 +1938,34 @@ impl Worker {
         eprintln!("pneud window: {message}: {error:#}");
         if self.current() {
             self.action_error = format!("{message}.");
+        }
+    }
+    fn start_open_folder(&mut self) {
+        if self.open_folder_job.is_some() {
+            return;
+        }
+        let folder = PathBuf::from(
+            self.status["config"]["save_path"]
+                .as_str()
+                .unwrap_or_default(),
+        );
+        self.open_folder_origin = Some((self.view(), folder.clone()));
+        let socket = self.socket();
+        self.open_folder_job = Some(Box::pin(async move { open_folder(&socket, &folder).await }));
+    }
+    fn opened_folder(&mut self, result: Result<()>) {
+        self.open_folder_job = None;
+        if let Some((origin, folder)) = self.open_folder_origin.take() {
+            self.origin = origin;
+            if let Err(error) = result {
+                eprintln!(
+                    "pneud window: couldn't open {}: {error:#}",
+                    folder.display()
+                );
+                if self.current() {
+                    self.action_error = format!("Couldn't open {}", super::display_path(&folder));
+                }
+            }
         }
     }
     fn socket(&self) -> PathBuf {
@@ -2051,6 +2086,7 @@ impl Worker {
                     self.folder_job = Some(Box::pin(async move { change_folder(&socket).await }));
                 }
             }
+            Action::OpenFolder => self.start_open_folder(),
             Action::Unpair(device) => match pneu_proto::Id::new(device.as_str()) {
                 Ok(device) => {
                     if let Err(error) = self.command(ipc::Command::Unpair { device }).await {
@@ -2156,37 +2192,8 @@ impl Worker {
                         .await
                         .map(|_| ()),
                     MenuAction::Folder => {
-                        let folder = self.status["config"]["save_path"]
-                            .as_str()
-                            .map(PathBuf::from)
-                            .context("save folder");
-                        match folder {
-                            Ok(folder) => {
-                                let create = folder.clone();
-                                let created = tokio::task::spawn_blocking(move || {
-                                    crate::storage::Folder::open(&create, true)
-                                })
-                                .await;
-                                match created {
-                                    Ok(Ok(_anchor)) => {
-                                        let (send, receive) = tokio::sync::oneshot::channel();
-                                        match slint::invoke_from_event_loop(move || {
-                                            let _ =
-                                                send.send(super::macos::native::open_path(&folder));
-                                        }) {
-                                            Ok(()) => receive
-                                                .await
-                                                .map_err(anyhow::Error::from)
-                                                .and_then(|result| result),
-                                            Err(error) => Err(error.into()),
-                                        }
-                                    }
-                                    Ok(Err(error)) => Err(error),
-                                    Err(error) => Err(error.into()),
-                                }
-                            }
-                            Err(error) => Err(error),
-                        }
+                        self.start_open_folder();
+                        Ok(())
                     }
                     MenuAction::Settings => {
                         let result = self
@@ -3447,6 +3454,8 @@ impl Worker {
 
     async fn close(&mut self, visible: &AtomicBool) {
         self.folder_job = None;
+        self.open_folder_job = None;
+        self.open_folder_origin = None;
         self.open_job = None;
         self.open_origin = None;
         self.chooser = None;
@@ -4150,7 +4159,7 @@ impl Worker {
             choose_each_time: flag("choose_devices_each_time"),
             queue_offline: flag("queue_offline"),
             save_to_folder: config.save_to_folder,
-            folder: middle_elide(&super::display_path(&config.save_path), 40),
+            folder: middle_elide(&super::display_path(&config.save_path), 26),
             notifications: config.notification_preview,
             copy_images: config.copy_image_to_clipboard,
             viewer: config.open_in_viewer,
@@ -4339,6 +4348,29 @@ async fn open_web(url: &'static str) -> Result<()> {
         crate::actions::open_url(url).await
     }
 }
+async fn open_folder(socket: &Path, folder: &Path) -> Result<()> {
+    #[cfg(any(target_os = "linux", windows))]
+    {
+        let _ = folder;
+        ipc::request(socket, ipc::Command::OpenFolder).await?;
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = socket;
+        let folder = folder.to_owned();
+        let create = folder.clone();
+        let _anchor =
+            tokio::task::spawn_blocking(move || crate::storage::Folder::open(&create, true))
+                .await??;
+        let (send, receive) = tokio::sync::oneshot::channel();
+        slint::invoke_from_event_loop(move || {
+            let _ = send.send(super::macos::native::open_path(&folder));
+        })?;
+        receive.await?
+    }
+}
+
 async fn change_folder(socket: &Path) -> Result<()> {
     let value = ipc::request(socket, ipc::Command::UiStatus).await?;
     let config: Config = serde_json::from_value(value["config"].clone())?;
@@ -5135,6 +5167,140 @@ mod tests {
             } => unreachable!(),
         }
         flush_ui();
+    }
+
+    #[tokio::test]
+    async fn open_folder_controls_follow_save_setting_and_recent_visibility() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::open_folder_controls_follow_save_setting_and_recent_visibility",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        let surface = headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (_worker, mut actions) = model_worker(&window, dir.path());
+        let ui = window.global::<Ui>();
+        window.show()?;
+        let mut recent_height = None;
+        for page in [Page::Main, Page::Settings] {
+            for save in [false, true] {
+                for has_recent in [false, true] {
+                    ui.set_page(page);
+                    ui.set_save_to_folder(save);
+                    ui.set_recent(ModelRc::new(VecModel::from(if has_recent {
+                        vec![RecentItem {
+                            title: "report.pdf".into(),
+                            ..Default::default()
+                        }]
+                    } else {
+                        Vec::new()
+                    })));
+                    let height = window.get_content_height();
+                    if page == Page::Main && has_recent {
+                        if let Some(previous) = recent_height {
+                            assert_eq!(
+                                height, previous,
+                                "the link must not enlarge the Recent header"
+                            );
+                        }
+                        recent_height = Some(height);
+                    }
+                    surface.set_size(slint::LogicalSize::new(400.0, height).to_physical(1.0));
+                    let mut found = false;
+                    // Exercise the actual hit targets, including hidden and
+                    // disabled controls, rather than duplicating the Slint rule.
+                    for y in (0..height as usize).step_by(4) {
+                        ui.set_page(page);
+                        ui.set_dialog(Dialog::None);
+                        let position = slint::LogicalPosition::new(
+                            if page == Page::Main { 330.0 } else { 235.0 },
+                            y as f32,
+                        );
+                        let button = slint::platform::PointerEventButton::Left;
+                        window.window().dispatch_event(
+                            slint::platform::WindowEvent::PointerPressed { position, button },
+                        );
+                        window.window().dispatch_event(
+                            slint::platform::WindowEvent::PointerReleased { position, button },
+                        );
+                        while let Ok(action) = actions.try_recv() {
+                            if matches!(action, Action::Scoped(_, action) if matches!(*action, Action::OpenFolder))
+                            {
+                                found = true;
+                            }
+                        }
+                    }
+                    assert_eq!(
+                        found,
+                        page == Page::Settings || (save && has_recent),
+                        "page {page:?}, save {save}, Recent {has_recent}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn open_folder_uses_daemon_command_and_reports_full_path_without_blocking_window()
+    -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::open_folder_uses_daemon_command_and_reports_full_path_without_blocking_window",
+            &[],
+        ).await? { return Ok(()); }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        let folder = dir
+            .path()
+            .join("A long received-files folder with spaces and 日本語");
+        worker.status["config"]["save_path"] = json!(folder);
+        worker.status["config"]["save_to_folder"] = json!(false);
+        let mock = mock_ipc(&worker.paths.socket, |command| {
+            assert_eq!(command, &json!({"command":"open_folder"}));
+            (false, json!("opener unavailable"))
+        })?;
+        window.global::<Ui>().invoke_open_folder();
+        worker.act(actions.try_recv()?).await;
+        assert!(worker.open_folder_job.is_some());
+        // Repeated clicks coalesce; other window actions remain available.
+        worker.act(Action::OpenFolder).await;
+        worker.act(Action::Focused).await;
+        let result = job_result(&mut worker.open_folder_job).await;
+        worker.opened_folder(result);
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+        let config: Config = serde_json::from_value(worker.status["config"].clone())?;
+        let frame = worker.frame(&config, &[], None, None, false, crate::now_ms());
+        assert_eq!(frame.folder.chars().count(), 26);
+        apply(&window, frame);
+        assert_eq!(
+            window.global::<Ui>().get_error().as_str(),
+            format!("Couldn't open {}", super::super::display_path(&folder))
+        );
+        worker.act(Action::Navigated).await;
+        assert!(
+            worker.action_error.is_empty(),
+            "normal navigation clears the banner"
+        );
+        worker.act(Action::OpenFolder).await;
+        let result = job_result(&mut worker.open_folder_job).await;
+        worker.view.lock().unwrap().page = Page::Settings;
+        worker.opened_folder(result);
+        assert!(
+            worker.action_error.is_empty(),
+            "late failures stay on the originating view"
+        );
+        worker.act(Action::OpenFolder).await;
+        worker.close(&AtomicBool::new(true)).await;
+        assert!(worker.open_folder_job.is_none());
+        assert!(worker.open_folder_origin.is_none());
+        Ok(())
     }
 
     fn status_value(worker: &Worker) -> Value {
@@ -8637,6 +8803,19 @@ mod tests {
                 go(Page::Main, 0, 0),
             ),
             scene(
+                "01-main-save-folder-off",
+                |w| {
+                    state(w, two(), recent_items());
+                    w.status["config"]["save_to_folder"] = json!(false);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "01-main-no-recent",
+                |w| state(w, two(), Vec::new()),
+                go(Page::Main, 0, 0),
+            ),
+            scene(
                 "55-main-received-video",
                 |w| {
                     let mut list = recent_items();
@@ -9195,6 +9374,26 @@ mod tests {
             scene(
                 "38-settings",
                 |w| state(w, two(), Vec::new()),
+                go(Page::Settings, 0, 0),
+            ),
+            scene(
+                "38-settings-save-folder-off",
+                |w| {
+                    state(w, two(), Vec::new());
+                    w.status["config"]["save_to_folder"] = json!(false);
+                    w.status["config"]["save_path"] = json!(
+                        PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+                            .join("Pictures/A very long received-files folder/Pneu")
+                    );
+                },
+                go(Page::Settings, 0, 0),
+            ),
+            scene(
+                "38-settings-open-folder-error",
+                |w| {
+                    state(w, two(), Vec::new());
+                    w.action_error = "Couldn't open ~/Pictures/Received files/Pneu".into();
+                },
                 go(Page::Settings, 0, 0),
             ),
             scene(
