@@ -18,11 +18,17 @@ pub mod clipboard;
 pub mod clipboard;
 #[cfg(target_os = "linux")]
 mod clipboard_content;
-#[cfg(any(windows, all(unix, any(target_os = "macos", test))))]
+#[cfg(any(
+    all(target_os = "linux", pneu_qt_drag),
+    windows,
+    all(unix, any(target_os = "macos", test))
+))]
 #[path = "macos/drop_target.rs"]
 mod drop_target;
 #[cfg(unix)]
 mod interactions;
+#[cfg(all(target_os = "linux", pneu_qt_drag))]
+mod linux_drag;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
 #[cfg(any(windows, all(unix, any(target_os = "macos", test))))]

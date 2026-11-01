@@ -204,7 +204,7 @@ enum Action {
     Close,
     #[cfg(target_os = "macos")]
     Native(super::macos::native::MenuAction),
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", all(target_os = "linux", pneu_qt_drag), windows))]
     DropFiles {
         files: Vec<PathBuf>,
         targets: Vec<contract::CapturedTarget>,
@@ -1219,6 +1219,8 @@ pub fn run(paths: Paths) -> Result<()> {
         window.global::<Ui>().set_drop_supported(true);
         install_drop(&window, &view, &commands);
     }
+    #[cfg(all(target_os = "linux", pneu_qt_drag))]
+    install_drop(&window, &view, &commands);
     #[cfg(windows)]
     let _login_poll = super::windows_login::install(&window);
     let weak = window.as_weak();
@@ -1299,6 +1301,8 @@ pub fn run(paths: Paths) -> Result<()> {
     super::macos::native::cleanup();
     #[cfg(windows)]
     super::windows_drag::cleanup();
+    #[cfg(all(target_os = "linux", pneu_qt_drag))]
+    super::linux_drag::cleanup();
     drop(window);
     drop(commands);
     let _ = worker.join();
@@ -1306,12 +1310,14 @@ pub fn run(paths: Paths) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "macos", all(target_os = "linux", pneu_qt_drag), windows))]
 fn install_drop(
     window: &PneuWindow,
     view: &Arc<Mutex<View>>,
     commands: &tokio::sync::mpsc::UnboundedSender<Action>,
 ) {
+    #[cfg(all(target_os = "linux", pneu_qt_drag))]
+    use super::linux_drag as native_drop;
     #[cfg(target_os = "macos")]
     use super::macos::drag as native_drop;
     #[cfg(windows)]
@@ -1433,7 +1439,7 @@ fn install_drop(
             .and_then(|s| s.hit(&w, point));
         w.global::<Ui>()
             .set_drop_hover(selected.map(|i| i as i32).unwrap_or(-1));
-        #[cfg(windows)]
+        #[cfg(any(target_os = "linux", windows))]
         if selected.is_none() && w.global::<Ui>().get_drop_active() {
             return outside_drop_list(&w, point);
         }
@@ -1458,7 +1464,7 @@ fn install_drop(
             return false;
         }
         let index = session.hit(&w, point);
-        #[cfg(windows)]
+        #[cfg(any(target_os = "linux", windows))]
         if index.is_none() && outside_drop_list(&w, point) {
             return output
                 .send(Action::DropFiles {
@@ -1521,6 +1527,10 @@ fn install_drop(
         }
         EventResult::Propagate
     });
+    #[cfg(all(target_os = "linux", pneu_qt_drag))]
+    window
+        .global::<Ui>()
+        .set_drop_supported(native_drop::install(window, callbacks));
     // Share the existing event filter: Slint can create its HWND after show()
     // and before the first native event, later than a zero-duration timer.
     #[cfg(windows)]
@@ -1529,7 +1539,7 @@ fn install_drop(
     });
 }
 
-#[cfg(windows)]
+#[cfg(any(all(target_os = "linux", pneu_qt_drag), windows))]
 fn outside_drop_list(window: &PneuWindow, point: (f64, f64)) -> bool {
     let g = window.get_drop_geometry();
     point.0.is_finite()
@@ -1539,6 +1549,10 @@ fn outside_drop_list(window: &PneuWindow, point: (f64, f64)) -> bool {
             && point.0 < (g.x + g.width) as f64
             && point.1 < (g.y + g.height) as f64)
 }
+
+#[cfg(all(test, target_os = "linux", pneu_qt_drag))]
+#[path = "linux_drag_tests.rs"]
+mod linux_drag_tests;
 
 #[derive(Clone)]
 struct UiSender {
@@ -2200,7 +2214,7 @@ impl Worker {
                 self.picker_files.clear();
                 self.picker_targets.clear();
             }
-            #[cfg(any(target_os = "macos", windows))]
+            #[cfg(any(target_os = "macos", all(target_os = "linux", pneu_qt_drag), windows))]
             Action::DropFiles {
                 files,
                 targets,
@@ -2211,7 +2225,7 @@ impl Worker {
                     let result = async {
                         let targets: Vec<crate::outbox::Authority> =
                             serde_json::from_value(serde_json::to_value(targets)?)?;
-                        #[cfg(windows)]
+                        #[cfg(any(target_os = "linux", windows))]
                         if targets.is_empty() {
                             self.command(ipc::Command::PresentFiles {
                                 paths: files,
