@@ -23,7 +23,7 @@ internal data class SavedClipsState(val enabled:Boolean=false,val items:List<Sav
 /** All admission, setting changes and file ownership share one lock. No clipboard
  * reads: callers supply only a sent/received payload or an explicitly chosen ID. */
 internal class SavedClips(private val context:Context,scope:CoroutineScope,
-    internal val database:SavedClipsDatabase=Room.databaseBuilder(context,SavedClipsDatabase::class.java,"clipboard-history.db").build(),
+    internal val database:SavedClipsDatabase=Room.databaseBuilder(context,SavedClipsDatabase::class.java,"clipboard-history.db").addMigrations(SavedClipsDatabase.MIGRATION_1_2).build(),
     private val now:()->Long=System::currentTimeMillis) {
     private val dao=database.clips()
     private val mutex=Mutex()
@@ -60,13 +60,36 @@ internal class SavedClips(private val context:Context,scope:CoroutineScope,
         directory.listFiles()?.forEach(::removeFile)
         publish()
     }
-    suspend fun clear()=locked {val old=dao.all();database.runInTransaction {old.forEach(::removeFiles);dao.clear()};directory.listFiles()?.forEach(::removeFile);publish()}
+    suspend fun clear()=locked {
+        val old=dao.all().filterNot {it.pinned}
+        database.runInTransaction {old.forEach {removeFiles(it);dao.delete(it.id)}}
+        publish()
+    }
+    /** False only when a new pin would exceed the limit. */
+    suspend fun setPinned(id:String,pinned:Boolean):Boolean=locked {
+        val items=dao.all();val item=items.find {it.id==id} ?: return@locked true
+        if(item.pinned==pinned)return@locked true
+        if(pinned && items.count {it.pinned}>=PIN_CAPACITY)return@locked false
+        item.pinned=pinned
+        item.pinPosition=if(pinned)(items.maxOfOrNull {it.pinPosition} ?: 0)+1 else 0
+        database.runInTransaction {dao.put(item);evict(except=id)}
+        sweepImages();publish();true
+    }
+    private fun evict(except:String?=null) {
+        val recent=dao.all().filterNot {it.pinned}
+        recent.asReversed().filter {it.id!=except}.take((recent.size-CAPACITY).coerceAtLeast(0)).forEach {dao.delete(it.id)}
+    }
+    private fun sweepImages() {
+        val retained=dao.all().flatMap {listOf(it.image,it.thumbnail)}.toSet()
+        directory.listFiles()?.filter {it.name !in retained}?.forEach(::removeFile)
+    }
     suspend fun delete(id:String)=locked {val item=dao.all().find {it.id==id} ?: return@locked;database.runInTransaction {removeFiles(item);dao.delete(id)};publish()}
     private fun save(item:SavedClip,arrived:Boolean=true) {
+        dao.all().find {it.id==item.id}?.let {item.pinned=it.pinned;item.pinPosition=it.pinPosition}
         item.copiedAt=now();item.position=(dao.all().maxOfOrNull {it.position} ?: 0)+1
         database.runInTransaction {
             dao.put(item)
-            dao.all().drop(CAPACITY).forEach {dao.delete(it.id)}
+            evict()
         }
         val retained=dao.all().flatMap {listOf(it.image,it.thumbnail)}.toSet()
         directory.listFiles()?.filter {it.name !in retained}?.forEach(::removeFile)
@@ -150,5 +173,5 @@ internal class SavedClips(private val context:Context,scope:CoroutineScope,
             FileProvider.getUriForFile(context,"${context.packageName}.history",it)==uri}==true
     }
     fun thumbnail(item:SavedClip)=file(item.thumbnail)
-    companion object {const val CAPACITY=50;const val MAX_TEXT=1024*1024;const val MAX_IMAGE=20*1024*1024}
+    companion object {const val CAPACITY=50;const val PIN_CAPACITY=25;const val MAX_TEXT=1024*1024;const val MAX_IMAGE=20*1024*1024}
 }

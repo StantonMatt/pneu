@@ -69,7 +69,7 @@ class ClipboardHistoryScreensDeviceTest {
             when(scene.value) {
                 "home"->Scaffold(containerColor=LocalPneuColors.current.bg,topBar={HomeTopBar(false,history={}) {}}) {padding->HomeScreen(p,LinkState("Connected","Wi-Fi"),emptyList(),Health(true,true,true,true),Modifier.padding(padding),{},{},{})}
                 "settings","off"->{SettingsScreen(p,Health(true,true,true,true),0,{},{})
-                    if(scene.value=="off")HistoryDeleteDialog(history.items.size,true,{},{})}
+                    if(scene.value=="off")HistoryDeleteDialog(history.items.size,true,{},confirm={})}
                 else->ClipboardHistoryScreen {}
             }
         }}}}

@@ -104,6 +104,7 @@ object ManualEntries {
         if(kind!="clipboard_image" || !app.savedClips.ownsImage(uri))
             shareStep("metadata_failed") {ShareAdmission.rejection(app.context,uri)}?.let {throw ShareFailure(it)}
         val type=resolvedMime ?: shareStep("metadata_failed") {ProviderReads.call {app.context.contentResolver.getType(uri)}}
+        if(kind=="clipboard_image")ClipboardImageSize.check(app.context,uri)
         val row=Outgoing().apply {mediaId="manual:${randomId()}";transferId=randomId();this.uri=uri.toString();this.kind=kind;this.sensitive=kind=="clipboard_image" && sensitive;automatic=false;createdAt=timestamp;mime=type ?: "application/octet-stream";fileName=app.context.getString(R.string.shared_item);this.recipients=recipients;sendProvenance=source}
         if(row.mime.startsWith("image/")) {row.hlc=stamp.hlc.toString();row.sourceDevice=stamp.source}
         row.fileName=shareStep("metadata_failed") {ProviderReads.call {signal->app.context.contentResolver.query(uri,arrayOf(OpenableColumns.DISPLAY_NAME),null,null,null,signal)?.use {if(it.moveToFirst())it.getString(0) else null}}} ?: row.fileName

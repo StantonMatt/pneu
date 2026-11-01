@@ -861,7 +861,7 @@ internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired
             }
         }
     }
-    if(historyOff)HistoryDeleteDialog(history.items.size,true,{historyOff=false}) {
+    if(historyOff)HistoryDeleteDialog(history.items.size,true,{historyOff=false},pinned=history.items.count {it.pinned}) {
         scope.launch {if(actions.run(resources.getString(R.string.ui_error_setting)) {app.savedClips.setEnabled(false)})historyOff=false}
     }
     if(renaming)RenameDialog(selfName(context,p),{renaming=false}) {name->
