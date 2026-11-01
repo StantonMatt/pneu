@@ -117,6 +117,7 @@ export component PneuButton inherits Rectangle {
 
 // Small square icon button, used for row actions (retry, cancel).
 export component IconButton inherits Rectangle {
+    in property <color> tint: Pneu.text2;
     in property <bool> dialog-control;
     private property <bool> interactive: !Interaction.modal-open || dialog-control;
     in property <bool> enabled: true;
@@ -130,7 +131,7 @@ export component IconButton inherits Rectangle {
     accessible-label: label;
     accessible-enabled: root.enabled && root.interactive;
     accessible-action-default => { if root.enabled && root.interactive { root.clicked(); } }
-    Image { accessible-role: none; x: 5px; y: 5px; width: 18px; height: 18px; source: root.icon; colorize: Pneu.text2; }
+    Image { accessible-role: none; x: 5px; y: 5px; width: 18px; height: 18px; source: root.icon; colorize: root.tint; }
     fs := FocusTarget { active: root.enabled && root.interactive; activate => { if root.enabled && root.interactive { root.clicked(); } } }
     touch := TouchArea { enabled: root.enabled && root.interactive; clicked => { fs.ring = false; fs.focus(); root.clicked(); } }
 }
@@ -404,8 +405,19 @@ export component DownloadQrCard inherits Rectangle {
     }
 }
 
-// Outlined single-line field for the rename popup.
+// Outlined single-line field for rename and history search.
 export component TextField inherits Rectangle {
+    in property <image> leading-icon;
+    in property <string> placeholder;
+    in property <bool> clearable;
+    in property <bool> enabled: true;
+    in property <int> focus-request;
+    private property <bool> focus-pending: root.autofocus;
+    changed focus-request => {
+        if root.enabled { input.focus(); input.select-all(); }
+        else { root.focus-pending = true; }
+    }
+    callback escaped();
     in-out property <string> text <=> input.text;
     in property <bool> autofocus;
     in property <string> label;
@@ -416,11 +428,16 @@ export component TextField inherits Rectangle {
     border-color: input.has-focus ? Pneu.accent : Pneu.button-border;
     forward-focus: input;
     Timer {
-        interval: 1ms; running: root.autofocus;
-        triggered => { self.running = false; input.focus(); input.select-all(); }
+        interval: 1ms; running: root.focus-pending && root.enabled;
+        triggered => { root.focus-pending = false; input.focus(); input.select-all(); }
     }
+    if root.leading-icon.width > 0: Image { accessible-role: none; x: 10px; y: 9px; width: 16px; height: 16px; source: root.leading-icon; colorize: Pneu.text2; }
+    if root.text == "": Text { accessible-role: none; x: input.x; width: input.width; height: parent.height; vertical-alignment: center; text: root.placeholder; color: Pneu.text2; }
+    if root.clearable && root.text != "": IconButton { x: parent.width - 31px; y: 3px; icon: Icons.close; label: "Clear search"; enabled: root.enabled; clicked => { root.text = ""; input.focus(); } }
     input := TextInput {
-        x: 10px; width: parent.width - 20px; height: parent.height;
+        enabled: root.enabled;
+        x: root.leading-icon.width > 0 ? 32px : 10px; width: parent.width - self.x - (root.clearable ? 34px : 10px); height: parent.height;
+        key-pressed(event) => { if root.clearable && event.text == Key.Escape { root.escaped(); return accept; } return reject; }
         vertical-alignment: center; single-line: true;
         color: Pneu.text; selection-background-color: Pneu.accent-soft; selection-foreground-color: Pneu.text;
         accessible-role: text-input;

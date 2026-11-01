@@ -34,10 +34,12 @@ impl Tray {
             .history_menu
             .as_ref()
             .unwrap_or(&self.snapshot.clipboard_history);
-        let mut submenu: Vec<_> = history
-            .iter()
-            .take(10)
+        let mut submenu: Vec<_> = super::tray_model::history_entries(history)
+            .into_iter()
             .map(|entry| {
+                let Some(entry) = entry else {
+                    return ksni::MenuItem::Separator;
+                };
                 let id = entry.id.clone();
                 StandardItem {
                     label: super::tray_model::history_label(entry, true),

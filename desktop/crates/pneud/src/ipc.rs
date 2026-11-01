@@ -61,6 +61,13 @@ pub enum Command {
     DeleteClipboardHistory {
         id: String,
     },
+    PinClipboardHistory {
+        id: String,
+        pinned: bool,
+    },
+    ClipboardHistorySearch {
+        ids: Vec<String>,
+    },
     ClearClipboardHistory,
     DisableEmptyClipboardHistory,
     SendFiles {
@@ -503,6 +510,8 @@ async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
         Command::CopyClipboardHistory{id}=>{core.copy_clipboard_history(id).await?;serde_json::Value::Null},
         Command::DeleteClipboardHistory{id}=>{core.delete_clipboard_history(Some(id)).await?;serde_json::Value::Null},
         Command::DisableEmptyClipboardHistory=>serde_json::json!(core.disable_empty_clipboard_history().await?),
+        Command::ClipboardHistorySearch{ids}=>{ensure!(ids.len()<=75,"too many history items");serde_json::Value::Array(history_search(&core.ui_snapshot(), &ids))},
+        Command::PinClipboardHistory{id,pinned}=>{core.pin_clipboard_history(id,pinned).await?;serde_json::Value::Null},
         Command::ClearClipboardHistory=>{core.delete_clipboard_history(None).await?;serde_json::Value::Null},
         Command::SetSetting{key,value}=>{core.set_setting(key,value).await?;serde_json::Value::Null},
         Command::Rename{name}=>{core.rename(name).await?;serde_json::Value::Null},
@@ -601,6 +610,23 @@ async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
     Ok(())
 
         }).await
+}
+// Keep each history projection below the page limit even for a 1 MiB text
+// item whose JSON escaping expands it. The window joins these before filtering.
+fn history_search(snapshot: &crate::ui::Snapshot, ids: &[String]) -> Vec<serde_json::Value> {
+    let mut chunks = Vec::new();
+    for item in snapshot
+        .clipboard_history
+        .iter()
+        .filter(|i| ids.contains(&i.id))
+    {
+        let mut chars = item.search.chars().peekable();
+        while chars.peek().is_some() {
+            let text: String = chars.by_ref().take(16_384).collect();
+            chunks.push(serde_json::json!({"id":item.id,"text":text}));
+        }
+    }
+    chunks
 }
 /// Split array projections into <= 1 MiB JSON pages, leaving 1 MiB of
 /// headroom below the reader's hard limit. This covers both status forms and
@@ -842,6 +868,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn history_search_keys_are_lossless_across_bounded_ipc_pages() -> Result<()> {
+        let search = format!("{}é", "\u{1}".repeat(crate::store::history::MAX_TEXT));
+        let item = crate::store::history::Item {
+            id: "a".repeat(32),
+            title: "Long item".into(),
+            search: search.clone(),
+            pinned: Some(1),
+            url: false,
+            image: false,
+            origin: None,
+            at: 1,
+            thumbnail: None,
+        };
+        let snapshot = crate::ui::Snapshot {
+            clipboard_history: vec![item],
+            ..Default::default()
+        };
+        let expected = serde_json::json!({"snapshot":snapshot,"history_search":history_search(&snapshot, &["a".repeat(32)])});
+        let pages = response_pages(Reply {
+            ok: true,
+            more: false,
+            value: expected.clone(),
+        })?;
+        assert!(pages.len() > 1);
+        let mut joined = serde_json::Value::Null;
+        for (n, page) in pages.into_iter().enumerate() {
+            assert!(serde_json::to_vec(&page)?.len() < RESPONSE_PAGE_BYTES);
+            if n == 0 {
+                joined = page.value;
+            } else {
+                append_page(&mut joined, page.value)?;
+            }
+        }
+        assert_eq!(joined, expected);
+        let restored: String = joined["history_search"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(restored, search);
+        Ok(())
+    }
+
+    #[test]
     fn link_existing_device_accepts_legacy_and_fenced_requests() -> Result<()> {
         let device = Id::from_bytes([1; 16]);
         for extra in [
@@ -876,6 +947,94 @@ mod tests {
         async fn open(&self, _: &Path) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pin_unpin_delete_and_clear_history_round_trip_over_ipc() -> Result<()> {
+        let dir = crate::test_support::scratch()?;
+        let paths = crate::Paths {
+            data: dir.path().join("data"),
+            cache: dir.path().join("cache"),
+            config: dir.path().join("config/config.toml"),
+            socket: dir.path().join("ipc.sock"),
+        };
+        crate::config::private_dir(&paths.data)?;
+        let id = {
+            let store = crate::store::Store::open(&paths.data.join("state.sqlite3"))?;
+            store.history_configure(true, true).await?;
+            for text in ["Keep café", "Clear me"] {
+                store
+                    .history_record(
+                        crate::actions::ClipboardInput::Text(text.into()),
+                        None,
+                        store.history_capture().unwrap(),
+                    )
+                    .await?;
+            }
+            store.history_items()[1].id.clone()
+        };
+        let core = Core::new(
+            paths.clone(),
+            Config {
+                clipboard_history: true,
+                save_path: dir.path().join("saved"),
+                ..Config::default()
+            },
+            Arc::new(NoActions),
+        )
+        .await?;
+        let (listener, _owner) = bind(&paths.socket)?;
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(serve(core.clone(), listener, rx));
+        request(
+            &paths.socket,
+            Command::PinClipboardHistory {
+                id: id.clone(),
+                pinned: true,
+            },
+        )
+        .await?;
+        assert!(core.ui_snapshot().clipboard_history[0].pinned.is_some());
+        let search = request(
+            &paths.socket,
+            Command::ClipboardHistorySearch {
+                ids: vec![id.clone()],
+            },
+        )
+        .await?;
+        assert!(
+            search
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["text"] == "keep cafe")
+        );
+        request(&paths.socket, Command::ClearClipboardHistory).await?;
+        assert_eq!(core.ui_snapshot().clipboard_history.len(), 1);
+        request(
+            &paths.socket,
+            Command::PinClipboardHistory {
+                id: id.clone(),
+                pinned: false,
+            },
+        )
+        .await?;
+        assert_eq!(core.ui_snapshot().clipboard_history[0].pinned, None);
+        request(
+            &paths.socket,
+            Command::PinClipboardHistory {
+                id: id.clone(),
+                pinned: true,
+            },
+        )
+        .await?;
+        request(&paths.socket, Command::DeleteClipboardHistory { id }).await?;
+        assert!(core.ui_snapshot().clipboard_history.is_empty());
+        let _ = stop.send(true);
+        tokio::time::timeout(Duration::from_secs(2), server).await???;
+        core.shutdown_actions().await?;
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]

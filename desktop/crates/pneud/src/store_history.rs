@@ -7,6 +7,8 @@ use std::sync::Weak;
 pub(crate) const MAX_TEXT: usize = 1024 * 1024;
 pub(crate) const MAX_IMAGE: usize = 20 * 1024 * 1024;
 const LIMIT: usize = 50;
+pub(crate) const PIN_LIMIT: usize = 25;
+pub(crate) const PIN_LIMIT_ERROR: &str = "You can pin up to 25 items";
 
 #[derive(Debug)]
 pub(crate) struct Capture {
@@ -20,6 +22,11 @@ pub(crate) struct Capture {
 pub struct Item {
     pub id: String,
     pub title: String,
+    // ClipboardHistorySearch sends complete keys separately from status, in bounded chunks.
+    #[serde(skip)]
+    pub search: String,
+    #[serde(default)]
+    pub pinned: Option<i64>,
     pub url: bool,
     pub image: bool,
     pub origin: Option<String>,
@@ -36,7 +43,36 @@ pub(super) struct State {
 }
 pub(super) fn migrate(tx: &Transaction<'_>) -> Result<()> {
     tx.execute_batch("CREATE TABLE IF NOT EXISTS clipboard_items(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,digest TEXT UNIQUE NOT NULL,text TEXT,origin TEXT,at INTEGER NOT NULL);")?;
+    let pinned: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('clipboard_items') WHERE name='pinned')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !pinned {
+        tx.execute_batch("ALTER TABLE clipboard_items ADD COLUMN pinned INTEGER;")?;
+    }
     Ok(())
+}
+/// The complete text is normalized before presentation truncates or drops a URL scheme.
+pub(crate) fn search_key(text: &str) -> String {
+    use caseless::Caseless;
+    use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .nfd()
+        .filter(|c| !is_combining_mark(*c))
+        .default_case_fold()
+        .collect()
+}
+fn evict(c: &Connection, protected: &str) -> Result<Vec<String>> {
+    let old = c.prepare("SELECT id FROM clipboard_items WHERE pinned IS NULL ORDER BY (id=?) DESC,seq DESC LIMIT -1 OFFSET ?")?
+        .query_map(params![protected, LIMIT as i64], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in &old {
+        c.execute("DELETE FROM clipboard_items WHERE id=?", [id])?;
+    }
+    Ok(old)
 }
 pub(crate) fn is_url(text: &str) -> bool {
     let text = text.trim();
@@ -79,18 +115,19 @@ fn remove_images(folder: &Path, id: &str) -> Result<()> {
 }
 fn load(c: &Connection, folder: &Path) -> Result<Vec<Item>> {
     let rows = c
-        .prepare("SELECT id,text,origin,at FROM clipboard_items ORDER BY seq DESC")?
+        .prepare("SELECT id,text,origin,at,pinned FROM clipboard_items ORDER BY pinned IS NOT NULL DESC,pinned DESC,seq DESC")?
         .query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, Option<String>>(1)?,
                 r.get::<_, Option<String>>(2)?,
                 r.get::<_, i64>(3)? as u64,
+                r.get::<_, Option<i64>>(4)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut items = Vec::new();
-    for (id, text, origin, at) in rows {
+    for (id, text, origin, at, pinned) in rows {
         if !valid_id(&id) {
             c.execute("DELETE FROM clipboard_items WHERE id=?", [&id])?;
             continue;
@@ -104,6 +141,8 @@ fn load(c: &Connection, folder: &Path) -> Result<Vec<Item>> {
         let thumb = image_path(folder, &id, true);
         items.push(Item {
             id,
+            pinned,
+            search: text.as_deref().map(search_key).unwrap_or_default(),
             title: text.as_deref().map(title).unwrap_or_else(|| "Image".into()),
             url: text.as_deref().is_some_and(is_url),
             image,
@@ -302,13 +341,12 @@ impl Store {
                     crate::config::atomic_private(&image_path(&folder, &id, true), &thumb)?;
                 }
                 let tx = c.transaction()?;
-                tx.execute("DELETE FROM clipboard_items WHERE id=?", [&id])?;
                 tx.execute(
-                    "INSERT INTO clipboard_items(seq,id,digest,text,origin,at) VALUES (?,?,?,?,?,?)",
+                    "INSERT INTO clipboard_items(seq,id,digest,text,origin,at) VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET seq=excluded.seq,origin=excluded.origin,at=excluded.at",
                     params![capture.seq, id, digest, text, origin, capture.at as i64],
                 )?;
                 let old = tx
-                    .prepare("SELECT id FROM clipboard_items ORDER BY seq DESC LIMIT -1 OFFSET ?")?
+                    .prepare("SELECT id FROM clipboard_items WHERE pinned IS NULL ORDER BY seq DESC LIMIT -1 OFFSET ?")?
                     .query_map([LIMIT as i64], |r| r.get::<_, String>(0))?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 for id in &old {
@@ -374,13 +412,60 @@ impl Store {
                 }
                 remove_images(&folder, &id)?;
             } else {
-                clear(c, &folder)?;
+                c.execute("DELETE FROM clipboard_items WHERE pinned IS NULL", [])?;
+                let retained: HashSet<_> = load(c, &folder)?
+                    .into_iter()
+                    .filter(|item| item.image)
+                    .flat_map(|item| {
+                        [
+                            image_path(&folder, &item.id, false),
+                            image_path(&folder, &item.id, true),
+                        ]
+                    })
+                    .collect();
+                // A failed recording can leave files before its row commits.
+                for entry in fs::read_dir(&folder)? {
+                    let entry = entry?;
+                    if entry.file_type()?.is_file() && !retained.contains(&entry.path()) {
+                        fs::remove_file(entry.path())?;
+                    }
+                }
+                c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
             }
             let items = load(c, &folder)?;
             state.lock().expect("clipboard history").items = items;
             Ok(())
         })
         .await
+    }
+    pub(crate) async fn history_pin(&self, id: String, pinned: bool) -> Result<()> {
+        ensure!(valid_id(&id), "invalid history id");
+        let gate = self.history_gate.clone().lock_owned().await;
+        ensure!(
+            self.history_generation().is_some(),
+            "clipboard history is off"
+        );
+        let folder = self.history_folder();
+        let state = self.history.clone();
+        self.history_call(move |c| {
+            let _gate = gate;
+            let tx = c.transaction()?;
+            let current: Option<i64> = tx.query_row("SELECT pinned FROM clipboard_items WHERE id=?", [&id], |r| r.get(0)).context("history item was deleted")?;
+            let mut evicted = Vec::new();
+            if pinned && current.is_none() {
+                let count: i64 = tx.query_row("SELECT count(*) FROM clipboard_items WHERE pinned IS NOT NULL", [], |r| r.get(0))?;
+                ensure!(count < PIN_LIMIT as i64, PIN_LIMIT_ERROR);
+                tx.execute("UPDATE clipboard_items SET pinned=(SELECT coalesce(max(pinned),0)+1 FROM clipboard_items) WHERE id=?", [&id])?;
+            } else if !pinned && current.is_some() {
+                tx.execute("UPDATE clipboard_items SET pinned=NULL WHERE id=?", [&id])?;
+                // Unpin always retains this item, even if it is older than all 50 Recent items.
+                evicted = evict(&tx, &id)?;
+            }
+            tx.commit()?;
+            for id in evicted { remove_images(&folder, &id)?; }
+            state.lock().expect("clipboard history").items = load(c, &folder)?;
+            Ok(())
+        }).await
     }
     pub(crate) async fn history_input(&self, id: String) -> Result<(ClipboardInput, Arc<Capture>)> {
         ensure!(valid_id(&id), "invalid history id");
@@ -429,7 +514,7 @@ impl Store {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     async fn record(store: &Store, text: &str, origin: Option<&str>) -> Result<()> {
@@ -464,6 +549,217 @@ mod tests {
                 store.history_capture().unwrap(),
             )
             .await
+    }
+    #[test]
+    fn search_folds_case_accents_whitespace_and_full_unicode_case() {
+        assert_eq!(
+            search_key("  CAFÉ\tmañana\n Straße Σς  "),
+            "cafe manana strasse σσ"
+        );
+        assert_eq!(search_key("CAFE\u{301}"), "cafe");
+        assert_eq!(search_key("Ა"), search_key("ა")); // Modern Georgian capitals.
+
+        assert_eq!(search_key("\t  "), "");
+        assert!(search_key("https://example.org/Café").contains(&search_key("HTTPS://EXAMPLE")));
+    }
+    #[tokio::test]
+    async fn pinned_image_files_survive_clear_and_restart_then_off_removes_them() -> Result<()> {
+        let dir = crate::test_support::scratch()?;
+        let path = dir.path().join("state.sqlite3");
+        let id = {
+            let store = Store::open(&path)?;
+            store.history_configure(true, true).await?;
+            record_image(&store, png(1, image::codecs::png::CompressionType::Fast)?).await?;
+            let id = store.history_items()[0].id.clone();
+            store.history_pin(id.clone(), true).await?;
+            record_image(&store, png(2, image::codecs::png::CompressionType::Fast)?).await?;
+            store.history_delete(None).await?;
+            assert_eq!(fs::read_dir(store.history_folder())?.count(), 2);
+            id
+        };
+        let store = Store::open(&path)?;
+        store.history_configure(true, true).await?;
+        assert_eq!(store.history_items()[0].id, id);
+        assert!(store.history_items()[0].pinned.is_some());
+        assert!(
+            store.history_items()[0]
+                .thumbnail
+                .as_ref()
+                .unwrap()
+                .is_file()
+        );
+        store.history_configure(false, false).await?;
+        assert!(store.history_items().is_empty());
+        assert_eq!(fs::read_dir(store.history_folder())?.count(), 0);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn clear_removes_failed_recording_orphans_and_preserves_pinned_images() -> Result<()> {
+        let dir = crate::test_support::scratch()?;
+        let store = Store::open(&dir.path().join("state.sqlite3"))?;
+        store.history_configure(true, true).await?;
+        record_image(&store, png(1, image::codecs::png::CompressionType::Fast)?).await?;
+        let id = store.history_items()[0].id.clone();
+        store.history_pin(id.clone(), true).await?;
+        let folder = store.history_folder();
+        let original = image_path(&folder, &id, false);
+        let thumbnail = image_path(&folder, &id, true);
+        let original_bytes = fs::read(&original)?;
+        let thumbnail_bytes = fs::read(&thumbnail)?;
+        record_image(&store, png(2, image::codecs::png::CompressionType::Fast)?).await?;
+        store.locked(|c| {
+            c.execute_batch("CREATE TEMP TRIGGER fail_history_insert BEFORE INSERT ON clipboard_items BEGIN SELECT RAISE(FAIL, 'history insert failed'); END;")?;
+            Ok(())
+        })?;
+        let error = record_image(&store, png(3, image::codecs::png::CompressionType::Fast)?)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("history insert failed"));
+        let rows = store.locked(|c| {
+            Ok(
+                c.query_row("SELECT count(*) FROM clipboard_items", [], |r| {
+                    r.get::<_, i64>(0)
+                })?,
+            )
+        })?;
+        assert_eq!(rows, 2);
+        assert_eq!(fs::read_dir(&folder)?.count(), 6);
+
+        store.history_delete(None).await?;
+
+        assert_eq!(fs::read_dir(&folder)?.count(), 2);
+        assert_eq!(fs::read(&original)?, original_bytes);
+        assert_eq!(fs::read(&thumbnail)?, thumbnail_bytes);
+        let items = store.history_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, id);
+        assert!(items[0].pinned.is_some());
+        store.history_pin(id, false).await?;
+        store.history_delete(None).await?;
+        assert!(store.history_items().is_empty());
+        assert_eq!(fs::read_dir(&folder)?.count(), 0);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn pins_survive_dedupe_restart_eviction_and_clear_but_not_off() -> Result<()> {
+        let dir = crate::test_support::scratch()?;
+        let path = dir.path().join("state.sqlite3");
+        let store = Store::open(&path)?;
+        store.history_configure(true, true).await?;
+        record(&store, "first pin", None).await?;
+        let first = store.history_items()[0].id.clone();
+        store.history_pin(first.clone(), true).await?;
+        record(&store, "second pin", None).await?;
+        let second = store
+            .history_items()
+            .iter()
+            .find(|i| i.title == "second pin")
+            .unwrap()
+            .id
+            .clone();
+        store.history_pin(second.clone(), true).await?;
+        let pin_order = store.history_items()[1].pinned;
+        let (_, capture) = store.history_input(first.clone()).await?;
+        store.history_touch(first.clone(), capture).await?;
+        record(&store, "first pin", Some("Phone")).await?;
+        let items = store.history_items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id, second);
+        assert_eq!(items[1].pinned, pin_order);
+        assert_eq!(items[1].origin.as_deref(), Some("Phone"));
+        for i in 0..55 {
+            record(&store, &format!("recent {i}"), None).await?;
+        }
+        assert_eq!(store.history_items().len(), 52);
+        assert_eq!(store.history_items()[1].id, first);
+        store.history_configure(true, true).await?;
+        assert_eq!(store.history_items()[0].id, second);
+        let pending = store.history_capture().unwrap();
+        store.history_delete(None).await?;
+        store
+            .history_record(ClipboardInput::Text("late".into()), None, pending)
+            .await?;
+        assert_eq!(store.history_items().len(), 2);
+        store.history_delete(Some(second)).await?;
+        assert_eq!(store.history_items().len(), 1);
+        store.history_configure(false, false).await?;
+        assert!(store.history_items().is_empty());
+        Ok(())
+    }
+    #[tokio::test]
+    async fn pin_cap_is_atomic_and_unpin_protects_the_oldest_item() -> Result<()> {
+        let dir = crate::test_support::scratch()?;
+        let store = Store::open(&dir.path().join("state.sqlite3"))?;
+        store.history_configure(true, true).await?;
+        let mut ids = Vec::new();
+        for i in 0..PIN_LIMIT {
+            record(&store, &format!("pin {i}"), None).await?;
+            let id = store
+                .history_items()
+                .iter()
+                .find(|i| i.pinned.is_none())
+                .unwrap()
+                .id
+                .clone();
+            store.history_pin(id.clone(), true).await?;
+            ids.push(id);
+        }
+        record(&store, "26th", None).await?;
+        let extra = store.history_items().last().unwrap().id.clone();
+        let before = store.history_items();
+        assert_eq!(
+            store
+                .history_pin(extra, true)
+                .await
+                .unwrap_err()
+                .to_string(),
+            PIN_LIMIT_ERROR
+        );
+        assert_eq!(store.history_items(), before);
+        store.history_pin(ids[0].clone(), true).await?; // Idempotent at the cap.
+        for i in 0..50 {
+            record(&store, &format!("new {i}"), None).await?;
+        }
+        store.history_pin(ids[0].clone(), false).await?;
+        let items = store.history_items();
+        assert_eq!(items.iter().filter(|i| i.pinned.is_none()).count(), LIMIT);
+        assert_eq!(items.last().unwrap().id, ids[0]);
+        assert!(!items.iter().any(|i| i.title == "new 0"));
+        store.history_pin(ids[0].clone(), true).await?;
+        assert_eq!(store.history_items()[0].id, ids[0]);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn v4_history_migration_preserves_content_sequence_and_images() -> Result<()> {
+        let dir = crate::test_support::scratch()?;
+        let path = dir.path().join("state.sqlite3");
+        let id = "a".repeat(32);
+        {
+            let store = Store::open(&path)?;
+            store.history_configure(true, true).await?;
+            record_image(&store, png(19, image::codecs::png::CompressionType::Fast)?).await?;
+            store.locked(move |c| {
+                c.execute_batch("ALTER TABLE clipboard_items DROP COLUMN pinned; PRAGMA user_version=4;")?;
+                c.execute("INSERT INTO clipboard_items(seq,id,digest,text,origin,at) VALUES(42,?,'text:legacy','café','Phone',123)", [&id])?;
+                Ok(())
+            })?;
+        }
+        let store = Store::open(&path)?;
+        store.history_configure(true, true).await?;
+        let items = store.history_items();
+        assert_eq!(items.len(), 2);
+        assert!(items[1].image);
+        assert!(items[1].thumbnail.as_ref().unwrap().is_file());
+        let item = &items[0];
+        assert_eq!(item.title, "café");
+        assert_eq!(item.search, "cafe");
+        assert_eq!(item.at, 123);
+        assert_eq!(item.pinned, None);
+        assert!(store.history_capture().unwrap().seq > 42);
+        store.history_pin(item.id.clone(), true).await?;
+        store.history_configure(true, true).await?;
+        assert!(store.history_items()[0].pinned.is_some());
+        Ok(())
     }
     #[tokio::test]
     async fn older_duplicate_completion_preserves_newer_time_and_origin() -> Result<()> {

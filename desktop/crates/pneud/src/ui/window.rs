@@ -5,7 +5,6 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
-#[cfg(target_os = "linux")]
 use std::collections::HashMap;
 use std::{
     collections::HashSet,
@@ -230,6 +229,7 @@ enum Action {
     CopyHistory(String),
     DisableEmptyHistory,
     DeleteHistory(String),
+    PinHistory(String, bool),
     ClearHistory,
     Cancel(String),
     Retry(String),
@@ -1576,6 +1576,43 @@ impl UiSender {
 // Slint 1.15 elides horizontal overflow but silently drops extra wrapped lines.
 // Use its renderer for the exact window font, fallback fonts and scale. These
 // internals are available through Slint's re-exports; Slint is pinned to 1.15.1.
+fn update_history_order(
+    order: &mut Vec<String>,
+    old: &[crate::store::history::Item],
+    items: &[crate::store::history::Item],
+    open: bool,
+) {
+    if !open {
+        *order = items.iter().map(|i| i.id.clone()).collect();
+        return;
+    }
+    order.retain(|id| items.iter().any(|i| &i.id == id));
+    // Only the unpinned row moves. Other Recent rows keep their displayed order,
+    // even if selecting one updated its copy time while this page was open.
+    for (rank, item) in items.iter().enumerate() {
+        if item.pinned.is_none() && old.iter().any(|i| i.id == item.id && i.pinned.is_some()) {
+            order.retain(|id| id != &item.id);
+            let position = order
+                .iter()
+                .position(|id| {
+                    items
+                        .iter()
+                        .position(|i| &i.id == id && i.pinned.is_none())
+                        .is_some_and(|r| r > rank)
+                })
+                .unwrap_or(order.len());
+            order.insert(position, item.id.clone());
+        }
+    }
+    let mut new: Vec<_> = items
+        .iter()
+        .filter(|i| !order.contains(&i.id))
+        .map(|i| i.id.clone())
+        .collect();
+    new.append(order);
+    *order = new;
+}
+
 fn history_text_size(window: &PneuWindow, text: &str, width: f32) -> (f32, f32) {
     use slint::private_unstable_api::re_exports::{
         ComplexText, ItemRc, LogicalLength, TextWrap, WindowInner,
@@ -1687,6 +1724,17 @@ fn connect(
     ui.on_choose_folder(send(|| Action::Folder));
     ui.on_open_folder(send(|| Action::OpenFolder));
     ui.on_send_clipboard(send(|| Action::SendClipboard));
+    ui.on_history_searching(|query| !crate::store::history::search_key(&query).is_empty());
+    ui.on_filter_history(|items, query, pinned| {
+        let query = crate::store::history::search_key(&query);
+        ModelRc::new(slint::FilterModel::new(items, move |i| {
+            i.pinned == pinned && (query.is_empty() || (!i.picture && i.search.contains(&query)))
+        }))
+    });
+    let pin_tx = commands.clone();
+    ui.on_pin_history(move |id, pinned| {
+        let _ = pin_tx.send(Action::PinHistory(id.to_string(), pinned));
+    });
     ui.on_copy_history(with(Action::CopyHistory));
     ui.on_disable_empty_history(send(|| Action::DisableEmptyHistory));
     ui.on_delete_history(with(Action::DeleteHistory));
@@ -1866,6 +1914,7 @@ struct Worker {
     status: Value,
     snapshot: super::Snapshot,
     history_order: Vec<String>,
+    history_search: HashMap<String, String>,
     transfers: Vec<Transfer>,
     pushed: Option<Frame>,
     phone_token: Option<pneu_proto::Hash>,
@@ -1932,6 +1981,7 @@ impl Worker {
             status: Value::Null,
             snapshot: Default::default(),
             history_order: Vec::new(),
+            history_search: HashMap::new(),
             transfers: Vec::new(),
             pushed: None,
             phone_token: None,
@@ -2322,6 +2372,24 @@ impl Worker {
                 {
                     Ok(_) => self.ui(move |w| w.invoke_history_copied(id.into())),
                     Err(error) => self.fail("Couldn't copy", error),
+                }
+            }
+            Action::PinHistory(id, pinned) => {
+                match self
+                    .command(ipc::Command::PinClipboardHistory { id, pinned })
+                    .await
+                {
+                    Ok(_) => (),
+                    Err(error)
+                        if error
+                            .to_string()
+                            .contains(crate::store::history::PIN_LIMIT_ERROR) =>
+                    {
+                        if self.current() {
+                            self.action_error = crate::store::history::PIN_LIMIT_ERROR.into();
+                        }
+                    }
+                    Err(error) => self.fail("Couldn't change pin", error),
                 }
             }
             Action::DeleteHistory(id) => {
@@ -3583,24 +3651,50 @@ impl Worker {
 
     async fn refresh(&mut self, value: Value, visible: &AtomicBool) -> Result<()> {
         self.origin = self.view();
-        let snapshot: super::Snapshot = serde_json::from_value(value["snapshot"].clone())?;
+        let mut snapshot: super::Snapshot = serde_json::from_value(value["snapshot"].clone())?;
+        // Text is immutable for an ID. Fetch complete search keys once rather
+        // than retransmitting up to 75 MiB on every status refresh.
+        self.history_search
+            .retain(|id, _| snapshot.clipboard_history.iter().any(|i| &i.id == id));
+        let ids: Vec<_> = snapshot
+            .clipboard_history
+            .iter()
+            .filter(|i| !i.image && !self.history_search.contains_key(&i.id))
+            .map(|i| i.id.clone())
+            .collect();
+        if !ids.is_empty() {
+            let chunks = self
+                .command(ipc::Command::ClipboardHistorySearch { ids: ids.clone() })
+                .await?;
+            for id in ids {
+                self.history_search.insert(id, String::new());
+            }
+            for chunk in chunks.as_array().context("invalid history search reply")? {
+                if let (Some(id), Some(text)) = (chunk["id"].as_str(), chunk["text"].as_str())
+                    && let Some(key) = self.history_search.get_mut(id)
+                {
+                    key.push_str(text);
+                }
+            }
+        }
+        for item in &mut snapshot.clipboard_history {
+            item.search = self
+                .history_search
+                .get(&item.id)
+                .cloned()
+                .unwrap_or_default();
+        }
         let config: Config = serde_json::from_value(value["config"].clone())?;
         self.status_error.clear();
         self.invitation_revision = value["invitation_revision"].as_u64().unwrap_or(0);
         self.transfers = snapshot.transfers.iter().map(Transfer::from).collect();
-        if self.view().page != Page::History {
-            self.history_order.clear();
-        }
-        self.history_order
-            .retain(|id| snapshot.clipboard_history.iter().any(|i| &i.id == id));
-        let mut new: Vec<_> = snapshot
-            .clipboard_history
-            .iter()
-            .filter(|i| !self.history_order.contains(&i.id))
-            .map(|i| i.id.clone())
-            .collect();
-        new.append(&mut self.history_order);
-        self.history_order = new;
+        let history_open = self.view().page == Page::History;
+        update_history_order(
+            &mut self.history_order,
+            &self.snapshot.clipboard_history,
+            &snapshot.clipboard_history,
+            history_open,
+        );
         self.snapshot = snapshot;
         #[cfg(target_os = "macos")]
         {
@@ -4192,17 +4286,22 @@ impl Worker {
             summary: hero,
             devices: peers.iter().map(|p| self.device_item(p)).collect(),
             recent: recent(peers, &self.transfers),
-            history: self
-                .history_order
-                .iter()
-                .filter_map(|id| {
-                    self.snapshot
-                        .clipboard_history
-                        .iter()
-                        .find(|i| &i.id == id)
-                        .cloned()
-                })
-                .collect(),
+            history: {
+                let mut items: Vec<_> = self
+                    .history_order
+                    .iter()
+                    .filter_map(|id| {
+                        self.snapshot
+                            .clipboard_history
+                            .iter()
+                            .find(|i| &i.id == id)
+                            .cloned()
+                    })
+                    .collect();
+                // Stable sorting keeps Recent frozen and puts new pins first.
+                items.sort_by_key(|i| (i.pinned.is_none(), std::cmp::Reverse(i.pinned)));
+                items
+            },
             keep_history: config.clipboard_history,
             manual_clipboard: mode == ClipboardMode::Manual,
             pair_again,
@@ -4263,12 +4362,18 @@ fn apply(w: &PneuWindow, frame: Frame) {
     sync(ui.get_devices(), &frame.devices);
     sync(ui.get_recent(), &frame.recent);
     ui.set_keep_history(frame.keep_history);
+    if frame.history.is_empty() {
+        ui.set_history_query("".into());
+    }
+    ui.set_history_pins(frame.history.iter().filter(|i| i.pinned.is_some()).count() as i32);
     let history: Vec<_> = frame
         .history
         .iter()
         .map(|item| HistoryItem {
             id: item.id.clone().into(),
             title: item.title.clone().into(),
+            search: item.search.clone().into(),
+            pinned: item.pinned.is_some(),
             url: item.url,
             picture: item.image,
             detail: format!(
@@ -8613,8 +8718,14 @@ mod tests {
             );
             let ui = window.global::<Ui>();
             ui.set_dialog(Dialog::None);
+            ui.set_page(Page::Main);
+            // Tear down the previous scene before constructing the next one's
+            // autofocus controls; captures must not inherit pending focus timers.
+            let _ = window.get_content_height();
+            advance_ui();
             ui.set_is_mac(false);
             ui.set_history_copied("".into());
+            ui.set_history_query("".into());
             ui.set_download(false);
             ui.set_qr(slint::Image::from_rgba8(qr_pixels(&sample_uri())?));
             ui.set_code_qr(slint::Image::from_rgba8(qr_pixels(&sample_uri())?));
@@ -8637,6 +8748,9 @@ mod tests {
             );
             apply(&window, frame);
             (scene.ui)(&window);
+            // Evaluate the layout before advancing timers: conditional controls
+            // must exist before their popup/search autofocus timers can run.
+            let _ = window.get_content_height();
             // Popups focus their default button on a short timer.
             slint::platform::update_timers_and_animations();
             std::thread::sleep(Duration::from_millis(5));
@@ -8683,6 +8797,34 @@ mod tests {
             surface.draw_if_needed(|renderer| {
                 renderer.render(&mut pixels, size.width as usize);
             });
+            // The first draw creates root-level popup controls. Capture their
+            // settled autofocus state, as the next real event-loop frame does.
+            advance_ui();
+            surface.request_redraw();
+            surface.draw_if_needed(|renderer| {
+                renderer.render(&mut pixels, size.width as usize);
+            });
+            if scene.name == "89-history-searching" {
+                assert_eq!(ui.get_history_query(), "pneu");
+                assert_eq!(ui.get_pinned_history().row_count(), 1);
+                assert_eq!(ui.get_recent_history().row_count(), 0);
+            }
+            if scene.name == "90-history-no-matches" {
+                assert_eq!(ui.get_history_query(), "invoice");
+                assert_eq!(
+                    ui.get_pinned_history().row_count() + ui.get_recent_history().row_count(),
+                    0
+                );
+            }
+            if matches!(ui.get_dialog(), Dialog::HistoryClear | Dialog::HistoryOff) {
+                assert!(
+                    pixels
+                        .iter()
+                        .any(|p| (p.red, p.green, p.blue) == (79, 91, 255)),
+                    "{}: Cancel must show its accent focus ring",
+                    scene.name
+                );
+            }
             if scene.name.starts_with("17-add-") {
                 // At the default size, the Phone page must keep its bottom
                 // padding and must not paint a scrollbar in the right gutter.
@@ -9951,6 +10093,207 @@ mod tests {
         list
     }
 
+    #[test]
+    fn history_pin_changes_preserve_other_rows_frozen_copy_order() -> Result<()> {
+        let item = |id: &str, pin| -> Result<crate::store::history::Item> {
+            Ok(serde_json::from_value(
+                json!({"id":id,"title":id,"pinned":pin,"url":false,"image":false,"origin":null,"at":1,"thumbnail":null}),
+            )?)
+        };
+        let old = vec![item("pin", Some(1))?, item("b", None)?, item("a", None)?];
+        let mut order = vec!["pin".into(), "a".into(), "b".into()];
+        update_history_order(&mut order, &old, &old, true);
+        assert_eq!(order, ["pin", "a", "b"]);
+        let unpinned = vec![item("b", None)?, item("pin", None)?, item("a", None)?];
+        update_history_order(&mut order, &old, &unpinned, true);
+        assert_eq!(order, ["pin", "a", "b"], "unpin does not move a and b");
+        update_history_order(&mut order, &unpinned, &unpinned, false);
+        assert_eq!(
+            order,
+            ["b", "pin", "a"],
+            "reopening takes the latest copy order"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn history_search_focus_enter_escape_and_shortcut() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::history_search_focus_enter_escape_and_shortcut",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        let surface = headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (_worker, mut rx) = model_worker(&window, dir.path());
+        let ui = window.global::<Ui>();
+        ui.set_keep_history(true);
+        ui.set_is_mac(cfg!(target_os = "macos"));
+        ui.set_history_pins(1);
+        let row = |id: &str, text: &str, pinned, picture| HistoryItem {
+            id: id.into(),
+            title: text.into(),
+            search: crate::store::history::search_key(text).into(),
+            pinned,
+            picture,
+            ..Default::default()
+        };
+        sync(
+            ui.get_history(),
+            &[
+                row("recent", "Café mañana", false, false),
+                row("pin", "CAFÉ au lait", true, false),
+                row("image", "Image", false, true),
+                row(
+                    "long",
+                    &format!("{} tail https://example.org", "x".repeat(600)),
+                    false,
+                    false,
+                ),
+            ],
+        );
+        window.invoke_go(Page::History);
+        window.show()?;
+        surface.set_size(slint::PhysicalSize::new(400, 600));
+        window
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::WindowActiveChanged(true));
+        let draw = || {
+            surface.request_redraw();
+            surface.draw_if_needed(|renderer| {
+                let mut pixels = vec![
+                        slint::platform::software_renderer::PremultipliedRgbaColor::default();
+                        400 * 600
+                    ];
+                renderer.render(&mut pixels, 400);
+            });
+            advance_ui();
+        };
+        let text = |text: &str| {
+            window
+                .window()
+                .dispatch_event(slint::platform::WindowEvent::KeyPressed { text: text.into() });
+            window
+                .window()
+                .dispatch_event(slint::platform::WindowEvent::KeyReleased { text: text.into() });
+            flush_ui();
+        };
+        draw();
+        while rx.try_recv().is_ok() {}
+        text("cafe");
+        assert_eq!(ui.get_history_query(), "cafe", "search takes focus on open");
+        assert_eq!(ui.get_pinned_history().row_count(), 1);
+        assert_eq!(ui.get_recent_history().row_count(), 1);
+        let model = ui.get_history();
+        let rows = model
+            .as_any()
+            .downcast_ref::<VecModel<HistoryItem>>()
+            .unwrap();
+        rows.push(row("arrival", "CAFÉ from a new copy", false, false));
+        assert_eq!(
+            ui.get_recent_history().row_count(),
+            2,
+            "matching arrivals update an active search"
+        );
+        rows.remove(4);
+        let mut pin = rows.row_data(1).unwrap();
+        pin.pinned = false;
+        rows.set_row_data(1, pin.clone());
+        assert_eq!(
+            ui.get_pinned_history().row_count(),
+            0,
+            "unpin updates the active groups"
+        );
+        assert_eq!(ui.get_recent_history().row_count(), 2);
+        pin.pinned = true;
+        rows.set_row_data(1, pin);
+        key(&window, slint::platform::Key::Return);
+        assert!(
+            matches!(rx.try_recv()?, Action::Scoped(_, action) if matches!(*action, Action::CopyHistory(ref id) if id == "pin"))
+        );
+        key(&window, slint::platform::Key::Escape);
+        assert_eq!(ui.get_history_query(), "");
+        assert_eq!(ui.get_page(), Page::History);
+        text("invoice");
+        assert_eq!(
+            ui.get_pinned_history().row_count() + ui.get_recent_history().row_count(),
+            0
+        );
+        assert!(
+            window.get_content_height() >= 256.0,
+            "No matches keeps its 132px card"
+        );
+        key(&window, slint::platform::Key::Return);
+        assert!(rx.try_recv().is_err(), "Enter with no results does nothing");
+        key(&window, slint::platform::Key::Escape);
+        text("tail HTTPS://");
+        assert_eq!(
+            ui.get_recent_history().row_count(),
+            1,
+            "full text and URL scheme match"
+        );
+        key(&window, slint::platform::Key::Tab);
+        let modifier = if cfg!(target_os = "macos") {
+            slint::platform::Key::Meta
+        } else {
+            slint::platform::Key::Control
+        };
+        window
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::KeyPressed {
+                text: modifier.into(),
+            });
+        text("f");
+        window
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::KeyReleased {
+                text: modifier.into(),
+            });
+        text("mañana");
+        assert_eq!(
+            ui.get_history_query(),
+            "mañana",
+            "shortcut focuses and selects all text"
+        );
+        window.invoke_go(Page::Main);
+        assert_eq!(ui.get_history_query(), "");
+        window.invoke_go(Page::History);
+        draw();
+        key(&window, slint::platform::Key::Escape);
+        assert_eq!(ui.get_page(), Page::Main);
+        window.invoke_go(Page::Settings);
+        ui.set_dialog(Dialog::HistoryOff);
+        draw();
+        window.invoke_go(Page::History); // Show All also closes an open popup.
+        draw();
+        text("cafe");
+        assert_eq!(
+            ui.get_history_query(),
+            "cafe",
+            "Show All focuses search after dismissing a popup"
+        );
+        key(&window, slint::platform::Key::Escape);
+        ui.set_dialog(Dialog::HistoryClear);
+        draw();
+        key(&window, slint::platform::Key::Return);
+        assert_eq!(
+            ui.get_dialog(),
+            Dialog::None,
+            "Cancel owns Enter when search previously had focus"
+        );
+        while let Ok(action) = rx.try_recv() {
+            assert!(
+                !matches!(action, Action::Scoped(_, action) if matches!(*action, Action::CopyHistory(_)))
+            );
+        }
+        window.hide()?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn history_keyboard_copies_deletes_and_confirmations_default_to_cancel() -> Result<()> {
         if in_offscreen_child("ui::window::tests::history_keyboard_copies_deletes_and_confirmations_default_to_cancel",&[]).await? {return Ok(());}
@@ -9986,8 +10329,6 @@ mod tests {
             advance_ui();
         };
         draw();
-        key(&window, slint::platform::Key::Tab);
-        key(&window, slint::platform::Key::Tab);
         key(&window, slint::platform::Key::Tab);
         key(&window, slint::platform::Key::Return);
         key(&window, slint::platform::Key::Delete);
@@ -10140,8 +10481,38 @@ mod tests {
             ("Image",Some("MacBook Air"),true),
             ("The meeting has moved to Thursday. Please send the updated notes before lunch so everyone has time to read them.",None,false),
             ("averylongwordwithoutanyspaces".repeat(8).as_str(),Some("The computer with an unusually long device name that must be elided"),false),
-        ].into_iter().enumerate().map(|(i,(text,origin,image))|crate::store::history::Item {id:format!("{i:032x}"),title:text.into(),url:i==1,image,origin:origin.map(str::to_owned),at,thumbnail:None}).collect()
+        ].into_iter().enumerate().map(|(i,(text,origin,image))|crate::store::history::Item {id:format!("{i:032x}"),title:text.into(),search:crate::store::history::search_key(text),pinned:None,url:i==1,image,origin:origin.map(str::to_owned),at,thumbnail:None}).collect()
         };
+        w.history_order = w
+            .snapshot
+            .clipboard_history
+            .iter()
+            .map(|i| i.id.clone())
+            .collect();
+    }
+    fn pinned_history_fixture(w: &mut Worker) {
+        history_fixture(w, false);
+        let pins = [
+            "Calle Los Aromos 1840, Depto 52, Providencia",
+            "meet.example.com/pneu-weekly",
+            "Guest Wi-Fi: lantern-orbit-42",
+        ];
+        for (n, text) in pins.into_iter().enumerate() {
+            w.snapshot.clipboard_history.insert(
+                n,
+                crate::store::history::Item {
+                    id: format!("{:032x}", 100 + n),
+                    title: text.into(),
+                    search: crate::store::history::search_key(text),
+                    pinned: Some(3 - n as i64),
+                    url: n == 1,
+                    image: false,
+                    origin: None,
+                    at: crate::now_ms() - 86_400_000,
+                    thumbnail: None,
+                },
+            );
+        }
         w.history_order = w
             .snapshot
             .clipboard_history
@@ -10151,6 +10522,78 @@ mod tests {
     }
     fn history_scenes() -> Vec<Scene> {
         vec![
+            scene(
+                "88-history-pinned-recent",
+                pinned_history_fixture,
+                go(Page::History, 0, 0),
+            ),
+            scene("89-history-searching", pinned_history_fixture, |w| {
+                go(Page::History, 0, 0)(w);
+                let _ = w.get_content_height();
+                advance_ui();
+                w.global::<Ui>().set_history_query("pneu".into());
+            }),
+            scene("90-history-no-matches", pinned_history_fixture, |w| {
+                go(Page::History, 0, 0)(w);
+                let _ = w.get_content_height();
+                advance_ui();
+                w.global::<Ui>().set_history_query("invoice".into());
+            }),
+            scene(
+                "91-history-pin-limit",
+                |w| {
+                    pinned_history_fixture(w);
+                    let template = w.snapshot.clipboard_history[0].clone();
+                    for n in 3..25 {
+                        let mut item = template.clone();
+                        item.id = format!("{:032x}", 100 + n);
+                        item.title = format!("Saved item {}", n + 1);
+                        item.pinned = Some(3 - n);
+                        w.snapshot.clipboard_history.push(item);
+                    }
+                    w.history_order = w
+                        .snapshot
+                        .clipboard_history
+                        .iter()
+                        .map(|i| i.id.clone())
+                        .collect();
+                    w.action_error = crate::store::history::PIN_LIMIT_ERROR.into();
+                },
+                go(Page::History, 0, 0),
+            ),
+            scene("92-history-clear-keeps-pins", pinned_history_fixture, |w| {
+                go(Page::History, 0, 0)(w);
+                w.global::<Ui>().set_dialog(Dialog::HistoryClear);
+            }),
+            scene(
+                "93-history-off-includes-pins",
+                pinned_history_fixture,
+                |w| {
+                    go(Page::Settings, 0, 0)(w);
+                    w.global::<Ui>().set_history_off_count(8);
+                    w.global::<Ui>().set_dialog(Dialog::HistoryOff);
+                },
+            ),
+            scene(
+                "94-history-only-pins",
+                |w| {
+                    pinned_history_fixture(w);
+                    w.snapshot.clipboard_history.retain(|i| i.pinned.is_some());
+                },
+                go(Page::History, 0, 0),
+            ),
+            scene(
+                "95-history-off-only-pins",
+                |w| {
+                    pinned_history_fixture(w);
+                    w.snapshot.clipboard_history.retain(|i| i.pinned.is_some());
+                },
+                |w| {
+                    go(Page::Settings, 0, 0)(w);
+                    w.global::<Ui>().set_history_off_count(3);
+                    w.global::<Ui>().set_dialog(Dialog::HistoryOff);
+                },
+            ),
             scene(
                 "80-history-main",
                 |w| history_fixture(w, false),

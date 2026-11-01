@@ -3,6 +3,20 @@ use super::{
     Snapshot,
     window::{Peer, contract::Transfer, display_peer_text},
 };
+/// Pins have their own order; Recent retains the store's copy-sequence order.
+pub(crate) fn history_entries(
+    items: &[crate::store::history::Item],
+) -> Vec<Option<&crate::store::history::Item>> {
+    let mut pins: Vec<_> = items.iter().filter(|i| i.pinned.is_some()).collect();
+    pins.sort_by_key(|i| std::cmp::Reverse(i.pinned));
+    let recent: Vec<_> = items.iter().filter(|i| i.pinned.is_none()).collect();
+    let mut entries: Vec<_> = pins.into_iter().take(5).map(Some).collect();
+    if !entries.is_empty() && !recent.is_empty() {
+        entries.push(None);
+    }
+    entries.extend(recent.into_iter().take(10).map(Some));
+    entries
+}
 /// The tray's first line, which also starts its tooltip.
 pub(crate) fn status(snapshot: &Snapshot, peers: &[Peer], transfers: &[Transfer]) -> String {
     let sending: Vec<&str> = peers
@@ -248,11 +262,12 @@ pub(super) fn menu(snapshot: &Snapshot, config: &crate::Config) -> Vec<MenuEntry
         }
     }
     fn history(snapshot: &Snapshot) -> MenuEntry {
-        let mut items: Vec<_> = snapshot
-            .clipboard_history
-            .iter()
-            .take(10)
+        let mut items: Vec<_> = history_entries(&snapshot.clipboard_history)
+            .into_iter()
             .map(|i| {
+                let Some(i) = i else {
+                    return Separator;
+                };
                 item(
                     history_label(i, false),
                     Command::CopyClipboardHistory(i.id.clone()),
@@ -633,12 +648,37 @@ mod history_tests {
         crate::store::history::Item {
             id: "1".repeat(32),
             title: crate::store::history::title(text),
+            search: crate::store::history::search_key(text),
+            pinned: None,
             url: crate::store::history::is_url(text),
             image: false,
             origin: None,
             at: 1,
             thumbnail: None,
         }
+    }
+    #[test]
+    fn history_menu_groups_five_newest_pins_then_ten_recent() {
+        let mut items: Vec<_> = (0..20)
+            .map(|n| {
+                let mut item = entry(&format!("item {n}"));
+                item.pinned = (n < 7).then_some(n);
+                item.at = (20 - n) as u64;
+                item
+            })
+            .collect();
+        // Wall-clock adjustments must not reorder the store's copy sequence.
+        items[7].at = 0;
+        let entries = history_entries(&items);
+        assert_eq!(entries.len(), 16);
+        assert_eq!(entries[0].unwrap().title, "item 6");
+        assert_eq!(entries[4].unwrap().title, "item 2");
+        assert!(entries[5].is_none());
+        assert_eq!(entries[6].unwrap().title, "item 7");
+        assert_eq!(entries[15].unwrap().title, "item 16");
+        items.retain(|i| i.pinned.is_some());
+        assert_eq!(history_entries(&items).len(), 5);
+        assert!(history_entries(&items).iter().all(Option::is_some));
     }
     #[test]
     fn history_labels_collapse_whitespace_trim_urls_limit_unicode_and_escape_kde_mnemonics() {

@@ -372,17 +372,19 @@ impl State {
         }
         unsafe {
             let submenu = new_menu("Clipboard History");
-            let entries: Vec<_> = self
-                .snapshot
-                .clipboard_history
-                .iter()
-                .take(10)
-                .cloned()
-                .collect();
+            let entries: Vec<_> =
+                crate::ui::tray_model::history_entries(&self.snapshot.clipboard_history)
+                    .into_iter()
+                    .map(|i| i.cloned())
+                    .collect();
             if entries.is_empty() {
                 self.add(&submenu, "Nothing copied yet", None, None, false);
             } else {
                 for entry in entries {
+                    let Some(entry) = entry else {
+                        Self::separator(&submenu);
+                        continue;
+                    };
                     let item = self.add(
                         &submenu,
                         &crate::ui::tray_model::history_label(&entry, false),

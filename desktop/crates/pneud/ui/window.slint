@@ -28,7 +28,7 @@ export struct DeviceItem {
 }
 
 export struct HistoryItem {
-    id: string, title: string, detail: string, url: bool, picture: bool, thumbnail: image,
+    id: string, title: string, detail: string, url: bool, picture: bool, thumbnail: image, pinned: bool, search: string,
 }
 export struct RecentItem {
     id: string,
@@ -148,6 +148,16 @@ export global Ui {
     in property <bool> include-images;
     in property <bool> keep-history;
     in property <[HistoryItem]> history;
+    in property <int> history-pins;
+    in-out property <string> history-query;
+    in-out property <int> history-focus;
+    changed page => { history-query = ""; }
+    pure callback filter-history([HistoryItem], string, bool) -> [HistoryItem];
+    pure callback history-searching(string) -> bool;
+    out property <bool> searching: Ui.history-searching(Ui.history-query);
+    out property <[HistoryItem]> pinned-history: Ui.filter-history(Ui.history, Ui.history-query, true);
+    out property <[HistoryItem]> recent-history: Ui.filter-history(Ui.history, Ui.history-query, false);
+    callback pin-history(string, bool);
     pure callback elide-history-title(string, length, length) -> string;
     in-out property <string> history-copied;
     callback copy-history(string);
@@ -340,6 +350,7 @@ component HistoryRow inherits NavRow {
     in property <length> line-height;
     callback copy();
     callback remove();
+    callback pin();
     min-height: 56px;
     accessible-label: item.title + ", " + item.detail;
     delete-enabled: true;
@@ -379,7 +390,24 @@ component HistoryRow inherits NavRow {
                 Text {text: Ui.history-copied == root.item.id ? "Copied" : root.item.detail; font-size: Pneu.label-size; overflow: elide; color: Ui.history-copied == root.item.id ? Pneu.accent-text : Pneu.text2; horizontal-stretch: 1;}
             }
         }
-        VerticalLayout {alignment: center; IconButton {icon: Icons.close; label: "Delete"; clicked => {root.remove();}} }
+        HorizontalLayout {
+            spacing: 2px;
+            VerticalLayout {alignment: center; IconButton {icon: root.item.pinned ? Icons.pin-filled : Icons.pin; tint: root.item.pinned ? Pneu.accent-text : Pneu.text2; label: root.item.pinned ? "Unpin" : "Pin"; clicked => {root.pin();}} }
+            VerticalLayout {alignment: center; IconButton {icon: Icons.close; label: "Delete"; clicked => {root.remove();}} }
+        }
+    }
+}
+
+component HistoryCard inherits Card {
+    in property <[HistoryItem]> items;
+    in property <length> line-height;
+    VerticalLayout {
+        spacing: 0px;
+        for item[i] in root.items: VerticalLayout {
+            spacing: 0px;
+            if i > 0: Divider {}
+            HistoryRow {item: item; line-height: root.line-height; copy => {Ui.copy-history(item.id);} remove => {Ui.delete-history(item.id);} pin => {Ui.pin-history(item.id, !item.pinned);} }
+        }
     }
 }
 
@@ -558,10 +586,12 @@ export component PneuWindow inherits Window {
     public function go(page: Page) {
         Ui.dialog = Dialog.none;
         Ui.download = false;
+        Ui.history-query = "";
         Ui.page = page;
         flick.viewport-y = 0;
         Ui.navigated();
         keys.focus();
+        if page == Page.history { Ui.history-focus += 1; }
     }
     public function history-copied(id: string) {
         Ui.history-copied = id;
@@ -598,6 +628,7 @@ export component PneuWindow inherits Window {
         keys.focus();
     }
     function close-window() {
+        Ui.history-query = "";
         Ui.dialog = Dialog.none;
         Ui.download = false;
         Ui.close();
@@ -666,6 +697,9 @@ export component PneuWindow inherits Window {
         focus-lost(reason) => { if reason == FocusReason.window-activation { WindowFocus.changed(false); } }
         focus-on-tab-navigation: false;
         key-pressed(event) => {
+            if Ui.page == Page.history && Ui.dialog == Dialog.none && (event.modifiers.control || (Ui.is-mac && event.modifiers.meta)) && event.text.to-lowercase() == "f" {
+                Ui.history-focus += 1; return accept;
+            }
             if event.text == Key.Escape {
                 if Ui.drop-active { Ui.drop-active = false; return accept; }
                 if Ui.dialog != Dialog.none { root.dismiss(); } else { root.back(); }
@@ -1084,21 +1118,33 @@ export component PneuWindow inherits Window {
                     HorizontalLayout {
                         spacing: 8px;
                         Header {title: "Clipboard History"; horizontal-stretch: 1; go-back => {root.back();} }
-                        if Ui.history.length > 0: PneuButton {text: "Clear All…"; clicked => { Ui.dialog = Dialog.history-clear;} }
+                        if Ui.history.length > Ui.history-pins && Ui.history-query == "": PneuButton {text: "Clear All…"; clicked => { Ui.dialog = Dialog.history-clear;} }
                     }
-                    Card {
+                    if Ui.history.length > 0: TextField {
+                        text <=> Ui.history-query; label: "Search"; placeholder: "Search"; leading-icon: Icons.search; clearable: true;
+                        autofocus: true; focus-request: Ui.history-focus; enabled: !Interaction.modal-open;
+                        accepted => {
+                            if Ui.pinned-history.length > 0 { Ui.copy-history(Ui.pinned-history[0].id); }
+                            else if Ui.recent-history.length > 0 { Ui.copy-history(Ui.recent-history[0].id); }
+                        }
+                        escaped => { if Ui.history-query != "" { Ui.history-query = ""; } else { root.back(); } }
+                    }
+                    if Ui.pinned-history.length > 0: VerticalLayout {
+                        spacing: 6px;
+                        SectionLabel {text: "Pinned";}
+                        HistoryCard {items: Ui.pinned-history; line-height: text-line.preferred-height;}
+                    }
+                    if Ui.recent-history.length > 0: VerticalLayout {
+                        spacing: 6px;
+                        if Ui.history-pins > 0: SectionLabel {text: "Recent";}
+                        HistoryCard {items: Ui.recent-history; line-height: text-line.preferred-height;}
+                    }
+                    if Ui.pinned-history.length + Ui.recent-history.length == 0: Card {
+                        height: 132px;
                         VerticalLayout {
-                            spacing: 0px;
-                            if Ui.history.length == 0: VerticalLayout {
-                                height: 132px; alignment: center; spacing: 8px;
-                                HorizontalLayout {alignment: center; Image {accessible-role: none; width: 28px; height: 28px; source: Icons.paste; colorize: Pneu.text2;} }
-                                Text {text: "Nothing copied yet"; color: Pneu.text2; horizontal-alignment: center;}
-                            }
-                            for item[i] in Ui.history: VerticalLayout {
-                                spacing: 0px;
-                                if i > 0: Divider {}
-                                HistoryRow {item: item; line-height: text-line.preferred-height; copy => {Ui.copy-history(item.id);} remove => {Ui.delete-history(item.id);} }
-                            }
+                            height: 132px; alignment: center; spacing: 8px;
+                            HorizontalLayout {alignment: center; Image {accessible-role: none; width: 28px; height: 28px; source: Ui.searching ? Icons.search : Icons.paste; colorize: Pneu.text2;} }
+                            Text {text: Ui.searching ? "No matches" : "Nothing copied yet"; color: Pneu.text2; horizontal-alignment: center;}
                         }
                     }
                 }
@@ -1289,8 +1335,12 @@ export component PneuWindow inherits Window {
             Text {text: Ui.dialog == Dialog.history-off ? "Turn off clipboard history?" : "Clear clipboard history?";font-size: Pneu.title-size;font-weight: 700;color: Pneu.text;wrap: word-wrap;}
             Rectangle {height: 8px;}
             Text {
-                private property <int> count: Ui.dialog == Dialog.history-off ? Ui.history-off-count : Ui.history.length;
-                text: self.count == 1 ? "This deletes 1 saved item." : "This deletes " + self.count + " saved items.";color: Pneu.text2;wrap: word-wrap;}
+                private property <int> count: Ui.dialog == Dialog.history-off ? Ui.history-off-count : Ui.history.length - Ui.history-pins;
+                text: Ui.dialog == Dialog.history-off && Ui.history-pins > 0
+                    ? (self.count == Ui.history-pins ? (self.count == 1 ? "This deletes 1 pinned item." : "This deletes " + self.count + " pinned items.")
+                        : "This deletes " + self.count + " saved items, including " + Ui.history-pins + " pinned.")
+                    : (self.count == 1 ? "This deletes 1 saved item." : "This deletes " + self.count + " saved items.")
+                        + (Ui.dialog == Dialog.history-clear && Ui.history-pins > 0 ? " Pinned items stay." : "");color: Pneu.text2;wrap: word-wrap;}
             Rectangle {height: 20px;}
             HorizontalLayout {
                 spacing: 8px; alignment: end;
