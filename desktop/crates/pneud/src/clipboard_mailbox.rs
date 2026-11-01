@@ -82,7 +82,7 @@ impl Sender {
     }
 }
 impl Receiver {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn len(&self) -> usize {
         self.0.queue.lock().unwrap().messages.len()
     }

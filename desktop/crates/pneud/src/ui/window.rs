@@ -1549,12 +1549,14 @@ impl UiSender {
     fn send(
         &self,
         action: Action,
-    ) -> std::result::Result<(), tokio::sync::mpsc::error::SendError<Action>> {
+    ) -> std::result::Result<(), Box<tokio::sync::mpsc::error::SendError<Action>>> {
         if matches!(action, Action::Close) {
-            return self.commands.send(action);
+            return self.commands.send(action).map_err(Box::new);
         }
         let view = self.view.lock().expect("window view").clone();
-        self.commands.send(Action::Scoped(view, Box::new(action)))
+        self.commands
+            .send(Action::Scoped(view, Box::new(action)))
+            .map_err(Box::new)
     }
 }
 
