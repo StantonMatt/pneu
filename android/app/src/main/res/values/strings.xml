@@ -331,4 +331,13 @@
     </plurals>
     <string name="item_connection_lost">Connection lost</string>
     <string name="item_connection_lost_progress">Connection lost · %1$s of %2$s sent</string>
+    <string name="group_computers">Computers</string>
+    <string name="pref_show_battery">Show battery level</string>
+    <string name="pref_allow_ringing">Allow ringing</string>
+    <string name="ring_full_screen_off">Full screen off</string>
+    <string name="perm_full_screen">Full-screen alerts</string>
+    <string name="channel_ringing">Ringing</string>
+    <string name="ring_title">Pneu is ringing</string>
+    <string name="ring_from">From %1$s</string>
+    <string name="ring_stop">Stop</string>
 </resources>

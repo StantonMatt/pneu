@@ -454,6 +454,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable internal fun SetupScreen(first: Boolean, health: Health, refresh: Int, back: () -> Unit, repair:()->Unit, next: () -> Unit) {
     val context=LocalContext.current;val resources=LocalResources.current; val scope=rememberCoroutineScope();val actions=LocalUiActions.current
+    val phoneSettings by context.graph.prefs.collectAsState()
     var recheck by remember { mutableIntStateOf(0) }; var returnedFromSleeping by remember { mutableStateOf(false) }
     val checked=remember(health,refresh,recheck) { context.health() }
     val permissions=rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
@@ -488,6 +489,9 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
                 PermissionRow(resources.getString(R.string.perm_notifications),R.drawable.ic_notifications,checked.notifications,if(notificationSettings)resources.getString(R.string.settings_title) else resources.getString(R.string.action_allow),if(notificationSettings && !checked.notifications)resources.getString(R.string.perm_denied) else null,divider=Build.VERSION.SDK_INT>=37) {
                     if(notificationSettings)context.startActivity(Intent(if(checked.channelBlocked)Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS else Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE,context.packageName).putExtra(Settings.EXTRA_CHANNEL_ID,StatusNotificationChannel.id(context)))
                     else request(Manifest.permission.POST_NOTIFICATIONS)
+                }
+                if(!first && phoneSettings.allowRinging)PermissionRow(resources.getString(R.string.perm_full_screen),R.drawable.ic_ring,context.getSystemService(android.app.NotificationManager::class.java).canUseFullScreenIntent(),resources.getString(R.string.action_fix)) {
+                    context.startActivity(Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT,Uri.parse("package:${context.packageName}")))
                 }
                 val limited=context.granted(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED) && !checked.photos
                 val photoAction=PermissionPolicy.photoAction(limited,PermissionRequests.asked(context,Manifest.permission.READ_MEDIA_IMAGES),activity.shouldShowRequestPermissionRationale(Manifest.permission.READ_MEDIA_IMAGES) || activity.shouldShowRequestPermissionRationale(Manifest.permission.READ_MEDIA_VIDEO))
@@ -842,6 +846,11 @@ internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired
                         else scope.launch {actions.run(resources.getString(R.string.ui_error_setting)) {app.savedClips.setEnabled(value)}}
                     }
                 }
+                Header(resources.getString(R.string.group_computers))
+                PneuCard {
+                    ToggleRow(resources.getString(R.string.pref_show_battery),p.showBatteryLevel,divider=false) {toggle("showBatteryLevel",it)}
+                    ToggleRow(resources.getString(R.string.pref_allow_ringing),p.allowRinging,warnDetail=true,detail=if(p.allowRinging && !context.getSystemService(android.app.NotificationManager::class.java).canUseFullScreenIntent())resources.getString(R.string.ring_full_screen_off) else null) {toggle("allowRinging",it)}
+                }
                 Header(resources.getString(R.string.group_connection))
                 PneuCard {
                     ToggleRow(resources.getString(R.string.pref_wifi),p.wifi,divider=false) {toggle("wifi",it)}
@@ -870,9 +879,9 @@ internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired
         scope.launch {if(actions.run(resources.getString(R.string.ui_error_setting)) {devicesModel.renameSelf(name)})renaming=false}
     }
 }
-@Composable private fun ToggleRow(title: String,checked: Boolean,enabled: Boolean=true,detail: String?=null,divider:Boolean=true,change: (Boolean) -> Unit) {
+@Composable private fun ToggleRow(title: String,checked: Boolean,enabled: Boolean=true,detail: String?=null,divider:Boolean=true,warnDetail:Boolean=false,change: (Boolean) -> Unit) {
     Row(Modifier.fillMaxWidth().pneuRow(divider).pneuToggle(checked,enabled,onChange=change).heightIn(min=if(detail==null)56.dp else 68.dp).padding(horizontal=16.dp,vertical=8.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(16.dp)) {
-        Column(Modifier.weight(1f).graphicsLayer {alpha=if(enabled)1f else .4f}) {Text(title,style=PneuType.body);if(detail!=null) Text(detail,style=PneuType.subhead,color=LocalPneuColors.current.danger)}
+        Column(Modifier.weight(1f).graphicsLayer {alpha=if(enabled)1f else .4f}) {Text(title,style=PneuType.body);if(detail!=null) Text(detail,style=PneuType.subhead,color=if(warnDetail)LocalPneuColors.current.warn else LocalPneuColors.current.danger)}
         PneuSwitch(checked=checked,onCheckedChange=null,enabled=enabled)
     }
 }

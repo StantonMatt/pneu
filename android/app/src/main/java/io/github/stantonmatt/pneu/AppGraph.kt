@@ -15,12 +15,13 @@ import io.github.stantonmatt.pneu.protocol.CAP_FILE_RESUME
 
 class PneuApp : Application() {
     lateinit var graph: AppGraph
-    override fun onCreate() { super.onCreate(); StatusNotificationChannel.create(this); graph = AppGraph(this) }
+    override fun onCreate() { super.onCreate(); StatusNotificationChannel.create(this); RingAudio.restorePending(this); graph = AppGraph(this) }
 }
 val Context.graph get() = (applicationContext as PneuApp).graph
 class AppGraph(val context: Context,val preferences: Preferences=Preferences(context),
                val scope:CoroutineScope=CoroutineScope(SupervisorJob() + Dispatchers.IO)) {
     private val snapshots=PreferenceSnapshots(preferences.flow,scope)
+    val ringing by lazy {PhoneRinging(context)}
     val prefs=snapshots.state
     suspend fun awaitPrefs():Prefs=snapshots.awaitLoaded()
     internal fun captureBinding(select:(Prefs)->DeliveryBinding?={DeliveryBinding.from(it)}):Deferred<DeliveryBinding?> =snapshots.captureBinding(select)
