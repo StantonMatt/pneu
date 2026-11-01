@@ -180,6 +180,8 @@ pub enum Command {
     Config {
         config: Config,
     },
+    #[cfg(any(target_os = "linux", windows))]
+    OpenFolder,
     SaveFolder {
         folder: std::path::PathBuf,
     },
@@ -237,6 +239,10 @@ impl Command {
     }
 
     fn requires_desktop(&self, choose_devices: bool) -> bool {
+        #[cfg(any(target_os = "linux", windows))]
+        if matches!(self, Self::OpenFolder) {
+            return true;
+        }
         #[cfg(target_os = "macos")]
         if matches!(self, Self::UiTest { .. }) {
             return true;
@@ -513,6 +519,10 @@ async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
         Command::ClosePairingIf { token } => { core.close_pairing_if(token).await; serde_json::Value::Null },
         Command::ClosePairing => { core.close_pairing().await; serde_json::Value::Null },
         Command::Unpair {device} => { core.unpair_device(device).await?; serde_json::Value::Null },
+        #[cfg(target_os = "linux")]
+        Command::OpenFolder => { crate::ui::runtime::open_folder(&core.config().save_path).await?; serde_json::Value::Null },
+        #[cfg(windows)]
+        Command::OpenFolder => { crate::actions::open_folder(&core.config().save_path).await?; serde_json::Value::Null },
         Command::SaveFolder {folder} => { core.change_save_folder(folder).await?; serde_json::Value::Null },
         Command::Config {config} => { core.update_config(config).await?; serde_json::Value::Null },
         Command::Clipboard {device,text} => serde_json::to_value(core.send_clipboard(device,text).await?)?,
@@ -689,6 +699,7 @@ async fn request_connected(
         if matches!(
             command,
             Command::ShowWindow { .. }
+                | Command::OpenFolder
                 | Command::PresentFiles { .. }
                 | Command::PresentPicker { .. }
                 | Command::PresentSendError { .. }
@@ -843,6 +854,82 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn open_folder_ipc_creates_missing_folder_and_launches_private_xdg_open() -> Result<()> {
+        let Some(root) = std::env::var_os("PNEU_OPEN_FOLDER_TEST_ROOT") else {
+            let dir = crate::test_support::scratch()?;
+            let bin = dir.path().join("bin");
+            std::fs::create_dir(&bin)?;
+            let opener = bin.join("xdg-open");
+            std::fs::write(
+                &opener,
+                "#!/bin/sh\ntest -d \"$1\" || exit 3\nprintf '%s\\n' \"$1\" >> \"$PNEU_OPEN_FOLDER_TEST_ROOT/calls\"\nif [ -f \"$PNEU_OPEN_FOLDER_TEST_ROOT/fail\" ]; then exit 1; fi\n",
+            )?;
+            std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o700))?;
+            let status = tokio::time::timeout(Duration::from_secs(30),
+                tokio::process::Command::new(std::env::current_exe()?)
+                    .args(["--exact", "ipc::tests::open_folder_ipc_creates_missing_folder_and_launches_private_xdg_open", "--nocapture"])
+                    .env("PNEU_OPEN_FOLDER_TEST_ROOT", dir.path())
+                    .env("PATH", bin)
+                    .env("DBUS_SESSION_BUS_ADDRESS", format!("unix:path={}/unavailable-bus", dir.path().display()))
+                    .env_remove("DISPLAY").env_remove("WAYLAND_DISPLAY")
+                    .kill_on_drop(true).status()
+            ).await??;
+            anyhow::ensure!(status.success(), "private open-folder IPC test failed");
+            return Ok(());
+        };
+        let root = std::path::PathBuf::from(root);
+        let folder = root.join("Received files 日本語/missing");
+        let paths = crate::Paths {
+            data: root.join("data"),
+            cache: root.join("cache"),
+            config: root.join("config/config.toml"),
+            socket: root.join("ipc.sock"),
+        };
+        let core = Core::new(
+            paths.clone(),
+            Config {
+                save_path: folder.clone(),
+                ..Config::default()
+            },
+            Arc::new(NoActions),
+        )
+        .await?;
+        assert!(!folder.exists());
+        let (listener, _owner) = bind(&paths.socket)?;
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(serve(core.clone(), listener, rx));
+        request(&paths.socket, Command::OpenFolder).await?;
+        assert!(folder.is_dir());
+        let expected = format!("{}\n", folder.display());
+        assert_eq!(std::fs::read_to_string(root.join("calls"))?, expected);
+        std::fs::write(root.join("fail"), b"")?;
+        let error = request(&paths.socket, Command::OpenFolder)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("folder opener exited unsuccessfully")
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("calls"))?,
+            expected.repeat(2)
+        );
+        std::fs::remove_dir(&folder)?;
+        std::fs::write(&folder, b"not a directory")?;
+        assert!(request(&paths.socket, Command::OpenFolder).await.is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("calls"))?,
+            expected.repeat(2)
+        );
+        let _ = stop.send(true);
+        tokio::time::timeout(Duration::from_secs(2), server).await???;
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn disconnected_client_queued_before_accept_does_not_stop_server() -> Result<()> {
@@ -914,6 +1001,8 @@ mod tests {
             let captured = || Targets::Captured(Vec::new());
             for (command, needs_ui) in [
                 (Command::AddDevice, true),
+                #[cfg(any(target_os = "linux", windows))]
+                (Command::OpenFolder, true),
                 (
                     Command::ShowWindow {
                         choose_folder: false,

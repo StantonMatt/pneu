@@ -184,6 +184,7 @@ export global Ui {
     callback set-peer(string, bool);
     callback unpair(string);
     callback choose-folder();
+    callback open-folder();
     callback set-mode(int);
     callback set-flag(string, bool);
     callback rename(string);
@@ -666,7 +667,15 @@ export component PneuWindow inherits Window {
                     }
                     if Ui.recent.length > 0: VerticalLayout {
                         spacing: 6px;
-                        SectionLabel { text: "Recent"; }
+                        HorizontalLayout {
+                            recent-label := SectionLabel { text: "Recent"; horizontal-stretch: 1; }
+                            if Ui.save-to-folder: PneuButton {
+                                text: "Open Folder"; icon: Icons.folder-open; kind: ButtonKind.link;
+                                icon-size: 15px; font-size: Pneu.label-size;
+                                min-height: recent-label.preferred-height; max-height: self.min-height;
+                                clicked => { Ui.open-folder(); }
+                            }
+                        }
                         Card {
                             VerticalLayout {
                                 for item[i] in Ui.recent: VerticalLayout {
@@ -1054,7 +1063,11 @@ export component PneuWindow inherits Window {
                                     }
                                     VerticalLayout {
                                         alignment: center;
-                                        PneuButton { text: "Change…"; clicked => { Ui.choose-folder(); } }
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            PneuButton { text: "Open"; clicked => { Ui.open-folder(); } }
+                                            PneuButton { text: "Change…"; clicked => { Ui.choose-folder(); } }
+                                        }
                                     }
                                 }
                                 Divider {}

@@ -327,7 +327,7 @@ fn event_updates_tray(event: &Event) -> bool {
     )
 }
 
-async fn open_folder(folder: &std::path::Path) -> Result<()> {
+pub(crate) async fn open_folder(folder: &std::path::Path) -> Result<()> {
     tokio::fs::create_dir_all(folder).await?;
     let uri = url::Url::from_directory_path(folder)
         .map_err(|_| anyhow::anyhow!("folder is not absolute"))?;

@@ -83,7 +83,7 @@ pub(super) async fn open_url(url: String) -> Result<Interaction> {
 
 pub(super) async fn open_folder(path: PathBuf) -> Result<Interaction> {
     sta(
-        move || platform_fs::Folder::open(&path, false)?.path(),
+        move || platform_fs::Folder::open(&path, true)?.path(),
         |path| execute(&path),
     )
     .await
