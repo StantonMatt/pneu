@@ -95,6 +95,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
     // Receive data hook; the designer-owned Recent ViewModel can combine this flow.
     val receivedFiles = ReceivedFiles(this)
     val receivedRecent get()=receivedFiles.recent
+    val phoneNotifications = PhoneNotifications()
     val connection = Connections(this)
     internal val tileInputs=combine(prefs,connection.state,connection.devices) {p,s,devices->
         TilePolicy.inputs(p,s,devices,connection.clipboardAvailable(p))

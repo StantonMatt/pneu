@@ -1,5 +1,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <application>
+        <activity android:name="io.github.stantonmatt.pneu.MirrorNotificationPosterActivity" android:exported="true" android:process=":notification_poster">
+            <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+        </activity>
         <activity android:name="io.github.stantonmatt.pneu.FixtureViewerActivity" android:exported="true" android:process=":viewer"/>
         <activity android:name="io.github.stantonmatt.pneu.FixtureCallerActivity" android:exported="true" android:process=":caller"/>
         <provider android:name="io.github.stantonmatt.pneu.FixtureShareProvider" android:authorities="io.github.stantonmatt.pneu.test.sources" android:exported="false" android:grantUriPermissions="true" android:process=":caller"/>

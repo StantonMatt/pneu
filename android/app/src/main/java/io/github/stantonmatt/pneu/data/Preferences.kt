@@ -49,6 +49,8 @@ data class Prefs(
     val automaticRevocations:Map<String,Long> = emptyMap(),
     val membership:SetupState=SetupState(),
     val showBatteryLevel:Boolean=true,val allowRinging:Boolean=true
+,
+    val notificationConsent:io.github.stantonmatt.pneu.features.NotificationConsent=io.github.stantonmatt.pneu.features.NotificationConsent(),
 ) {
     fun automaticRevocation(kind:String)=automaticRevocations[when(kind) {"photo"->"photos";"recording"->"recordings";else->"screenshots"}] ?: 0
     // Compatibility projection for the existing single-computer screens/fixtures.
@@ -68,6 +70,10 @@ class Preferences(private val context:Context,internal val store:androidx.datast
     internal val policy=AdmissionPolicy()
     /** Serializes computer-feature effects with local permission/pause commits. */
     internal val computerPolicy=Mutex()
+    // Process-local notification admissions must stay revoked even across off/on.
+    // Read and advanced only under policy, like the persisted Pause epoch.
+    internal var notificationGeneration=0L
+        private set
     @Volatile internal var readCatalogVersion:suspend ()->String={MediaCatalog.version(context)}
     @Volatile internal var pairingBoundary:suspend ()->CatalogBoundary={MediaCatalog.boundary(context)}
     @Volatile internal var readSnapshot:suspend ()->CatalogSnapshot={MediaCatalog.snapshot(context)}
@@ -127,7 +133,7 @@ class Preferences(private val context:Context,internal val store:androidx.datast
             legacyQueuePeer=s(p,"legacyQueuePeer"),legacyQueueGeneration=l(p,"legacyQueueGeneration"),
             recentClipboardHashes=s(p,"recentClipboardHashes").split('|').filter {it.isNotEmpty()},recentClipboardSources=ClipboardHistory.read(p),selfName=s(p,"selfName"),chooseDevicesEachTime=b(p,"chooseDevicesEachTime"),
             showBatteryLevel=b(p,"showBatteryLevel",true),allowRinging=b(p,"allowRinging",true),
-            membership=SetupStorage.read(p),automaticRevocations=listOf("screenshots","photos","recordings").associateWith {l(p,it+"AdmissionEpoch")}.filterValues {it!=0L})
+            notificationConsent=readNotificationConsent(p),membership=SetupStorage.read(p),automaticRevocations=listOf("screenshots","photos","recordings").associateWith {l(p,it+"AdmissionEpoch")}.filterValues {it!=0L})
     }
     val flow=raw.recoverReads()
     suspend fun read():Prefs=kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {storageDeadline {beforeReadStart();raw.first()}}
@@ -445,6 +451,31 @@ class Preferences(private val context:Context,internal val store:androidx.datast
     internal suspend fun introducedRefusal(binding:DeliveryBinding,authenticated:Boolean) {edit {p->
         PeerRegistry.write(p,PeerRegistry.read(p).map {peer->refusedPeer(peer,binding,authenticated)})
     }}
+    private fun readNotificationConsent(p:androidx.datastore.preferences.core.Preferences)=io.github.stantonmatt.pneu.features.NotificationConsent(
+        b(p,"mirrorEnabled"),b(p,"mirrorInitialized"),b(p,"mirrorNamesOnly"),p[stringSetPreferencesKey("mirrorComputers")].orEmpty(),p[stringSetPreferencesKey("mirrorApps")].orEmpty())
+    suspend fun notificationMaster(enabled:Boolean)=policy.locked {
+        notificationGeneration=Math.addExact(notificationGeneration,1)
+        edit {p->
+            if(enabled && !b(p,"mirrorInitialized")) {
+                p[stringSetPreferencesKey("mirrorComputers")]=PeerRegistry.read(p).filter {it.role=="computer" && !it.pairingLost}.map {io.github.stantonmatt.pneu.features.NotificationConsent.computer(it)}.toSet()
+                p[booleanPreferencesKey("mirrorInitialized")]=true
+            }
+            p[booleanPreferencesKey("mirrorEnabled")]=enabled
+        }
+    }
+    suspend fun notificationNamesOnly(enabled:Boolean)=policy.locked {
+        notificationGeneration=Math.addExact(notificationGeneration,1)
+        edit {it[booleanPreferencesKey("mirrorNamesOnly")]=enabled}
+    }
+    suspend fun notificationSelection(computer:Boolean,key:String,enabled:Boolean)=policy.locked {
+        notificationGeneration=Math.addExact(notificationGeneration,1)
+        edit {p->
+            val field=stringSetPreferencesKey(if(computer)"mirrorComputers" else "mirrorApps")
+            val current=p[field].orEmpty()
+            // A stale UI cannot grant a removed or replaced binding.
+            if(!computer || !enabled || PeerRegistry.read(p).any {io.github.stantonmatt.pneu.features.NotificationConsent.computer(it)==key})p[field]=if(enabled)current+key else current-key
+        }
+    }
     suspend fun finishPeerReset(peerId:String) {edit {PeerRegistry.finishReset(it,peerId)}}
     suspend fun forget(lostPcName:String?=null,peerId:String?=null):Unit=policy.locked {
         beforeMutation("forget")
@@ -453,6 +484,8 @@ class Preferences(private val context:Context,internal val store:androidx.datast
             val peers=PeerRegistry.read(it)
             val target=peers.find {peer->peer.deviceId==(peerId ?: peers.firstOrNull()?.deviceId)}
             if(target!=null) {
+                val grants=stringSetPreferencesKey("mirrorComputers")
+                it[grants]=it[grants].orEmpty().filterNot {grant->grant.startsWith(target.deviceId+"/")}.toSet()
                 if(lostPcName!=null)PeerRegistry.write(it,peers.map {peer->if(peer==target)peer.copy(pairingLost=true) else peer})
                 else {
                     PeerRegistry.remove(it,target.deviceId)
