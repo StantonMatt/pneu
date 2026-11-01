@@ -217,7 +217,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
     }
     LaunchedEffect(removeRequest) {removeRequest?.let {askRemove(it);consumeRemove()}}
     var health by remember { mutableStateOf(Health(true,true,true,true)) }
-    LaunchedEffect(refresh,p.recordings,p.neverSleeping) { health=withContext(Dispatchers.IO) {context.health()} }
+    LaunchedEffect(refresh,p.recordings,p.neverSleeping,p.notificationConsent.enabled) { health=withContext(Dispatchers.IO) {context.health()} }
     LaunchedEffect(p.setup,p.deviceId,SetupPresentation.hasDevices(p)) { if(screen == null && p.deviceId.isNotEmpty()) navigate(if(!p.setup) "setup" else if(!SetupPresentation.hasDevices(p) && !p.pairingLost) "pair" else "home") }
     LaunchedEffect(requested) { requested?.let { navigate(it); consume() } }
     LaunchedEffect(p.peer,pairingAttempt,p.pairingLost,SetupPresentation.hasDevices(p)) { if(pairingAttempt!=null || !p.pairingLost && p.peer != null && screen != "pair") actions.run(resources.getString(R.string.ui_error_connection)) {PneuService.start(context)}
@@ -235,8 +235,8 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
         }.onFailure {filesFor=null;actionError=UiFeedback(resources.getString(R.string.toast_cant_read)) to null}
     }
     var backProgress by remember {mutableFloatStateOf(0f)}
-    PredictiveBackHandler(enabled=screen in listOf("settings","permissions","history") || screen?.startsWith(DEVICE)==true || screen?.startsWith(MEMBER)==true || (screen=="pair" && SetupPresentation.hasDevices(p))) { events ->
-        try {events.collect {backProgress=it.progress};navigate(if(screen=="permissions") permissionOrigin else "home")}
+    PredictiveBackHandler(enabled=screen in listOf("settings","permissions","history","notifications") || screen?.startsWith(DEVICE)==true || screen?.startsWith(MEMBER)==true || (screen=="pair" && SetupPresentation.hasDevices(p))) { events ->
+        try {events.collect {backProgress=it.progress};navigate(when(screen) {"permissions"->permissionOrigin;"notifications"->"settings";else->"home"})}
         finally {backProgress=0f}
     }
     CompositionLocalProvider(LocalUiActions provides actions) {
@@ -260,7 +260,8 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
                     LaunchedEffect(historyState.enabled) {if(!historyState.enabled)navigate("home")}
                     if(historyState.enabled)ClipboardHistoryScreen {navigate("home")}
                 }
-                "settings" -> SettingsScreen(p,health,refresh,{navigate("home")},{permissionOrigin="settings";navigate("permissions")})
+                "notifications" -> NotificationsScreen(p) {navigate("settings")}
+                "settings" -> SettingsScreen(p,health,refresh,{navigate("home")},{permissionOrigin="settings";navigate("permissions")},{navigate("notifications")})
                 else -> if(visibleScreen?.startsWith(MEMBER)==true) {
                     val key=visibleScreen.removePrefix(MEMBER)
                     val member=SetupPresentation.phones(p).find {it.key==key}
@@ -448,8 +449,8 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
 }
 @Composable fun Symbol(id: Int, description: String? = null, modifier: Modifier = Modifier.size(24.dp), tint: Color = LocalContentColor.current) { Icon(painterResource(id),description,modifier,tint) }
 @Composable private fun groupColor() = LocalPneuColors.current.surface
-@Composable private fun Header(text: String) { Text(text,Modifier.padding(start=16.dp,top=22.dp,bottom=8.dp),style=PneuType.section,color=LocalPneuColors.current.text2) }
-@Composable private fun NavIcon(back: () -> Unit) { IconButton(onClick=back) { Symbol(R.drawable.ic_arrow_back,stringResource(R.string.cd_back)) } }
+@Composable internal fun Header(text: String) { Text(text,Modifier.padding(start=16.dp,top=22.dp,bottom=8.dp),style=PneuType.section,color=LocalPneuColors.current.text2) }
+@Composable internal fun NavIcon(back: () -> Unit) { IconButton(onClick=back) { Symbol(R.drawable.ic_arrow_back,stringResource(R.string.cd_back)) } }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable internal fun SetupScreen(first: Boolean, health: Health, refresh: Int, back: () -> Unit, repair:()->Unit, next: () -> Unit) {
@@ -488,6 +489,10 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
                 PermissionRow(resources.getString(R.string.perm_notifications),R.drawable.ic_notifications,checked.notifications,if(notificationSettings)resources.getString(R.string.settings_title) else resources.getString(R.string.action_allow),if(notificationSettings && !checked.notifications)resources.getString(R.string.perm_denied) else null,divider=Build.VERSION.SDK_INT>=37) {
                     if(notificationSettings)context.startActivity(Intent(if(checked.channelBlocked)Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS else Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE,context.packageName).putExtra(Settings.EXTRA_CHANNEL_ID,StatusNotificationChannel.id(context)))
                     else request(Manifest.permission.POST_NOTIFICATIONS)
+                }
+                if(!checked.notificationMirroring)PermissionRow(resources.getString(R.string.notification_access_off),R.drawable.ic_notifications,false,resources.getString(R.string.action_fix)) {
+                    context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_DETAIL_SETTINGS).putExtra(Settings.EXTRA_NOTIFICATION_LISTENER_COMPONENT_NAME,
+                        android.content.ComponentName(context,PhoneNotificationListener::class.java).flattenToString()))
                 }
                 val limited=context.granted(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED) && !checked.photos
                 val photoAction=PermissionPolicy.photoAction(limited,PermissionRequests.asked(context,Manifest.permission.READ_MEDIA_IMAGES),activity.shouldShowRequestPermissionRationale(Manifest.permission.READ_MEDIA_IMAGES) || activity.shouldShowRequestPermissionRationale(Manifest.permission.READ_MEDIA_VIDEO))
@@ -794,7 +799,7 @@ internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable internal fun SettingsScreen(p: Prefs,health: Health,refresh:Int,back: () -> Unit,permissions: () -> Unit) {
+@Composable internal fun SettingsScreen(p: Prefs,health: Health,refresh:Int,back: () -> Unit,permissions: () -> Unit,notifications:()->Unit={}) {
     val context=LocalContext.current;val resources=LocalResources.current;val app=context.graph;val scope=rememberCoroutineScope();val actions=LocalUiActions.current;val snackbar=remember {SnackbarHostState()}
     val devicesModel=remember(context) {androidx.lifecycle.ViewModelProvider(context as ComponentActivity)[DevicesViewModel::class.java]}
     val history by app.savedClips.state.collectAsState()
@@ -840,6 +845,8 @@ internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired
                         else scope.launch {actions.run(resources.getString(R.string.ui_error_setting)) {app.savedClips.setEnabled(value)}}
                     }
                 }
+                Header(resources.getString(R.string.notification_computers))
+                PneuCard {NotificationSettingsRows(p,refresh,notifications)}
                 Header(resources.getString(R.string.group_connection))
                 PneuCard {
                     ToggleRow(resources.getString(R.string.pref_wifi),p.wifi,divider=false) {toggle("wifi",it)}
@@ -868,13 +875,13 @@ internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired
         scope.launch {if(actions.run(resources.getString(R.string.ui_error_setting)) {devicesModel.renameSelf(name)})renaming=false}
     }
 }
-@Composable private fun ToggleRow(title: String,checked: Boolean,enabled: Boolean=true,detail: String?=null,divider:Boolean=true,change: (Boolean) -> Unit) {
+@Composable internal fun ToggleRow(title: String,checked: Boolean,enabled: Boolean=true,detail: String?=null,divider:Boolean=true,change: (Boolean) -> Unit) {
     Row(Modifier.fillMaxWidth().pneuRow(divider).pneuToggle(checked,enabled,onChange=change).heightIn(min=if(detail==null)56.dp else 68.dp).padding(horizontal=16.dp,vertical=8.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(16.dp)) {
         Column(Modifier.weight(1f).graphicsLayer {alpha=if(enabled)1f else .4f}) {Text(title,style=PneuType.body);if(detail!=null) Text(detail,style=PneuType.subhead,color=LocalPneuColors.current.danger)}
         PneuSwitch(checked=checked,onCheckedChange=null,enabled=enabled)
     }
 }
-@Composable private fun SettingRow(title: String,detail: String?=null,error: Boolean=false,divider:Boolean=true,external:Boolean=false,click: (() -> Unit)?=null) {
+@Composable internal fun SettingRow(title: String,detail: String?=null,error: Boolean=false,divider:Boolean=true,external:Boolean=false,click: (() -> Unit)?=null) {
     val c=LocalPneuColors.current
     Row(Modifier.fillMaxWidth().pneuRow(divider).then(if(click!=null)Modifier.pneuClick(onClick=click)else Modifier).heightIn(min=if(detail==null)56.dp else 68.dp).padding(horizontal=16.dp,vertical=12.dp),verticalAlignment=Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {

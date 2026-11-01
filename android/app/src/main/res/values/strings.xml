@@ -309,4 +309,22 @@
         <item quantity="one">This deletes %d saved item.</item>
         <item quantity="other">This deletes %d saved items.</item>
     </plurals>
+    <string name="notification_computers">Computers</string>
+    <string name="notification_show">Show notifications</string>
+    <string name="notification_off">Off</string>
+    <string name="notification_no_apps">On · No apps</string>
+    <string name="notification_needs_access">Needs notification access</string>
+    <plurals name="notification_app_count"><item quantity="one">On · %d app</item><item quantity="other">On · %d apps</item></plurals>
+    <string name="notification_title">Notifications on computers</string>
+    <string name="notification_show_on">Show on computers</string>
+    <string name="notification_names_only">Only show app names</string>
+    <string name="notification_allow_title">Allow notification access</string>
+    <string name="notification_allow_text">Pneu sends notifications only from the apps you pick, and only to the computers you choose.</string>
+    <string name="notification_continue">Continue</string>
+    <string name="notification_blocked">Android blocked notification access</string>
+    <string name="notification_restricted_hint">Open App info, tap ⋮ › Allow restricted settings, then try again.</string>
+    <string name="notification_app_info">Open app info</string>
+    <string name="notification_access_off">Notification access is off</string>
+    <string name="notification_apps">Apps</string>
+    <string name="notification_update">Needs a Pneu update</string>
 </resources>
