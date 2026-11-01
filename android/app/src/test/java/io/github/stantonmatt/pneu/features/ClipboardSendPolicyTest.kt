@@ -34,14 +34,18 @@ class ClipboardSendPolicyTest {
         assertEquals(listOf(targets[1]),ClipboardSendPolicy.targets(clip,latest,targets))
         assertTrue(ClipboardSendPolicy.targets(clip,latest,targets,automatic=true).isEmpty())
     }
-    @Test fun sensitiveClipIsRejectedForExplicitAndAutomaticSendsAndNeverAcquiresNewTargets() {
+    @Test fun sensitiveClipKeepsExplicitTargetsAndRemainsExcludedFromAutomaticSends() {
         val clip=ClipboardDelivery.receivedClip("Pneu","secret","hash",a.deviceId)
         clip.description.extras=PersistableBundle(clip.description.extras).apply {putBoolean(ClipDescription.EXTRA_IS_SENSITIVE,true)}
-        for(automatic in listOf(false,true))assertTrue(ClipboardSendPolicy.targets(clip,p,targets,automatic).isEmpty())
+        assertEquals(listOf(targets[1]),ClipboardSendPolicy.targets(clip,p,targets))
+        assertTrue(ClipboardSendPolicy.targets(clip,p,targets,automatic=true).isEmpty())
         val userClip=ClipData.newPlainText("user","new content")
         assertEquals(targets,ClipboardSendPolicy.targets(userClip,p,targets))
         assertEquals(listOf(targets[1]),ClipboardSendPolicy.targets(userClip,p.copy(peers=listOf(b)),targets))
         assertEquals(listOf(targets[0]),ClipboardSendPolicy.targets(userClip,p,listOf(targets[0])))
+        userClip.description.extras=PersistableBundle().apply {putBoolean(ClipDescription.EXTRA_IS_SENSITIVE,true)}
+        assertEquals(targets,ClipboardSendPolicy.targets(userClip,p,targets))
+        assertTrue(ClipboardSendPolicy.targets(userClip,p,targets,automatic=true).isEmpty())
     }
     @Test fun automaticEchoSuppressionIncludesOlderReceivedHashes() {
         val clip=ClipData.newPlainText("other-app","older received")

@@ -84,7 +84,7 @@ class ConnectionPresentationTest {
         assertFalse(ClipboardSendPolicy.available(clip,prefs,emptyMap()))
         assertFalse(ClipboardSendPolicy.available(clip,prefs.copy(peers=listOf(a,b.copy(clipboardSend=false))),links))
         clip.description.extras=PersistableBundle().apply {putBoolean(ClipDescription.EXTRA_IS_SENSITIVE,true)}
-        assertFalse(ClipboardSendPolicy.available(clip,prefs,links))
+        assertTrue(ClipboardSendPolicy.available(clip,prefs,links))
     }
     @Test fun providerMimeRatherThanDescriptionSelectsTheEligibleClipboardRepresentation() {
         val imageLinks=mapOf(b.deviceId to LinkState("Connected",capabilities=setOf("files","clipboard_image")))
@@ -105,6 +105,6 @@ class ConnectionPresentationTest {
         assertFalse(ClipboardSendPolicy.available(fallback,prefs,imageLinks,"application/pdf"))
         assertFalse(ClipboardSendPolicy.available(raw,prefs.copy(resetPeers=setOf(b.deviceId)),imageLinks,"image/png"))
         raw.description.extras=PersistableBundle().apply {putBoolean(ClipDescription.EXTRA_IS_SENSITIVE,true)}
-        assertFalse(ClipboardSendPolicy.available(raw,prefs,imageLinks,"image/png"))
+        assertTrue(ClipboardSendPolicy.available(raw,prefs,imageLinks,"image/png"))
     }
 }

@@ -825,6 +825,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
             send(Frame.Control(Type.FILE_END,json("transfer_id" to row.transferId)));ended=true
             val response=awaitReceipt(receipt)
             if(response.type==Type.ACK) {
+                if(row.kind=="clipboard_image")PostCommit.maintainSuspending {app.savedClips.recordImage(row.mime,sensitive=row.sensitive) {file.inputStream()}}
                 row.state="sent";row.error="";app.staging.completeFile(row)
             } else {
                 val code=response.body["code"].asString;row.error=code;row.state="failed";if(code=="unsupported_kind")row.rejectedCapabilities=emission.rejectedCapabilities
@@ -859,11 +860,11 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
         val receipt=CompletableDeferred<Frame.Control>();textReceipt=row.transferId to receipt
         val emission=QueuedEmission(row,binding);textEmission=emission
         try {
-            val body=json("transfer_id" to row.transferId,"text" to row.text,"created_at" to row.createdAt,"origin" to row.origin)
+            val body=Staging.clipboardMetadata(row)
             if("mesh" in capabilities) {body.addProperty("hlc",row.hlc.toBigInteger());body.addProperty("source_device",row.sourceDevice)}
             if(!send(Frame.Control(Type.CLIPBOARD,body),emission))return false
             val response=awaitReceipt(receipt)
-            if(response.type==Type.ACK) {row.state="sent";row.error="";updateRow(row)}
+            if(response.type==Type.ACK) {PostCommit.maintainSuspending {app.savedClips.recordText(row.text,sensitive=row.sensitive)};row.state="sent";row.error="";updateRow(row)}
             else {
                 val code=response.body["code"].asString;if(code=="unsupported_kind")row.rejectedCapabilities=emission.rejectedCapabilities
                 val decision=RetryPolicy.nack(code,row.mismatches,Random.nextDouble(.8,1.2))

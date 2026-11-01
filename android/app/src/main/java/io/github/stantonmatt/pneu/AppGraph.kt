@@ -51,7 +51,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
             db.execSQL("UPDATE receipts SET state='applied' WHERE state='complete'")
             db.execSQL("UPDATE outgoing SET state='superseded' WHERE kind='text' AND state IN ('waiting','sending','failed') AND orderId < (SELECT MAX(orderId) FROM outgoing WHERE kind='text' AND state IN ('waiting','sending','failed'))")
         }
-    }, QueueMigrations.clipboardWindow, QueueMigrations.outboundWindow, QueueMigrations.recipients, QueueMigrations.peerWatermarks, QueueMigrations.pendingAdmissions, QueueMigrations.receivedFiles).addCallback(object : androidx.room.RoomDatabase.Callback() {
+    }, QueueMigrations.clipboardWindow, QueueMigrations.outboundWindow, QueueMigrations.recipients, QueueMigrations.peerWatermarks, QueueMigrations.pendingAdmissions, QueueMigrations.receivedFiles, QueueMigrations.sensitiveClips).addCallback(object : androidx.room.RoomDatabase.Callback() {
         override fun onOpen(db: androidx.sqlite.db.SupportSQLiteDatabase) { db.execSQL("PRAGMA synchronous=FULL") }
     }).build()
     val queue = database.queue()
@@ -87,6 +87,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
     @Volatile internal var onMediaObserverReady:()->Unit={}
     val mediaRefresh=MutableStateFlow(0L)
     fun requestMediaScan() {mediaRefresh.update {it+1}}
+    internal val savedClips = SavedClips(context,scope)
     val staging = Staging(this)
     val clipboard = ClipboardDelivery(this)
     // Receive data hook; the designer-owned Recent ViewModel can combine this flow.

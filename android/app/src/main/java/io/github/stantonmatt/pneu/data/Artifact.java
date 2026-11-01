@@ -18,6 +18,7 @@ public class Artifact {
     @ColumnInfo(defaultValue = "0") public boolean optimized;
     @ColumnInfo(defaultValue = "0") public long orderId;
     @NonNull @ColumnInfo(defaultValue = "''") public String sourceHash = "";
+    @androidx.room.ColumnInfo(defaultValue="0") public boolean sensitive;
     public long size;
     public long createdAt;
     @NonNull @ColumnInfo(defaultValue="''") public String hlc="";

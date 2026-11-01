@@ -9,9 +9,10 @@ import java.security.MessageDigest
 /** All known wire fields, before storage-name sanitizing. Unknown extensions do not
  * participate in receipt equality. Optional fields retain absent/present identity. */
 data class ReceivedMetadata(val id:String,val name:String,val mime:String,val size:Long,val hash:String,
-    val kind:String,val createdAt:Long,val mediaId:String?=null,val hlc:String?=null,val source:String?=null) {
+    val kind:String,val createdAt:Long,val mediaId:String?=null,val hlc:String?=null,val source:String?=null,val sensitive:Boolean=false) {
     val canonical:String get()=json("transfer_id" to id,"file_name" to name,"mime" to mime,"size" to size,
         "sha256" to hash,"kind" to kind,"created_at" to createdAt).apply {
+        if(sensitive)addProperty("sensitive",true)
         mediaId?.let {addProperty("source_media_id",it)}
         hlc?.let {addProperty("hlc",it.toBigInteger());addProperty("source_device",source)}
     }.toString()
@@ -20,7 +21,7 @@ data class ReceivedMetadata(val id:String,val name:String,val mime:String,val si
             Protocol.validate(Type.FILE_BEGIN,body)
             return ReceivedMetadata(body["transfer_id"].asString,body["file_name"].asString,body["mime"].asString,
                 body["size"].asLong,body["sha256"].asString,body["kind"].asString,body["created_at"].asLong,
-                body["source_media_id"]?.asString,body["hlc"]?.asString?.toBigInteger()?.toString(),body["source_device"]?.asString)
+                body["source_media_id"]?.asString,body["hlc"]?.asString?.toBigInteger()?.toString(),body["source_device"]?.asString,body["kind"].asString=="clipboard_image" && body["sensitive"]?.asBoolean==true)
         }
     }
 }

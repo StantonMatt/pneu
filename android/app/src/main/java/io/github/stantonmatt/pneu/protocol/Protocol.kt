@@ -39,10 +39,10 @@ object Protocol {
         Type.HELLO to setOf("version", "device_id", "name", "capabilities", "paused", "role", "addresses", "setup"),
         Type.PAIR_REQUEST to setOf("token"), Type.PAIR_RESULT to setOf("accepted", "code", "message"),
         Type.PING to setOf("nonce"), Type.PONG to setOf("nonce"), Type.STATUS to setOf("paused"), Type.UNPAIR to emptySet(),
-        Type.FILE_BEGIN to setOf("transfer_id", "file_name", "mime", "size", "sha256", "kind", "created_at", "source_media_id", "hlc", "source_device"),
+        Type.FILE_BEGIN to setOf("transfer_id", "file_name", "mime", "size", "sha256", "kind", "created_at", "source_media_id", "hlc", "source_device", "sensitive"),
         Type.FILE_END to setOf("transfer_id"), Type.ACK to setOf("transfer_id", "deduplicated"),
         Type.NACK to setOf("transfer_id", "code", "retryable", "message"),
-        Type.CLIPBOARD to setOf("transfer_id", "text", "created_at", "origin", "hlc", "source_device"),
+        Type.CLIPBOARD to setOf("transfer_id", "text", "created_at", "origin", "hlc", "source_device", "sensitive"),
         Type.PEER_SETTINGS to setOf("transfer_id", "settings"),
         Type.MEMBERS to setOf("transfer_id", "setup_id", "members"),
         Type.ERROR to setOf("code", "message", "supported_version")
@@ -199,14 +199,14 @@ object Protocol {
                 val name = str("file_name", 255); require(name !in setOf(".", "..") && '/' !in name && '\\' !in name)
                 val mime = str("mime", 255); val kind = str("kind", 32)
                 require(kind in setOf("screenshot", "photo", "recording", "file", "clipboard_image"))
-                if (kind == "clipboard_image") require(mime.startsWith("image/") && mime.length > 6)
+                if (kind == "clipboard_image") {require(mime.startsWith("image/") && mime.length > 6);optional("sensitive") {bool("sensitive")}}
                 optional("source_media_id") { str("source_media_id", 256) }
                 clipboardClock();require(!o.has("hlc") || (mime.startsWith("image/") && mime.length > 6))
             }
             Type.FILE_END -> hex("transfer_id", 32)
             Type.ACK -> { hex("transfer_id", 32); bool("deduplicated") }
             Type.NACK -> { hex("transfer_id", 32); val code = str("code", 64); require(code in nackCodes); require(bool("retryable") == (code !in setOf("unsupported_kind", "id_conflict"))) }
-            Type.CLIPBOARD -> { hex("transfer_id", 32); str("text", 16384, 0); num("created_at", MAX_TIMESTAMP); optional("origin") { require(str("origin", 16) in setOf("clipboard", "share")) };clipboardClock() }
+            Type.CLIPBOARD -> { optional("sensitive") {bool("sensitive")};hex("transfer_id", 32); str("text", 16384, 0); num("created_at", MAX_TIMESTAMP); optional("origin") { require(str("origin", 16) in setOf("clipboard", "share")) };clipboardClock() }
             Type.PEER_SETTINGS -> {
                 hex("transfer_id",32)
                 val settings=o.get("settings");require(settings is JsonArray && settings.size() in 1..3)

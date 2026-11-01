@@ -292,4 +292,21 @@
     <string name="delivery_stopped">Stopped</string>
     <string name="delivery_superseded">Replaced by a newer item</string>
     <string name="delivery_skipped">Skipped</string>
+    <string name="pref_keep_history">Keep history</string>
+    <string name="history_title">Clipboard history</string>
+    <string name="history_clear_all">Clear all</string>
+    <string name="history_this_phone">This phone</string>
+    <string name="history_origin_time">%1$s · %2$s</string>
+    <string name="history_from">From %1$s</string>
+    <string name="history_copied">Copied</string>
+    <string name="history_delete">Delete</string>
+    <string name="history_empty">Nothing sent or received yet</string>
+    <string name="history_clear_title">Clear clipboard history?</string>
+    <string name="history_off_title">Turn off clipboard history?</string>
+    <string name="history_clear">Clear</string>
+    <string name="history_turn_off">Turn off</string>
+    <plurals name="history_delete_count">
+        <item quantity="one">This deletes %d saved item.</item>
+        <item quantity="other">This deletes %d saved items.</item>
+    </plurals>
 </resources>

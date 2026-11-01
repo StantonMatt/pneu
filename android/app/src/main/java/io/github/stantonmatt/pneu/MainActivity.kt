@@ -166,6 +166,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
         onDispose {}
     }
     var permissionOrigin by rememberSaveable {mutableStateOf("home")}
+    val historyState by app.savedClips.state.collectAsState()
     val waiting by app.waitingCount.collectAsState()
     val pendingDeliveries by app.work.collectAsState()
     val pairingAttempt by app.connection.attempt.collectAsState()
@@ -234,7 +235,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
         }.onFailure {filesFor=null;actionError=UiFeedback(resources.getString(R.string.toast_cant_read)) to null}
     }
     var backProgress by remember {mutableFloatStateOf(0f)}
-    PredictiveBackHandler(enabled=screen in listOf("settings","permissions") || screen?.startsWith(DEVICE)==true || screen?.startsWith(MEMBER)==true || (screen=="pair" && SetupPresentation.hasDevices(p))) { events ->
+    PredictiveBackHandler(enabled=screen in listOf("settings","permissions","history") || screen?.startsWith(DEVICE)==true || screen?.startsWith(MEMBER)==true || (screen=="pair" && SetupPresentation.hasDevices(p))) { events ->
         try {events.collect {backProgress=it.progress};navigate(if(screen=="permissions") permissionOrigin else "home")}
         finally {backProgress=0f}
     }
@@ -251,10 +252,14 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
                     val session=scannerSession
                     key(session) {PairScreen(p,link,{ if(screen=="pair" && session==scannerSession)navigate("home") },{ if(SetupPresentation.hasDevices(p))navigate("home") else (context as Activity).finish() },{offerPair(it)},lastAttemptedInvitation=lastAttemptedInvitation,initialPairingRevision=scannerPairingRevision,initialAttemptId=scannerAttemptId,validationFeedback=rejectedLinkFeedback)}
                 }
-                "home" -> {var homeScrolled by remember {mutableStateOf(false)};Scaffold(containerColor=background,contentWindowInsets=WindowInsets.statusBars,topBar={HomeTopBar(homeScrolled){navigate("settings")}},snackbarHost={PneuSnackbarHost(homeSnackbar,Modifier.navigationBarsPadding(),::presentedNews)}) { padding ->
+                "home" -> {var homeScrolled by remember {mutableStateOf(false)};Scaffold(containerColor=background,contentWindowInsets=WindowInsets.statusBars,topBar={HomeTopBar(homeScrolled,history=if(historyState.enabled)({navigate("history")})else null){navigate("settings")}},snackbarHost={PneuSnackbarHost(homeSnackbar,Modifier.navigationBarsPadding(),::presentedNews)}) { padding ->
                     HomeScreen(p,link,recent,health,Modifier.padding(padding),{permissionOrigin="home";navigate("permissions")},{navigate("pair")},{homeScrolled=it},recentItems.associateBy {it.row.mediaId},deviceStates,
                         setup=HomeSetup(SetupPresentation.banner(p,setupUi),SetupPresentation.phones(p),{id->displayedBindings[id]?.let {linkDevices(it,displayedAllPrompts)}},{setupStore.update {it.copy(bannerDismissed=true)}}) {navigate(MEMBER+it)}) {navigate(DEVICE+it)}
                 }}
+                "history" -> {
+                    LaunchedEffect(historyState.enabled) {if(!historyState.enabled)navigate("home")}
+                    if(historyState.enabled)ClipboardHistoryScreen {navigate("home")}
+                }
                 "settings" -> SettingsScreen(p,health,refresh,{navigate("home")},{permissionOrigin="settings";navigate("permissions")})
                 else -> if(visibleScreen?.startsWith(MEMBER)==true) {
                     val key=visibleScreen.removePrefix(MEMBER)
@@ -432,13 +437,13 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
     }
 }
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable internal fun HomeTopBar(scrolled:Boolean,settings:()->Unit) {
+@Composable internal fun HomeTopBar(scrolled:Boolean,history:(()->Unit)?=null,settings:()->Unit) {
     val c=LocalPneuColors.current
     TopAppBar(modifier=Modifier.drawWithContent {drawContent();if(scrolled)drawLine(c.separator,androidx.compose.ui.geometry.Offset(0f,size.height-1f),androidx.compose.ui.geometry.Offset(size.width,size.height-1f),1f)},
         title={Row(Modifier.padding(start=4.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(12.dp)) {
             Symbol(R.drawable.ic_pneu_mark,modifier=Modifier.size(28.dp),tint=Color.Unspecified)
             Text(stringResource(R.string.home_title),style=PneuType.title2)
-        }},actions={IconButton(onClick=settings){Symbol(R.drawable.ic_settings,stringResource(R.string.cd_settings))}},
+        }},actions={if(history!=null)IconButton(onClick=history){Symbol(R.drawable.ic_content_paste,stringResource(R.string.history_title))};IconButton(onClick=settings){Symbol(R.drawable.ic_settings,stringResource(R.string.cd_settings))}},
         colors=TopAppBarDefaults.topAppBarColors(containerColor=c.bg))
 }
 @Composable fun Symbol(id: Int, description: String? = null, modifier: Modifier = Modifier.size(24.dp), tint: Color = LocalContentColor.current) { Icon(painterResource(id),description,modifier,tint) }
@@ -792,6 +797,8 @@ internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired
 @Composable internal fun SettingsScreen(p: Prefs,health: Health,refresh:Int,back: () -> Unit,permissions: () -> Unit) {
     val context=LocalContext.current;val resources=LocalResources.current;val app=context.graph;val scope=rememberCoroutineScope();val actions=LocalUiActions.current;val snackbar=remember {SnackbarHostState()}
     val devicesModel=remember(context) {androidx.lifecycle.ViewModelProvider(context as ComponentActivity)[DevicesViewModel::class.java]}
+    val history by app.savedClips.state.collectAsState()
+    var historyOff by rememberSaveable {mutableStateOf(false)}
     var renaming by rememberSaveable {mutableStateOf(false)}
     var pendingMedia by rememberSaveable {mutableStateOf("")}
     fun mediaPermissionFor(key:String)=if(key=="recordings")Manifest.permission.READ_MEDIA_VIDEO else Manifest.permission.READ_MEDIA_IMAGES
@@ -828,6 +835,10 @@ internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired
                 Header(resources.getString(R.string.group_clipboard))
                 PneuCard {
                     ToggleRow(resources.getString(R.string.pref_clipboard_button),p.clipboardButton,divider=false) {toggle("clipboardButton",it)}
+                    ToggleRow(resources.getString(R.string.pref_keep_history),history.enabled,enabled=history.loaded) {value->
+                        if(!value && history.items.isNotEmpty())historyOff=true
+                        else scope.launch {actions.run(resources.getString(R.string.ui_error_setting)) {app.savedClips.setEnabled(value)}}
+                    }
                 }
                 Header(resources.getString(R.string.group_connection))
                 PneuCard {
@@ -849,6 +860,9 @@ internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired
                 Text(resources.getString(R.string.version,BuildConfig.VERSION_NAME),Modifier.fillMaxWidth().padding(24.dp),style=PneuType.caption,color=LocalPneuColors.current.text3,textAlign=TextAlign.Center)
             }
         }
+    }
+    if(historyOff)HistoryDeleteDialog(history.items.size,true,{historyOff=false}) {
+        scope.launch {if(actions.run(resources.getString(R.string.ui_error_setting)) {app.savedClips.setEnabled(false)})historyOff=false}
     }
     if(renaming)RenameDialog(selfName(context,p),{renaming=false}) {name->
         scope.launch {if(actions.run(resources.getString(R.string.ui_error_setting)) {devicesModel.renameSelf(name)})renaming=false}

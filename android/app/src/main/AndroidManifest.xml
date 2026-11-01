@@ -16,6 +16,9 @@
     <uses-feature android:name="android.hardware.camera.any" android:required="false"/>
     <queries><package android:name="com.tailscale.ipn"/><package android:name="com.samsung.android.lool"/></queries>
     <application android:name=".PneuApp" android:label="@string/app_name" android:icon="@mipmap/ic_launcher" android:allowBackup="false" android:supportsRtl="true" android:theme="@style/Theme.Pneu" android:usesCleartextTraffic="false">
+        <provider android:name="androidx.core.content.FileProvider" android:authorities="${applicationId}.history" android:exported="false" android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/history_paths"/>
+        </provider>
         <activity android:name=".MainActivity" android:enableOnBackInvokedCallback="true" android:exported="true" android:launchMode="singleTop">
             <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
             <intent-filter><action android:name="android.intent.action.VIEW"/><category android:name="android.intent.category.DEFAULT"/><category android:name="android.intent.category.BROWSABLE"/><data android:scheme="pneu" android:host="pair"/></intent-filter>

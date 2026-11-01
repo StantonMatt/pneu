@@ -73,7 +73,7 @@ class MeshStorageTest {
             override fun onUpgrade(db:SupportSQLiteDatabase,oldVersion:Int,newVersion:Int)=error("Unexpected upgrade")
         }).build())
         helper.writableDatabase;helper.close()
-        val room=Room.databaseBuilder(context,QueueDatabase::class.java,name).addMigrations(QueueMigrations.recipients,QueueMigrations.peerWatermarks,QueueMigrations.pendingAdmissions,QueueMigrations.receivedFiles).build()
+        val room=Room.databaseBuilder(context,QueueDatabase::class.java,name).addMigrations(QueueMigrations.recipients,QueueMigrations.peerWatermarks,QueueMigrations.pendingAdmissions,QueueMigrations.receivedFiles,QueueMigrations.sensitiveClips).build()
         try {
             val queue=room.queue();val row=queue.all().single {it.mediaId=="old"}
             assertEquals("Unfenced clipboard work cannot survive upgrade", "superseded",queue.find("old-text").state)

@@ -221,6 +221,8 @@ def authenticated(rows, digest):
 
 
 LOCAL_TESTS = (
+    'ClipboardHistoryDeviceTest', 'ClipboardHistoryIntegrationDeviceTest', 'ClipboardHistoryMigrationDeviceTest',
+    'ClipboardHistoryScreensDeviceTest',
     'Sweep4RegressionDeviceTest',
     'ReceiveStorageDeviceTest', 'DeviceScreensDeviceTest', 'Sweep3RegressionDeviceTest', 'OperationFeedbackDeviceTest',
     'AdmissionFenceDeviceTest', 'MergeRegressionDeviceTest',
