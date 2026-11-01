@@ -3,7 +3,9 @@ package io.github.stantonmatt.pneu.data
 import android.app.Application
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color
+import androidx.exifinterface.media.ExifInterface
 import androidx.room.Room
 import io.github.stantonmatt.pneu.historyDisplayOrder
 import kotlinx.coroutines.*
@@ -13,6 +15,7 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
+import org.robolectric.annotation.GraphicsMode
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -111,6 +114,29 @@ class SavedClipsTest {
         store.recordImage("image/png") {png.inputStream()};store.delete(items.first().id);assertEquals(0,directory.listFiles()!!.size)
         store.recordImage("image/png") {png.inputStream()};store.clear();assertEquals(0,directory.listFiles()!!.size)
         store.recordImage("image/png") {png.inputStream()};store.setEnabled(false);assertFalse(store.state.value.enabled);assertTrue(items.isEmpty());assertEquals(0,directory.listFiles()!!.size)
+    }
+    @Test @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun imageThumbnailAppliesExifOrientationAndPreservesEncodedOriginal()=runBlocking {
+        val jpeg=File.createTempFile("history-exif-",".jpg",context.cacheDir)
+        val bytes=try {
+            jpeg.writeBytes(image(Bitmap.CompressFormat.JPEG))
+            ExifInterface(jpeg.path).apply {
+                setAttribute(ExifInterface.TAG_ORIENTATION,ExifInterface.ORIENTATION_ROTATE_90.toString())
+                saveAttributes()
+            }
+            jpeg.readBytes()
+        } finally {jpeg.delete()}
+        store.setEnabled(true)
+        store.recordImage("image/jpeg") {bytes.inputStream()}
+        val item=items.single()
+        val thumbnail=BitmapFactory.decodeFile(store.thumbnail(item).path)!!
+        try {assertEquals(10,thumbnail.width);assertEquals(12,thumbnail.height)}
+        finally {thumbnail.recycle()}
+        assertArrayEquals(bytes,directory.resolve(item.image).readBytes())
+        assertEquals("image:"+io.github.stantonmatt.pneu.protocol.sha256(bytes),item.id)
+        assertTrue(store.copy(item.id) {clip->
+            assertArrayEquals(bytes,context.contentResolver.openInputStream(clip.getItemAt(0).uri!!)!!.use {it.readBytes()})
+        })
     }
     @Test fun clipboardSnapshotSurvivesCleanupAndRestartAndOnlyTheNextImageCopyReplacesIt()=runBlocking {
         store.setEnabled(true)

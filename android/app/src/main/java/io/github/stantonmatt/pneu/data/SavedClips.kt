@@ -7,6 +7,7 @@ import android.graphics.BitmapFactory
 import androidx.core.content.FileProvider
 import androidx.room.Room
 import io.github.stantonmatt.pneu.protocol.sha256
+import io.github.stantonmatt.pneu.features.ImageOrientation
 import io.github.stantonmatt.pneu.features.ImageWorkBudget
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -86,7 +87,7 @@ internal class SavedClips(private val context:Context,scope:CoroutineScope,
             if(bounds.outWidth<=0 || bounds.outHeight<=0)return@run
             var sample=1
             while(maxOf(bounds.outWidth,bounds.outHeight)/sample>128)sample*=2
-            val bitmap=BitmapFactory.decodeByteArray(bytes,0,bytes.size,BitmapFactory.Options().apply {inSampleSize=sample}) ?: return@run
+            val bitmap=ImageOrientation.apply(bytes,BitmapFactory.decodeByteArray(bytes,0,bytes.size,BitmapFactory.Options().apply {inSampleSize=sample}) ?: return@run)
             try {
                 // Hash the bounded encoded payload; dedupe never needs full-size pixels.
                 val hash=sha256(bytes)
