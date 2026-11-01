@@ -77,7 +77,11 @@ fn every_known_field_rejects_wrong_types_null_and_duplicates() {
                     && match type_id {
                         0x01 => matches!(field.as_str(), "paused" | "role" | "addresses"),
                         0x03 | 0x14 | 0x7f => field == "message",
-                        0x10 => matches!(field.as_str(), "source_media_id" | "sensitive"),
+                        0x10 => {
+                            matches!(field.as_str(), "source_media_id" | "sensitive" | "folder")
+                                || (field == "resume" && payload.get("folder").is_none())
+                        }
+                        0x33 => matches!(field.as_str(), "title" | "text" | "icon_png"),
                         0x20 => matches!(field.as_str(), "origin" | "sensitive"),
                         _ => false,
                     };
@@ -154,11 +158,20 @@ fn every_known_field_rejects_wrong_types_null_and_duplicates() {
         (0x06, "paused"),
         (
             0x10,
-            "transfer_id file_name mime size sha256 kind created_at source_media_id hlc source_device sensitive",
+            "transfer_id file_name mime size sha256 kind created_at source_media_id hlc source_device sensitive resume folder",
         ),
         (0x12, "transfer_id"),
         (0x13, "transfer_id deduplicated"),
         (0x14, "transfer_id code retryable message"),
+        (0x15, "transfer_id offset"),
+        (0x16, "transfer_id"),
+        (0x30, "level charging"),
+        (0x31, "action"),
+        (0x32, "ringing"),
+        (
+            0x33,
+            "action key app_package app_label time title text icon_png",
+        ),
         (
             0x20,
             "transfer_id text created_at origin hlc source_device sensitive",
@@ -300,6 +313,9 @@ fn all_wire_enums_are_strings_in_frames_and_direct_deserialization() {
             "clipboard_unavailable"
         ]
     );
+    check!(RingAction, ["start", "stop"]);
+    check!(NotificationAction, ["clear", "remove", "upsert"]);
+    check!(FolderEntryType, ["file", "directory"]);
     check!(ClipboardOrigin, ["clipboard", "share"]);
     check!(
         ErrorCode,
@@ -387,7 +403,12 @@ fn string_constraints_and_array_elements() {
                     }
                     let bounds = match field.as_str() {
                         "name" => Some((1, 128)),
-                        "file_name" | "mime" => Some((1, 255)),
+                        "file_name" => Some((1, 255)),
+                        "mime" if payload.get("folder").is_none() => Some((1, 255)),
+                        "app_package" => Some((1, 255)),
+                        "app_label" => Some((1, 128)),
+                        "title" => Some((0, 1024)),
+                        "text" if type_id == 0x33 => Some((0, 8192)),
                         "source_media_id" => Some((1, 256)),
                         "message" => Some((0, 512)),
                         "text" => Some((0, MAX_CLIPBOARD_BYTES)),

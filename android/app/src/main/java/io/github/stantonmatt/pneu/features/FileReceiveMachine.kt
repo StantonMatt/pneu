@@ -9,9 +9,10 @@ import java.security.MessageDigest
 /** All known wire fields, before storage-name sanitizing. Unknown extensions do not
  * participate in receipt equality. Optional fields retain absent/present identity. */
 data class ReceivedMetadata(val id:String,val name:String,val mime:String,val size:Long,val hash:String,
-    val kind:String,val createdAt:Long,val mediaId:String?=null,val hlc:String?=null,val source:String?=null,val sensitive:Boolean=false) {
+    val kind:String,val createdAt:Long,val mediaId:String?=null,val hlc:String?=null,val source:String?=null,val sensitive:Boolean=false,val folder:Folder?=null) {
     val canonical:String get()=json("transfer_id" to id,"file_name" to name,"mime" to mime,"size" to size,
         "sha256" to hash,"kind" to kind,"created_at" to createdAt).apply {
+        folder?.let {add("folder",json("manifest_len" to it.manifestLen))}
         if(sensitive)addProperty("sensitive",true)
         mediaId?.let {addProperty("source_media_id",it)}
         hlc?.let {addProperty("hlc",it.toBigInteger());addProperty("source_device",source)}
@@ -21,7 +22,7 @@ data class ReceivedMetadata(val id:String,val name:String,val mime:String,val si
             Protocol.validate(Type.FILE_BEGIN,body)
             return ReceivedMetadata(body["transfer_id"].asString,body["file_name"].asString,body["mime"].asString,
                 body["size"].asLong,body["sha256"].asString,body["kind"].asString,body["created_at"].asLong,
-                body["source_media_id"]?.asString,body["hlc"]?.asString?.toBigInteger()?.toString(),body["source_device"]?.asString,body["kind"].asString=="clipboard_image" && body["sensitive"]?.asBoolean==true)
+                body["source_media_id"]?.asString,body["hlc"]?.asString?.toBigInteger()?.toString(),body["source_device"]?.asString,body["kind"].asString=="clipboard_image" && body["sensitive"]?.asBoolean==true,body["folder"]?.asJsonObject?.let {Folder(it["manifest_len"].asLong)})
         }
     }
 }
@@ -54,6 +55,7 @@ internal class FileReceiveMachine(private val backend:ReceiveBackend,private val
     suspend fun begin(body:JsonObject) {
         if(slot!=null)throw ReceiveViolation()
         val meta=try {ReceivedMetadata.parse(body)}catch(_:IllegalArgumentException) {throw ReceiveViolation("malformed_message")}
+        if(body["resume"]?.asBoolean == true || body.has("folder"))throw ReceiveViolation()
         val admission=try {backend.admit(meta)}catch(e:CancellationException) {throw e}
             catch(e:ReceiveViolation) {throw e}
             catch(e:Exception) {ReceiveAdmission(reply=ReceiveReply(failure(e)))}

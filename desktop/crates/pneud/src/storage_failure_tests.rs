@@ -32,6 +32,8 @@ fn storage_text(peer: &Id) -> Clipboard {
 }
 fn storage_file(peer: &Id) -> FileBegin {
     FileBegin {
+            resume: None,
+            folder: None,
             sensitive: false,
         transfer_id: Id::from_bytes(rand::random()),
         file_name: "clipboard.png".into(),

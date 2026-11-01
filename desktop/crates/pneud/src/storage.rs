@@ -887,6 +887,8 @@ mod tests {
     fn streamed_verification_checks_both_count_and_digest() {
         use sha2::{Digest, Sha256};
         let begin = pneu_proto::FileBegin {
+            resume: None,
+            folder: None,
             sensitive: false,
             hlc: None,
             source_device: None,

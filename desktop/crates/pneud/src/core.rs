@@ -2667,6 +2667,8 @@ impl Core {
         let image = image.map(|bytes| {
             OutgoingSelection::Image(
                 FileBegin {
+                    resume: None,
+                    folder: None,
                     sensitive: false,
                     transfer_id: operation.id.clone(),
                     file_name: "clipboard.png".into(),
@@ -4445,6 +4447,7 @@ impl Core {
         Box::pin(async move {
             match message {
                 Message::FileBegin(begin) => {
+                    ensure!(begin.resume != Some(true) && begin.folder.is_none(), "unnegotiated file extension");
                     ensure!(incoming.is_none(), "second FILE_BEGIN");
                     let config = self.config();
                     let mut state = Incoming {
@@ -4472,7 +4475,7 @@ impl Core {
                         .await
                     {
                         Ok(Some((meta, complete))) => {
-                            if meta == Metadata::File(begin.clone()) && complete {
+                            if matches!(&meta, Metadata::File(retained) if retained.content_eq(&begin)) && complete {
                                 state.admission = FileAdmission::RetainedReplay;
                                 state.deduplicated = true;
                             } else {
@@ -6113,6 +6116,7 @@ mod tests {
                 .await?;
             for conflict in [false, true] {
                 let mut replay = begin.clone();
+                replay.resume = Some(false); // Transport-only field must not conflict with retained metadata.
                 if conflict {
                     replay.file_name = "conflict.png".into();
                 }
@@ -8065,6 +8069,41 @@ mod tests {
         core.shutdown_actions().await
     }
     #[tokio::test]
+    async fn protocol_extensions_are_not_advertised_or_admitted() -> Result<()> {
+        let (_dir, core, peer) = fixture(Arc::new(NoActions)).await?;
+        let hello = core.computer_hello();
+        assert_eq!(
+            hello.capabilities,
+            [
+                "files",
+                "clipboard_text",
+                "clipboard_image",
+                "mesh",
+                "setup"
+            ]
+        );
+        let mut incoming = None;
+        let (tx, mut rx) = mpsc::channel(8);
+        {
+            let mut begin = test_begin(b"abc");
+            begin.resume = Some(true);
+            let error = core
+                .receive_test(
+                    &core.store,
+                    &peer,
+                    Message::FileBegin(begin),
+                    &mut incoming,
+                    &tx,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(processing_error_code(&error), ErrorCode::UnexpectedMessage);
+            assert!(incoming.is_none());
+            assert!(rx.try_recv().is_err());
+        }
+        core.shutdown_actions().await
+    }
+    #[tokio::test]
     async fn hello_and_status_bounds_are_validated_before_publication() -> Result<()> {
         let (_dir, core, _peer) = fixture(Arc::new(NoActions)).await?;
         let mut config = core.config();
@@ -9778,6 +9817,8 @@ mod tests {
             .await?;
         let bytes = b"original bytes";
         let begin = FileBegin {
+            resume: None,
+            folder: None,
             sensitive: false,
             hlc: None,
             source_device: None,
@@ -10005,6 +10046,8 @@ mod tests {
 
     fn test_begin(bytes: &[u8]) -> FileBegin {
         FileBegin {
+            resume: None,
+            folder: None,
             sensitive: false,
             hlc: None,
             source_device: None,

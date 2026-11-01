@@ -286,6 +286,8 @@ mod tests {
             FileKind::ClipboardImage,
         ] {
             let m = FileBegin {
+                resume: None,
+                folder: None,
                 sensitive: false,
                 hlc: None,
                 source_device: None,

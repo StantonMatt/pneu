@@ -16,7 +16,7 @@ const val CHUNK_SIZE = 262_144
 
 enum class Type(val wire: Int) {
     HELLO(1), PAIR_REQUEST(2), PAIR_RESULT(3), PING(4), PONG(5), STATUS(6), UNPAIR(7),
-    FILE_BEGIN(16), FILE_CHUNK(17), FILE_END(18), ACK(19), NACK(20), CLIPBOARD(32), PEER_SETTINGS(33), MEMBERS(34), ERROR(127);
+    FILE_BEGIN(16), FILE_CHUNK(17), FILE_END(18), ACK(19), NACK(20), FILE_READY(21), CANCEL(22), BATTERY_STATE(48), RING(49), RING_STATE(50), NOTIFICATION_EVENT(51), CLIPBOARD(32), PEER_SETTINGS(33), MEMBERS(34), ERROR(127);
     val label get() = name.lowercase()
 }
 sealed interface Frame {
@@ -39,7 +39,10 @@ object Protocol {
         Type.HELLO to setOf("version", "device_id", "name", "capabilities", "paused", "role", "addresses", "setup"),
         Type.PAIR_REQUEST to setOf("token"), Type.PAIR_RESULT to setOf("accepted", "code", "message"),
         Type.PING to setOf("nonce"), Type.PONG to setOf("nonce"), Type.STATUS to setOf("paused"), Type.UNPAIR to emptySet(),
-        Type.FILE_BEGIN to setOf("transfer_id", "file_name", "mime", "size", "sha256", "kind", "created_at", "source_media_id", "hlc", "source_device", "sensitive"),
+        Type.FILE_BEGIN to setOf("transfer_id", "file_name", "mime", "size", "sha256", "kind", "created_at", "source_media_id", "hlc", "source_device", "sensitive", "resume", "folder"),
+        Type.FILE_READY to setOf("transfer_id", "offset"), Type.CANCEL to setOf("transfer_id"),
+        Type.BATTERY_STATE to setOf("level", "charging"), Type.RING to setOf("action"),
+        Type.RING_STATE to setOf("ringing"), Type.NOTIFICATION_EVENT to ExtensionWire.notificationFields,
         Type.FILE_END to setOf("transfer_id"), Type.ACK to setOf("transfer_id", "deduplicated"),
         Type.NACK to setOf("transfer_id", "code", "retryable", "message"),
         Type.CLIPBOARD to setOf("transfer_id", "text", "created_at", "origin", "hlc", "source_device", "sensitive"),
@@ -89,30 +92,51 @@ object Protocol {
             return Frame.Chunk(id, offset, ByteArray(length - 25).also { stream.readFully(it) })
         }
         require(length <= 65537)
-        val text = strictUtf8(ByteArray(length - 1).also { stream.readFully(it) })
-        require(!text.startsWith('\uFEFF'))
-        val reader = JsonReader(StringReader(text)).apply { strictness = Strictness.STRICT }
-        require(reader.peek() == JsonToken.BEGIN_OBJECT)
-        val result = readValue(reader, known.getValue(type)).asJsonObject
-        require(reader.peek() == JsonToken.END_DOCUMENT)
+        val result = parseObject(ByteArray(length - 1).also { stream.readFully(it) }, known.getValue(type))
         validate(type, result)
         return Frame.Control(type, result)
     }
-    // Stream every object before Gson can discard duplicate fields. Unknown
-    // values still get Unicode member-name validation recursively.
-    private fun readValue(reader: JsonReader, fields: Set<String>? = null, context: String = ""): JsonElement = when(reader.peek()) {
+    internal fun parseObject(bytes: ByteArray, fields: Set<String>, maxDepth: Int = Int.MAX_VALUE, strictUnknownUnicode: Boolean = false): JsonObject {
+        require(!bytes.take(3).toByteArray().contentEquals(byteArrayOf(0xef.toByte(), 0xbb.toByte(), 0xbf.toByte())))
+        val decoder = Charsets.UTF_8.newDecoder()
+            .onMalformedInput(CodingErrorAction.REPORT).onUnmappableCharacter(CodingErrorAction.REPORT)
+        val reader = JsonReader(InputStreamReader(ByteArrayInputStream(bytes), decoder)).apply { strictness = Strictness.STRICT }
+        require(reader.peek() == JsonToken.BEGIN_OBJECT)
+        val result = readValue(reader, fields, maxDepth=maxDepth, strictUnknownUnicode=strictUnknownUnicode).asJsonObject
+        require(reader.peek() == JsonToken.END_DOCUMENT)
+        return result
+    }
+    // Root depth is 1; every member value/array element adds one, including
+    // scalars. Member names add no depth. Discard unknown values as tokens,
+    // validating manifest Unicode rather than letting skipValue bypass strings.
+    // Legacy controls retain their existing unknown-string policy.
+    private fun readValue(reader: JsonReader, fields: Set<String>? = null, context: String = "", depth: Int = 1, maxDepth: Int = Int.MAX_VALUE, strictUnknownUnicode: Boolean = false): JsonElement {
+        require(depth <= maxDepth) { "JSON nesting limit" }
+        // Reject wrong manifest field types before they can allocate a tree.
+        if(fields != null)require(reader.peek() == JsonToken.BEGIN_OBJECT)
+        when(context) {
+            "entries" -> require(reader.peek() == JsonToken.BEGIN_ARRAY)
+            "path", "type", "sha256" -> require(reader.peek() == JsonToken.STRING)
+            "size" -> require(reader.peek() == JsonToken.NUMBER)
+        }
+        return when(reader.peek()) {
         JsonToken.BEGIN_OBJECT -> JsonObject().apply {
             val seen=mutableSetOf<String>();reader.beginObject()
             while(reader.hasNext()) {
                 val name=reader.nextName().also(::validateUnicode)
                 require(fields==null || name !in fields || seen.add(name)) { "Duplicate field" }
+                if(fields != null && name !in fields) {
+                    skipValue(reader, depth+1, maxDepth, strictUnknownUnicode)
+                    continue
+                }
                 val nested=when(name.takeIf {fields!=null && name in fields}) {
+                    "folder" -> setOf("manifest_len")
                     "setup" -> SetupWire.helloFields
                     "reach" -> SetupWire.reachFields
                     "readmits" -> SetupWire.readmitsFields
                     else -> null
                 }
-                val value=readValue(reader,nested,if(fields!=null && name in fields)name else "")
+                val value=readValue(reader,nested,if(fields!=null && name in fields)name else "",depth+1,maxDepth,strictUnknownUnicode)
                 if(fields==null || name in fields)add(name,value)
             }
             reader.endObject()
@@ -121,15 +145,41 @@ object Protocol {
             reader.beginArray()
             while(reader.hasNext()) {
                 val itemFields=when(context) {
+                    "entries" -> setOf("path", "type", "size", "sha256")
                     "members" -> SetupWire.memberFields
                     "settings" -> setOf("key","enabled","hlc","writer_device")
                     else -> null
                 }
-                add(readValue(reader,itemFields))
+                if(context == "entries")require(size() < MAX_MANIFEST_ENTRIES) { "manifest entry count" }
+                add(readValue(reader,itemFields,depth=depth+1,maxDepth=maxDepth,strictUnknownUnicode=strictUnknownUnicode))
             }
             reader.endArray()
         }
+        JsonToken.STRING -> JsonPrimitive(reader.nextString().also {if(strictUnknownUnicode)validateUnicode(it)})
         else -> JsonParser.parseReader(reader)
+        }
+    }
+    private fun skipValue(reader: JsonReader, depth: Int, maxDepth: Int, strictUnknownUnicode: Boolean) {
+        require(depth <= maxDepth) { "JSON nesting limit" }
+        when(reader.peek()) {
+            JsonToken.BEGIN_OBJECT -> {
+                reader.beginObject()
+                while(reader.hasNext()) {
+                    validateUnicode(reader.nextName())
+                    skipValue(reader, depth+1, maxDepth, strictUnknownUnicode)
+                }
+                reader.endObject()
+            }
+            JsonToken.BEGIN_ARRAY -> {
+                reader.beginArray()
+                while(reader.hasNext())skipValue(reader, depth+1, maxDepth, strictUnknownUnicode)
+                reader.endArray()
+            }
+            JsonToken.STRING -> if(strictUnknownUnicode)validateUnicode(reader.nextString()) else reader.skipValue()
+            // JsonReader still checks strict JSON grammar for discarded tokens.
+            JsonToken.NUMBER, JsonToken.BOOLEAN, JsonToken.NULL -> reader.skipValue()
+            else -> error("Expected JSON value")
+        }
     }
     fun write(output: OutputStream, frame: Frame) {
         val stream = DataOutputStream(output)
@@ -180,6 +230,8 @@ object Protocol {
                 val caps = o.get("capabilities"); require(caps is JsonArray && caps.size() <= 16)
                 val names = caps.map { string(it,64) }
                 require(names.distinct().size == names.size && ("clipboard_image" !in names || "files" in names))
+                require(CAP_FILE_RESUME !in names || "files" in names)
+                require(CAP_FOLDER !in names || ("files" in names && CAP_FILE_RESUME in names))
                 SetupWire.validateHello(o,names)
                 optional("paused") { bool("paused") }
                 optional("role") { require(str("role",8) in setOf("phone","computer")) }
@@ -202,7 +254,10 @@ object Protocol {
                 if (kind == "clipboard_image") {require(mime.startsWith("image/") && mime.length > 6);optional("sensitive") {bool("sensitive")}}
                 optional("source_media_id") { str("source_media_id", 256) }
                 clipboardClock();require(!o.has("hlc") || (mime.startsWith("image/") && mime.length > 6))
+                optional("resume") { bool("resume") }
+                optional("folder") { ExtensionWire.validateFolderBegin(o) }
             }
+            Type.FILE_READY, Type.CANCEL, Type.BATTERY_STATE, Type.RING, Type.RING_STATE, Type.NOTIFICATION_EVENT -> ExtensionWire.validate(type,o)
             Type.FILE_END -> hex("transfer_id", 32)
             Type.ACK -> { hex("transfer_id", 32); bool("deduplicated") }
             Type.NACK -> { hex("transfer_id", 32); val code = str("code", 64); require(code in nackCodes); require(bool("retryable") == (code !in setOf("unsupported_kind", "id_conflict"))) }

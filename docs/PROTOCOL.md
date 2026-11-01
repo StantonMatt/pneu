@@ -332,6 +332,11 @@ direct link is ask. Exported trust requires explicit removal to revoke.
 
 ## Common types and JSON rules
 
+Folder entry paths are structurally checked relative paths, not FILE_BEGIN
+basenames and never filesystem authority. Folder kind remains `file`. Content
+identity includes every known content field including `folder`, preserving
+existing absent/default semantics, and excludes `resume` and unknown fields.
+
 JSON control payloads are UTF-8 objects without BOM. Required fields listed
 below MUST be present; optional fields MUST be omitted when absent (not `null`).
 Unknown object fields and unknown HELLO capability strings are ignored. Reject
@@ -377,6 +382,11 @@ compression or base64 layer exists.
   and avoid overwrite/symlink attacks regardless of what the sender supplies.
 
 ## Frame layout and limits
+
+The 64-GiB stream ceiling includes exact manifest bytes and file content together.
+A folder consumes one file slot and one receipt; its offsets address that complete
+stream. The 8-MiB manifest cap is a streamed-byte limit, independent of the 64-KiB
+control payload cap. Binary chunk layout remains unchanged.
 
 Every frame starts with an unsigned 32-bit **big-endian** length `L`, followed by
 exactly `L` bytes. `L` includes the type byte, excludes the four-byte prefix.
@@ -433,9 +443,15 @@ objects are lowercase snake_case; these names are not carried on the wire.
 | `12` | FILE_END | Sender finished bytes |
 | `13` | ACK | Durable verified receipt |
 | `14` | NACK | Receipt failed |
+| `15` (21) | FILE_READY | Resumable transfer starting offset |
+| `16` (22) | CANCEL | Cancel sender-owned incomplete transfer |
 | `20` | CLIPBOARD | Clipboard text operation |
 | `21` | PEER_SETTINGS | Synced directional pair switches (`mesh` only) |
 | `22` | MEMBERS | Full setup membership snapshot (`setup` only) |
+| `30` (48) | BATTERY_STATE | Phone battery sample or clear |
+| `31` (49) | RING | Computer start/stop command |
+| `32` (50) | RING_STATE | Phone ringing state |
+| `33` (51) | NOTIFICATION_EVENT | Phone clear/upsert/remove |
 | `7f` | ERROR | Fatal error or graceful close; then close TLS |
 
 The following JSON Schema (2020-12) defines the control payloads. Select the
@@ -503,9 +519,44 @@ unique known fields or filename safety).
         "source_media_id":{"type":"string","minLength":1},
         "hlc":{"$ref":"#/$defs/hlc"},
         "source_device":{"$ref":"#/$defs/id"},
-        "sensitive":{"type":"boolean"}
+        "sensitive":{"type":"boolean"},
+        "resume":{"type":"boolean"},
+        "folder":{"$ref":"#/$defs/folder"}
       },
       "dependentRequired":{"hlc":["source_device"],"source_device":["hlc"]}
+    },
+    "folder": {
+      "type":"object","required":["manifest_len"],
+      "properties":{"manifest_len":{"type":"integer","minimum":1,"maximum":8388608}}
+    },
+    "file_ready": {
+      "type":"object","required":["transfer_id","offset"],
+      "properties":{"transfer_id":{"$ref":"#/$defs/id"},"offset":{"type":"integer","minimum":0,"maximum":68719476736}}
+    },
+    "cancel": {
+      "type":"object","required":["transfer_id"],
+      "properties":{"transfer_id":{"$ref":"#/$defs/id"}}
+    },
+    "battery_state": {
+      "type":"object","properties":{"level":{"type":"integer","minimum":0,"maximum":100},"charging":{"type":"boolean"}},
+      "dependentRequired":{"level":["charging"],"charging":["level"]}
+    },
+    "ring": {"type":"object","required":["action"],"properties":{"action":{"enum":["start","stop"]}}},
+    "ring_state": {"type":"object","required":["ringing"],"properties":{"ringing":{"type":"boolean"}}},
+    "notification_event": {
+      "type":"object","required":["action"],
+      "properties": {
+        "action":{"enum":["clear","remove","upsert"]},"key":{"$ref":"#/$defs/id"},
+        "app_package":{"type":"string","minLength":1,"maxLength":255},
+        "app_label":{"type":"string","minLength":1,"maxLength":128},
+        "time":{"$ref":"#/$defs/timestamp"},"title":{"type":"string","maxLength":1024},
+        "text":{"type":"string","maxLength":8192},"icon_png":{"type":"string","minLength":2,"maxLength":16384,"pattern":"^([0-9a-f]{2})+$"}
+      },
+      "oneOf": [
+        {"properties":{"action":{"const":"clear"}},"not":{"anyOf":[{"required":["key"]},{"required":["app_package"]},{"required":["app_label"]},{"required":["time"]},{"required":["title"]},{"required":["text"]},{"required":["icon_png"]}]}},
+        {"properties":{"action":{"const":"remove"}},"required":["key"],"not":{"anyOf":[{"required":["app_package"]},{"required":["app_label"]},{"required":["time"]},{"required":["title"]},{"required":["text"]},{"required":["icon_png"]}]}},
+        {"properties":{"action":{"const":"upsert"}},"required":["key","app_package","app_label","time"]}
+      ]
     },
     "file_end": {
       "type":"object","required":["transfer_id"],
@@ -634,7 +685,8 @@ the same except for labelling.
 `disk_full` and `not_writable` NACKs mean the receiver could not store the file
 in its configured folder. The receiver does not keep a copy; the sender retries. Each capability is 1–64 UTF-8 bytes; at most 16
 unique entries. Defined capabilities are `files`, `clipboard_text`,
-`clipboard_image`, `mesh`, `setup`. Advertising `clipboard_image` requires `files`;
+`clipboard_image`, `mesh`, `setup`, `file_resume_v1`, `folder_v1`,
+`battery_v1`, `ring_v1`, `notifications_v1`. Advertising `clipboard_image` requires `files`;
 `setup` requires `mesh` and the HELLO setup object above. Capabilities
 mean ability/willingness to receive that feature, not permission to bypass local
 settings. Send a feature only if the receiving HELLO advertises it. Both sides
@@ -648,6 +700,18 @@ The phone advertises the existing `files` capability only once its file receive
 state machine is implemented; this enables FILE_BEGIN/CHUNK/END in that direction
 without new message types. Codec support alone is not receive capability.
 
+| Capability | Advertiser and exact gate |
+|---|---|
+| `file_resume_v1` | Both endpoints, requires `files`; bilateral support enables `resume:true`, READY and CANCEL. Capability alone never makes a BEGIN resumable. |
+| `folder_v1` | Receiver, requires `files` + `file_resume_v1`; folder sending also requires bilateral resume. Sender need not advertise folder reception. Android gate: Folder streams below. |
+| `battery_v1` | Receiving computer; phone sends only to that computer. |
+| `ring_v1` | Phone advertises only while global Allow ringing is on; computer advertises to declare RING_STATE receive support. Commands and state require bilateral support. This prevents broadcasting a new message type to legacy computers. |
+| `notifications_v1` | Receiving computer; never grants phone-side access by itself. |
+
+Current authenticated HELLO governs emission. Cached capabilities only label offline
+queues: without a fresh HELLO, connect to check support. Missing support requires
+an update and does not revoke trust. Codec support alone never advertises a capability.
+
 FILE_CHUNK payload is binary, with these **absolute frame offsets**:
 
 | Offset | Size | Meaning |
@@ -659,6 +723,10 @@ FILE_CHUNK payload is binary, with these **absolute frame offsets**:
 | 29 | 1–262144 | Raw bytes, no encoding |
 
 Offset starts at zero and equals bytes already received for this transfer.
+FILE_READY offset is an unsigned integer token in 0..active BEGIN.size; invalid
+range is malformed_message. It is not required to align to chunks. Legacy transfers
+start at zero; resumable chunks start at the authorized READY offset.
+
 Offset plus chunk data length MUST be at most 64 GiB (check `offset <= MAX_FILE`
 and `data_length <= MAX_FILE - offset`, without overflowing addition). Non-contiguous offsets, wrong IDs or chunk data beyond
 declared size are fatal `unexpected_message` violations. FILE_END carries only
@@ -687,6 +755,15 @@ platform permits it: KDE `x-kde-passwordManagerHint=secret`, macOS
 kinds. Older peers ignore this additive field under the unknown-field rule.
 
 ## Connection and pairing state machines
+
+Battery, ring and notification messages require READY, authenticated `mesh` roles,
+the negotiated capability, and the specified phone/computer direction. Ring requires
+bilateral support. They are forbidden in provisional pairing, on phone-to-phone
+links and as forwarded traffic. Recognized unnegotiated/wrong-direction frames
+are fatal `unexpected_message`; malformed payloads are `malformed_message`;
+unassigned types remain fatal `unknown_message`. Changes to HELLO capabilities
+require reconnect, never a second HELLO. Dispatch readiness, final receipts and
+cancellation by phase; receipt waiters never hold the writer while waiting.
 
 1. **DISCONNECTED → TCP → TLS.** Dialer authenticates acceptor against invitation/stored pin.
    The acceptor requires a cryptographically valid client certificate and completes TLS
@@ -888,6 +965,11 @@ Legacy wire messages strip the stamp and set `created_at` to the operation's HLC
 Old durable legacy clipboard rows are discarded at migration/startup.
 
 ## PEER_SETTINGS (`21`, decimal 33)
+
+Battery, ringing and notification consents are local phone settings; they introduce
+no PEER_SETTINGS keys, defaults or snapshots. A computer cannot enable its own
+notification access. Reinstall replacement copies only applicable ordinary
+switches through fresh local edits under the existing authority below.
 
 This is the next unassigned control ID after CLIPBOARD (`20`); it remains inside
 v1 and is legal only in READY with negotiated `mesh`. No extra ACK message type
@@ -1405,6 +1487,12 @@ PEER_SETTINGS; it delays new introductions/removals. Keepalive remains live.
 
 ### Admission, readiness and removal
 
+Local reinstall replacement confirms exact old/new identities after normal pairing,
+then invokes existing removal and ordinary settings edits. It creates no new trust
+authority or message. Removal cancels old queued deliveries and purges incomplete
+receive state under binding fences; completed user files remain. See Local
+reinstall replacement below.
+
 Both prospective endpoints must learn each other's bindings from a common
 member **before** their direct connection succeeds. Desktop admission continues
 to reject unknown certificates immediately after TLS and before HELLO. No new
@@ -1503,6 +1591,152 @@ that a forwarded entry has reached its subject. The UI MAY show waits for known
 unacknowledged members, but MUST NOT claim globally completed removal from those
 ACKs alone; v1 carries no transitive per-member delivery attestation.
 
+## Resumable transfers and CANCEL
+
+### Wire and machines
+
+BEGIN adds optional `resume:boolean` (absent/false = unchanged legacy flow). A new receiver rejects `resume:true` without bilateral capability with `unexpected_message`. With `true` and bilateral capability the receiver sends **one FILE_READY or early NACK**, and only then may the sender send chunks/END. READY is not a receipt. Offset is authoritative, arbitrary byte aligned, and may regress to zero after eviction. Chunks are strictly contiguous from that offset. A full retained completion returns READY(size), then END → ACK(deduplicated=true), without inspecting the published user file. Empty files follow READY(0) → END. Wrong ID, duplicate/unsolicited READY, chunks before readiness, chunks after READY(size), or out-of-phase receipts are `unexpected_message`. Invalid offset range is malformed. No prefix hash or restart flag exists.
+
+Sender: `QUEUED → validate immutable spool → BEGIN(true) → WAIT_READY → seek(offset) → SEND_SUFFIX → END → WAIT_RECEIPT → SENT/retry/pause`. Register readiness and receipt phases separately before sending; never hold the writer while awaiting a reader-dispatched response. Each recipient has independent offset, receipt, cancellation and retry budget; shared source artifacts live until all deliveries are terminal. Logical progress may go backwards on resume.
+
+Receiver: `IDLE → BEGIN → completion/conflict/policy/checkpoint lookup → READY(offset) → RECEIVE → END → verify whole size/SHA → durable publish+receipt → ACK → IDLE`. A retained ID with different semantic metadata returns early `id_conflict,false`. Equality includes every known content field (size/hash/name/MIME/kind/created_at/source-media/order/sensitivity and `folder` if present), using existing absent/default identity semantics; it excludes `resume` and unknown fields. New bytes/metadata require a new ID. For a legacy BEGIN, send no READY, discard any incomplete matching prefix and start at zero; retained completions/conflicts retain today's drain-to-END behavior. Sensitive clipboard images remain connected-only, nonretained and sent without resume.
+
+Receiver rehashes retained prefix locally to seed the whole-file digest, then appends suffix; it must never hash only the suffix. Local checkpoint checksums may detect corruption but are not on the wire. Hash/count mismatch at END destroys the incomplete stage and checkpoint: next attempt gets zero under the same ID. Sender uses existing initial attempt plus at most **three** mismatch retries, rechecking its spool; after that pause visibly. Do not reset the budget by changing IDs. Normal network retries/eviction do not consume it. Storage errors after READY drain through END and NACK as today, unless CANCEL ends the transfer first; purge failed stages.
+
+Phase deadlines: sender waits ≤120 s for READY/early NACK; receiver has ≤90 s to reopen/rehash, otherwise discard the candidate and prepare offset zero or NACK storage failure. Receiver allows 120 s from READY to first chunk/END; thereafter existing 60 s file-progress and 120 s final-receipt deadlines apply. Keepalive stays live throughout hashing/publication; move Android work off the socket reader into a bounded, ordered file worker. Queue backpressure remains bounded. Deadline/failure mid-frame closes TLS.
+
+CANCEL is sent by the content sender for its own incoming transfer at the receiver, including a retained inactive partial from an earlier connection. At a frame boundary, fence further chunks, send CANCEL and send no END; receiver promptly cancels ongoing reopen/hash work, serializes against the publication fence, deletes matching incomplete data/catalogue, releases that slot and sends **no receipt**. Do not leave it queued behind a long hash/publication worker that has not acquired that fence. Missing/already-canceled ID is a no-op; a different active ID is unaffected. Completed/publication-committed content and receipts remain. CANCEL never retracts user files. Cancel racing commit may lose to commit. Sender consumes an already-in-flight READY/receipt for that canceled operation without changing the canceled UI state; do not reuse that ID on this connection. Do not accept arbitrary unmatched receipts. CANCEL is not a remote-erasure acknowledgment.
+
+Cancel in the middle of a frame closes the unusable lane; on the next authenticated capable connection send CANCEL for the old ID before new file work. A task-owned durable pending-cancel intent may retain ID/binding until the frame is flushed (or unpair); delivery failure can still leave a partial until TTL. Offline cancel cannot promise immediate purge. Retry after cancellation is explicit; Send again uses a fresh ID. Receiver local discard purges its own incomplete data. Other recipients continue independently.
+
+### Persistence, recovery and errors
+
+Persist a partial catalogue keyed by exact trust binding + transfer ID: semantic metadata, anchored destination identity, private stage identities, durable contiguous offset, optional local checksum, last durable progress/expiry, generation/lease; folders also store exact manifest and mapped paths (Folder streams). Flush/fsync complete-frame bytes before committing their checkpoint. Default checkpoint after 4 MiB or 5 s of progress, plus clean disconnect if possible. Recovery truncates uncheckpointed tails; missing/short/corrupt/identity-changed storage discards that candidate and returns zero. Retained digest is recomputed; no serialized SHA implementation state. Ordinary disconnect/replaced transport preserves eligible prefixes; integrity failure, receiver discard, unpair/revoke or unsafe destination purges incomplete state. Policy disable cannot be bypassed by a retained prefix.
+
+Expire after **24 h without durable byte progress**, or detected wall-clock rollback. BEGIN/reconnect alone never renews expiry. Use monotonic clocks within a run and persist wall progress plus a last-observed wall high-water mark; rollback expires questionable partials. No extra hard-age deadline. Default inactive-byte budgets: desktop 16 GiB, Android 2 GiB; 64 partial jobs globally, 8 per peer. A folder is one job, all its stored bytes count. Apply existing free-space reserves; evict expired then least-recent-progress inactive jobs, never a live lease or completion receipt. Oversized inactive prefixes may be evicted entirely; READY(0) is always valid. Retention is best effort.
+
+Startup performs catalogue reconciliation before admission into each root: verify private/no-follow ownership and stored identities, bind to still-current trust, truncate tails, retain valid rows, remove only positively identified Pneu orphans/expired stages. Do not chmod user directories or sweep live leases. Defer inaccessible old roots; reconcile before using them. Changing save folder affects new jobs; an old job reopens its anchored root or restarts safely. Stage Drop must relinquish to durable ownership rather than unlink retained bytes. Ordinary Android resume can use an app-private seekable spool + Room checkpoint, then existing verified MediaStore publication journal; budget both copies. Do not advertise resume until recovery works.
+
+Reuse NACKs: `hash_mismatch,true` / `size_mismatch,true` (bounded mismatch budget, destroy stage); `disk_full,true`, `not_writable,true`, `storage_failed,true` (60 s ±20% retry); `unsupported_kind,false` (policy/capability/unsupported folder); `id_conflict,false` (metadata/operation namespace conflict). Early NACK is legal only for `resume:true`; it releases the slot and no END follows. Existing final NACK behavior remains for legacy or post-READY failures. No new NACK code or machine-readable free-space field is added.
+
+## Folder streams
+
+### BEGIN, manifest schema and limits
+
+BEGIN adds optional `folder:{manifest_len:integer 1..8388608}`. Folder BEGIN requires `resume:true`, `kind:"file"`, `file_name` = requested root basename, `mime:"application/vnd.pneu.folder"`; omit `source_media_id`, `hlc`, `source_device`, `sensitive`. `folder` participates in content equality. Stream bytes are **exact captured manifest JSON bytes followed by regular-file bytes in manifest array order**, with no separators/compression/archive headers. BEGIN size and SHA cover that complete concatenation. Directories contribute zero bytes. Freeze manifest bytes and all file spools before queueing; serialization is not canonicalized on retry.
+
+Manifest schema (2020-12; common strict parsing and byte/path constraints below are additionally normative):
+
+```json
+{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","required":["entries"],"properties":{"entries":{"type":"array","maxItems":10000,"items":{"oneOf":[{"type":"object","required":["path","type"],"properties":{"path":{"type":"string","minLength":1},"type":{"const":"directory"}},"not":{"anyOf":[{"required":["size"]},{"required":["sha256"]}]}},{"type":"object","required":["path","type","size","sha256"],"properties":{"path":{"type":"string","minLength":1},"type":{"const":"file"},"size":{"type":"integer","minimum":0,"maximum":68719476736},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}}]}}}}
+```
+
+Unknown fields are ignored but count in manifest length; duplicate known fields, nulls, bad types and integer tokens reject. Files require size/hash; directories omit both.
+
+Parse the manifest as a stream: reject the 10,001st entry before deserializing it and consume unknown members without constructing their value trees. Every value, including unknown values and scalars, has JSON depth at most **64**: the root object has depth 1; each object member value or array element has its parent's depth plus 1. Member names do not add depth; empty containers still have their own depth. Thus a scalar inside 62 nested arrays in an unknown root member is at depth 64 and is allowed; one further array is rejected. All bytes must be valid UTF-8 JSON, and every string and member name, including discarded unknown members, must contain valid Unicode scalar values (escaped lone surrogates such as `\ud800` are invalid). Unknown null values are allowed; the null prohibition applies to known fields.
+
+Root is implicit. Every non-root ancestor directory appears exactly once **before** its descendants; exact wire paths are unique and a file cannot be an ancestor. `entries:[]` is valid (empty root); empty files have size 0 and empty SHA. No per-entry transfer IDs, MIME, receipt, timestamps or skip markers.
+
+Ceilings: 10,000 files+directories; depth ≤32 components; path ≤4,096 UTF-8 bytes; each component 1..255 bytes; exact encoded manifest ≤8,388,608 bytes. Let M=`manifest_len`, T=sum(file sizes), using checked addition: **BEGIN.size = M+T ≤MAX** (so content T≤MAX−M). This preserves the existing 64-GiB stream limit. Enforce M≤BEGIN.size before allocation; bound parse memory/count/depth independently. Before manifest completion receiver can only preflight declared stream size/free space, not validate the tree. There is no second READY/manifest ACK. Invalid manifest/path/limit → drain remaining stream, NACK `unsupported_kind,false` at END, purge; storage/capacity refusal uses existing storage NACK. Never allocate from an unchecked length or let malformed file-data framing bypass checks.
+
+### Capture, paths and collision mapping
+
+Reject structural escape before mapping: leading/trailing `/`, empty components, `.`/`..`, any backslash/NUL, absolute/drive/UNC/device-prefix paths and drive-shaped components such as `C:`. Never percent-decode. Root uses existing basename validation. Map a reserved save-root control name (including `.pneu-staging`) to a safe root; that spelling inside the private tree is ordinary data. After structural validation apply existing per-platform basename mapping (Windows devices/ADS/forbidden characters/trailing dots/spaces, Unix ordinary names). Never open raw peer path strings as authority.
+
+At manifest acceptance, calculate and persist **one complete entry-index → local relative path map**. In manifest order, within each mapped parent, keep a free mapped basename or add ` (2)`, ` (3)`, … before a file extension (directories: after entire name), scalar-safe truncating the stem to the component limit. Compare using actual destination case/normalization equivalence; descendants follow their ancestor's chosen mapping. Number until unique, including names that already contain suffixes. Valid mapped-name collisions never reject the folder or overwrite a sibling. Persist mapping before creating children; reuse on resume, never recompute against a partial tree. A platform path-length/representation limit still produces `unsupported_kind`; suffixing cannot make every structurally valid path representable.
+
+Capture via anchored no-follow filesystem handles; check opened identities and parent identities against enumeration, including Windows reparse/junction swaps. Skip symlinks, reparse points, special files and multiply-linked regular files rather than following them. Skip unreadable/disappeared/changed files **during capture**, report count + bounded local names/reasons to sender UI, and exclude them from the final manifest. Failed directory enumeration skips that subtree with a local diagnostic; don't claim an unknown descendant count. Directory/root identity replacement invalidates the affected capture; if the root cannot be safely captured, fail the send. Pre/post file identity/size/mtime checks are race evidence, not content identity; hash the captured bytes. SAF tree sending uses provider identities/names and bounded/cancelable reads; it may hash in place during Preparing, then must fail clearly if the source changes; never follow provider display names as host paths. It is a captured set, not a point-in-time backup.
+
+All skipping ends before manifest/hash/ID freeze. A later spool failure pauses/fails that delivery; no midstream omission or changed metadata under the same ID. Local skip counts/details are not on wire; receiver reports what the manifest actually contains. An empty surviving manifest is valid on wire even if UX declines an empty selection.
+
+### Stream offsets and receiver tree
+
+Let regular files, in manifest order, be f0…fn−1, with size si and start Bi=M+Σ(j<i)sj. Offset q<M resumes exact manifest bytes at q; do not create children until all M bytes parse/validate. Offset q≥M covers the first q−M content bytes: files with Bi+si≤q are complete, the first file with Bi≤q<Bi+si resumes at local offset q−Bi, all later files start at zero. Zero-size files consume no stream bytes and are created from the accepted manifest. q=M starts content; q=BEGIN.size requires only END, including empty trees. Chunks can cross M or any file boundary; split them locally without changing their binary offset. If a checkpoint lies inside the manifest, retain those exact bytes separately.
+
+Receiver: `BEGIN → READY(checkpoint) → accumulate/validate manifest → persist mapping → create private tree → route contiguous stream ranges → END → verify stream + every file + exact tree → publish → one durable receipt/ACK`. A manifest invalidity/storage failure after READY enters existing bounded drain mode. On checkpoint, fsync every affected file and directory plus exact manifest bytes before committing q; no checkpoint may claim uncreated directory/empty-file entries. Recovery validates all identities, truncates the file intersecting q and resets later file data to zero while retaining/recreating the exact declared directory/empty-file structure; rehashes exact manifest plus the stored content prefix in order. Missing/checksum-bad pieces invalidate the **whole** checkpoint: purge the tree and resume at zero. No per-child receipt or recovery inventory exists.
+
+Create the staging root privately on the destination filesystem under anchored `.pneu-staging`, with no-follow component traversal, exclusive child creation and identity validation on reopen. Create manifest-declared directories/zero-byte files; refuse unexpected tree entries or identity/type swaps. Whole-stream SHA and each entry SHA must match before publication (empty files too); a per-entry mismatch is `hash_mismatch` for the whole transfer. EOF/truncated stream is not an END or a success. CANCEL/eviction discards the whole job, never selected children.
+
+### Publication, receipts and replay
+
+Desktop: fsync files and tree directories; recheck binding/policy/root under the publication fence; publish the **one root** by anchored atomic rename-no-replace; sync destination parent; persist the ordinary verified completion receipt and path; ACK the transfer ID. Never merge with, replace or delete an existing root. Use original mapped root if free, otherwise `name (2)`, `name (3)`, …; choose safely against final-rename races, preserving component/path limits. Root suffix may change at publication if another job wins; internal mapping stays fixed. Require actual directory no-replace primitives on Linux/macOS/Windows/filesystem; cross-device copy is not atomic publication.
+
+A crash before publish exposes no partial desktop folder. Preserve the current narrow rename-before-receipt trade-off: crash after rename but before receipt may leave a complete root and replay may create a second complete root. Never delete uncertain user-visible folders to repair it. A durable completion returns READY(size) → END → deduplicated ACK with no second folder or notices, independent of later user edits/deletion. One folder uses one transfer slot, retention job, receipt and Recent/notification entry; no child success UI. Sender uses the resumable machine once for the whole stream and retains its frozen artifacts per recipient.
+
+Legacy boundary: if current authenticated receiver lacks `folder_v1`, send **no folder BEGIN or bytes**, even if it has `files`/resume; show “{device} needs a Pneu update”. Never fall back to a disguised ordinary file or loose child sends. Mixed recipients have independent capability failures.
+
+### Android receive capability gate
+
+Android sending via SAF is supported independently of receive advertisement. **Default until evidence exists: do not advertise `folder_v1`; send-only in v1.** Do not substitute v1's app-owned ReceivedFolders destination for the decided public Download destination.
+
+Advertise only on a supported configuration after an API-34 device test demonstrates the intended MediaStore backend can: create owned pending rows under `Download/Pneu/{mapped root}/…`; reopen `rw`, seek and truncate across process death (including shortening a partially written last file); preserve bytes and identities; create/preserve a genuinely empty root and nested empty directories with no placeholder user files; honor mapped sibling/root collision reservations without merging another user's folder; and recover publication after process death. Test with normal app grants, no broad storage permission, `_data` writes, adb-created directories or privileged path bypass. Record device/build/provider/test evidence; API number or successful ordinary file receipt alone is insufficient. If required behavior fails or is unproven, Android does **not** advertise the capability in v1.
+
+Passing branch: persist manifest, map, per-entry owned URIs/identities and contiguous checkpoint in Room; hold bytes in pending rows as the private receive set (manifest privately stored); implement the same seek/truncate/routing/hash rules. Keep every file pending until **all** stream/entry verification succeeds. Durably journal a single verified folder plus the exact publication set, then flip pending rows, finish directory materialization as proven by the test, and commit the one folder receipt only after every entry is published. Recovery queries the exact URIs and finishes that verified publication set idempotently; never recaptures/reallocates roots after publication began. Unknown or replaced URIs stop recovery with a visible storage failure. Cancel/revoke before verified publication purges owned pending data; once any row is public preserve public content and recover conservatively. Retention cleanup must never delete published rows. Reserve root naming without replacement/merge and include pending roots in collision allocation; if the backend cannot do so, use the no-advertisement branch.
+
+**Platform limit:** MediaStore pending-row flips are not an atomic root rename.
+All bytes are verified before any row becomes public; a crash during publication
+may expose a verified, incompletely published set until recovery finishes it.
+Seek/truncate/empty-directory tests do not prove multi-row atomicity.
+
+## Phone battery and ringing
+
+### Battery
+
+Phone global Show battery level defaults **on**. No per-computer permission/sync switch. `BATTERY_STATE {level,charging}` is a sample; `{}` clears for disabled/unavailable (one optional alone is malformed). `charging` means charging or full on external power. Send fresh on eligible READY, level/charging changes and every 5 min; coalesce samples (≤1/s). Off, unavailable or pause sends clear to connected capable computers; no timestamp field or persistent sample. Machine: phone `OFF/UNAVAILABLE ↔ SAMPLED → send latest to eligible READY`; computer `EMPTY → SAMPLE → replace/clear → EMPTY on disconnect/unpair`. Store only RAM per authenticated phone/session; clear immediately on disconnect, also expire locally after 10 min without sample. Reconnect sends fresh state, never restores disk state. Invalid payload → fatal malformed; OS sample failure → clear. No ACK, queued retries or new failure code.
+
+### Ring
+
+Allow ringing is one phone-global switch, default **on**. Phone HELLO includes `ring_v1` only while it is on. Computer support advertisement is independent of the phone's preference. Re-advertise capability changes by orderly reconnect, never a second HELLO; turning off first stops audio, sends false to negotiated computers and suppresses in-flight starts immediately. Until that reconnect, an otherwise valid command denied by local off/pause receives current false state; it never grants permission or launches a system grant dialog.
+
+Computer: `UNKNOWN/OFF → current RING_STATE → IDLE/RINGING`; user start/stop writes one RING, never queues/retries it across disconnect. Phone: `IDLE + start → RINGING(deadline=now+30s)`; `RINGING + start → reset deadline=now+30s`; `stop from any capable paired computer / tap in Pneu's ringing surface or notification Stop / screen off / timeout / disable / pause / revoke / service stop → IDLE`. No owner, request IDs, result/status codes, duration field or outcome cache. Broadcast RING_STATE on each actual change, and a current snapshot on eligible READY; a same-state command returns current state to its sender (no extra result type). Any computer can stop; all connected negotiated computers see state. A disconnecting computer clears its own display; phone's global ring continues to its fixed deadline unless another stop condition occurs. After 5 s without a useful state response UI may say “{phone} didn't respond”; state is observation, not proof that a particular command succeeded.
+
+Use alarm stream at maximum alarm volume while ringing; snapshot previous alarm volume once before the first increase, **do not resnapshot on repeated start**, and restore it on every exit. Phone owns a monotonic 30-s deadline and bounded service/audio/wake resources. Persist only a minimal volume-restoration journal before changing shared volume, clear after restore; on process/service restart perform restoration and remain IDLE (never replay a start). Audio/service failure stops/releases/restores and sends `ringing:false`; no refusal reason exists. DND total silence is not handled in v1. Do not add DND access. Process death stops audio; restoration after abrupt death happens when Pneu restarts, not by a nonexistent post-crash finally block.
+
+Phone-local stopping means a tap on Pneu's ringing screen, the notification's
+Stop action, or the power button's screen-off broadcast. Pneu does not intercept
+touches in other apps. Any connected capable computer may stop it, and the 30 s
+timeout always applies.
+
+## Phone notification mirroring
+
+### Exact payload and consent
+
+`NOTIFICATION_EVENT` actions:
+
+| Action | Required fields | Optional fields |
+|---|---|---|
+| `clear` | `action:"clear"` | none |
+| `remove` | `action:"remove"`, `key:Id` | none |
+| `upsert` | `action:"upsert"`, `key:Id`, `app_package:string 1..255`, `app_label:string 1..128`, `time:Timestamp` | `title:string 0..1024`, `text:string 0..8192`, `icon_png:string` |
+
+A key is random 128-bit CSPRNG per notification **per connection/recipient**, RAM mapping from local Android key; stable across that connection's updates/removal, fresh on reconnect. Never transmit raw Android keys/tags/account identifiers. TCP order plus current session ownership supplies ordering; no stream IDs, sequence fields or HMAC. Missing title/text is intentional app-name-only content, not an error. Only-show-app-names omits **both**; no hidden/sensitive wire flag is needed. Never send VISIBILITY_SECRET (remove an earlier mirror if it becomes secret). Otherwise send selected apps' available content: per-app opt-in supplies consent; don't suppress VISIBILITY_PRIVATE solely for that classification. Honor OS redaction as given; never recover redacted text from another source. No replies/actions/intents/deep links/attachments or dismiss request.
+
+Optional `icon_png` is lowercase hex encoding of a sanitized static PNG, 1..8,192 decoded bytes, ≤64×64 pixels, ≤16,384 decoded RGBA bytes; no URI/path/resource lookup. Send on the first upsert for that app per connection, cache thereafter (clear resets active notices, not app icon cache). Invalid bounded PNG may fall back to generic icon; wrong type/nonhex/oversize field is malformed. Bound icon cache to 128 apps/1 MiB per connection; once full omit new icons/use generic, without resending icons. Text is plain, trim to a paragraph; escape platform markup. Total escaped JSON still ≤65,536 bytes: drop icon then scalar-safe truncate text/title. No generic base64 layer.
+
+Persist **only phone-local** master (off), per-computer binding selection and per-app/profile allow list (empty). During explicit notification setup, preselect currently paired computers and show the user that selection; user can change it. Computers paired later start unselected. Actual emission needs master + selected current computer + selected app + OS listener access + remote capability + allowed profile + not paused. OS access alone is not consent. Computer cannot enable access with any message or PEER_SETTINGS edit; setup introductions/replacement never copy notification grants. No battery/ring grant is copied either (both have global settings). Master off retains local choices; unpair deletes that binding's selection.
+
+Exclude Pneu's own notices, ongoing/foreground-service notifications, group summaries and silent/minimized events; eligible posts/alerting updates use current app content. No lock-screen-private filter from other UI wording overrides the decided app consent. Recheck all eligibility at frame emission; revoke queued content before cleanup. App opt-out emits removes for its mirrored keys; master/computer/listener disable emits clear and stops upserts. Cleanup contains no content and remains legal after opt-out. A partially started frame may finish or force connection close; no new content frame starts after revoke commits.
+
+### Machines, bounds, recovery and failures
+
+Phone per computer: `DISALLOWED → AUTHORIZED_READY → clear → current eligible active snapshot → LIVE latest-per-key upsert/remove → clear/close`. Current snapshot is not offline history. One actor serializes snapshot/listener deltas, rechecks a key is still active before emission and coalesces intermediate updates, preventing snapshot resurrection after remove. At most 128 active and 128 pending keys per computer; select newest 128 by time (tie: local key ordering), remove an evicted key before adding its replacement. Overflow discards stale pending data and schedules one clear+current snapshot; coalesce further changes instead of unbounded rebuilds. ≤10 events/s, burst 20 per recipient and globally, fair scheduling; prioritize clear/removes/keepalive. No disk payload queue.
+
+Computer: `EMPTY → clear → LIVE(key→OS handle) → upsert replace/remove → EMPTY on clear/disconnect/unpair`. First event on a connection must be clear; remove missing key is a no-op. Same-key upsert replaces regardless of `time` (display only). Limit 128 active handles per phone and bounded OS dispatch; reject a violating stream with unexpected_message rather than allocate indefinitely. Old-session callbacks cannot remove/post new-session notices. No OS grant/post failure: drop locally, expose local diagnostic, keep ordinary file transport alive; no ACK/replay. A local desktop dismissal never signals the phone; an updated phone post may show again.
+
+Keys/content/icon caches and OS handles are RAM only. Disconnect/revoke clears that phone's active OS notices and RAM; restart clears the dedicated mirror notification group, waits for fresh clear/snapshot. No titles/bodies/icons/keys in Pneu SQL, Recent/history, logs or telemetry. The OS notification center may retain already-posted content after a process crash; this is not remote-erasure proof. Keep mirror grouping separate from Pneu transfer/pairing notices. Battery/ring also remain independent of file receipts/outbox.
+
+## Local reinstall replacement
+
+No new message, capability or pairing exception. The trusted confirming device, after **fresh normal pairing succeeds**, finds a different paired entry with same authenticated role and normalized name (Unicode case-insensitive, trimmed whitespace) that is not connected. If multiple candidates, offer the most recently seen, deterministic ID tie-break. Name ranks a suggestion only. Pair Again from that exact old entry implies Replace only if the new pairing still meets the same-role/name/offline checks; otherwise normal pairing completes and no silent removal occurs. A name match alone never authorizes removal. Never change pins or treat a reinstall as the old binding.
+
+Local machine: `NEW_PAIR_COMMITTED → candidate → OFFER/explicit Pair Again choice → revalidate exact old/new pins, generations, role, name, old offline → existing remove transaction + local ordinary switch edits → DONE`. Decline/esc keeps both, including the successful new pairing; persist a local suppression for that exact pair so reconnect/restart doesn't reprompt. Failure leaves the new pairing intact and reports replacement incomplete. Do not hold the pairing handshake across a prompt, merge setup IDs or bypass member capacity/removal barriers. If the old entry comes online or changes identity before commit, abort the implied choice/re-evaluate; never silently remove the now-online device.
+
+Use existing setup-wide removal when scoped, otherwise existing direct unpair. Copy the confirming device's applicable **ordinary** pair-switch values (both clipboard directions and phone→computer automatic photos) as local edits for the new endpoint IDs, allocating fresh ordinary HLCs/writer IDs. Do not copy old register keys/stamps blindly or modify PEER_SETTINGS schema. New pairing defaults remain until the local edits commit; serialize with bootstrap/policy emission to avoid a temporary default-on send. Other members learn existing MEMBERS removal/ordinary settings under existing authority, not a portable replacement attestation. No promise of immediate partition-wide revocation.
+
+Persist a small **local UI operation intent** containing exact old/new bindings, selected ordinary values and phase before removal. Make removal+settings edits one store transaction where possible; across Android stores use existing binding/reset journal with idempotent phases. Recovery finishes the captured authorized edits/removal or reports incomplete if authority changed; never picks a new candidate on recovery. No wire request/result or replacement outcome table. A crash cannot authorize a different old identity. Declined intent/suppression lives only while these exact entries exist; completed intent can be deleted once edits/reset cleanup are durable.
+
+Cancel old binding's outgoing deliveries visibly and keep them resendable via Send again to a newly chosen recipient with new IDs. Do not migrate deliveries, receipt records, resume stages, clipboard data, notification grants or source-media mappings to the new installation. Purge old incomplete receive jobs and fence active workers through ordinary remove/reset paths; preserve other recipients/shared artifacts and already received user files. The remote old installation's unsent queue cannot be erased. Local storage failures use existing UI errors; remote MEMBERS/PEER_SETTINGS errors remain their existing `storage_failed`/`id_conflict`/`unsupported_kind` NACKs. There is no replacement-specific failure code.
+
 ## Transfer and delivery state machines
 
 For mesh, the originator freezes the selected recipient set when creating the
@@ -1527,7 +1761,7 @@ It may hash while preparing the queue but must know size/SHA-256 before BEGIN.
 Changing bytes (including compression), filename, kind, timestamps or other
 metadata is a new logical transfer with a new ID. Retrying preserves everything.
 
-**Sender:** QUEUED → FILE_BEGIN → contiguous FILE_CHUNK frames → FILE_END →
+**Legacy sender:** QUEUED → FILE_BEGIN → contiguous FILE_CHUNK frames → FILE_END →
 WAIT_RECEIPT → ACK removes queue entry; NACK retains/marks it as specified below.
 Empty files go directly BEGIN → END with SHA-256 of empty bytes. ACK/NACK may be
 sent for CLIPBOARD immediately; for files they are sent only after END, so the
@@ -1535,7 +1769,7 @@ sender can pipeline chunks without a per-chunk RTT. Matching ACK/NACK can
 interleave with reverse-direction traffic. An unsolicited receipt (no matching
 pending operation on that connection) is fatal `unexpected_message`.
 
-**Receiver:** IDLE → BEGIN (reserve slot, inspect dedupe/policy) → RECEIVING or
+**Legacy receiver:** IDLE → BEGIN (reserve slot, inspect dedupe/policy) → RECEIVING or
 DRAINING → END → VERIFY → COMMIT → ACK/NACK → IDLE. Hash incrementally and write
 to an owner-only temporary file in the destination filesystem. Check declared
 size, final count and digest while receiving, so FILE_END processing does not
@@ -1546,16 +1780,20 @@ receipt and metadata in one durable database transaction, then ACK. Completion
 receipt commits MUST survive crashes and power loss before ACK. On save error,
 delete staging and NACK; never keep staging for recovery. Staging lives in a
 private disposable `.pneu-staging` directory per destination folder. Persist the
-list of ever-used staging folders before creating a stage and wipe those staging
-directories at startup, independently of the current save configuration. Cleanup
+list of ever-used staging folders before creating a stage. For legacy transfers, wipe
+disposable staging at startup, independently of the current save configuration;
+for opted-in resumable transfers, reconcile and retain eligible catalogue-owned
+stages as specified under Resumable transfers and CANCEL. Cleanup
 of unavailable/read-only historical folders is best-effort: log and defer errors,
 retry on first use or a later startup, and do not block daemon startup. Before admitting a new transfer to
 a deferred folder, cleanup MUST succeed; never sweep a root holding live stages.
 Cleanup MUST NOT chmod existing directories. A save path change affects new transfers only; existing transfers retain their folder
 handles and configuration. Never chmod a user-selected folder.
 
-There are no rollback intents, persisted inode identities, or recovery of placed
-files. **Accepted trade-off:** a crash (or receipt persistence failure) in the
+The legacy transfer flow has no rollback intents, persisted inode identities, or
+recovery of placed files. Resumable transfers persist private stage/root identities
+as required by their catalogue; this does not authorize deleting uncertain placed
+user files. **Accepted trade-off:** a crash (or receipt persistence failure) in the
 short window between rename and receipt commit can leave a visible file without
 a receipt; replay can create a second visible copy. Never delete an uncertain
 user file to repair this window. An ACK still means file placement and receipt
@@ -1601,11 +1839,12 @@ logical transfer mapping to avoid enqueueing the same MediaStore event twice.
 The authoritative receiver key is always `(device_id, transfer_id)`; neither
 media IDs nor SHA alone collapse intentional sends of the same content.
 
-**Disconnect at any stage:** close the stream, delete incomplete staging files,
-retain completed dedupe records, release active slots. Sender retains unACKed
-operations and retries the entire file from offset zero on the new connection;
-there is no resume query/offset negotiation. A lost ACK yields a complete replay
-and deduplicated ACK. Serialize file placement/receipt transactions against
+**Disconnect at any stage:** close the stream and release active slots. Legacy
+transfers delete incomplete staging and retry from zero. Opted-in resumable
+transfers relinquish eligible private stages to the durable catalogue described
+above. Keep completed dedupe records. A lost ACK produces READY(size) for a
+retained resumable completion, then END and deduplicated ACK; legacy replay still
+drains the complete stream before its receipt. Serialize file placement/receipt transactions against
 unpair and other commits so revoked work cannot write into a replacement pairing.
 Obsolete connections cannot publish progress, status or desktop actions.
 
@@ -1652,6 +1891,13 @@ The acceptor closes after **180 s without any valid received frame**. This gives
 phones about one wakeup per minute and tolerates scheduling jitter; actual
 Samsung background/Doze behavior still requires device testing.
 
+Resumable sender waits at most 120 s for READY or early NACK. Receiver has
+at most 90 s to reopen/rehash before restarting at zero or refusing storage, then
+allows 120 s after READY for first chunk/END. Early NACK is legal only for
+`resume:true`; it releases the slot with no END. Post-READY failures retain the
+normal drain-to-END rule. Battery/ring/notifications have no receipts or durable
+queue. All these deadlines use monotonic clocks and leave keepalive live.
+
 File sender has a 60 s write-progress timeout; receiver has a 60 s timeout between
 BEGIN/chunks/END (keepalives do not extend file progress). After END/text, sender
 waits at most 120 s for receipt. Receiver must produce a receipt within that
@@ -1690,6 +1936,16 @@ machine-readable. ERROR has no receipt and always closes the connection.
 | `closing` | Deliberate normal shutdown/unpairing; retain sender queue |
 
 ## Security and implementation notes
+
+Folder sinks use anchored private trees, no-follow handles, persisted collision
+maps and no-replace root publication. Android receive support requires the actual
+MediaStore gate above and has the documented non-atomic publication boundary.
+Phone notification access comes only from phone-local consent and OS access;
+remote parser capability never grants it. CANCEL cannot erase a committed user
+file or prove purge while offline; setup removals cannot promise immediate
+partition-wide revocation. All asynchronous work captures device ID, fingerprint,
+binding generation and connection generation, rechecked before admission,
+first-frame emission and commit. Stale work must not affect a newer session.
 
 Authenticate before creating files or applying clipboard content. Treat names,
 MIME, timestamps, DNS/mDNS, source IDs and diagnostics as untrusted. MIME is a hint,

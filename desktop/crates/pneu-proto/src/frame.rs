@@ -16,7 +16,7 @@ fn check_type_and_size(type_id: u8, payload_len: usize) -> Result<()> {
                 return Err(ProtocolError::InvalidLength(payload_len + 1));
             }
         }
-        0x01..=0x07 | 0x10 | 0x12..=0x14 | 0x20..=0x22 | 0x7f => {
+        0x01..=0x07 | 0x10 | 0x12..=0x16 | 0x20..=0x22 | 0x30..=0x33 | 0x7f => {
             if payload_len > MAX_CONTROL_PAYLOAD {
                 return Err(ProtocolError::InvalidLength(payload_len + 1));
             }
@@ -61,6 +61,12 @@ fn decode_payload(type_id: u8, payload: &[u8]) -> Result<Message> {
         0x20 => Message::Clipboard(serde_json::from_slice(payload)?),
         0x21 => Message::PeerSettings(serde_json::from_slice(payload)?),
         0x22 => Message::Members(serde_json::from_slice(payload)?),
+        0x15 => Message::FileReady(serde_json::from_slice(payload)?),
+        0x16 => Message::Cancel(serde_json::from_slice(payload)?),
+        0x30 => Message::BatteryState(serde_json::from_slice(payload)?),
+        0x31 => Message::Ring(serde_json::from_slice(payload)?),
+        0x32 => Message::RingState(serde_json::from_slice(payload)?),
+        0x33 => Message::NotificationEvent(serde_json::from_slice(payload)?),
         0x7f => Message::Error(serde_json::from_slice(payload)?),
         other => return Err(ProtocolError::UnknownType(other)),
     };
@@ -110,6 +116,12 @@ pub fn encode_frame(message: &Message) -> Result<Vec<u8>> {
         Message::Clipboard(m) => serde_json::to_vec(m)?,
         Message::PeerSettings(m) => serde_json::to_vec(m)?,
         Message::Members(m) => serde_json::to_vec(m)?,
+        Message::FileReady(m) => serde_json::to_vec(m)?,
+        Message::Cancel(m) => serde_json::to_vec(m)?,
+        Message::BatteryState(m) => serde_json::to_vec(m)?,
+        Message::Ring(m) => serde_json::to_vec(m)?,
+        Message::RingState(m) => serde_json::to_vec(m)?,
+        Message::NotificationEvent(m) => serde_json::to_vec(m)?,
         Message::Error(m) => serde_json::to_vec(m)?,
     };
     let type_id = message.type_id();

@@ -357,6 +357,8 @@ fn assert_simulator_rejection(error: &anyhow::Error) {
 
 fn metadata(id: Id, bytes: &[u8]) -> FileBegin {
     FileBegin {
+        resume: None,
+        folder: None,
         sensitive: false,
         hlc: None,
         source_device: None,
@@ -4814,6 +4816,8 @@ async fn peer_settings_receiver_rejects_disabled_text_and_drains_automatic_media
     .await?;
     let bytes = b"not saved";
     let begin = FileBegin {
+        resume: None,
+        folder: None,
         sensitive: false,
         transfer_id: Id::from_bytes(rand::random()),
         file_name: "photo.png".into(),
@@ -5039,6 +5043,8 @@ async fn duplicate_mesh_replacement_preserves_image_frames_and_completed_deferre
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let bytes = b"\x89PNG\r\n\x1a\nincoming";
     let image = FileBegin {
+        resume: None,
+        folder: None,
         sensitive: false,
         transfer_id: Id::from_bytes(rand::random()),
         file_name: "clipboard.png".into(),
@@ -5188,6 +5194,8 @@ async fn peer_settings_disable_revalidates_already_prepared_clipboard_image_at_e
     let local = h.core.identity.device_id.clone();
     let bytes = b"\x89PNG\r\n\x1a\nclipboard image";
     let image = FileBegin {
+        resume: None,
+        folder: None,
         sensitive: false,
         transfer_id: Id::from_bytes(rand::random()),
         file_name: "clipboard.png".into(),

@@ -1417,7 +1417,10 @@ impl Store {
                 if let Some((meta, _)) =
                     receipt_row(tx, device.as_str(), begin.transfer_id.as_str())?
                 {
-                    ensure!(meta == Metadata::File(begin.clone()), ReceiptConflict);
+                    ensure!(
+                        matches!(&meta, Metadata::File(retained) if retained.content_eq(&begin)),
+                        ReceiptConflict
+                    );
                     return Ok(false);
                 }
                 validate_failed_file(tx, &device, &begin)?;
@@ -1496,7 +1499,7 @@ impl Store {
             let key = (device.clone(), begin.transfer_id.clone());
             let result = store.peer_write(epoch, |tx| {
                 if let Some((meta, _)) = receipt_row(tx, device.as_str(), begin.transfer_id.as_str())? {
-                    ensure!(meta == Metadata::File(begin.clone()), ReceiptConflict);
+                    ensure!(matches!(&meta, Metadata::File(retained) if retained.content_eq(&begin)), ReceiptConflict);
                     return Ok(false);
                 }
                 validate_failed_file(tx, &device, &begin)?;
@@ -1782,7 +1785,10 @@ fn failed_file(
 }
 fn validate_failed_file(c: &Connection, device: &Id, begin: &FileBegin) -> Result<()> {
     if let Some((meta, _)) = failed_file(c, device, begin)? {
-        ensure!(meta == Metadata::File(begin.clone()), ReceiptConflict);
+        ensure!(
+            matches!(&meta, Metadata::File(retained) if retained.content_eq(begin)),
+            ReceiptConflict
+        );
     }
     Ok(())
 }
@@ -2082,6 +2088,8 @@ mod tests {
     }
     fn begin(bytes: &[u8]) -> FileBegin {
         FileBegin {
+            resume: None,
+            folder: None,
             sensitive: false,
             hlc: None,
             source_device: None,
@@ -3568,6 +3576,17 @@ mod tests {
                 .count(),
             1
         );
+        for resume in [Some(false), Some(true)] {
+            let mut replay = meta.clone();
+            replay.resume = resume;
+            let staged = stage(&store, path.clone(), bytes).await?;
+            assert!(
+                !store
+                    .commit_file(device.clone(), VerifiedFile::fixture(replay), staged)
+                    .await?,
+                "transport-only changes must reuse the receipt"
+            );
+        }
         let mut conflicting = text(1);
         conflicting.transfer_id = meta.transfer_id;
         assert_eq!(

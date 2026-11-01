@@ -2733,6 +2733,8 @@ mod tests {
             assert_eq!(&*startup_id.lock().unwrap(), token.unwrap_or_default());
         }
         let metadata = pneu_proto::FileBegin {
+            resume: None,
+            folder: None,
             sensitive: false,
             hlc: None,
             source_device: None,

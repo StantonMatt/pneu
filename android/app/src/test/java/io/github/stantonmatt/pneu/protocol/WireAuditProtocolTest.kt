@@ -41,8 +41,9 @@ class WireAuditProtocolTest {
                     val optional = !isNested && when (type) {
                         Type.HELLO -> field in setOf("paused", "role", "addresses")
                         Type.PAIR_RESULT, Type.NACK, Type.ERROR -> field == "message"
-                        Type.FILE_BEGIN -> field == "source_media_id"
-                        Type.CLIPBOARD -> field == "origin"
+                        Type.FILE_BEGIN -> field in setOf("source_media_id","sensitive","folder") || (field=="resume" && !payload.has("folder"))
+                        Type.NOTIFICATION_EVENT -> field in setOf("title","text","icon_png")
+                        Type.CLIPBOARD -> field in setOf("origin","sensitive")
                         else -> false
                     }
                     val missing = obj.deepCopy().apply { remove(field) }
@@ -70,10 +71,13 @@ class WireAuditProtocolTest {
             Type.HELLO to "version device_id name capabilities paused role addresses",
             Type.PAIR_REQUEST to "token", Type.PAIR_RESULT to "accepted code message",
             Type.PING to "nonce", Type.PONG to "nonce", Type.STATUS to "paused",
-            Type.FILE_BEGIN to "transfer_id file_name mime size sha256 kind created_at source_media_id hlc source_device",
+            Type.FILE_BEGIN to "transfer_id file_name mime size sha256 kind created_at source_media_id hlc source_device sensitive resume folder",
             Type.FILE_END to "transfer_id", Type.ACK to "transfer_id deduplicated",
             Type.NACK to "transfer_id code retryable message",
-            Type.CLIPBOARD to "transfer_id text created_at origin hlc source_device",
+            Type.CLIPBOARD to "transfer_id text created_at origin hlc source_device sensitive",
+            Type.FILE_READY to "transfer_id offset", Type.CANCEL to "transfer_id",
+            Type.BATTERY_STATE to "level charging", Type.RING to "action", Type.RING_STATE to "ringing",
+            Type.NOTIFICATION_EVENT to "action key app_package app_label time title text icon_png",
             Type.PEER_SETTINGS to "transfer_id settings", Type.ERROR to "code message supported_version"
         )
         for ((type, fields) in expected) assertEquals(type.label, fields.split(' ').toSet(), covered[type])
@@ -136,10 +140,14 @@ class WireAuditProtocolTest {
                     if (digits != null) for (bad in listOf("a".repeat(digits - 1), "a".repeat(digits + 1), "A".repeat(digits), "g".repeat(digits))) text(bad, false)
                     val bounds = when (field) {
                         "name" -> 1 to 128
-                        "file_name", "mime" -> 1 to 255
+                        "file_name" -> 1 to 255
+                        "mime" -> if(!payload.has("folder")) 1 to 255 else null
+                        "app_package" -> 1 to 255
+                        "app_label" -> 1 to 128
+                        "title" -> 0 to 1024
                         "source_media_id" -> 1 to 256
                         "message" -> 0 to 512
-                        "text" -> 0 to 16384
+                        "text" -> 0 to (if(type==Type.NOTIFICATION_EVENT)8192 else 16384)
                         else -> null
                     }
                     if (bounds != null) {

@@ -367,7 +367,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
         val localScope=attempt?.prior?.setupScope ?: attempt?.let {if(it.setupEnabled)SetupScope.ENABLED else SetupScope.DISABLED} ?: p.peer?.setupScope ?: SetupScope.ASK
         val localSetup=p.membership.hello(localScope)
         val hello=phase(ssl,10000) {
-        send(Frame.Control(Type.HELLO, json("version" to 1, "device_id" to p.deviceId, "name" to utf8Prefix(name,128).ifEmpty {"Pneu"}, "capabilities" to listOf("files","clipboard_text","clipboard_image","mesh","setup"),"role" to "phone", "paused" to p.paused).apply {add("setup",localSetup.json())}))
+        send(Frame.Control(Type.HELLO, json("version" to 1, "device_id" to p.deviceId, "name" to utf8Prefix(name,128).ifEmpty {"Pneu"}, "capabilities" to LEGACY_PHONE_CAPABILITIES,"role" to "phone", "paused" to p.paused).apply {add("setup",localSetup.json())}))
         readControl(ssl)
         }
         if (hello.type == Type.ERROR) throw RemoteError(hello.body["code"].asString)
@@ -724,6 +724,11 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
             }
         }
         suspend fun receiveFile(frame:Frame) {
+            if(frame is Frame.Control && frame.type == Type.FILE_BEGIN &&
+                (frame.body["resume"]?.asBoolean == true || frame.body.has("folder"))) {
+                send(Frame.Control(Type.ERROR,json("code" to "unexpected_message")))
+                throw RemoteError("unexpected_message")
+            }
             if(recoveryFiles.active) {
                 recoveryFile(frame)
                 if(recoveryFiles.active)receiveProgress.progress() else receiveProgress.complete()

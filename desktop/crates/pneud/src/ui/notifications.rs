@@ -259,6 +259,8 @@ mod tests {
     use super::*;
     fn metadata(kind: FileKind) -> FileBegin {
         FileBegin {
+            resume: None,
+            folder: None,
             sensitive: false,
             hlc: None,
             source_device: None,

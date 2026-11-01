@@ -280,6 +280,8 @@ impl Phone {
             hash.update(&buf[..n]);
         }
         let begin = FileBegin {
+            resume: None,
+            folder: None,
             sensitive: false,
             hlc: None,
             source_device: None,
