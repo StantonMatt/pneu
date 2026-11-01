@@ -3,6 +3,7 @@
 mod test_support;
 use anyhow::Result;
 use async_trait::async_trait;
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use pneu_proto::*;
 use pneud::{Config, Core, Paths, actions::PcActions};
 use std::{path::Path, sync::Arc, time::Duration};
@@ -118,6 +119,81 @@ async fn raw(
     };
     Ok(tls)
 }
+// Shared loopback ports can receive host HTTP/TLS probes before the intended
+// dialer. Inspect candidates concurrently so a silent probe cannot block it;
+// after selecting pneu.local, propagate handshake failures without retrying.
+async fn accept_proxy(
+    proxy: &TcpListener,
+    peer: &Core,
+) -> Result<tokio_rustls::server::TlsStream<TcpStream>> {
+    let verifier = Arc::new(pneud::tls::ClientVerifier::new(
+        Default::default(),
+        Default::default(),
+    ));
+    let config = Arc::new(pneud::tls::server_config(&peer.identity, verifier)?);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut candidates = FuturesUnordered::new();
+        loop {
+            tokio::select! {
+                accepted = proxy.accept() => {
+                    let (tcp, _) = accepted?;
+                    candidates.push(tokio_rustls::LazyConfigAcceptor::new(
+                        rustls::server::Acceptor::default(), tcp,
+                    ));
+                }
+                Some(hello) = candidates.next(), if !candidates.is_empty() => {
+                    let Ok(hello) = hello else { continue };
+                    if hello.client_hello().server_name() == Some("pneu.local") {
+                        return Ok(hello.into_stream(config.clone()).await?);
+                    }
+                }
+            }
+        }
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn proxy_accept_skips_foreign_and_stalled_connections() -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let (_da, a, _la) = core().await?;
+    let (_db, b, _lb) = core().await?;
+    let proxy = TcpListener::bind("127.0.0.1:0").await?;
+    let address = proxy.local_addr()?;
+    let mut plaintext = TcpStream::connect(address).await?;
+    plaintext.write_all(b"GET / HTTP/1.1\r\n\r\n").await?;
+    let silent = TcpStream::connect(address).await?;
+    let mut partial = TcpStream::connect(address).await?;
+    partial.write_all(&[0x16, 0x03]).await?;
+    let mut foreign = TcpStream::connect(address).await?;
+    let config = Arc::new(pneud::tls::client_config(
+        &a.identity,
+        b.identity.fingerprint.clone(),
+    )?);
+    let mut probe = rustls::ClientConnection::new(
+        config.clone(),
+        rustls::pki_types::ServerName::try_from("localhost")?,
+    )?;
+    let mut hello = Vec::new();
+    probe.write_tls(&mut hello)?;
+    foreign.write_all(&hello).await?;
+    let dialer = async {
+        let tcp = TcpStream::connect(address).await?;
+        Ok::<_, anyhow::Error>(
+            TlsConnector::from(config)
+                .connect(rustls::pki_types::ServerName::try_from("pneu.local")?, tcp)
+                .await?,
+        )
+    };
+    let (accepted, dialed) = tokio::try_join!(accept_proxy(&proxy, &b), dialer)?;
+    assert_eq!(accepted.get_ref().1.server_name(), Some("pneu.local"));
+    drop((accepted, dialed, plaintext, silent, partial, foreign));
+    a.shutdown_actions().await?;
+    b.shutdown_actions().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn lost_result_reverse_dial_keeps_recoverable_binding() -> Result<()> {
     let (_da, a, la) = core().await?;
@@ -264,15 +340,7 @@ async fn delayed_speculative_denial_preserves_completed_join() -> Result<()> {
     .await?;
     assert!(matches!(read_frame(&mut original).await?,Some(Message::PairResult(r)) if r.accepted));
     drop(original);
-    let verifier = Arc::new(pneud::tls::ClientVerifier::new(
-        Default::default(),
-        Default::default(),
-    ));
-    let config = pneud::tls::server_config(&b.identity, verifier)?;
-    let (tcp, _) = tokio::time::timeout(Duration::from_secs(5), proxy.accept()).await??;
-    let mut denied = tokio_rustls::TlsAcceptor::from(Arc::new(config))
-        .accept(tcp)
-        .await?;
+    let mut denied = accept_proxy(&proxy, &b).await?;
     assert!(matches!(
         read_frame(&mut denied).await?,
         Some(Message::Hello(_))
@@ -384,15 +452,7 @@ async fn delayed_version_error_cannot_override_inbound_recovery() -> Result<()> 
     .await?;
     assert!(matches!(read_frame(&mut original).await?,Some(Message::PairResult(r)) if r.accepted));
     drop(original);
-    let verifier = Arc::new(pneud::tls::ClientVerifier::new(
-        Default::default(),
-        Default::default(),
-    ));
-    let config = pneud::tls::server_config(&b.identity, verifier)?;
-    let (tcp, _) = tokio::time::timeout(Duration::from_secs(5), proxy.accept()).await??;
-    let mut denied = tokio_rustls::TlsAcceptor::from(Arc::new(config))
-        .accept(tcp)
-        .await?;
+    let mut denied = accept_proxy(&proxy, &b).await?;
     assert!(matches!(
         read_frame(&mut denied).await?,
         Some(Message::Hello(_))
