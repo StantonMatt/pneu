@@ -855,6 +855,17 @@ impl PcActions for DesktopActions {
             .await
             .map(|_| ())
     }
+    async fn notify_clipboard_too_large(&self) -> Result<()> {
+        self.notice(
+            crate::ui::notifications::Notice::image_too_large(),
+            Vec::new(),
+            None,
+            0,
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
     async fn notify_send_admission_failure(&self, reason: &str) -> Result<()> {
         let mut notice = crate::ui::notifications::Notice::new("Couldn't send files");
         notice.body = crate::ui::notifications::escape(reason);

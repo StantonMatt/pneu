@@ -35,6 +35,14 @@ use super::window_setup::{self as setup, Remembered, Removal, Row, Setup, Top};
 const DOWNLOAD_PAGE: &str = "https://stantonmatt.github.io/pneu/";
 const TAILSCALE_DOWNLOAD: &str = "https://tailscale.com/download";
 
+fn clipboard_send_error(error: &str, from_menu: bool) -> Option<&'static str> {
+    if error.contains("clipboard image too large") {
+        (!from_menu).then_some("Couldn't send the clipboard. The image is over 20 MB")
+    } else {
+        Some("Couldn't send the clipboard")
+    }
+}
+
 fn is_pairing_page(page: Page) -> bool {
     matches!(page, Page::Add | Page::Code | Page::Scan)
 }
@@ -351,11 +359,11 @@ impl Peer {
     pub(crate) fn connected(&self) -> bool {
         self.health.connected()
     }
-    /// v2's per-device line, without transfers ("Connected over Wi-Fi").
+    /// v2's per-device line, without transfers ("Connected over local network").
     pub(crate) fn connection(&self) -> String {
         match self.health {
             Health::Connected => match &self.route {
-                Some(route) => format!("Connected over {route}"),
+                Some(route) => format!("Connected over {}", super::route_in_sentence(route)),
                 None => "Connected".into(),
             },
             Health::Paused => "Paused on phone".into(),
@@ -378,7 +386,7 @@ impl Peer {
     pub(crate) fn receiving(&self) -> bool {
         self.receiving.is_some()
     }
-    /// Tooltip line: "Galaxy S25+ · Wi-Fi", "Office-PC · last seen 9:02 AM".
+    /// Tooltip line: "Galaxy S25+ · Local network", "Office-PC · last seen 9:02 AM".
     pub(crate) fn short(&self) -> String {
         let state = match self.health {
             Health::Connected => self.route.clone().unwrap_or_else(|| "Connected".into()),
@@ -546,19 +554,8 @@ fn summary(peers: &[Peer], transfers: &[Transfer]) -> SummaryData {
             },
         )
     } else if let [one] = peers {
-        // With exactly one device the window keeps v2's name and status.
-        let detail = if one.health == Health::Paused {
-            "Paused on phone".into()
-        } else if let Some(t) = sending {
-            format!("Sending {}…", t.file_name)
-        } else if one.receiving.is_some() {
-            "Receiving…".into()
-        } else if one.health == Health::Offline && one.last_seen != 0 {
-            format!("Not connected · last seen {}", seen(one.last_seen))
-        } else {
-            one.connection()
-        };
-        (one.name.clone(), detail)
+        let device = device_summary(one).0;
+        (device.title, device.detail)
     } else if paused {
         ("Paused".into(), "Automatic sending is off".into())
     } else if !connected.is_empty() {
@@ -674,7 +671,7 @@ fn device_summary(peer: &Peer) -> (SummaryData, &'static str) {
 }
 
 /// Switch labels describe the pair from this computer's side.
-fn device_settings(peer: &Peer, reply: &Value) -> (Vec<SettingItem>, String) {
+fn device_settings(peer: &Peer, reply: &Value, mode: ClipboardMode) -> (Vec<SettingItem>, String) {
     if peer.health.lost() {
         return (Vec::new(), String::new());
     }
@@ -709,12 +706,16 @@ fn device_settings(peer: &Peer, reply: &Value) -> (Vec<SettingItem>, String) {
                 SettingItem {
                     key: key.into(),
                     label: label.into(),
-                    sub: if s["pending"] == json!(true) && !peer.connected() {
+                    enabled: order != 0 || mode != ClipboardMode::Off,
+                    sub: if order == 0 && mode == ClipboardMode::Off {
+                        "Off for all devices in Settings".into()
+                    } else if s["pending"] == json!(true) && !peer.connected() {
                         format!("Applies when {} connects", peer.name).into()
                     } else {
                         SharedString::new()
                     },
-                    on: s["enabled"].as_bool().unwrap_or(true),
+                    on: !(order == 0 && mode == ClipboardMode::Off)
+                        && s["enabled"].as_bool().unwrap_or(true),
                 },
             ))
         })
@@ -819,11 +820,16 @@ fn recipient_details(peers: &[Peer], transfers: &[Transfer], key: &str) -> Vec<R
 /// Recent: active, waiting and failed items first, then the last three done.
 fn recent(peers: &[Peer], transfers: &[Transfer]) -> Vec<RecentItem> {
     let name = |id: &str| {
-        peers
+        let name = peers
             .iter()
             .find(|p| p.id == id)
             .map(|p| p.name.clone())
-            .unwrap_or_else(|| "a removed device".into())
+            .unwrap_or_else(|| "a removed device".into());
+        if name.chars().count() > 24 {
+            format!("{}…", name.chars().take(23).collect::<String>())
+        } else {
+            name
+        }
     };
     let mut operations: Vec<(String, Vec<&Transfer>)> = Vec::new();
     for t in transfers {
@@ -836,7 +842,6 @@ fn recent(peers: &[Peer], transfers: &[Transfer]) -> Vec<RecentItem> {
     operations.sort_by_key(|(_, list)| {
         std::cmp::Reverse(list.iter().filter_map(|t| t.finished_at).max().unwrap_or(0))
     });
-    let several = peers.len() > 1;
     let (mut open, mut done) = (Vec::new(), Vec::new());
     for (operation, list) in operations {
         let first = list[0];
@@ -889,12 +894,7 @@ fn recent(peers: &[Peer], transfers: &[Transfer]) -> Vec<RecentItem> {
             if !sending.is_empty() {
                 continue; // The sender's device row shows incoming progress.
             }
-            item.detail = with_time(if several {
-                format!("From {}", name(&first.device))
-            } else {
-                String::new()
-            })
-            .into();
+            item.detail = with_time(format!("From {}", name(&first.device))).into();
             item.can_open = first.path.is_some();
             done.push(item);
             continue;
@@ -959,8 +959,7 @@ fn recent(peers: &[Peer], transfers: &[Transfer]) -> Vec<RecentItem> {
         } else {
             let sent: Vec<_> = live.iter().filter(|t| t.state == "sent").copied().collect();
             item.detail = with_time(match sent.as_slice() {
-                _ if !several => String::new(),
-                [one] => format!("To {}", name(&one.device)),
+                [one, ..] if distinct_recipients(&sent) == 1 => format!("To {}", name(&one.device)),
                 many => format!("To {} devices", distinct_recipients(many)),
             })
             .into();
@@ -2767,15 +2766,21 @@ impl Worker {
     }
 
     async fn send_clipboard(&mut self, targets: &[contract::CapturedTarget]) {
-        self.send_request_id = None;
+        let notify_too_large = self.send_request_id.take().is_some();
         let result = async {
             let targets: crate::outbox::Targets =
                 serde_json::from_value(serde_json::to_value(targets)?)?;
-            self.command(ipc::Command::SendClipboard { targets }).await
+            self.command(ipc::Command::SendClipboard {
+                targets,
+                notify_too_large,
+            })
+            .await
         }
         .await;
-        if let Err(error) = result {
-            self.fail("Couldn't send the clipboard", error);
+        if let Err(error) = result
+            && let Some(message) = clipboard_send_error(&error.to_string(), notify_too_large)
+        {
+            self.fail(message, error);
         }
     }
 
@@ -3080,7 +3085,7 @@ impl Worker {
             ),
             "unreachable" => (
                 format!("Can't reach {name}"),
-                "Make sure both are on the same Wi-Fi, or that Tailscale is connected.".into(),
+                "Make sure both are on the same network, or that Tailscale is connected.".into(),
                 0,
                 "Cancel",
                 "Try Again",
@@ -4111,7 +4116,7 @@ impl Worker {
                         .peer_settings
                         .as_ref()
                         .filter(|(id, _, _)| *id == peer.id)
-                        .map(|(_, reply, _)| device_settings(peer, reply))
+                        .map(|(_, reply, _)| device_settings(peer, reply, mode))
                         .unwrap_or_default();
                     if introduced
                         && self.setup.link(&peer.id).is_some_and(|l| !l.hello_seen)
@@ -4613,7 +4618,7 @@ mod tests {
             state: state.into(),
             last_seen,
             dialer: None,
-            route: (state == "connected").then(|| "Wi-Fi".into()),
+            route: (state == "connected").then(|| "Local network".into()),
         }
     }
     fn snapshot(devices: Vec<crate::core::mesh::DeviceSnapshot>) -> super::super::Snapshot {
@@ -4684,8 +4689,11 @@ mod tests {
             s(vec![mac("unauthorized"), office("pairing_lost")]).2,
             Tube::Broken
         );
-        // One device keeps v2's name and status line.
-        assert_eq!(s(vec![phone()]).0, "Galaxy S25+");
+        // One device uses its page status; the Devices row retains the name.
+        assert_eq!(
+            s(vec![phone()]),
+            ("Connected".into(), "Local network".into(), Tube::Solid)
+        );
         let mut paused = snapshot(vec![phone()]);
         paused.paused_devices = vec![id(1)];
         assert_eq!(summary(&peers(&paused, &[]), &[]).link.tube, Tube::Paused);
@@ -4739,7 +4747,7 @@ mod tests {
         let mut incoming = transfer("in", 2, "report.pdf", "sending", 5, 10);
         incoming.direction = Some("incoming".into());
         let peers = peers(&snap, &[incoming]);
-        assert_eq!(peers[0].connection(), "Connected over Wi-Fi");
+        assert_eq!(peers[0].connection(), "Connected over local network");
         assert_eq!(peers[1].connection(), "Connected over Tailscale");
         assert!(!peers[0].receiving());
         assert!(peers[1].receiving());
@@ -4953,7 +4961,7 @@ mod tests {
             {"key": format!("{it}/{me}/clipboard"), "enabled": false, "pending": true},
             {"key": format!("{me}/{it}/clipboard"), "enabled": true, "pending": false},
         ]});
-        let (items, note) = device_settings(phone, &reply);
+        let (items, note) = device_settings(phone, &reply, ClipboardMode::Automatic);
         assert!(note.is_empty());
         assert_eq!(
             items
@@ -4970,18 +4978,22 @@ mod tests {
                 ("Receive automatic photos", true, ""),
             ]
         );
-        let (items, note) = device_settings(phone, &json!({"can_sync": false, "settings": []}));
+        let (items, note) = device_settings(
+            phone,
+            &json!({"can_sync": false, "settings": []}),
+            ClipboardMode::Automatic,
+        );
         assert!(items.is_empty());
         assert_eq!(note, "Switches sync when Galaxy S25+ connects.");
         let mut seen = phone.clone();
         seen.last_seen = 1;
         assert_eq!(
-            device_settings(&seen, &json!({"can_sync": false})).1,
+            device_settings(&seen, &json!({"can_sync": false}), ClipboardMode::Automatic).1,
             "Update Pneu on Galaxy S25+ to sync these switches."
         );
         let mut connected = phone.clone();
         connected.health = Health::Connected;
-        let (items, _) = device_settings(&connected, &reply);
+        let (items, _) = device_settings(&connected, &reply, ClipboardMode::Automatic);
         assert!(
             items.iter().all(|s| s.sub.is_empty()),
             "connected settings must not say waiting to connect"
@@ -4989,6 +5001,114 @@ mod tests {
         assert_eq!(phone.connection(), "Not connected yet");
     }
 
+    #[test]
+    fn manual_image_limit_maps_to_window_banner_or_menu_notice_only() {
+        assert_eq!(
+            clipboard_send_error("clipboard image too large", false),
+            Some("Couldn't send the clipboard. The image is over 20 MB")
+        );
+        assert_eq!(
+            clipboard_send_error("clipboard image too large", true),
+            None
+        );
+        for from_menu in [false, true] {
+            assert_eq!(
+                clipboard_send_error("clipboard unavailable", from_menu),
+                Some("Couldn't send the clipboard")
+            );
+        }
+    }
+    #[test]
+    fn share_off_disables_only_send_clipboard_without_changing_pair_settings() {
+        let ps = peers(
+            &snapshot(vec![device(1, "Galaxy S25+", true, "disconnected", 0)]),
+            &[],
+        );
+        let reply = json!({"can_sync":true,"settings":[
+            {"key":format!("{}/{}/clipboard", id(9), id(1)),"enabled":true,"pending":true},
+            {"key":format!("{}/{}/clipboard", id(1), id(9)),"enabled":true,"pending":true}
+        ]});
+        for mode in [
+            ClipboardMode::Automatic,
+            ClipboardMode::Manual,
+            ClipboardMode::Off,
+        ] {
+            let (items, _) = device_settings(&ps[0], &reply, mode);
+            assert_eq!(items[0].enabled, mode != ClipboardMode::Off);
+            assert_eq!(items[0].on, mode != ClipboardMode::Off);
+            assert_eq!(
+                items[0].sub,
+                if mode == ClipboardMode::Off {
+                    "Off for all devices in Settings"
+                } else {
+                    "Applies when Galaxy S25+ connects"
+                }
+            );
+            assert!(items[1].enabled && items[1].on);
+            assert_eq!(items[1].sub, "Applies when Galaxy S25+ connects");
+        }
+        assert_eq!(reply["settings"][0]["enabled"], true);
+    }
+    #[test]
+    fn one_device_status_matches_device_page_for_every_health_and_progress_state() {
+        for state in [
+            "connected",
+            "connecting",
+            "disconnected",
+            "unauthorized",
+            "update_required",
+        ] {
+            for last in [0, crate::now_ms() - 60_000] {
+                let snap = snapshot(vec![device(1, "Galaxy S25+", true, state, last)]);
+                let ps = peers(&snap, &[]);
+                let main = summary(&ps, &[]);
+                let page = device_summary(&ps[0]).0;
+                assert_eq!((main.title, main.detail), (page.title, page.detail));
+                assert_eq!(ps[0].item().name, "Galaxy S25+");
+            }
+        }
+        for incoming in [false, true] {
+            let snap = snapshot(vec![device(1, "Galaxy S25+", true, "connected", 0)]);
+            let mut t = transfer("s", 1, "report.pdf", "sending", 5, 10);
+            if incoming {
+                t.direction = Some("incoming".into());
+            }
+            let ps = peers(&snap, std::slice::from_ref(&t));
+            assert_eq!(summary(&ps, &[t]).detail, device_summary(&ps[0]).0.detail);
+        }
+        let mut snap = snapshot(vec![device(1, "Galaxy S25+", true, "connected", 0)]);
+        snap.paused_devices = vec![id(1)];
+        let ps = peers(&snap, &[]);
+        assert_eq!(summary(&ps, &[]).title, "Paused");
+        assert_eq!(summary(&ps, &[]).detail, "Automatic sending is off");
+    }
+    #[test]
+    fn recent_direction_always_names_one_device_and_limits_name_before_time() {
+        for name in ["Galaxy S25+".to_owned(), "é".repeat(25)] {
+            let ps = peers(&snapshot(vec![device(1, &name, true, "connected", 0)]), &[]);
+            for incoming in [false, true] {
+                let mut t = transfer("done", 1, "report.pdf", "sent", 10, 10);
+                t.finished_at = Some(crate::now_ms() - 60_000);
+                if incoming {
+                    t.direction = Some("incoming".into());
+                }
+                let row = recent(&ps, std::slice::from_ref(&t)).remove(0);
+                let short = if name.chars().count() > 24 {
+                    format!("{}…", name.chars().take(23).collect::<String>())
+                } else {
+                    name.clone()
+                };
+                assert_eq!(
+                    row.detail,
+                    format!(
+                        "{} {short} · {}",
+                        if incoming { "From" } else { "To" },
+                        super::super::last_seen(t.finished_at.unwrap())
+                    )
+                );
+            }
+        }
+    }
     #[test]
     fn sizes_titles_and_modes() {
         assert_eq!(size_pair(12_000_000, 40_000_000), "12 of 40 MB");
@@ -8342,7 +8462,14 @@ mod tests {
         assert_eq!(worker.view().page, Page::Add);
         assert_eq!(ui.get_dialog(), Dialog::Message);
         let message = ui.get_message();
-        assert_eq!(message.title, "This computer was removed from your devices");
+        assert_eq!(
+            message.title,
+            if cfg!(target_os = "macos") {
+                "This Mac was removed from your devices"
+            } else {
+                "This computer was removed from your devices"
+            }
+        );
         assert_eq!(
             (message.text.as_str(), message.primary.as_str()),
             ("", "OK")
@@ -8667,7 +8794,7 @@ mod tests {
             .is_some_and(|d| d.role == "phone" && d.state == "connected")
         {
             w.snapshot.device = Some(id(1));
-            w.snapshot.phone.route = "Wi-Fi".into();
+            w.snapshot.phone.route = "Local network".into();
         }
         w.transfers = transfers;
         let config = Config {
@@ -8861,6 +8988,52 @@ mod tests {
         ];
         sending.extend(recent_items());
         let mut list = vec![
+            scene(
+                "polish-one-device-recent",
+                |w| {
+                    let mut incoming =
+                        transfer("received", 1, "Screenshot_20261101.png", "sent", 10, 10);
+                    incoming.direction = Some("incoming".into());
+                    incoming.finished_at = Some(crate::now_ms() - 60_000);
+                    let mut outgoing =
+                        transfer("sent", 1, "Quarterly report final v3.pdf", "sent", 10, 10);
+                    outgoing.finished_at = Some(crate::now_ms() - 120_000);
+                    state(
+                        w,
+                        vec![device(1, "Galaxy S25+", true, "connected", 0)],
+                        vec![incoming, outgoing],
+                    );
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "polish-share-off-device",
+                move |w| {
+                    state(
+                        w,
+                        vec![device(1, "Galaxy S25+", true, "connected", 0)],
+                        Vec::new(),
+                    );
+                    w.status["config"]["clipboard_mode"] = json!("off");
+                    w.peer_settings =
+                        Some((id(1).as_str().into(), phone_settings(), Instant::now()));
+                    open(w, Page::Device, 1, 0);
+                },
+                go(Page::Device, 1, 0),
+            ),
+            scene(
+                "polish-image-too-large-banner",
+                |w| {
+                    state(
+                        w,
+                        vec![device(1, "Galaxy S25+", true, "connected", 0)],
+                        Vec::new(),
+                    );
+                    w.status["config"]["clipboard_mode"] = json!("manual");
+                    w.action_error = "Couldn't send the clipboard. The image is over 20 MB.".into();
+                },
+                go(Page::Main, 0, 0),
+            ),
             scene(
                 "40-main-status-unavailable",
                 |w| {
@@ -9372,7 +9545,7 @@ mod tests {
                     message(
                         w,
                         "Can't reach Office-PC",
-                        "Make sure both are on the same Wi-Fi, or that Tailscale is connected.",
+                        "Make sure both are on the same network, or that Tailscale is connected.",
                         0,
                         "Cancel",
                         "Try Again",
@@ -9513,7 +9686,14 @@ mod tests {
                     picks(
                         w,
                         &[
-                            (1, "Galaxy S25+", true, true, true, "Connected over Wi-Fi"),
+                            (
+                                1,
+                                "Galaxy S25+",
+                                true,
+                                true,
+                                true,
+                                "Connected over local network",
+                            ),
                             (2, "MacBook Air", false, true, true, "Connected"),
                             (3, "Office-PC", false, false, true, "Not connected"),
                             (4, "Old Laptop", false, false, false, "Update required"),
@@ -9534,7 +9714,14 @@ mod tests {
                     picks(
                         w,
                         &[
-                            (1, "Galaxy S25+", true, true, true, "Connected over Wi-Fi"),
+                            (
+                                1,
+                                "Galaxy S25+",
+                                true,
+                                true,
+                                true,
+                                "Connected over local network",
+                            ),
                             (2, "MacBook Air", false, true, true, "Connected"),
                             (3, "Office-PC", false, false, false, "Not connected"),
                         ],

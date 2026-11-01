@@ -16,8 +16,8 @@ pub mod clipboard;
 #[cfg(windows)]
 #[path = "windows_clipboard.rs"]
 pub mod clipboard;
-#[cfg(target_os = "linux")]
-mod clipboard_content;
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) mod clipboard_content;
 #[cfg(any(
     all(target_os = "linux", pneu_qt_drag),
     windows,
@@ -328,7 +328,10 @@ impl Snapshot {
         } else if self.receiving && self.connected {
             format!("Receiving from {phone}…")
         } else if self.connected {
-            format!("{phone} connected over {}", self.phone.route)
+            format!(
+                "{phone} connected over {}",
+                route_in_sentence(&self.phone.route)
+            )
         } else {
             format!("{phone} isn't connected")
         }
@@ -434,6 +437,14 @@ fn twelve_hour_clock() -> bool {
         twelve
     }
 }
+/// Route name within a sentence; Tailscale keeps its proper name.
+pub(crate) fn route_in_sentence(route: &str) -> &str {
+    if route == "Local network" {
+        "local network"
+    } else {
+        route
+    }
+}
 pub fn route(address: IpAddr) -> &'static str {
     match address {
         IpAddr::V4(ip) if u32::from(ip) & 0xffc00000 == 0x64400000 => "Tailscale",
@@ -441,7 +452,7 @@ pub fn route(address: IpAddr) -> &'static str {
         IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some() => {
             route(IpAddr::V4(ip.to_ipv4_mapped().unwrap()))
         }
-        _ => "Wi-Fi",
+        _ => "Local network",
     }
 }
 pub fn display_path(path: &Path) -> String {
@@ -618,8 +629,8 @@ mod tests {
         s.paired = true;
         s.phone.name = "Phone".into();
         s.connected = true;
-        s.phone.route = "Wi-Fi".into();
-        assert_eq!(s.status(), "Phone connected over Wi-Fi");
+        s.phone.route = "Local network".into();
+        assert_eq!(s.status(), "Phone connected over local network");
         assert_eq!(s.icon(), "pneu-tray-connected");
         s.receiving = true;
         assert_eq!(s.icon(), "pneu-tray-receiving");
@@ -652,7 +663,7 @@ mod tests {
             assert_eq!(route(address.parse().unwrap()), "Tailscale");
         }
         for address in ["100.63.255.255", "100.128.0.1", "192.168.1.1", "::1"] {
-            assert_eq!(route(address.parse().unwrap()), "Wi-Fi");
+            assert_eq!(route(address.parse().unwrap()), "Local network");
         }
     }
 }

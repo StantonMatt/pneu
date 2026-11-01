@@ -22,13 +22,29 @@ impl ArrivalSource {
     ) -> crate::ui::notifications::Notice {
         if clipboard {
             notice.copied_from(&self.name)
-        } else if self.several {
-            notice.from_device(&self.name)
         } else {
-            notice
+            notice.from_device(&self.name)
         }
     }
 }
+#[derive(Debug)]
+pub(crate) struct BoundedReadLimit;
+impl std::fmt::Display for BoundedReadLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("input exceeds bounded read limit")
+    }
+}
+impl std::error::Error for BoundedReadLimit {}
+/// Kept distinct through daemon IPC so manual sends can explain the limit.
+#[derive(Debug)]
+pub(crate) struct ImageTooLarge;
+impl std::fmt::Display for ImageTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("clipboard image too large")
+    }
+}
+impl std::error::Error for ImageTooLarge {}
+
 #[derive(Debug)]
 pub(crate) struct FileUnavailable;
 impl std::fmt::Display for FileUnavailable {
@@ -89,7 +105,7 @@ impl ReceivedFile {
     pub fn read_bounded(&self, limit: usize) -> Result<Vec<u8>> {
         anyhow::ensure!(
             self.file.metadata()?.len() <= limit as u64,
-            "input exceeds bounded read limit"
+            BoundedReadLimit
         );
         let mut bytes = Vec::new();
         let mut buffer = [0; 8192];
@@ -101,7 +117,7 @@ impl ReceivedFile {
             }
             bytes.extend_from_slice(&buffer[..n]);
         }
-        anyhow::ensure!(bytes.len() <= limit, "input grew beyond bounded read limit");
+        anyhow::ensure!(bytes.len() <= limit, BoundedReadLimit);
         Ok(bytes)
     }
     pub(crate) fn is_image(&self, mime: &str) -> Result<bool> {
@@ -437,6 +453,9 @@ pub trait PcActions: Send + Sync {
         self.notify_save_failure(metadata, code, destination, folder)
             .await
     }
+    async fn notify_clipboard_too_large(&self) -> Result<()> {
+        Ok(())
+    }
     async fn notify_send_admission_failure(&self, _reason: &str) -> Result<()> {
         Ok(())
     }
@@ -497,5 +516,38 @@ mod acl_tests {
         assert_eq!(std::fs::read_dir(&root)?.count(), 0);
         assert!(clipboard_file(&root).is_err());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod arrival_copy_tests {
+    use super::*;
+    #[test]
+    fn every_file_arrival_names_sender_even_with_one_pair() {
+        for several in [false, true] {
+            let source = ArrivalSource {
+                device: pneu_proto::Id::from_bytes([1; 16]),
+                name: "Galaxy S25+".into(),
+                several,
+            };
+            let mut notice = crate::ui::notifications::Notice::new("Screenshot");
+            notice.body = "Copied to clipboard".into();
+            assert_eq!(
+                source.file_notice(notice, false).body,
+                "From Galaxy S25+ · Copied to clipboard"
+            );
+            assert_eq!(
+                source
+                    .file_notice(crate::ui::notifications::Notice::new("report.pdf"), false)
+                    .body,
+                "From Galaxy S25+"
+            );
+            assert_eq!(
+                source
+                    .file_notice(crate::ui::notifications::Notice::text("hello"), true)
+                    .summary,
+                "Copied from Galaxy S25+"
+            );
+        }
     }
 }

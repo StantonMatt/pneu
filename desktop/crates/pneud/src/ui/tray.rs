@@ -139,15 +139,7 @@ impl ksni::Tray for Tray {
     fn tool_tip(&self) -> ksni::ToolTip {
         let transfers = self.transfers();
         let peers = peers(&self.snapshot, &transfers);
-        // One line per device; the status line leads only when it adds something.
-        let mut lines: Vec<String> = peers.iter().map(Peer::short).collect();
-        if self.snapshot.error.is_some()
-            || self.snapshot.pairing.is_some()
-            || lines.is_empty()
-            || peers.iter().any(|p| p.sending() || p.receiving())
-        {
-            lines.insert(0, status(&self.snapshot, &peers, &transfers));
-        }
+        let lines = super::tray_model::tooltip_lines(&self.snapshot, &peers, &transfers);
         ksni::ToolTip {
             icon_name: "pneu".into(),
             title: "Pneu".into(),
@@ -199,11 +191,11 @@ impl ksni::Tray for Tray {
                 &mut self.device_slots.lock().expect("tray device slots"),
                 &identities,
             );
-            for identity in slots {
+            for identity in &slots {
                 let peer = peers.iter().find(|p| {
                     identities
                         .iter()
-                        .any(|(key, id)| key == &identity && id == &p.id)
+                        .any(|(key, id)| key == identity && id == &p.id)
                 });
                 let Some(peer) = peer else {
                     targets.push(
@@ -223,6 +215,7 @@ impl ksni::Tray for Tray {
                     self.snapshot.send_targets.clone(),
                     Some(&device),
                 );
+                let identity = identity.clone();
                 targets.push(item(
                     format!("{}…", menu_label(&peer.name)),
                     if peer.phone { "smartphone" } else { "computer" },
@@ -237,15 +230,59 @@ impl ksni::Tray for Tray {
                     },
                 ));
             }
-            items.push(
-                SubMenu {
-                    label: "Send Files To".into(),
-                    icon_name: "document-send".into(),
-                    submenu: targets,
-                    ..Default::default()
+            if peers.len() == 1 {
+                // Keep the same captured-identity tombstones as the submenu.
+                // An old positional menu ID must never select a newly paired device.
+                for identity in slots {
+                    let peer = peers.iter().find(|p| {
+                        identities
+                            .iter()
+                            .any(|(key, id)| key == &identity && id == &p.id)
+                    });
+                    let Some(peer) = peer else {
+                        items.push(
+                            StandardItem {
+                                visible: false,
+                                enabled: false,
+                                ..Default::default()
+                            }
+                            .into(),
+                        );
+                        continue;
+                    };
+                    if let Ok(device) = pneu_proto::Id::new(&peer.id) {
+                        let captured = super::runtime::file_recipients(
+                            self.snapshot.send_targets.clone(),
+                            Some(&device),
+                        );
+                        items.push(item(
+                            "Send Files…",
+                            "document-send",
+                            move |s: &mut Self| {
+                                if tray_identities(&s.snapshot, &peers_for_menu(s))
+                                    .iter()
+                                    .any(|(key, _)| key == &identity)
+                                {
+                                    s.send(Command::SendFiles {
+                                        recipients: captured.clone(),
+                                        targeted: true,
+                                    });
+                                }
+                            },
+                        ));
+                    }
                 }
-                .into(),
-            );
+            } else {
+                items.push(
+                    SubMenu {
+                        label: "Send Files To".into(),
+                        icon_name: "document-send".into(),
+                        submenu: targets,
+                        ..Default::default()
+                    }
+                    .into(),
+                );
+            }
             let mode = self.clipboard_mode();
             if mode == ClipboardMode::Manual {
                 let captured = super::captured_authorities(&self.snapshot);
@@ -477,7 +514,7 @@ mod tests {
                         state: (*state).into(),
                         last_seen: 0,
                         dialer: None,
-                        route: (*state == "connected").then(|| "Wi-Fi".into()),
+                        route: (*state == "connected").then(|| "Local network".into()),
                     },
                 )
                 .collect(),
@@ -603,6 +640,22 @@ mod tests {
             would_queue: false,
             reason: None,
         }];
+        let single_menu = tray.menu();
+        let ksni::MenuItem::Standard(single) = &single_menu[2] else {
+            panic!("single-device send item");
+        };
+        assert_eq!(single.label, "Send Files…");
+        (single.activate)(&mut tray);
+        assert!(
+            matches!(rx.try_recv().unwrap(), Command::SendFiles { recipients: targets, targeted: true } if targets == vec![authority.clone()])
+        );
+        // With a second paired (offline) device the broadcast submenu remains;
+        // its connected-only recipient set still contains just A.
+        let mut second = tray.snapshot.devices[0].clone();
+        second.device = pneu_proto::Id::from_bytes([2; 16]);
+        second.name = "B".into();
+        second.state = "disconnected".into();
+        tray.snapshot.devices.push(second);
         let menu = tray.menu();
         let ksni::MenuItem::SubMenu(files) = &menu[2] else {
             panic!("files submenu")
@@ -617,6 +670,11 @@ mod tests {
             Some(pneu_proto::Hash::new("cd".repeat(32)).unwrap());
         assert!(
             matches!(rx.try_recv().unwrap(), Command::SendFiles { recipients: targets, .. } if targets == vec![authority.clone()])
+        );
+        (single.activate)(&mut tray);
+        assert!(
+            rx.try_recv().is_err(),
+            "old direct callback must retain its pairing identity"
         );
         // Old named menu callbacks become inert once the snapshot is current.
         (one.activate)(&mut tray);
@@ -652,8 +710,8 @@ mod tests {
         assert_eq!(icon_of(&none), "pneu-tray-disconnected");
         let mut one = devices(&[("Galaxy S25+", true, "connected")]);
         one.device = Some(pneu_proto::Id::from_bytes([1; 16]));
-        one.phone.route = "Wi-Fi".into();
-        assert_eq!(line(&one), "Galaxy S25+ connected over Wi-Fi");
+        one.phone.route = "Local network".into();
+        assert_eq!(line(&one), "Galaxy S25+ connected over local network");
         assert_eq!(icon_of(&one), "pneu-tray-connected");
         one.paused_devices = vec![pneu_proto::Id::from_bytes([1; 16])];
         assert_eq!(line(&one), "Galaxy S25+ paused sending");

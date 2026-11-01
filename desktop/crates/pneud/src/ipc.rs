@@ -119,6 +119,8 @@ pub enum Command {
     },
     SendClipboard {
         targets: crate::outbox::Targets,
+        #[serde(default)]
+        notify_too_large: bool,
     },
     Rename {
         name: String,
@@ -274,7 +276,8 @@ impl Command {
                     targets: crate::outbox::Targets::All(_),
                     ..
                 } | Self::SendClipboard {
-                    targets: crate::outbox::Targets::All(_)
+                    targets: crate::outbox::Targets::All(_),
+                    ..
                 }
             ))
     }
@@ -466,7 +469,7 @@ async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
         #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         Command::PresentPicker {..} => true,
         Command::PresentFiles {..} | Command::PresentSendError {..} => true,
-        Command::SendFiles {targets,..} | Command::SendClipboard {targets} => !matches!(targets, crate::outbox::Targets::Captured(_)),
+        Command::SendFiles {targets,..} | Command::SendClipboard {targets,..} => !matches!(targets, crate::outbox::Targets::Captured(_)),
         _ => false,
     };
     let result: Result<serde_json::Value> = async {
@@ -503,10 +506,16 @@ async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
         Command::ClearClipboardHistory=>{core.delete_clipboard_history(None).await?;serde_json::Value::Null},
         Command::SetSetting{key,value}=>{core.set_setting(key,value).await?;serde_json::Value::Null},
         Command::Rename{name}=>{core.rename(name).await?;serde_json::Value::Null},
-        Command::SendClipboard{targets:crate::outbox::Targets::All(_)} if ask=>core.present_send(crate::ui::window::SendRequest {
+        Command::SendClipboard{targets:crate::outbox::Targets::All(_),..} if ask=>core.present_send(crate::ui::window::SendRequest {
             id:crate::random_hex(16),paths:None,targets:crate::ui::captured_authorities(&core.ui_snapshot()),clipboard:true,targeted:false,error:None,
         })?,
-        Command::SendClipboard{targets}=>serde_json::json!({"transfer_id":core.share_clipboard(targets).await?}),
+        Command::SendClipboard{targets,notify_too_large}=>{
+            let result = core.share_clipboard(targets).await;
+            if notify_too_large && result.as_ref().is_err_and(|error| error.is::<crate::actions::ImageTooLarge>()) {
+                let _ = core.notify_clipboard_too_large().await;
+            }
+            serde_json::json!({"transfer_id":result?})
+        },
         Command::Join { uri } => core.join(&uri).await?,
         Command::JoinConfirm { attempt } => core.confirm_join(&attempt).await?,
         Command::JoinConfirmScoped { attempt, enabled } => core.confirm_join_scoped(&attempt,enabled).await?,
@@ -1056,7 +1065,13 @@ mod tests {
                     },
                     choose_devices,
                 ),
-                (Command::SendClipboard { targets: all() }, choose_devices),
+                (
+                    Command::SendClipboard {
+                        targets: all(),
+                        notify_too_large: false,
+                    },
+                    choose_devices,
+                ),
                 (
                     Command::SendFiles {
                         paths: vec![],
@@ -1065,7 +1080,13 @@ mod tests {
                     },
                     false,
                 ),
-                (Command::SendClipboard { targets: devices() }, false),
+                (
+                    Command::SendClipboard {
+                        targets: devices(),
+                        notify_too_large: false,
+                    },
+                    false,
+                ),
                 (
                     Command::SendFiles {
                         paths: vec![],
@@ -1076,6 +1097,7 @@ mod tests {
                 ),
                 (
                     Command::SendClipboard {
+                        notify_too_large: false,
                         targets: captured(),
                     },
                     false,

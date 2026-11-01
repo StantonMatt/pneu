@@ -15,7 +15,7 @@ use std::{
 };
 
 pub const ORIGIN_MIME: &str = "io.github.stantonmatt.pneu.origin";
-pub const MAX_IMAGE: usize = 20 * 1024 * 1024;
+pub use crate::ui::clipboard_content::MAX_IMAGE;
 const TEXT: &str = "public.utf8-plain-text";
 const IMAGE_TYPES: [(&str, &str); 5] = [
     ("public.png", "image/png"),
@@ -295,6 +295,9 @@ fn observe_change(
             let Some(core) = weak.upgrade() else { return };
             match completion {
                 Completion::Read(result) => {
+                    if let Some(fingerprint) = result.oversized {
+                        core.clipboard_image_too_large(token, fingerprint);
+                    }
                     core.clipboard_observed_hashes(token, result.content, result.fingerprints, true)
                 }
                 Completion::Unavailable => core.clipboard_observed(token, None, false),
@@ -387,6 +390,7 @@ pub fn read_helper(count: isize, marker: bool) -> Result<()> {
 }
 fn read_snapshot(count: isize, marker: bool) -> ReadResult<Content> {
     let empty = || ReadResult {
+        oversized: None,
         marker: None,
         content: None,
         fingerprints: Vec::new(),
@@ -422,6 +426,7 @@ fn read_snapshot(count: isize, marker: bool) -> ReadResult<Content> {
     let mut fingerprints = Vec::new();
     let mut value = None;
     let mut png = None;
+    let mut oversized = None;
     // Default/Ask are allowed one read per new changeCount. Nil reads are a
     // stable denied/unavailable state until another human copy; never a retry
     // or prompt loop. Do not override the user's system policy.
@@ -445,10 +450,16 @@ fn read_snapshot(count: isize, marker: bool) -> ReadResult<Content> {
         } else {
             crate::store::history::MAX_IMAGE
         };
-        if let Some(data) = pb
-            .dataForType(&NSString::from_str(uti))
-            .filter(|d| d.len() <= cap)
-        {
+        if let Some(data) = pb.dataForType(&NSString::from_str(uti)) {
+            if data.len() > MAX_IMAGE {
+                // NSData remains retained and immutable throughout this helper
+                // read. Hash in place without making another oversized copy.
+                oversized = Some(Sha256::digest(unsafe { data.as_bytes_unchecked() }).into());
+                continue;
+            }
+            if data.len() > cap {
+                continue;
+            }
             let bytes = data.to_vec();
             if let Ok(decoded) = crate::actions::decode_image(&bytes) {
                 fingerprints.push(Sha256::digest(&bytes).into());
@@ -460,9 +471,12 @@ fn read_snapshot(count: isize, marker: bool) -> ReadResult<Content> {
                         if decoded
                             .write_to(&mut converted, image::ImageFormat::Png)
                             .is_ok()
-                            && converted.get_ref().len() <= MAX_IMAGE
                         {
-                            png = Some(converted.into_inner());
+                            if converted.get_ref().len() > MAX_IMAGE {
+                                oversized = Some(Sha256::digest(&bytes).into());
+                            } else {
+                                png = Some(converted.into_inner());
+                            }
                         }
                     }
                 }
@@ -474,6 +488,7 @@ fn read_snapshot(count: isize, marker: bool) -> ReadResult<Content> {
         return empty();
     }
     ReadResult {
+        oversized: if png.is_some() { None } else { oversized },
         marker: None,
         content: combine(value, png),
         fingerprints,

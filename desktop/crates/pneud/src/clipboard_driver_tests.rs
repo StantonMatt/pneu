@@ -1582,3 +1582,15 @@ async fn history_fixture() -> Result<(tempfile::TempDir, Arc<Core>, Arc<HistoryA
     .await?;
     Ok((dir, core, actions))
 }
+
+#[test]
+fn too_large_failure_remains_distinct_from_unavailable_clipboard() {
+    let error = failure_error(Failure::TooLarge);
+    assert!(error.is::<crate::actions::ImageTooLarge>());
+    assert_eq!(error.to_string(), "clipboard image too large");
+    assert_eq!(
+        failure_error(Failure::Clipboard).to_string(),
+        "clipboard unavailable"
+    );
+    assert!(!failure_error(Failure::Clipboard).is::<crate::actions::ImageTooLarge>());
+}
