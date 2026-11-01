@@ -776,12 +776,9 @@ fn recipient_details(peers: &[Peer], transfers: &[Transfer], key: &str) -> Vec<R
                 "sending" => format!("Sending · {}", size_pair(t.sent, t.size)),
                 "staging" => "Preparing…".into(),
                 "queued" | "waiting_for_device" => "Waiting · not connected".into(),
-                "failed" => format!(
-                    "Failed · {}",
-                    super::notifications::send_failure_reason(
-                        peer.map(|p| p.name.as_str()).unwrap_or("a removed device"),
-                        t.error.as_deref().unwrap_or_default(),
-                    )
+                "failed" => transfer_failure(
+                    t,
+                    peer.map(|p| p.name.as_str()).unwrap_or("a removed device"),
                 ),
                 "sent" => t
                     .finished_at
@@ -814,6 +811,21 @@ fn recipient_details(peers: &[Peer], transfers: &[Transfer], key: &str) -> Vec<R
             }
         })
         .collect()
+}
+
+fn transfer_failure(t: &Transfer, name: &str) -> String {
+    if matches!(
+        t.error.as_deref(),
+        Some("Connection lost" | "Connection interrupted")
+    ) {
+        if t.sent > 0 {
+            format!("Connection lost · {} sent", size_pair(t.sent, t.size))
+        } else {
+            "Connection lost".into()
+        }
+    } else {
+        super::notifications::send_failure_reason(name, t.error.as_deref().unwrap_or_default())
+    }
 }
 
 /// Recent: active, waiting and failed items first, then the last three done.
@@ -936,10 +948,7 @@ fn recent(peers: &[Peer], transfers: &[Transfer]) -> Vec<RecentItem> {
                     .error
                     .clone()
                     .unwrap_or_else(|| "Couldn't send this item".into()),
-                [one] => super::notifications::send_failure_reason(
-                    &name(&one.device),
-                    one.error.as_deref().unwrap_or_default(),
-                ),
+                [one] => transfer_failure(one, &name(&one.device)),
                 many => format!("Failed on {} devices", distinct_recipients(many)),
             }
             .into();
@@ -1014,7 +1023,7 @@ fn size_pair(sent: u64, size: u64) -> String {
     };
     let number = |bytes: u64| {
         let value = bytes as f64 / scale;
-        if value < 10.0 && scale > 1.0 && value.fract() >= 0.05 {
+        if value < 10.0 && scale > 1.0 && (unit == "GB" || value.fract() >= 0.05) {
             format!("{value:.1}")
         } else {
             format!("{value:.0}")
@@ -4563,6 +4572,38 @@ async fn choose_files_on(
 mod tests {
     use super::*;
     #[test]
+    fn resume_recent_failure_and_retry_strings() {
+        let ps = peers(&snapshot(two()), &[]);
+        let mut failed = transfer(
+            "resume",
+            1,
+            "Recording.mp4",
+            "failed",
+            1_200_000_000,
+            4_000_000_000,
+        );
+        failed.error = Some("Connection lost".into());
+        assert_eq!(
+            transfer_failure(&failed, "Desktop"),
+            format!(
+                "Connection lost · {} sent",
+                size_pair(failed.sent, failed.size)
+            )
+        );
+        assert!(
+            recent(&ps, &[failed.clone()])[0]
+                .detail
+                .contains("Connection lost ·")
+        );
+        failed.sent = 0;
+        assert_eq!(recent(&ps, &[failed.clone()])[0].detail, "Connection lost");
+        failed.state = "sending".into();
+        failed.sent = 1_200_000_000;
+        let rows = recent(&ps, &[failed]);
+        assert_eq!(rows[0].progress, 0.3);
+        assert!(rows[0].detail.starts_with("Sending ·"));
+    }
+    #[test]
     fn peer_labels_normalize_a_protocol_limit_name_and_unicode_line_breaks() {
         let name = format!("{}xy", "Phone\n".repeat(21));
         assert_eq!(name.len(), 128);
@@ -4980,6 +5021,7 @@ mod tests {
         assert_eq!(size_pair(12_000_000, 40_000_000), "12 of 40 MB");
         assert_eq!(size_pair(1_200_000, 2_400_000), "1.2 of 2.4 MB");
         assert_eq!(size_pair(320, 900), "320 of 900 B");
+        assert_eq!(size_pair(1_200_000_000, 4_000_000_000), "1.2 of 4.0 GB");
         assert_eq!(
             files_title(&[PathBuf::from("/a/report.pdf")], "Send"),
             "Send report.pdf to"
@@ -8847,6 +8889,50 @@ mod tests {
         ];
         sending.extend(recent_items());
         let mut list = vec![
+            scene(
+                "resume-failed",
+                |w| {
+                    let mut row = transfer(
+                        "resume",
+                        1,
+                        "Recording.mp4",
+                        "failed",
+                        1_200_000_000,
+                        4_000_000_000,
+                    );
+                    row.error = Some("Connection lost".into());
+                    state(w, two(), vec![row]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "resume-retry",
+                |w| {
+                    state(
+                        w,
+                        two(),
+                        vec![transfer(
+                            "resume",
+                            1,
+                            "Recording.mp4",
+                            "sending",
+                            1_200_000_000,
+                            4_000_000_000,
+                        )],
+                    )
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "resume-legacy-failed",
+                |w| {
+                    let mut row =
+                        transfer("legacy", 1, "Recording.mp4", "failed", 0, 4_000_000_000);
+                    row.error = Some("Connection lost".into());
+                    state(w, two(), vec![row]);
+                },
+                go(Page::Main, 0, 0),
+            ),
             scene(
                 "40-main-status-unavailable",
                 |w| {

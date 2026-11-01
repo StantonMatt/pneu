@@ -224,8 +224,12 @@ pub(crate) fn metadata_file(directory: &File, name: impl AsRef<OsStr>) -> Result
 use std::{ffi::CStr, os::fd::AsRawFd};
 
 /// Stable identity only; each backend chooses its representation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Identity(u64, u64);
+pub(crate) fn single_link(file: &File) -> Result<()> {
+    ensure!(file.metadata()?.nlink() == 1, "file has multiple links");
+    Ok(())
+}
 pub(crate) fn identity(file: &File) -> Result<Identity> {
     let stat = rustix::fs::fstat(file)?;
     Ok(Identity(stat.st_dev as u64, stat.st_ino))
@@ -307,7 +311,6 @@ pub(crate) fn open_secret(path: &Path) -> std::io::Result<File> {
         .custom_flags(OFlags::NOFOLLOW.bits() as i32)
         .open(path)
 }
-#[cfg(any(target_os = "macos", test))]
 pub(crate) fn open_read_write_at(parent: &File, name: impl AsRef<OsStr>) -> Result<File> {
     Ok(File::from(rustix::fs::openat(
         parent,

@@ -693,6 +693,9 @@ impl Store {
                 }
                 Ok(result)
             })
+            .inspect(|_| {
+                let _ = s.purge_revoked_partials();
+            })
         })
         .await
     }
@@ -957,6 +960,7 @@ impl Store {
                 if let Some(r)=&m.reach {validate_stamp(r.hlc,now).map_err(|_|MembersError::Malformed)?;}
                 if let Some(c)=&m.readmits {validate_stamp(c.hlc,now).map_err(|_|MembersError::Malformed)?;}
             }
+            reject_partial_id(tx,&fence.device,&snapshot.transfer_id)?;
             let meta=members_metadata(&snapshot);
             if let Some((old,_))=receipt_row(tx,fence.device.as_str(),snapshot.transfer_id.as_str())? {ensure!(old==meta,ReceiptConflict);return Ok(true);}
             let failed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM failed_cache WHERE device=? AND id=?)",params![fence.device.as_str(),snapshot.transfer_id.as_str()],|r|r.get(0))?;ensure!(!failed,ReceiptConflict);

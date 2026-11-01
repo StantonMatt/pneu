@@ -4,7 +4,10 @@ use anyhow::{Context, Result, ensure};
 use std::{
     fs::File,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crate::platform::fs;
@@ -69,6 +72,7 @@ fn numbered_name(name: &str, number: usize) -> String {
     )
 }
 /// Startup-only sweep. Never called while a transfer owns a live stage.
+#[cfg(test)]
 pub(crate) fn clean_staging(folder: &Folder) -> Result<()> {
     clean_legacy_staging(folder)?;
     match fs::open_directory_at(&folder.file, STAGING_DIR) {
@@ -190,6 +194,8 @@ pub(crate) struct StageInner {
     pub name: String,
     pub destination: String,
     placed_name: Mutex<Option<String>>,
+    pub retained: AtomicBool,
+    pub cancelled: AtomicBool,
     pub cleanup: Mutex<Option<Cleanup>>,
 }
 impl Stage {
@@ -217,8 +223,29 @@ impl Stage {
             name,
             destination,
             placed_name: Mutex::new(None),
+            retained: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
             cleanup: Mutex::new(None),
         })))
+    }
+    pub(crate) fn reopen(
+        folder: Folder,
+        directory: Folder,
+        file: File,
+        name: String,
+        destination: String,
+    ) -> Self {
+        Self(Arc::new(StageInner {
+            folder,
+            directory,
+            file,
+            name,
+            destination,
+            placed_name: Mutex::new(None),
+            retained: AtomicBool::new(true),
+            cancelled: AtomicBool::new(false),
+            cleanup: Mutex::new(None),
+        }))
     }
     pub fn record_placed(&self) -> Result<OwnedFile> {
         Ok(OwnedFile {
@@ -255,6 +282,7 @@ impl Stage {
         Ok(())
     }
     pub fn place(&self) -> Result<()> {
+        ensure!(!self.0.cancelled.load(Ordering::SeqCst), "stage cancelled");
         // Windows rename needs only DELETE access so frozen read-only files
         // remain publishable. Flush data on the retained writer beforehand.
         #[cfg(windows)]
@@ -312,6 +340,9 @@ impl Stage {
 }
 impl Drop for StageInner {
     fn drop(&mut self) {
+        if self.retained.load(Ordering::SeqCst) {
+            return;
+        }
         let directory = self.directory.clone();
         let name = self.name.clone();
         // If FD duplication fails, startup can sweep the disposable stage;

@@ -248,6 +248,7 @@ impl Core {
             paused: None,
             capabilities: vec![
                 "files".into(),
+                "file_resume_v1".into(),
                 "clipboard_text".into(),
                 "clipboard_image".into(),
                 "mesh".into(),
@@ -3404,6 +3405,231 @@ mod tests {
                 Ok(())
             })
             .await
+    }
+    async fn resume_test_link(core: Arc<Core>, address: String, pin: Hash) -> Result<()> {
+        let captured = core.store.with_current_pairing();
+        let ComputerLink {
+            mut tls,
+            hello,
+            remote,
+            permit,
+            transport: _transport,
+            setup_sent,
+            ..
+        } = core.connect_computer(&[address], pin.clone(), None).await?;
+        let buffered = core.confirm_peer_ready(&mut tls).await?;
+        core.register_buffered_setup(
+            tls, hello, pin, remote, permit, captured, true, false, buffered, None, setup_sent,
+        )
+        .await
+    }
+    #[tokio::test]
+    async fn resume_bulk_pending_cancels_reconnect_without_blocking_reports() -> Result<()> {
+        let (dir, a, la) = core().await?;
+        let (_db, b, lb) = core().await?;
+        drop(la);
+        let address = lb.local_addr()?.to_string();
+        computer_route(&a, &b, address.clone()).await?;
+        bind(&b, &a).await?;
+        let device = b.identity.device_id.clone();
+        let generation = a.store.pairing_generation(&device).unwrap();
+        let peer = device.clone();
+        a.store
+            .call(move |c| {
+                let tx = c.transaction()?;
+                for n in 0..64u8 {
+                    tx.execute(
+                        "INSERT INTO file_pending_cancels(device,id,generation) VALUES(?,?,?)",
+                        rusqlite::params![
+                            peer.as_str(),
+                            Id::from_bytes([n; 16]).as_str(),
+                            generation as i64
+                        ],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .await?;
+        let source = dir.path().join("after-cancels.txt");
+        std::fs::write(&source, b"connection is usable")?;
+        let server = Task::spawn(b.clone().serve(lb, false));
+        let link = Task::spawn(resume_test_link(
+            a.clone(),
+            address,
+            b.identity.fingerprint.clone(),
+        ));
+        let completed: Result<()> = async {
+            let drained = tokio::time::timeout(Duration::from_secs(10), async {
+                while !a
+                    .outbox
+                    .pending_cancels(device.clone(), generation)
+                    .await?
+                    .is_empty()
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            ensure!(
+                drained.is_ok(),
+                "64 pending cancels must drain reports: {} intents remain",
+                a.outbox
+                    .pending_cancels(device.clone(), generation)
+                    .await?
+                    .len()
+            );
+            drained??;
+            // HELLO has now established file support. The connection must
+            // remain usable after draining all 64 cancellation reports.
+            let reply = a
+                .send_files(vec![source], crate::outbox::Targets::Devices(vec![device]))
+                .await?;
+            let operation = Id::new(reply["operation"].as_str().unwrap().to_owned())?;
+            until(|| {
+                a.ui_snapshot()
+                    .transfers
+                    .iter()
+                    .any(|t| t.operation == operation && t.state == "sent")
+            })
+            .await?;
+            Ok(())
+        }
+        .await;
+        a.request_shutdown();
+        b.request_shutdown();
+        server.await??;
+        let _ = tokio::time::timeout(Duration::from_secs(5), link).await?;
+        a.shutdown_actions().await?;
+        b.shutdown_actions().await?;
+        completed?;
+        assert_eq!(
+            std::fs::read(b.config().save_path.join("after-cancels.txt"))?,
+            b"connection is usable"
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn desktop_resume_after_connection_drop_preserves_exact_file() -> Result<()> {
+        let (da, a, la) = core().await?;
+        let (_db, b, lb) = core().await?;
+        drop(la);
+        let address = lb.local_addr()?.to_string();
+        computer_route(&a, &b, address.clone()).await?;
+        bind(&b, &a).await?;
+        a.set_setting("queue_offline".into(), false.into()).await?;
+        *b.file_write_delay.lock().unwrap() = Duration::from_millis(15);
+        let server = Task::spawn(b.clone().serve(lb, false));
+        let dialing = a.clone();
+        let route = address.clone();
+        let pin = b.identity.fingerprint.clone();
+        let first = Task::spawn(resume_test_link(dialing, route, pin));
+        until(|| a.connected_devices().contains(&b.identity.device_id)).await?;
+        let bytes: Vec<u8> = (0..12 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let source = da.path().join("resume.bin");
+        std::fs::write(&source, &bytes)?;
+        let mut events = b.subscribe();
+        let reply = a
+            .send_files(
+                vec![source],
+                crate::outbox::Targets::Devices(vec![b.identity.device_id.clone()]),
+            )
+            .await?;
+        let operation = Id::new(reply["operation"].as_str().unwrap().to_owned())?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Event::TransferProgress { received, .. } = events.recv().await?
+                    && received >= 5 * 1024 * 1024
+                {
+                    break;
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        b.sessions.lock().unwrap().sessions[&a.identity.device_id]
+            .close
+            .send_replace(Some(CloseReason::Error(ErrorCode::Closing)));
+        let _ = first.await?;
+        until(|| {
+            a.ui_snapshot()
+                .transfers
+                .iter()
+                .any(|t| t.operation == operation && t.state == "failed")
+        })
+        .await?;
+        until(|| b.connected_devices().is_empty()).await?;
+        tokio::time::timeout(Duration::from_secs(10), b.store.drain()).await?;
+        let sender = a.identity.device_id.clone();
+        let durable = b
+            .store
+            .call(move |c| {
+                let record: String = c.query_row(
+                    "SELECT record FROM file_partials WHERE device=?",
+                    [sender.as_str()],
+                    |r| r.get(0),
+                )?;
+                Ok(serde_json::from_str::<Value>(&record)?["offset"]
+                    .as_u64()
+                    .unwrap())
+            })
+            .await?;
+        assert!(
+            durable > 0 && durable < bytes.len() as u64,
+            "durable prefix {durable}"
+        );
+        // A sender can be ahead of the receiver's fsynced prefix. Deliberately
+        // persist a misleading UI offset; READY must still select the suffix.
+        let advisory_offset = bytes.len() as i64;
+        a.store
+            .call(move |c| {
+                c.execute(
+                    "UPDATE outbox_deliveries SET sent=? WHERE state='failed'",
+                    [advisory_offset],
+                )?;
+                Ok(())
+            })
+            .await?;
+        let mut events = b.subscribe();
+        a.retry_transfer(operation.clone(), b.identity.device_id.clone())
+            .await?;
+        let dialing = a.clone();
+        let pin = b.identity.fingerprint.clone();
+        let second = Task::spawn(resume_test_link(dialing, address, pin));
+        let resumed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Event::TransferProgress { received, .. } = events.recv().await? {
+                    return Ok::<_, anyhow::Error>(received);
+                }
+            }
+        })
+        .await??;
+        assert_eq!(
+            resumed, durable,
+            "first receiver progress is the READY offset"
+        );
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !a
+                .ui_snapshot()
+                .transfers
+                .iter()
+                .any(|t| t.operation == operation && t.state == "sent")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(
+            std::fs::read(b.config().save_path.join("resume.bin"))?,
+            bytes
+        );
+        a.request_shutdown();
+        b.request_shutdown();
+        server.await??;
+        let _ = tokio::time::timeout(Duration::from_secs(5), second).await?;
+        a.shutdown_actions().await?;
+        Ok(())
     }
     #[tokio::test]
     async fn sixteen_stalled_computers_leave_inbound_phone_admission_available() -> Result<()> {

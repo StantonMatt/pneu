@@ -227,6 +227,7 @@ fn label(name: &str) -> String {
 pub(crate) fn send_failure_reason(device: &str, reason: &str) -> String {
     let device = label(device);
     match reason {
+        "Connection lost" | "Connection interrupted" => "Connection lost".into(),
         "UnsupportedKind" | "unsupported_kind" => {
             format!("Update Pneu on {device} to send this kind of file")
         }

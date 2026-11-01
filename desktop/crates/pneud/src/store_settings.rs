@@ -305,6 +305,7 @@ impl Store {
                     f.validate().map_err(|_| SettingsMalformed)?;
                     validate_stamp(f.hlc, crate::now_ms()).map_err(|_| SettingsMalformed)?;
                 }
+                reject_partial_id(tx,&peer,&snapshot.transfer_id)?;
                 let meta = Metadata::Settings(snapshot.clone());
                 if let Some((old, _)) =
                     receipt_row(tx, peer.as_str(), snapshot.transfer_id.as_str())?
