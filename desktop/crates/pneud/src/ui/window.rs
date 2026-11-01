@@ -216,6 +216,7 @@ enum Action {
     OpenFolder,
     Unpair(String),
     SendFiles(String),
+    Ring(String, String, bool),
     PickerSend(Vec<String>),
     PickerCancel,
     SendClipboard,
@@ -341,6 +342,11 @@ pub(crate) struct Peer {
     pub id: String,
     pub name: String,
     pub phone: bool,
+    pub battery: Option<u8>,
+    pub charging: bool,
+    pub ring_supported: bool,
+    pub ringing: bool,
+    pub ring_connection: Option<u64>,
     health: Health,
     pub last_seen: u64,
     pub route: Option<String>,
@@ -386,7 +392,16 @@ impl Peer {
             Health::Offline if self.last_seen != 0 => format!("last seen {}", seen(self.last_seen)),
             _ => self.connection(),
         };
-        format!("{} · {state}", self.name)
+        let battery = self
+            .battery
+            .map(|level| {
+                format!(
+                    " · Battery {level}%{}",
+                    if self.charging { ", charging" } else { "" }
+                )
+            })
+            .unwrap_or_default();
+        format!("{} · {state}{battery}", self.name)
     }
     fn item(&self) -> DeviceItem {
         let (status, progress) = if let Some(t) = &self.sending {
@@ -407,6 +422,15 @@ impl Peer {
             id: self.id.as_str().into(),
             name: self.name.as_str().into(),
             phone: self.phone,
+            battery: self.battery.map_or(-1, i32::from),
+            charging: self.charging,
+            ring_supported: self.ring_supported,
+            ringing: self.ringing,
+            ring_connection: self
+                .ring_connection
+                .map(|c| c.to_string())
+                .unwrap_or_default()
+                .into(),
             tone: self.health.tone(),
             status: status.into(),
             status_tone: match self.health {
@@ -454,7 +478,17 @@ pub(crate) fn peers(snapshot: &super::Snapshot, transfers: &[Transfer]) -> Vec<P
                     .cloned()
             };
             let route = health.connected().then(|| d.route.clone()).flatten();
+            let control = snapshot.phone_controls.get(&d.device);
+            let live = d.role == "phone"
+                && d.state == "connected"
+                && !paused
+                && snapshot.connected_devices.contains(&d.device);
             Peer {
+                battery: control.filter(|_| live).and_then(|c| c.battery),
+                charging: live && control.is_some_and(|c| c.charging),
+                ring_supported: d.role == "phone" && control.is_some_and(|c| c.ring_supported),
+                ringing: live && control.is_some_and(|c| c.ringing),
+                ring_connection: control.filter(|_| live).and_then(|c| c.connection),
                 name: display_peer_text(&d.name),
                 phone: d.role == "phone",
                 health,
@@ -619,7 +653,9 @@ fn device_summary(peer: &Peer) -> (SummaryData, &'static str) {
     let (title, detail) = match h {
         Health::Connected => (
             "Connected".to_owned(),
-            if let Some(t) = &peer.sending {
+            if peer.battery.is_some() || peer.ringing {
+                peer.route.clone().unwrap_or_default()
+            } else if let Some(t) = &peer.sending {
                 format!("Sending {} · {}", t.file_name, size_pair(t.sent, t.size))
             } else if let Some(t) = &peer.receiving {
                 format!("Receiving {} · {}%", t.file_name, percent(t.sent, t.size))
@@ -1252,14 +1288,14 @@ pub fn run(paths: Paths) -> Result<()> {
                         }
                     }
                 }
-                let _ = ipc::request(&worker.paths.socket,ipc::Command::WindowFocus { request: worker.request, focused: visible.load(Ordering::SeqCst) && focused.load(Ordering::SeqCst) }).await;
+                let _ = ipc::request(&worker.paths.socket,ipc::Command::WindowFocus { request: worker.request, focused: visible.load(Ordering::SeqCst) && focused.load(Ordering::SeqCst), visible: visible.load(Ordering::SeqCst) }).await;
                 let value = match ipc::request(&worker.paths.socket,ipc::Command::UiStatus).await {
                     Ok(value) => value,
                     Err(error) => { worker.status_failed(error); continue; }
                 };
                 if let Err(error) = worker.refresh(value, &visible).await { worker.status_failed(error); }
             }
-            let _ = ipc::request(&worker.paths.socket,ipc::Command::WindowFocus { request: worker.request, focused: false }).await;
+            let _ = ipc::request(&worker.paths.socket,ipc::Command::WindowFocus { request: worker.request, focused: false, visible: false }).await;
             drop(invitation_job);
             worker.release().await;
             let _ = slint::quit_event_loop();
@@ -1705,6 +1741,14 @@ fn connect(
     ui.on_get_tailscale(send(|| Action::GetTailscale));
     ui.on_unpair(with(Action::Unpair));
     ui.on_send_files(with(Action::SendFiles));
+    let ring_commands = commands.clone();
+    let ring_view = view.clone();
+    ui.on_ring_phone(move |device, connection, stop| {
+        let _ = ring_commands.send(Action::Scoped(
+            ring_view.lock().expect("view").clone(),
+            Box::new(Action::Ring(device.into(), connection.into(), stop)),
+        ));
+    });
     ui.on_cancel_item(with(Action::Cancel));
     ui.on_retry_item(with(Action::Retry));
     ui.on_dismiss_item(with(Action::Dismiss));
@@ -2162,6 +2206,24 @@ impl Worker {
                 }
                 Err(error) => self.fail("Couldn't unpair", error.into()),
             },
+            Action::Ring(device, connection, stop) => {
+                let result = async {
+                    self.command(ipc::Command::Ring {
+                        device: pneu_proto::Id::new(device)?,
+                        connection: connection.parse()?,
+                        action: if stop {
+                            pneu_proto::RingAction::Stop
+                        } else {
+                            pneu_proto::RingAction::Start
+                        },
+                    })
+                    .await
+                }
+                .await;
+                if let Err(error) = result {
+                    self.fail("Couldn't ring phone", error);
+                }
+            }
             Action::SendFiles(target) => {
                 if self.chooser.is_none() {
                     self.chooser_origin = Some(self.view());
@@ -3565,6 +3627,13 @@ impl Worker {
     async fn refresh(&mut self, value: Value, visible: &AtomicBool) -> Result<()> {
         self.origin = self.view();
         let snapshot: super::Snapshot = serde_json::from_value(value["snapshot"].clone())?;
+        if let Some(failure) = &snapshot.ring_failure
+            && self.snapshot.ring_failure.as_ref() != Some(failure)
+            && failure.request == self.request
+            && visible.load(Ordering::SeqCst)
+        {
+            self.action_error = failure.message.clone();
+        }
         let config: Config = serde_json::from_value(value["config"].clone())?;
         self.status_error.clear();
         self.invitation_revision = value["invitation_revision"].as_u64().unwrap_or(0);
@@ -8496,6 +8565,16 @@ mod tests {
             );
             apply(&window, frame);
             (scene.ui)(&window);
+            if (scene.name.starts_with("11") || scene.name.starts_with("120-"))
+                && scene.name.ends_with("-page")
+            {
+                assert_eq!(
+                    ui.get_device().name,
+                    "Galaxy S25+",
+                    "{} must select the phone before projecting its page",
+                    scene.name
+                );
+            }
             // Popups focus their default button on a short timer.
             slint::platform::update_timers_and_animations();
             std::thread::sleep(Duration::from_millis(5));
@@ -8825,6 +8904,7 @@ mod tests {
             w.global::<Ui>().set_download(true);
         }
     }
+    include!("phone_control_tests.rs");
     fn scenes() -> Vec<Scene> {
         let peer = |device: u8, pending: bool| {
             let (me, it) = (id(9), id(device));
@@ -9745,6 +9825,84 @@ mod tests {
                 },
             ),
         ];
+        for (name, level, charging, ringing, supported, page) in [
+            ("110-battery-normal-row", 82, false, false, true, Page::Main),
+            ("111-battery-low-row", 15, false, false, true, Page::Main),
+            (
+                "112-battery-charging-row",
+                12,
+                true,
+                false,
+                true,
+                Page::Main,
+            ),
+            ("113-ringing-row", 82, false, true, true, Page::Main),
+            ("114-ringing-off-row", 82, false, false, false, Page::Main),
+            (
+                "115-battery-normal-page",
+                82,
+                false,
+                false,
+                true,
+                Page::Device,
+            ),
+            ("116-battery-low-page", 15, false, false, true, Page::Device),
+            (
+                "117-battery-charging-page",
+                12,
+                true,
+                false,
+                true,
+                Page::Device,
+            ),
+            ("118-ringing-page", 82, false, true, true, Page::Device),
+            (
+                "119-ringing-off-page",
+                82,
+                false,
+                false,
+                false,
+                Page::Device,
+            ),
+        ] {
+            list.push(scene(
+                name,
+                move |w| {
+                    state(w, two(), recent_items());
+                    if page == Page::Device {
+                        open(w, Page::Device, 1, 0);
+                        w.peer_settings =
+                            Some((id(1).as_str().into(), phone_settings(), Instant::now()));
+                    }
+                    w.snapshot.phone_controls.insert(
+                        id(1),
+                        super::super::PhoneControl {
+                            battery: Some(level),
+                            charging,
+                            ringing,
+                            ring_supported: supported,
+                            connection: Some(42),
+                        },
+                    );
+                },
+                go(page, if page == Page::Device { 1 } else { 0 }, 0),
+            ));
+        }
+        list.push(scene(
+            "120-ring-offline-page",
+            |w| {
+                offline_phone(w);
+                open(w, Page::Device, 1, 0);
+                w.snapshot.phone_controls.insert(
+                    id(1),
+                    super::super::PhoneControl {
+                        ring_supported: true,
+                        ..Default::default()
+                    },
+                );
+            },
+            go(Page::Device, 1, 0),
+        ));
         list.extend(history_scenes());
         list.extend(linking_scenes());
         list

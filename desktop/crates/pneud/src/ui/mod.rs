@@ -94,8 +94,21 @@ pub struct PairingCompletion {
     pub token: pneu_proto::Hash,
     pub device: pneu_proto::Id,
 }
+/// Ephemeral phone presentation; never persisted to the phone metadata file.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PhoneControl {
+    pub battery: Option<u8>,
+    pub charging: bool,
+    pub ring_supported: bool,
+    pub ringing: bool,
+    pub connection: Option<u64>,
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub ring_failure: Option<RingFailure>,
+    #[serde(default)]
+    pub phone_controls: std::collections::HashMap<pneu_proto::Id, PhoneControl>,
     #[serde(default)]
     pub clipboard_history: Vec<crate::store::history::Item>,
     /// Last locally consumed invitation, published with Event::Paired.
@@ -136,6 +149,12 @@ pub struct Snapshot {
     pub receiving: bool,
     pub pairing: Option<String>,
     pub error: Option<ReceiveError>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RingFailure {
+    pub request: u64,
+    pub revision: u64,
+    pub message: String,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ReceiveDestination {
@@ -524,6 +543,11 @@ pub(crate) fn captured_authorities(snapshot: &Snapshot) -> Vec<crate::outbox::Au
 }
 #[derive(Clone, Debug)]
 pub enum Command {
+    Ring {
+        device: pneu_proto::Id,
+        connection: u64,
+        action: pneu_proto::RingAction,
+    },
     ShowClipboardHistory,
     CopyClipboardHistory(String),
     SetupDecision {

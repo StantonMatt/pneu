@@ -432,6 +432,9 @@ impl State {
             let peers = crate::ui::window::peers(&self.snapshot, &transfers);
             let status = crate::ui::tray_model::status(&self.snapshot, &peers, &transfers);
             self.add(&menu, &status, None, None, false);
+            for line in crate::ui::tray_model::battery_lines(&peers) {
+                self.add(&menu, &line, None, None, false);
+            }
             Self::separator(&menu);
             if peers.is_empty() {
                 self.add_history(&menu);
@@ -496,6 +499,30 @@ impl State {
                     );
                 }
                 self.add_history(&menu);
+                let rings = crate::ui::tray_model::ring_items(&peers);
+                if rings.len() == 1 {
+                    let ring = &rings[0];
+                    self.add(
+                        &menu,
+                        &ring.label,
+                        Some(command(ring.request())),
+                        None,
+                        ring.connection.is_some(),
+                    );
+                } else if !rings.is_empty() {
+                    let submenu = new_menu("Ring Phone");
+                    for ring in rings {
+                        self.add(
+                            &submenu,
+                            &ring.label,
+                            Some(command(ring.request())),
+                            None,
+                            ring.connection.is_some(),
+                        );
+                    }
+                    let parent = self.add(&menu, "Ring Phone", None, None, true);
+                    let _: () = msg_send![&*parent, setSubmenu: &*submenu];
+                }
                 self.add(&menu, "Open Folder", Some(MenuAction::Folder), None, true);
                 Self::separator(&menu);
                 let clipboard = new_menu("Clipboard");

@@ -252,6 +252,8 @@ impl Core {
                 "clipboard_image".into(),
                 "mesh".into(),
                 "setup".into(),
+                CAP_BATTERY.into(),
+                CAP_RING.into(),
             ],
         };
         #[cfg(test)]

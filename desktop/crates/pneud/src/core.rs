@@ -44,6 +44,8 @@ mod file_sender;
 pub mod mesh;
 #[path = "peer_settings.rs"]
 mod peer_settings;
+#[path = "phone_controls.rs"]
+mod phone_controls;
 #[path = "setup.rs"]
 mod setup;
 use file_sender::{FileWrite, transmit_file};
@@ -692,9 +694,10 @@ impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for DeliveryWriter<
     }
 }
 async fn send_pending_messages<W: tokio::io::AsyncWrite + Unpin>(
+    core: &Core,
     writer: &mut W,
     priority: &mut mpsc::Receiver<Message>,
-    normal: &mut mpsc::Receiver<Message>,
+    normal: &mut phone_controls::FrameQueue,
     reports: Option<&mpsc::Sender<WriteReport>>,
 ) -> Result<()> {
     // Bound each drain so incoming traffic cannot indefinitely stall an image.
@@ -708,7 +711,7 @@ async fn send_pending_messages<W: tokio::io::AsyncWrite + Unpin>(
         }
     }
     if let Ok(message) = normal.try_recv() {
-        send(writer, &message).await?;
+        normal.send(core, writer, &message).await?;
         if let Some(reports) = reports {
             report_frame(reports, &message).await;
         }
@@ -720,7 +723,7 @@ async fn transmit_automatic<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     work: AutomaticWrite,
     priority: &mut mpsc::Receiver<Message>,
-    normal: &mut mpsc::Receiver<Message>,
+    normal: &mut phone_controls::FrameQueue,
     mut text: Option<&mut mpsc::Receiver<AutomaticWrite>>,
     reports: Option<&mpsc::Sender<WriteReport>>,
 ) -> Result<bool> {
@@ -744,7 +747,8 @@ async fn transmit_automatic<W: tokio::io::AsyncWrite + Unpin>(
                 send(&mut writer, &frame).await?;
                 for (index, chunk) in bytes.chunks(CHUNK_SIZE).enumerate() {
                     // Receipts and heartbeats stay prompt between image frames.
-                    send_pending_messages(&mut *writer.writer, priority, normal, reports).await?;
+                    send_pending_messages(core, &mut *writer.writer, priority, normal, reports)
+                        .await?;
                     if let Some(text) = &mut text {
                         send_pending_clipboard_text(
                             core,
@@ -766,7 +770,7 @@ async fn transmit_automatic<W: tokio::io::AsyncWrite + Unpin>(
                     )
                     .await?;
                 }
-                send_pending_messages(&mut *writer.writer, priority, normal, reports).await?;
+                send_pending_messages(core, &mut *writer.writer, priority, normal, reports).await?;
                 send(&mut writer, &Message::FileEnd(FileEnd { transfer_id: id })).await?;
             }
         }
@@ -783,7 +787,7 @@ async fn send_pending_clipboard_text<W: tokio::io::AsyncWrite + Unpin>(
     core: &Core,
     writer: &mut W,
     priority: &mut mpsc::Receiver<Message>,
-    normal: &mut mpsc::Receiver<Message>,
+    normal: &mut phone_controls::FrameQueue,
     text: &mut mpsc::Receiver<AutomaticWrite>,
     reports: Option<&mpsc::Sender<WriteReport>>,
 ) -> Result<()> {
@@ -967,6 +971,7 @@ struct PhoneWrites {
 /// Clone the Arc<Core> into a tray/window. Commands below are async; subscribe()
 /// returns a bounded broadcast stream (lagging UI consumers must resnapshot).
 pub struct Core {
+    phone_controls: Mutex<phone_controls::Controls>,
     #[cfg(target_os = "macos")]
     pub(crate) ui_ready: Mutex<Arc<std::sync::atomic::AtomicBool>>,
     mesh: Arc<mesh::Mesh>,
@@ -1015,6 +1020,7 @@ pub struct Core {
     window_remove: Mutex<Option<(u64, Id)>>,
     pending_sends: Mutex<std::collections::VecDeque<crate::ui::window::SendRequest>>,
     window_focus: Mutex<Option<(u64, Instant)>>,
+    window_visible: Mutex<Option<(u64, Instant)>>,
     #[cfg(test)]
     file_write_delay: Mutex<Duration>,
 }
@@ -1140,6 +1146,7 @@ impl Core {
         );
         clipboard_state.seed_tickets(rand::random());
         let core = Arc::new(Self {
+            phone_controls: Mutex::default(),
             setup_invitation_scope: AtomicBool::new(true),
             #[cfg(test)]
             setup_test_capability: AtomicBool::new(true),
@@ -1194,6 +1201,7 @@ impl Core {
             window_remove: Mutex::new(None),
             pending_sends: Mutex::default(),
             window_focus: Mutex::new(None),
+            window_visible: Mutex::new(None),
             #[cfg(test)]
             file_write_delay: Mutex::new(Duration::ZERO),
         });
@@ -1269,6 +1277,9 @@ impl Core {
         {
             let changed = s.paused != paused;
             s.paused = paused;
+            if paused {
+                self.clear_phone_control(device, id);
+            }
             if changed {
                 self.clipboard.event(ClipboardEvent::Narrow(device.clone()));
                 self.automatic
@@ -1301,6 +1312,7 @@ impl Core {
             .is_some_and(|s| s.id == id && &s.device == device)
         {
             state.sessions.remove(device);
+            self.end_phone_control(device, id);
             self.clipboard.event(ClipboardEvent::Narrow(device.clone()));
             self.mesh.changed.notify_waiters();
             self.automatic
@@ -1532,6 +1544,7 @@ impl Core {
         let mut ui = self.ui.lock().expect("UI state");
         select_display(&sessions, &admission, &mut ui);
         let mut snapshot = ui.snapshot.clone();
+        snapshot.phone_controls = self.phone_control_snapshot(&sessions, &admission);
         snapshot.clipboard_history = self.store.history_items();
         snapshot.setup_refusal_since = self.setup_refusal_since();
         snapshot.devices = self.device_snapshots(&sessions, &admission, &ui);
@@ -2336,6 +2349,19 @@ impl Core {
             *self.window_focus.lock().expect("window focus") =
                 focused.then_some((request, Instant::now()));
         }
+    }
+    pub(crate) fn set_window_visible(&self, request: u64, visible: bool) {
+        if self.window_request() == request {
+            *self.window_visible.lock().expect("window visibility") =
+                visible.then_some((request, Instant::now()));
+        }
+    }
+    pub(crate) fn window_visible(&self) -> bool {
+        let request = self.window_request();
+        self.window_visible
+            .lock()
+            .expect("window visibility")
+            .is_some_and(|(r, at)| r == request && at.elapsed() < Duration::from_secs(2))
     }
     pub(crate) fn window_focused(&self) -> bool {
         let request = self.window_request.lock().expect("window request").0;
@@ -3838,6 +3864,10 @@ impl Core {
         let activity = Arc::new(Mutex::new(Instant::now()));
         let mut writer = crate::transport::ActivityWriter { writer, sent: activity.clone() };
         let (write_tx, write_rx) = mpsc::channel::<Message>(32);
+        self.attach_phone_control(hello, &store, write_tx.clone());
+        let write_rx = phone_controls::FrameQueue::new(write_rx, hello, &store);
+        let mut phone_tick = tokio::time::interval(Duration::from_secs(1));
+        phone_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let (priority_tx, priority_rx) = mpsc::channel::<Message>(8);
         let (automatic_tx, automatic_rx) = mpsc::channel::<AutomaticWrite>(1);
         let (automatic_text_tx, automatic_text_rx) = mpsc::channel::<AutomaticWrite>(1);
@@ -4132,6 +4162,7 @@ impl Core {
                     _=retry_timer(settings_retry),if settings_retry.is_some()=>{settings_retry=None;},
                     _=tokio::time::sleep_until(file_poll),if pending.is_none()=>{},
                     _=wake.notified()=>{file_poll=Instant::now();},
+                    _=phone_tick.tick()=>{self.expire_phone_control(hello, &store).await;},
                     _=config.changed()=>{},
                     _=settings_changes.changed()=>{},
                     _=setup_changes.changed()=>{},
@@ -4161,6 +4192,8 @@ impl Core {
                             refusal = Some(NackCode::StorageFailed);
                         }
                         match message {
+                            Message::BatteryState(sample) if phone_controls::eligible(hello, CAP_BATTERY) => { self.receive_phone_battery(&store, hello, sample); },
+                            Message::RingState(state) if phone_controls::eligible(hello, CAP_RING) => { self.receive_phone_ring(&store, hello, state); },
                             Message::Error(error)=>{
                                 if error.code == ErrorCode::Closing && hello.capabilities.iter().any(|c| c == "setup") && self.connection_current(&store, &hello.device_id) {
                                     self.ui.lock().expect("UI state").refreshing_scope(&hello.device_id);
@@ -4301,6 +4334,7 @@ impl Core {
                 }
             }Ok(())
         }.await;
+        self.end_phone_control(&hello.device_id, store.connection_id.expect("connection id"));
         if let Err(error) = &result
             && close.borrow().is_none()
         {
@@ -5604,7 +5638,7 @@ async fn report_frame(reports: &mpsc::Sender<WriteReport>, message: &Message) {
     }
 }
 struct WriterQueues {
-    normal: mpsc::Receiver<Message>,
+    normal: phone_controls::FrameQueue,
     priority: mpsc::Receiver<Message>,
     automatic: mpsc::Receiver<AutomaticWrite>,
     text: mpsc::Receiver<AutomaticWrite>,
@@ -5682,7 +5716,7 @@ async fn writer_loop<W: tokio::io::AsyncWrite + Unpin>(
                 }
                 let sent = tokio::select! { biased;
                     _ = writer_close.changed() => None,
-                    sent = send(writer, &message) => Some(sent),
+                    sent = write_rx.send(&core, writer, &message) => Some(sent),
                 };
                 match sent {
                     Some(result) => {
@@ -6798,7 +6832,7 @@ mod tests {
                 core.clone(),
                 &mut bytes,
                 WriterQueues {
-                    normal,
+                    normal: normal.into(),
                     priority,
                     automatic,
                     text,
@@ -6863,7 +6897,7 @@ mod tests {
                 core.clone(),
                 &mut stream,
                 WriterQueues {
-                    normal,
+                    normal: normal.into(),
                     priority,
                     automatic,
                     text,
@@ -6956,7 +6990,7 @@ mod tests {
                     writer_core,
                     &mut stream,
                     WriterQueues {
-                        normal,
+                        normal: normal.into(),
                         priority,
                         automatic,
                         text,
@@ -7049,7 +7083,7 @@ mod tests {
                         writer_core,
                         &mut writer,
                         WriterQueues {
-                            normal,
+                            normal: normal.into(),
                             priority,
                             automatic,
                             text,
@@ -7145,7 +7179,8 @@ mod tests {
             };
             let writer_core = core.clone();
             let (_tx, mut priority) = mpsc::channel(1);
-            let (_normal_tx, mut normal) = mpsc::channel(1);
+            let (_normal_tx, normal) = mpsc::channel(1);
+            let mut normal = phone_controls::FrameQueue::from(normal);
             let task = tokio::spawn(Box::pin(async move {
                 transmit_automatic(
                     &writer_core,
@@ -7954,7 +7989,8 @@ mod tests {
     }
     async fn automatic_wire(core: &Core, work: AutomaticWrite) -> Result<Vec<Message>> {
         let (_priority_tx, mut priority) = mpsc::channel(1);
-        let (_normal_tx, mut normal) = mpsc::channel(1);
+        let (_normal_tx, normal) = mpsc::channel(1);
+        let mut normal = phone_controls::FrameQueue::from(normal);
         let mut bytes = Vec::new();
         assert!(
             transmit_automatic(
@@ -8069,7 +8105,7 @@ mod tests {
         core.shutdown_actions().await
     }
     #[tokio::test]
-    async fn protocol_extensions_are_not_advertised_or_admitted() -> Result<()> {
+    async fn only_implemented_protocol_extensions_are_advertised() -> Result<()> {
         let (_dir, core, peer) = fixture(Arc::new(NoActions)).await?;
         let hello = core.computer_hello();
         assert_eq!(
@@ -8079,7 +8115,9 @@ mod tests {
                 "clipboard_text",
                 "clipboard_image",
                 "mesh",
-                "setup"
+                "setup",
+                "battery_v1",
+                "ring_v1"
             ]
         );
         let mut incoming = None;
@@ -8846,7 +8884,8 @@ mod tests {
                             .await?
                     };
                     let (_priority, mut priority_rx) = mpsc::channel(1);
-                    let (_normal, mut normal_rx) = mpsc::channel(1);
+                    let (_normal, normal_rx) = mpsc::channel(1);
+                    let mut normal_rx = phone_controls::FrameQueue::from(normal_rx);
                     let mut bytes = Vec::new();
                     assert!(
                         !transmit_automatic(
@@ -9938,6 +9977,7 @@ mod tests {
         ));
         Ok(())
     }
+    include!("phone_control_tests.rs");
     async fn fixture(actions: Arc<dyn PcActions>) -> Result<(tempfile::TempDir, Arc<Core>, Id)> {
         let dir = crate::test_support::scratch()?;
         let core = Core::new(
@@ -12803,7 +12843,7 @@ mod tests {
                 sender,
                 &mut stream,
                 WriterQueues {
-                    normal,
+                    normal: normal.into(),
                     priority,
                     automatic,
                     text,
@@ -12978,7 +13018,8 @@ mod tests {
             );
             // A first-byte writer already holding work also rejects it.
             let (_priority, mut priority) = mpsc::channel(1);
-            let (_normal, mut normal) = mpsc::channel(1);
+            let (_normal, normal) = mpsc::channel(1);
+            let mut normal = phone_controls::FrameQueue::from(normal);
             let mut bytes = Vec::new();
             assert!(
                 !transmit_automatic(

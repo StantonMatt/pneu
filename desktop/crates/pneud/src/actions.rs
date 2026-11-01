@@ -437,6 +437,9 @@ pub trait PcActions: Send + Sync {
         self.notify_save_failure(metadata, code, destination, folder)
             .await
     }
+    async fn notify_ring_failure(&self, _phone: &str) -> Result<()> {
+        Ok(())
+    }
     async fn notify_send_admission_failure(&self, _reason: &str) -> Result<()> {
         Ok(())
     }

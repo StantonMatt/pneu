@@ -25,6 +25,11 @@ export struct DeviceItem {
     // Below zero when nothing is moving.
     progress: float,
     connected: bool,
+    battery: int,
+    charging: bool,
+    ring-supported: bool,
+    ringing: bool,
+    ring-connection: string,
 }
 
 export struct HistoryItem {
@@ -185,6 +190,7 @@ export global Ui {
     callback close();
     // "" sends to every connected device (or asks, with Choose devices each time).
     callback send-files(string);
+    callback ring-phone(string, string, bool);
     callback send-clipboard();
     callback cancel-item(string);
     callback retry-item(string);
@@ -237,8 +243,32 @@ component Banner inherits Rectangle {
     }
 }
 
+component Battery inherits HorizontalLayout {
+    in property <int> level: -1;
+    in property <bool> charging;
+    property <color> ink: level <= 15 && !charging ? Pneu.danger : Pneu.text2;
+    spacing: 6px; alignment: center; horizontal-stretch: 0;
+    accessible-role: text;
+    accessible-label: level + "%" + (charging ? ", charging" : "");
+    VerticalLayout {
+        alignment: center;
+        Rectangle {
+            width: 20px; height: 10px;
+            Rectangle { x: 0px; width: 18px; height: 10px; border-radius: 3px; border-width: 1.3px; border-color: root.ink;
+                Rectangle { x: 2px; y: 2px; height: 6px; width: 14px * max(0.07, root.level / 100); border-radius: 1px; background: root.charging ? Pneu.accent : root.ink; }
+            }
+            Rectangle { x: 19px; y: 3px; width: 2px; height: 4px; border-top-right-radius: 1px; border-bottom-right-radius: 1px; background: root.ink; }
+        }
+    }
+    if charging: VerticalLayout { alignment: center; Rectangle { width: 7px; height: 12px; Image { x: -2px; width: 12px; height: 12px; source: Icons.bolt; colorize: Pneu.accent; } } }
+    Text { text: root.level + "%"; font-size: Pneu.label-size; color: root.ink; vertical-alignment: center; }
+}
+
 component LinkCard inherits Card {
     in property <Summary> summary;
+    in property <int> battery: -1;
+    in property <bool> charging;
+    in property <bool> ringing;
     in property <bool> motion;
     in property <length> text-line;
     in property <length> title-line;
@@ -252,10 +282,17 @@ component LinkCard inherits Card {
             wrap: root.wrap-text ? word-wrap : no-wrap;
             overflow: elide; max-height: root.wrap-text ? self.preferred-height : root.title-line; horizontal-alignment: center;
         }
-        if root.summary.detail != "": Text {
+        if root.battery < 0 && !root.ringing && root.summary.detail != "": Text {
             text: root.summary.detail; color: Pneu.text2;
             wrap: root.wrap-text ? word-wrap : no-wrap;
             overflow: elide; max-height: root.wrap-text ? self.preferred-height : root.text-line; horizontal-alignment: center;
+        }
+        if root.ringing: Text { text: "Ringing…"; color: Pneu.accent-text; font-weight: 600; horizontal-alignment: center; }
+        if root.battery >= 0 && !root.ringing: HorizontalLayout {
+            alignment: center; spacing: 6px; height: root.text-line;
+            if root.summary.detail != "": Text { text: root.summary.detail; color: Pneu.text2; }
+            if root.summary.detail != "": Text { text: "·"; color: Pneu.text2; }
+            Battery { level: root.battery; charging: root.charging; }
         }
         @children
     }
@@ -263,7 +300,7 @@ component LinkCard inherits Card {
 
 component DeviceRow inherits NavRow {
     in property <DeviceItem> item;
-    accessible-label: item.name + ", " + item.status;
+    accessible-label: item.name + ", " + item.status + (item.battery >= 0 ? ", Battery " + item.battery + "%" + (item.charging ? ", charging" : "") : "");
     min-height: 56px;
     HorizontalLayout {
         padding-top: 10px; padding-bottom: 10px; padding-left: 12px; padding-right: 12px; spacing: 12px;
@@ -281,6 +318,7 @@ component DeviceRow inherits NavRow {
                 ProgressBar { value: root.item.progress; }
             }
         }
+        if root.item.battery >= 0: Battery { level: root.item.battery; charging: root.item.charging; }
         VerticalLayout {
             alignment: center;
             Image { accessible-role: none; width: 16px; height: 16px; source: Icons.chevron-right; colorize: Pneu.text2; }
@@ -788,13 +826,20 @@ export component PneuWindow inherits Window {
                     spacing: 12px;
                     Header { title: Ui.device.name; go-back => { root.back(); } }
                     LinkCard {
-                        summary: Ui.device-summary; motion: Ui.motion; wrap-text: true;
+                        summary: Ui.device-summary; battery: Ui.device.id != "" ? Ui.device.battery : -1; charging: Ui.device.charging; ringing: Ui.device.ringing; motion: Ui.motion; wrap-text: true;
                         text-line: text-line.preferred-height; title-line: title-line.preferred-height;
                         HorizontalLayout {
-                            padding-top: 14px;
+                            padding-top: 14px; spacing: 8px;
                             if Ui.device-action == "send": PneuButton { enabled: root.device-ready;
                                 text: "Send Files…"; icon: Icons.upload; kind: ButtonKind.tonal; wide: true;
                                 clicked => { Ui.send-files(Ui.device-id); }
+                            }
+                            if Ui.device.ring-supported: PneuButton {
+                                enabled: root.device-ready && Ui.device.ring-connection != "";
+                                text: Ui.device.ringing ? "Stop Ringing" : "Ring Phone";
+                                icon: Ui.device.ringing ? Icons.stop : Icons.ring;
+                                kind: Ui.device.ringing ? ButtonKind.primary : ButtonKind.tonal; wide: true;
+                                clicked => { Ui.ring-phone(Ui.device-id, Ui.device.ring-connection, Ui.device.ringing); }
                             }
                             if Ui.device-action == "pair" || Ui.device-action == "pair-warning": PneuButton { enabled: root.device-ready;
                                 text: "Pair Again…"; icon: Icons.qr-code; kind: Ui.device-action == "pair" ? ButtonKind.primary : ButtonKind.tonal; wide: true;

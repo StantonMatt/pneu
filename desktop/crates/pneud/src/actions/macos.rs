@@ -584,6 +584,13 @@ impl PcActions for DesktopActions {
             .await
             .map(|(_, wait)| wait)
     }
+    async fn notify_ring_failure(&self, phone: &str) -> Result<()> {
+        let mut notice = crate::ui::notifications::Notice::new(format!("Couldn't ring {phone}"));
+        notice.body = crate::ui::notifications::escape(&format!("{phone} didn't respond"));
+        self.notice(notice, Vec::new(), None, 0, None)
+            .await
+            .map(|_| ())
+    }
     async fn notify_send_admission_failure(&self, reason: &str) -> Result<()> {
         let mut n = Notice::new("Couldn't send files");
         n.body = crate::ui::notifications::escape(reason);

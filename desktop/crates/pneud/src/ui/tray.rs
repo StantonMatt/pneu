@@ -175,6 +175,20 @@ impl ksni::Tray for Tray {
             .into(),
             ksni::MenuItem::Separator,
         ];
+        for (index, label) in super::tray_model::battery_lines(&peers)
+            .into_iter()
+            .enumerate()
+        {
+            items.insert(
+                1 + index,
+                StandardItem {
+                    label: label.replace('_', "__"),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
         if !peers.is_empty() {
             let connected =
                 super::runtime::file_recipients(self.snapshot.send_targets.clone(), None);
@@ -255,6 +269,38 @@ impl ksni::Tray for Tray {
             }
             if self.config.clipboard_history {
                 items.push(self.history_menu());
+            }
+            let rings = super::tray_model::ring_items(&peers)
+                .into_iter()
+                .map(|ring| {
+                    StandardItem {
+                        label: ring.label.replace('_', "__"),
+                        enabled: ring.connection.is_some(),
+                        activate: Box::new(move |s: &mut Self| {
+                            if let Some(connection) = ring.connection {
+                                s.send(Command::Ring {
+                                    device: ring.device.clone(),
+                                    connection,
+                                    action: ring.action,
+                                });
+                            }
+                        }),
+                        ..Default::default()
+                    }
+                    .into()
+                })
+                .collect::<Vec<ksni::MenuItem<Self>>>();
+            if rings.len() == 1 {
+                items.extend(rings);
+            } else if !rings.is_empty() {
+                items.push(
+                    SubMenu {
+                        label: "Ring Phone".into(),
+                        submenu: rings,
+                        ..Default::default()
+                    }
+                    .into(),
+                );
             }
             items.push(item("Open Folder", "folder-open", |s: &mut Self| {
                 s.send(Command::OpenFolder)
@@ -483,6 +529,73 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+    #[test]
+    fn phone_controls_kde_menu_tooltip_and_captured_ring_command() {
+        use ksni::Tray as _;
+        let (commands, mut rx) = mpsc::channel(4);
+        let mut snapshot = devices(&[("Phone_A", true, "connected")]);
+        let device = snapshot.devices[0].device.clone();
+        snapshot.connected_devices.push(device.clone());
+        snapshot.phone_controls.insert(
+            device.clone(),
+            super::super::PhoneControl {
+                battery: Some(15),
+                charging: false,
+                ring_supported: true,
+                ringing: true,
+                connection: Some(7),
+            },
+        );
+        let mut tray = Tray {
+            snapshot,
+            config: Config::default(),
+            icons: PathBuf::new(),
+            pixmaps: Vec::new(),
+            named_icons: false,
+            commands,
+            history_menu: None,
+            device_slots: Mutex::default(),
+        };
+        let menu = tray.menu();
+        assert!(
+            matches!(&menu[1], ksni::MenuItem::Standard(item) if !item.enabled && item.label == "Phone__A · Battery 15%")
+        );
+        assert!(
+            tray.tool_tip()
+                .description
+                .contains("Phone_A · Wi-Fi · Battery 15%")
+        );
+        let ring = menu
+            .iter()
+            .find_map(|entry| match entry {
+                ksni::MenuItem::Standard(item) if item.label == "Stop Ringing" => Some(item),
+                _ => None,
+            })
+            .expect("ring menu item");
+        assert!(ring.enabled);
+        tray.snapshot
+            .phone_controls
+            .get_mut(&device)
+            .unwrap()
+            .connection = Some(8);
+        (ring.activate)(&mut tray);
+        assert!(
+            matches!(rx.try_recv().unwrap(), Command::Ring {connection:7, action:pneu_proto::RingAction::Stop, device:captured} if captured == device)
+        );
+        tray.snapshot.connected_devices.clear();
+        tray.snapshot.devices[0].state = "disconnected".into();
+        let menu = tray.menu();
+        assert!(!menu.iter().any(|entry| matches!(entry, ksni::MenuItem::Standard(item) if item.label.contains("Battery"))));
+        assert!(menu.iter().any(|entry| matches!(entry, ksni::MenuItem::Standard(item) if item.label == "Ring Phone" && !item.enabled)));
+        tray.snapshot
+            .phone_controls
+            .get_mut(&device)
+            .unwrap()
+            .ring_supported = false;
+        assert!(!tray.menu().iter().any(
+            |entry| matches!(entry, ksni::MenuItem::Standard(item) if item.label == "Ring Phone")
+        ));
     }
     #[test]
     fn device_menu_slots_never_reassign_stale_ids() {

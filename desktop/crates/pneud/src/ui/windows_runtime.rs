@@ -99,6 +99,7 @@ pub async fn run(
                 Command::SendFiles { recipients, targeted } => {
                     if let Err(error) = core.present_send(SendRequest { id: crate::random_hex(16), paths: None, targets: recipients, clipboard: false, targeted, error: None }) { eprintln!("pneud: send unavailable: {error:#}"); }
                 }
+                Command::Ring {device,connection,action} => { if let Err(error)=core.ring_phone(device,connection,action) { eprintln!("pneud: ring unavailable: {error}"); } }
                 Command::SendClipboard(recipients) => {
                     if let Err(error) = core.present_send(SendRequest { id: crate::random_hex(16), paths: None, targets: recipients, clipboard: true, targeted: false, error: None }) { eprintln!("pneud: send unavailable: {error:#}"); }
                 }

@@ -1,4 +1,5 @@
 #![cfg(unix)]
+mod phone_controls_cases;
 #[path = "../src/test_support.rs"]
 mod test_support;
 use anyhow::{Context, Result};
