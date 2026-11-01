@@ -208,6 +208,7 @@ private fun automaticKinds(context:android.content.Context,p:Prefs):String? {
                 val sending=recipient.state=="sending" && recipient.active
                 val connectionLost=UiPresentation.connectionLostFailure(context,recipient.state,recipient.error,recipient.resumable,recipient.sent,recipient.total)
                 val (line,color)=when {
+                    recipient.error==ReinstallReplacement.CANCELLED->resources.getString(R.string.replacement_recipient_not_sent) to c.warn
                     recipient.state=="sent"->resources.getString(R.string.delivery_sent,lastConnectedLabel(context,item.row.createdAt)) to c.text2
                     recipient.state in setOf("discarded","superseded","skipped")->resources.getString(when(recipient.state) {
                         "discarded"->R.string.delivery_stopped;"superseded"->R.string.delivery_superseded;else->R.string.delivery_skipped
@@ -225,6 +226,7 @@ private fun automaticKinds(context:android.content.Context,p:Prefs):String? {
                         Text(line,style=PneuType.subhead,color=color,maxLines=1,overflow=TextOverflow.Ellipsis)
                         if(sending)LinearProgressIndicator(progress={if(recipient.total>0)(recipient.sent.toFloat()/recipient.total).coerceIn(0f,1f) else 0f},modifier=Modifier.fillMaxWidth().padding(top=7.dp).height(3.dp).clip(RoundedCornerShape(2.dp)),color=c.accent,trackColor=c.fill2,gapSize=0.dp,drawStopIndicator={})
                     }
+                    if(recipient.error==ReinstallReplacement.CANCELLED && recipient.item!=null)IconButton(modifier=Modifier.size(40.dp),onClick={stop(recipient)}) {Symbol(R.drawable.ic_close,resources.getString(R.string.cd_remove),modifier=Modifier.size(22.dp),tint=c.text2)}
                     when {
                         recipient.state=="sent"->Box(Modifier.size(40.dp),contentAlignment=Alignment.Center) {Symbol(R.drawable.ic_check_circle,tint=c.accent)}
                         recipient.retryable && recipient.item!=null->IconButton(modifier=Modifier.size(40.dp),onClick={retry(recipient)}) {Symbol(R.drawable.ic_refresh,resources.getString(R.string.cd_retry),modifier=Modifier.size(22.dp),tint=c.text2)}

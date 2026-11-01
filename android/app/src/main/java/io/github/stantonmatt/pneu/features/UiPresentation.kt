@@ -3,6 +3,7 @@ package io.github.stantonmatt.pneu.features
 import io.github.stantonmatt.pneu.connection.ConnectionStatus
 import io.github.stantonmatt.pneu.connection.PairingIssue
 import io.github.stantonmatt.pneu.R
+import io.github.stantonmatt.pneu.data.ReinstallReplacement
 import io.github.stantonmatt.pneu.protocol.Endpoint
 
 object UiPresentation {
@@ -29,6 +30,7 @@ object UiPresentation {
     /** A row with several recipients reports the worst one. Recipient failures stay
      * visible while another device is still sending; the combined bar continues. */
     fun recentOutcome(context:android.content.Context,item:RecentItem):String =when {
+        item.failed.size==1 && item.failed.single().error==ReinstallReplacement.CANCELLED -> context.getString(R.string.replacement_not_sent)
         item.failed.size==1 -> item.failed.single().let {failed->
             val name=failed.name.ifEmpty {context.getString(R.string.computer)}
             if(failed.error=="connection_lost")return@let context.getString(R.string.item_failed_on_reason,name,
@@ -105,6 +107,7 @@ object UiPresentation {
         else context.getString(R.string.item_connection_lost)
 
     fun failedItem(error:String):Int = when(error) {
+        ReinstallReplacement.CANCELLED -> R.string.replacement_not_sent
         "disk_full" -> R.string.item_failed_disk
         "not_writable" -> R.string.item_failed_write
         "unsupported_kind" -> R.string.item_failed_unsupported

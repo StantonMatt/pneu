@@ -358,4 +358,15 @@
     <string name="notification_access_off">Notification access is off</string>
     <string name="notification_apps">Apps</string>
     <string name="notification_update">Needs a Pneu update</string>
+    <string name="replacement_title">Replace the old %1$s?</string>
+    <string name="replacement_seen">It last connected %1$s. Replace it if this is the same computer.</string>
+    <string name="replacement_never">It hasn\'t connected yet. Replace it if this is the same computer.</string>
+    <string name="replacement_keep_both">Keep both</string>
+    <string name="replacement_action">Replace</string>
+    <string name="replacement_notifications_off">Notifications are off for %1$s</string>
+    <string name="replacement_turn_on">Turn on</string>
+    <string name="replacement_failed">Replacement incomplete. The new pairing is kept.</string>
+    <string name="replacement_not_sent">Not sent · old device replaced</string>
+    <string name="replacement_recipient_not_sent">Not sent · replaced</string>
+    <string name="replacement_today">today at %1$s</string>
 </resources>

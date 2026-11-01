@@ -48,9 +48,9 @@ data class Prefs(
     val recentClipboardSources:Map<String,String> = emptyMap(),
     val automaticRevocations:Map<String,Long> = emptyMap(),
     val membership:SetupState=SetupState(),
-    val showBatteryLevel:Boolean=true,val allowRinging:Boolean=true
-,
+    val showBatteryLevel:Boolean=true,val allowRinging:Boolean=true,
     val notificationConsent:io.github.stantonmatt.pneu.features.NotificationConsent=io.github.stantonmatt.pneu.features.NotificationConsent(),
+    val replacements:ReplacementState=ReplacementState(),
 ) {
     fun automaticRevocation(kind:String)=automaticRevocations[when(kind) {"photo"->"photos";"recording"->"recordings";else->"screenshots"}] ?: 0
     // Compatibility projection for the existing single-computer screens/fixtures.
@@ -133,7 +133,7 @@ class Preferences(private val context:Context,internal val store:androidx.datast
             legacyQueuePeer=s(p,"legacyQueuePeer"),legacyQueueGeneration=l(p,"legacyQueueGeneration"),
             recentClipboardHashes=s(p,"recentClipboardHashes").split('|').filter {it.isNotEmpty()},recentClipboardSources=ClipboardHistory.read(p),selfName=s(p,"selfName"),chooseDevicesEachTime=b(p,"chooseDevicesEachTime"),
             showBatteryLevel=b(p,"showBatteryLevel",true),allowRinging=b(p,"allowRinging",true),
-            notificationConsent=readNotificationConsent(p),membership=SetupStorage.read(p),automaticRevocations=listOf("screenshots","photos","recordings").associateWith {l(p,it+"AdmissionEpoch")}.filterValues {it!=0L})
+            notificationConsent=readNotificationConsent(p),membership=SetupStorage.read(p),replacements=ReinstallReplacement.read(p),automaticRevocations=listOf("screenshots","photos","recordings").associateWith {l(p,it+"AdmissionEpoch")}.filterValues {it!=0L})
     }
     val flow=raw.recoverReads()
     suspend fun read():Prefs=kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {storageDeadline {beforeReadStart();raw.first()}}

@@ -42,7 +42,7 @@ internal object RecentProjection {
             val link=links[delivery.peerId]?.takeIf {it.connectionStatus==ConnectionStatus.CONNECTED && it.transferMediaId==delivery.mediaId && delivery.state=="sending"}
             val total=maxOf(delivery.size,link?.total ?: 0).coerceAtLeast(0)
             val sent=if(delivery.state=="sent")total else (link?.sent ?: delivery.sentBytes).coerceIn(0,total)
-            RecipientOutcome(delivery.peerId,p.devices.find {it.deviceId==delivery.peerId}?.name.orEmpty(),delivery.state,delivery.error,sent,total,link!=null,ConfirmedItem.from(delivery),delivery.resumable)
+            RecipientOutcome(delivery.peerId,(p.devices.find {it.deviceId==delivery.peerId}?.name ?: p.replacements.replacement(delivery.peerId,delivery.bindingGeneration)?.old?.pcName).orEmpty(),delivery.state,delivery.error,sent,total,link!=null,ConfirmedItem.from(delivery),delivery.resumable)
         })
     }.sortedWith(compareBy<RecentItem> {if(it.row.state=="sent")1 else 0}
         .thenBy {if(it.row.state=="sent")-it.row.orderId else it.row.orderId}.thenBy {it.row.mediaId})

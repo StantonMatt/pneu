@@ -119,6 +119,31 @@ class Staging(private val app: AppGraph, private val deleteCommittedSource:(File
         } catch(e:LocalCapacityException) {app.preferences.toggle("localCapacity",true);throw e}
         finally {part?.let {activeParts.remove(it)}}
     }
+    /** Fresh operations own fresh payload files; the original artifact can still
+     * be completed or evicted independently by its other recipients. */
+    internal suspend fun withResendPayloads(rows:List<Outgoing>,publish:suspend ()->Boolean):Boolean=withContext(Dispatchers.IO) {
+        val copies=mutableListOf<File>();var committed=false
+        try {
+            for(row in rows.filter {it.kind!="text"}) {
+                val source=File(row.path)
+                capacity(source.length())
+                val target=File(dir,"${row.transferId}.bin")
+                // Register before creating the file, as cleanup runs concurrently.
+                activeParts.add(target);copies+=target
+                FileOutputStream(target).use {output->
+                    source.inputStream().use {it.copyTo(writer(output))}
+                    output.fd.sync()
+                }
+                row.path=target.absolutePath
+            }
+            if(copies.isNotEmpty())syncDir()
+            withContext(NonCancellable) {committed=publish()}
+            committed
+        } catch(e:LocalCapacityException) {app.preferences.toggle("localCapacity",true);throw e}
+        finally {
+            copies.forEach {if(!committed)it.delete();activeParts.remove(it)}
+        }
+    }
     suspend fun optimize(row:Outgoing)=withContext(Dispatchers.IO) {ImageWorkBudget.run {
         // An interrupted pre-send preparation may already have published a JPEG.
         // Its ID, bytes and metadata are immutable on every subsequent selection.

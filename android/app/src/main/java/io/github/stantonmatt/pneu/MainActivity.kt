@@ -92,13 +92,13 @@ class MainActivity : ComponentActivity() {
         /** Pneu in front shows link requests and joins itself instead of notifying. */
         val foreground=kotlinx.coroutines.flow.MutableStateFlow(false) }
 }
-suspend fun beginPair(context: android.content.Context, uri: String, expected: ConfirmedBinding?=null, setupEnabled: Boolean=true): Boolean {
+suspend fun beginPair(context: android.content.Context, uri: String, expected: ConfirmedBinding?=null, setupEnabled: Boolean=true, replaceOld:ConfirmedBinding?=null): Boolean {
     val graph=context.graph
     val invitation=runCatching { Invitation.parse(uri) }.getOrNull()
     val active=graph.connection.attempt.value
     if(invitation == null || invitation.version != 1L) { graph.connection.state.update { it.withPairing(context.getString(R.string.pair_not_pneu)) }; return false }
     if(invitation != active?.invitation && invitation.expires <= System.currentTimeMillis()) { graph.connection.state.update { it.withPairing(PairingIssue.EXPIRED_MESSAGE) }; return false }
-    check(graph.requestPairing(uri,expected ?: ConfirmedBinding.forInvitation(graph.prefs.value,invitation),setupEnabled)) {"Binding changed during pairing"}
+    check(graph.requestPairing(uri,expected ?: ConfirmedBinding.forInvitation(graph.prefs.value,invitation),setupEnabled,replaceOld)) {"Binding changed during pairing"}
     PneuService.start(context)
     return true
 }
@@ -144,7 +144,9 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
     var scannerPairingRevision by rememberSaveable(p.deviceId) {mutableStateOf<Long?>(null)}
     var scannerSession by rememberSaveable(p.deviceId) {mutableIntStateOf(0)}
     var rejectedLinkFeedback by rememberSaveable(p.deviceId,stateSaver=UiFeedbackSaver) {mutableStateOf<UiFeedback?>(null)}
+    var replaceOld by remember {mutableStateOf<ConfirmedBinding?>(null)}
     fun navigate(next:String) {
+        if(next!="pair")replaceOld=null
         if(next!="pair") {
             // The approved pre-install floor belongs to this scanner session.
             // A later pair intent must start from the binding now installed.
@@ -271,7 +273,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
                     // Unpaired here or on the other device: the page has nothing left to show.
                     val state=deviceStates.find {it.peer.deviceId==id}
                     LaunchedEffect(state==null,p.devices) {if(state==null && p.devices.none {it.deviceId==id} && screen==visibleScreen)navigate("home")}
-                    if(state!=null)DeviceScreen(p,state,{navigate("home")},{navigate("pair")},{unpair=ConfirmedBinding.from(p,id)},{sendFiles(id)},
+                    if(state!=null)DeviceScreen(p,state,{navigate("home")},{replaceOld=ConfirmedBinding.from(p,id);navigate("pair")},{unpair=ConfirmedBinding.from(p,id)},{sendFiles(id)},
                         SetupActions(link={displayedBindings[id]?.let {linkDevices(it,displayedAllPrompts)}},allow={answer(displayedPrompts,true)},remove={SetupPresentation.memberKey(p,state.peer)?.let(::askRemove)})) {key,value->
                         val authority=DeliveryBinding.from(p,id)?.let(::CapturedAuthority)
                         if(authority!=null)scope.launch {actions.run(resources.getString(R.string.ui_error_setting)) {devicesModel.setPairSwitch(authority,key,value)}}
@@ -301,7 +303,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
             // Who this phone joins through: its notices say "Also linked", never "joined".
             val pin=runCatching {Invitation.parse(raw).fingerprint}.getOrDefault("")
             setupStore.update {if(setupEnabled)it.copy(joinedPin=pin,joinedAt=System.currentTimeMillis()) else it.copy(joinedPin="",joinedAt=0)}
-            scope.launch {if(actions.run(resources.getString(R.string.ui_error_pairing),{confirmationAttempt++;offerPair(raw)}) {beginPair(context,raw,target,setupEnabled)}) {scannerPairingRevision=baseline;scannerAttemptId=app.connection.lastStartedAttemptId;offerPair(null);navigate("pair")}}
+            scope.launch {if(actions.run(resources.getString(R.string.ui_error_pairing),{confirmationAttempt++;offerPair(raw)}) {beginPair(context,raw,target,setupEnabled,replaceOld)}) {replaceOld=null;scannerPairingRevision=baseline;scannerAttemptId=app.connection.lastStartedAttemptId;offerPair(null);navigate("pair")}}
         }
         fun finishApproved() {
             val approved=permissionPair ?: return
@@ -359,6 +361,33 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
                 else {if(!remaining.pairingLost)PneuService.start(context);navigate("home")}
             }}}) {Text(resources.getString(R.string.action_unpair))}},
             dismissButton={PneuTextButton(onClick={unpair=null}) {Text(resources.getString(R.string.cd_cancel))}})}
+        val replacement=p.replacements.offers.firstOrNull {!it.implied}
+        if(resumed && replacement!=null && screen !in setOf(null,"setup","permissions","pair")) {
+            fun decline() {scope.launch {actions.run(resources.getString(R.string.replacement_failed)) {app.preferences.declineReplacement(replacement)}}}
+            ReplaceDeviceDialog(replacement,::decline) {
+                scope.launch {actions.run(resources.getString(R.string.replacement_failed)) {app.replaceReinstalledDevice(replacement)}}
+            }
+        }
+        if(resumed && p.replacements.failed!=null)SetupNoticeDialog(resources.getString(R.string.replacement_failed),null) {
+            scope.launch {app.preferences.edit {ReinstallReplacement.finishFailure(it)}}
+        }
+        val replacementNotice=p.replacements.notificationNotice
+        LaunchedEffect(replacementNotice?.key,screen,resumed) {
+            if(replacementNotice!=null && resumed && screen=="home") {
+                val result=homeSnackbar.showSnackbar(resources.getString(R.string.replacement_notifications_off,replacementNotice.name),
+                    actionLabel=resources.getString(R.string.replacement_turn_on),duration=SnackbarDuration.Long)
+                // Acknowledging the notice changes this effect's key. Finish the
+                // explicit consent action before that acknowledgement can cancel it.
+                withContext(NonCancellable) {
+                    if(result==SnackbarResult.ActionPerformed)actions.run(resources.getString(R.string.ui_error_setting)) {
+                        val target=replacementNotice.fresh
+                        val binding=DeliveryBinding(target.phoneId,requireNotNull(target.pin),requireNotNull(target.pcId),target.revision)
+                        check(app.withBinding(binding) {app.replacementNotificationAction.turnOnForNewComputer(binding);true}==true) {"Pairing changed"}
+                    }
+                    app.preferences.finishReplacementNotice(replacementNotice.key)
+                }
+            }
+        }
         val removedSelf=p.membership.withdrawalRevision>setupUi.seenWithdrawal
         val asking=displayedPrompts.filter {SetupPresentation.promptKey(it) !in answering}
         val askingKeys=asking.map(SetupPresentation::promptKey)
@@ -763,7 +792,7 @@ internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired
                                 several -> UiPresentation.recentOutcome(context,outcome!!)
                                 else -> resources.getString(R.string.item_waiting)
                             }
-                            Text(supporting,style=MaterialTheme.typography.bodyMedium,color=if(row.state=="failed" || several && failing) LocalPneuColors.current.danger else if(progress)LocalPneuColors.current.accentText else LocalPneuColors.current.text2,maxLines=1,overflow=TextOverflow.Ellipsis)
+                            Text(supporting,style=MaterialTheme.typography.bodyMedium,color=if(row.error==ReinstallReplacement.CANCELLED)LocalPneuColors.current.warn else if(row.state=="failed" || several && failing) LocalPneuColors.current.danger else if(progress)LocalPneuColors.current.accentText else LocalPneuColors.current.text2,maxLines=1,overflow=TextOverflow.Ellipsis)
                             if(progress)LinearProgressIndicator(progress={if(total>0)(sent.toFloat()/total).coerceIn(0f,1f)else 0f},modifier=Modifier.fillMaxWidth().padding(top=7.dp).height(3.dp).clip(RoundedCornerShape(2.dp)),color=LocalPneuColors.current.accent,trackColor=LocalPneuColors.current.fill2,gapSize=0.dp,drawStopIndicator={})
                         }
                         if(row.state=="failed") IconButton(modifier=Modifier.size(40.dp),onClick={val reference=ConfirmedItem.from(row);scope.launch {actions.run(resources.getString(R.string.ui_error_retry_item)) {val selected=app.confirmArtifact(p,reference);check(app.retry(reference.mediaId,selected)) {"Queue item changed"}}}}) {Symbol(R.drawable.ic_refresh,resources.getString(R.string.cd_retry),modifier=Modifier.size(22.dp),tint=LocalPneuColors.current.text2)}
@@ -786,8 +815,8 @@ internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired
     val row=item.row
     val title=when(row.kind) {"photo"->resources.getString(R.string.kind_photo);"recording"->resources.getString(R.string.kind_recording);"file"->row.fileName;"text"->row.text.lineSequence().firstOrNull().orEmpty().removePrefix("https://");"clipboard_image"->resources.getString(R.string.kind_image);else->resources.getString(R.string.kind_screenshot)}
     RecipientsSheet(title,item,p.devices.associate {it.deviceId to (links[it.deviceId]?.connectionStatus==ConnectionStatus.CONNECTED && !it.pairingLost && it.deviceId !in p.resetPeers)},close,
-        stop={recipient->val selected=ConfirmedQueue(ConfirmedBinding.from(p),listOfNotNull(recipient.item));scope.launch {actions.run(resources.getString(R.string.ui_error_remove_item)) {check(app.discard(selected)) {"Queue item changed"}}}},
-        retry={recipient->val selected=ConfirmedQueue(ConfirmedBinding.from(p),listOfNotNull(recipient.item));scope.launch {actions.run(resources.getString(R.string.ui_error_retry_item)) {check(app.retry(row.mediaId,selected)) {"Queue item changed"}}}})
+        stop={recipient->val selected=ConfirmedQueue.items(p,listOfNotNull(recipient.item));scope.launch {actions.run(resources.getString(R.string.ui_error_remove_item)) {check(app.discard(selected)) {"Queue item changed"}}}},
+        retry={recipient->val selected=ConfirmedQueue.items(p,listOfNotNull(recipient.item));scope.launch {actions.run(resources.getString(R.string.ui_error_retry_item)) {check(app.retry(row.mediaId,selected)) {"Queue item changed"}}}})
 }
 @Composable private fun MediaThumb(row: Outgoing) {
     val context=LocalContext.current
