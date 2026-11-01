@@ -222,6 +222,8 @@ enum Action {
     Folder,
     OpenFolder,
     Unpair(String),
+    PairAgain(String),
+    ReplacementAnswer(String, bool),
     SendFiles(String),
     Ring(String, String, bool),
     PickerSend(Vec<String>),
@@ -788,6 +790,9 @@ fn artifact_key(t: &Transfer) -> String {
 fn artifact_id(t: &Transfer) -> Option<&str> {
     (!t.transfer_id.is_empty() && t.transfer_id != t.operation).then_some(t.transfer_id.as_str())
 }
+fn replaced(t: &Transfer) -> bool {
+    t.state == "cancelled" && t.error.as_deref() == Some(crate::store::replacement::REPLACED)
+}
 fn has_recipient(t: &Transfer) -> bool {
     !(t.transfer_id == t.operation && t.device == "00000000000000000000000000000000")
 }
@@ -821,6 +826,7 @@ fn recipient_details(peers: &[Peer], transfers: &[Transfer], key: &str) -> Vec<R
                     .finished_at
                     .map(|at| format!("Sent · {}", super::last_seen(at)))
                     .unwrap_or_else(|| "Sent".into()),
+                "cancelled" if replaced(t) => "Not sent · replaced".into(),
                 "cancelled" => "Stopped".into(),
                 other => other.into(),
             };
@@ -832,7 +838,9 @@ fn recipient_details(peers: &[Peer], transfers: &[Transfer], key: &str) -> Vec<R
                     .unwrap_or("a removed device")
                     .into(),
                 phone: peer.is_some_and(|p| p.phone),
-                tone: if t.state == "failed" {
+                tone: if replaced(t) {
+                    Tone::Warn
+                } else if t.state == "failed" {
                     Tone::Danger
                 } else {
                     peer.map(|p| p.health.tone()).unwrap_or_default()
@@ -844,7 +852,7 @@ fn recipient_details(peers: &[Peer], transfers: &[Transfer], key: &str) -> Vec<R
                     -1.0
                 },
                 can_stop: active,
-                can_retry: t.state == "failed" && artifact_id(t).is_some(),
+                can_retry: (t.state == "failed" || replaced(t)) && artifact_id(t).is_some(),
             }
         })
         .collect()
@@ -896,7 +904,7 @@ fn recent(peers: &[Peer], transfers: &[Transfer]) -> Vec<RecentItem> {
         let live: Vec<_> = list
             .iter()
             .copied()
-            .filter(|t| t.state != "cancelled")
+            .filter(|t| t.state != "cancelled" || replaced(t))
             .collect();
         if live.is_empty() {
             continue;
@@ -948,13 +956,14 @@ fn recent(peers: &[Peer], transfers: &[Transfer]) -> Vec<RecentItem> {
             continue;
         }
         if !sending.is_empty() {
-            let (sent, size) = live
+            let active: Vec<_> = live.iter().copied().filter(|t| !replaced(t)).collect();
+            let (sent, size) = active
                 .iter()
                 .fold((0, 0), |(s, z), t| (s + t.sent, z + t.size));
             item.detail = if sending.iter().all(|t| t.state == "staging") {
                 "Preparing…".into()
             } else {
-                match distinct_recipients(&live) {
+                match distinct_recipients(&active) {
                     1 => format!("Sending · {}", size_pair(sent, size)),
                     n => format!("Sending to {n} devices · {}", size_pair(sent, size)),
                 }
@@ -977,6 +986,12 @@ fn recent(peers: &[Peer], transfers: &[Transfer]) -> Vec<RecentItem> {
             }
             .into();
             item.can_cancel = true;
+            open.push(item);
+        } else if distinct_recipients(&list) == 1 && live.iter().any(|t| replaced(t)) {
+            item.detail = "Not sent · old device replaced".into();
+            item.detail_tone = Tone::Warn;
+            item.can_retry = true;
+            item.can_dismiss = true;
             open.push(item);
         } else if !failed.is_empty() {
             item.detail = match failed.as_slice() {
@@ -1024,6 +1039,35 @@ fn seen(timestamp: u64) -> String {
         time => time,
     }
 }
+fn replacement_text(offer: &crate::store::replacement::Offer) -> String {
+    let when = if offer.last_seen == 0 {
+        "It hasn't connected yet.".into()
+    } else {
+        let label = chrono::DateTime::from_timestamp_millis(offer.last_seen as i64)
+            .map(|t| {
+                let time = t.with_timezone(&chrono::Local);
+                let today = chrono::Local::now().date_naive();
+                if time.date_naive() == today {
+                    format!("today at {}", super::last_seen(offer.last_seen))
+                } else if Some(time.date_naive()) == today.pred_opt() {
+                    "yesterday".into()
+                } else {
+                    time.format("%b %-d").to_string()
+                }
+            })
+            .unwrap_or_else(|| seen(offer.last_seen));
+        format!("It last connected {label}.")
+    };
+    format!(
+        "{when} Replace it if this is the same {}.",
+        if offer.role == "phone" {
+            "phone"
+        } else {
+            "computer"
+        }
+    )
+}
+
 fn is_picture(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     [
@@ -1152,6 +1196,18 @@ struct Paired {
     at: Instant,
     linked_at: Option<Instant>,
     linked: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PairAgainAttempt {
+    Invitation(pneu_proto::Hash),
+    Join(String),
+    Paired(pneu_proto::Id),
+}
+
+struct PairAgain {
+    old: crate::outbox::Authority,
+    attempt: Option<PairAgainAttempt>,
 }
 
 #[derive(Default)]
@@ -1810,6 +1866,7 @@ fn connect(
     ui.on_picker_cancel(send(|| Action::PickerCancel));
     ui.on_get_tailscale(send(|| Action::GetTailscale));
     ui.on_unpair(with(Action::Unpair));
+    ui.on_pair_again_started(with(Action::PairAgain));
     ui.on_send_files(with(Action::SendFiles));
     let ring_commands = commands.clone();
     let ring_view = view.clone();
@@ -1851,8 +1908,18 @@ fn connect(
         let _ = c.send(Action::SetMode(mode));
     });
     let c = commands.clone();
+    let weak = window.as_weak();
     ui.on_message_action(move |action, primary| {
-        let _ = c.send(Action::Message(action.into(), primary));
+        if action == "replace-device" {
+            if let Some(window) = weak.upgrade() {
+                let _ = c.send(Action::ReplacementAnswer(
+                    window.global::<Ui>().get_replacement_intent().into(),
+                    primary,
+                ));
+            }
+        } else {
+            let _ = c.send(Action::Message(action.into(), primary));
+        }
     });
     let c = commands.clone();
     let weak = window.as_weak();
@@ -1981,6 +2048,9 @@ struct Worker {
     probed: bool,
     seen_pairing_token: Option<pneu_proto::Hash>,
     paired: Option<Paired>,
+    pair_again_choice: Option<PairAgain>,
+    replacement: Option<crate::store::replacement::Offer>,
+    replacement_shown: HashSet<pneu_proto::Id>,
     peer_settings: Option<(String, Value, Instant)>,
     last_view: View,
     requested_page: Option<Page>,
@@ -2048,6 +2118,9 @@ impl Worker {
             probed: false,
             seen_pairing_token: None,
             paired: None,
+            pair_again_choice: None,
+            replacement: None,
+            replacement_shown: HashSet::new(),
             peer_settings: None,
             requested_page: None,
             tailscale: None,
@@ -2238,7 +2311,11 @@ impl Worker {
                         | Action::Rename(_)
                         | Action::DisableEmptyHistory
                 );
-                if self.view() != view && !global_write {
+                let pair_again_navigation = matches!(*action, Action::PairAgain(_))
+                    && view.page == Page::Device
+                    && self.view().page == Page::Add
+                    && self.view().revision == view.revision.wrapping_add(1);
+                if self.view() != view && !global_write && !pair_again_navigation {
                     return;
                 }
                 self.origin = view;
@@ -2269,6 +2346,37 @@ impl Worker {
                 }
             }
             Action::OpenFolder => self.start_open_folder(),
+            Action::PairAgain(device) => {
+                self.pair_again_choice = self
+                    .origin
+                    .targets
+                    .as_ref()
+                    .into_iter()
+                    .flatten()
+                    .find(|t| t.device == device)
+                    .and_then(|t| {
+                        Some(crate::outbox::Authority {
+                            device: pneu_proto::Id::new(&t.device).ok()?,
+                            generation: t.generation,
+                            fingerprint: pneu_proto::Hash::new(t.fingerprint.as_ref()?).ok()?,
+                        })
+                    })
+                    .map(|old| PairAgain { old, attempt: None });
+            }
+            Action::ReplacementAnswer(intent, replace) => {
+                if self
+                    .replacement
+                    .as_ref()
+                    .is_some_and(|o| o.id.as_str() == intent)
+                {
+                    self.answer_replacement(replace, None).await;
+                } else {
+                    self.fail(
+                        "Replacement incomplete",
+                        anyhow::anyhow!("The pairing changed. Confirm the current choice."),
+                    );
+                }
+            }
             Action::Unpair(device) => match pneu_proto::Id::new(device.as_str()) {
                 Ok(device) => {
                     if let Err(error) = self.command(ipc::Command::Unpair { device }).await {
@@ -2504,7 +2612,9 @@ impl Worker {
                     .transfers
                     .iter()
                     .filter(|t| {
-                        artifact_key(t) == item && t.state == "failed" && artifact_id(t).is_some()
+                        artifact_key(t) == item
+                            && (t.state == "failed" || replaced(t))
+                            && artifact_id(t).is_some()
                     })
                     .map(|t| t.device.clone())
                     .collect();
@@ -2738,10 +2848,18 @@ impl Worker {
             self.paired = None;
         }
         let previous = std::mem::replace(&mut self.last_view, view.clone());
+        if !is_pairing_page(view.page) {
+            self.pair_again_choice = None;
+        }
         if is_pairing_page(view.page) && !is_pairing_page(previous.page) {
             self.known_roster = self.setup.roster_ids();
             self.paired = None;
             self.probed = false;
+            // Pair Again starts its own invitation. Adopting an existing code
+            // cannot grant removal authority to its earlier pairing attempt.
+            if self.pair_again_choice.is_some() {
+                self.show_code(true).await;
+            }
         }
         if probe_clipboard && view.page == Page::Add && !self.probed {
             // A usable link from another computer on the clipboard is offered at once.
@@ -2999,10 +3117,25 @@ impl Worker {
         }
         match reply {
             Ok(uri) => {
+                if new && let Some(choice) = &mut self.pair_again_choice {
+                    choice.attempt = Some(PairAgainAttempt::Invitation(uri.token.clone()));
+                }
                 self.code.error.clear();
                 self.code.offline = false;
                 self.status["invitation"] = serde_json::to_value(&uri).expect("pairing URI");
-                self.adopt_code(&uri);
+                if self.view().page == Page::Add && self.view().add_tab == 0 {
+                    // A phone QR still closes with the window. Only visiting
+                    // Pairing Code gives an invitation that longer lifetime.
+                    self.phone_token = Some(uri.token.clone());
+                    self.phone_failed = false;
+                    if let Ok(link) = uri.build()
+                        && let Ok(pixels) = qr_pixels(&link)
+                    {
+                        self.ui(move |w| w.global::<Ui>().set_qr(slint::Image::from_rgba8(pixels)));
+                    }
+                } else {
+                    self.adopt_code(&uri);
+                }
             }
             Err(error) => {
                 eprintln!("pneud window: pairing code unavailable: {error:#}");
@@ -3116,6 +3249,11 @@ impl Worker {
         let name = display_peer_text(reply["name"].as_str().unwrap_or("the other computer"));
         let state = reply["state"].as_str().unwrap_or_default();
         if state == "confirmation" {
+            if let Some(choice) = &mut self.pair_again_choice {
+                choice.attempt = Some(PairAgainAttempt::Join(
+                    reply["attempt"].as_str().unwrap_or_default().into(),
+                ));
+            }
             self.join = Some(Join {
                 attempt: reply["attempt"].as_str().unwrap_or_default().into(),
                 uri: text,
@@ -3600,6 +3738,114 @@ impl Worker {
             Err(_) => {}
         }
     }
+    fn complete_pair_again(&mut self, attempt: PairAgainAttempt, device: pneu_proto::Id) {
+        if let Some(choice) = &mut self.pair_again_choice
+            && choice.attempt.as_ref() == Some(&attempt)
+        {
+            choice.attempt = Some(PairAgainAttempt::Paired(device));
+        }
+    }
+
+    async fn answer_replacement(
+        &mut self,
+        replace: bool,
+        implied_old: Option<crate::outbox::Authority>,
+    ) {
+        let Some(offer) = self.replacement.take() else {
+            return;
+        };
+        self.replacement_shown.insert(offer.id.clone());
+        if let Err(error) = self
+            .command(ipc::Command::ReplacementDecision {
+                intent: offer.id.clone(),
+                replace,
+                implied_old,
+            })
+            .await
+        {
+            self.replacement_shown.remove(&offer.id);
+            self.fail("Replacement incomplete", error);
+        }
+    }
+
+    async fn poll_replacement(&mut self) {
+        if let Some(current) = &self.replacement {
+            if self
+                .snapshot
+                .replacements
+                .iter()
+                .any(|o| o.id == current.id)
+            {
+                return;
+            }
+            self.replacement = None;
+            self.ui(|w| {
+                let ui = w.global::<Ui>();
+                if ui.get_dialog() == Dialog::Message && ui.get_message().action == "replace-device"
+                {
+                    ui.set_dialog(Dialog::None);
+                }
+            });
+        }
+        let view = self.view();
+        let offer = self
+            .snapshot
+            .replacements
+            .iter()
+            .find(|o| {
+                !self.replacement_shown.contains(&o.id)
+                    && self
+                        .paired
+                        .as_ref()
+                        .and_then(|p| p.device.as_deref())
+                        .is_none_or(|d| d == o.new.device.as_str())
+            })
+            .cloned();
+        let Some(offer) = offer else {
+            return;
+        };
+        // An unconfirmed intent survives a window/daemon restart. Restore its
+        // successful pairing screen before presenting the same exact choice.
+        if view.page == Page::Main {
+            let tab = if offer.role == "phone" { 0 } else { 1 };
+            self.ui(move |w| w.invoke_open_add(tab));
+            return;
+        }
+        if !is_pairing_page(view.page) {
+            return;
+        }
+        if self.paired.is_none() {
+            self.paired = Some(Paired {
+                origin: view,
+                name: offer.name.clone(),
+                device: Some(offer.new.device.to_string()),
+                at: Instant::now(),
+                linked_at: None,
+                linked: String::new(),
+            });
+        }
+        self.replacement = Some(offer.clone());
+        if self.pair_again_choice.as_ref().is_some_and(|choice| {
+            choice.attempt.as_ref() == Some(&PairAgainAttempt::Paired(offer.new.device.clone()))
+        }) && let Some(choice) = self.pair_again_choice.take()
+            && offer.choices.iter().any(|(a, _)| a == &choice.old)
+        {
+            self.answer_replacement(true, Some(choice.old)).await;
+            return;
+        }
+        let text = replacement_text(&offer);
+        let intent = offer.id.to_string();
+        self.ui(move |w| w.global::<Ui>().set_replacement_intent(intent.into()));
+        self.message(
+            format!("Replace the old {}?", offer.name),
+            text,
+            0,
+            "Keep Both",
+            "Replace",
+            "replace-device",
+        );
+    }
+
     async fn poll_join(&mut self) {
         let Some(join) = self.join.as_ref().filter(|j| j.confirmed) else {
             return;
@@ -3641,6 +3887,10 @@ impl Worker {
                     return;
                 };
                 let join = self.join.take().expect("join");
+                self.complete_pair_again(
+                    PairAgainAttempt::Join(join.attempt.clone()),
+                    pneu_proto::Id::new(device).expect("validated device"),
+                );
                 self.forget_join();
                 self.paired = Some(Paired {
                     origin: self.view(),
@@ -3684,6 +3934,8 @@ impl Worker {
         self.open_origin = None;
         self.chooser = None;
         self.paired = None;
+        self.replacement = None;
+        self.pair_again_choice = None;
         self.picker_active = false;
         self.send_request_id = None;
         self.picker_files.clear();
@@ -4029,6 +4281,9 @@ impl Worker {
                 .pairing_completion
                 .as_ref()
                 .map(|done| done.token.clone());
+            if let Some(done) = self.snapshot.pairing_completion.clone() {
+                self.complete_pair_again(PairAgainAttempt::Invitation(done.token), done.device);
+            }
             self.paired = Some(Paired {
                 origin: view.clone(),
                 name: peer.name.clone(),
@@ -4042,6 +4297,7 @@ impl Worker {
                 self.ui(|_| super::macos::camera::close());
             }
         }
+        self.poll_replacement().await;
         // Phone pairing QR (v2): keep an invitation open while the tab shows.
         let phone_tab = view.page == Page::Add && view.add_tab == 0;
         if phone_tab {
@@ -4106,6 +4362,7 @@ impl Worker {
             })
         });
         if let Some(paired) = &self.paired
+            && self.replacement.is_none()
             && paired.at.elapsed()
                 >= if linking {
                     Duration::from_secs(5)
@@ -5066,6 +5323,35 @@ mod tests {
         for name in ["", "capture", "capture.", "mp4", "capturemp4"] {
             assert!(!is_picture(name), "{name}");
             assert!(!is_video(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn replacement_recent_preserves_sibling_success_and_failure() {
+        let ps = peers(&snapshot(two()), &[]);
+        let mut old = transfer("operation", 1, "report.pdf", "cancelled", 0, 10);
+        old.error = Some(crate::store::replacement::REPLACED.into());
+        for (state, detail, tone) in [
+            ("sent", "To MacBook Air", Tone::Neutral),
+            ("failed", "MacBook Air's disk is full", Tone::Danger),
+        ] {
+            let mut sibling = transfer("operation", 2, "report.pdf", state, 10, 10);
+            sibling.error = (state == "failed").then(|| "DiskFull".into());
+            let transfers = [old.clone(), sibling];
+            let rows = recent(&ps, &transfers);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].detail, detail);
+            assert_eq!(rows[0].detail_tone, tone);
+            let details = recipient_details(&ps, &transfers, &rows[0].id);
+            assert_eq!(details.len(), 2);
+            assert_eq!(details[0].detail, "Not sent · replaced");
+            assert_eq!(details[0].tone, Tone::Warn);
+            assert!(details[0].can_retry && !details[0].can_stop);
+            assert!(
+                details[1]
+                    .detail
+                    .starts_with(if state == "sent" { "Sent" } else { "Failed" })
+            );
         }
     }
 
@@ -8758,6 +9044,307 @@ mod tests {
         Ok(())
     }
 
+    fn replacement_offer() -> crate::store::replacement::Offer {
+        let old = crate::outbox::Authority {
+            device: id(1),
+            generation: 7,
+            fingerprint: pneu_proto::Hash::new("ab".repeat(32)).unwrap(),
+        };
+        crate::store::replacement::Offer {
+            id: id(8),
+            old: old.clone(),
+            new: crate::outbox::Authority {
+                device: id(3),
+                generation: 1,
+                fingerprint: pneu_proto::Hash::new("cd".repeat(32)).unwrap(),
+            },
+            name: "Galaxy S25+".into(),
+            role: "phone".into(),
+            last_seen: 0,
+            choices: vec![(old, 0)],
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_ui_offer_escape_replace_pair_again_and_recent_states() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::replacement_ui_offer_escape_replace_pair_again_and_recent_states",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        let surface = headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        let mock = mock_ipc(&worker.paths.socket, |_| (true, Value::Null))?;
+        window.invoke_open_add(0);
+        drain(&mut worker, &mut actions).await;
+        let offer = replacement_offer();
+        worker.snapshot.replacements = vec![offer.clone()];
+        worker.poll_replacement().await;
+        flush_ui();
+        let ui = window.global::<Ui>();
+        assert_eq!(ui.get_dialog(), Dialog::Message);
+        assert_eq!(ui.get_message().title, "Replace the old Galaxy S25+?");
+        assert_eq!(
+            ui.get_message().text,
+            "It hasn't connected yet. Replace it if this is the same phone."
+        );
+        assert!(worker.paired.is_some());
+        assert!(
+            mock.requests.lock().unwrap().is_empty(),
+            "matching only offers"
+        );
+        window.show()?;
+        surface.set_size(slint::PhysicalSize::new(400, 700));
+        window
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::WindowActiveChanged(true));
+        let draw = || {
+            flush_ui();
+            surface.request_redraw();
+            surface.draw_if_needed(|renderer| {
+                let mut pixels = vec![
+                        slint::platform::software_renderer::PremultipliedRgbaColor::default();
+                        400 * 700
+                    ];
+                renderer.render(&mut pixels, 400);
+            });
+            advance_ui();
+        };
+        draw();
+        key(&window, slint::platform::Key::Escape);
+        drain(&mut worker, &mut actions).await;
+        draw();
+        assert_eq!(ui.get_dialog(), Dialog::None);
+        assert_eq!(sent(&mock, "replacement_decision")[0]["replace"], false);
+        worker.poll_replacement().await;
+        flush_ui();
+        assert_eq!(
+            ui.get_dialog(),
+            Dialog::None,
+            "decline doesn't reprompt from stale snapshots"
+        );
+        worker.replacement_shown.clear();
+        worker.poll_replacement().await;
+        draw();
+        key(&window, slint::platform::Key::Return);
+        drain(&mut worker, &mut actions).await;
+        assert_eq!(sent(&mock, "replacement_decision")[1]["replace"], true);
+        // An offer left pending by an earlier pairing needs confirmation even
+        // after Pair Again captures exactly the same old entry.
+        worker.replacement_shown.clear();
+        window.invoke_open_device(id(1).to_string().into());
+        drain(&mut worker, &mut actions).await;
+        worker.view.lock().unwrap().targets = Some(vec![SendTarget {
+            device: offer.old.device.to_string(),
+            generation: offer.old.generation,
+            fingerprint: Some(offer.old.fingerprint.to_string()),
+            ..Default::default()
+        }]);
+        ui.invoke_pair_again_started(id(1).to_string().into());
+        window.invoke_open_add(0);
+        drain(&mut worker, &mut actions).await;
+        assert_eq!(
+            worker.pair_again_choice.as_ref().map(|c| &c.old),
+            Some(&offer.old)
+        );
+        worker.poll_replacement().await;
+        flush_ui();
+        assert_eq!(sent(&mock, "replacement_decision").len(), 2);
+        assert_eq!(ui.get_dialog(), Dialog::Message);
+        assert_eq!(ui.get_message().action, "replace-device");
+        worker
+            .act(Action::ReplacementAnswer(offer.id.to_string(), false))
+            .await;
+        worker.replacement_shown.clear();
+        let mut lookalike = offer.old.clone();
+        lookalike.generation += 1;
+        worker.pair_again_choice = Some(PairAgain {
+            old: lookalike,
+            attempt: Some(PairAgainAttempt::Paired(offer.new.device.clone())),
+        });
+        worker.poll_replacement().await;
+        flush_ui();
+        assert_eq!(
+            sent(&mock, "replacement_decision").len(),
+            3,
+            "lookalike never implies removal"
+        );
+        assert_eq!(ui.get_dialog(), Dialog::Message);
+        // A queued answer belongs to the displayed operation, even if another
+        // fresh pairing replaces the offer before the worker handles the click.
+        let mut newer = offer.clone();
+        newer.id = id(7);
+        worker.replacement = Some(newer);
+        worker
+            .act(Action::ReplacementAnswer(offer.id.to_string(), true))
+            .await;
+        assert_eq!(sent(&mock, "replacement_decision").len(), 3);
+        worker.snapshot.replacements.clear();
+        worker.poll_replacement().await;
+        flush_ui();
+        assert_eq!(
+            ui.get_dialog(),
+            Dialog::None,
+            "a stale binding dismisses its offer"
+        );
+        let mut cancelled = transfer("old", 1, "Holiday video.mp4", "cancelled", 0, 10);
+        cancelled.error = Some(crate::store::replacement::REPLACED.into());
+        let key = artifact_key(&cancelled);
+        let rows = recent(&[], std::slice::from_ref(&cancelled));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].detail, "Not sent · old device replaced");
+        assert_eq!(rows[0].detail_tone, Tone::Warn);
+        assert!(rows[0].can_retry && rows[0].can_dismiss);
+        let recipients = recipient_details(&[], &[cancelled], &key);
+        assert_eq!(recipients[0].detail, "Not sent · replaced");
+        assert!(recipients[0].can_retry && !recipients[0].can_stop);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replacement_pair_again_authority_requires_its_authenticated_attempt() -> Result<()> {
+        if in_offscreen_child("ui::window::tests::replacement_pair_again_authority_requires_its_authenticated_attempt", &[]).await? { return Ok(()); }
+        headless()?;
+        for case in ["invitation", "other-token", "join", "restored-join"] {
+            let window = PneuWindow::new()?;
+            let dir = tempfile::tempdir()?;
+            let (mut worker, mut actions) = model_worker(&window, dir.path());
+            let uri = sample_uri();
+            let pair_uri = uri.clone();
+            let mock = mock_ipc(&worker.paths.socket, move |request| {
+                let reply = match request["command"].as_str().unwrap_or_default() {
+                    "pair" => json!({"uri":pair_uri}),
+                    "join" => {
+                        json!({"state":"confirmation", "attempt":"fresh-join", "name":"Galaxy S25+"})
+                    }
+                    "join_confirm_scoped" => json!({"state":"pairing"}),
+                    "join_status" => json!({"state":"paired", "device":id(3)}),
+                    _ => Value::Null,
+                };
+                (true, reply)
+            })?;
+            let offer = replacement_offer();
+            window.invoke_open_device(id(1).to_string().into());
+            drain(&mut worker, &mut actions).await;
+            worker.view.lock().unwrap().targets = Some(vec![SendTarget {
+                device: offer.old.device.to_string(),
+                generation: offer.old.generation,
+                fingerprint: Some(offer.old.fingerprint.to_string()),
+                ..Default::default()
+            }]);
+            window
+                .global::<Ui>()
+                .invoke_pair_again_started(id(1).to_string().into());
+            window.invoke_open_add(0);
+            drain(&mut worker, &mut actions).await;
+            assert_eq!(sent(&mock, "pair").len(), 1, "{case}: fresh invitation");
+            assert!(sent(&mock, "replacement_decision").is_empty());
+            if case.ends_with("join") {
+                worker.paste(uri.clone(), false).await;
+                worker.confirm_join().await;
+                if case == "restored-join" {
+                    // A restored or unrelated handle cannot inherit authority
+                    // from the fresh join, even for the very same new peer.
+                    worker.join.as_mut().unwrap().attempt = "restored-handle".into();
+                }
+                worker.poll_join().await;
+                worker.snapshot.replacements = vec![offer.clone()];
+                worker.poll_replacement().await;
+            } else {
+                state(
+                    &mut worker,
+                    vec![device(3, "Galaxy S25+", true, "connected", 0)],
+                    vec![],
+                );
+                let mut token = pneu_proto::PairingUri::parse(&uri)?.token;
+                if case == "other-token" {
+                    token = pneu_proto::Hash::new("ef".repeat(32))?;
+                }
+                worker.snapshot.pairing_completion = Some(super::super::PairingCompletion {
+                    token,
+                    device: id(3),
+                });
+                worker.snapshot.replacements = vec![offer.clone()];
+                let mut status = status_value(&worker);
+                status["invitation"] = serde_json::to_value(pneu_proto::PairingUri::parse(&uri)?)?;
+                worker.refresh(status, &AtomicBool::new(true)).await?;
+            }
+            flush_ui();
+            let requests = sent(&mock, "replacement_decision");
+            if matches!(case, "invitation" | "join") {
+                assert_eq!(requests.len(), 1, "{case}");
+                assert_eq!(
+                    requests[0]["implied_old"],
+                    serde_json::to_value(&offer.old)?,
+                    "{case}"
+                );
+                assert_eq!(requests[0]["replace"], true);
+            } else {
+                assert!(
+                    requests.is_empty(),
+                    "{case}: unrelated attempt must confirm"
+                );
+                assert_eq!(
+                    window.global::<Ui>().get_dialog(),
+                    Dialog::Message,
+                    "{case}"
+                );
+                assert_eq!(window.global::<Ui>().get_message().action, "replace-device");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replacement_unanswered_offer_returns_after_window_close() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::replacement_unanswered_offer_returns_after_window_close",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        let mock = mock_ipc(&worker.paths.socket, |_| (true, Value::Null))?;
+        window.invoke_open_add(0);
+        drain(&mut worker, &mut actions).await;
+        let offer = replacement_offer();
+        worker.snapshot.replacements = vec![offer.clone()];
+        worker.poll_replacement().await;
+        flush_ui();
+        let ui = window.global::<Ui>();
+        assert_eq!(ui.get_dialog(), Dialog::Message);
+        let visible = AtomicBool::new(true);
+        worker.close(&visible).await;
+        flush_ui();
+        assert_eq!(ui.get_dialog(), Dialog::None);
+        assert!(!visible.load(Ordering::SeqCst));
+        assert!(sent(&mock, "replacement_decision").is_empty());
+        window.show()?;
+        visible.store(true, Ordering::SeqCst);
+        worker.poll_replacement().await;
+        flush_ui();
+        assert_eq!(ui.get_dialog(), Dialog::Message);
+        assert_eq!(ui.get_replacement_intent(), offer.id.as_str());
+        worker
+            .act(Action::ReplacementAnswer(offer.id.to_string(), true))
+            .await;
+        let requests = sent(&mock, "replacement_decision");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["replace"], true);
+        window.hide()?;
+        Ok(())
+    }
+
     /// Every page and popup, rendered with the software renderer. Each must
     /// stay 400 px wide and at most 720 px tall. With PNEU_WINDOW_SHOTS set to
     /// a folder, the renders are also saved there as PNG files.
@@ -8891,6 +9478,9 @@ mod tests {
             }
             let size = slint::LogicalSize::new(400.0, height).to_physical(scale);
             surface.set_size(size);
+            // Layout creates conditional popup buttons lazily. Let their
+            // focus timers run after geometry is resolved, before capture.
+            advance_ui();
             if scene.name.ends_with("-copied") && !scene.name.contains("history") {
                 // Click the address, which sits just above Pairing Code.
                 let position =
@@ -9298,122 +9888,6 @@ mod tests {
                 },
                 go(Page::Main, 0, 0),
             ),
-            device(1, "Galaxy S25+", true, "connected", 0),
-            device(2, "MacBook Air", false, "connected", 0),
-            device(
-                3,
-                "Matthew’s MacBook Pro (Studio, 16-inch) with a very long name",
-                false,
-                "connected",
-                0,
-            ),
-            device(4, "Living-Room-HTPC", false, "connected", 0),
-            device(
-                5,
-                "Office-PC",
-                false,
-                "disconnected",
-                crate::now_ms() - 86_400_000,
-            ),
-            device(6, "Old Laptop", false, "update_required", 0),
-            device(7, "Pixel 6a", true, "unauthorized", 0),
-        ];
-        list.extend(
-            (8..=16).map(|n| device(n, &format!("Lab-PC-{n:02}"), false, "disconnected", 0)),
-        );
-        list
-    }
-    fn picks(w: &PneuWindow, devices: &[(u8, &str, bool, bool, bool, &str)]) {
-        let picks: Vec<PickItem> = devices
-            .iter()
-            .map(|(n, name, phone, connected, eligible, status)| PickItem {
-                id: id(*n).as_str().into(),
-                name: (*name).into(),
-                phone: *phone,
-                tone: if *connected {
-                    Tone::Accent
-                } else if *eligible {
-                    Tone::Neutral
-                } else {
-                    Tone::Danger
-                },
-                connected: *connected,
-                eligible: *eligible,
-                status: (*status).into(),
-                checked: *connected && *eligible,
-            })
-            .collect();
-        let ui = w.global::<Ui>();
-        ui.set_picker_count(picks.iter().filter(|p| p.checked).count() as i32);
-        ui.set_picks(ModelRc::new(VecModel::from(picks)));
-        ui.set_dialog(Dialog::Picker);
-    }
-    fn offline_phone(w: &mut Worker) {
-        let mut phone = device(1, "Galaxy S25+", true, "disconnected", 0);
-        phone.last_seen = crate::now_ms() - 7_200_000;
-        let waiting = transfer("w", 1, "notes.md", "waiting_for_device", 0, 9);
-        state(w, vec![phone], vec![waiting]);
-    }
-    fn offline_devices(w: &mut Worker) {
-        let mut list = vec![
-            transfer("w", 1, "notes.md", "waiting_for_device", 0, 9),
-            transfer("w", 2, "notes.md", "waiting_for_device", 0, 9),
-        ];
-        list.extend(recent_items()[..1].to_vec());
-        state(
-            w,
-            vec![
-                device(
-                    1,
-                    "Galaxy S25+",
-                    true,
-                    "disconnected",
-                    crate::now_ms() - 7_200_000,
-                ),
-                device(
-                    2,
-                    "MacBook Air",
-                    false,
-                    "disconnected",
-                    crate::now_ms() - 9_000_000,
-                ),
-            ],
-            list,
-        );
-    }
-    fn help(w: &PneuWindow) {
-        go(Page::Main, 0, 0)(w);
-        w.global::<Ui>().set_dialog(Dialog::Help);
-    }
-    fn download(tab: i32, mac: bool) -> impl Fn(&PneuWindow) {
-        move |w: &PneuWindow| {
-            go(Page::Add, 0, tab)(w);
-            w.global::<Ui>().set_is_mac(mac);
-            w.global::<Ui>().set_download(true);
-        }
-    }
-    fn scenes() -> Vec<Scene> {
-        let peer = |device: u8, pending: bool| {
-            let (me, it) = (id(9), id(device));
-            json!({"can_sync": true, "settings": [
-                {"key": format!("{me}/{it}/clipboard"), "enabled": true, "pending": false},
-                {"key": format!("{it}/{me}/clipboard"), "enabled": !pending, "pending": pending},
-            ]})
-        };
-        let phone_settings = || {
-            let (me, it) = (id(9), id(1));
-            json!({"can_sync": true, "settings": [
-                {"key": format!("{me}/{it}/clipboard"), "enabled": true, "pending": false},
-                {"key": format!("{it}/{me}/clipboard"), "enabled": true, "pending": false},
-                {"key": format!("{it}/{me}/automatic_media"), "enabled": true, "pending": false},
-            ]})
-        };
-        let mut sending = vec![
-            transfer("s", 1, "report.pdf", "sending", 12_000_000, 40_000_000),
-            transfer("s", 2, "report.pdf", "sending", 31_000_000, 40_000_000),
-        ];
-        sending.extend(recent_items());
-        let mut list = vec![
             scene(
                 "resume-failed",
                 |w| {
@@ -9455,6 +9929,56 @@ mod tests {
                         transfer("legacy", 1, "Recording.mp4", "failed", 0, 4_000_000_000);
                     row.error = Some("Connection lost".into());
                     state(w, two(), vec![row]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "90-replacement-popup",
+                |w| {
+                    state(
+                        w,
+                        vec![
+                            device(1, "Galaxy S25+", true, "disconnected", 0),
+                            device(3, "Galaxy S25+", true, "connected", 0),
+                        ],
+                        vec![],
+                    );
+                    open(w, Page::Add, 0, 0);
+                    w.paired = Some(Paired {
+                        origin: w.view(),
+                        name: "Galaxy S25+".into(),
+                        device: Some(id(3).to_string()),
+                        at: Instant::now(),
+                        linked_at: None,
+                        linked: String::new(),
+                    });
+                },
+                |w| {
+                    go(Page::Add, 0, 0)(w);
+                    let ui = w.global::<Ui>();
+                    ui.set_message(Message {
+                        title: "Replace the old Galaxy S25+?".into(),
+                        text: "It last connected Oct 12. Replace it if this is the same phone."
+                            .into(),
+                        primary: "Replace".into(),
+                        secondary: "Keep Both".into(),
+                        action: "replace-device".into(),
+                        ..Default::default()
+                    });
+                    ui.set_dialog(Dialog::Message);
+                },
+            ),
+            scene(
+                "91-replacement-recent",
+                |w| {
+                    let mut row =
+                        transfer("old", 1, "Holiday video.mp4", "cancelled", 0, 1_800_000_000);
+                    row.error = Some(crate::store::replacement::REPLACED.into());
+                    state(
+                        w,
+                        vec![device(3, "Galaxy S25+", true, "connected", 0)],
+                        vec![row],
+                    );
                 },
                 go(Page::Main, 0, 0),
             ),

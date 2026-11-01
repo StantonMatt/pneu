@@ -48,6 +48,8 @@ pub mod mesh;
 mod peer_settings;
 #[path = "phone_controls.rs"]
 mod phone_controls;
+#[path = "replacement.rs"]
+mod replacement;
 #[path = "setup.rs"]
 mod setup;
 use file_sender::{FileWrite, transmit_file};
@@ -1560,6 +1562,12 @@ impl Core {
         let mut snapshot = ui.snapshot.clone();
         snapshot.phone_controls = self.phone_control_snapshot(&sessions, &admission);
         snapshot.clipboard_history = self.store.history_items();
+        snapshot.replacements = self
+            .store
+            .replacements
+            .lock()
+            .expect("replacement offers")
+            .clone();
         snapshot.setup_refusal_since = self.setup_refusal_since();
         snapshot.devices = self.device_snapshots(&sessions, &admission, &ui);
         snapshot.send_targets = self.file_targets(&snapshot.devices, &sessions, &admission);
@@ -2164,6 +2172,7 @@ impl Core {
         target.config_epoch == self.clipboard_config_epoch.load(Ordering::SeqCst)
             && self.config().clipboard_sync_to_phone
             && self.config().clipboard_mode != crate::config::ClipboardMode::Off
+            && !self.store.replacement_pending(&target.device)
             && !sessions.unpairing.contains(&target.device)
             && target.binding == self.store.pairing_generation(&target.device).unwrap_or(0)
             && sessions.sessions.get(&target.device).is_some_and(|s| {
@@ -3778,8 +3787,15 @@ impl Core {
         let incoming = self.setup_incoming.clone();
         let lifecycle_store = self.store.clone();
         let setup_generation = self.store.setup_state().generation;
+        let offline = self
+            .ui_snapshot()
+            .devices
+            .into_iter()
+            .filter(|d| !self.connected_devices().contains(&d.device))
+            .map(|d| (d.device, d.last_seen))
+            .collect();
         self.store
-            .pair_then_hello_scoped(
+            .pair_then_hello_replacement(
                 device.clone(),
                 fp.clone(),
                 hello,
@@ -3790,6 +3806,7 @@ impl Core {
                     SetupScope::Disabled
                 },
                 route_proven,
+                offline,
                 move || {
                     let _guard = guard;
                     if let Some(pin) = old_pin {
@@ -4101,7 +4118,7 @@ impl Core {
                         }
                     }
                 }
-                if store.mesh {
+                if store.mesh && !self.store.replacement_pending(&hello.device_id) {
                     let fields=self.store.pair_settings.lock().expect("pair settings").get(&hello.device_id).cloned().unwrap_or_default();
                     if settings_pending.is_none() && settings_retry.is_none_or(|at|at<=Instant::now()) && settings_confirmed.as_ref()!=Some(&fields) {
                         match store.settings_outgoing(self.identity.device_id.clone(),hello.device_id.clone(),hello.role==Some(DeviceRole::Phone)).await {
@@ -5205,6 +5222,10 @@ impl Core {
                     incoming.take();
                 }
                 Message::Clipboard(text) => {
+                    if self.store.replacement_pending(device) {
+                        tx.send(nack(text.transfer_id, NackCode::UnsupportedKind)).await?;
+                        return Ok(());
+                    }
                     let receipt = if store.mesh {
                         match store
                             .receipt(device.clone(), text.transfer_id.clone())
@@ -12488,6 +12509,175 @@ mod tests {
             fingerprint: peer.fingerprint,
         })
     }
+
+    #[tokio::test]
+    async fn replacement_retry_image_sends_and_applies_after_newer_clipboard_activity() -> Result<()>
+    {
+        let (dir, sender, _) = fixture(Arc::new(NoActions)).await?;
+        let actions = Arc::new(CountingActions(AtomicU64::new(0)));
+        let (_received_dir, receiver, _) = fixture(actions.clone()).await?;
+        let old = Id::from_bytes([81; 16]);
+        let pin = Hash::new("81".repeat(32))?;
+        let pair = |device: Id, fingerprint: Hash, offline| {
+            sender.store.pair_then_hello_replacement(
+                device.clone(),
+                fingerprint,
+                Some(Hello {
+                    version: 1,
+                    device_id: device,
+                    name: "Replacement PC".into(),
+                    capabilities: vec!["mesh".into()],
+                    role: Some(DeviceRole::Computer),
+                    addresses: None,
+                    setup: None,
+                    paused: None,
+                }),
+                None,
+                SetupScope::Disabled,
+                false,
+                offline,
+                || {},
+            )
+        };
+        pair(old.clone(), pin.clone(), vec![]).await?;
+        let operation = Id::from_bytes([82; 16]);
+        let source = dir.path().join("retained.png");
+        let immutable = b"\x89PNG\r\n\x1a\noriginal image";
+        std::fs::write(&source, immutable)?;
+        let (artifact, _) = sender
+            .outbox
+            .admit_selected(
+                operation.clone(),
+                source.clone(),
+                vec![file_test_peer(&sender, &old).await?],
+                crate::outbox::PEER_BYTES,
+                sender.identity.device_id.clone(),
+            )
+            .await?;
+        pair(
+            receiver.identity.device_id.clone(),
+            receiver.identity.fingerprint.clone(),
+            vec![(old.clone(), 42)],
+        )
+        .await?;
+        let offer = sender.store.replacements.lock().unwrap()[0].clone();
+        sender
+            .store
+            .replacement_decide(sender.identity.device_id.clone(), offer, true, |_| {})
+            .await?;
+        sender.outbox.reconcile().await?;
+        // The mutable source is no longer the content being sent.
+        std::fs::write(&source, b"changed original source")?;
+        let peer = sender.identity.device_id.clone();
+        receiver
+            .store
+            .pair(peer.clone(), sender.identity.fingerprint.clone())
+            .await?;
+        receiver
+            .action_scope
+            .lock()
+            .unwrap()
+            .insert(peer.clone(), ActionScope::new());
+        let mut config = receiver.config();
+        config.notification_preview = false;
+        config.open_in_viewer = false;
+        config.copy_image_to_clipboard = true;
+        receiver.update_config(config).await?;
+        let (created_at, hlc) = sender.store.local_clipboard(peer.clone()).await?;
+        let (tx, mut rx) = mpsc::channel(2);
+        receiver
+            .receive_test(
+                &receiver.store,
+                &peer,
+                Message::Clipboard(Clipboard {
+                    sensitive: false,
+                    hlc: Some(hlc),
+                    source_device: Some(peer.clone()),
+                    transfer_id: Id::from_bytes([83; 16]),
+                    text: "newer clipboard".into(),
+                    created_at,
+                    origin: ClipboardOrigin::Clipboard,
+                }),
+                &mut None,
+                &tx,
+            )
+            .await?;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(3), rx.recv()).await?,
+            Some(Message::Ack(_))
+        ));
+        assert_eq!(actions.0.load(Ordering::SeqCst), 1);
+        let target = file_test_peer(&sender, &receiver.identity.device_id).await?;
+        sender
+            .outbox
+            .retry_replaced(
+                operation.clone(),
+                Some(artifact.clone()),
+                old,
+                vec![target.clone()],
+                peer.clone(),
+            )
+            .await?;
+        let delivery = sender
+            .outbox
+            .claim(target.device, target.generation, 1)
+            .await?
+            .context("retry send")?;
+        assert_ne!(delivery.begin.transfer_id, artifact);
+        assert!(delivery.begin.hlc.context("retry HLC")? > hlc);
+        assert!(
+            sender
+                .outbox
+                .snapshot(&[])
+                .iter()
+                .any(|r| r.transfer_id == delivery.begin.transfer_id && r.operation != operation)
+        );
+        let mut file = sender.outbox.reader(delivery.clone()).await?;
+        let mut bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut file, &mut bytes).await?;
+        assert_eq!(bytes, immutable);
+        let mut incoming = None;
+        for message in [
+            Message::FileBegin(delivery.begin.clone()),
+            Message::FileChunk(FileChunk {
+                transfer_id: delivery.begin.transfer_id.clone(),
+                offset: 0,
+                data: bytes,
+            }),
+            Message::FileEnd(FileEnd {
+                transfer_id: delivery.begin.transfer_id.clone(),
+            }),
+        ] {
+            receiver
+                .receive_test(&receiver.store, &peer, message, &mut incoming, &tx)
+                .await?;
+        }
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(3), rx.recv()).await?,
+            Some(Message::Ack(Ack {
+                deduplicated: false,
+                ..
+            }))
+        ));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let (register, _, _) = receiver.store.clipboard_snapshot().await?;
+                if actions.0.load(Ordering::SeqCst) == 2
+                    && register.is_some_and(|key| Some(key.hlc) == delivery.begin.hlc)
+                {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("retried image must apply after the newer clipboard")??;
+        sender.outbox.receipt(delivery, None).await?;
+        sender.shutdown_actions().await?;
+        receiver.shutdown_actions().await?;
+        Ok(())
+    }
+
     async fn file_recipient_fixture() -> Result<(
         tempfile::TempDir,
         Arc<Core>,

@@ -118,6 +118,7 @@ export global Ui {
     in property <[RecentItem]> recent;
     in property <bool> manual-clipboard;
     in property <bool> pair-again;
+    callback pair-again-started(string);
     in property <bool> motion: true;
 
     in property <DeviceItem> device;
@@ -136,6 +137,7 @@ export global Ui {
     in property <bool> network: true;
     in property <string> pairing;
     in property <string> paired;
+    in property <string> replacement-intent;
     in property <string> offer;
     // Also link with your other devices, on every pairing confirmation.
     in-out property <bool> link-on: true;
@@ -361,7 +363,7 @@ component RecentRow inherits NavRow {
             Text { text: root.item.title; color: Pneu.text; overflow: elide; }
             Text {
                 text: root.item.detail; font-size: Pneu.label-size; overflow: elide;
-                color: root.item.detail-tone == Tone.danger ? Pneu.danger : root.item.detail-tone == Tone.accent ? Pneu.accent-text : Pneu.text2;
+                color: root.item.detail-tone == Tone.danger ? Pneu.danger : root.item.detail-tone == Tone.accent ? Pneu.accent-text : root.item.detail-tone == Tone.warn ? Pneu.warn : Pneu.text2;
             }
             if root.item.progress >= 0: VerticalLayout {
                 padding-top: 5px;
@@ -451,10 +453,12 @@ component HistoryCard inherits Card {
 
 component Done inherits VerticalLayout {
     in property <string> name;
+    in property <length> reserved-bottom;
     // "Also linked: …", or why it was paired with that device only.
     in property <string> detail;
     in property <bool> only;
     alignment: center; spacing: 14px;
+    padding-bottom: root.reserved-bottom;
     HorizontalLayout {
         alignment: center;
         Rectangle {
@@ -543,13 +547,14 @@ global Popup { in-out property <length> needed; }
 component PopupCard inherits Rectangle {
     in property <length> card-width: 320px;
     in property <length> limit;
+    in property <bool> low;
     private property <length> needed: body.preferred-height + 32px;
     init => { Popup.needed = self.needed; }
     changed needed => { Popup.needed = self.needed; }
     background: Pneu.dim;
     TouchArea {}
     Card {
-        x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+        x: (parent.width - self.width) / 2; y: root.low ? max(16px, parent.height - self.height - 24px) : (parent.height - self.height) / 2;
         width: min(root.card-width, root.width - 32px);
         height: max(0px, min(body.preferred-height, root.limit));
         drop-shadow-blur: 28px; drop-shadow-offset-y: 8px; drop-shadow-color: Pneu.dark ? #000000B3 : #14161A33;
@@ -604,6 +609,7 @@ export component PneuWindow inherits Window {
     private property <string> copied;
     private property <bool> device-ready: Ui.device.id == Ui.device-id && Ui.device-id != "" && Ui.device-revision == Ui.navigation-revision;
     private property <bool> modal-open: Ui.dialog != Dialog.none;
+    private property <length> replacement-space: Ui.dialog == Dialog.message && Ui.message.action == "replace-device" ? Popup.needed : 0px;
     changed modal-open => {
         Interaction.modal-open = root.modal-open;
         if !root.modal-open { Popup.needed = 0; }
@@ -877,7 +883,7 @@ export component PneuWindow inherits Window {
                             }
                             if Ui.device-action == "pair" || Ui.device-action == "pair-warning": PneuButton { enabled: root.device-ready;
                                 text: "Pair Again…"; icon: Icons.qr-code; kind: Ui.device-action == "pair" ? ButtonKind.primary : ButtonKind.tonal; wide: true;
-                                clicked => { root.open-add(Ui.device.phone ? 0 : 1); }
+                                clicked => { Ui.pair-again-started(Ui.device-id); root.open-add(Ui.device.phone ? 0 : 1); }
                             }
                         }
                     }
@@ -950,6 +956,7 @@ export component PneuWindow inherits Window {
                         select(i) => { Ui.download = false; Ui.add-tab = i; Ui.navigated(); }
                     }
                     if Ui.paired != "": Done {
+                        reserved-bottom: root.replacement-space;
                         height: root.pairing-height + (Ui.add-tab == 0 ? root.phone-link-height : 0px); name: Ui.paired;
                         detail: Ui.paired-detail; only: Ui.paired-only;
                     }
@@ -1085,7 +1092,7 @@ export component PneuWindow inherits Window {
                 if Ui.is-mac && Ui.page == Page.scan: VerticalLayout {
                     spacing: 12px;
                     Header { title: "Scan QR Code"; go-back => { root.back(); } }
-                    if Ui.paired != "": Done { height: root.pairing-height; name: Ui.paired; detail: Ui.paired-detail; only: Ui.paired-only; }
+                    if Ui.paired != "": Done { reserved-bottom: root.replacement-space; height: root.pairing-height; name: Ui.paired; detail: Ui.paired-detail; only: Ui.paired-only; }
                     if Ui.paired == "" && (Ui.scan-state == ScanState.requesting || Ui.scan-state == ScanState.scanning): VerticalLayout {
                         spacing: 12px;
                         Rectangle {
@@ -1155,7 +1162,7 @@ export component PneuWindow inherits Window {
                     if Ui.code-state == CodeState.pairing: Busy {
                         height: root.pairing-height; motion: Ui.motion; text: "Pairing with " + Ui.pairing + "…";
                     }
-                    if Ui.code-state == CodeState.paired: Done { height: root.pairing-height; name: Ui.paired; detail: Ui.paired-detail; only: Ui.paired-only; }
+                    if Ui.code-state == CodeState.paired: Done { reserved-bottom: root.replacement-space; height: root.pairing-height; name: Ui.paired; detail: Ui.paired-detail; only: Ui.paired-only; }
                 }
 
                 if Ui.page == Page.history && Ui.keep-history: VerticalLayout {
@@ -1517,6 +1524,7 @@ export component PneuWindow inherits Window {
             }
         }
         if Ui.dialog == Dialog.message: PopupCard {
+            low: Ui.message.action == "replace-device";
             card-width: 352px;
             limit: root.height - 32px;
             if Ui.message.tile != 0: HorizontalLayout {
@@ -1537,12 +1545,12 @@ export component PneuWindow inherits Window {
                 spacing: 8px; alignment: end;
                 if Ui.message.secondary != "": PneuButton { dialog-control: true;
                     text: Ui.message.secondary;
-                    autofocus: true;
+                    autofocus: Ui.message.action != "replace-device";
                     clicked => { Ui.dialog = Dialog.none; Ui.message-action(Ui.message.action, false); keys.focus(); }
                 }
                 PneuButton { dialog-control: true;
                     text: Ui.message.primary; kind: ButtonKind.primary;
-                    autofocus: Ui.message.secondary == "";
+                    autofocus: Ui.message.secondary == "" || Ui.message.action == "replace-device";
                     clicked => {
                         Ui.dialog = Dialog.none;
                         if Ui.message.action == "join-confirm" { Ui.confirm-join(Ui.link-on && !Ui.link-full); }
@@ -1598,7 +1606,7 @@ export component PneuWindow inherits Window {
                                 VerticalLayout {
                                     alignment: center; horizontal-stretch: 1;
                                     Text { text: recipient.name; font-weight: 600; color: Pneu.text; overflow: elide; }
-                                    Text { text: recipient.detail; font-size: Pneu.label-size; color: recipient.tone == Tone.danger ? Pneu.danger : Pneu.text2; wrap: word-wrap; }
+                                    Text { text: recipient.detail; font-size: Pneu.label-size; color: recipient.tone == Tone.danger ? Pneu.danger : recipient.tone == Tone.warn ? Pneu.warn : Pneu.text2; wrap: word-wrap; }
                                     if recipient.progress >= 0: ProgressBar { value: recipient.progress; }
                                 }
                                 if recipient.can-retry: VerticalLayout { alignment: center;

@@ -69,6 +69,7 @@ pub(crate) struct SetupDelta {
     pub added: Vec<Id>,
     pub removed: Vec<Id>,
     pub tombstones: Vec<(Id, Hash)>,
+    pub(super) settings: Vec<(Id, Vec<pneu_proto::PeerSetting>)>,
     pub reconnect: bool,
     pub reconnect_peer: Option<Id>,
     pub withdrawn: bool,
@@ -620,7 +621,7 @@ impl Store {
 
     /// Every externally visible peer/cache change is published after COMMIT in
     /// this blocking continuation. Canceling its async caller cannot skip it.
-    async fn setup_write<T: Send + 'static>(
+    pub(super) async fn setup_write<T: Send + 'static>(
         &self,
         edit: impl FnOnce(&Transaction<'_>, &mut SetupDelta) -> Result<T> + Send + 'static,
         finish: impl FnOnce(SetupDelta) + Send + 'static,
@@ -647,12 +648,27 @@ impl Store {
                         })
                         .collect::<Result<HashMap<_, _>>>()?
                 };
+                let replacements = replacement::pending(&tx)?;
                 // Lock order matches the ordinary lifecycle (DB -> caches).
                 let mut cached = s.setup.lock().expect("setup");
                 let mut epochs = s.generations.lock().expect("peer generations");
                 let mut policy = s.pair_settings.lock().expect("pair settings");
                 let mut remote_scopes = s.setup_remote_scopes.lock().expect("remote setup scopes");
+                let mut offers = s.replacements.lock().expect("replacement offers");
+                let settings_changed = !delta.settings.is_empty() || *offers != replacements;
                 tx.commit()?;
+                for (id, fields) in delta.settings.drain(..) {
+                    policy.insert(id.clone(), fields);
+                    let mut revisions =
+                        s.settings_generations.lock().expect("settings generations");
+                    let revision = revisions.entry(id).or_default();
+                    *revision = revision.wrapping_add(1);
+                }
+                *offers = replacements;
+                drop(offers);
+                if settings_changed {
+                    s.settings_changed.send_modify(|n| *n = n.wrapping_add(1));
+                }
                 let previous_scopes = remote_scopes.clone();
                 if let Some((device, scope)) = delta.remote_scope.take()
                     && let Some(generation) = generations.get(&device)
@@ -1127,47 +1143,7 @@ impl Store {
         finish: impl FnOnce(SetupDelta) + Send + 'static,
     ) -> Result<()> {
         self.setup_write(
-            move |tx, delta| {
-                let s = state(tx)?;
-                ensure!(!s.withdrawn, "withdrawn setup");
-                let id = s.setup_id.context("no setup")?;
-                let member = s
-                    .roster
-                    .into_iter()
-                    .find(|m| m.device_id == device && m.status == MemberStatus::Member)
-                    .context("not an active setup member")?;
-                ensure!(device != local, "cannot remove own identity");
-                let mut removed = member;
-                removed.status = MemberStatus::Removed;
-                removed.reach = None;
-                removed.readmits = None;
-                removed.hlc = match now {
-                    Some(now) => allocate_stamp_at(tx, now)?.1,
-                    None => allocate_stamp(tx)?.1,
-                };
-                removed.writer_device = local.clone();
-                save_entry(
-                    tx,
-                    &Entry {
-                        ready_generation: None,
-                        readmission: None,
-                        admitted_hlc: None,
-                        joined_notice: None,
-                        value: removed.clone(),
-                        removal: Some(removed.clone()),
-                        denied: true,
-                        authored: true,
-                        revoked_binding: true,
-                        setup_id: Some(id),
-                    },
-                )?;
-                delta
-                    .tombstones
-                    .push((removed.device_id.clone(), removed.fingerprint.clone()));
-                forget(tx, &removed.device_id, &removed.fingerprint, delta)?;
-                dissolve_if_last(tx, &local, delta)?;
-                validate_capacity(tx)
-            },
+            move |tx, delta| remove(tx, &local, &device, now, delta),
             finish,
         )
         .await
@@ -1856,4 +1832,53 @@ impl Store {
             Ok(())
         },finish).await
     }
+}
+
+/// The ordinary authored removal, shared by explicit removal and local reinstall replacement.
+pub(super) fn remove(
+    tx: &Transaction<'_>,
+    local: &Id,
+    device: &Id,
+    now: Option<u64>,
+    delta: &mut SetupDelta,
+) -> Result<()> {
+    let s = state(tx)?;
+    ensure!(!s.withdrawn, "withdrawn setup");
+    let id = s.setup_id.context("no setup")?;
+    let member = s
+        .roster
+        .into_iter()
+        .find(|m| m.device_id == *device && m.status == MemberStatus::Member)
+        .context("not an active setup member")?;
+    ensure!(device != local, "cannot remove own identity");
+    let mut removed = member;
+    removed.status = MemberStatus::Removed;
+    removed.reach = None;
+    removed.readmits = None;
+    removed.hlc = match now {
+        Some(now) => allocate_stamp_at(tx, now)?.1,
+        None => allocate_stamp(tx)?.1,
+    };
+    removed.writer_device = local.clone();
+    save_entry(
+        tx,
+        &Entry {
+            ready_generation: None,
+            readmission: None,
+            admitted_hlc: None,
+            joined_notice: None,
+            value: removed.clone(),
+            removal: Some(removed.clone()),
+            denied: true,
+            authored: true,
+            revoked_binding: true,
+            setup_id: Some(id),
+        },
+    )?;
+    delta
+        .tombstones
+        .push((removed.device_id.clone(), removed.fingerprint.clone()));
+    forget(tx, &removed.device_id, &removed.fingerprint, delta)?;
+    dissolve_if_last(tx, local, delta)?;
+    validate_capacity(tx)
 }
