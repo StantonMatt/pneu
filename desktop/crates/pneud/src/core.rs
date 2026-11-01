@@ -2017,6 +2017,9 @@ impl Core {
         self.send_observed_formats(self.explicit_clipboard_offer_for(device)?, Some(text), None)
             .await
     }
+    pub(crate) async fn notify_clipboard_too_large(&self) -> Result<()> {
+        self.actions.notify_clipboard_too_large().await
+    }
     pub async fn share_clipboard(&self, targets: crate::outbox::Targets) -> Result<Id> {
         let mut offer = {
             // Match the displayed pairing as well as the frozen offer's binding.
@@ -2251,6 +2254,10 @@ impl Core {
     #[cfg(any(target_os = "macos", windows))]
     pub(crate) fn retire_clipboard_observation(&self, token: u64) {
         self.clipboard.event(ClipboardEvent::AbandonRead(token));
+    }
+    pub(crate) fn clipboard_image_too_large(&self, token: u64, fingerprint: [u8; 32]) {
+        self.clipboard
+            .event(ClipboardEvent::ImageTooLarge { token, fingerprint });
     }
     pub(crate) fn clipboard_observed(
         &self,
@@ -12134,6 +12141,7 @@ mod tests {
                 request_id: None,
             },
             crate::ipc::Command::SendClipboard {
+                notify_too_large: false,
                 targets: crate::outbox::Targets::All("all".into()),
             },
         ] {

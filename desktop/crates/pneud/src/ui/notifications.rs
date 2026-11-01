@@ -178,7 +178,7 @@ impl Notice {
         n.actions.push(("pair", "Add Device…"));
         n
     }
-    /// With more than one paired device, arrivals say where they came from:
+    /// File arrivals always say where they came from:
     /// "From Galaxy S25+ · Copied to clipboard".
     pub fn from_device(mut self, device: &str) -> Self {
         let from = format!("From {}", escape(&label(device)));
@@ -193,6 +193,14 @@ impl Notice {
     pub fn copied_from(mut self, device: &str) -> Self {
         self.summary = format!("Copied from {}", label(device));
         self
+    }
+    pub fn image_too_large() -> Self {
+        let mut n = Self::new("Image too large to send");
+        n.body = "The limit for copied images is 20 MB.".into();
+        n.urgency = 0;
+        n.transient = true;
+        n.expires = 4000;
+        n
     }
     /// Short, transient: "report.pdf sent to 2 devices".
     pub fn sent(file: &str, devices: &[String]) -> Self {
@@ -271,6 +279,19 @@ mod tests {
             created_at: 0,
             source_media_id: None,
         }
+    }
+    #[test]
+    fn oversized_image_notice_is_quiet_transient_and_actionless() {
+        let n = Notice::image_too_large();
+        assert_eq!(
+            (n.summary.as_str(), n.body.as_str()),
+            (
+                "Image too large to send",
+                "The limit for copied images is 20 MB."
+            )
+        );
+        assert_eq!((n.urgency, n.transient, n.expires), (0, true, 4000));
+        assert!(n.actions.is_empty() && n.urls.is_empty());
     }
     #[test]
     fn blocked_copy_is_device_neutral_and_decision_actions_are_negative_first() {

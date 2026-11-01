@@ -439,7 +439,10 @@ async fn outbox_cli_and_ipc_validate_paths_and_persist_settings() -> Result<()> 
             targets: all(),
             request_id: None,
         },
-        pneud::ipc::Command::SendClipboard { targets: all() },
+        pneud::ipc::Command::SendClipboard {
+            targets: all(),
+            notify_too_large: false,
+        },
         #[cfg(target_os = "macos")]
         pneud::ipc::desktop_send_command(&[path.to_str().unwrap().into()]),
         #[cfg(target_os = "macos")]

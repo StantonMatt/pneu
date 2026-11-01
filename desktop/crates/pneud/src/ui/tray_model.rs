@@ -36,7 +36,11 @@ pub(crate) fn status(snapshot: &Snapshot, peers: &[Peer], transfers: &[Transfer]
         if one.paused() {
             format!("{} paused sending", one.name)
         } else if let (true, Some(route)) = (one.connected(), &one.route) {
-            format!("{} connected over {route}", one.name)
+            format!(
+                "{} connected over {}",
+                one.name,
+                super::route_in_sentence(route)
+            )
         } else if one.connected() {
             format!("{} connected", one.name)
         } else if one.lost() {
@@ -56,6 +60,26 @@ pub(crate) fn status(snapshot: &Snapshot, peers: &[Peer], transfers: &[Transfer]
     } else {
         format!("{} of {} devices connected", connected.len(), peers.len())
     }
+}
+/// A single device has one tooltip line, with active status taking precedence.
+pub(crate) fn tooltip_lines(
+    snapshot: &Snapshot,
+    peers: &[Peer],
+    transfers: &[Transfer],
+) -> Vec<String> {
+    let leads = snapshot.error.is_some()
+        || snapshot.pairing.is_some()
+        || peers.is_empty()
+        || peers.iter().any(|p| p.sending() || p.receiving())
+        || (snapshot.receiving && snapshot.connected);
+    if leads && peers.len() <= 1 {
+        return vec![status(snapshot, peers, transfers)];
+    }
+    let mut lines: Vec<_> = peers.iter().map(Peer::short).collect();
+    if leads {
+        lines.insert(0, status(snapshot, peers, transfers));
+    }
+    lines
 }
 pub(crate) fn icon(snapshot: &Snapshot, peers: &[Peer]) -> &'static str {
     if snapshot.error.is_some() {
@@ -314,10 +338,22 @@ pub(super) fn menu(snapshot: &Snapshot, config: &crate::Config) -> Vec<MenuEntry
                 ));
             }
         }
-        items.push(Submenu {
-            label: "Send Files To".into(),
-            items: targets,
-        });
+        if let [one] = peers.as_slice() {
+            if let Ok(device) = pneu_proto::Id::new(&one.id) {
+                items.push(item(
+                    "Send Files…",
+                    Command::SendFiles {
+                        recipients: recipients(Some(&device)),
+                        targeted: true,
+                    },
+                ));
+            }
+        } else {
+            items.push(Submenu {
+                label: "Send Files To".into(),
+                items: targets,
+            });
+        }
         let value = serde_json::to_value(config).unwrap_or_default();
         let mode = ClipboardMode::from_config(
             Some(&value["clipboard_mode"]).filter(|v| !v.is_null()),
@@ -389,6 +425,34 @@ mod tests {
     use super::super::{Command, Toggle, window::peers};
     use super::*;
 
+    #[test]
+    fn one_device_tooltip_has_one_line_and_multiple_devices_keep_each_line() {
+        let mut snap = Snapshot {
+            devices: (1..=2)
+                .map(|n| crate::core::mesh::DeviceSnapshot {
+                    device: pneu_proto::Id::from_bytes([n; 16]),
+                    name: format!("Device {n}"),
+                    role: "computer".into(),
+                    state: "connected".into(),
+                    last_seen: 0,
+                    dialer: None,
+                    route: Some("Local network".into()),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(tooltip_lines(&snap, &peers(&snap, &[]), &[]).len(), 2);
+        snap.devices.pop();
+        assert_eq!(
+            tooltip_lines(&snap, &peers(&snap, &[]), &[]),
+            ["Device 1 · Local network"]
+        );
+        snap.error = Some(super::super::ReceiveError::Port(53317));
+        assert_eq!(
+            tooltip_lines(&snap, &peers(&snap, &[]), &[]),
+            [snap.error.as_ref().unwrap().tooltip()]
+        );
+    }
     #[test]
     fn menu_projects_unpaired_and_paired_settings_and_captures_authority() {
         let mut snapshot = Snapshot::default();
@@ -464,7 +528,7 @@ mod tests {
             [
                 "---",
                 "Open Pneu",
-                "Send Files To",
+                "Send Files…",
                 "Open Received Files",
                 "---",
                 "Clipboard",
@@ -481,7 +545,7 @@ mod tests {
             [
                 "---",
                 "Open Pneu",
-                "Send Files To",
+                "Send Files…",
                 "Send Clipboard",
                 "Open Received Files",
                 "---",
@@ -495,16 +559,11 @@ mod tests {
         );
         let files = entries
             .iter()
-            .find_map(|item| match item {
-                MenuEntry::Submenu { label, items } if label == "Send Files To" => Some(items),
-                _ => None,
-            })
+            .find(|entry| matches!(entry, MenuEntry::Item {label,..} if label == "Send Files…"))
             .unwrap();
         assert!(
-            matches!(&files[0], MenuEntry::Item { command: Some(Command::SendFiles { recipients, targeted: false }), .. } if recipients.len() == 1 && recipients[0].generation == 7)
-        );
-        assert!(
-            matches!(&files[2], MenuEntry::Item { command: Some(Command::SendFiles { recipients, targeted: true }), .. } if recipients[0].device == device)
+            matches!(files, MenuEntry::Item { command: Some(Command::SendFiles { recipients, targeted: true }), .. }
+            if recipients.len() == 1 && recipients[0].device == device && recipients[0].generation == 7)
         );
         let clipboard = entries
             .iter()
@@ -528,8 +587,18 @@ mod tests {
         // it even after a peer is removed or paired again before activation.
         snapshot.send_targets[0].generation = 8;
         assert!(
-            matches!(&files[2], MenuEntry::Item { command: Some(Command::SendFiles { recipients, .. }), .. } if recipients[0].generation == 7)
+            matches!(files, MenuEntry::Item { command: Some(Command::SendFiles { recipients, .. }), .. } if recipients[0].generation == 7)
         );
+        snapshot.devices[0].state = "disconnected".into();
+        snapshot.send_targets[0].would_queue = true;
+        assert!(menu(&snapshot, &config).iter().any(|entry| matches!(entry, MenuEntry::Item { label, command: Some(Command::SendFiles {recipients,targeted:true}),.. } if label == "Send Files…" && recipients.len() == 1)));
+        let mut second = snapshot.devices[0].clone();
+        second.device = pneu_proto::Id::from_bytes([2; 16]);
+        second.name = "Second computer".into();
+        snapshot.devices.push(second);
+        assert!(menu(&snapshot, &config).iter().any(
+            |entry| matches!(entry, MenuEntry::Submenu {label,..} if label == "Send Files To")
+        ));
     }
 
     #[test]

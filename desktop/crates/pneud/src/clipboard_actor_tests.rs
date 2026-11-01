@@ -86,13 +86,16 @@ impl Compositor {
     fn effects(&mut self, effects: Vec<Effect>) {
         for effect in effects {
             match effect {
+                Effect::ImageTooLarge { fingerprint, .. } => {
+                    self.state.image_notice_posted(fingerprint)
+                }
                 Effect::RecordHistory { .. } => {}
                 Effect::PairingLink(_) => {}
                 Effect::LoadShare { token, payload } => self.pending.push_back(Event::ShareReady {
                     token,
                     content: match payload.as_ref() {
-                        Payload::Content(content) => Some(content.clone()),
-                        _ => None,
+                        Payload::Content(content) => Ok(content.clone()),
+                        _ => Err(Failure::Clipboard),
                     },
                 }),
                 Effect::Clock { token, floor } => {
@@ -1158,7 +1161,7 @@ fn randomized_interleavings(mut seed: u64, seconds: u64, case_limit: u64) {
                 }
                 21 => Event::ShareReady {
                     token: 1_000_000 + token,
-                    content: Some(content("stale share")),
+                    content: Ok(content("stale share")),
                 },
                 7 => Event::Narrow(id(if seed & 128 == 0 { 2 } else { 3 })),
                 8 => Event::Policy {
@@ -2752,7 +2755,7 @@ fn manual_queued_share_keeps_captured_identity_through_clock_and_incoming() {
     for token in [20, 21] {
         model.event(Event::ShareReady {
             token,
-            content: Some(content("human")),
+            content: Ok(content("human")),
         });
     }
     model.event(Event::Submit(remote(30, 2, model.clock + 10, "remote")));
@@ -2777,7 +2780,7 @@ fn manual_clocking_share_is_cancelled_by_new_physical_selection() {
     });
     model.event(Event::ShareReady {
         token: 20,
-        content: Some(content("first")),
+        content: Ok(content("first")),
     });
     model.copy(30, Some(content("second")), &[2]);
     model.settle();
@@ -2884,7 +2887,7 @@ fn manual_changed_image_bytes_are_rejected_before_clocking() {
     });
     model.event(Event::ShareReady {
         token: 20,
-        content: Some(Content::Image(vec![4, 5, 6])),
+        content: Ok(Content::Image(vec![4, 5, 6])),
     });
     model.settle();
     assert_eq!(model.state.register, register);
@@ -3100,4 +3103,223 @@ async fn history_reversed_read_completions_keep_copy_order_after_restart() -> an
         .await?;
     assert_eq!(store.history_items()[0].title, "C");
     Ok(())
+}
+
+fn oversized_read(
+    state: &mut State,
+    token: u64,
+    fingerprint: u8,
+    offer: Option<ClipboardOffer>,
+    origin: bool,
+) -> Vec<Effect> {
+    state.step(Event::Observe {
+        token,
+        id: id(token as u8),
+        offer,
+        origin,
+        clear: false,
+        history: None,
+    });
+    state.step(Event::ImageTooLarge {
+        token,
+        fingerprint: [fingerprint; 32],
+    });
+    state.step(Event::Read {
+        token,
+        content: None,
+        fingerprints: Vec::new(),
+        debounce: false,
+    })
+}
+#[test]
+fn oversized_notice_requires_automatic_image_recipient_and_deduplicates_last_image() {
+    for mode in [
+        ClipboardMode::Off,
+        ClipboardMode::Manual,
+        ClipboardMode::Automatic,
+    ] {
+        for recipients in [false, true] {
+            for images in [false, true] {
+                for origin in [false, true] {
+                    let mut state = State::default();
+                    state.step(Event::Mode(mode));
+                    let mut target = offer(10, if recipients { &[2] } else { &[] });
+                    for r in &mut target.recipients {
+                        r.image = images;
+                    }
+                    let effects = oversized_read(&mut state, 10, 1, Some(target), origin);
+                    assert_eq!(
+                        effects
+                            .iter()
+                            .any(|e| matches!(e, Effect::ImageTooLarge { .. })),
+                        mode == ClipboardMode::Automatic && recipients && images && !origin
+                    );
+                }
+            }
+        }
+    }
+    let mut state = State::default();
+    state.step(Event::Mode(ClipboardMode::Automatic));
+    for (token, fingerprint, expected) in
+        [(10, 1, true), (20, 1, false), (30, 2, true), (40, 2, false)]
+    {
+        let effects = oversized_read(
+            &mut state,
+            token,
+            fingerprint,
+            Some(offer(token, &[2])),
+            false,
+        );
+        assert_eq!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::ImageTooLarge { .. })),
+            expected
+        );
+        if expected {
+            state.image_notice_posted([fingerprint; 32]);
+        }
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::RecordHistory { .. }))
+        );
+    }
+    // A recipient revoked at delivery does not consume the deduplication key.
+    let mut state = State::default();
+    state.step(Event::Mode(ClipboardMode::Automatic));
+    for token in [10, 20] {
+        assert!(
+            oversized_read(&mut state, token, 1, Some(offer(token, &[2])), false)
+                .iter()
+                .any(|e| matches!(e, Effect::ImageTooLarge { .. }))
+        );
+    }
+    // A history-only observation never emits or consumes the once-per-image notice.
+    let mut state = State::default();
+    state.step(Event::Mode(ClipboardMode::Automatic));
+    assert!(
+        !oversized_read(&mut state, 10, 1, None, false)
+            .iter()
+            .any(|e| matches!(e, Effect::ImageTooLarge { .. }))
+    );
+    assert!(
+        oversized_read(&mut state, 20, 1, Some(offer(20, &[2])), false)
+            .iter()
+            .any(|e| matches!(e, Effect::ImageTooLarge { .. }))
+    );
+}
+#[test]
+fn manual_oversized_share_reports_too_large_each_attempt_and_new_copy_clears_it() {
+    let mut state = State::default();
+    state.step(Event::Mode(ClipboardMode::Manual));
+    assert!(
+        !oversized_read(&mut state, 10, 1, Some(offer(10, &[2])), false)
+            .iter()
+            .any(|e| matches!(e, Effect::ImageTooLarge { .. }))
+    );
+    for token in [20, 30] {
+        assert!(
+            state
+                .step(Event::Share {
+                    token,
+                    id: id(token as u8),
+                    source: id(1),
+                    offer: offer(token, &[2])
+                })
+                .iter()
+                .any(|e| matches!(
+                    e,
+                    Effect::Reply {
+                        failure: Some(Failure::TooLarge),
+                        ..
+                    }
+                ))
+        );
+    }
+    state.step(Event::Observe {
+        token: 40,
+        id: id(40),
+        offer: None,
+        origin: false,
+        clear: true,
+        history: None,
+    });
+    assert!(!state.os_image_too_large);
+}
+
+#[test]
+fn manual_mixed_oversized_image_offer_shares_eligible_text() {
+    for (text, image) in [(true, false), (true, true), (false, true)] {
+        let mut model = Compositor::default();
+        model.event(Event::Mode(ClipboardMode::Manual));
+        model.event(Event::Observe {
+            token: 10,
+            id: id(10),
+            offer: None,
+            origin: false,
+            clear: false,
+            history: None,
+        });
+        model.event(Event::ImageTooLarge {
+            token: 10,
+            fingerprint: [1; 32],
+        });
+        // The adapter retains valid text while omitting the oversized image.
+        model.event(Event::Read {
+            token: 10,
+            content: Some(content("valid text")),
+            fingerprints: Vec::new(),
+            debounce: false,
+        });
+        model.settle();
+        let mut target = offer(20, &[2]);
+        target.recipients[0].text = text;
+        target.recipients[0].image = image;
+        model.event(Event::Share {
+            token: 20,
+            id: id(20),
+            source: id(1),
+            offer: target,
+        });
+        model.settle();
+        if text {
+            assert_eq!(model.replies[&20].1, None, "include images: {image}");
+            assert_eq!(model.published.len(), 1);
+            assert_eq!(model.published[0].content, Some(content("valid text")));
+            let recipients = &model.published[0].offer.as_ref().unwrap().recipients;
+            assert_eq!(recipients.len(), 1);
+            assert!(recipients[0].text);
+            assert!(!recipients[0].image);
+        } else {
+            assert_eq!(model.replies[&20].1, Some(Failure::TooLarge));
+            assert!(model.published.is_empty());
+        }
+    }
+}
+
+#[test]
+fn manual_share_load_failure_keeps_too_large_reason() {
+    let mut model = Compositor::default();
+    model.copy(10, Some(content("human")), &[2]);
+    model.settle();
+    model.event(Event::Mode(ClipboardMode::Manual));
+    model.state.step(Event::Share {
+        token: 20,
+        id: id(20),
+        source: id(1),
+        offer: offer(20, &[2]),
+    });
+    let effects = model.state.step(Event::ShareReady {
+        token: 20,
+        content: Err(Failure::TooLarge),
+    });
+    assert!(effects.iter().any(|e| matches!(
+        e,
+        Effect::Reply {
+            token: 20,
+            failure: Some(Failure::TooLarge),
+            ..
+        }
+    )));
 }

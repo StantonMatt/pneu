@@ -1,13 +1,11 @@
 //! Win32 clipboard adapter. The watcher owns actor observations; provider reads
 //! run in a killable child and publication is one OpenClipboard transaction.
-#[path = "clipboard_content.rs"]
-mod content;
+pub use super::clipboard_content::{Content, MAX_IMAGE};
 use super::{
     pasteboard_reader::{Reader, ticket},
     windows_clipboard_content::*,
 };
 use anyhow::{Context, Result, ensure};
-pub use content::{Content, MAX_IMAGE};
 use sha2::{Digest, Sha256};
 use std::{
     ptr::{null, null_mut},
@@ -270,6 +268,7 @@ impl std::fmt::Display for ReadAbort {
     }
 }
 impl std::error::Error for ReadAbort {}
+type PngRead = (Option<Vec<u8>>, Option<[u8; 32]>);
 struct ReadGuard {
     sequence: u32,
     history: Option<u32>,
@@ -287,6 +286,28 @@ impl ReadGuard {
             return Err(ReadAbort(SnapshotStatus::Sensitive).into());
         }
         Ok(())
+    }
+    fn png(&self, id: u32) -> Result<PngRead> {
+        let memory = unsafe { GetClipboardData(id) };
+        self.check()?;
+        ensure!(!memory.is_null(), "clipboard format unavailable");
+        let size = unsafe { GlobalSize(memory) };
+        if size <= MAX_IMAGE {
+            return Ok((Some(copy_memory(memory, MAX_IMAGE)?), None));
+        }
+        let pointer = unsafe { GlobalLock(memory) };
+        ensure!(!pointer.is_null(), "lock clipboard format");
+        // The helper is killable and the HGLOBAL remains locked until hashing
+        // finishes. Never copy an oversized provider buffer into the IPC result.
+        let bytes = unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), size) };
+        let fingerprint = bytes
+            .starts_with(b"\x89PNG\r\n\x1a\n")
+            .then(|| Sha256::digest(bytes).into());
+        unsafe {
+            GlobalUnlock(memory);
+        }
+        self.check()?;
+        Ok((None, fingerprint))
     }
     fn optional(&self, id: u32, cap: usize) -> Result<Option<Vec<u8>>> {
         match get_checked(id, cap, self) {
@@ -625,7 +646,16 @@ fn read_snapshot(sequence: u32, marker: bool, images: bool) -> Result<Snapshot> 
             if images {
                 let png_format = format("PNG")?;
                 if meta.formats.contains(&png_format) {
-                    image = guard.optional(png_format, MAX_IMAGE)?.filter(|b| {
+                    let (png, oversized) = match guard.png(png_format) {
+                        Ok(value) => value,
+                        Err(error) if error.is::<ReadAbort>() => return Err(error),
+                        Err(_) => {
+                            guard.check()?;
+                            (None, None)
+                        }
+                    };
+                    result.oversized = oversized;
+                    image = png.filter(|b| {
                         b.starts_with(b"\x89PNG\r\n\x1a\n")
                             && crate::actions::decode_image(b).is_ok()
                     });
@@ -633,15 +663,24 @@ fn read_snapshot(sequence: u32, marker: bool, images: bool) -> Result<Snapshot> 
                 if image.is_none() {
                     for id in [DIBV5, DIB] {
                         if meta.formats.contains(&id) {
-                            image = guard
-                                .optional(id, MAX_DIB)?
-                                .and_then(|b| dib_to_png(&b).ok());
+                            if let Some(bytes) = guard.optional(id, MAX_DIB)? {
+                                match dib_to_png(&bytes) {
+                                    Ok(png) => image = Some(png),
+                                    Err(error) if error.is::<crate::actions::ImageTooLarge>() => {
+                                        result.oversized = Some(Sha256::digest(&bytes).into());
+                                    }
+                                    Err(_) => {}
+                                }
+                            }
                             if image.is_some() {
                                 break;
                             }
                         }
                     }
                 }
+            }
+            if image.is_some() {
+                result.oversized = None;
             }
             result.content = combine(text, image);
         }
@@ -784,9 +823,11 @@ fn poll(
             completed: false,
         };
         pending.take();
-        if let Err(error) =
-            next.start(core.config().clipboard_include_images || core.config().clipboard_history)
-        {
+        if let Err(error) = next.start(
+            core.config().clipboard_include_images
+                || core.config().clipboard_history
+                || core.config().clipboard_mode == crate::config::ClipboardMode::Manual,
+        ) {
             next.finish(core, None, false);
             return Err(error);
         }
@@ -842,9 +883,11 @@ fn service_pending(
             // An unknown/retired or foreign marker does not hide local content.
             // Keep the original token, frozen policy, cancellation and deadline.
             read.marker = false;
-            if let Err(error) = read
-                .start(core.config().clipboard_include_images || core.config().clipboard_history)
-            {
+            if let Err(error) = read.start(
+                core.config().clipboard_include_images
+                    || core.config().clipboard_history
+                    || core.config().clipboard_mode == crate::config::ClipboardMode::Manual,
+            ) {
                 read.finish(core, None, false);
                 return Err(error);
             }
@@ -853,6 +896,9 @@ fn service_pending(
     } else {
         if result.content.is_some() {
             eprintln!("pneud: clipboard observed sequence={sequence}");
+        }
+        if let Some(fingerprint) = result.oversized {
+            core.clipboard_image_too_large(read.token, fingerprint);
         }
         read.finish(core, result.content, true);
     }

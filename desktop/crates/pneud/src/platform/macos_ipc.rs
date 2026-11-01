@@ -293,6 +293,7 @@ mod ui_capability_tests {
                 request_id: None,
             },
             Command::SendClipboard {
+                notify_too_large: false,
                 targets: crate::outbox::Targets::All("all".into()),
             },
         ] {

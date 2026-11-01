@@ -72,6 +72,8 @@ pub(super) struct ReadResult<C> {
     pub marker: Option<String>,
     pub content: Option<C>,
     pub fingerprints: Vec<[u8; 32]>,
+    #[serde(default)]
+    pub oversized: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -465,6 +467,7 @@ mod tests {
             }
         }
         let result = ReadResult {
+            oversized: None,
             marker: None,
             content: Some(super::super::clipboard::Content::Formats(
                 "\u{1}".repeat(crate::store::history::MAX_TEXT),
@@ -513,6 +516,7 @@ mod tests {
     }
     fn result_command(_: isize, phase: Phase) -> Result<Command> {
         let result = ReadResult {
+            oversized: None,
             marker: (phase != Phase::Payload).then(|| format!("{:032x}", 42)),
             content: (phase == Phase::Payload).then(|| "human copy".to_owned()),
             fingerprints: Vec::new(),
@@ -657,6 +661,7 @@ mod tests {
                 .change(17, Phase::InitialMarker)
                 .start(|_, _| {
                     Ok(output(&serde_json::to_string(&ReadResult::<String> {
+                        oversized: None,
                         marker: marker.map(str::to_owned),
                         content: None,
                         fingerprints: Vec::new(),

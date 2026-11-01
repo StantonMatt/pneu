@@ -13,6 +13,14 @@ use tokio::sync::{oneshot, watch};
 #[path = "clipboard_mailbox.rs"]
 mod mailbox;
 
+fn failure_error(failure: Failure) -> anyhow::Error {
+    match failure {
+        Failure::TooLarge => crate::actions::ImageTooLarge.into(),
+        Failure::Clipboard => anyhow!("clipboard unavailable"),
+        Failure::Storage => crate::store::ClipboardStorageFailure.into(),
+        Failure::Cancelled => anyhow!("clipboard operation cancelled"),
+    }
+}
 #[derive(Debug)]
 pub(in crate::core) struct Outcome {
     pub deduplicated: bool,
@@ -237,6 +245,19 @@ impl Driver {
                 continue;
             };
             match effect {
+                Effect::ImageTooLarge { fingerprint, offer } => {
+                    if offer
+                        .recipients
+                        .iter()
+                        .any(|r| r.image && core.automatic_recipient_current(&r.target))
+                        && core.config().clipboard_mode == crate::config::ClipboardMode::Automatic
+                    {
+                        self.state.image_notice_posted(fingerprint);
+                        self.spawn(Vec::new(), async move {
+                            let _ = core.actions.notify_clipboard_too_large().await;
+                        });
+                    }
+                }
                 Effect::RecordHistory { content, capture } => {
                     // Keep one active write and only the latest waiting payload.
                     // Never block the actor control lane on history storage.
@@ -274,7 +295,7 @@ impl Driver {
                     let job = self.spawn(
                         vec![Event::ShareReady {
                             token,
-                            content: None,
+                            content: Err(Failure::Clipboard),
                         }],
                         async move {
                             let content = outbox
@@ -293,8 +314,17 @@ impl Driver {
                                             ..
                                         }) => Content::Formats(text.clone(), png.clone()),
                                         Payload::Input(ClipboardInput::Image(file, mime)) => {
-                                            let mut bytes =
-                                                file.read_bounded(crate::ui::clipboard::MAX_IMAGE)?;
+                                            let mut bytes = file
+                                                .read_bounded(crate::ui::clipboard::MAX_IMAGE)
+                                                .map_err(|error| {
+                                                    if error
+                                                        .is::<crate::actions::BoundedReadLimit>()
+                                                    {
+                                                        anyhow!(crate::actions::ImageTooLarge)
+                                                    } else {
+                                                        error
+                                                    }
+                                                })?;
                                             if mime != "image/png" {
                                                 let mut png = std::io::Cursor::new(Vec::new());
                                                 crate::actions::decode_image(&bytes)?
@@ -303,14 +333,35 @@ impl Driver {
                                             }
                                             anyhow::ensure!(
                                                 bytes.len() <= crate::ui::clipboard::MAX_IMAGE,
-                                                "clipboard image too large"
+                                                crate::actions::ImageTooLarge
                                             );
                                             Content::Image(bytes)
                                         }
                                     })
                                 })
                                 .await
-                                .ok();
+                                .and_then(|content| {
+                                    let image = match &content {
+                                        Content::Image(bytes) | Content::Formats(_, bytes) => {
+                                            Some(bytes)
+                                        }
+                                        _ => None,
+                                    };
+                                    anyhow::ensure!(
+                                        image
+                                            .is_none_or(|bytes| bytes.len()
+                                                <= crate::ui::clipboard::MAX_IMAGE),
+                                        crate::actions::ImageTooLarge
+                                    );
+                                    Ok(content)
+                                })
+                                .map_err(|error| {
+                                    if error.is::<crate::actions::ImageTooLarge>() {
+                                        Failure::TooLarge
+                                    } else {
+                                        Failure::Clipboard
+                                    }
+                                });
                             handle.event(Event::ShareReady { token, content });
                         },
                     );
@@ -706,7 +757,9 @@ impl Driver {
                                 deduplicated,
                             })
                         } else {
-                            Err(anyhow!("clipboard cannot be shared"))
+                            Err(failure
+                                .map(failure_error)
+                                .unwrap_or_else(|| anyhow!("clipboard cannot be shared")))
                         });
                     }
                     self.admissions.remove(&token);
@@ -724,13 +777,7 @@ impl Driver {
                                 deduplicated,
                                 applied,
                             }),
-                            Some(Failure::Storage) => {
-                                Err(crate::store::ClipboardStorageFailure.into())
-                            }
-                            Some(Failure::Cancelled) => {
-                                Err(anyhow!("clipboard operation cancelled"))
-                            }
-                            Some(Failure::Clipboard) => Err(anyhow!("clipboard unavailable")),
+                            Some(failure) => Err(failure_error(failure)),
                         };
                         let _ = request.reply.send(result);
                     }

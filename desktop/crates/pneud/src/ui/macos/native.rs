@@ -480,8 +480,30 @@ impl State {
                         true,
                     );
                 }
-                let parent = self.add(&menu, "Send Files To", None, None, true);
-                let _: () = msg_send![&*parent, setSubmenu: &*submenu];
+                if let [one] = peers.as_slice() {
+                    if let Ok(id) = pneu_proto::Id::new(&one.id) {
+                        let captured = crate::file_recipients::resolve(
+                            &self.snapshot.send_targets,
+                            crate::file_recipients::Selection::Explicit(&[id]),
+                        )
+                        .map(|r| r.recipients)
+                        .unwrap_or_default();
+                        self.add(
+                            &menu,
+                            "Send Files…",
+                            Some(MenuAction::Send {
+                                recipients: captured,
+                                targeted: true,
+                                clipboard: false,
+                            }),
+                            None,
+                            true,
+                        );
+                    }
+                } else {
+                    let parent = self.add(&menu, "Send Files To", None, None, true);
+                    let _: () = msg_send![&*parent, setSubmenu: &*submenu];
+                }
                 if self.config.clipboard_mode == crate::config::ClipboardMode::Manual {
                     self.add(
                         &menu,
@@ -604,17 +626,7 @@ impl State {
                 let _: () = msg_send![&*image, setTemplate: Bool::YES];
                 let _: () = msg_send![&*button, setImage: &*image];
             }
-            let mut lines = peers
-                .iter()
-                .map(crate::ui::window::Peer::short)
-                .collect::<Vec<_>>();
-            if lines.is_empty()
-                || self.snapshot.error.is_some()
-                || self.snapshot.pairing.is_some()
-                || peers.iter().any(|p| p.sending() || p.receiving())
-            {
-                lines.insert(0, status);
-            }
+            let lines = crate::ui::tray_model::tooltip_lines(&self.snapshot, &peers, &transfers);
             let _: () = msg_send![&*button, setToolTip: &*NSString::from_str(&lines.join("\n"))];
         }
     }

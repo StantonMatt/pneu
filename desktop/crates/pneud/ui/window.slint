@@ -52,7 +52,7 @@ export struct RecipientItem {
     detail: string, progress: float, can-stop: bool, can-retry: bool,
 }
 
-export struct SettingItem { key: string, label: string, sub: string, on: bool }
+export struct SettingItem { key: string, label: string, sub: string, on: bool, enabled: bool }
 
 export struct PickItem {
     id: string,
@@ -809,7 +809,7 @@ export component PneuWindow inherits Window {
                             VerticalLayout {
                                 for setting[i] in Ui.device-settings: VerticalLayout {
                                     if i > 0: Divider {}
-                                    SwitchRow { enabled: root.device-ready;
+                                    SwitchRow { enabled: root.device-ready && setting.enabled;
                                         label: setting.label; sub: setting.sub; checked: setting.on;
                                         toggled(on) => { Ui.set-peer(setting.key, on); }
                                     }

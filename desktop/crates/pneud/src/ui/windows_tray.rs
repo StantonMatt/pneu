@@ -275,15 +275,12 @@ fn run(
             if next != icon_key && tray.set_icon(Some(icon(next.0, next.1, next.2)?)).is_ok() {
                 icon_key = next;
             }
-            let mut lines: Vec<_> = peers.iter().map(super::window::Peer::short).collect();
-            if snapshot.error.is_some()
-                || snapshot.pairing.is_some()
-                || lines.is_empty()
-                || peers.iter().any(|p| p.sending() || p.receiving())
-            {
-                lines.insert(0, tray_model::status(&snapshot, &peers, &transfers));
-            }
-            let next_tooltip = format!("Pneu\n{}", lines.join("\n"));
+            let lines = tray_model::tooltip_lines(&snapshot, &peers, &transfers);
+            let next_tooltip = if peers.len() == 1 {
+                lines.join("\n")
+            } else {
+                format!("Pneu\n{}", lines.join("\n"))
+            };
             if next_tooltip != tooltip && tray.set_tooltip(Some(&next_tooltip)).is_ok() {
                 tooltip = next_tooltip;
             }
