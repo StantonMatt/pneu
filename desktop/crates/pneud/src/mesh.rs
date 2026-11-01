@@ -255,6 +255,7 @@ impl Core {
                 "setup".into(),
                 CAP_BATTERY.into(),
                 CAP_RING.into(),
+                pneu_proto::CAP_NOTIFICATIONS.into(),
             ],
         };
         #[cfg(test)]

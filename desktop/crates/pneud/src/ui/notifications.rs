@@ -263,6 +263,63 @@ pub fn single_url(text: &str) -> Option<String> {
         None
     }
 }
+/// Plain content shared by the native mirror projections. Never stored in SQL.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PhoneNotice {
+    pub app: String,
+    pub title: Option<String>,
+    pub text: Option<String>,
+    pub icon: Option<PhoneIcon>,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum PhoneIcon {
+    Pixels {
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
+    File(std::path::PathBuf),
+}
+impl PhoneIcon {
+    pub fn file_path(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::File(path) => Some(path),
+            Self::Pixels { .. } => None,
+        }
+    }
+}
+impl PhoneNotice {
+    pub fn app_only(&self) -> bool {
+        self.title.is_none() && self.text.is_none()
+    }
+    pub fn linux(&self) -> Notice {
+        let mut n = Notice::new(if self.app_only() {
+            "New notification"
+        } else {
+            self.title.as_deref().unwrap_or("")
+        });
+        n.summary = escape(&n.summary);
+        n.body = escape(self.text.as_deref().unwrap_or(""));
+        n
+    }
+    pub fn macos(&self) -> (String, String, String) {
+        if self.app_only() {
+            (self.app.clone(), String::new(), "New notification".into())
+        } else {
+            (
+                self.title.clone().unwrap_or_default(),
+                self.app.clone(),
+                self.text.clone().unwrap_or_default(),
+            )
+        }
+    }
+}
+
+/// A stable native identifier in a group separate from transfer notices.
+pub fn phone_identifier(id: &str) -> String {
+    format!("pneu-mirror-{id}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,5 +569,46 @@ mod tests {
         assert!(Notice::text("https://example.com more").actions.is_empty());
         assert_eq!(Notice::text("<a>\n2\n3\n4").body, "&lt;a&gt;\n2\n3");
         assert_eq!(Notice::text(&"é".repeat(220)).body.chars().count(), 200);
+    }
+
+    #[test]
+    fn phone_notifications_linux_and_macos_projections() {
+        assert_eq!(phone_identifier("session-key"), "pneu-mirror-session-key");
+        assert_ne!(
+            phone_identifier("session-key"),
+            phone_identifier("next-session-key")
+        );
+        let mut n = PhoneNotice {
+            app: "Chat<&>".into(),
+            title: None,
+            text: None,
+            icon: None,
+        };
+        let linux = n.linux();
+        assert_eq!(linux.summary, "New notification");
+        assert!(linux.body.is_empty());
+        assert!(linux.actions.is_empty());
+        assert_eq!(linux.urgency, 1);
+        assert_eq!(linux.expires, -1);
+        assert_eq!(
+            n.macos(),
+            ("Chat<&>".into(), "".into(), "New notification".into())
+        );
+        n.title = Some("Ana<&>".into());
+        n.text = Some("¿Llegaste? <b>".into());
+        let linux = n.linux();
+        assert_eq!(linux.summary, escape("Ana<&>"));
+        assert_eq!(linux.body, escape("¿Llegaste? <b>"));
+        assert!(linux.actions.is_empty());
+        // UserNotifications takes plain strings, so markup stays literal.
+        assert_eq!(
+            n.macos(),
+            ("Ana<&>".into(), "Chat<&>".into(), "¿Llegaste? <b>".into())
+        );
+        n.title = None;
+        assert_eq!(n.macos().0, "");
+        assert_eq!(n.linux().summary, "");
+        n.text = Some(String::new());
+        assert!(!n.app_only());
     }
 }

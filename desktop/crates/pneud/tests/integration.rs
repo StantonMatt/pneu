@@ -20,6 +20,15 @@ use tokio::{net::TcpListener, task::JoinHandle};
 
 #[derive(Default)]
 struct Actions {
+    phone_notices: Mutex<Vec<(String, u32, pneud::ui::notifications::PhoneNotice)>>,
+    phone_removed: Mutex<Vec<(String, u32)>>,
+    phone_batches: Mutex<Vec<usize>>,
+    phone_denied: std::sync::atomic::AtomicBool,
+    phone_block: std::sync::atomic::AtomicBool,
+    phone_remove_block: std::sync::atomic::AtomicBool,
+    phone_entered: tokio::sync::Notify,
+    phone_release: tokio::sync::Notify,
+
     block_install: std::sync::atomic::AtomicBool,
     install_entered: tokio::sync::Notify,
     install_release: tokio::sync::Notify,
@@ -67,6 +76,62 @@ impl Actions {
 }
 #[async_trait]
 impl PcActions for Actions {
+    async fn begin_phone_notification<'a>(
+        &'a self,
+        id: &'a str,
+        notice: &'a pneud::ui::notifications::PhoneNotice,
+        replaces: u32,
+    ) -> Result<pneud::actions::PhoneAcknowledgement<'a>> {
+        // Model native submission returning promptly; show waits for its ACK.
+        Ok(Box::pin(self.show_phone_notification(id, notice, replaces)))
+    }
+    async fn show_phone_notification(
+        &self,
+        id: &str,
+        notice: &pneud::ui::notifications::PhoneNotice,
+        replaces: u32,
+    ) -> Result<u32> {
+        if self.phone_block.load(std::sync::atomic::Ordering::SeqCst) {
+            self.phone_entered.notify_one();
+            self.phone_release.notified().await;
+        }
+        anyhow::ensure!(
+            !self.phone_denied.load(std::sync::atomic::Ordering::SeqCst),
+            "mock denied"
+        );
+        let mut notices = self.phone_notices.lock().unwrap();
+        let handle = if replaces == 0 {
+            notices.len() as u32 + 1
+        } else {
+            replaces
+        };
+        notices.push((id.into(), handle, notice.clone()));
+        self.changed.notify_one();
+        Ok(handle)
+    }
+    async fn remove_phone_notification(&self, id: &str, handle: u32) -> Result<()> {
+        self.phone_removed.lock().unwrap().push((id.into(), handle));
+        self.changed.notify_one();
+        if self
+            .phone_remove_block
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            std::future::pending::<()>().await;
+        }
+        Ok(())
+    }
+    async fn remove_phone_notifications(&self, handles: &[(String, u32)]) -> Result<()> {
+        self.phone_batches.lock().unwrap().push(handles.len());
+        futures_util::future::join_all(
+            handles
+                .iter()
+                .map(|(id, handle)| self.remove_phone_notification(id, *handle)),
+        )
+        .await
+        .into_iter()
+        .collect()
+    }
+
     async fn clipboard_text(&self, text: &str) -> Result<()> {
         if self.block_text.load(std::sync::atomic::Ordering::SeqCst) {
             self.text_entered.notify_one();
@@ -3833,6 +3898,15 @@ async fn mesh_phone(h: &Harness, phone: &Phone) -> Result<PhoneTls> {
     negotiated_phone(h, phone, true, true).await
 }
 async fn hello_phone(h: &Harness, phone: &Phone, mesh: bool, text: bool) -> Result<PhoneTls> {
+    hello_peer_role(h, phone, mesh, text, DeviceRole::Phone).await
+}
+async fn hello_peer_role(
+    h: &Harness,
+    phone: &Phone,
+    mesh: bool,
+    text: bool,
+    role: DeviceRole,
+) -> Result<PhoneTls> {
     let mut events = h.core.subscribe();
     let mut tls = raw_connect(h, phone).await?;
     write_frame(
@@ -3852,7 +3926,7 @@ async fn hello_phone(h: &Harness, phone: &Phone, mesh: bool, text: bool) -> Resu
             .flatten()
             .map(str::to_owned)
             .collect(),
-            role: Some(DeviceRole::Phone),
+            role: Some(role),
             addresses: None,
             paused: None,
         }),
@@ -5979,3 +6053,459 @@ async fn probe_authorized_mesh_install_after_disable() -> Result<()> {
 
 #[path = "support/file_outbox.rs"]
 mod file_outbox;
+
+fn notification(value: serde_json::Value) -> Message {
+    let e: NotificationEvent = serde_json::from_value(value).unwrap();
+    e.validate().unwrap();
+    Message::NotificationEvent(e)
+}
+fn phone_upsert(key: u128) -> Message {
+    notification(
+        serde_json::json!({"action":"upsert", "key":format!("{key:032x}"), "app_package":"org.chat", "app_label":"Chat", "time":1}),
+    )
+}
+async fn phone_counts(actions: &Actions, shows: usize, removed: usize) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let changed = actions.changed.notified();
+            if actions.phone_notices.lock().unwrap().len() == shows
+                && actions.phone_removed.lock().unwrap().len() == removed
+            {
+                break;
+            }
+            changed.await;
+        }
+    })
+    .await?;
+    Ok(())
+}
+#[tokio::test]
+async fn phone_notifications_fake_peer_updates_removes_clears_and_disconnects_without_replay()
+-> Result<()> {
+    let h = Harness::mesh().await?;
+    let phone = h.phone("mirroring-phone")?;
+    drop(h.pair(&phone).await?);
+    let mut tls = mesh_phone(&h, &phone).await?;
+    write_frame(
+        &mut tls,
+        &notification(serde_json::json!({"action":"clear"})),
+    )
+    .await?;
+    let mut first = phone_upsert(1);
+    if let Message::NotificationEvent(e) = &mut first {
+        e.icon_png=Some("89504e470d0a1a0a0000000d4948445200000001000000010804000000b51c0c020000000b4944415478da6364f80f00010501012718e3660000000049454e44ae426082".into());
+    }
+    write_frame(&mut tls, &first).await?;
+    phone_counts(&h.actions, 1, 0).await?;
+    let icon = h.actions.phone_notices.lock().unwrap()[0]
+        .2
+        .icon
+        .clone()
+        .expect("cached icon");
+    if let Some(path) = icon.file_path() {
+        assert!(path.exists());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        assert!(matches!(
+            icon,
+            pneud::ui::notifications::PhoneIcon::Pixels { .. }
+        ));
+        assert!(!h.core.paths.cache.join("phone-notification-icons").exists());
+    }
+    write_frame(&mut tls,&notification(serde_json::json!({"action":"upsert", "key":format!("{:032x}",1),"app_package":"org.chat","app_label":"Chat","title":"Ana <&>","text":"¿Llegaste?\nNow", "time":0}))).await?;
+    phone_counts(&h.actions, 2, 0).await?;
+    {
+        let notices = h.actions.phone_notices.lock().unwrap();
+        assert_eq!(notices[0].0, notices[1].0);
+        assert_eq!(notices[0].1, notices[1].1);
+        assert!(notices[0].2.app_only());
+        assert_eq!(notices[1].2.title.as_deref(), Some("Ana <&>"));
+        assert_eq!(notices[1].2.text.as_deref(), Some("¿Llegaste? Now"));
+    }
+    write_frame(
+        &mut tls,
+        &notification(serde_json::json!({"action":"remove","key":format!("{:032x}",1)})),
+    )
+    .await?;
+    phone_counts(&h.actions, 2, 1).await?;
+    write_frame(&mut tls, &phone_upsert(2)).await?;
+    write_frame(&mut tls, &phone_upsert(3)).await?;
+    phone_counts(&h.actions, 4, 1).await?;
+    write_frame(
+        &mut tls,
+        &notification(serde_json::json!({"action":"clear"})),
+    )
+    .await?;
+    phone_counts(&h.actions, 4, 3).await?;
+    write_frame(&mut tls, &phone_upsert(1)).await?;
+    phone_counts(&h.actions, 5, 3).await?;
+    if let Some(path) = icon.file_path() {
+        assert!(path.exists(), "clear must retain the connection icon cache");
+    }
+    let mut events = h.core.subscribe();
+    drop(tls);
+    phone_counts(&h.actions, 5, 4).await?;
+    event_matching(&mut events, |e| {
+        matches!(
+            e,
+            pneud::Event::ConnectionChanged {
+                connected: false,
+                ..
+            }
+        )
+    })
+    .await?;
+    if let Some(path) = icon.file_path() {
+        assert!(
+            !path.exists(),
+            "disconnect must delete private icon exports"
+        );
+    }
+    let mut tls = mesh_phone(&h, &phone).await?;
+    // A fresh HELLO and keepalive cause no mirror replay or notification ACK.
+    write_frame(
+        &mut tls,
+        &Message::Ping(Ping {
+            nonce: Nonce::new("00000000000001c8")?,
+        }),
+    )
+    .await?;
+    assert_eq!(
+        wire_reply(&mut tls).await?,
+        Message::Pong(Ping {
+            nonce: Nonce::new("00000000000001c8")?
+        })
+    );
+    phone_counts(&h.actions, 5, 4).await?;
+    write_frame(
+        &mut tls,
+        &notification(serde_json::json!({"action":"clear"})),
+    )
+    .await?;
+    write_frame(&mut tls, &phone_upsert(1)).await?;
+    phone_counts(&h.actions, 6, 4).await?;
+    {
+        let notices = h.actions.phone_notices.lock().unwrap();
+        assert_ne!(notices[0].0, notices[5].0);
+        assert!(notices[5].2.icon.is_none());
+    }
+    drop(tls);
+    phone_counts(&h.actions, 6, 5).await?;
+    h.stop().await
+}
+#[tokio::test]
+async fn phone_notifications_reject_uncleared_legacy_and_wrong_direction_streams() -> Result<()> {
+    let h = Harness::mesh().await?;
+    let phone = h.phone("notification-errors")?;
+    drop(h.pair(&phone).await?);
+    for mesh in [true, false] {
+        let mut tls = negotiated_phone(&h, &phone, mesh, true).await?;
+        let message = if mesh {
+            phone_upsert(1)
+        } else {
+            notification(serde_json::json!({"action":"clear"}))
+        };
+        write_frame(&mut tls, &message).await?;
+        assert!(matches!(
+            wire_reply(&mut tls).await?,
+            Message::Error(ErrorMessage {
+                code: ErrorCode::UnexpectedMessage,
+                ..
+            })
+        ));
+    }
+    let mut computer = hello_peer_role(&h, &phone, true, true, DeviceRole::Computer).await?;
+    write_frame(
+        &mut computer,
+        &notification(serde_json::json!({"action":"clear"})),
+    )
+    .await?;
+    loop {
+        match wire_reply(&mut computer).await? {
+            Message::PeerSettings(_) => {} // The computer's initial snapshot may precede rejection.
+            Message::Error(error) => {
+                assert_eq!(error.code, ErrorCode::UnexpectedMessage);
+                break;
+            }
+            other => panic!("unexpected computer reply: {other:?}"),
+        }
+    }
+    assert!(h.actions.phone_notices.lock().unwrap().is_empty());
+    h.stop().await
+}
+#[tokio::test]
+async fn phone_notifications_denial_and_blocked_submission_keep_transport_alive_and_revoke()
+-> Result<()> {
+    use std::sync::atomic::Ordering;
+    let h = Harness::mesh().await?;
+    let phone = h.phone("notification-revoke")?;
+    drop(h.pair(&phone).await?);
+    let mut tls = mesh_phone(&h, &phone).await?;
+    let mut events = h.core.subscribe();
+    h.actions.phone_denied.store(true, Ordering::SeqCst);
+    write_frame(
+        &mut tls,
+        &notification(serde_json::json!({"action":"clear"})),
+    )
+    .await?;
+    write_frame(&mut tls, &phone_upsert(1)).await?;
+    event_matching(&mut events, |e|matches!(e,pneud::Event::Error {message,..} if message=="Phone notification unavailable")).await?;
+    write_frame(
+        &mut tls,
+        &Message::Ping(Ping {
+            nonce: Nonce::new("0000000000000063")?,
+        }),
+    )
+    .await?;
+    assert_eq!(
+        wire_reply(&mut tls).await?,
+        Message::Pong(Ping {
+            nonce: Nonce::new("0000000000000063")?
+        })
+    );
+    let mut file = metadata(Id::from_bytes([0x77; 16]), b"");
+    file.kind = FileKind::File;
+    file.file_name = "still-receiving.txt".into();
+    file.mime = "text/plain".into();
+    write_frame(&mut tls, &Message::FileBegin(file.clone())).await?;
+    write_frame(
+        &mut tls,
+        &Message::FileEnd(FileEnd {
+            transfer_id: file.transfer_id.clone(),
+        }),
+    )
+    .await?;
+    assert!(
+        matches!(wire_reply(&mut tls).await?, Message::Ack(ack) if ack.transfer_id == file.transfer_id && !ack.deduplicated)
+    );
+    h.actions.phone_denied.store(false, Ordering::SeqCst);
+    h.actions.phone_block.store(true, Ordering::SeqCst);
+    write_frame(&mut tls, &phone_upsert(2)).await?;
+    tokio::time::timeout(Duration::from_secs(3), h.actions.phone_entered.notified()).await?;
+    write_frame(
+        &mut tls,
+        &Message::Ping(Ping {
+            nonce: Nonce::new("0000000000000064")?,
+        }),
+    )
+    .await?;
+    assert_eq!(
+        wire_reply(&mut tls).await?,
+        Message::Pong(Ping {
+            nonce: Nonce::new("0000000000000064")?
+        })
+    );
+    // Replacing the transport cancels its pending native handoff.
+    let replacement = mesh_phone(&h, &phone).await?;
+    h.actions.phone_release.notify_one();
+    assert!(h.actions.phone_notices.lock().unwrap().is_empty());
+    drop(tls);
+    drop(replacement);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn phone_notifications_identical_keys_on_two_phones_have_independent_ownership() -> Result<()>
+{
+    let h = Harness::mesh().await?;
+    let a = h.phone("mirror-a")?;
+    let b = h.phone("mirror-b")?;
+    drop(h.pair(&a).await?);
+    drop(h.pair(&b).await?);
+    let mut ta = mesh_phone(&h, &a).await?;
+    let mut tb = mesh_phone(&h, &b).await?;
+    let clear = notification(serde_json::json!({"action":"clear"}));
+    write_frame(&mut ta, &clear).await?;
+    write_frame(&mut ta, &phone_upsert(1)).await?;
+    phone_counts(&h.actions, 1, 0).await?;
+    write_frame(&mut tb, &clear).await?;
+    write_frame(&mut tb, &phone_upsert(1)).await?;
+    phone_counts(&h.actions, 2, 0).await?;
+    {
+        let notices = h.actions.phone_notices.lock().unwrap();
+        assert_ne!(notices[0].0, notices[1].0);
+    }
+    drop(ta);
+    phone_counts(&h.actions, 2, 1).await?;
+    {
+        let notices = h.actions.phone_notices.lock().unwrap();
+        assert_eq!(
+            h.actions.phone_removed.lock().unwrap()[0],
+            (notices[0].0.clone(), notices[0].1)
+        );
+    }
+    write_frame(&mut tb, &phone_upsert(1)).await?;
+    phone_counts(&h.actions, 3, 1).await?;
+    {
+        let notices = h.actions.phone_notices.lock().unwrap();
+        assert_eq!(notices[1].0, notices[2].0);
+        assert_eq!(notices[1].1, notices[2].1);
+    }
+    drop(tb);
+    phone_counts(&h.actions, 3, 2).await?;
+    h.stop().await
+}
+
+#[tokio::test]
+async fn phone_notifications_legacy_peer_keeps_exact_clipboard_receipt_bytes() -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    let h = Harness::new().await?;
+    let phone = h.phone("legacy-no-notification-capability")?;
+    drop(h.pair(&phone).await?);
+    let mut tls = negotiated_phone(&h, &phone, false, true).await?;
+    let id = Id::from_bytes([0x11; 16]);
+    write_frame(
+        &mut tls,
+        &Message::Clipboard(Clipboard {
+            transfer_id: id.clone(),
+            text: "legacy".into(),
+            created_at: 0,
+            origin: ClipboardOrigin::Clipboard,
+            hlc: None,
+            source_device: None,
+            sensitive: false,
+        }),
+    )
+    .await?;
+    let payload = format!(r#"{{"transfer_id":"{id}","deduplicated":false}}"#);
+    let mut expected = ((payload.len() + 1) as u32).to_be_bytes().to_vec();
+    expected.push(0x13);
+    expected.extend_from_slice(payload.as_bytes());
+    let mut actual = vec![0; expected.len()];
+    tokio::time::timeout(Duration::from_secs(3), tls.read_exact(&mut actual)).await??;
+    assert_eq!(actual, expected);
+    write_frame(
+        &mut tls,
+        &Message::Ping(Ping {
+            nonce: Nonce::new("000000000000002a")?,
+        }),
+    )
+    .await?;
+    assert_eq!(
+        wire_reply(&mut tls).await?,
+        Message::Pong(Ping {
+            nonce: Nonce::new("000000000000002a")?
+        })
+    );
+    assert!(h.actions.phone_notices.lock().unwrap().is_empty());
+    drop(tls);
+    h.stop().await
+}
+
+#[tokio::test]
+async fn phone_notifications_stalled_show_does_not_block_transfer_notifications() -> Result<()> {
+    use std::sync::atomic::Ordering;
+    let h = Harness::mesh().await?;
+    let phone = h.phone("stalled-mirror")?;
+    drop(h.pair(&phone).await?);
+    let mut tls = mesh_phone(&h, &phone).await?;
+    h.actions.phone_block.store(true, Ordering::SeqCst);
+    write_frame(
+        &mut tls,
+        &notification(serde_json::json!({"action":"clear"})),
+    )
+    .await?;
+    write_frame(&mut tls, &phone_upsert(1)).await?;
+    tokio::time::timeout(Duration::from_secs(3), h.actions.phone_entered.notified()).await?;
+    let mut file = metadata(Id::from_bytes([0x79; 16]), b"");
+    file.kind = FileKind::File;
+    file.file_name = "during-stalled-mirror.txt".into();
+    file.mime = "text/plain".into();
+    write_frame(&mut tls, &Message::FileBegin(file.clone())).await?;
+    write_frame(
+        &mut tls,
+        &Message::FileEnd(FileEnd {
+            transfer_id: file.transfer_id.clone(),
+        }),
+    )
+    .await?;
+    assert!(
+        matches!(wire_reply(&mut tls).await?, Message::Ack(ack) if ack.transfer_id == file.transfer_id)
+    );
+    let delivered = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let changed = h.actions.changed.notified();
+            if !h.actions.notices.lock().unwrap().is_empty() {
+                break;
+            }
+            changed.await;
+        }
+    })
+    .await;
+    // Always release the fake so a regression failure cannot leak a server.
+    h.actions.phone_release.notify_one();
+    drop(tls);
+    h.stop().await?;
+    delivered.context("stalled phone acknowledgement blocked transfer notification")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn phone_notifications_stalled_withdrawal_disconnect_is_bounded_and_attempts_all_handles()
+-> Result<()> {
+    use std::sync::atomic::Ordering;
+    let h = Harness::mesh().await?;
+    let phone = h.phone("stalled-withdrawal")?;
+    drop(h.pair(&phone).await?);
+    let mut tls = mesh_phone(&h, &phone).await?;
+    write_frame(
+        &mut tls,
+        &notification(serde_json::json!({"action":"clear"})),
+    )
+    .await?;
+    for key in 1..=3 {
+        write_frame(&mut tls, &phone_upsert(key)).await?;
+    }
+    phone_counts(&h.actions, 3, 0).await?;
+    h.actions.phone_remove_block.store(true, Ordering::SeqCst);
+    let mut events = h.core.subscribe();
+    drop(tls);
+    let disconnected = tokio::time::timeout(Duration::from_secs(3), event_matching(&mut events, |e| {
+        matches!(e, pneud::Event::ConnectionChanged { device, connected: false } if *device == phone.identity.device_id)
+    })).await;
+    assert_eq!(
+        h.actions.phone_removed.lock().unwrap().len(),
+        3,
+        "one stalled withdrawal must not prevent attempts for the other handles"
+    );
+    h.stop().await?;
+    disconnected.context("stalled withdrawal blocked disconnect beyond teardown bound")??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn phone_notifications_full_session_uses_bulk_withdrawal_on_clear_and_disconnect()
+-> Result<()> {
+    let h = Harness::mesh().await?;
+    let phone = h.phone("full-notification-session")?;
+    drop(h.pair(&phone).await?);
+    let mut tls = mesh_phone(&h, &phone).await?;
+    write_frame(
+        &mut tls,
+        &notification(serde_json::json!({"action":"clear"})),
+    )
+    .await?;
+    for key in 1..=128 {
+        write_frame(&mut tls, &phone_upsert(key)).await?;
+        // Fill native state without also testing dispatch-queue saturation.
+        phone_counts(&h.actions, key as usize, 0).await?;
+    }
+    phone_counts(&h.actions, 128, 0).await?;
+    write_frame(
+        &mut tls,
+        &notification(serde_json::json!({"action":"clear"})),
+    )
+    .await?;
+    phone_counts(&h.actions, 128, 128).await?;
+    assert_eq!(*h.actions.phone_batches.lock().unwrap(), vec![128]);
+    for key in 1..=128 {
+        write_frame(&mut tls, &phone_upsert(key)).await?;
+        phone_counts(&h.actions, 128 + key as usize, 128).await?;
+    }
+    phone_counts(&h.actions, 256, 128).await?;
+    drop(tls);
+    phone_counts(&h.actions, 256, 256).await?;
+    assert_eq!(*h.actions.phone_batches.lock().unwrap(), vec![128, 128]);
+    h.stop().await
+}

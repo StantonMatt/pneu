@@ -15,6 +15,9 @@ use tokio::{
 pub struct DesktopActions {
     cache: PathBuf,
     notifications: Mutex<Option<Notifications>>,
+    // Pin each mirror handle to the unique D-Bus owner that issued it. A
+    // restarted notification server may reuse numeric IDs.
+    phone_notifications: Mutex<HashMap<String, (zbus::Proxy<'static>, u32)>>,
     jobs: Arc<crate::work::Work>,
     commands: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<crate::ui::Command>>>>,
     copy_results: Mutex<HashMap<PathBuf, bool>>,
@@ -123,6 +126,7 @@ impl DesktopActions {
         Self {
             cache,
             notifications: Mutex::new(None),
+            phone_notifications: Mutex::new(HashMap::new()),
             jobs: Arc::new(crate::work::Work::default()),
             commands: Arc::new(std::sync::Mutex::new(None)),
             copy_results: Mutex::new(HashMap::new()),
@@ -581,8 +585,167 @@ impl DesktopActions {
         Ok(id)
     }
 }
+// A cancelled D-Bus caller can still receive an OS ID. Keep that reply
+// owned until delivery to the connection worker, and withdraw on abandonment.
+struct PhoneSubmission {
+    proxy: zbus::Proxy<'static>,
+    id: u32,
+    jobs: Arc<crate::work::Work>,
+    accepted: bool,
+}
+impl Drop for PhoneSubmission {
+    fn drop(&mut self) {
+        if self.accepted {
+            return;
+        }
+        let proxy = self.proxy.clone();
+        let id = self.id;
+        let owned = crate::work::track(vec![self.jobs.clone()]);
+        tokio::spawn(async move {
+            let _owned = owned;
+            let _ = tokio::time::timeout(
+                super::PHONE_WITHDRAW_TIMEOUT,
+                proxy.call::<_, _, ()>("CloseNotification", &(id,)),
+            )
+            .await;
+        });
+    }
+}
 #[async_trait]
 impl PcActions for DesktopActions {
+    async fn show_phone_notification(
+        &self,
+        id: &str,
+        notice: &crate::ui::notifications::PhoneNotice,
+        replaces: u32,
+    ) -> Result<u32> {
+        self.begin_phone_notification(id, notice, replaces)
+            .await?
+            .await
+    }
+    async fn begin_phone_notification<'a>(
+        &'a self,
+        id: &'a str,
+        notice: &'a crate::ui::notifications::PhoneNotice,
+        _replaces: u32,
+    ) -> Result<super::PhoneAcknowledgement<'a>> {
+        let current = self.notifications().await?;
+        let n = current.as_ref().context("notification proxy")?;
+        let content = notice.linux();
+        let mut hints = HashMap::<&str, zbus::zvariant::Value<'_>>::new();
+        hints.insert("urgency", zbus::zvariant::Value::from(1u8));
+        hints.insert("category", zbus::zvariant::Value::from("pneu.phone"));
+        if let Some(crate::ui::notifications::PhoneIcon::Pixels {
+            width,
+            height,
+            rgba,
+        }) = &notice.icon
+        {
+            hints.insert(
+                "image-data",
+                zbus::zvariant::Value::from(zbus::zvariant::Structure::from((
+                    *width as i32,
+                    *height as i32,
+                    (*width * 4) as i32,
+                    true,
+                    8i32,
+                    4i32,
+                    rgba.clone(),
+                ))),
+            );
+        }
+        let icon = "pneu";
+        let connection = n.proxy.connection().clone();
+        drop(current);
+        let dbus = zbus::fdo::DBusProxy::new(&connection).await?;
+        let owner = dbus
+            .get_name_owner(zbus::names::BusName::try_from(
+                "org.freedesktop.Notifications",
+            )?)
+            .await?;
+        let proxy = zbus::Proxy::new_owned(
+            connection,
+            owner.to_string(),
+            "/org/freedesktop/Notifications",
+            "org.freedesktop.Notifications",
+        )
+        .await?;
+        let replaces = self
+            .phone_notifications
+            .lock()
+            .await
+            .get(id)
+            .filter(|(old, _)| old.destination() == proxy.destination())
+            .map_or(0, |(_, handle)| *handle);
+        let jobs = self.jobs.clone();
+        let app = notice.app.clone();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let reservation = jobs.reserve().await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        tokio::spawn(async move {
+            let _reservation = reservation;
+            if send.is_closed() {
+                return;
+            }
+            // Keep the D-Bus reply owned after the caller's deadline. Dropping
+            // Notify cannot cancel a server-side post; a late ID must be closed.
+            let result = proxy
+                .call(
+                    "Notify",
+                    &(
+                        app,
+                        replaces,
+                        icon,
+                        content.summary,
+                        content.body,
+                        Vec::<String>::new(),
+                        hints,
+                        -1i32,
+                    ),
+                )
+                .await
+                .map_err(anyhow::Error::from)
+                .map(|id| PhoneSubmission {
+                    proxy,
+                    id,
+                    jobs,
+                    accepted: false,
+                });
+            let _ = send.send(result);
+        });
+        Ok(Box::pin(async move {
+            let mut submitted = tokio::time::timeout_at(deadline, receive)
+                .await
+                .context("notification submission timed out")?
+                .context("notification submission ended")??;
+            self.phone_notifications
+                .lock()
+                .await
+                .insert(id.into(), (submitted.proxy.clone(), submitted.id));
+            submitted.accepted = true;
+            Ok(submitted.id)
+        }))
+    }
+
+    async fn remove_phone_notification(&self, id: &str, _handle: u32) -> Result<()> {
+        let handle = self.phone_notifications.lock().await.remove(id);
+        if let Some((proxy, handle)) = handle {
+            let result = tokio::time::timeout(
+                super::PHONE_WITHDRAW_TIMEOUT,
+                proxy.call::<_, _, ()>("CloseNotification", &(handle,)),
+            )
+            .await?;
+            // A local dismissal can precede the phone's remove. An unknown ID
+            // is already withdrawn and must not become a user-facing failure.
+            if let Err(error) = result
+                && !matches!(&error, zbus::Error::MethodError(name, _, _) if matches!(name.as_str(), "org.freedesktop.Notifications.InvalidId" | "org.freedesktop.DBus.Error.InvalidArgs"))
+            {
+                return Err(error.into());
+            }
+        }
+        Ok(())
+    }
+
     async fn clipboard_text(&self, _text: &str) -> Result<()> {
         anyhow::bail!("clipboard writes require the clipboard actor")
     }
@@ -1029,6 +1192,15 @@ impl PcActions for DesktopActions {
     }
     async fn shutdown(&self) -> Result<()> {
         self.jobs.drain().await;
+        let mirrors = std::mem::take(&mut *self.phone_notifications.lock().await);
+        futures_util::future::join_all(mirrors.into_values().map(|(proxy, id)| async move {
+            let _ = tokio::time::timeout(
+                super::PHONE_WITHDRAW_TIMEOUT,
+                proxy.call::<_, _, ()>("CloseNotification", &(id,)),
+            )
+            .await;
+        }))
+        .await;
         if let Some(n) = self.notifications.lock().await.take() {
             n.stop.send_replace(true);
             let _ = n.task.await;
@@ -1524,6 +1696,7 @@ mod tests {
         resume: tokio::sync::oneshot::Receiver<()>,
     }
     struct NotificationServer(
+        Arc<std::sync::Mutex<(String, String)>>,
         std::sync::atomic::AtomicU32,
         Arc<std::sync::Mutex<HashMap<String, zbus::zvariant::OwnedValue>>>,
         Arc<std::sync::Mutex<Vec<String>>>,
@@ -1536,30 +1709,31 @@ mod tests {
         #[allow(clippy::too_many_arguments)]
         async fn notify(
             &self,
-            _app: &str,
+            app: &str,
             replaces: u32,
-            _icon: &str,
+            icon: &str,
             summary: &str,
             body: &str,
             actions: Vec<String>,
             hints: HashMap<String, zbus::zvariant::OwnedValue>,
             _timeout: i32,
         ) -> u32 {
-            let deferred = self.4.lock().unwrap().take();
+            *self.0.lock().unwrap() = (app.into(), icon.into());
+            let deferred = self.5.lock().unwrap().take();
             if let Some(deferred) = deferred {
                 let _ = deferred.entered.send(());
                 let _ = deferred.resume.await;
             }
-            *self.3.lock().unwrap() = (summary.into(), body.into());
-            *self.1.lock().unwrap() = hints;
-            *self.2.lock().unwrap() = actions;
-            let next = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            *self.4.lock().unwrap() = (summary.into(), body.into());
+            *self.2.lock().unwrap() = hints;
+            *self.3.lock().unwrap() = actions;
+            let next = self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             if replaces == 0 { next } else { replaces }
         }
         fn close_notification(&self, id: u32) -> zbus::fdo::Result<()> {
-            let mut closed = self.5.lock().unwrap();
+            let mut closed = self.6.lock().unwrap();
             let known = id != 0
-                && id <= self.0.load(std::sync::atomic::Ordering::SeqCst)
+                && id <= self.1.load(std::sync::atomic::Ordering::SeqCst)
                 && !closed.contains(&id);
             closed.push(id);
             if known {
@@ -1604,6 +1778,7 @@ mod tests {
             .serve_at(
                 "/org/freedesktop/Notifications",
                 NotificationServer(
+                    Default::default(),
                     Default::default(),
                     Default::default(),
                     Default::default(),
@@ -1895,6 +2070,7 @@ mod tests {
                     Default::default(),
                     Default::default(),
                     Default::default(),
+                    Default::default(),
                     copy.clone(),
                     Arc::new(std::sync::Mutex::new(Some(DeferredNotification {
                         entered: entered_tx,
@@ -2154,6 +2330,7 @@ mod tests {
             .serve_at(
                 "/org/freedesktop/Notifications",
                 NotificationServer(
+                    Default::default(),
                     std::sync::atomic::AtomicU32::new(0),
                     notification_hints.clone(),
                     notification_actions.clone(),
@@ -3183,6 +3360,233 @@ mod tests {
         open_uri_portal("https://example.com", &connection, None).await?;
         waiting.shutdown().await;
         drop(replacement);
+        drop(server);
+        bus.kill().await?;
+        bus.wait().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn phone_notifications_kde_posts_replaces_withdraws_without_actions_or_ledger()
+    -> Result<()> {
+        use crate::ui::notifications::PhoneNotice;
+        let (dir, mut bus, address) = notification_test_bus("").await?;
+        let app_icon = Arc::new(std::sync::Mutex::new((String::new(), String::new())));
+        let copy = Arc::new(std::sync::Mutex::new((String::new(), String::new())));
+        let hints = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let actions_sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let closed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = zbus::connection::Builder::address(address.as_str())?
+            .name("org.freedesktop.Notifications")?
+            .serve_at(
+                "/org/freedesktop/Notifications",
+                NotificationServer(
+                    app_icon.clone(),
+                    Default::default(),
+                    hints.clone(),
+                    actions_sent.clone(),
+                    copy.clone(),
+                    Default::default(),
+                    closed.clone(),
+                ),
+            )?
+            .build()
+            .await?;
+        let mut actions = DesktopActions::new(dir.path().to_owned());
+        actions.bus = Some(
+            zbus::connection::Builder::address(address.as_str())?
+                .build()
+                .await?,
+        );
+        let mut notice = PhoneNotice {
+            app: "Chat".into(),
+            title: None,
+            text: None,
+            icon: Some(crate::ui::notifications::PhoneIcon::Pixels {
+                width: 1,
+                height: 1,
+                rgba: vec![12, 34, 56, 255],
+            }),
+        };
+        let id = actions
+            .show_phone_notification("session-key", &notice, 0)
+            .await?;
+        assert_eq!(app_icon.lock().unwrap().0, "Chat");
+        assert_eq!(app_icon.lock().unwrap().1, "pneu");
+        let pixels: (i32, i32, i32, bool, i32, i32, Vec<u8>) = hints.lock().unwrap()["image-data"]
+            .try_clone()?
+            .try_into()?;
+        assert_eq!(pixels, (1, 1, 4, true, 8, 4, vec![12, 34, 56, 255]));
+        assert!(!dir.path().join("icon.png").exists());
+        assert_eq!(
+            *copy.lock().unwrap(),
+            ("New notification".into(), "".into())
+        );
+        notice.title = Some("Ana <&>".into());
+        notice.text = Some("hello <b>".into());
+        assert_eq!(
+            actions
+                .show_phone_notification("session-key", &notice, id)
+                .await?,
+            id
+        );
+        assert_eq!(
+            *copy.lock().unwrap(),
+            ("Ana &lt;&amp;&gt;".into(), "hello &lt;b&gt;".into())
+        );
+        assert!(actions_sent.lock().unwrap().is_empty());
+        actions.remove_phone_notification("session-key", id).await?;
+        assert_eq!(*closed.lock().unwrap(), vec![id]);
+        let ledger: NoticeLedger =
+            serde_json::from_slice(&std::fs::read(dir.path().join("setup-notifications.json"))?)?;
+        assert!(
+            ledger.ids.is_empty(),
+            "mirror handles must not enter the setup ledger"
+        );
+        let dismissed = actions
+            .show_phone_notification("dismissed-key", &notice, 0)
+            .await?;
+        let proxy = actions.phone_notifications.lock().await["dismissed-key"]
+            .0
+            .clone();
+        proxy
+            .call::<_, _, ()>("CloseNotification", &(dismissed,))
+            .await?;
+        actions
+            .remove_phone_notification("dismissed-key", dismissed)
+            .await?;
+        assert_eq!(*closed.lock().unwrap(), vec![id, dismissed, dismissed]);
+        actions.shutdown().await?;
+        drop(server);
+        bus.kill().await?;
+        bus.wait().await?;
+        Ok(())
+    }
+    struct StalledPhoneWithdrawal;
+    #[zbus::interface(name = "org.freedesktop.Notifications")]
+    impl StalledPhoneWithdrawal {
+        async fn close_notification(&self, _id: u32) {
+            std::future::pending::<()>().await;
+        }
+    }
+    #[tokio::test]
+    async fn phone_notifications_kde_stalled_withdrawal_releases_handles_and_bounds_shutdown()
+    -> Result<()> {
+        let (dir, mut bus, address) = notification_test_bus("").await?;
+        let server = zbus::connection::Builder::address(address.as_str())?
+            .name("org.freedesktop.Notifications")?
+            .serve_at("/org/freedesktop/Notifications", StalledPhoneWithdrawal)?
+            .build()
+            .await?;
+        let connection = zbus::connection::Builder::address(address.as_str())?
+            .build()
+            .await?;
+        let proxy = zbus::Proxy::new_owned(
+            connection.clone(),
+            server.unique_name().unwrap().to_string(),
+            "/org/freedesktop/Notifications",
+            "org.freedesktop.Notifications",
+        )
+        .await?;
+        let mut actions = DesktopActions::new(dir.path().to_owned());
+        actions.bus = Some(connection);
+        for id in 1..=3 {
+            actions
+                .phone_notifications
+                .lock()
+                .await
+                .insert(id.to_string(), (proxy.clone(), id));
+        }
+        let removed = tokio::time::timeout(
+            super::super::PHONE_WITHDRAW_TIMEOUT + std::time::Duration::from_secs(1),
+            actions.remove_phone_notification("1", 1),
+        )
+        .await;
+        assert!(
+            matches!(removed, Ok(Err(_))),
+            "stalled native removal must time out"
+        );
+        assert!(!actions.phone_notifications.lock().await.contains_key("1"));
+        tokio::time::timeout(
+            super::super::PHONE_WITHDRAW_TIMEOUT + std::time::Duration::from_secs(1),
+            actions.shutdown(),
+        )
+        .await??;
+        assert!(actions.phone_notifications.lock().await.is_empty());
+        drop(server);
+        bus.kill().await?;
+        bus.wait().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn phone_notifications_kde_cancelled_submission_withdraws_late_os_handle() -> Result<()> {
+        abandoned_phone_submission_withdraws(false).await
+    }
+    #[tokio::test]
+    async fn phone_notifications_kde_timed_out_submission_withdraws_late_os_handle() -> Result<()> {
+        abandoned_phone_submission_withdraws(true).await
+    }
+    async fn abandoned_phone_submission_withdraws(timed_out: bool) -> Result<()> {
+        use crate::ui::notifications::PhoneNotice;
+        let (dir, mut bus, address) = notification_test_bus("").await?;
+        let closed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        let server = zbus::connection::Builder::address(address.as_str())?
+            .name("org.freedesktop.Notifications")?
+            .serve_at(
+                "/org/freedesktop/Notifications",
+                NotificationServer(
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                    Arc::new(std::sync::Mutex::new(Some(DeferredNotification {
+                        entered,
+                        resume: resumed,
+                    }))),
+                    closed.clone(),
+                ),
+            )?
+            .build()
+            .await?;
+        let mut actions = DesktopActions::new(dir.path().to_owned());
+        actions.bus = Some(
+            zbus::connection::Builder::address(address.as_str())?
+                .build()
+                .await?,
+        );
+        let actions = Arc::new(actions);
+        let issued = actions.clone();
+        let task = tokio::spawn(async move {
+            issued
+                .show_phone_notification(
+                    "old-key",
+                    &PhoneNotice {
+                        app: "Chat".into(),
+                        title: None,
+                        text: None,
+                        icon: None,
+                    },
+                    0,
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), waiting).await??;
+        if timed_out {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(7), task).await??;
+            assert!(
+                result.is_err(),
+                "caller must time out before the late reply"
+            );
+        } else {
+            task.abort();
+            let _ = task.await;
+        }
+        resume.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), actions.shutdown()).await??;
+        assert_eq!(*closed.lock().unwrap(), vec![1]);
         drop(server);
         bus.kill().await?;
         bus.wait().await?;

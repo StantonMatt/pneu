@@ -177,6 +177,48 @@ fn escape(value: &str) -> String {
         .collect()
 }
 
+/// Dedicated mirror group: no activation arguments, actions or transfer targets.
+pub(crate) const PHONE_GROUP: &str = "pneu-mirrors";
+pub(crate) fn phone_tag(id: &str) -> String {
+    use sha2::Digest;
+    hex::encode(&sha2::Sha256::digest(id.as_bytes())[..8])
+}
+pub(crate) fn phone_xml(notice: &super::notifications::PhoneNotice) -> String {
+    let (title, text, attribution) = if notice.app_only() {
+        (notice.app.as_str(), "New notification", None)
+    } else {
+        (
+            notice.title.as_deref().unwrap_or(""),
+            notice.text.as_deref().unwrap_or(""),
+            Some(notice.app.as_str()),
+        )
+    };
+    let mut xml = format!(
+        r#"<toast activationType="background"><visual><binding template="ToastGeneric"><text>{}</text><text>{}</text>"#,
+        escape(title),
+        escape(text)
+    );
+    if let Some(icon) = notice
+        .icon
+        .as_ref()
+        .and_then(|icon| icon.file_path())
+        .and_then(|p| url::Url::from_file_path(p).ok())
+    {
+        xml.push_str(&format!(
+            r#"<image placement="appLogoOverride" src="{}"/>"#,
+            escape(icon.as_str())
+        ));
+    }
+    if let Some(app) = attribution {
+        xml.push_str(&format!(
+            r#"<text placement="attribution">{}</text>"#,
+            escape(app)
+        ));
+    }
+    xml.push_str("</binding></visual></toast>");
+    xml
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,5 +368,32 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn phone_notifications_windows_content_tag_group_and_no_actions() {
+        let mut n = super::super::notifications::PhoneNotice {
+            app: "Chat<&>".into(),
+            title: None,
+            text: None,
+            icon: Some(super::super::notifications::PhoneIcon::File(
+                std::env::temp_dir().join("icon &.png"),
+            )),
+        };
+        let hidden = phone_xml(&n);
+        assert!(hidden.contains("<text>Chat&lt;&amp;&gt;</text><text>New notification</text>"));
+        assert!(!hidden.contains("attribution"));
+        assert!(!hidden.contains("launch="));
+        assert!(!hidden.contains("<actions>"));
+        assert!(hidden.contains("appLogoOverride"));
+        n.title = Some("Ana<&>".into());
+        n.text = Some("¿Llegaste?".into());
+        let xml = phone_xml(&n);
+        assert!(xml.contains("<text>Ana&lt;&amp;&gt;</text><text>¿Llegaste?</text>"));
+        assert!(xml.contains("placement=\"attribution\">Chat&lt;&amp;&gt;</text>"));
+        assert_eq!(phone_tag("one"), phone_tag("one"));
+        assert_eq!(phone_tag("one").len(), 16);
+        assert_ne!(phone_tag("one"), phone_tag("two"));
+        assert_eq!(PHONE_GROUP, "pneu-mirrors");
     }
 }

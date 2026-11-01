@@ -55,6 +55,24 @@ impl Drop for Submission {
     }
 }
 
+struct PhoneSubmission {
+    sender: toasts::Sender,
+    tag: String,
+    life: Arc<crate::ui::notice_lifecycle::Lifecycle>,
+    accepted: bool,
+}
+impl Drop for PhoneSubmission {
+    fn drop(&mut self) {
+        if !self.accepted {
+            self.life.cancel();
+            self.sender.remove_tag(
+                self.tag.clone(),
+                crate::ui::windows_toast_model::PHONE_GROUP.into(),
+            );
+        }
+    }
+}
+
 pub async fn open_folder(path: &Path) -> Result<()> {
     shell::open_folder(path.to_owned()).await?.await
 }
@@ -304,6 +322,54 @@ fn file_attribution(metadata: &pneu_proto::FileBegin) -> Option<String> {
 
 #[async_trait]
 impl PcActions for DesktopActions {
+    async fn show_phone_notification(
+        &self,
+        id: &str,
+        notice: &crate::ui::notifications::PhoneNotice,
+        replaces: u32,
+    ) -> Result<u32> {
+        self.begin_phone_notification(id, notice, replaces)
+            .await?
+            .await
+    }
+    async fn begin_phone_notification<'a>(
+        &'a self,
+        id: &'a str,
+        notice: &'a crate::ui::notifications::PhoneNotice,
+        _replaces: u32,
+    ) -> Result<super::PhoneAcknowledgement<'a>> {
+        use crate::ui::{notice_lifecycle::Lifecycle, windows_toast_model::*};
+        let sender = self
+            .sender
+            .get()
+            .context("Windows notifications require an interactive daemon")?;
+        let mut submission = PhoneSubmission {
+            sender: sender.clone(),
+            tag: phone_tag(id),
+            life: Arc::new(Lifecycle::new(None)),
+            accepted: false,
+        };
+        let wait = sender.show(
+            phone_xml(notice),
+            submission.tag.clone(),
+            PHONE_GROUP.into(),
+            submission.life.clone(),
+        )?;
+        Ok(Box::pin(async move {
+            wait.await?;
+            submission.accepted = true;
+            Ok(0)
+        }))
+    }
+    async fn remove_phone_notification(&self, id: &str, _handle: u32) -> Result<()> {
+        use crate::ui::windows_toast_model::*;
+        self.sender
+            .get()
+            .context("toast host unavailable")?
+            .remove_tag(phone_tag(id), PHONE_GROUP.into());
+        Ok(())
+    }
+
     async fn clipboard_text(&self, _text: &str) -> Result<()> {
         anyhow::bail!("Windows clipboard writes require the clipboard actor")
     }

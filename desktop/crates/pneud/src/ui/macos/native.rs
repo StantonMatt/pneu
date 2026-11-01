@@ -45,6 +45,7 @@ struct State {
     child: Option<Child>,
     panels: HashMap<u64, Retained<AnyObject>>,
     notifications: HashMap<u64, Arc<NativeNotice>>,
+    mirrors: HashMap<u64, (String, Arc<Lifecycle>)>,
     next_panel: u64,
     materials: crate::ui::viewer_cache::Materials,
     requests: HashMap<u64, Arc<std::sync::atomic::AtomicBool>>,
@@ -133,12 +134,20 @@ define_class!(
         fn present(
             &self,
             _center: &UNUserNotificationCenter,
-            _notification: &UNNotification,
+            notification: &UNNotification,
             completion: &DynBlock<dyn Fn(UNNotificationPresentationOptions)>,
         ) {
-            completion
-                .call((UNNotificationPresentationOptions::Banner
-                    | UNNotificationPresentationOptions::List,));
+            let mut options =
+                UNNotificationPresentationOptions::Banner | UNNotificationPresentationOptions::List;
+            if notification
+                .request()
+                .identifier()
+                .to_string()
+                .starts_with("pneu-mirror-")
+            {
+                options |= UNNotificationPresentationOptions::Sound;
+            }
+            completion.call((options,));
         }
         #[unsafe(method(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:))]
         fn response(
@@ -149,6 +158,14 @@ define_class!(
         ) {
             autoreleasepool(|_| {
                 let identifier = response.notification().request().identifier().to_string();
+                if identifier.starts_with("pneu-mirror-") {
+                    let _ = slint::invoke_from_event_loop(move || {
+                        forget_phone(&identifier);
+                        remove_native(&identifier);
+                    });
+                    completion.call(());
+                    return;
+                }
                 let action = response.actionIdentifier().to_string();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some((namespace, id)) = identifier
@@ -204,6 +221,12 @@ fn retire_stale_notices(identifiers: Vec<String>) {
                     .values()
                     .filter(|n| n.life.active())
                     .map(|n| n.notification.identifier())
+                    .chain(
+                        s.mirrors
+                            .values()
+                            .filter(|(_, life)| life.active())
+                            .map(|(id, _)| id.clone()),
+                    )
                     .collect::<std::collections::HashSet<_>>()
             })
             .unwrap_or_default()
@@ -726,6 +749,7 @@ pub(crate) fn install(
                 child: None,
                 panels: HashMap::new(),
                 notifications: HashMap::new(),
+                mirrors: HashMap::new(),
                 next_panel: 1,
                 materials: crate::ui::viewer_cache::Materials::default(),
                 requests: HashMap::new(),
@@ -909,6 +933,43 @@ pub(crate) fn request(id: u64, request: Request, descriptor: Option<OwnedFd>, gu
         return;
     }
     match request {
+        Request::PhoneNotification {
+            id: mirror_id,
+            notice,
+        } if descriptor.is_none() => {
+            let identifier = crate::ui::notifications::phone_identifier(&mirror_id);
+            if let Some(notice) = notice {
+                post_phone(id, identifier, notice, guard);
+            } else {
+                let result = guard.run(|| {
+                    forget_phone(&identifier);
+                    remove_native(&identifier);
+                    Ok(())
+                });
+                guard.finish(result);
+            }
+        }
+        Request::WithdrawPhoneNotifications { ids } if descriptor.is_none() => {
+            let result = guard.run(|| {
+                let identifiers: Vec<_> = ids
+                    .iter()
+                    .map(|id| crate::ui::notifications::phone_identifier(id))
+                    .collect();
+                for identifier in &identifiers {
+                    forget_phone(identifier);
+                }
+                let identifiers: Vec<_> = identifiers
+                    .iter()
+                    .map(|id| NSString::from_str(id))
+                    .collect();
+                let identifiers = NSArray::from_retained_slice(&identifiers);
+                let center = UNUserNotificationCenter::currentNotificationCenter();
+                center.removePendingNotificationRequestsWithIdentifiers(&identifiers);
+                center.removeDeliveredNotificationsWithIdentifiers(&identifiers);
+                Ok(())
+            });
+            guard.finish(result);
+        }
         Request::Notify(notification) if descriptor.is_none() => post(id, notification, guard),
         Request::ClearStale { .. } if descriptor.is_none() => clear_stale_notices(guard),
         Request::Withdraw {
@@ -1356,6 +1417,12 @@ pub(crate) async fn choose(
     receiver.await.context("picker cancelled")?
 }
 pub(crate) fn cancel_request(id: u64) {
+    let mirror = STATE.with(|s| s.borrow_mut().as_mut().and_then(|s| s.mirrors.remove(&id)));
+    if let Some((identifier, life)) = mirror {
+        life.cancel();
+        remove_native(&identifier);
+    }
+
     STATE.with(|s| {
         if let Some(flag) = s.borrow().as_ref().and_then(|s| s.requests.get(&id)) {
             flag.store(true, std::sync::atomic::Ordering::Release);
@@ -1378,6 +1445,10 @@ pub(crate) fn cleanup() {
     let state = STATE.with(|s| s.borrow_mut().take());
     if let Some(mut state) = state {
         main_thread();
+        for (_, (identifier, life)) in state.mirrors.drain() {
+            life.cancel();
+            remove_native(&identifier);
+        }
         let identifiers = state
             .notifications
             .values()
@@ -1806,6 +1877,144 @@ fn test_control(action: &str) -> Result<()> {
     }
 }
 
+fn forget_phone(identifier: &str) {
+    STATE.with(|s| {
+        if let Some(s) = s.borrow_mut().as_mut() {
+            s.mirrors.retain(|_, (name, life)| {
+                if name == identifier {
+                    life.cancel();
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+    });
+}
+// The cached app icon is connection-owned. Its per-submission copy lasts only
+// until UserNotifications has finished importing the attachment.
+struct PhoneAttachmentFile(PathBuf);
+impl Drop for PhoneAttachmentFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+fn post_phone(
+    request_id: u64,
+    identifier: String,
+    notice: crate::ui::notifications::PhoneNotice,
+    guard: RequestGuard,
+) {
+    forget_phone(&identifier);
+    STATE.with(|s| {
+        if let Some(s) = s.borrow_mut().as_mut() {
+            s.mirrors
+                .insert(request_id, (identifier.clone(), guard.life().clone()));
+        }
+    });
+    let center = UNUserNotificationCenter::currentNotificationCenter();
+    center.getNotificationSettingsWithCompletionHandler(&RcBlock::new(
+        move |settings: NonNull<UNNotificationSettings>| {
+            autoreleasepool(|_| {
+                let status = unsafe { settings.as_ref() }.authorizationStatus();
+                if !matches!(
+                    status,
+                    UNAuthorizationStatus::Authorized
+                        | UNAuthorizationStatus::Provisional
+                        | UNAuthorizationStatus::Ephemeral
+                ) {
+                    let _ = slint::invoke_from_event_loop(move || cancel_request(request_id));
+                    guard.finish(Err(anyhow::anyhow!("phone notifications unavailable")));
+                    return;
+                }
+                let content = UNMutableNotificationContent::new();
+                let (title, subtitle, body) = notice.macos();
+                content.setTitle(&NSString::from_str(&title));
+                content.setSubtitle(&NSString::from_str(&subtitle));
+                content.setBody(&NSString::from_str(&body));
+                content.setSound(Some(&UNNotificationSound::defaultSound()));
+                let mut attachment_file = None;
+                if let Some(path) = notice.icon.as_ref().and_then(|icon| icon.file_path()) {
+                    // UserNotifications may move an attachment into its store.
+                    // Keep the connection's cached source available for updates.
+                    let attachment_path =
+                        path.with_file_name(format!("attachment-{}.png", crate::random_hex(16)));
+                    let copied = std::fs::read(path)
+                        .and_then(|bytes| {
+                            crate::config::atomic_private(&attachment_path, &bytes)
+                                .map_err(std::io::Error::other)
+                        })
+                        .is_ok();
+                    if copied {
+                        attachment_file = Some(PhoneAttachmentFile(attachment_path.clone()));
+                    }
+                    let url = NSURL::fileURLWithPath(&NSString::from_str(
+                        &attachment_path.to_string_lossy(),
+                    ));
+                    if copied
+                        && let Ok(attachment) = unsafe {
+                            UNNotificationAttachment::attachmentWithIdentifier_URL_options_error(
+                                &NSString::from_str("icon"),
+                                &url,
+                                None,
+                            )
+                        }
+                    {
+                        content.setAttachments(&NSArray::from_slice(&[&*attachment]));
+                    }
+                }
+                let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
+                    &NSString::from_str(&identifier),
+                    &content,
+                    None,
+                );
+                let completion = guard.clone();
+                let cancelled_id = identifier.clone();
+                if !guard.submit(|| {
+                    UNUserNotificationCenter::currentNotificationCenter()
+                        .addNotificationRequest_withCompletionHandler(
+                            &request,
+                            Some(&RcBlock::new(move |error: *mut NSError| {
+                                if let Some(file) = &attachment_file {
+                                    let _ = std::fs::remove_file(&file.0);
+                                }
+                                let succeeded = error.is_null();
+                                let id = cancelled_id.clone();
+                                let completion = completion.clone();
+                                // A native completion may be synchronous. Leave
+                                // the submit lifecycle lock before acknowledging.
+                                let _ = slint::invoke_from_event_loop(move || {
+                                    let ok = succeeded && completion.life().acknowledge();
+                                    if !ok {
+                                        let newer = STATE.with(|s| {
+                                            s.borrow().as_ref().is_some_and(|s| {
+                                                s.mirrors.iter().any(|(request, (name, _))| {
+                                                    *request != request_id && name == &id
+                                                })
+                                            })
+                                        });
+                                        if !newer {
+                                            forget_phone(&id);
+                                            remove_native(&id);
+                                        }
+                                    }
+                                    completion.finish(if ok {
+                                        Ok(())
+                                    } else {
+                                        Err(anyhow::anyhow!("phone notification submission failed"))
+                                    });
+                                });
+                            })),
+                        );
+                }) {
+                    let _ = slint::invoke_from_event_loop(move || cancel_request(request_id));
+                    guard.finish(Err(anyhow::anyhow!("phone notification cancelled")));
+                }
+            });
+        },
+    ));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1881,6 +2090,9 @@ mod tests {
             Request::OpenUrl("https://example.com".into()),
             Request::ClearStale {
                 namespace: "Pneu test".into(),
+            },
+            Request::WithdrawPhoneNotifications {
+                ids: (0..128).map(|key| format!("session-{key}")).collect(),
             },
             Request::Withdraw {
                 id: 1,
