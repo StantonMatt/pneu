@@ -1370,7 +1370,7 @@ impl Core {
     }
     pub(crate) async fn copy_clipboard_history(&self, id: String) -> Result<()> {
         ensure!(self.config().clipboard_history, "clipboard history is off");
-        let (input, generation) = self.store.history_input(id.clone()).await?;
+        let (input, capture) = self.store.history_input(id.clone()).await?;
         let content = self
             .outbox
             .file_io({
@@ -1412,7 +1412,7 @@ impl Core {
             repair: false,
             observation: None,
             sensitive: false,
-            history: Some(generation),
+            history: Some(capture),
             history_id: Some(id),
         };
         // Restoring is local even when peers cannot accept this representation.
@@ -2232,7 +2232,7 @@ impl Core {
             });
         self.clipboard.event(ClipboardEvent::Observe {
             history: (!initial && !owned)
-                .then(|| self.store.history_generation())
+                .then(|| self.store.history_capture())
                 .flatten(),
             token,
             id: Id::new(crate::random_hex(16)).expect("random id"),
@@ -4915,7 +4915,7 @@ impl Core {
                     let content = crate::ui::clipboard::Content::Text(text.text.clone());
                     let operation = ClipboardOperation {
                         sensitive: text.sensitive,
-                        history: self.store.history_generation(),
+                        history: self.store.history_capture(),
                         history_id: None,
                         token,
                         id: text.transfer_id.clone(),
@@ -5227,7 +5227,7 @@ impl Core {
             let token = self.clipboard.token();
             let operation = ClipboardOperation {
                 sensitive: job.metadata.kind == FileKind::ClipboardImage && job.metadata.sensitive,
-                history: self.store.history_generation(),
+                history: self.store.history_capture(),
                 history_id: None,
                 token,
                 id: job.metadata.transfer_id.clone(),

@@ -1306,7 +1306,7 @@ async fn received_sensitive_items_apply_without_history_and_manager_echo_preserv
             repair: false,
             observation: None,
             sensitive,
-            history: core.store.history_generation(),
+            history: core.store.history_capture(),
             history_id: None,
         };
         let (reply, _) = oneshot::channel();
@@ -1408,7 +1408,7 @@ async fn history_restore_is_local_even_when_the_outbound_representation_is_unusa
             ClipboardInput::Text(text.clone())
         };
         core.store
-            .history_record(input, None, core.store.history_generation().unwrap())
+            .history_record(input, None, core.store.history_capture().unwrap())
             .await?;
         let id = core.store.history_items()[0].id.clone();
         core.copy_clipboard_history(id).await?;
@@ -1436,7 +1436,7 @@ async fn history_disable_checks_daemon_items_and_fences_queued_captures() -> Res
     let (_dir, core, _actions) = history_fixture().await?;
     core.set_setting("clipboard_history".into(), true.into())
         .await?;
-    let generation = core.store.history_generation().unwrap();
+    let generation = core.store.history_capture().unwrap();
     core.store
         .history_record(
             ClipboardInput::Text("not in the window snapshot".into()),
@@ -1452,7 +1452,7 @@ async fn history_disable_checks_daemon_items_and_fences_queued_captures() -> Res
     assert!(core.store.history_items().is_empty());
     core.set_setting("clipboard_history".into(), true.into())
         .await?;
-    let generation = core.store.history_generation().unwrap();
+    let generation = core.store.history_capture().unwrap();
     assert_eq!(core.disable_empty_clipboard_history().await?, 0);
     core.store
         .history_record(
@@ -1472,7 +1472,7 @@ async fn history_work_keeps_one_active_and_only_the_latest_waiting_payload() -> 
     let (_dir, core, actions) = history_fixture().await?;
     core.set_setting("clipboard_history".into(), true.into())
         .await?;
-    let generation = core.store.history_generation().unwrap();
+    let older = core.store.history_capture().unwrap();
     let (handle, _rx) = Handle::channel();
     let mut driver = Driver {
         core: Arc::downgrade(&core),
@@ -1497,15 +1497,22 @@ async fn history_work_keeps_one_active_and_only_the_latest_waiting_payload() -> 
         pending_record: None,
     };
     // Do not yield to the storage jobs until the whole burst is queued.
+    let mut latest_seq = 0;
     for n in 0..100 {
+        let capture = core.store.history_capture().unwrap();
+        latest_seq = capture.seq;
         driver.effects(vec![Effect::RecordHistory {
-            generation,
+            capture,
             content: Content::Text(format!("copy {n}")),
         }]);
         assert_eq!(driver.jobs.len(), 1);
     }
+    driver.effects(vec![Effect::RecordHistory {
+        capture: older,
+        content: Content::Text("late older copy".into()),
+    }]);
     assert!(
-        matches!(&driver.pending_record, Some((Content::Text(t), g)) if t == "copy 99" && *g == generation)
+        matches!(&driver.pending_record, Some((Content::Text(t), capture)) if t == "copy 99" && capture.seq == latest_seq)
     );
     while let Some(result) = driver.jobs.join_next_with_id().await {
         driver.joined(result);

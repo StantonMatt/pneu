@@ -3,6 +3,7 @@
 use super::{ClipboardOffer, ClipboardRecipient};
 use crate::clipboard_fingerprint::FingerprintKey;
 use crate::config::ClipboardMode;
+use crate::store::history::Capture as HistoryCapture;
 use crate::ui::clipboard::Content;
 use pneu_proto::Id;
 use serde::{Deserialize, Serialize};
@@ -46,7 +47,7 @@ pub(super) enum Payload {
 pub(super) struct Operation {
     pub token: Token,
     pub sensitive: bool,
-    pub history: Option<u64>,
+    pub history: Option<Arc<HistoryCapture>>,
     pub history_id: Option<String>,
     pub id: Id,
     pub source: Id,
@@ -108,7 +109,7 @@ pub(super) enum Event {
         offer: Option<ClipboardOffer>,
         origin: bool,
         clear: bool,
-        history: Option<u64>,
+        history: Option<Arc<HistoryCapture>>,
     },
     Read {
         token: Token,
@@ -162,7 +163,7 @@ pub(super) enum Event {
 pub(super) enum Effect {
     RecordHistory {
         content: Content,
-        generation: u64,
+        capture: Arc<HistoryCapture>,
     },
     /// Local UI hint, independent from the ordinary sharing classification.
     PairingLink(Option<String>),
@@ -206,7 +207,7 @@ pub(super) enum Effect {
 }
 #[derive(Clone, Debug)]
 struct Observation {
-    history: Option<u64>,
+    history: Option<Arc<HistoryCapture>>,
     token: Token,
     id: Id,
     offer: Option<ClipboardOffer>,
@@ -1333,9 +1334,9 @@ impl State {
                         .all(|hash| self.known_hash(hash))
                 };
                 let history = self.read_slot(token).and_then(|o| o.history.take());
-                if !echo && let (Some(generation), Some(content)) = (history, content.as_ref()) {
+                if !echo && let (Some(capture), Some(content)) = (history, content.as_ref()) {
                     effects.push(Effect::RecordHistory {
-                        generation,
+                        capture,
                         content: content.clone(),
                     });
                 }

@@ -2,10 +2,19 @@
 use super::*;
 use crate::actions::ClipboardInput;
 use image::GenericImageView;
+use std::sync::Weak;
 
 pub(crate) const MAX_TEXT: usize = 1024 * 1024;
 pub(crate) const MAX_IMAGE: usize = 20 * 1024 * 1024;
 const LIMIT: usize = 50;
+
+#[derive(Debug)]
+pub(crate) struct Capture {
+    generation: u64,
+    pub(crate) seq: i64,
+    at: u64,
+    deleted: Mutex<HashSet<String>>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Item {
@@ -21,6 +30,8 @@ pub struct Item {
 pub(super) struct State {
     enabled: bool,
     generation: u64,
+    sequence: i64,
+    captures: Vec<Weak<Capture>>,
     items: Vec<Item>,
 }
 pub(super) fn migrate(tx: &Transaction<'_>) -> Result<()> {
@@ -129,9 +140,26 @@ impl Store {
     fn history_folder(&self) -> PathBuf {
         self.history_folder.clone()
     }
-    pub(crate) fn history_generation(&self) -> Option<u64> {
+    fn history_generation(&self) -> Option<u64> {
         let state = self.history.lock().expect("clipboard history");
         state.enabled.then_some(state.generation)
+    }
+    pub(crate) fn history_capture(&self) -> Option<Arc<Capture>> {
+        let mut state = self.history.lock().expect("clipboard history");
+        if !state.enabled {
+            return None;
+        }
+        // Reserve the existing SQLite seq at observation time, before any read.
+        state.sequence = state.sequence.checked_add(1)?;
+        let capture = Arc::new(Capture {
+            generation: state.generation,
+            seq: state.sequence,
+            at: crate::now_ms(),
+            deleted: Mutex::new(HashSet::new()),
+        });
+        state.captures.retain(|capture| capture.strong_count() != 0);
+        state.captures.push(Arc::downgrade(&capture));
+        Some(capture)
     }
     pub(crate) fn history_items(&self) -> Vec<Item> {
         self.history
@@ -179,7 +207,14 @@ impl Store {
                 }
             }
             let mut state = state.lock().expect("clipboard history");
+            let sequence: i64 = c.query_row(
+                "SELECT coalesce(max(seq),0) FROM clipboard_items",
+                [],
+                |r| r.get(0),
+            )?;
+            state.sequence = state.sequence.max(sequence);
             state.generation = state.generation.wrapping_add(1);
+            state.captures.clear();
             state.enabled = enabled;
             state.items = items;
             Ok(())
@@ -190,10 +225,10 @@ impl Store {
         &self,
         input: ClipboardInput,
         origin: Option<String>,
-        generation: u64,
+        capture: Arc<Capture>,
     ) -> Result<()> {
         let gate = self.history_gate.clone().lock_owned().await;
-        if self.history_generation() != Some(generation) {
+        if self.history_generation() != Some(capture.generation) {
             return Ok(());
         }
         let folder = self.history_folder();
@@ -244,13 +279,21 @@ impl Store {
                     thumbnail = Some(output.into_inner());
                     format!("image:{}", hex::encode(hash.finalize()))
                 };
-                let id = c
+                if capture.deleted.lock().expect("deleted history captures").contains(&digest) {
+                    return load(c, &folder);
+                }
+                let existing = c
                     .query_row(
-                        "SELECT id FROM clipboard_items WHERE digest=?",
+                        "SELECT id,seq FROM clipboard_items WHERE digest=?",
                         [&digest],
-                        |r| r.get::<_, String>(0),
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
                     )
-                    .optional()?
+                    .optional()?;
+                // A late older copy must not replace a newer duplicate's metadata.
+                if existing.as_ref().is_some_and(|(_, seq)| *seq >= capture.seq) {
+                    return load(c, &folder);
+                }
+                let id = existing.map(|(id, _)| id)
                     .unwrap_or_else(|| crate::random_hex(16));
                 if let Some(png) = png {
                     crate::config::atomic_private(&image_path(&folder, &id, false), &png)?;
@@ -261,8 +304,8 @@ impl Store {
                 let tx = c.transaction()?;
                 tx.execute("DELETE FROM clipboard_items WHERE id=?", [&id])?;
                 tx.execute(
-                    "INSERT INTO clipboard_items(id,digest,text,origin,at) VALUES (?,?,?,?,?)",
-                    params![id, digest, text, origin, crate::now_ms() as i64],
+                    "INSERT INTO clipboard_items(seq,id,digest,text,origin,at) VALUES (?,?,?,?,?,?)",
+                    params![capture.seq, id, digest, text, origin, capture.at as i64],
                 )?;
                 let old = tx
                     .prepare("SELECT id FROM clipboard_items ORDER BY seq DESC LIMIT -1 OFFSET ?")?
@@ -287,13 +330,48 @@ impl Store {
         if let Some(id) = &id {
             ensure!(valid_id(id), "invalid history id");
         }
-        self.history.lock().expect("clipboard history").generation += 1;
+        let cutoff = {
+            let mut state = self.history.lock().expect("clipboard history");
+            if id.is_none() {
+                state.generation = state.generation.wrapping_add(1);
+                state.captures.clear();
+            }
+            state.sequence
+        };
         let folder = self.history_folder();
         let state = self.history.clone();
         self.history_call(move |c| {
             let _gate = gate;
             if let Some(id) = id {
+                let digest: Option<String> = c
+                    .query_row(
+                        "SELECT digest FROM clipboard_items WHERE id=?",
+                        [&id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
                 c.execute("DELETE FROM clipboard_items WHERE id=?", [&id])?;
+                if let Some(digest) = digest {
+                    // Delete cancels pre-delete captures of this content; a new copy may add it again.
+                    state
+                        .lock()
+                        .expect("clipboard history")
+                        .captures
+                        .retain(|capture| {
+                            if let Some(capture) = capture.upgrade() {
+                                if capture.seq <= cutoff {
+                                    capture
+                                        .deleted
+                                        .lock()
+                                        .expect("deleted history captures")
+                                        .insert(digest.clone());
+                                }
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                }
                 remove_images(&folder, &id)?;
             } else {
                 clear(c, &folder)?;
@@ -304,12 +382,10 @@ impl Store {
         })
         .await
     }
-    pub(crate) async fn history_input(&self, id: String) -> Result<(ClipboardInput, u64)> {
+    pub(crate) async fn history_input(&self, id: String) -> Result<(ClipboardInput, Arc<Capture>)> {
         ensure!(valid_id(&id), "invalid history id");
         let gate = self.history_gate.clone().lock_owned().await;
-        let generation = self
-            .history_generation()
-            .context("clipboard history is off")?;
+        let capture = self.history_capture().context("clipboard history is off")?;
         let folder = self.history_folder();
         let input = self
             .history_call(move |c| {
@@ -328,24 +404,28 @@ impl Store {
                 })
             })
             .await?;
-        Ok((input, generation))
+        Ok((input, capture))
     }
-    pub(crate) async fn history_touch(&self, id: String, generation: u64) -> Result<()> {
+    pub(crate) async fn history_touch(&self, id: String, capture: Arc<Capture>) -> Result<()> {
         let gate = self.history_gate.clone().lock_owned().await;
-        if self.history_generation() != Some(generation) {
+        if self.history_generation() != Some(capture.generation) {
             return Ok(());
         }
         let folder = self.history_folder();
         let state = self.history.clone();
-        self.history_call(move|c| {
-            let _gate=gate;
-            let tx=c.transaction()?;
-            tx.execute("UPDATE clipboard_items SET seq=(SELECT coalesce(max(seq),0)+1 FROM clipboard_items),at=? WHERE id=?",params![crate::now_ms() as i64,id])?;
+        self.history_call(move |c| {
+            let _gate = gate;
+            let tx = c.transaction()?;
+            tx.execute(
+                "UPDATE clipboard_items SET seq=?,at=? WHERE id=? AND seq<?",
+                params![capture.seq, capture.at as i64, id, capture.seq],
+            )?;
             tx.commit()?;
-            let items=load(c,&folder)?;
-            state.lock().expect("clipboard history").items=items;
+            let items = load(c, &folder)?;
+            state.lock().expect("clipboard history").items = items;
             Ok(())
-        }).await
+        })
+        .await
     }
 }
 
@@ -357,7 +437,7 @@ mod tests {
             .history_record(
                 ClipboardInput::Text(text.into()),
                 origin.map(str::to_owned),
-                store.history_generation().context("enabled history")?,
+                store.history_capture().context("enabled history")?,
             )
             .await
     }
@@ -381,9 +461,94 @@ mod tests {
                     cache: store.history_folder(),
                 },
                 None,
-                store.history_generation().unwrap(),
+                store.history_capture().unwrap(),
             )
             .await
+    }
+    #[tokio::test]
+    async fn older_duplicate_completion_preserves_newer_time_and_origin() -> Result<()> {
+        let dir = crate::test_support::scratch()?;
+        let store = Store::open(&dir.path().join("state.sqlite3"))?;
+        store.history_configure(true, true).await?;
+        let older = store.history_capture().unwrap();
+        let newer = store.history_capture().unwrap();
+        let copied_at = newer.at;
+        store
+            .history_record(ClipboardInput::Text("same".into()), None, newer)
+            .await?;
+        let newest = store.history_items()[0].clone();
+        assert_eq!(newest.at, copied_at);
+        store
+            .history_record(
+                ClipboardInput::Text("same".into()),
+                Some("Phone".into()),
+                older,
+            )
+            .await?;
+        assert_eq!(store.history_items(), vec![newest]);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn delete_keeps_unrelated_pending_capture() -> Result<()> {
+        let dir = crate::test_support::scratch()?;
+        let store = Store::open(&dir.path().join("state.sqlite3"))?;
+        store.history_configure(true, true).await?;
+        record(&store, "A", None).await?;
+        let a = store.history_items()[0].id.clone();
+        let pending = store.history_capture().unwrap();
+        store.history_delete(Some(a)).await?;
+        store
+            .history_record(ClipboardInput::Text("B".into()), None, pending)
+            .await?;
+        let items = store.history_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "B");
+        Ok(())
+    }
+    #[tokio::test]
+    async fn delete_fences_same_content_only_until_a_new_copy() -> Result<()> {
+        let dir = crate::test_support::scratch()?;
+        let store = Store::open(&dir.path().join("state.sqlite3"))?;
+        store.history_configure(true, true).await?;
+        record(&store, "X", None).await?;
+        let x = store.history_items()[0].id.clone();
+        let pending = store.history_capture().unwrap();
+        store.history_delete(Some(x)).await?;
+        store
+            .history_record(
+                ClipboardInput::Text("X".into()),
+                Some("old".into()),
+                pending.clone(),
+            )
+            .await?;
+        assert!(store.history_items().is_empty());
+        record(&store, "X", None).await?;
+        assert_eq!(store.history_items().len(), 1);
+        assert_eq!(store.history_items()[0].origin, None);
+        let newest = store.history_items();
+        store
+            .history_record(
+                ClipboardInput::Text("X".into()),
+                Some("old".into()),
+                pending,
+            )
+            .await?;
+        assert_eq!(store.history_items(), newest);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn late_history_selection_does_not_supersede_a_newer_duplicate() -> Result<()> {
+        let dir = crate::test_support::scratch()?;
+        let store = Store::open(&dir.path().join("state.sqlite3"))?;
+        store.history_configure(true, true).await?;
+        record(&store, "same", Some("Phone")).await?;
+        let id = store.history_items()[0].id.clone();
+        let (_, pending) = store.history_input(id.clone()).await?;
+        record(&store, "same", None).await?;
+        let newest = store.history_items();
+        store.history_touch(id, pending).await?;
+        assert_eq!(store.history_items(), newest);
+        Ok(())
     }
     #[tokio::test]
     async fn cap_exact_text_dedupe_moves_to_top_and_replaces_origin() -> Result<()> {
@@ -423,7 +588,7 @@ mod tests {
         store.history_delete(Some(id)).await?;
         assert_eq!(fs::read_dir(store.history_folder())?.count(), 0);
         record_image(&store, png(20, image::codecs::png::CompressionType::Fast)?).await?;
-        let stale = store.history_generation().unwrap();
+        let stale = store.history_capture().unwrap();
         store.history_delete(None).await?;
         store
             .history_record(ClipboardInput::Text("late old read".into()), None, stale)
@@ -431,7 +596,7 @@ mod tests {
         assert!(store.history_items().is_empty());
         assert_eq!(fs::read_dir(store.history_folder())?.count(), 0);
         record_image(&store, png(30, image::codecs::png::CompressionType::Fast)?).await?;
-        let stale = store.history_generation().unwrap();
+        let stale = store.history_capture().unwrap();
         store.history_configure(false, false).await?;
         assert!(store.history_items().is_empty());
         assert_eq!(fs::read_dir(store.history_folder())?.count(), 0);
@@ -505,7 +670,7 @@ mod tests {
             record(&store, "admitted clipboard", None).await?;
             let item = store.history_items()[0].clone();
             store
-                .history_touch(item.id.clone(), store.history_generation().unwrap())
+                .history_touch(item.id.clone(), store.history_capture().unwrap())
                 .await?;
             store.history_delete(Some(item.id)).await?;
             Ok::<_, anyhow::Error>(())

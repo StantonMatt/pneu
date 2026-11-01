@@ -148,7 +148,7 @@ struct Driver {
     share_jobs: HashMap<Token, tokio::task::AbortHandle>,
     history_revision: u64,
     record_job: Option<tokio::task::Id>,
-    pending_record: Option<(Content, u64)>,
+    pending_record: Option<(Content, Arc<HistoryCapture>)>,
 }
 impl Driver {
     fn spawn(
@@ -167,11 +167,8 @@ impl Driver {
         };
         if self.record_job == Some(id) {
             self.record_job = None;
-            if let Some((content, generation)) = self.pending_record.take() {
-                self.effects(vec![Effect::RecordHistory {
-                    content,
-                    generation,
-                }]);
+            if let Some((content, capture)) = self.pending_record.take() {
+                self.effects(vec![Effect::RecordHistory { content, capture }]);
             }
         }
         match result {
@@ -240,21 +237,24 @@ impl Driver {
                 continue;
             };
             match effect {
-                Effect::RecordHistory {
-                    content,
-                    generation,
-                } => {
+                Effect::RecordHistory { content, capture } => {
                     // Keep one active write and only the latest waiting payload.
                     // Never block the actor control lane on history storage.
                     if self.record_job.is_some() {
-                        self.pending_record = Some((content, generation));
+                        if self
+                            .pending_record
+                            .as_ref()
+                            .is_none_or(|(_, pending)| capture.seq > pending.seq)
+                        {
+                            self.pending_record = Some((content, capture));
+                        }
                         continue;
                     }
                     let input = core.clipboard_input(Some(content));
                     if let Ok(input) = input {
                         let job = self.spawn(Vec::new(), async move {
                             if let Err(error) =
-                                core.store.history_record(input, None, generation).await
+                                core.store.history_record(input, None, capture).await
                             {
                                 eprintln!("pneud: clipboard history unavailable: {error}");
                             }
@@ -614,10 +614,10 @@ impl Driver {
                                 if applied
                                     && !operation.repair
                                     && !operation.sensitive
-                                    && let Some(generation) = operation.history
+                                    && let Some(capture) = operation.history.clone()
                                 {
                                     if let Some(id) = operation.history_id.clone() {
-                                        store.history_touch(id, generation).await?;
+                                        store.history_touch(id, capture).await?;
                                     } else if operation.received {
                                         let input = match operation.payload.as_deref() {
                                             Some(Payload::Input(input)) => Some(input.clone()),
@@ -629,7 +629,7 @@ impl Driver {
                                         if let Some(input) = input {
                                             let origin =
                                                 Some(core.arrival_source(&operation.source).name);
-                                            store.history_record(input, origin, generation).await?;
+                                            store.history_record(input, origin, capture).await?;
                                         }
                                     }
                                 }

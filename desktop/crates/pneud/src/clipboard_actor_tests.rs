@@ -2990,8 +2990,11 @@ fn confirmed_marker_retires_provisional_observation_without_a_local_clock() {
     }
 }
 
-#[test]
-fn history_capture_follows_echo_classification_and_only_records_once() {
+#[tokio::test]
+async fn history_capture_follows_echo_classification_and_only_records_once() -> anyhow::Result<()> {
+    let dir = crate::test_support::scratch()?;
+    let store = crate::store::Store::open(&dir.path().join("state.sqlite3"))?;
+    store.history_configure(true, true).await?;
     let mut model = Compositor::default();
     model.event(Event::Submit(remote(10, 2, 100, "received")));
     model.settle();
@@ -3002,7 +3005,7 @@ fn history_capture_follows_echo_classification_and_only_records_once() {
             offer: None,
             origin: false,
             clear: false,
-            history: Some(7),
+            history: store.history_capture(),
         });
         let effects = model.state.step(Event::Read {
             token,
@@ -3012,7 +3015,7 @@ fn history_capture_follows_echo_classification_and_only_records_once() {
         });
         assert_eq!(
             effects.iter().any(|e| matches!(e,
-            Effect::RecordHistory { content: Content::Text(t), generation: 7 } if t == text)),
+            Effect::RecordHistory { content: Content::Text(t), .. } if t == text)),
             expected
         );
         assert!(
@@ -3023,4 +3026,78 @@ fn history_capture_follows_echo_classification_and_only_records_once() {
                 .any(|e| matches!(e, Effect::RecordHistory { .. }))
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn history_reversed_read_completions_keep_copy_order_after_restart() -> anyhow::Result<()> {
+    let dir = crate::test_support::scratch()?;
+    let path = dir.path().join("state.sqlite3");
+    let store = crate::store::Store::open(&path)?;
+    store.history_configure(true, true).await?;
+    let mut model = Compositor::default();
+    model.event(Event::Submit(remote(10, 2, 100, "received")));
+    model.settle();
+    for token in [20, 30] {
+        model.state.step(Event::Observe {
+            token,
+            id: id(token as u8),
+            offer: None,
+            origin: false,
+            clear: false,
+            history: store.history_capture(),
+        });
+    }
+    // B finishes first; A finishes while B is still in its debounce window.
+    for (token, text) in [(30, "B"), (20, "A")] {
+        let effects = model.state.step(Event::Read {
+            token,
+            content: Some(content(text)),
+            fingerprints: vec![],
+            debounce: true,
+        });
+        let (content, capture) = effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::RecordHistory {
+                    content: Content::Text(text),
+                    capture,
+                } => Some((text, capture)),
+                _ => None,
+            })
+            .expect("history effect for each human copy");
+        store
+            .history_record(crate::actions::ClipboardInput::Text(content), None, capture)
+            .await?;
+    }
+    assert_eq!(
+        store
+            .history_items()
+            .iter()
+            .map(|item| item.title.as_str())
+            .collect::<Vec<_>>(),
+        ["B", "A"]
+    );
+    store.drain().await;
+    drop(store);
+    let store = crate::store::Store::open(&path)?;
+    store.history_configure(true, true).await?;
+    assert_eq!(
+        store
+            .history_items()
+            .iter()
+            .map(|item| item.title.as_str())
+            .collect::<Vec<_>>(),
+        ["B", "A"]
+    );
+    // The first copy after restart must also sort above the persisted sequence.
+    store
+        .history_record(
+            crate::actions::ClipboardInput::Text("C".into()),
+            None,
+            store.history_capture().unwrap(),
+        )
+        .await?;
+    assert_eq!(store.history_items()[0].title, "C");
+    Ok(())
 }
