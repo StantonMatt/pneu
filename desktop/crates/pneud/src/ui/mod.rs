@@ -97,6 +97,8 @@ pub struct PairingCompletion {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
     #[serde(default)]
+    pub replacements: Vec<crate::store::replacement::Offer>,
+    #[serde(default)]
     pub clipboard_history: Vec<crate::store::history::Item>,
     /// Last locally consumed invitation, published with Event::Paired.
     #[serde(default)]

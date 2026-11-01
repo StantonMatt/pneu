@@ -7,6 +7,8 @@ pub(crate) mod history;
 pub(crate) mod members;
 #[path = "outbox.rs"]
 pub mod outbox;
+#[path = "store_replacement.rs"]
+pub(crate) mod replacement;
 #[path = "store_settings.rs"]
 mod settings;
 pub(crate) use settings::{SettingsMalformed, SettingsUnexpected};
@@ -39,6 +41,28 @@ pub(crate) fn normalize_legacy_hello(hello: &mut pneu_proto::Hello, outbound: bo
         });
         hello.addresses = None;
     }
+}
+
+/// Ordinary direct-unpair mutation, also used by local reinstall replacement.
+fn remove_binding(tx: &Transaction<'_>, device: &Id) -> Result<i64> {
+    tx.execute(
+        "DELETE FROM members_receipts WHERE device=?",
+        [device.as_str()],
+    )?;
+    ensure!(
+        tx.execute("DELETE FROM peers WHERE id=?", [device.as_str()])? == 1,
+        "pairing was not removed"
+    );
+    tx.execute(
+        "UPDATE peer_generations SET generation=generation+1 WHERE device=?",
+        [device.as_str()],
+    )?;
+    let generation: i64 = tx.query_row(
+        "SELECT generation FROM peer_generations WHERE device=?",
+        [device.as_str()],
+        |r| r.get(0),
+    )?;
+    Ok(generation)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +137,7 @@ struct AbandonedClaim {
 }
 #[derive(Clone)]
 pub struct Store {
+    pub(crate) replacements: Arc<Mutex<Vec<replacement::Offer>>>,
     pub(crate) setup: Arc<Mutex<Option<members::SetupState>>>,
     // Last authenticated HELLO scope, tied to the binding incarnation. UI only.
     pub(crate) setup_remote_scopes: Arc<Mutex<HashMap<Id, (u64, pneu_proto::SetupScope)>>>,
@@ -670,6 +695,8 @@ impl Store {
         history::migrate(&tx)?;
         outbox::migrate(&tx)?;
         let setup = members::migrate(&tx)?;
+        replacement::migrate(&tx)?;
+        let replacements = replacement::pending(&tx)?;
         // Policy is authoritative before Core can expose any clipboard offers.
         let pair_settings = {
             let mut q = tx.prepare("SELECT id FROM peers")?;
@@ -704,6 +731,7 @@ impl Store {
         let folder = Folder::open(path.parent().context("database parent")?, false)?;
         folder.file.sync_all()?;
         Ok(Self {
+            replacements: Arc::new(Mutex::new(replacements)),
             setup: Arc::new(Mutex::new(Some(setup))),
             setup_remote_scopes: Arc::new(Mutex::new(HashMap::new())),
             setup_changed: tokio::sync::watch::channel(0).0,
@@ -1143,6 +1171,7 @@ impl Store {
         )
         .await
     }
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn pair_then_hello_scoped(
         &self,
@@ -1152,6 +1181,30 @@ impl Store {
         local: Option<pneu_proto::Member>,
         scope: pneu_proto::SetupScope,
         route_proven: bool,
+        finish: impl FnOnce() + Send + 'static,
+    ) -> Result<()> {
+        self.pair_then_hello_replacement(
+            device,
+            fp,
+            hello,
+            local,
+            scope,
+            route_proven,
+            Vec::new(),
+            finish,
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn pair_then_hello_replacement(
+        &self,
+        device: Id,
+        fp: Hash,
+        hello: Option<pneu_proto::Hello>,
+        local: Option<pneu_proto::Member>,
+        scope: pneu_proto::SetupScope,
+        route_proven: bool,
+        offline: Vec<(Id, u64)>,
         finish: impl FnOnce() + Send + 'static,
     ) -> Result<()> {
         self.blocking(move |store| {
@@ -1182,8 +1235,11 @@ impl Store {
                 if let (Some(local),Some(hello)) = (&local,&hello) { members::paired(&tx,local,hello,&fp,scope,previous_setup)?; }
                 else { tx.execute("INSERT INTO setup_links(device,scope) VALUES(?,'ask')",[device.as_str()])?; }
                 if route_proven&&!addresses.is_empty() {tx.execute("UPDATE setup_links SET route_proven=1 WHERE device=?",[device.as_str()])?;}
+                replacement::paired(&tx, &device, &offline)?;
+                let replacements = replacement::pending(&tx)?;
                 let setup = members::state(&tx)?;
                 tx.commit()?;
+                *store.replacements.lock().expect("replacement offers") = replacements;
                 let mut remote_scopes = store.setup_remote_scopes.lock().expect("remote setup scopes");
                 remote_scopes.remove(&device);
                 if let Some(remote) = hello.as_ref().filter(|h| h.capabilities.iter().any(|c| c == "setup")).and_then(|h| h.setup.as_ref()) {
@@ -1222,25 +1278,18 @@ impl Store {
                 store.fault("unpair_reserved")?;
                 let tx = c.transaction()?;
                 epoch.check(&tx)?;
-                tx.execute(
-                    "DELETE FROM members_receipts WHERE device=?",
-                    [device.as_str()],
-                )?;
-                ensure!(
-                    tx.execute("DELETE FROM peers WHERE id=?", [device.as_str()])? == 1,
-                    "pairing was not removed"
-                );
-                tx.execute(
-                    "UPDATE peer_generations SET generation=generation+1 WHERE device=?",
-                    [device.as_str()],
-                )?;
-                let generation: i64 = tx.query_row(
-                    "SELECT generation FROM peer_generations WHERE device=?",
-                    [device.as_str()],
-                    |r| r.get(0),
-                )?;
+                let generation = remove_binding(&tx, &device)?;
                 let setup = members::state(&tx)?;
+                let replacements = replacement::pending(&tx)?;
                 tx.commit()?;
+                let mut offers = store.replacements.lock().expect("replacement offers");
+                if *offers != replacements {
+                    *offers = replacements;
+                    store
+                        .settings_changed
+                        .send_modify(|n| *n = n.wrapping_add(1));
+                }
+                drop(offers);
                 store
                     .setup_remote_scopes
                     .lock()

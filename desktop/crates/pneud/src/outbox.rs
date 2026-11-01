@@ -3,6 +3,8 @@ use super::*;
 use crate::platform::fs as platform_fs;
 use pneu_proto::{FileKind, Message};
 use std::io::{Read, Write};
+#[path = "outbox_replacement.rs"]
+mod reinstall;
 
 pub const GLOBAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const PEER_BYTES: u64 = 1024 * 1024 * 1024;
@@ -198,7 +200,7 @@ pub(super) fn migrate(tx: &Transaction<'_>) -> Result<()> {
     tx.execute_batch("CREATE TRIGGER IF NOT EXISTS outbox_finished AFTER UPDATE OF state ON outbox_deliveries WHEN NEW.state != OLD.state BEGIN UPDATE outbox_deliveries SET finished_at=CASE WHEN NEW.state IN ('sent','failed','cancelled') THEN CAST((julianday('now')-2440587.5)*86400000 AS INTEGER) ELSE NULL END WHERE artifact=NEW.artifact AND device=NEW.device; END;")?;
     // Recover capacity hidden by older Remove implementations too. Startup
     // collection below will release the now-terminal staged payloads.
-    tx.execute_batch("UPDATE outbox_deliveries SET state='cancelled',error=NULL WHERE state NOT IN ('sent','cancelled') AND artifact IN (SELECT a.id FROM outbox_artifacts a WHERE EXISTS(SELECT 1 FROM outbox_dismissed h WHERE h.operation=a.operation) OR EXISTS(SELECT 1 FROM outbox_artifact_dismissed h WHERE h.artifact=a.id));")?;
+    tx.execute_batch("UPDATE outbox_deliveries SET state='cancelled',error=NULL WHERE (state NOT IN ('sent','cancelled') OR error='Old device replaced') AND artifact IN (SELECT a.id FROM outbox_artifacts a WHERE EXISTS(SELECT 1 FROM outbox_dismissed h WHERE h.operation=a.operation) OR EXISTS(SELECT 1 FROM outbox_artifact_dismissed h WHERE h.artifact=a.id));")?;
     Ok(())
 }
 impl Outbox {
@@ -292,7 +294,7 @@ impl Outbox {
     fn refresh(&self) -> Result<()> {
         self.store.locked(|c| {
             // Keep every recipient and artifact of each retained operation.
-            let mut q=c.prepare("SELECT a.operation,a.meta,d.device,d.generation,d.state,d.error,d.finished_at,a.path FROM outbox_artifacts a JOIN outbox_deliveries d ON d.artifact=a.id WHERE NOT EXISTS(SELECT 1 FROM outbox_dismissed o WHERE o.operation=a.operation) AND NOT EXISTS(SELECT 1 FROM outbox_artifact_dismissed h WHERE h.artifact=a.id) AND (a.operation IN (SELECT operation FROM outbox_artifacts GROUP BY operation ORDER BY max(rowid) DESC LIMIT 50) OR a.operation IN (SELECT a.operation FROM outbox_artifacts a JOIN outbox_deliveries d ON d.artifact=a.id WHERE d.state NOT IN ('sent','cancelled'))) ORDER BY a.rowid,d.device")?;
+            let mut q=c.prepare("SELECT a.operation,a.meta,d.device,d.generation,d.state,d.error,d.finished_at,a.path FROM outbox_artifacts a JOIN outbox_deliveries d ON d.artifact=a.id WHERE NOT EXISTS(SELECT 1 FROM outbox_dismissed o WHERE o.operation=a.operation) AND NOT EXISTS(SELECT 1 FROM outbox_artifact_dismissed h WHERE h.artifact=a.id) AND (a.operation IN (SELECT operation FROM outbox_artifacts GROUP BY operation ORDER BY max(rowid) DESC LIMIT 50) OR a.operation IN (SELECT a.operation FROM outbox_artifacts a JOIN outbox_deliveries d ON d.artifact=a.id WHERE d.state NOT IN ('sent','cancelled') OR d.error='Old device replaced')) ORDER BY a.rowid,d.device")?;
             let view=q.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,Option<i64>>(6)?,r.get::<_,Option<String>>(7)?)))?.map(|r| {
                 let (operation,meta,device,generation,state,error,finished_at,path)=r?;let begin:FileBegin=serde_json::from_str(&meta)?;
                 Ok(Transfer{operation:Id::new(operation)?,transfer_id:begin.transfer_id,device:Id::new(device)?,file_name:begin.file_name,size:begin.size,sent:if state=="sent" {begin.size} else {0},state,error,generation:generation as u64,direction:outgoing_direction(),finished_at:finished_at.map(|t| t as u64),path:path.map(PathBuf::from)})
@@ -413,7 +415,7 @@ impl Outbox {
         }
     }
     fn capacity(c: &Connection, size: u64, recipients: &[Authority]) -> Result<()> {
-        let (bytes,count):(i64,i64)=c.query_row("SELECT coalesce(sum(json_extract(meta,'$.size')),0),(SELECT count(*) FROM outbox_deliveries WHERE state NOT IN ('sent','cancelled')) FROM outbox_artifacts WHERE staged=1",[],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let (bytes,count):(i64,i64)=c.query_row("SELECT coalesce(sum(json_extract(meta,'$.size')),0),(SELECT count(*) FROM outbox_deliveries WHERE state NOT IN ('sent','cancelled') OR error='Old device replaced') FROM outbox_artifacts WHERE staged=1",[],|r|Ok((r.get(0)?,r.get(1)?)))?;
         ensure!(
             (bytes as u64).saturating_add(size) <= GLOBAL_BYTES
                 && count + recipients.len() as i64 <= GLOBAL_DELIVERIES as i64,
@@ -741,7 +743,7 @@ impl Outbox {
             .await
     }
     fn collect(&self) -> Result<()> {
-        let ids=self.store.locked(|c|{let mut q=c.prepare("SELECT id FROM outbox_artifacts a WHERE staged=1 AND NOT EXISTS(SELECT 1 FROM outbox_deliveries d WHERE d.artifact=a.id AND state NOT IN ('sent','cancelled'))")?;Ok(q.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)})?;
+        let ids=self.store.locked(|c|{let mut q=c.prepare("SELECT id FROM outbox_artifacts a WHERE staged=1 AND NOT EXISTS(SELECT 1 FROM outbox_deliveries d WHERE d.artifact=a.id AND (state NOT IN ('sent','cancelled') OR error='Old device replaced'))")?;Ok(q.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)})?;
         for id in ids {
             match platform_fs::open_read_at(&self.folder.file, id.as_str()) {
                 Ok(fd) => {
@@ -795,7 +797,8 @@ fn recent_operations(rows: Vec<Transfer>) -> Vec<Transfer> {
                 groups.len() - 1
             });
         let group = &mut groups[index];
-        group.active |= matches!(row.state.as_str(), "staging" | "queued" | "sending")
+        group.active |= row.error.as_deref() == Some(replacement::REPLACED)
+            || matches!(row.state.as_str(), "staging" | "queued" | "sending")
             || (row.generation != 0 && row.state == "failed");
         group.finished = group.finished.max(row.finished_at.unwrap_or_default());
         group.rows.push(row);

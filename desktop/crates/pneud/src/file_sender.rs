@@ -393,6 +393,35 @@ impl Core {
         self.outbox
             .check_artifact(operation.clone(), artifact.clone())
             .await?;
+        let eligible = self
+            .ui_snapshot()
+            .send_targets
+            .into_iter()
+            .filter(|t| t.eligible)
+            .filter_map(|t| {
+                t.fingerprint.map(|fingerprint| Authority {
+                    device: t.device,
+                    generation: t.generation,
+                    fingerprint,
+                })
+            })
+            .collect();
+        if let Some(new) = self
+            .outbox
+            .retry_replaced(
+                operation.clone(),
+                artifact.clone(),
+                device.clone(),
+                eligible,
+                self.identity.device_id.clone(),
+            )
+            .await?
+        {
+            self.wake(&new);
+            self.mesh.changed.notify_one();
+            let _ = self.events.send(Event::ConfigChanged);
+            return Ok(());
+        }
         let sessions = self.sessions.clone();
         let store = self.store.clone();
         self.outbox

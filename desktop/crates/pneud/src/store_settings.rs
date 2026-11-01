@@ -49,7 +49,7 @@ pub(super) fn initialize(tx: &Transaction<'_>, local: &Id, peer: &Id, phone: boo
     }
     Ok(())
 }
-fn write_field(tx: &Transaction<'_>, peer: &Id, field: &PeerSetting) -> Result<()> {
+pub(super) fn write_field(tx: &Transaction<'_>, peer: &Id, field: &PeerSetting) -> Result<()> {
     tx.execute("INSERT INTO peer_settings VALUES(?,?,?,?,?) ON CONFLICT(device,key) DO UPDATE SET enabled=excluded.enabled,hlc=excluded.hlc,writer_device=excluded.writer_device",params![peer.as_str(),field.key,field.enabled,field.hlc.to_string(),field.writer_device.as_str()])?;
     Ok(())
 }

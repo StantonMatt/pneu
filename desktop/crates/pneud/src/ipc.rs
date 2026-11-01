@@ -186,6 +186,12 @@ pub enum Command {
     Unpair {
         device: Id,
     },
+    ReplacementDecision {
+        intent: Id,
+        replace: bool,
+        #[serde(default)]
+        implied_old: Option<crate::outbox::Authority>,
+    },
     Config {
         config: Config,
     },
@@ -534,6 +540,7 @@ async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
         Command::ClosePairingIf { token } => { core.close_pairing_if(token).await; serde_json::Value::Null },
         Command::ClosePairing => { core.close_pairing().await; serde_json::Value::Null },
         Command::Unpair {device} => { core.unpair_device(device).await?; serde_json::Value::Null },
+        Command::ReplacementDecision {intent,replace,implied_old} => { core.decide_replacement(intent,replace,implied_old).await?; serde_json::Value::Null },
         #[cfg(target_os = "linux")]
         Command::OpenFolder => { crate::ui::runtime::open_folder(&core.config().save_path).await?; serde_json::Value::Null },
         #[cfg(windows)]

@@ -2,6 +2,9 @@ use super::*;
 
 impl Core {
     pub(super) fn pair_allows(&self, device: &Id, from: &Id, to: &Id, feature: &str) -> bool {
+        if self.store.replacement_pending(device) {
+            return false;
+        }
         let key = format!("{from}/{to}/{feature}");
         self.store
             .pair_settings
@@ -12,13 +15,14 @@ impl Core {
             .is_none_or(|f| f.enabled)
     }
     pub(super) fn content_ready(&self, store: &Store, device: &Id) -> bool {
-        !store.mesh
-            || self
-                .settings_ready
-                .lock()
-                .expect("settings ready")
-                .get(device)
-                .is_some_and(|connection| Some(*connection) == store.connection_id)
+        !self.store.replacement_pending(device)
+            && (!store.mesh
+                || self
+                    .settings_ready
+                    .lock()
+                    .expect("settings ready")
+                    .get(device)
+                    .is_some_and(|connection| Some(*connection) == store.connection_id))
     }
     pub(super) fn publish_settings_ready(&self, store: &Store, device: &Id, synchronized: bool) {
         // Settings persistence can await across a replacement. Publish only for
@@ -39,6 +43,9 @@ impl Core {
         }
     }
     pub(super) fn incoming_kind_allowed(&self, store: &Store, device: &Id, kind: FileKind) -> bool {
+        if kind != FileKind::File && self.store.replacement_pending(device) {
+            return false;
+        }
         if !store.mesh {
             return true;
         }

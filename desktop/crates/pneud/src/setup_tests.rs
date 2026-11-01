@@ -85,6 +85,136 @@ async fn pair(a: &Core, b: &Core, scope: bool) -> Result<()> {
 }
 
 #[tokio::test]
+async fn replacement_two_daemons_propagate_existing_members_tombstone() -> Result<()> {
+    let a = Running::new().await?;
+    let b = Running::new().await?;
+    pair(&a.core, &b.core, true).await?;
+    until(|| {
+        a.core.store.setup_state().setup_id.is_some()
+            && a.core.store.setup_state().setup_id == b.core.store.setup_state().setup_id
+    })
+    .await?;
+    // The old phone is an offline fixture; the two real daemons exchange the
+    // resulting introduction and removal over their ordinary pinned sessions.
+    let old = Id::from_bytes([81; 16]);
+    let pin = Hash::new("81".repeat(32))?;
+    let hello = Hello {
+        version: 1,
+        device_id: old.clone(),
+        name: "Pneu simulator".into(),
+        capabilities: vec!["mesh".into(), "setup".into()],
+        paused: None,
+        role: Some(DeviceRole::Phone),
+        addresses: None,
+        setup: Some(SetupHello {
+            scope: SetupScope::Enabled,
+            setup_id: a.core.store.setup_state().setup_id,
+        }),
+    };
+    a.core
+        .persist_pairing_hello_scoped(
+            &old,
+            &pin,
+            a.core.pairing_gate.clone().lock_owned().await,
+            false,
+            Some(hello),
+            None,
+            Some(true),
+        )
+        .await?;
+    until(|| {
+        b.core
+            .store
+            .setup_state()
+            .roster
+            .iter()
+            .any(|m| m.device_id == old && m.status == MemberStatus::Member)
+    })
+    .await?;
+    assert!(b.core.paired_devices().contains(&old));
+    let phone = crate::client::Phone::new(a._dir.path().join("reinstalled-phone"))?;
+    let uri = a
+        .core
+        .start_pairing_with_addresses(vec![format!("127.0.0.1:{}", a.core.bound_port())])
+        .await?;
+    let mut connection = phone.pair(&uri).await?;
+    until(|| {
+        a.core
+            .ui_snapshot()
+            .replacements
+            .iter()
+            .any(|o| o.old.device == old)
+    })
+    .await?;
+    let offer = a
+        .core
+        .ui_snapshot()
+        .replacements
+        .into_iter()
+        .find(|o| o.old.device == old)
+        .unwrap();
+    assert!(
+        a.core.paired_devices().contains(&old),
+        "name match never removes without confirmation"
+    );
+    a.core.decide_replacement(offer.id, true, None).await?;
+    until(|| {
+        [&a.core, &b.core].iter().all(|core| {
+            !core.paired_devices().contains(&old)
+                && core.store.setup_state().roster.iter().any(|m| {
+                    m.device_id == old && m.fingerprint == pin && m.status == MemberStatus::Removed
+                })
+        })
+    })
+    .await?;
+    assert!(a.core.paired_devices().contains(&phone.identity.device_id));
+    connection.close().await?;
+    a.stop().await?;
+    b.stop().await
+}
+
+#[tokio::test]
+async fn replacement_online_during_dialog_keeps_both_and_legacy_hello_bytes() -> Result<()> {
+    let a = Running::new().await?;
+    let before = encode_frame(&Message::Hello(a.core.computer_hello()))?;
+    let old = crate::client::Phone::new(a._dir.path().join("old-phone"))?;
+    let new = crate::client::Phone::new(a._dir.path().join("new-phone"))?;
+    let uri = a
+        .core
+        .start_pairing_with_addresses(vec![format!("127.0.0.1:{}", a.core.bound_port())])
+        .await?;
+    let mut old_connection = old.pair(&uri).await?;
+    old_connection.close().await?;
+    until(|| !a.core.connected_devices().contains(&old.identity.device_id)).await?;
+    let uri = a
+        .core
+        .start_pairing_with_addresses(vec![format!("127.0.0.1:{}", a.core.bound_port())])
+        .await?;
+    let mut new_connection = new.pair(&uri).await?;
+    until(|| !a.core.ui_snapshot().replacements.is_empty()).await?;
+    let offer = a.core.ui_snapshot().replacements[0].clone();
+    let mut old_connection = old.reconnect().await?;
+    until(|| a.core.connected_devices().contains(&old.identity.device_id)).await?;
+    let error = a
+        .core
+        .decide_replacement(offer.id, true, None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Both pairings were kept"));
+    assert!(a.core.paired_devices().contains(&old.identity.device_id));
+    assert!(a.core.paired_devices().contains(&new.identity.device_id));
+    assert!(a.core.ui_snapshot().replacements.is_empty());
+    assert_eq!(
+        encode_frame(&Message::Hello(a.core.computer_hello()))?,
+        before,
+        "replacement adds no HELLO fields or capability, including for legacy peers"
+    );
+    new_connection.close().await?;
+    old_connection.close().await?;
+    a.stop().await
+}
+
+#[tokio::test]
 async fn setup_remote_scope_status_drives_existing_window_states() -> Result<()> {
     use crate::store::members::SetupFence;
     use crate::ui::window_setup::{Remembered, Row, Setup, Top};
