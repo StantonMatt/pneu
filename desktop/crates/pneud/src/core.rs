@@ -1586,7 +1586,9 @@ impl Core {
             }
         }
         snapshot.transfers = self.outbox.snapshot(&snapshot.connected_devices);
-        snapshot.transfers.extend(ui.incoming.iter().cloned());
+        let mut incoming: Vec<_> = ui.incoming.iter().cloned().collect();
+        self.store.attribute_finished_transfers(&mut incoming);
+        snapshot.transfers.extend(incoming);
         snapshot
     }
     fn arrival_source(&self, device: &Id) -> crate::actions::ArrivalSource {
@@ -10171,6 +10173,8 @@ mod tests {
             .store
             .create_stage(history.clone(), "unfinished".into(), 1)
             .await?;
+        // Plant crash orphans while the stage is live: empty staging roots are retired.
+        std::fs::write(history.join(".pneu-staging/orphan"), b"crashed")?;
         drop(stage);
         core.store.drain().await;
         let healthy = core.config().save_path;
@@ -10178,9 +10182,9 @@ mod tests {
             .store
             .create_stage(healthy.clone(), "temporary".into(), 1)
             .await?;
+        std::fs::write(healthy.join(".pneu-staging/orphan"), b"crashed")?;
         drop(stage);
         core.store.drain().await;
-        std::fs::write(healthy.join(".pneu-staging/orphan"), b"crashed")?;
         let paths = core.paths.clone();
         let config = core.config();
         core.shutdown_actions().await?;
@@ -10327,7 +10331,8 @@ mod tests {
         )
         .await?;
         let state = incoming.as_mut().unwrap();
-        let stage = state.stage.clone().unwrap();
+        // Resolve while linked: cleanup also retires the empty staging root.
+        let stage_path = state.stage.as_ref().unwrap().path()?;
         // /dev/full gives a real ENOSPC without exhausting a shared filesystem.
         // Keep the real staging file so cleanup proves it removes the copy.
         state.file = Some(
@@ -10366,7 +10371,14 @@ mod tests {
                 ..
             }))
         ));
-        assert!(!stage.path()?.exists());
+        assert!(!stage_path.exists());
+        assert!(
+            !core
+                .config()
+                .save_path
+                .join(crate::storage::STAGING_DIR)
+                .exists()
+        );
         let cached: Vec<_> = std::fs::read_dir(&core.paths.cache)?
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
@@ -12624,11 +12636,32 @@ mod tests {
             vec![(old.clone(), 42)],
         )
         .await?;
+        let incoming = test_begin(b"previous receive");
+        sender.event(Event::TransferStarted {
+            device: old.clone(),
+            metadata: incoming.clone(),
+        });
+        sender.event(Event::TransferFinished {
+            device: old.clone(),
+            transfer_id: incoming.transfer_id.clone(),
+            path: Some(dir.path().join("received.jpg")),
+            deduplicated: false,
+        });
         let offer = sender.store.replacements.lock().unwrap()[0].clone();
         sender
             .store
             .replacement_decide(sender.identity.device_id.clone(), offer, true, |_| {})
             .await?;
+        assert!(
+            sender
+                .ui_snapshot()
+                .transfers
+                .iter()
+                .any(|r| r.direction == "incoming"
+                    && r.device == receiver.identity.device_id
+                    && r.transfer_id == incoming.transfer_id
+                    && r.state == "sent")
+        );
         sender.outbox.reconcile().await?;
         // The mutable source is no longer the content being sent.
         std::fs::write(&source, b"changed original source")?;

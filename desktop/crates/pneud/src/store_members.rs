@@ -604,7 +604,36 @@ fn joined_is_new(c: &Connection, local: &Id, member: &Member) -> Result<bool> {
         .unwrap_or(0);
     Ok(member.hlc >= baseline)
 }
+pub(super) fn history_devices(c: &Connection) -> Result<HashMap<Id, Id>> {
+    let mut q = c.prepare("SELECT old_device,new_device FROM history_device_replacements")?;
+    q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .map(|r| {
+            let (old, new) = r?;
+            Ok((Id::new(old)?, Id::new(new)?))
+        })
+        .collect()
+}
+/// Display attribution only: never migrate receipts, delivery authority or queued work.
+pub(super) fn replace_history_device(tx: &Transaction<'_>, old: &Id, new: &Id) -> Result<()> {
+    tx.execute(
+        "UPDATE history_device_replacements SET new_device=? WHERE new_device=?",
+        params![new.as_str(), old.as_str()],
+    )?;
+    tx.execute("INSERT INTO history_device_replacements VALUES(?,?) ON CONFLICT(old_device) DO UPDATE SET new_device=excluded.new_device", params![old.as_str(), new.as_str()])?;
+    Ok(())
+}
 impl Store {
+    pub(crate) fn attribute_finished_transfers(&self, rows: &mut [crate::outbox::Transfer]) {
+        let devices = self.history_devices.lock().expect("history devices");
+        for row in rows {
+            if matches!(row.state.as_str(), "sent" | "received")
+                && let Some(device) = devices.get(&row.device)
+            {
+                row.device = device.clone();
+            }
+        }
+    }
+
     /// A known former member can race withdrawal with a reconnect. Refuse it
     /// normally, but do not invite the owner to pair an apparent stranger.
     pub(crate) async fn setup_quiet_reconnect(&self, pin: Hash) -> Result<bool> {
@@ -652,6 +681,7 @@ impl Store {
                         .collect::<Result<HashMap<_, _>>>()?
                 };
                 let replacements = replacement::pending(&tx)?;
+                let history_devices = history_devices(&tx)?;
                 // Lock order matches the ordinary lifecycle (DB -> caches).
                 let mut cached = s.setup.lock().expect("setup");
                 let mut epochs = s.generations.lock().expect("peer generations");
@@ -659,7 +689,10 @@ impl Store {
                 let mut remote_scopes = s.setup_remote_scopes.lock().expect("remote setup scopes");
                 let mut offers = s.replacements.lock().expect("replacement offers");
                 let settings_changed = !delta.settings.is_empty() || *offers != replacements;
+                let mut history = s.history_devices.lock().expect("history devices");
                 tx.commit()?;
+                *history = history_devices;
+                drop(history);
                 for (id, fields) in delta.settings.drain(..) {
                     policy.insert(id.clone(), fields);
                     let mut revisions =

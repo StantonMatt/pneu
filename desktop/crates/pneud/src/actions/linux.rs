@@ -635,26 +635,13 @@ impl PcActions for DesktopActions {
         let mut hints = HashMap::<&str, zbus::zvariant::Value<'_>>::new();
         hints.insert("urgency", zbus::zvariant::Value::from(1u8));
         hints.insert("category", zbus::zvariant::Value::from("pneu.phone"));
-        if let Some(crate::ui::notifications::PhoneIcon::Pixels {
-            width,
-            height,
-            rgba,
-        }) = &notice.icon
-        {
-            hints.insert(
-                "image-data",
-                zbus::zvariant::Value::from(zbus::zvariant::Structure::from((
-                    *width as i32,
-                    *height as i32,
-                    (*width * 4) as i32,
-                    true,
-                    8i32,
-                    4i32,
-                    rgba.clone(),
-                ))),
-            );
-        }
-        let icon = "pneu";
+        let icon = notice
+            .icon
+            .as_ref()
+            .and_then(crate::ui::notifications::PhoneIcon::file_path)
+            .and_then(std::path::Path::to_str)
+            .unwrap_or("pneu")
+            .to_owned();
         let connection = n.proxy.connection().clone();
         drop(current);
         let dbus = zbus::fdo::DBusProxy::new(&connection).await?;
@@ -3443,26 +3430,37 @@ mod tests {
                 .build()
                 .await?,
         );
+        image::DynamicImage::new_rgba8(64, 64).save(dir.path().join("icon.png"))?;
         let mut notice = PhoneNotice {
             app: "Chat".into(),
             title: None,
             text: None,
-            icon: Some(crate::ui::notifications::PhoneIcon::Pixels {
-                width: 1,
-                height: 1,
-                rgba: vec![12, 34, 56, 255],
-            }),
+            icon: Some(crate::ui::notifications::PhoneIcon::File(
+                dir.path().join("icon.png"),
+            )),
         };
         let id = actions
             .show_phone_notification("session-key", &notice, 0)
             .await?;
         assert_eq!(app_icon.lock().unwrap().0, "Chat");
+        assert_eq!(
+            app_icon.lock().unwrap().1,
+            dir.path().join("icon.png").to_str().unwrap()
+        );
+        assert_eq!(
+            hints
+                .lock()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>(),
+            std::collections::HashSet::from(["category".to_owned(), "urgency".to_owned()])
+        );
+        notice.icon = None;
+        actions
+            .show_phone_notification("no-icon", &notice, 0)
+            .await?;
         assert_eq!(app_icon.lock().unwrap().1, "pneu");
-        let pixels: (i32, i32, i32, bool, i32, i32, Vec<u8>) = hints.lock().unwrap()["image-data"]
-            .try_clone()?
-            .try_into()?;
-        assert_eq!(pixels, (1, 1, 4, true, 8, 4, vec![12, 34, 56, 255]));
-        assert!(!dir.path().join("icon.png").exists());
         assert_eq!(
             *copy.lock().unwrap(),
             ("New notification".into(), "".into())

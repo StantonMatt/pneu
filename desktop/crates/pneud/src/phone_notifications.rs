@@ -169,25 +169,20 @@ async fn withdraw(core: &Core, session: &str, handles: &mut HashMap<Id, u32>) {
 }
 
 pub(super) fn prepare_icons(cache: &Path) -> Result<()> {
-    #[cfg(any(target_os = "macos", windows))]
     FileIcons::prepare(cache)?;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let _ = cache;
     Ok(())
 }
 fn paragraph(value: String) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 struct Icons {
-    #[cfg(any(target_os = "macos", windows))]
     files: FileIcons,
     apps: HashMap<String, Option<PhoneIcon>>,
 }
 impl Icons {
-    fn new(_cache: &Path, _session: &str) -> Self {
+    fn new(cache: &Path, session: &str) -> Self {
         Self {
-            #[cfg(any(target_os = "macos", windows))]
-            files: FileIcons::new(_cache, _session),
+            files: FileIcons::new(cache, session),
             apps: HashMap::new(),
         }
     }
@@ -211,15 +206,6 @@ impl Icons {
             limits.max_alloc = Some(65_536);
             reader.limits(limits);
             let image = reader.decode().ok()?.to_rgba8();
-            #[cfg(target_os = "linux")]
-            {
-                Some(PhoneIcon::Pixels {
-                    width: image.width(),
-                    height: image.height(),
-                    rgba: image.into_raw(),
-                })
-            }
-            #[cfg(any(target_os = "macos", windows))]
             self.files.write(image, self.apps.len())
         });
         self.apps.insert(app.clone(), icon.clone());
@@ -227,14 +213,11 @@ impl Icons {
     }
 }
 
-// Compiled in Linux tests too, so the exact macOS/Windows file lifecycle and
-// platform-private filesystem helpers are exercised before native validation.
-#[cfg(any(target_os = "macos", windows, test))]
+// Every desktop uses the same private, connection-owned icon files.
 struct FileIcons {
     path: PathBuf,
     created: bool,
 }
-#[cfg(any(target_os = "macos", windows, test))]
 impl FileIcons {
     fn prepare(cache: &Path) -> Result<()> {
         let root = cache.join("phone-notification-icons");
@@ -274,7 +257,6 @@ impl FileIcons {
         Some(PhoneIcon::File(path))
     }
 }
-#[cfg(any(target_os = "macos", windows, test))]
 impl Drop for FileIcons {
     fn drop(&mut self) {
         if self.created {
@@ -352,29 +334,11 @@ mod tests {
         same_app.app_package = Some("org.example.chat".into());
         assert_eq!(icons.get(&same_app), Some(icon.clone()));
         assert_eq!(Icons::new(scratch.path(), "fresh").get(&same_app), None);
-        #[cfg(target_os = "linux")]
-        {
-            assert!(matches!(
-                icon,
-                PhoneIcon::Pixels {
-                    width: 1,
-                    height: 1,
-                    ..
-                }
-            ));
-            assert_eq!(
-                std::fs::read_dir(scratch.path()).unwrap().count(),
-                0,
-                "Linux mirroring must never create icon files or directories"
-            );
-        }
-        if let Some(path) = icon.file_path() {
-            assert!(path.exists());
-        }
+        let path = icon.file_path().expect("all desktops cache a private PNG");
+        assert!(path.starts_with(scratch.path()));
+        assert!(path.exists());
         drop(icons);
-        if let Some(path) = icon.file_path() {
-            assert!(!path.exists());
-        }
+        assert!(!path.exists());
     }
     #[test]
     fn phone_notifications_icon_cache_bounds_and_invalid_png_fallback() {
@@ -388,7 +352,6 @@ mod tests {
             assert_eq!(icons.get(&e), None);
         }
         assert_eq!(icons.apps.len(), 128);
-        #[cfg(any(target_os = "macos", windows))]
         assert!(!icons.files.created);
         let mut large = upsert(1);
         let mut png = std::io::Cursor::new(Vec::new());
@@ -406,9 +369,10 @@ mod tests {
         crate::config::private_dir(&cache)?;
         FileIcons::prepare(&cache)?;
         let mut first = FileIcons::new(&cache, "first");
-        let icon = first.write(image::RgbaImage::new(1, 1), 0).unwrap();
+        let icon = first.write(image::RgbaImage::new(64, 64), 0).unwrap();
         let path = icon.file_path().unwrap();
         assert!(path.starts_with(&cache));
+        assert_eq!(image::image_dimensions(path)?, (64, 64));
         let dir = crate::storage::Folder::open(path.parent().unwrap(), false)?;
         let file = crate::storage::open_regular_file(path)?;
         crate::platform::private::check(&dir.file)?;

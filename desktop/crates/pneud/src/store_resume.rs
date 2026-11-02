@@ -76,6 +76,9 @@ impl Partial {
         );
         let folder = Folder::open(&self.root, false)?;
         ensure!(folder.identity()? == self.root_id, IdentityChanged);
+        let _lifecycle = crate::storage::STAGING_LIFECYCLE
+            .lock()
+            .expect("staging lifecycle");
         let directory = staging_directory(&folder)?;
         ensure!(directory.identity()? == self.directory_id, IdentityChanged);
         let file = match pfs::open_read_write_at(&directory.file, &self.name) {
@@ -385,6 +388,10 @@ impl Store {
             }
         }
         directory.file.sync_all()?;
+        let _lifecycle = crate::storage::STAGING_LIFECYCLE
+            .lock()
+            .expect("staging lifecycle");
+        crate::storage::remove_empty_staging(folder, &directory)?;
         Ok(())
     }
     pub(crate) async fn discard_legacy_partial(&self, device: Id, begin: FileBegin) -> Result<()> {

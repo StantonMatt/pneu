@@ -356,7 +356,6 @@ fn configured_win32_alias_names_stay_strict_while_receive_names_are_mapped() -> 
     let (temp, folder) = fixture()?;
     let source = create_private_at(&folder.file, "source", Access::ReadWrite)?;
     source.sync_all()?;
-    let staging = crate::storage::staging_directory(&folder)?;
     for name in [
         "data.",
         "data ",
@@ -376,11 +375,13 @@ fn configured_win32_alias_names_stay_strict_while_receive_names_are_mapped() -> 
     ] {
         let path = temp.path().join(name);
         assert!(validate_path(&path).is_err(), "{name}");
+        let staging = crate::storage::staging_directory(&folder)?;
         let stage = crate::storage::Stage::create(folder.clone(), staging.clone(), name.into(), 0)?;
         assert_ne!(stage.0.destination, name);
         validate_name(OsStr::new(&stage.0.destination))?;
         drop(stage);
-        assert_eq!(entries(&staging.file)?.count(), 0);
+        drop(staging);
+        assert!(!temp.path().join(crate::storage::STAGING_DIR).exists());
         assert!(Folder::open_private(&path).is_err(), "{name}");
         assert!(Folder::open(&path.join("child"), true).is_err(), "{name}");
         assert!(open_read(&path).is_err(), "{name}");

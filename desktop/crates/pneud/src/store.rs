@@ -140,6 +140,7 @@ struct AbandonedClaim {
 #[derive(Clone)]
 pub struct Store {
     pub(crate) replacements: Arc<Mutex<Vec<replacement::Offer>>>,
+    history_devices: Arc<Mutex<HashMap<Id, Id>>>,
     pub(crate) setup: Arc<Mutex<Option<members::SetupState>>>,
     // Last authenticated HELLO scope, tied to the binding incarnation. UI only.
     pub(crate) setup_remote_scopes: Arc<Mutex<HashMap<Id, (u64, pneu_proto::SetupScope)>>>,
@@ -704,6 +705,7 @@ impl Store {
         let setup = members::migrate(&tx)?;
         replacement::migrate(&tx)?;
         let replacements = replacement::pending(&tx)?;
+        let history_devices = members::history_devices(&tx)?;
         // Policy is authoritative before Core can expose any clipboard offers.
         let pair_settings = {
             let mut q = tx.prepare("SELECT id FROM peers")?;
@@ -741,6 +743,7 @@ impl Store {
         folder.file.sync_all()?;
         Ok(Self {
             replacements: Arc::new(Mutex::new(replacements)),
+            history_devices: Arc::new(Mutex::new(history_devices)),
             setup: Arc::new(Mutex::new(Some(setup))),
             setup_remote_scopes: Arc::new(Mutex::new(HashMap::new())),
             setup_changed: tokio::sync::watch::channel(0).0,
@@ -1376,6 +1379,9 @@ impl Store {
             if !ready.contains(&identity) {
                 store.reconcile_resume_folder(&folder)?;
             }
+            let _lifecycle = crate::storage::STAGING_LIFECYCLE
+                .lock()
+                .expect("staging lifecycle");
             let directory = staging_directory(&folder)?;
             let stage = Stage::create(folder, directory, destination, size)?;
             *stage.0.cleanup.lock().expect("stage cleanup") = Some(crate::storage::Cleanup {
@@ -3245,6 +3251,7 @@ mod tests {
         fs::create_dir(&external)?;
         fs::write(external.join("keep"), b"foreign")?;
         for path in [&a, &b] {
+            Folder::open_private(&path.join(".pneu-staging"))?;
             fs::write(
                 path.join(".pneu-staging/crash-before-stage-return"),
                 b"orphan",
@@ -3257,7 +3264,7 @@ mod tests {
             .clean_staging(vec![dir.path().join("unrelated-current-config")])
             .await?;
         for path in [a, b] {
-            assert_eq!(fs::read_dir(path.join(".pneu-staging"))?.count(), 0);
+            assert!(!path.join(".pneu-staging").exists());
         }
         assert_eq!(fs::read(external.join("keep"))?, b"foreign");
         Ok(())
@@ -3587,7 +3594,7 @@ mod tests {
         store.drain().await;
         assert_eq!(fs::read(&original)?, b"owned");
         assert!(!duplicate.exists());
-        assert_eq!(fs::read_dir(&cache)?.count(), 2); // preview + staging directory
+        assert_eq!(fs::read_dir(&cache)?.count(), 1); // preview only
         let saved = stage(&store, dir.path().join("saved"), b"owned").await?;
         let saved_path = saved.destination_path()?;
         assert!(
@@ -3713,10 +3720,7 @@ mod tests {
             fs::read(dir.path().join("moved").join(destination))?,
             b"anchored"
         );
-        assert_eq!(
-            fs::read_dir(dir.path().join("moved/.pneu-staging"))?.count(),
-            0
-        );
+        assert!(!dir.path().join("moved/.pneu-staging").exists());
         Ok(())
     }
     #[tokio::test]
@@ -3781,6 +3785,77 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    async fn empty_staging_removed_after_last_publish_and_startup_but_live_receive_survives()
+    -> Result<()> {
+        let (dir, store, device) = fixture().await?;
+        let path = dir.path().join("save");
+        let first = stage(&store, path.clone(), b"first").await?;
+        let second = stage(&store, path.clone(), b"second").await?;
+        let second_path = second.path()?;
+        store
+            .commit_file(
+                device.clone(),
+                VerifiedFile::fixture(begin(b"first")),
+                first,
+            )
+            .await?;
+        assert!(
+            second_path.exists(),
+            "publishing cannot remove another receive"
+        );
+        store.clean_staging(vec![path.clone()]).await?;
+        assert!(second_path.exists(), "cleanup cannot sweep a live receive");
+        store
+            .commit_file(device, VerifiedFile::fixture(begin(b"second")), second)
+            .await?;
+        assert!(!path.join(".pneu-staging").exists());
+        // A later receive creates a new linked root and can still publish.
+        let third = stage(&store, path.clone(), b"third").await?;
+        assert!(third.path()?.exists());
+        store.discard_stage(third).await?;
+        assert!(!path.join(".pneu-staging").exists());
+        Folder::open_private(&path.join(".pneu-staging"))?;
+        close_for_restart(store).await?;
+        let store = Store::open(&dir.path().join("state.sqlite3"))?;
+        assert!(store.clean_staging(vec![]).await?.is_empty());
+        assert!(!path.join(".pneu-staging").exists());
+        Ok(())
+    }
+    #[tokio::test]
+    async fn staging_retirement_serializes_with_new_receive_admission() -> Result<()> {
+        let (dir, store, _) = fixture().await?;
+        let path = dir.path().join("save");
+        let first = stage(&store, path.clone(), b"first").await?;
+        // Queue admission while holding the exact creation/retirement mutex.
+        let held = crate::storage::STAGING_LIFECYCLE.lock().unwrap();
+        let (entered, ready) = std::sync::mpsc::channel();
+        let (created, finished) = std::sync::mpsc::channel();
+        let runtime = tokio::runtime::Handle::current();
+        let creating_store = store.clone();
+        let creating_path = path.clone();
+        let create = std::thread::spawn(move || -> Result<Stage> {
+            entered.send(())?;
+            let stage =
+                runtime.block_on(creating_store.create_stage(creating_path, "next".into(), 1))?;
+            created.send(())?;
+            Ok(stage)
+        });
+        ready.recv()?;
+        assert!(finished.try_recv().is_err());
+        drop(held);
+        // Either winner is valid: the stage file prevents retirement, or a new
+        // root is opened and populated after retirement, under the same mutex.
+        first.cleanup()?;
+        finished.recv()?;
+        drop(first);
+
+        let next = create.join().unwrap()?;
+        assert!(next.path()?.exists());
+        next.cleanup()?;
+        assert!(!path.join(".pneu-staging").exists());
+        Ok(())
+    }
+    #[tokio::test]
     async fn dropped_and_cancelled_creation_results_are_globally_tracked_until_cleanup()
     -> Result<()> {
         let (dir, store, _) = fixture().await?;
@@ -3798,7 +3873,7 @@ mod tests {
         task.abort();
         let _ = task.await;
         store.drain().await;
-        assert_eq!(fs::read_dir(path.join(".pneu-staging"))?.count(), 0);
+        assert!(!path.join(".pneu-staging").exists());
         Ok(())
     }
     #[tokio::test]
@@ -4036,7 +4111,7 @@ mod tests {
         close_for_restart(store).await?;
         let store = Store::open(&dir.path().join("state.sqlite3"))?;
         store.clean_staging(vec![]).await?;
-        assert_eq!(fs::read_dir(folder.join(".pneu-staging"))?.count(), 0);
+        assert!(!folder.join(".pneu-staging").exists());
         assert_eq!(fs::read(path)?, b"saved");
         assert_eq!(
             store.receipt(device, meta.transfer_id.clone()).await?,

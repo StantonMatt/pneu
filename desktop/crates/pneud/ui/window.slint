@@ -911,10 +911,13 @@ export component PneuWindow inherits Window {
                         text-line: text-line.preferred-height; title-line: title-line.preferred-height;
                         HorizontalLayout {
                             padding-top: 14px; spacing: 8px;
-                            if Ui.device-action == "send": SendButton { enabled: root.device-ready; align-left: true; reason: Ui.device-folder-reason;
+                            if Ui.device-action == "send": SendButton {
+                                min-width: 0px; preferred-width: 0px;
+                                enabled: root.device-ready; align-left: true; reason: Ui.device-folder-reason;
                                 files => { Ui.send-files(Ui.device-id); } folder => { Ui.send-folder(Ui.device-id); }
                             }
                             if Ui.device.ring-supported: PneuButton {
+                                min-width: 0px; preferred-width: 0px;
                                 enabled: root.device-ready && Ui.device.ring-connection != "";
                                 text: Ui.device.ringing ? "Stop Ringing" : "Ring Phone";
                                 icon: Ui.device.ringing ? Icons.stop : Icons.ring;

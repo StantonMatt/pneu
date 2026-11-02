@@ -19,6 +19,7 @@ pub struct Offer {
 
 pub(super) fn migrate(tx: &Transaction<'_>) -> Result<()> {
     tx.execute_batch("CREATE TABLE IF NOT EXISTS local_pairing_intents(id TEXT PRIMARY KEY,old_device TEXT NOT NULL,new_device TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,payload TEXT NOT NULL,phase TEXT NOT NULL,settings TEXT);
+        CREATE TABLE IF NOT EXISTS history_device_replacements(old_device TEXT PRIMARY KEY,new_device TEXT NOT NULL);
         CREATE TRIGGER IF NOT EXISTS local_pairing_intent_end AFTER DELETE ON peers BEGIN DELETE FROM local_pairing_intents WHERE old_device=OLD.id AND phase<>'applying' AND phase<>'done'; END;")?;
     Ok(())
 }
@@ -152,6 +153,7 @@ impl Store {
             // A retained default snapshot must not be emitted after the edits.
             tx.execute("DELETE FROM settings_outgoing WHERE device=?", [new.device.as_str()])?;
             tx.execute("DELETE FROM settings_replay WHERE device=?", [new.device.as_str()])?;
+            members::replace_history_device(tx, &old.device, &new.device)?;
             if members::state(tx)?.roster.iter().any(|m| m.device_id == old.device && m.status == pneu_proto::MemberStatus::Member) {
                 members::remove(tx, &local, &old.device, None, delta)?;
             } else {
@@ -350,6 +352,98 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn replacement_finished_history_is_atomic_persistent_and_display_only() -> Result<()> {
+        let (dir, s) = fixture().await?;
+        let q = outbox::Outbox::open(s.clone(), &dir.path().join("outbox"))?;
+        let source = dir.path().join("sent.txt");
+        fs::write(&source, b"sent")?;
+        let authority = Authority {
+            device: id(1),
+            generation: 1,
+            fingerprint: pin(1),
+        };
+        let artifact = q
+            .admit(
+                id(8),
+                source.clone(),
+                vec![authority.clone()],
+                outbox::PEER_BYTES,
+            )
+            .await?;
+        let delivery = q.claim(id(1), 1, 1).await?.context("queued send")?;
+        q.receipt(delivery, None).await?;
+        q.admit(id(7), source, vec![authority], outbox::PEER_BYTES)
+            .await?;
+        let mut incoming = q
+            .snapshot(&[])
+            .into_iter()
+            .find(|r| r.transfer_id == artifact)
+            .unwrap();
+        incoming.direction = "incoming".into();
+        let finished_at = incoming.finished_at;
+        pair(&s, 2, DeviceRole::Phone, "galaxy s25+", vec![(id(1), 42)]).await?;
+        let o = offer(&s);
+        s.fail_next("members_before_commit", 1);
+        assert!(
+            s.replacement_decide(id(9), o.clone(), true, |_| panic!("rollback published"))
+                .await
+                .is_err()
+        );
+        let mut received = vec![incoming.clone()];
+        s.attribute_finished_transfers(&mut received);
+        assert_eq!(received[0].device, id(1));
+        assert_eq!(
+            s.call(|c| Ok(c.query_row(
+                "SELECT count(*) FROM history_device_replacements",
+                [],
+                |r| r.get::<_, i64>(0)
+            )?))
+            .await?,
+            0
+        );
+        s.replacement_decide(id(9), o, true, |_| {}).await?;
+        s.attribute_finished_transfers(&mut received);
+        assert_eq!(received[0].device, id(2));
+        assert_eq!(received[0].finished_at, finished_at);
+        // The original receipt/delivery identity remains transport-owned.
+        let stored: String = s
+            .call(move |c| {
+                Ok(c.query_row(
+                    "SELECT device FROM outbox_deliveries WHERE artifact=?",
+                    [artifact.as_str()],
+                    |r| r.get(0),
+                )?)
+            })
+            .await?;
+        assert_eq!(stored, id(1).to_string());
+        q.reconcile().await?;
+        let rows = q.snapshot(&[]);
+        assert!(
+            rows.iter()
+                .any(|r| r.operation == id(8) && r.device == id(2) && r.state == "sent")
+        );
+        assert!(rows.iter().any(|r| r.operation == id(7)
+            && r.device == id(1)
+            && r.state == "cancelled"
+            && r.error.as_deref() == Some(REPLACED)));
+        pair(&s, 3, DeviceRole::Phone, "galaxy s25+", vec![(id(2), 42)]).await?;
+        s.replacement_decide(id(9), offer(&s), true, |_| {}).await?;
+        s.drain().await;
+        drop((q, s));
+        let s = Store::open(&dir.path().join("state.sqlite3"))?;
+        let q = outbox::Outbox::open(s.clone(), &dir.path().join("outbox"))?;
+        let mut received = vec![incoming];
+        s.attribute_finished_transfers(&mut received);
+        assert_eq!(received[0].device, id(3));
+        assert_eq!(received[0].finished_at, finished_at);
+        assert!(
+            q.snapshot(&[])
+                .iter()
+                .any(|r| r.operation == id(8) && r.device == id(3) && r.state == "sent")
+        );
+        Ok(())
+    }
     #[tokio::test]
     async fn replacement_decline_persists_and_keeps_both_and_queue() -> Result<()> {
         let (dir, s) = fixture().await?;
