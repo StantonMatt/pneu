@@ -413,6 +413,56 @@ mod tests {
     use super::*;
     use crate::ui::notifications::Notice;
 
+    #[tokio::test]
+    async fn phone_notification_submission_guard_lives_until_ack_or_cancellation() -> Result<()> {
+        use crate::actions::PcActions;
+        let notice = crate::ui::notifications::PhoneNotice {
+            app: "Chat".into(),
+            title: Some("Message".into()),
+            text: None,
+            icon: None,
+        };
+        for mode in ["ack", "drop", "error"] {
+            let actions = DesktopActions::new(PathBuf::new());
+            let (send, receive) = mpsc::channel();
+            assert!(actions.sender.set(Sender(send)).is_ok());
+            let wait = actions
+                .begin_phone_notification("phone-key", &notice, 0)
+                .await?;
+            let Command::Show {
+                life, reply, tag, ..
+            } = receive.try_recv()?
+            else {
+                panic!("missing phone notification submission");
+            };
+            assert!(
+                life.active(),
+                "guard cancelled before acknowledgement: {mode}"
+            );
+            assert!(receive.try_recv().is_err());
+            if mode == "ack" {
+                reply.send(Ok(())).unwrap();
+                assert_eq!(wait.await?, 0);
+                assert!(life.active());
+                assert!(receive.try_recv().is_err());
+            } else {
+                if mode == "drop" {
+                    drop(wait);
+                } else {
+                    reply
+                        .send(Err(anyhow::anyhow!("submission failed")))
+                        .unwrap();
+                    assert!(wait.await.is_err());
+                }
+                assert!(!life.active());
+                assert!(
+                    matches!(receive.try_recv()?, Command::Remove { tag: removed, .. } if removed == tag)
+                );
+            }
+        }
+        Ok(())
+    }
+
     #[tokio::test(start_paused = true)]
     async fn withdrawal_precedes_reused_tag_for_activation_cancellation_and_expiry() -> Result<()> {
         for mode in ["activation", "cancellation", "expiry"] {

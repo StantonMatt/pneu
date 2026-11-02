@@ -265,7 +265,7 @@ enum ReceiptNotice {
     Text(String),
     TextFailed,
     SaveFailed {
-        metadata: FileBegin,
+        metadata: Box<FileBegin>,
         code: NackCode,
         destination: crate::ui::ReceiveDestination,
         folder: PathBuf,
@@ -277,7 +277,7 @@ struct ReceiptJob {
     notice: ReceiptNotice,
 }
 enum NotificationJob {
-    File(ActionJob, DesktopAction),
+    File(Box<ActionJob>, DesktopAction),
     Receipt(ReceiptJob),
     Delivery(crate::outbox::Transfer, String),
 }
@@ -342,7 +342,7 @@ impl ActionQueue {
         accepted
     }
     fn notice(pending: &mut PendingActions, job: ActionJob, action: DesktopAction) {
-        Self::push_notice(pending, NotificationJob::File(job, action));
+        Self::push_notice(pending, NotificationJob::File(Box::new(job), action));
     }
     fn push_notice(pending: &mut PendingActions, job: NotificationJob) {
         if pending.notifications.len() == NOTIFICATION_LIMIT {
@@ -1059,7 +1059,9 @@ impl Core {
         config.clipboard_sync_to_phone = config.clipboard_mode != crate::config::ClipboardMode::Off;
         config.validate_with_cache(&paths.cache)?;
         paths.prepare()?;
-        phone_notifications::prepare_icons(&paths.cache)?;
+        if let Err(error) = phone_notifications::prepare_icons(&paths.cache) {
+            eprintln!("pneud: phone notification icon cleanup deferred: {error}");
+        }
         let store = Store::open(&paths.data.join("state.sqlite3"))?;
         let identity = Identity::load_or_create(&paths.data)?;
         if let Some(own) = store.setup_state().roster.iter().find(|m| {
@@ -5150,7 +5152,7 @@ impl Core {
                                     scope,
                                     origin,
                                     ReceiptNotice::SaveFailed {
-                                        metadata: state.begin.clone(),
+                                        metadata: Box::new(state.begin.clone()),
                                         code,
                                         destination: state.storage_kind,
                                         folder: state.storage_folder(&self.paths).to_owned(),
@@ -5223,7 +5225,8 @@ impl Core {
                 }
                 Message::Clipboard(text) => {
                     if self.store.replacement_pending(device) {
-                        tx.send(nack(text.transfer_id, NackCode::UnsupportedKind)).await?;
+                        tx.send(nack(text.transfer_id, NackCode::UnsupportedKind))
+                            .await?;
                         return Ok(());
                     }
                     let receipt = if store.mesh {
@@ -13307,6 +13310,8 @@ mod tests {
     async fn file_replacement_during_claim_handoff_recovers_after_waiter_is_cancelled() -> Result<()>
     {
         let (dir, core, device) = fixture(Arc::new(NoActions)).await?;
+        core.set_setting("queue_offline".into(), true.into())
+            .await?;
         let _old = admit_ui_test_phone(&core, &device, 1)?;
         let authority = file_test_peer(&core, &device).await?;
         let source = dir.path().join("source");

@@ -22,11 +22,9 @@ import org.robolectric.shadows.ShadowNetworkInfo
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.OutputStream
-import java.lang.reflect.InvocationTargetException
 import java.net.Socket
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import kotlin.coroutines.intrinsics.suspendCoroutineUninterceptedOrReturn
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk=[34],application=Application::class)
@@ -36,6 +34,7 @@ class PhoneComputerEmissionTest {
         val release=CountDownLatch(1)
         val bytes=ByteArrayOutputStream()
         var stalled=false
+        var stallBeforeBytes=false
         private val output=object:OutputStream() {
             override fun write(value:Int) {
                 if(stalled) {entered.countDown();check(release.await(10,TimeUnit.SECONDS)) {"Writer not released"}}
@@ -46,19 +45,16 @@ class PhoneComputerEmissionTest {
                 bytes.write(b,off,len)
             }
         }
-        override fun getOutputStream()=output
+        override fun getOutputStream():OutputStream {
+            if(stallBeforeBytes) {entered.countDown();check(release.await(10,TimeUnit.SECONDS)) {"Socket not released"}}
+            return output
+        }
     }
     private fun ConnectionManager.field(name:String,value:Any?) {
         ConnectionManager::class.java.getDeclaredField(name).apply {isAccessible=true}.set(this,value)
     }
-    // Exercise the actual frame admission/write path without a live TLS peer.
     private suspend fun ConnectionManager.sendPhone(frame:Frame.Control,binding:DeliveryBinding):Boolean=
-        suspendCoroutineUninterceptedOrReturn {continuation->
-            try {
-                ConnectionManager::class.java.declaredMethods.single {it.name=="send"}.apply {isAccessible=true}
-                    .invoke(this,frame,null,binding,continuation)
-            } catch(e:InvocationTargetException) {throw e.targetException}
-        }
+        sendPhoneState(binding,frame)
     private suspend fun fixture(body:suspend (AppGraph,ConnectionManager,DeliveryBinding,Wire)->Unit) {
         val context=RuntimeEnvironment.getApplication()
         val owner=CoroutineScope(SupervisorJob()+Dispatchers.IO)
@@ -140,5 +136,48 @@ class PhoneComputerEmissionTest {
                 assertFalse(queued.await().await());assertEquals(0,wire.bytes.size())
             }
         }
+    }
+    /** The first-byte check rebuilds the frame from current settings. [expected]
+     * is the body that must reach the wire, or null when nothing may be sent. */
+    private suspend fun beforeFirstByte(change:suspend (AppGraph,ConnectionManager)->Unit,expected:(Type)->com.google.gson.JsonObject?) {
+        for(type in listOf(Type.BATTERY_STATE,Type.RING_STATE))fixture {app,connection,binding,wire->
+            coroutineScope {
+                wire.stallBeforeBytes=true
+                val frame=if(type==Type.BATTERY_STATE)Frame.Control(type,json("level" to 42,"charging" to false))
+                    else Frame.Control(type,json("ringing" to false))
+                val sending=async(Dispatchers.IO) {connection.sendPhone(frame,binding)}
+                try {
+                    assertTrue(wire.entered.await(5,TimeUnit.SECONDS))
+                    withTimeout(2000) {change(app,connection)}
+                }finally {wire.release.countDown()}
+                val body=expected(type)
+                if(body==null) {assertFalse(sending.await());assertEquals(0,wire.bytes.size())}
+                else {
+                    assertTrue(sending.await())
+                    val input=wire.bytes.toByteArray().inputStream()
+                    val sent=Protocol.read(input) as Frame.Control
+                    assertEquals(type,sent.type);assertEquals(body,sent.body);assertEquals(0,input.available())
+                }
+            }
+        }
+    }
+    @Test fun pauseBeforeFirstByteSendsClearedPhoneState()=runBlocking(Dispatchers.IO) {
+        beforeFirstByte({app,_->app.preferences.toggle("paused",true)}) {type->
+            if(type==Type.BATTERY_STATE)json() else json("ringing" to false)
+        }
+    }
+    @Test fun permissionRoundTripBeforeFirstByteRebuildsPhoneState()=runBlocking(Dispatchers.IO) {
+        beforeFirstByte({app,_->
+            app.preferences.toggle("showBatteryLevel",false);app.preferences.toggle("allowRinging",false)
+            app.preferences.toggle("showBatteryLevel",true);app.preferences.toggle("allowRinging",true)
+        }) {type->if(type==Type.BATTERY_STATE)json("level" to 42,"charging" to false) else json("ringing" to false)}
+    }
+    @Test fun batteryHiddenBeforeFirstByteSendsClear()=runBlocking(Dispatchers.IO) {
+        beforeFirstByte({app,_->app.preferences.toggle("showBatteryLevel",false)}) {type->
+            if(type==Type.BATTERY_STATE)json() else json("ringing" to false)
+        }
+    }
+    @Test fun replacedSessionBeforeFirstByteRejectsPhoneState()=runBlocking(Dispatchers.IO) {
+        beforeFirstByte({_,connection->connection.bindingChanged()}) {null}
     }
 }

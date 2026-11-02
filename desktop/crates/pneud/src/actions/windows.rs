@@ -343,7 +343,7 @@ impl PcActions for DesktopActions {
             .sender
             .get()
             .context("Windows notifications require an interactive daemon")?;
-        let mut submission = PhoneSubmission {
+        let submission = PhoneSubmission {
             sender: sender.clone(),
             tag: phone_tag(id),
             life: Arc::new(Lifecycle::new(None)),
@@ -356,6 +356,9 @@ impl PcActions for DesktopActions {
             submission.life.clone(),
         )?;
         Ok(Box::pin(async move {
+            // Move the complete cancellation guard into the future. Capturing
+            // only its Copy bool drops the guard before submission is awaited.
+            let mut submission = submission;
             wait.await?;
             submission.accepted = true;
             Ok(0)

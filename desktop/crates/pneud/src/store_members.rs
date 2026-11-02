@@ -280,8 +280,11 @@ pub(super) fn migrate(tx: &Transaction<'_>) -> Result<SetupState> {
         CREATE TABLE IF NOT EXISTS setup_retired(setup_id TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS setup_withdrawn_pins(fingerprint TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS setup_candidates(device TEXT NOT NULL,fingerprint TEXT NOT NULL,introduced_by TEXT NOT NULL,introducer_name TEXT NOT NULL,PRIMARY KEY(device,fingerprint));
-        CREATE TABLE IF NOT EXISTS setup_notices(device TEXT NOT NULL,generation INTEGER NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(device,generation));
-        PRAGMA user_version=4;")?;
+        CREATE TABLE IF NOT EXISTS setup_notices(device TEXT NOT NULL,generation INTEGER NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(device,generation));")?;
+    let version: u32 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version < 4 {
+        tx.pragma_update(None, "user_version", 4)?;
+    }
     let has_routes: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('setup_links') WHERE name='route_proven')",
         [],

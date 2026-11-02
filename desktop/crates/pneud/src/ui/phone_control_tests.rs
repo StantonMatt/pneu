@@ -100,12 +100,12 @@ fn phone_controls_rows_pages_and_trays_follow_live_state() {
     let projected = peers(&snapshot, &[]);
     assert_eq!(projected[0].item().battery, 82);
     assert!(!projected[0].item().charging);
-    assert_eq!(device_summary(&projected[0]).0.detail, "Wi-Fi");
+    assert_eq!(device_summary(&projected[0]).0.detail, "Local network");
     assert_eq!(
         tray_model::battery_lines(&projected),
         ["Galaxy S25+ · Battery 82%"]
     );
-    assert_eq!(projected[0].short(), "Galaxy S25+ · Wi-Fi · Battery 82%");
+    assert_eq!(projected[0].short(), "Galaxy S25+ · Local network · Battery 82%");
     let rings = tray_model::ring_items(&projected);
     assert_eq!(rings[0].label, "Ring Phone");
     assert_eq!(rings[0].connection, Some(42));

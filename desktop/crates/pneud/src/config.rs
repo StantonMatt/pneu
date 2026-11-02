@@ -434,7 +434,7 @@ mod tests {
     }
     #[test]
     fn legacy_name_is_migrated_and_saved_without_changing_preferences() -> Result<()> {
-        let dir = tempfile::tempdir()?;
+        let dir = crate::test_support::scratch()?;
         let path = dir.path().join("config.toml");
         let legacy = Config {
             name: "Pneu PC".into(),

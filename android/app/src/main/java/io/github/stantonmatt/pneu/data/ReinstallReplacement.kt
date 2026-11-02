@@ -48,6 +48,10 @@ internal object ReinstallReplacement {
         check(consent.offers.any {it.key==choice.key} && choice.key !in consent.declined && choice.matches(prefs(p),connected)) {"Replacement changed"}
         val peers=PeerRegistry.read(p);val old=peers.single {it.deviceId==choice.old.pcId}
         val fresh=peers.single {it.deviceId==choice.fresh.pcId}
+        // Offer `Turn on` only when the old entry was actually mirroring. Read this
+        // before removal, which drops the old entry's grant.
+        val mirrored=p[booleanPreferencesKey("mirrorEnabled")]==true &&
+            io.github.stantonmatt.pneu.features.NotificationConsent.computer(old) in p[stringSetPreferencesKey("mirrorComputers")].orEmpty()
         val setup=SetupStorage.read(p)
         val member=setup.roster.find {it.active && it.deviceId==old.deviceId && it.fingerprint==old.pin}
         if(member!=null)SetupTransactions.remove(p,member.key,setup.generation)
@@ -64,7 +68,7 @@ internal object ReinstallReplacement {
         PeerRegistry.write(p,peers.mapNotNull {when(it.deviceId) {old.deviceId->updated;fresh.deviceId->null;else->it}})
         p.remove(longPreferencesKey("legacyImageTime:${old.deviceId}"));p.remove(longPreferencesKey("legacyImageGeneration:${old.deviceId}"))
         val state=read(p)
-        write(p,state.copy(offers=state.offers.filterNot {it.key==choice.key},replaced=state.replaced+choice,notificationNotice=choice))
+        write(p,state.copy(offers=state.offers.filterNot {it.key==choice.key},replaced=state.replaced+choice,notificationNotice=if(mirrored)choice else state.notificationNotice))
     }
     fun fail(p:MutablePreferences,choice:ReplacementChoice) {
         decline(p,choice)

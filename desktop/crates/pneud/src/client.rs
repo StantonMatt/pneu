@@ -738,6 +738,10 @@ mod tests {
         scenario: Scenario,
         id: Id,
     ) -> Result<(PhoneConnection, JoinHandle<Result<()>>)> {
+        // macOS temporary roots may arrive through /var's symlink. Production
+        // private writes deliberately reject such an unanchored parent.
+        #[cfg(not(windows))]
+        let directory = directory.canonicalize()?;
         let phone = Phone::new(directory.join("phone"))?;
         let pc = Identity::load_or_create(&directory.join("pc"))?;
         let admission = Arc::new(Mutex::new(Admission::default()));

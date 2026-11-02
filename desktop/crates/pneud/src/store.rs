@@ -7,10 +7,10 @@ pub(crate) mod history;
 pub(crate) mod members;
 #[path = "outbox.rs"]
 pub mod outbox;
-#[path = "store_resume.rs"]
-pub(crate) mod resume;
 #[path = "store_replacement.rs"]
 pub(crate) mod replacement;
+#[path = "store_resume.rs"]
+pub(crate) mod resume;
 #[path = "store_settings.rs"]
 mod settings;
 pub(crate) use settings::{SettingsMalformed, SettingsUnexpected};
@@ -548,7 +548,7 @@ impl Store {
         };
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;")?;
         let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        ensure!(version <= 4, "unsupported store schema version {version}");
+        ensure!(version <= 5, "unsupported store schema version {version}");
         // All schema changes and legacy cleanup are one transaction. A failed
         // migration leaves the existing pairing, receipts and outbox intact.
         let tx = conn.transaction()?;
@@ -731,6 +731,8 @@ impl Store {
         let clipboard_fingerprint_key =
             crate::clipboard_fingerprint::FingerprintKey::load_in(&folder)?;
         clipboard::migrate_fingerprints(&tx, &clipboard_fingerprint_key)?;
+        // One atomic v5 migration covers history pin order, resume and replacement.
+        tx.pragma_update(None, "user_version", 5)?;
         tx.commit()?;
         // Remove obsolete raw hashes from the migration WAL as well.
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
@@ -2244,6 +2246,122 @@ mod tests {
         Ok((dir, store, device))
     }
 
+    #[tokio::test]
+    async fn v4_to_v5_preserves_data_and_migrations_never_downgrade() -> Result<()> {
+        let (dir, store, device) = fixture().await?;
+        let peers = store.peers().await?;
+        let id = device.clone();
+        store.call(move |c| {
+            c.execute("INSERT INTO receipts VALUES(?,?,?,?)", params![id.as_str(), "receipt", "{}", "kept-file"])?;
+            c.execute_batch("INSERT INTO clipboard_items(id,digest,text,origin,at) VALUES('clip','digest','saved text','Phone',123);
+                DROP TABLE file_partials; DROP TABLE file_stage_protected; DROP TABLE resume_clock;
+                DROP TABLE file_pending_cancels; DROP TRIGGER local_pairing_intent_end; DROP TABLE local_pairing_intents;
+                ALTER TABLE clipboard_items DROP COLUMN pinned;
+                ALTER TABLE outbox_deliveries DROP COLUMN resume;
+                ALTER TABLE outbox_deliveries DROP COLUMN sent;
+                PRAGMA user_version=4;")?;
+            Ok(())
+        }).await?;
+        close_for_restart(store).await?;
+        let path = dir.path().join("state.sqlite3");
+        let store = Store::open(&path)?;
+        assert_eq!(store.peers().await?, peers);
+        store
+            .call(|c| {
+                assert_eq!(
+                    c.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))?,
+                    5
+                );
+                assert_eq!(
+                    c.query_row(
+                        "SELECT text FROM clipboard_items WHERE id='clip'",
+                        [],
+                        |r| r.get::<_, String>(0)
+                    )?,
+                    "saved text"
+                );
+                assert_eq!(
+                    c.query_row(
+                        "SELECT destination FROM receipts WHERE id='receipt'",
+                        [],
+                        |r| r.get::<_, String>(0)
+                    )?,
+                    "kept-file"
+                );
+                assert!(
+                    c.query_row("SELECT pinned IS NULL FROM clipboard_items", [], |r| r
+                        .get::<_, bool>(0))?
+                );
+                for table in [
+                    "file_partials",
+                    "file_stage_protected",
+                    "resume_clock",
+                    "file_pending_cancels",
+                    "local_pairing_intents",
+                ] {
+                    c.prepare(&format!("SELECT * FROM {table}"))?;
+                }
+                c.execute_batch("UPDATE clipboard_items SET pinned=7;")?;
+                let tx = c.transaction()?;
+                outbox::migrate(&tx)?;
+                members::migrate(&tx)?;
+                assert_eq!(
+                    tx.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))?,
+                    5
+                );
+                tx.commit()?;
+                Ok(())
+            })
+            .await?;
+        close_for_restart(store).await?;
+        let store = Store::open(&path)?;
+        store
+            .call(|c| {
+                assert_eq!(
+                    c.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))?,
+                    5
+                );
+                assert_eq!(
+                    c.query_row("SELECT pinned FROM clipboard_items", [], |r| r
+                        .get::<_, i64>(0))?,
+                    7
+                );
+                Ok(())
+            })
+            .await?;
+        close_for_restart(store).await
+    }
+
+    #[tokio::test]
+    async fn future_schema_refused_before_data_migration() -> Result<()> {
+        let (dir, store, _) = fixture().await?;
+        let peers = store.peers().await?;
+        store
+            .call(|c| {
+                c.pragma_update(None, "user_version", 6)?;
+                Ok(())
+            })
+            .await?;
+        close_for_restart(store).await?;
+        let path = dir.path().join("state.sqlite3");
+        let error = Store::open(&path).err().context("future schema accepted")?;
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported store schema version 6")
+        );
+        let c = test_connection(&path)?;
+        assert_eq!(
+            c.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))?,
+            6
+        );
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM peers", [], |r| r.get::<_, i64>(0))?,
+            peers.len() as i64
+        );
+        Ok(())
+    }
+
     fn text(created_at: u64) -> Clipboard {
         Clipboard {
             sensitive: false,
@@ -2552,7 +2670,7 @@ mod tests {
             .call(|c| {
                 assert_eq!(
                     c.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))?,
-                    4
+                    5
                 );
                 assert_eq!(
                     c.query_row(

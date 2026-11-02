@@ -882,11 +882,10 @@ internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired
                 }
                 Header(resources.getString(R.string.group_computers))
                 PneuCard {
-                    ToggleRow(resources.getString(R.string.pref_show_battery),p.showBatteryLevel,divider=false) {toggle("showBatteryLevel",it)}
+                    NotificationSettingsRows(p,refresh,notifications)
+                    ToggleRow(resources.getString(R.string.pref_show_battery),p.showBatteryLevel) {toggle("showBatteryLevel",it)}
                     ToggleRow(resources.getString(R.string.pref_allow_ringing),p.allowRinging,warnDetail=true,detail=if(p.allowRinging && !context.getSystemService(android.app.NotificationManager::class.java).canUseFullScreenIntent())resources.getString(R.string.ring_full_screen_off) else null) {toggle("allowRinging",it)}
                 }
-                Header(resources.getString(R.string.notification_computers))
-                PneuCard {NotificationSettingsRows(p,refresh,notifications)}
                 Header(resources.getString(R.string.group_connection))
                 PneuCard {
                     ToggleRow(resources.getString(R.string.pref_wifi),p.wifi,divider=false) {toggle("wifi",it)}

@@ -244,7 +244,7 @@ pub fn render_svg(svg: &[u8], size: u32) -> Result<Vec<u8>> {
         &mut pixmap.as_mut(),
     );
     // tiny-skia pixels are premultiplied. SNI and Slint take straight-alpha bytes.
-    for pixel in pixmap.data_mut().chunks_exact_mut(4) {
+    for pixel in pixmap.data_mut().as_chunks_mut::<4>().0 {
         if pixel[3] > 0 {
             for i in 0..3 {
                 pixel[i] = (u32::from(pixel[i]) * 255 / u32::from(pixel[3])).min(255) as u8;
@@ -728,8 +728,8 @@ mod tests {
                 for size in [16, 20, 24, 32] {
                     let rgba = render_svg(svg.as_bytes(), size)?;
                     assert_eq!(rgba.len(), (size * size * 4) as usize);
-                    assert!(rgba.chunks_exact(4).any(|p| p[3] != 0));
-                    assert!(rgba.chunks_exact(4).any(|p| p[3] == 0));
+                    assert!(rgba.as_chunks::<4>().0.iter().any(|p| p[3] != 0));
+                    assert!(rgba.as_chunks::<4>().0.iter().any(|p| p[3] == 0));
                 }
             }
         }

@@ -192,8 +192,11 @@ pub(super) fn migrate(tx: &Transaction<'_>) -> Result<()> {
         CREATE INDEX IF NOT EXISTS outbox_peer ON outbox_deliveries(device,state,retry_at);
         CREATE TRIGGER IF NOT EXISTS outbox_revoke BEFORE DELETE ON peers BEGIN UPDATE outbox_deliveries SET state='cancelled',error='Pairing changed' WHERE device=OLD.id AND state NOT IN ('sent','cancelled'); END;
         UPDATE outbox_deliveries SET state='queued',error='Connection lost' WHERE state='sending';
-        CREATE TABLE IF NOT EXISTS outbox_capabilities(device TEXT PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,generation INTEGER NOT NULL,files INTEGER NOT NULL);
-        PRAGMA user_version=3;")?;
+        CREATE TABLE IF NOT EXISTS outbox_capabilities(device TEXT PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,generation INTEGER NOT NULL,files INTEGER NOT NULL);")?;
+    let version: u32 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version < 3 {
+        tx.pragma_update(None, "user_version", 3)?;
+    }
     let has_finished: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('outbox_deliveries') WHERE name='finished_at')", [], |r| r.get(0))?;
     if !has_finished {
         tx.execute_batch("ALTER TABLE outbox_deliveries ADD COLUMN finished_at INTEGER")?;

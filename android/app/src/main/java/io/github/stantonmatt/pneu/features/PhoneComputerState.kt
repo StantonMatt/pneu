@@ -9,7 +9,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 
 /** Only the receiving phone advertises ring willingness. Keep the legacy list in order. */
 fun phoneComputerCapabilities(allowRinging:Boolean):List<String> =
-    LEGACY_PHONE_CAPABILITIES + if(allowRinging)listOf(CAP_RING) else emptyList()
+    LEGACY_PHONE_CAPABILITIES + CAP_FILE_RESUME + if(allowRinging)listOf(CAP_RING) else emptyList()
 
 /** One RAM-only coalescer per authenticated connection. Clear bypasses the sample throttle. */
 internal class BatteryCoalescer {

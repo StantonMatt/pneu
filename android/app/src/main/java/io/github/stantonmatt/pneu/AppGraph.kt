@@ -20,7 +20,9 @@ class PneuApp : Application() {
 val Context.graph get() = (applicationContext as PneuApp).graph
 class AppGraph(val context: Context,val preferences: Preferences=Preferences(context),
                val scope:CoroutineScope=CoroutineScope(SupervisorJob() + Dispatchers.IO)) {
-    var replacementNotificationAction=ReplacementNotificationAction {}
+    var replacementNotificationAction=ReplacementNotificationAction {binding->
+        preferences.notificationReplacement(binding)
+    }
     private val snapshots=PreferenceSnapshots(preferences.flow,scope)
     val ringing by lazy {PhoneRinging(context)}
     val prefs=snapshots.state
@@ -489,9 +491,11 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
         if(!selected.matches(currentPrefs))return@withLock false
         val removed=queueMutex.withLock commit@{
             val rows=selected.items.map {item->queue.delivery(item.mediaId,item.peerId)?.takeIf(item::matches) ?: return@commit false}
-            database.runInTransaction {rows.forEach {if(it.kind!="text" && it.attempted && (it.resumable || CAP_FILE_RESUME in connection.devices.value[it.peerId]?.capabilities.orEmpty()))queue.insertPendingCancel(PendingCancel().apply {
-                peerId=it.peerId;transferId=it.transferId;generation=it.bindingGeneration
-                pin=currentPrefs.devices.find {peer->peer.deviceId==it.peerId}?.pin.orEmpty()
+            database.runInTransaction {rows.forEach {
+                // A removed or replaced computer will never reconnect to take the CANCEL.
+                val paired=currentPrefs.devices.find {peer->peer.deviceId==it.peerId}?.takeIf {_->it.error!=ReinstallReplacement.CANCELLED}
+                if(paired!=null && it.kind!="text" && it.attempted && (it.resumable || CAP_FILE_RESUME in connection.devices.value[it.peerId]?.capabilities.orEmpty()))queue.insertPendingCancel(PendingCancel().apply {
+                peerId=it.peerId;transferId=it.transferId;generation=it.bindingGeneration;pin=paired.pin
             });it.state="discarded";if(it.error==ReinstallReplacement.CANCELLED)it.error="";it.revision++;queue.update(it)}}
             rows.forEach {connection.cancelTransfer(it.mediaId,it.peerId);if(queue.hasPath(it.path)==0)java.io.File(it.path).delete()}
             maintainTerminalLocked();true

@@ -31,13 +31,14 @@ class PhoneComputerStateTest {
     }
     @Test fun defaultSettingsAndCapabilityTogglePreserveLegacyOrder() {
         assertTrue(Prefs().showBatteryLevel);assertTrue(Prefs().allowRinging)
-        assertEquals(LEGACY_PHONE_CAPABILITIES,phoneComputerCapabilities(false))
-        assertEquals(LEGACY_PHONE_CAPABILITIES+CAP_RING,phoneComputerCapabilities(true))
+        assertEquals(LEGACY_PHONE_CAPABILITIES+CAP_FILE_RESUME,phoneComputerCapabilities(false))
+        assertEquals(LEGACY_PHONE_CAPABILITIES+CAP_FILE_RESUME+CAP_RING,phoneComputerCapabilities(true))
         assertFalse(CAP_BATTERY in phoneComputerCapabilities(true))
-        // With ringing off the HELLO remains byte-for-byte the legacy capability payload.
+        assertFalse(CAP_NOTIFICATIONS in phoneComputerCapabilities(true))
+        // Resume stays advertised when ring willingness is off.
         fun hello(caps:List<String>)=ByteArrayOutputStream().also {Protocol.write(it,Frame.Control(Type.HELLO,
             json("version" to 1,"device_id" to "0".repeat(32),"name" to "Phone","capabilities" to caps,"role" to "phone","paused" to false).apply {add("setup",io.github.stantonmatt.pneu.data.SetupState().hello(SetupScope.ASK).json())}))}.toByteArray()
-        assertArrayEquals(hello(LEGACY_PHONE_CAPABILITIES),hello(phoneComputerCapabilities(false)))
+        assertArrayEquals(hello(LEGACY_PHONE_CAPABILITIES+CAP_FILE_RESUME),hello(phoneComputerCapabilities(false)))
     }
     @Test fun batterySendsFreshCoalescesChangesClearsImmediatelyAndRefreshes()=runTest {
         val input=MutableStateFlow(BatteryState(82,true));val sent=mutableListOf<Pair<Long,BatteryState>>()

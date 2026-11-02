@@ -371,7 +371,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
         val localScope=attempt?.prior?.setupScope ?: attempt?.let {if(it.setupEnabled)SetupScope.ENABLED else SetupScope.DISABLED} ?: p.peer?.setupScope ?: SetupScope.ASK
         val localSetup=p.membership.hello(localScope)
         val hello=phase(ssl,10000) {
-        send(Frame.Control(Type.HELLO, json("version" to 1, "device_id" to p.deviceId, "name" to utf8Prefix(name,128).ifEmpty {"Pneu"}, "capabilities" to (phoneComputerCapabilities(p.allowRinging)+CAP_FILE_RESUME),"role" to "phone", "paused" to p.paused).apply {add("setup",localSetup.json())}))
+        send(Frame.Control(Type.HELLO, json("version" to 1, "device_id" to p.deviceId, "name" to utf8Prefix(name,128).ifEmpty {"Pneu"}, "capabilities" to phoneComputerCapabilities(p.allowRinging),"role" to "phone", "paused" to p.paused).apply {add("setup",localSetup.json())}))
         readControl(ssl)
         }
         if (hello.type == Type.ERROR) throw RemoteError(hello.body["code"].asString)
@@ -498,12 +498,12 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
             publishBattery(combine(phoneBattery(context),app.prefs.filter {it.loaded}) {sample,prefs->
                 if(prefs.showBatteryLevel && !prefs.paused)sample else BatteryState()
             }.distinctUntilChanged(),SystemClock::elapsedRealtime) {sample->
-                send(Frame.Control(Type.BATTERY_STATE,if(sample.level==null)json() else json("level" to sample.level,"charging" to requireNotNull(sample.charging))),phoneAuthority=phoneAuthority)
+                sendPhoneState(phoneAuthority,Frame.Control(Type.BATTERY_STATE,if(sample.level==null)json() else json("level" to sample.level,"charging" to requireNotNull(sample.charging))))
             }
         } else null
         val ringSender=if(ringNegotiated)launch {
             app.ringing.state.map {it.ringing}.distinctUntilChanged().collect {ringing->
-                send(Frame.Control(Type.RING_STATE,json("ringing" to ringing)),phoneAuthority=phoneAuthority)
+                sendPhoneState(phoneAuthority,Frame.Control(Type.RING_STATE,json("ringing" to ringing)))
             }
         } else null
         val ringPolicy=launch {
@@ -512,7 +512,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                     // Stop and flush false using the old negotiation before reconnecting.
                     if(!allowed) {
                         withContext(Dispatchers.Main.immediate) {app.ringing.stop(RingStopSource.DISABLED)}
-                        if(ringNegotiated)withTimeoutOrNull(2000) {send(Frame.Control(Type.RING_STATE,json("ringing" to false)),phoneAuthority=phoneAuthority)}
+                        if(ringNegotiated)withTimeoutOrNull(2000) {sendPhoneState(phoneAuthority,Frame.Control(Type.RING_STATE,json("ringing" to false)))}
                     }
                     // Prefer a frame boundary; a stalled writer must not keep
                     // obsolete ring willingness advertised indefinitely.
@@ -933,7 +933,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                             if(!ownsSession(phoneAuthority))throw RemoteError("closing")
                             app.ringing.command(frame.body["action"].asString=="start",hello.body["name"].asString) {ownsSession(phoneAuthority)}
                         } ?: throw RemoteError("closing")
-                        if(before==result)send(Frame.Control(Type.RING_STATE,json("ringing" to result)),phoneAuthority=phoneAuthority)
+                        if(before==result)sendPhoneState(phoneAuthority,Frame.Control(Type.RING_STATE,json("ringing" to result)))
                     }
                     Type.ERROR -> throw RemoteError(frame.body["code"].asString)
                     Type.STATUS -> Unit
@@ -1076,12 +1076,32 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                 !session.current(event,app.phoneNotifications.snapshot(),current.notificationConsent,authorized))false
             else {fence=generation;true}
         }} ?: false
-        return send(Frame.Control(Type.NOTIFICATION_EVENT,com.google.gson.Gson().toJsonTree(event).asJsonObject),
-            // Only admission holds global locks. A stalled socket owns just this peer's writer.
-            guard={write->if(admit())write() else false},
-            // Socket acquisition/dispatcher waits may outlive opt-out, Pause or unpair.
-            // Recheck the captured generations immediately before the first encoded byte.
-            beforeFirstByte={admit()})
+        val frame=Frame.Control(Type.NOTIFICATION_EVENT,com.google.gson.Gson().toJsonTree(event).asJsonObject)
+        return send(frame,admission={if(admit())frame else null})
+    }
+
+    internal suspend fun sendPhoneState(binding:DeliveryBinding,frame:Frame.Control):Boolean {
+        // Each admission rebuilds the frame from current settings, so a Pause or
+        // toggle raced before the first byte sends the current state, not the old one.
+        suspend fun admit():Frame?=app.withBinding(binding.copy(sessionId=null)) {
+            app.preferences.computerPolicy.withLock {
+                if(!ownsSession(binding) || "mesh" !in capabilities)return@withBinding null
+                val current=readPrefs()
+                if(activeEndpoint?.let {endpointAllowed(current,it)}!=true)return@withBinding null
+                when(frame.type) {
+                    Type.BATTERY_STATE -> {
+                        if(CAP_BATTERY !in capabilities)return@withBinding null
+                        if(!current.showBatteryLevel || current.paused)Frame.Control(Type.BATTERY_STATE,json()) else frame
+                    }
+                    Type.RING_STATE -> {
+                        if(CAP_RING !in capabilities)return@withBinding null
+                        Frame.Control(Type.RING_STATE,json("ringing" to (current.allowRinging && !current.paused && app.ringing.state.value.ringing)))
+                    }
+                    else->null
+                }
+            }
+        }
+        return send(frame,admission={admit()})
     }
 
     internal var beforeFirstFrame:suspend (Outgoing)->Unit={}
@@ -1089,11 +1109,11 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
     internal var beforeReceiveChunk:suspend ()->Unit={}
     internal var afterFileFrameFlushed:(String)->Unit={}
     internal suspend fun withWriteLockForTest(body:suspend ()->Unit)=writes.withLock {body()}
-    private suspend fun send(frame: Frame,emission:QueuedEmission?=null,expectedSession:String?=null,onWritten:(()->Unit)?=null,phoneAuthority:DeliveryBinding?=null,guard:suspend (suspend ()->Boolean)->Boolean={it()},beforeFirstByte:(suspend ()->Boolean)?=null):Boolean {
+    private suspend fun send(frame: Frame,emission:QueuedEmission?=null,expectedSession:String?=null,onWritten:(()->Unit)?=null,admission:(suspend ()->Frame?)?=null):Boolean {
         // Validate local fields/encoding before touching a wire frame.
         SendFailures.local("invalid_payload") {Protocol.write(java.io.OutputStream.nullOutputStream(),frame)}
         if(emission!=null)beforeFirstFrame(emission.row)
-        return writes.withLock { guard write@{
+        return writes.withLock write@{
         if(expectedSession!=null && (!ready || admissionSession!=expectedSession))return@write false
         val s = socket ?: throw TransportFailure(java.io.IOException("Disconnected"))
         if(frame is Frame.Control && frame.type==Type.MEMBERS) {
@@ -1126,42 +1146,21 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                 state.update {it.copy(sent=0,total=row.size,transferMediaId=row.mediaId,transferKind=row.kind,transferFileName=row.fileName)}
             }
         }
-        if(phoneAuthority!=null) {
-            // Commit emission authority after waiting for the writer, just like
-            // beginDelivery above. Never retain privacy/lifecycle locks across I/O.
-            val outgoing=app.withBinding(phoneAuthority.copy(sessionId=null)) {
-                app.preferences.computerPolicy.withLock {
-                    if(!ownsSession(phoneAuthority) || "mesh" !in capabilities)return@withBinding null
-                    val current=readPrefs()
-                    if(activeEndpoint?.let {endpointAllowed(current,it)}!=true)return@withBinding null
-                    val control=frame as Frame.Control
-                    when(control.type) {
-                        Type.BATTERY_STATE -> {
-                            if(CAP_BATTERY !in capabilities)return@withBinding null
-                            if(!current.showBatteryLevel || current.paused)Frame.Control(Type.BATTERY_STATE,json()) else control
-                        }
-                        Type.RING_STATE -> {
-                            if(CAP_RING !in capabilities)return@withBinding null
-                            Frame.Control(Type.RING_STATE,json("ringing" to (current.allowRinging && !current.paused && app.ringing.state.value.ringing)))
-                        }
-                        else->return@withBinding null
-                    }
-                }
-            } ?: return@write false
-            return@write transmit(s,outgoing)
+        // Admission holds only local locks. Socket I/O owns just this peer's writer.
+        val outgoing=if(admission==null)frame else admission() ?: return@write false
+        transmit(s,outgoing,onWritten,admission)
         }
-        transmit(s,frame,onWritten,beforeFirstByte)
-        }}
     }
-    private suspend fun transmit(s:Socket,frame:Frame,onWritten:(()->Unit)?=null,beforeFirstByte:(suspend ()->Boolean)?=null):Boolean {
+    private suspend fun transmit(s:Socket,frame:Frame,onWritten:(()->Unit)?=null,admission:(suspend ()->Frame?)?=null):Boolean {
         val writingTransferId=when(frame) {is Frame.Chunk->frame.id;is Frame.Control->if(frame.type in setOf(Type.FILE_BEGIN,Type.FILE_END))frame.body["transfer_id"].asString else null}
-        val encoded=if(beforeFirstByte==null)null else java.io.ByteArrayOutputStream().also {Protocol.write(it,frame)}.toByteArray()
         writing.progress(); writeWake.trySend(Unit)
         try { val emitted=withContext(Dispatchers.IO) {
             val output=ProgressOutput(s.getOutputStream()) {writing.progress();writeWake.trySend(Unit)}
-            if(beforeFirstByte!=null && !beforeFirstByte())return@withContext false
+            // Obtaining the socket or dispatcher can suspend past opt-out, Pause,
+            // unpair or reconnect. Recheck immediately before the first byte.
+            val outgoing=if(admission==null)frame else admission() ?: return@withContext false
             fileFrameWriter.write(writingTransferId,{
-                if(encoded==null)Protocol.write(output,frame) else {output.write(encoded);output.flush()}
+                Protocol.write(output,outgoing)
             },{
                 onWritten?.invoke()
                 writingTransferId?.let {afterFileFrameFlushed(it)}

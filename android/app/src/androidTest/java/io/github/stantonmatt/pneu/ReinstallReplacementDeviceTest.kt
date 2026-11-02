@@ -38,6 +38,9 @@ class ReinstallReplacementDeviceTest {
         app.preferences.edit {p->
             p[longPreferencesKey("pairingRevision")]=1
             PeerRegistry.write(p,listOf(old))
+            // The snackbar only appears when the replaced entry was mirroring.
+            p[booleanPreferencesKey("mirrorInitialized")]=true;p[booleanPreferencesKey("mirrorEnabled")]=true
+            p[stringSetPreferencesKey("mirrorComputers")]=setOf(io.github.stantonmatt.pneu.features.NotificationConsent.computer(old))
         }
         val payload=File(context.cacheDir,"replacement-report.pdf").apply {writeText("Replacement resend fixture")}
         app.queue.insert(Outgoing().apply {mediaId="replacement-report";transferId=randomId();peerId=oldId;bindingGeneration=1;kind="file";fileName="Report.pdf";automatic=false;path=payload.absolutePath;size=payload.length();hash=sha256(payload.readBytes());mime="application/pdf"})

@@ -361,6 +361,16 @@ impl Harness {
         event_matching(&mut events, |e| matches!(e, pneud::Event::ConnectionChanged { device, connected: true } if *device == phone.identity.device_id)).await?;
         Ok(connection)
     }
+    async fn keep_both(&self, phone: &Phone) -> Result<()> {
+        // Simulators share a display name. Multi-phone cases deliberately keep
+        // both identities when pairing suggests replacing an offline fixture.
+        for offer in self.core.ui_snapshot().replacements {
+            if offer.new.device == phone.identity.device_id {
+                self.core.decide_replacement(offer.id, false, None).await?;
+            }
+        }
+        Ok(())
+    }
     async fn stop(self) -> Result<()> {
         self.core.request_shutdown();
         let result = tokio::time::timeout(Duration::from_secs(15), self.task).await??;
@@ -3872,6 +3882,7 @@ async fn computer_invitation_errors_and_cli_stdin_are_private() -> Result<()> {
     })
     .await?;
     assert_eq!(b.core.join_status(&attempt)?["state"], "paired");
+    wait_computer_setup(&a, &b).await?;
     assert_eq!(b.core.join(&uri).await?["state"], "already_paired");
     let reused = c.core.join(&uri).await?;
     let attempt = reused["attempt"].as_str().unwrap();
@@ -4039,6 +4050,7 @@ async fn mesh_global_order_and_slow_image_recheck_preserve_newer_text() -> Resul
     let q = h.phone("q")?;
     h.pair(&p).await?.close().await?;
     h.pair(&q).await?.close().await?;
+    h.keep_both(&q).await?;
     let mut a = mesh_phone(&h, &p).await?;
     let mut b = mesh_phone(&h, &q).await?;
     let stamp = pneud::now_ms();
@@ -4379,6 +4391,7 @@ async fn mesh_legacy_effect_fences_older_image_and_local_restart_preserves_clock
     let legacy = h.phone("legacy")?;
     h.pair(&mesh).await?.close().await?;
     let mut legacy_link = h.pair(&legacy).await?;
+    h.keep_both(&legacy).await?;
     let mut m = mesh_phone(&h, &mesh).await?;
     let mut image = metadata(Id::from_bytes(rand::random()), b"\x89PNG\r\n\x1a\nold");
     image.kind = FileKind::ClipboardImage;
@@ -6313,6 +6326,7 @@ async fn phone_notifications_identical_keys_on_two_phones_have_independent_owner
     let b = h.phone("mirror-b")?;
     drop(h.pair(&a).await?);
     drop(h.pair(&b).await?);
+    h.keep_both(&b).await?;
     let mut ta = mesh_phone(&h, &a).await?;
     let mut tb = mesh_phone(&h, &b).await?;
     let clear = notification(serde_json::json!({"action":"clear"}));
@@ -6509,3 +6523,6 @@ async fn phone_notifications_full_session_uses_bulk_withdrawal_on_clear_and_disc
     assert_eq!(*h.actions.phone_batches.lock().unwrap(), vec![128, 128]);
     h.stop().await
 }
+
+#[cfg(target_os = "linux")]
+mod android_interop_cases;

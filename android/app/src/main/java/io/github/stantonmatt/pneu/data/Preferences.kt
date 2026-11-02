@@ -476,6 +476,18 @@ class Preferences(private val context:Context,internal val store:androidx.datast
             if(!computer || !enabled || PeerRegistry.read(p).any {io.github.stantonmatt.pneu.features.NotificationConsent.computer(it)==key})p[field]=if(enabled)current+key else current-key
         }
     }
+    /** The snackbar tap grants only this exact new binding. It never touches the
+     * master switch: turning that on would resume sending to every remembered computer. */
+    internal suspend fun notificationReplacement(binding:DeliveryBinding)=policy.locked {
+        notificationGeneration=Math.addExact(notificationGeneration,1)
+        edit {p->
+            val peer=PeerRegistry.read(p).singleOrNull {it.deviceId==binding.pcId && it.pin==binding.pin &&
+                it.generation==binding.generation && !it.pairingLost && it.role=="computer"}
+            check(peer!=null && s(p,"deviceId")==binding.phoneId && !b(p,"deliveryReset") && binding.pcId !in PeerRegistry.resets(p)) {"Pairing changed"}
+            val field=stringSetPreferencesKey("mirrorComputers")
+            p[field]=p[field].orEmpty()+io.github.stantonmatt.pneu.features.NotificationConsent.computer(peer)
+        }
+    }
     suspend fun finishPeerReset(peerId:String) {edit {PeerRegistry.finishReset(it,peerId)}}
     suspend fun forget(lostPcName:String?=null,peerId:String?=null):Unit=policy.locked {
         beforeMutation("forget")

@@ -16,6 +16,53 @@ import java.io.File
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk=[34],application=Application::class)
 class NotificationConsentTest {
+    private suspend fun replacementFixture(enabled:Boolean,body:suspend (Preferences,io.github.stantonmatt.pneu.AppGraph,DeliveryBinding,Peer,Peer)->Unit) {
+        val context=RuntimeEnvironment.getApplication()
+        val owner=CoroutineScope(SupervisorJob()+Dispatchers.IO)
+        val file=File(context.cacheDir,"replacement-consent-${System.nanoTime()}.preferences_pb")
+        val store=PreferenceDataStoreFactory.create(scope=owner) {file}
+        val preferences=Preferences(context,store)
+        val peer=Peer("New PC","b".repeat(64),"b".repeat(32),emptyList(),generation=2)
+        val other=peer.copy(name="Other PC",deviceId="d".repeat(32),pin="d".repeat(64))
+        val graph=io.github.stantonmatt.pneu.AppGraph(context,preferences,
+            CoroutineScope(SupervisorJob()+kotlinx.coroutines.test.StandardTestDispatcher()))
+        try {
+            store.edit {
+                it[stringPreferencesKey("deviceId")]="c".repeat(32);PeerRegistry.write(it,listOf(peer,other))
+                it[stringSetPreferencesKey("mirrorApps")]=setOf("0/chat")
+                it[booleanPreferencesKey("mirrorNamesOnly")]=true
+                // The master remembers its computer choices while it is off.
+                it[booleanPreferencesKey("mirrorInitialized")]=true;it[booleanPreferencesKey("mirrorEnabled")]=enabled
+                it[stringSetPreferencesKey("mirrorComputers")]=setOf(NotificationConsent.computer(other))
+            }
+            body(preferences,graph,requireNotNull(DeliveryBinding.from(preferences.read(),peer.deviceId)),peer,other)
+        }finally {
+            graph.scope.cancel();graph.database.close();context.deleteDatabase("outgoing.db")
+            owner.cancel();owner.coroutineContext[Job]?.join();file.delete()
+        }
+    }
+    @Test fun replacementActionGrantsOnlyTheExactNewComputerAndPreservesAppChoices()=runBlocking<Unit> {
+        replacementFixture(enabled=true) {preferences,graph,binding,peer,other->
+            graph.withBinding(binding) {graph.replacementNotificationAction.turnOnForNewComputer(binding)}
+            val consent=preferences.read().notificationConsent
+            assertTrue(consent.enabled);assertTrue(consent.initialized);assertTrue(consent.namesOnly)
+            assertEquals(setOf(NotificationConsent.computer(other),NotificationConsent.computer(peer)),consent.computers)
+            assertEquals(setOf("0/chat"),consent.apps)
+            preferences.edit {PeerRegistry.write(it,listOf(peer.copy(generation=3),other))}
+            assertTrue(runCatching {graph.replacementNotificationAction.turnOnForNewComputer(binding)}.isFailure)
+            assertFalse(NotificationConsent.computer(peer.copy(generation=3)) in preferences.read().notificationConsent.computers)
+        }
+    }
+    @Test fun replacementActionWithMasterOffNeverResumesOtherComputers()=runBlocking<Unit> {
+        replacementFixture(enabled=false) {preferences,graph,binding,peer,other->
+            graph.withBinding(binding) {graph.replacementNotificationAction.turnOnForNewComputer(binding)}
+            val p=preferences.read();val consent=p.notificationConsent
+            assertFalse(consent.enabled);assertTrue(consent.initialized)
+            assertEquals(setOf(NotificationConsent.computer(other),NotificationConsent.computer(peer)),consent.computers)
+            assertFalse(consent.allows(p,p.devices.single {it.deviceId==other.deviceId},access=true,capable=true))
+            assertFalse(consent.allows(p,p.devices.single {it.deviceId==peer.deviceId},access=true,capable=true))
+        }
+    }
     @Test fun defaultsSetupPreselectionPersistenceAndBindingRemoval()=runBlocking<Unit> {
         val context=RuntimeEnvironment.getApplication()
         val owner=CoroutineScope(SupervisorJob()+Dispatchers.IO)

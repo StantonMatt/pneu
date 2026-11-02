@@ -36,8 +36,12 @@ class ReinstallReplacementTest {
         assertEquals(ReinstallReplacement.name("Σ"),ReinstallReplacement.name("ς"))
         assertNotEquals(ReinstallReplacement.name("I"),ReinstallReplacement.name("ı"))
     }
+    private fun mirror(data:MutablePreferences,enabled:Boolean,vararg peers:Peer) {
+        data[booleanPreferencesKey("mirrorInitialized")]=true;data[booleanPreferencesKey("mirrorEnabled")]=enabled
+        data[stringSetPreferencesKey("mirrorComputers")]=peers.map(io.github.stantonmatt.pneu.features.NotificationConsent::computer).toSet()
+    }
     @Test fun replaceCopiesOnlyOrdinaryValuesWithFreshLocalStampsAndPreservesNewIdentity() {
-        val data=data();val choice=offer(data)
+        val data=data();mirror(data,true,old);val choice=offer(data)
         ReinstallReplacement.replace(data,choice) {false}
         val after=p(data);val peer=after.devices.single()
         assertEquals(b,peer.deviceId);assertEquals(fresh.pin,peer.pin);assertEquals(2L,peer.generation)
@@ -49,6 +53,25 @@ class ReinstallReplacementTest {
         assertTrue(a in PeerRegistry.resets(data));assertEquals(choice,after.replacements.notificationNotice)
         assertTrue(after.replacements.offers.isEmpty())
         assertEquals(choice,after.replacements.replacement(a,1))
+    }
+    @Test fun notificationNoticeOnlyWhenTheOldEntryWasMirroring() {
+        val other=Peer("Other","c".repeat(64),"4".repeat(32),emptyList(),generation=3)
+        fun notice(setup:(MutablePreferences)->Unit):ReplacementChoice? {
+            val data=data(listOf(old,fresh,other));setup(data);val choice=offer(data)
+            ReinstallReplacement.replace(data,choice) {false}
+            val state=ReinstallReplacement.read(data)
+            assertEquals(choice,state.replaced.single())
+            // The old grant never carries over to the new entry.
+            assertFalse(io.github.stantonmatt.pneu.features.NotificationConsent.computer(PeerRegistry.read(data).single {it.deviceId==b}) in
+                data[stringSetPreferencesKey("mirrorComputers")].orEmpty())
+            return state.notificationNotice?.also {assertEquals(choice,it)}
+        }
+        assertNotNull(notice {mirror(it,true,old)})
+        assertNotNull(notice {mirror(it,true,old,other)})
+        assertNull(notice {})
+        assertNull(notice {mirror(it,false,old,other)})
+        assertNull(notice {mirror(it,true,other)})
+        assertNull(notice {mirror(it,true)})
     }
     @Test fun declinePersistsExactPairSuppressionAndKeepsBothPairingsAndSwitches() {
         val data=data();val choice=offer(data);val before=PeerRegistry.read(data)
@@ -111,7 +134,7 @@ class ReinstallReplacementTest {
         val job=SupervisorJob();val store=PreferenceDataStoreFactory.create(scope=CoroutineScope(job+Dispatchers.IO)) {file}
         val prefs=Preferences(context,store);val db=Room.inMemoryDatabaseBuilder(context,QueueDatabase::class.java).build();val queue=db.queue()
         try {
-            store.edit {it[stringPreferencesKey("deviceId")]=phone;it[longPreferencesKey("pairingRevision")]=2;PeerRegistry.write(it,listOf(old,fresh))}
+            store.edit {it[stringPreferencesKey("deviceId")]=phone;it[longPreferencesKey("pairingRevision")]=2;PeerRegistry.write(it,listOf(old,fresh));mirror(it,true,old)}
             val row=Outgoing().apply {mediaId="payload";transferId="transfer";peerId=a;bindingGeneration=1;fileName="report.pdf";path="/retained/report.pdf";automatic=false;kind="file"}
             queue.insert(row);queue.insertDelivery(Delivery.from(row).apply {peerId="other";bindingGeneration=7})
             var choice:ReplacementChoice?=null
@@ -241,6 +264,17 @@ class ReinstallReplacementTest {
             assertEquals("waiting",graph.queue.delivery(newer.mediaId,b).state)
             assertOriginalRecipient(graph,cancelled,other)
             assertEquals(2048,graph.queue.pendingCount())
+        }
+    }
+    @Test fun discardingAReplacedRecipientQueuesNoCancelForTheRemovedComputer()=runBlocking<Unit>(Dispatchers.IO) {
+        retryFixture("file") {graph,cancelled,_,other->
+            graph.queue.deliveries(cancelled.mediaId).forEach {graph.queue.update(it.apply {attempted=true;resumable=true})}
+            assertTrue(graph.discard(ConfirmedQueue.from(graph.preferences.read(),graph.queue.deliveries(cancelled.mediaId))))
+            assertTrue(graph.queue.pendingCancels(a).isEmpty())
+            // A still-paired recipient keeps its resume CANCEL.
+            val kept=graph.queue.pendingCancels(other.deviceId).single()
+            assertEquals(cancelled.transferId,kept.transferId);assertEquals(other.pin,kept.pin);assertEquals(3L,kept.generation)
+            assertTrue(graph.queue.deliveries(cancelled.mediaId).all {it.state=="discarded"})
         }
     }
     private fun assertOriginalRecipient(graph:AppGraph,cancelled:Outgoing,other:Peer) {

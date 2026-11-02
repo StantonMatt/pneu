@@ -603,7 +603,7 @@ mod tests {
         assert!(
             tray.tool_tip()
                 .description
-                .contains("Phone_A · Wi-Fi · Battery 15%")
+                .contains("Phone_A · Local network · Battery 15%")
         );
         let ring = menu
             .iter()

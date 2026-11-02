@@ -23,6 +23,7 @@ class MirrorNotificationPosterActivity:Activity() {
     override fun onCreate(state:Bundle?) {
         super.onCreate(state)
         val manager=getSystemService(NotificationManager::class.java)
+        if(intent.getBooleanExtra("cancel",false)) {manager.cancel(42);finish();return}
         manager.createNotificationChannel(NotificationChannel("mirror-test","Mirror test",NotificationManager.IMPORTANCE_HIGH))
         manager.notify(42,Notification.Builder(this,"mirror-test").setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentTitle("Ana").setContentText(intent.getStringExtra("text") ?: "¿Llegaste?").setVisibility(if(intent.getBooleanExtra("secret",false))Notification.VISIBILITY_SECRET else Notification.VISIBILITY_PRIVATE).build())

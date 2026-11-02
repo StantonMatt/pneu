@@ -818,10 +818,20 @@ fn recipient_details(peers: &[Peer], transfers: &[Transfer], key: &str) -> Vec<R
                 "sending" => format!("Sending · {}", size_pair(t.sent, t.size)),
                 "staging" => "Preparing…".into(),
                 "queued" | "waiting_for_device" => "Waiting · not connected".into(),
-                "failed" => transfer_failure(
-                    t,
-                    peer.map(|p| p.name.as_str()).unwrap_or("a removed device"),
-                ),
+                "failed" => {
+                    let failure = transfer_failure(
+                        t,
+                        peer.map(|p| p.name.as_str()).unwrap_or("a removed device"),
+                    );
+                    if matches!(
+                        t.error.as_deref(),
+                        Some("Connection lost" | "Connection interrupted")
+                    ) {
+                        failure
+                    } else {
+                        format!("Failed · {failure}")
+                    }
+                }
                 "sent" => t
                     .finished_at
                     .map(|at| format!("Sent · {}", super::last_seen(at)))
@@ -5843,6 +5853,8 @@ mod tests {
         window: &PneuWindow,
         dir: &Path,
     ) -> (Worker, tokio::sync::mpsc::UnboundedReceiver<Action>) {
+        #[cfg(not(windows))]
+        let dir = dir.canonicalize().expect("canonical fixture root");
         let view = Arc::new(Mutex::new(View::default()));
         let (commands, rx) = tokio::sync::mpsc::unbounded_channel();
         connect(window, &commands, &view);

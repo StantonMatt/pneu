@@ -350,7 +350,7 @@ async fn outbox_pc_to_pc_lost_ack_replays_to_receiver_dedupe() -> Result<()> {
             .ui_snapshot()
             .devices
             .iter()
-            .all(|d| d.state != "connected" || d.route.as_deref() == Some("Wi-Fi"))
+            .all(|d| d.state != "connected" || d.route.as_deref() == Some("Local network"))
     );
     assert_eq!(b.saved()?.len(), 1);
     assert_eq!(std::fs::read(&b.saved()?[0])?, b"PC file bytes");
@@ -655,7 +655,7 @@ async fn incoming_phone_progress_and_recent_are_scoped_to_each_device() -> Resul
         snapshot
             .devices
             .iter()
-            .all(|d| d.route.as_deref() == Some("Wi-Fi"))
+            .all(|d| d.route.as_deref() == Some("Local network"))
     );
     write_frame(
         &mut b,
