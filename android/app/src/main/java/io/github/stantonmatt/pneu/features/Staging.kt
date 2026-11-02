@@ -114,6 +114,22 @@ class Staging(private val app: AppGraph, private val deleteCommittedSource:(File
         } catch(e:LocalCapacityException) {app.preferences.toggle("localCapacity",true);throw e}
         finally {part?.let {activeParts.remove(it)}}
     }
+    internal suspend fun admitFolder(row:Outgoing,capture:FolderCapture,binding:DeliveryBinding):Boolean=withContext(Dispatchers.IO) {mutex.withLock {
+        capacity(0)
+        val target=File(dir,"${row.transferId}.bin")
+        val part=File.createTempFile("folder-",".part",dir)
+        try {
+            val descriptor=capture.encode().toByteArray()
+            if(descriptor.size>32*1024*1024)throw FolderInvalid(FolderInvalid.Reason.METADATA)
+            FileOutputStream(part).use {out->writer(out).write(descriptor);out.fd.sync()}
+            check(part.renameTo(target));syncDir();row.path=target.path
+            Protocol.validate(Type.FILE_BEGIN,metadata(row))
+            val admitted=app.enqueue(row,binding)
+            if(!admitted)target.delete()
+            admitted
+        }catch(e:Exception) {if(app.queue.anyPath(target.path)==0)target.delete();throw e}
+        finally {part.delete()}
+    }}
     suspend fun optimize(row:Outgoing)=withContext(Dispatchers.IO) {ImageWorkBudget.run {
         // An interrupted pre-send preparation may already have published a JPEG.
         // Its ID, bytes and metadata are immutable on every subsequent selection.
@@ -166,7 +182,7 @@ class Staging(private val app: AppGraph, private val deleteCommittedSource:(File
         }}catch(_:Exception) {null}
         var retained=false
         try {
-            val thumbnail=target?.let {MediaPreview.makeThumbnail(app.context,row,it,beforeThumbnailWrite)}
+            val thumbnail=if(row.isFolder())null else target?.let {MediaPreview.makeThumbnail(app.context,row,it,beforeThumbnailWrite)}
             if(thumbnail==null)target?.delete()
             mutex.withLock {app.queueMutex.withLock commit@{
                 val current=app.queue.delivery(row.mediaId,row.peerId)
@@ -200,6 +216,8 @@ class Staging(private val app: AppGraph, private val deleteCommittedSource:(File
     }
     companion object {
         fun clipboardMetadata(row:Outgoing)=json("transfer_id" to row.transferId,"text" to row.text,"created_at" to row.createdAt,"origin" to row.origin).apply {if(row.sensitive)addProperty("sensitive",true)}
-        fun metadata(row: Outgoing)=json("transfer_id" to row.transferId,"file_name" to row.fileName,"mime" to row.mime,"size" to row.size,"sha256" to row.hash,"kind" to row.kind,"created_at" to row.createdAt,"source_media_id" to row.mediaId).apply {if(row.kind=="clipboard_image" && row.sensitive)addProperty("sensitive",true)}
+        fun metadata(row: Outgoing)=json("transfer_id" to row.transferId,"file_name" to row.fileName,"mime" to row.mime,"size" to row.size,"sha256" to row.hash,"kind" to row.kind,"created_at" to row.createdAt,"source_media_id" to row.mediaId).apply {if(row.isFolder()) {
+            remove("source_media_id");addProperty("resume",true);add("folder",json("manifest_len" to requireNotNull(row.folderSummary()).manifestLen))
+        }else if(row.kind=="clipboard_image" && row.sensitive)addProperty("sensitive",true)}
     }
 }

@@ -90,6 +90,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
     fun requestMediaScan() {mediaRefresh.update {it+1}}
     internal val savedClips = SavedClips(context,scope)
     val staging = Staging(this)
+    internal val folderSends = FolderSends(this)
     val clipboard = ClipboardDelivery(this)
     // Receive data hook; the designer-owned Recent ViewModel can combine this flow.
     val receivedFiles = ReceivedFiles(this)
@@ -496,7 +497,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
             if(expected!=null && (expected.items.isEmpty() || expected.items.any {it.mediaId!=id}))return@commit false
             val rows=if(expected!=null)expected.resolve(queue.deliveries(id)) ?: return@commit false
                 else queue.deliveries(id).filter {it.state in setOf("waiting","failed")}
-            val retryable=rows.filter {it.state in setOf("waiting","failed")}
+            val retryable=rows.filter {it.state in setOf("waiting","failed") && !(it.isFolder() && it.error in setOf("folder_changed","folder_access_lost"))}
             if(retryable.isEmpty())return@commit false
             database.runInTransaction {retryable.forEach {row->
                 row.state=if(row.kind=="text" && queue.newerPeerText(row.peerId,row.orderId)>0)"superseded" else "waiting"

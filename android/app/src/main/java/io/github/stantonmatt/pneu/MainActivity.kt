@@ -234,6 +234,43 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
             files.launch("*/*")
         }.onFailure {filesFor=null;actionError=UiFeedback(resources.getString(R.string.toast_cant_read)) to null}
     }
+    var folderFor by rememberSaveable(stateSaver=CapturedAuthoritySaver) {mutableStateOf<CapturedAuthority?>(null)}
+    val folderPicker=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) {uri->
+        val authority=folderFor;folderFor=null
+        if(uri!=null && authority!=null)app.scope.launch {
+            try {app.folderSends.send(uri,authority)}
+            catch(e:CancellationException) {throw e}
+            catch(e:Exception) {withContext(Dispatchers.Main) {
+                val message=when(e) {
+                    is FolderEmpty->resources.getString(R.string.folder_empty,e.folder)
+                    is FolderTooLarge->resources.getString(R.string.folder_too_large,e.folder)
+                    is FolderChanged->resources.getString(R.string.folder_changed)
+                    is SecurityException->resources.getString(R.string.folder_cant_read_selected)
+                    is LocalCapacityException->resources.getString(R.string.folder_storage_full)
+                    is FolderInvalid->resources.getString(when(e.reason) {
+                        FolderInvalid.Reason.PATH->R.string.folder_bad_names
+                        FolderInvalid.Reason.DEPTH->R.string.folder_too_deep
+                        FolderInvalid.Reason.COUNT->R.string.folder_too_many
+                        FolderInvalid.Reason.CHANGING->R.string.folder_changing
+                        FolderInvalid.Reason.METADATA->R.string.folder_metadata
+                        FolderInvalid.Reason.UNREADABLE->R.string.folder_unreadable
+                    })
+                    is FolderUnavailable->resources.getString(R.string.folder_update_required,e.device)
+                    else->resources.getString(R.string.toast_cant_read)
+                }
+                actionError=UiFeedback(message) to null
+            }}
+        }
+    }
+    fun sendFolder(id:String) {
+        val peer=p.devices.find {it.deviceId==id} ?: return
+        val state=app.connection.devices.value[id]
+        if(FolderGate.needsUpdate(state?.capabilities.orEmpty(),app.connection.connected(id))) {actionError=UiFeedback(resources.getString(R.string.folder_update_required,peer.name)) to null;return}
+        runCatching {
+            folderFor=CapturedAuthority(requireNotNull(DeliveryBinding.from(p,id)))
+            folderPicker.launch(null)
+        }.onFailure {folderFor=null;actionError=UiFeedback(resources.getString(R.string.toast_cant_read)) to null}
+    }
     var backProgress by remember {mutableFloatStateOf(0f)}
     PredictiveBackHandler(enabled=screen in listOf("settings","permissions","history") || screen?.startsWith(DEVICE)==true || screen?.startsWith(MEMBER)==true || (screen=="pair" && SetupPresentation.hasDevices(p))) { events ->
         try {events.collect {backProgress=it.progress};navigate(if(screen=="permissions") permissionOrigin else "home")}
@@ -271,7 +308,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
                     val state=deviceStates.find {it.peer.deviceId==id}
                     LaunchedEffect(state==null,p.devices) {if(state==null && p.devices.none {it.deviceId==id} && screen==visibleScreen)navigate("home")}
                     if(state!=null)DeviceScreen(p,state,{navigate("home")},{navigate("pair")},{unpair=ConfirmedBinding.from(p,id)},{sendFiles(id)},
-                        SetupActions(link={displayedBindings[id]?.let {linkDevices(it,displayedAllPrompts)}},allow={answer(displayedPrompts,true)},remove={SetupPresentation.memberKey(p,state.peer)?.let(::askRemove)})) {key,value->
+                        SetupActions(link={displayedBindings[id]?.let {linkDevices(it,displayedAllPrompts)}},allow={answer(displayedPrompts,true)},remove={SetupPresentation.memberKey(p,state.peer)?.let(::askRemove)}),sendFolder={sendFolder(id)}) {key,value->
                         val authority=DeliveryBinding.from(p,id)?.let(::CapturedAuthority)
                         if(authority!=null)scope.launch {actions.run(resources.getString(R.string.ui_error_setting)) {devicesModel.setPairSwitch(authority,key,value)}}
                     }
@@ -641,8 +678,10 @@ internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired
 }
 
 @Composable internal fun HomeScreen(p: Prefs,link: LinkState,recent: List<Outgoing>,health: Health,modifier: Modifier,permissions: () -> Unit,pair: () -> Unit,onScrolled:(Boolean)->Unit,outcomes:Map<String,RecentItem> = emptyMap(),
-                                    devices:List<DeviceState>?=null,deviceLinks:Map<String,LinkState>?=null,setup:HomeSetup=HomeSetup(),openDevice:(String)->Unit={}) {
+                                    devices:List<DeviceState>?=null,deviceLinks:Map<String,LinkState>?=null,setup:HomeSetup=HomeSetup(),folderPreparations:List<FolderPreparing>?=null,openDevice:(String)->Unit={}) {
     val context=LocalContext.current;val resources=LocalResources.current; val app=context.graph; val scope=rememberCoroutineScope();val actions=LocalUiActions.current
+    val livePreparing by app.folderSends.preparing.collectAsState()
+    val preparing=folderPreparations ?: livePreparing
     val liveLinks by app.connection.devices.collectAsState()
     val links=deviceLinks ?: liveLinks
     val deviceList=devices ?: remember(p,links) {DeviceProjection.states(p,links)}
@@ -719,16 +758,19 @@ internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired
                     }
                 }
             }
-            if(recent.isEmpty()) item {PneuCard {Column(Modifier.fillMaxWidth().height(132.dp),horizontalAlignment=Alignment.CenterHorizontally,verticalArrangement=Arrangement.Center) {Symbol(R.drawable.ic_image,modifier=Modifier.size(28.dp),tint=LocalPneuColors.current.text3);Text(resources.getString(R.string.recent_empty),Modifier.padding(top=8.dp),style=MaterialTheme.typography.bodyMedium,color=MaterialTheme.colorScheme.onSurfaceVariant)}}}
+            items(preparing,key={"preparing:"+it.row.mediaId}) {preparation->FolderPreparingRow(preparation,if(p.devices.size>1)p.devices.find {it.deviceId==preparation.row.peerId}?.name else null,preparation==preparing.first(),preparation==preparing.last() && recent.isEmpty()) {app.folderSends.cancel(preparation.row.mediaId)}}
+            if(recent.isEmpty() && preparing.isEmpty()) item {PneuCard {Column(Modifier.fillMaxWidth().height(132.dp),horizontalAlignment=Alignment.CenterHorizontally,verticalArrangement=Arrangement.Center) {Symbol(R.drawable.ic_image,modifier=Modifier.size(28.dp),tint=LocalPneuColors.current.text3);Text(resources.getString(R.string.recent_empty),Modifier.padding(top=8.dp),style=MaterialTheme.typography.bodyMedium,color=MaterialTheme.colorScheme.onSurfaceVariant)}}}
             else items(recent,key={it.mediaId}) {row ->
-                Surface(color=groupColor(),modifier=Modifier.then(if(LocalPneuMotion.current)Modifier.animateItem(fadeInSpec=androidx.compose.animation.core.tween(200),fadeOutSpec=androidx.compose.animation.core.tween(200))else Modifier).fillMaxWidth().pneuCardRowHairline(row==recent.first(),row==recent.last()),shape=RoundedCornerShape(topStart=if(row==recent.first())24.dp else 0.dp,topEnd=if(row==recent.first())24.dp else 0.dp,bottomStart=if(row==recent.last())24.dp else 0.dp,bottomEnd=if(row==recent.last())24.dp else 0.dp)) {
+                val first=preparing.isEmpty() && row==recent.first();val last=row==recent.last()
+                val folderSummary=remember(row.origin,row.mime,row.text) {row.folderSummary()}
+                Surface(color=groupColor(),modifier=Modifier.then(if(LocalPneuMotion.current)Modifier.animateItem(fadeInSpec=androidx.compose.animation.core.tween(200),fadeOutSpec=androidx.compose.animation.core.tween(200))else Modifier).fillMaxWidth().pneuCardRowHairline(first,last),shape=RoundedCornerShape(topStart=if(first)24.dp else 0.dp,topEnd=if(first)24.dp else 0.dp,bottomStart=if(last)24.dp else 0.dp,bottomEnd=if(last)24.dp else 0.dp)) {
                     val outcome=outcomes[row.mediaId]
                     val multi=outcome!=null && outcome.recipients.size>1
                     val settled=outcome?.let {!it.actionable} ?: (row.state !in setOf("waiting","sending","failed"))
                     val progress=outcome?.sending==true || link.transferMediaId==row.mediaId && showProgress
                     val sent=if(outcome?.sending==true)outcome.sent else link.sent
                     val total=if(outcome?.sending==true)outcome.total else link.total
-                    Row(Modifier.fillMaxWidth().pneuRow(row!=recent.first(),76.dp).heightIn(min=68.dp).pneuClick(enabled=multi && !settled || row.state=="sent" && (if(row.kind=="text")row.text.matches(Regex("""https?://\S+""")) else row.uri.isNotEmpty())) {if(multi && !settled)details=row.mediaId else scope.launch {actions.run(resources.getString(R.string.toast_cant_read)) {
+                    Row(Modifier.fillMaxWidth().pneuRow(!first,76.dp).heightIn(min=68.dp).pneuClick(enabled=multi && !settled || row.state=="sent" && (if(row.kind=="text")row.text.matches(Regex("""https?://\S+""")) else row.uri.isNotEmpty())) {if(multi && !settled)details=row.mediaId else scope.launch {actions.run(resources.getString(R.string.toast_cant_read)) {
                         if(row.kind=="text")context.startActivity(Intent(Intent.ACTION_VIEW,Uri.parse(row.text)))
                         else outcome?.received?.let {file->context.startActivity(ReceivedFileNotifications.openIntent(context,file))}
                             ?: check(RecentItems.openOriginal(context,row)) {"Original unavailable"}
@@ -743,6 +785,11 @@ internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired
                             val failing=outcome?.failed?.isNotEmpty()==true
                             val connectionLost=UiPresentation.connectionLostFailure(context,row.state,row.error,row.resumable,row.sentBytes,row.size)
                             val supporting=when {
+                                row.isFolder() && row.state=="sent" -> (if(p.devices.size>1)resources.getString(R.string.folder_to,p.devices.find {it.deviceId==row.peerId}?.name.orEmpty()) else "")+requireNotNull(folderSummary).sent(context,time,android.text.format.Formatter.formatShortFileSize(context,row.size-requireNotNull(folderSummary).manifestLen))
+                                row.isFolder() && row.error=="folder_update_required" -> resources.getString(R.string.folder_update_required,p.devices.find {it.deviceId==row.peerId}?.name.orEmpty())
+                                row.isFolder() && row.error=="folder_access_lost" -> resources.getString(R.string.folder_cant_read,row.fileName)
+                                row.isFolder() && row.error=="folder_changed" -> resources.getString(R.string.folder_changed)
+                                row.isFolder() && row.error=="folder_disk_full_early" -> resources.getString(R.string.folder_needs_free,p.devices.find {it.deviceId==row.peerId}?.name.orEmpty(),android.text.format.Formatter.formatShortFileSize(context,row.size))
                                 outcome?.received!=null -> UiPresentation.recentReceived(context,outcome,time,p.devices.size)!!
                                 several && settled -> UiPresentation.recentSent(context,outcome,clipboard,time) ?: time
                                 several && failing -> UiPresentation.recentOutcome(context,outcome!!)
@@ -754,10 +801,10 @@ internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired
                                 several -> UiPresentation.recentOutcome(context,outcome!!)
                                 else -> resources.getString(R.string.item_waiting)
                             }
-                            Text(supporting,style=MaterialTheme.typography.bodyMedium,color=if(row.state=="failed" || several && failing) LocalPneuColors.current.danger else if(progress)LocalPneuColors.current.accentText else LocalPneuColors.current.text2,maxLines=1,overflow=TextOverflow.Ellipsis)
+                            Text(supporting,style=MaterialTheme.typography.bodyMedium,color=if(row.state=="failed" || several && failing) LocalPneuColors.current.danger else if(row.state=="sent" && folderSummary?.skipped?.let {it.unreadable>0 || it.directories>0}==true)LocalPneuColors.current.warn else if(progress)LocalPneuColors.current.accentText else LocalPneuColors.current.text2,maxLines=1,overflow=TextOverflow.Ellipsis)
                             if(progress)LinearProgressIndicator(progress={if(total>0)(sent.toFloat()/total).coerceIn(0f,1f)else 0f},modifier=Modifier.fillMaxWidth().padding(top=7.dp).height(3.dp).clip(RoundedCornerShape(2.dp)),color=LocalPneuColors.current.accent,trackColor=LocalPneuColors.current.fill2,gapSize=0.dp,drawStopIndicator={})
                         }
-                        if(row.state=="failed") IconButton(modifier=Modifier.size(40.dp),onClick={val reference=ConfirmedItem.from(row);scope.launch {actions.run(resources.getString(R.string.ui_error_retry_item)) {val selected=app.confirmArtifact(p,reference);check(app.retry(reference.mediaId,selected)) {"Queue item changed"}}}}) {Symbol(R.drawable.ic_refresh,resources.getString(R.string.cd_retry),modifier=Modifier.size(22.dp),tint=LocalPneuColors.current.text2)}
+                        if(row.state=="failed" && row.error !in setOf("folder_changed","folder_access_lost")) IconButton(modifier=Modifier.size(40.dp),onClick={val reference=ConfirmedItem.from(row);scope.launch {actions.run(resources.getString(R.string.ui_error_retry_item)) {val selected=app.confirmArtifact(p,reference);check(app.retry(reference.mediaId,selected)) {"Queue item changed"}}}}) {Symbol(R.drawable.ic_refresh,resources.getString(R.string.cd_retry),modifier=Modifier.size(22.dp),tint=LocalPneuColors.current.text2)}
                         if(row.state!="sent") Box(contentAlignment=Alignment.Center) {
                             IconButton(modifier=Modifier.size(40.dp),onClick={val reference=ConfirmedItem.from(row);scope.launch {actions.run(resources.getString(R.string.ui_error_remove_item)) {val selected=app.confirmArtifact(p,reference);check(app.discard(selected)) {"Queue item changed"}}}}) {Symbol(R.drawable.ic_close,if(progress)resources.getString(R.string.cd_cancel) else if(row.state=="failed")resources.getString(R.string.cd_remove) else resources.getString(R.string.cd_dont_send),modifier=Modifier.size(22.dp),tint=LocalPneuColors.current.text2)}
                         }
@@ -783,12 +830,12 @@ internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired
 @Composable private fun MediaThumb(row: Outgoing) {
     val context=LocalContext.current
     val bitmap by produceState<android.graphics.Bitmap?>(null,row.path,row.mime) {
-        value=MediaPreview.load(context,row)
+        value=if(row.isFolder())null else MediaPreview.load(context,row)
     }
     Surface(Modifier.size(44.dp),shape=RoundedCornerShape(10.dp),color=MaterialTheme.colorScheme.secondaryContainer) {
         val b=bitmap
         if(b!=null) androidx.compose.foundation.Image(b.asImageBitmap(),null,contentScale=androidx.compose.ui.layout.ContentScale.Crop)
-        else Box(contentAlignment=Alignment.Center) {Symbol(when {row.kind=="text" && row.text.matches(Regex("""https?://\S+"""))->R.drawable.ic_link;row.kind=="text"->R.drawable.ic_content_paste;row.kind=="file"->R.drawable.ic_description;else->R.drawable.ic_image},modifier=Modifier.size(22.dp),tint=LocalPneuColors.current.text2)}
+        else Box(contentAlignment=Alignment.Center) {Symbol(when {row.isFolder()->R.drawable.ic_folder;row.kind=="text" && row.text.matches(Regex("""https?://\S+"""))->R.drawable.ic_link;row.kind=="text"->R.drawable.ic_content_paste;row.kind=="file"->R.drawable.ic_description;else->R.drawable.ic_image},modifier=Modifier.size(22.dp),tint=LocalPneuColors.current.text2)}
         if(b!=null && row.mime.startsWith("video/")) Box(Modifier.fillMaxSize().padding(4.dp),contentAlignment=Alignment.BottomStart) {
             Box(Modifier.size(18.dp).background(Color.Black.copy(alpha=.55f),CircleShape),contentAlignment=Alignment.Center) {Symbol(R.drawable.ic_play_arrow,modifier=Modifier.size(12.dp),tint=Color.White)}
         }

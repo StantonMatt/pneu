@@ -311,4 +311,32 @@
     </plurals>
     <string name="item_connection_lost">Connection lost</string>
     <string name="item_connection_lost_progress">Connection lost · %1$s of %2$s sent</string>
+    <string name="action_send_folder">Send folder</string>
+    <string name="folder_changed">Folder changed after Preparing. Send the folder again.</string>
+    <string name="folder_name">Folder</string>
+    <string name="folder_cant_read_selected">Can’t read this folder. Send the folder again.</string>
+    <string name="folder_empty">%1$s is empty</string>
+    <string name="folder_too_large">%1$s is over 64 GB</string>
+    <string name="folder_cant_read">Can’t read %1$s. Send the folder again.</string>
+    <string name="folder_storage_full">Not enough space to prepare this folder</string>
+    <string name="folder_bad_names">This folder has invalid or duplicate item names</string>
+    <string name="folder_too_deep">This folder has more than 32 levels</string>
+    <string name="folder_too_many">This folder has more than 10,000 items</string>
+    <string name="folder_changing">This folder keeps changing. Try sending it again.</string>
+    <string name="folder_metadata">This folder has too much metadata</string>
+    <string name="folder_unreadable">This folder\'s files couldn\'t be read</string>
+    <string name="folder_update_required">%1$s needs a Pneu update</string>
+    <string name="folder_needs_free">%1$s needs %2$s free</string>
+    <string name="folder_to">To %1$s ·\u0020</string>
+    <string name="folder_preparing_count">Preparing · %1$s</string>
+    <string name="folder_preparing_bytes">Preparing · %1$s of %2$s</string>
+    <string name="folder_sent_some">Sent %1$s of %2$s · %3$s</string>
+    <string name="folder_sent">%1$s, %2$s · %3$s</string>
+    <string name="folder_sent_to">%1$s sent to %2$s</string>
+    <string name="folder_unsent">%1$s couldn\'t be sent: %2$s</string>
+    <string name="folder_names_more">%1$s and %2$s more</string>
+    <string name="folder_names_and">%1$s and %2$s</string>
+    <string name="folder_special_skipped">%1$s links and special files skipped</string>
+    <plurals name="folder_items"><item quantity="one">%1$s item</item><item quantity="other">%1$s items</item></plurals>
+    <plurals name="folder_links_skipped"><item quantity="one">1 link skipped</item><item quantity="other">%1$s links skipped</item></plurals>
 </resources>
