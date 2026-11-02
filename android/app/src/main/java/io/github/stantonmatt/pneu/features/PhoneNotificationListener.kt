@@ -32,6 +32,10 @@ class PhoneNotifications {
         active.clear();current.forEach {active[it.localKey]=it};connected=true
     }
     @Synchronized fun post(notice:MirrorNotice) {
+        // Snapshot presence is not delivery. Only changed visible content is a live event;
+        // timestamp-only reposts must not cross a reconnect/consent fence.
+        val previous=active[notice.localKey]
+        if(previous?.copy(time=notice.time,postSequence=notice.postSequence)==notice)return
         active[notice.localKey]=notice.copy(postSequence=++postSequence)
         if(active.size>128)active.values.minWithOrNull(compareBy<MirrorNotice> {it.time}.thenByDescending {it.localKey})?.let {active.remove(it.localKey)}
     }
@@ -71,8 +75,6 @@ class PhoneNotificationListener:NotificationListenerService() {
     override fun onNotificationPosted(sbn:StatusBarNotification) {
         val consent=app.prefs.value.notificationConsent
         val notice=capture(sbn,consent)
-        if(notice!=null && sbn.notification.flags and Notification.FLAG_ONLY_ALERT_ONCE!=0 &&
-            app.phoneNotifications.snapshot().any {it.localKey==sbn.key})return
         if(notice==null) {
             if(app.phoneNotifications.snapshot().any {it.localKey==sbn.key})refresh(consent,preserveExisting=true)
         } else app.phoneNotifications.post(notice)
@@ -86,15 +88,14 @@ class PhoneNotificationListener:NotificationListenerService() {
         if(sbn.user!=Process.myUserHandle() || sbn.packageName==packageName || !consent.enabled ||
             NotificationConsent.app(sbn.user.hashCode(),sbn.packageName) !in consent.apps ||
             n.visibility==Notification.VISIBILITY_SECRET || n.flags and (Notification.FLAG_ONGOING_EVENT or Notification.FLAG_FOREGROUND_SERVICE or Notification.FLAG_GROUP_SUMMARY)!=0)return@runCatching null
-        if(n.group!=null && n.groupAlertBehavior==Notification.GROUP_ALERT_SUMMARY)return@runCatching null
         val ranking=Ranking();if(!currentRanking.getRanking(sbn.key,ranking) || ranking.importance<NotificationManager.IMPORTANCE_DEFAULT || ranking.isSuspended)return@runCatching null
         if(existing!=null)return@runCatching existing
         val info=runCatching {packageManager.getApplicationInfo(sbn.packageName,0)}.getOrNull() ?: return@runCatching null
         val label=packageManager.getApplicationLabel(info).toString()
         val messages=androidx.core.app.NotificationCompat.MessagingStyle.extractMessagingStyleFromNotification(n)?.messages
         val message=messages?.lastOrNull()
-        val title=n.extras.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: message?.person?.name?.toString()
-        val text=n.extras.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: message?.text?.toString()
+        val title=n.extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.takeUnless {it.isBlank()} ?: message?.person?.name?.toString()
+        val text=n.extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.takeUnless {it.isBlank()} ?: message?.text?.toString()
         MirrorNotice(sbn.key,sbn.user.hashCode(),sbn.packageName,label,sbn.postTime,
             notificationParagraph(title,1024),notificationParagraph(text,8192),icon(sbn.packageName))
     }.getOrNull()

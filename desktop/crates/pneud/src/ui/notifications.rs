@@ -372,16 +372,21 @@ impl PhoneIcon {
 }
 impl PhoneNotice {
     pub fn app_only(&self) -> bool {
-        self.title.is_none() && self.text.is_none()
+        self.title.as_deref().is_none_or(|s| s.trim().is_empty())
+            && self.text.as_deref().is_none_or(|s| s.trim().is_empty())
     }
     pub fn linux(&self) -> Notice {
         let mut n = Notice::new(if self.app_only() {
-            "New notification"
+            &self.app
         } else {
             self.title.as_deref().unwrap_or("")
         });
         n.summary = escape(&n.summary);
-        n.body = escape(self.text.as_deref().unwrap_or(""));
+        n.body = if self.app_only() {
+            "New notification".into()
+        } else {
+            escape(self.text.as_deref().unwrap_or(""))
+        };
         n
     }
     pub fn macos(&self) -> (String, String, String) {
@@ -718,6 +723,25 @@ mod tests {
     }
 
     #[test]
+    fn phone_notifications_blank_content_has_app_and_generic_body() {
+        for blank in [None, Some(String::new()), Some("  \t".into())] {
+            let n = PhoneNotice {
+                app: "Chat<&>".into(),
+                title: blank.clone(),
+                text: blank,
+                icon: None,
+            };
+            assert!(n.app_only());
+            let linux = n.linux();
+            assert_eq!(linux.summary, escape("Chat<&>"));
+            assert_eq!(linux.body, "New notification");
+            assert_eq!(
+                n.macos(),
+                ("Chat<&>".into(), "".into(), "New notification".into())
+            );
+        }
+    }
+    #[test]
     fn phone_notifications_linux_and_macos_projections() {
         assert_eq!(phone_identifier("session-key"), "pneu-mirror-session-key");
         assert_ne!(
@@ -731,8 +755,8 @@ mod tests {
             icon: None,
         };
         let linux = n.linux();
-        assert_eq!(linux.summary, "New notification");
-        assert!(linux.body.is_empty());
+        assert_eq!(linux.summary, escape("Chat<&>"));
+        assert_eq!(linux.body, "New notification");
         assert!(linux.actions.is_empty());
         assert_eq!(linux.urgency, 1);
         assert_eq!(linux.expires, -1);
@@ -755,6 +779,6 @@ mod tests {
         assert_eq!(n.macos().0, "");
         assert_eq!(n.linux().summary, "");
         n.text = Some(String::new());
-        assert!(!n.app_only());
+        assert!(n.app_only());
     }
 }

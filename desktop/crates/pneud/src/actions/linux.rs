@@ -3463,7 +3463,7 @@ mod tests {
         assert_eq!(app_icon.lock().unwrap().1, "pneu");
         assert_eq!(
             *copy.lock().unwrap(),
-            ("New notification".into(), "".into())
+            ("Chat".into(), "New notification".into())
         );
         notice.title = Some("Ana <&>".into());
         notice.text = Some("hello <b>".into());
