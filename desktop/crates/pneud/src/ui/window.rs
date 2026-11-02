@@ -61,6 +61,7 @@ pub(crate) mod contract {
         pub file_name: String,
         pub size: u64,
         pub sent: u64,
+        pub folder: Option<crate::folders::Details>,
         pub state: String,
         pub error: Option<String>,
         pub direction: Option<String>,
@@ -77,6 +78,7 @@ pub(crate) mod contract {
     pub struct SendTarget {
         pub device: String,
         pub name: String,
+        pub folder_reason: Option<String>,
         pub eligible: bool,
         pub would_queue: bool,
         pub generation: u64,
@@ -136,6 +138,7 @@ pub(crate) mod contract {
                 file_name: t.file_name.clone(),
                 size: t.size,
                 sent: t.sent,
+                folder: t.folder.clone(),
                 state: t.state.clone(),
                 error: t.error.clone(),
                 direction: Some(t.direction.clone()),
@@ -216,6 +219,7 @@ enum Action {
     OpenFolder,
     Unpair(String),
     SendFiles(String),
+    SendFolder(String),
     PickerSend(Vec<String>),
     PickerCancel,
     SendClipboard,
@@ -776,6 +780,9 @@ fn recipient_details(peers: &[Peer], transfers: &[Transfer], key: &str) -> Vec<R
                 "sending" => format!("Sending · {}", size_pair(t.sent, t.size)),
                 "staging" => "Preparing…".into(),
                 "queued" | "waiting_for_device" => "Waiting · not connected".into(),
+                "failed" if t.error.as_deref() == Some("Needs a Pneu update") => {
+                    "Needs a Pneu update".into()
+                }
                 "failed" => transfer_failure(
                     t,
                     peer.map(|p| p.name.as_str()).unwrap_or("a removed device"),
@@ -784,6 +791,7 @@ fn recipient_details(peers: &[Peer], transfers: &[Transfer], key: &str) -> Vec<R
                     .finished_at
                     .map(|at| format!("Sent · {}", super::last_seen(at)))
                     .unwrap_or_else(|| "Sent".into()),
+                "skipped" => t.error.clone().unwrap_or_default(),
                 "cancelled" => "Stopped".into(),
                 other => other.into(),
             };
@@ -807,7 +815,11 @@ fn recipient_details(peers: &[Peer], transfers: &[Transfer], key: &str) -> Vec<R
                     -1.0
                 },
                 can_stop: active,
-                can_retry: t.state == "failed" && artifact_id(t).is_some(),
+                can_retry: t.state == "failed"
+                    && artifact_id(t).is_some()
+                    && super::notifications::retryable_reason(
+                        t.error.as_deref().unwrap_or_default(),
+                    ),
             }
         })
         .collect()
@@ -855,7 +867,7 @@ fn recent(peers: &[Peer], transfers: &[Transfer]) -> Vec<RecentItem> {
         let live: Vec<_> = list
             .iter()
             .copied()
-            .filter(|t| t.state != "cancelled")
+            .filter(|t| t.state != "cancelled" && t.state != "skipped")
             .collect();
         if live.is_empty() {
             continue;
@@ -866,7 +878,8 @@ fn recent(peers: &[Peer], transfers: &[Transfer]) -> Vec<RecentItem> {
             can_details: !first.incoming() && list.iter().any(|t| has_recipient(t)),
             title: first.file_name.as_str().into(),
             batch: artifact_id(first).is_none(),
-            picture,
+            picture: picture && first.folder.is_none(),
+            folder: first.folder.is_some(),
             video: is_video(&first.file_name),
             progress: -1.0,
             ..Default::default()
@@ -907,6 +920,19 @@ fn recent(peers: &[Peer], transfers: &[Transfer]) -> Vec<RecentItem> {
                 String::new()
             })
             .into();
+            if let Some(folder) = &first.folder {
+                let prefix = if several {
+                    format!("From {} · ", name(&first.device))
+                } else {
+                    String::new()
+                };
+                item.detail = with_time(format!(
+                    "{prefix}{}, {}",
+                    crate::folders::items(folder.items),
+                    crate::folders::size_label(folder.content_size.unwrap_or(first.size))
+                ))
+                .into();
+            }
             item.can_open = first.path.is_some();
             done.push(item);
             continue;
@@ -916,7 +942,15 @@ fn recent(peers: &[Peer], transfers: &[Transfer]) -> Vec<RecentItem> {
                 .iter()
                 .fold((0, 0), |(s, z), t| (s + t.sent, z + t.size));
             item.detail = if sending.iter().all(|t| t.state == "staging") {
-                "Preparing…".into()
+                if let Some(folder) = &first.folder {
+                    if first.size > 0 {
+                        format!("Preparing · {}", size_pair(first.sent, first.size))
+                    } else {
+                        format!("Preparing · {}", crate::folders::items(folder.items))
+                    }
+                } else {
+                    "Preparing…".into()
+                }
             } else {
                 match distinct_recipients(&live) {
                     1 => format!("Sending · {}", size_pair(sent, size)),
@@ -925,7 +959,11 @@ fn recent(peers: &[Peer], transfers: &[Transfer]) -> Vec<RecentItem> {
             }
             .into();
             item.progress = if sending.iter().all(|t| t.state == "staging") {
-                -1.0
+                if first.folder.is_some() && first.size > 0 {
+                    fraction(first.sent, first.size)
+                } else {
+                    -1.0
+                }
             } else {
                 fraction(sent, size)
             };
@@ -953,7 +991,12 @@ fn recent(peers: &[Peer], transfers: &[Transfer]) -> Vec<RecentItem> {
             }
             .into();
             item.detail_tone = Tone::Danger;
-            item.can_retry = failed.iter().any(|t| artifact_id(t).is_some());
+            item.can_retry = failed.iter().any(|t| {
+                artifact_id(t).is_some()
+                    && super::notifications::retryable_reason(
+                        t.error.as_deref().unwrap_or_default(),
+                    )
+            });
             item.can_dismiss = !transfers.iter().any(|t| {
                 (if artifact_id(first).is_some() {
                     artifact_key(t) == artifact_key(first)
@@ -973,6 +1016,35 @@ fn recent(peers: &[Peer], transfers: &[Transfer]) -> Vec<RecentItem> {
                 many => format!("To {} devices", distinct_recipients(many)),
             })
             .into();
+            if let Some(folder) = &first.folder {
+                let prefix = if several {
+                    match sent.as_slice() {
+                        [one] => format!("To {} · ", name(&one.device)),
+                        many => format!("To {} devices · ", distinct_recipients(many)),
+                    }
+                } else {
+                    String::new()
+                };
+                let content = if folder.failed + folder.links + folder.special > 0 {
+                    if folder.failed > 0 {
+                        item.detail_tone = Tone::Warn;
+                    }
+                    format!(
+                        "Sent {} of {} items",
+                        crate::folders::grouped(folder.items),
+                        crate::folders::grouped(
+                            folder.items + folder.failed + folder.links + folder.special
+                        )
+                    )
+                } else {
+                    format!(
+                        "{}, {}",
+                        crate::folders::items(folder.items),
+                        crate::folders::size_label(folder.content_size.unwrap_or(first.size))
+                    )
+                };
+                item.detail = with_time(format!("{prefix}{content}")).into();
+            }
             item.can_open = first.path.is_some();
             done.push(item);
         }
@@ -1015,22 +1087,9 @@ fn percent(sent: u64, size: u64) -> u32 {
 }
 /// "12 of 40 MB": both numbers in the total's unit.
 fn size_pair(sent: u64, size: u64) -> String {
-    let (unit, scale) = match size {
-        0..1_000 => ("B", 1.0),
-        1_000..1_000_000 => ("KB", 1e3),
-        1_000_000..1_000_000_000 => ("MB", 1e6),
-        _ => ("GB", 1e9),
-    };
-    let number = |bytes: u64| {
-        let value = bytes as f64 / scale;
-        if value < 10.0 && scale > 1.0 && (unit == "GB" || value.fract() >= 0.05) {
-            format!("{value:.1}")
-        } else {
-            format!("{value:.0}")
-        }
-    };
-    format!("{} of {} {unit}", number(sent.min(size)), number(size))
+    crate::folders::size_pair(sent, size)
 }
+
 pub(crate) fn files_title(paths: &[PathBuf], prefix: &str) -> String {
     match paths {
         [one] => format!(
@@ -1046,6 +1105,7 @@ pub(crate) fn files_title(paths: &[PathBuf], prefix: &str) -> String {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Frame {
+    targets: Vec<SendTarget>,
     error: String,
     summary: SummaryData,
     devices: Vec<DeviceItem>,
@@ -1331,6 +1391,7 @@ fn install_drop(
         origin: View,
         targets: Vec<Vec<contract::CapturedTarget>>,
         enabled: Vec<bool>,
+        folders: bool,
     }
     impl DropSession {
         fn enabled_now(&self, window: &PneuWindow) -> Vec<bool> {
@@ -1345,9 +1406,18 @@ fn install_drop(
                                 .iter()
                                 .map(|target| target.device.as_str()),
                             |id| {
-                                peers
-                                    .iter()
-                                    .any(|peer| peer.id.as_str() == id && peer.connected)
+                                let supported = index != 0
+                                    || !self.folders
+                                    || self
+                                        .origin
+                                        .targets
+                                        .as_ref()
+                                        .and_then(|targets| targets.iter().find(|t| t.device == id))
+                                        .is_some_and(|t| t.folder_reason.is_none());
+                                supported
+                                    && peers
+                                        .iter()
+                                        .any(|peer| peer.id.as_str() == id && peer.connected)
                             },
                         )
                 })
@@ -1380,7 +1450,7 @@ fn install_drop(
     let pending = session.clone();
     let weak = window.as_weak();
     let frame = view.clone();
-    let begin = std::rc::Rc::new(move || {
+    let begin = std::rc::Rc::new(move |paths: &[PathBuf]| {
         let Some(w) = weak.upgrade() else {
             return false;
         };
@@ -1393,14 +1463,34 @@ fn install_drop(
             return false;
         }
         let origin = frame.lock().expect("drop frame").clone();
-        let bindings = origin.targets.clone().unwrap_or_default();
+        let folders = paths.iter().any(|p| p.is_dir());
+        let mut bindings = origin.targets.clone().unwrap_or_default();
+        if folders {
+            for target in &mut bindings {
+                if let Some(reason) = &target.folder_reason {
+                    target.eligible = false;
+                    target.reason = Some(reason.clone());
+                }
+            }
+        }
         let all =
             contract::resolve_files(&bindings, crate::file_recipients::Selection::ConnectedOnly)
                 .unwrap_or_default();
-        let mut targets = vec![all];
+        let any_supported = !all.is_empty();
+        let selected = if folders {
+            contract::resolve_files(
+                origin.targets.as_deref().unwrap_or_default(),
+                crate::file_recipients::Selection::ConnectedOnly,
+            )
+            .unwrap_or_default()
+        } else {
+            all
+        };
+        let mut targets = vec![selected];
         let mut labels = vec![DropItem {
+            sub: "".into(),
             name: "All connected devices".into(),
-            enabled: !targets[0].is_empty(),
+            enabled: any_supported,
         }];
         for device in ui.get_devices().iter() {
             let authority = bindings
@@ -1414,8 +1504,25 @@ fn install_drop(
                     })
                 });
             labels.push(DropItem {
+                sub: bindings
+                    .iter()
+                    .find(|t| t.device == device.id.as_str())
+                    .and_then(|t| {
+                        if folders {
+                            t.folder_reason.clone()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default()
+                    .into(),
                 name: device.name,
-                enabled: device.connected && authority.is_some(),
+                enabled: device.connected
+                    && authority.is_some()
+                    && bindings
+                        .iter()
+                        .find(|t| t.device == device.id.as_str())
+                        .is_none_or(|t| t.eligible),
             });
             targets.push(authority.into_iter().collect());
         }
@@ -1426,6 +1533,7 @@ fn install_drop(
             origin,
             targets,
             enabled,
+            folders,
         });
         true
     });
@@ -1714,6 +1822,7 @@ fn connect(
     ui.on_get_tailscale(send(|| Action::GetTailscale));
     ui.on_unpair(with(Action::Unpair));
     ui.on_send_files(with(Action::SendFiles));
+    ui.on_send_folder(with(Action::SendFolder));
     ui.on_cancel_item(with(Action::Cancel));
     ui.on_retry_item(with(Action::Retry));
     ui.on_dismiss_item(with(Action::Dismiss));
@@ -1853,6 +1962,9 @@ struct Worker {
     picker_clipboard: bool,
     send_request_id: Option<String>,
     handled_send: Option<String>,
+    folder_errors: HashSet<String>,
+    window_started: u64,
+    choosing_folder: bool,
     details: Option<String>,
     origin: View,
     restored_join: bool,
@@ -1919,6 +2031,9 @@ impl Worker {
             picker_clipboard: false,
             send_request_id: None,
             handled_send: None,
+            folder_errors: HashSet::new(),
+            window_started: crate::now_ms(),
+            choosing_folder: false,
             details: None,
             origin: View::default(),
             restored_join: false,
@@ -2171,13 +2286,35 @@ impl Worker {
                 }
                 Err(error) => self.fail("Couldn't unpair", error.into()),
             },
+            Action::SendFolder(target) => {
+                if self.chooser.is_none() {
+                    self.choosing_folder = true;
+                    self.chooser_origin = Some(self.view());
+                    let bindings = self.captured_targets(&target);
+                    let origin = self.view();
+                    self.chooser = Some(Box::pin(async move {
+                        Ok((
+                            target,
+                            bindings,
+                            origin,
+                            choose_folder(Path::new("")).await?.map(|p| vec![p]),
+                        ))
+                    }));
+                }
+            }
             Action::SendFiles(target) => {
                 if self.chooser.is_none() {
                     self.chooser_origin = Some(self.view());
                     let bindings = self.captured_targets(&target);
                     let origin = self.view();
+                    self.choosing_folder = false;
+                    let folders = self.snapshot.send_targets.iter().any(|t| {
+                        (target.is_empty() || t.device.as_str() == target)
+                            && t.eligible
+                            && t.folder_reason.is_none()
+                    });
                     self.chooser = Some(Box::pin(async move {
-                        Ok((target, bindings, origin, choose_files("Send Files").await?))
+                        Ok((target, bindings, origin, choose_send_files(folders).await?))
                     }));
                 }
             }
@@ -2361,7 +2498,12 @@ impl Worker {
                     .transfers
                     .iter()
                     .filter(|t| {
-                        artifact_key(t) == item && t.state == "failed" && artifact_id(t).is_some()
+                        artifact_key(t) == item
+                            && t.state == "failed"
+                            && artifact_id(t).is_some()
+                            && super::notifications::retryable_reason(
+                                t.error.as_deref().unwrap_or_default(),
+                            )
                     })
                     .map(|t| t.device.clone())
                     .collect();
@@ -2657,6 +2799,7 @@ impl Worker {
     }
 
     async fn chosen(&mut self, result: Result<Chosen>) {
+        let choosing_folder = std::mem::take(&mut self.choosing_folder);
         let (target, bindings, origin, files) = match result {
             Ok((target, bindings, origin, Some(files))) if !files.is_empty() => {
                 (target, bindings, origin, files)
@@ -2667,7 +2810,14 @@ impl Worker {
             }
             Err(error) => {
                 self.send_request_id = None;
-                return self.fail("Couldn't choose files", error);
+                return self.fail(
+                    if choosing_folder {
+                        "Couldn't choose a folder"
+                    } else {
+                        "Couldn't choose files"
+                    },
+                    error,
+                );
             }
         };
         self.select_send(files, bindings, origin, !target.is_empty(), false)
@@ -2712,18 +2862,26 @@ impl Worker {
             .unwrap_or_default()
         };
         let peers = peers(&self.snapshot, &self.transfers);
+        let folders = files.iter().any(|p| p.is_dir());
         let picks: Vec<PickItem> = peers
             .iter()
             .map(|p| {
                 let target = targets.iter().find(|t| t.device == p.id);
                 let eligible = bindings.iter().any(|t| t.device == p.id)
+                    && (!folders || target.is_none_or(|t| t.folder_reason.is_none()))
                     && if clipboard {
                         p.connected()
                     } else {
                         eligible_files.iter().any(|t| t.device == p.id)
                     };
                 let would_queue = target.is_some_and(|t| t.would_queue);
-                let status = match target.and_then(|t| t.reason.clone()) {
+                let status = match target.and_then(|t| {
+                    if folders {
+                        t.folder_reason.clone().or_else(|| t.reason.clone())
+                    } else {
+                        t.reason.clone()
+                    }
+                }) {
                     Some(reason) if !eligible => reason,
                     _ if !eligible => p.connection(),
                     _ if would_queue => "Not connected".into(),
@@ -2781,6 +2939,15 @@ impl Worker {
             self.send_request_id = None;
             return;
         }
+        let folders = self.snapshot.send_targets.iter().any(|t| {
+            t.eligible
+                && t.folder_reason.is_none()
+                && (!request.targeted
+                    || request
+                        .targets
+                        .iter()
+                        .any(|a| a.device == t.device && a.generation == t.generation))
+        });
         let bindings = request
             .targets
             .into_iter()
@@ -2805,7 +2972,7 @@ impl Worker {
                 String::new()
             };
             self.chooser = Some(Box::pin(async move {
-                Ok((target, bindings, origin, choose_files("Send Files").await?))
+                Ok((target, bindings, origin, choose_send_files(folders).await?))
             }));
         }
     }
@@ -3578,6 +3745,23 @@ impl Worker {
         self.status_error.clear();
         self.invitation_revision = value["invitation_revision"].as_u64().unwrap_or(0);
         self.transfers = snapshot.transfers.iter().map(Transfer::from).collect();
+        self.transfers.retain(|t| {
+            if let Some(error) = &t.error
+                && (error.ends_with(" is empty")
+                    || error.contains(" is over ")
+                    || error == "Folder contains more than 10,000 entries"
+                    || error.ends_with(" can't receive folders yet"))
+            {
+                if t.finished_at.is_some_and(|at| at >= self.window_started)
+                    && self.folder_errors.insert(artifact_key(t))
+                {
+                    self.action_error = error.clone();
+                }
+                false
+            } else {
+                true
+            }
+        });
         if self.view().page != Page::History {
             self.history_order.clear();
         }
@@ -4178,6 +4362,7 @@ impl Worker {
             hero.link.tube = Tube::Dashed;
         }
         Frame {
+            targets: contract::list(&self.status, "send_targets"),
             error,
             summary: hero,
             devices: peers.iter().map(|p| self.device_item(p)).collect(),
@@ -4288,6 +4473,39 @@ fn apply(w: &PneuWindow, frame: Frame) {
     ui.set_device(frame.device);
     ui.set_device_summary(frame.device_summary.summary());
     ui.set_device_action(frame.device_action.into());
+    let targets = frame.targets.as_slice();
+    let reason = if targets
+        .iter()
+        .any(|t| t.eligible && t.folder_reason.is_none())
+    {
+        String::new()
+    } else if let [one] = targets {
+        one.folder_reason
+            .as_ref()
+            .map(|r| {
+                format!(
+                    "{} {}",
+                    one.name,
+                    if r == "Can't receive folders yet" {
+                        "can't receive folders yet"
+                    } else {
+                        "needs a Pneu update"
+                    }
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        "No device can receive folders yet".into()
+    };
+    ui.set_folder_reason(reason.into());
+    ui.set_device_folder_reason(
+        targets
+            .iter()
+            .find(|t| t.device == ui.get_device_id().as_str())
+            .and_then(|t| t.folder_reason.clone())
+            .unwrap_or_default()
+            .into(),
+    );
     sync(ui.get_device_settings(), &frame.device_settings);
     ui.set_device_note(frame.device_note.into());
     ui.set_device_link(frame.device_link);
@@ -4455,22 +4673,38 @@ async fn change_folder(socket: &Path) -> Result<()> {
     Ok(())
 }
 fn recent_file(path: &Path) -> Result<crate::actions::ReceivedFile> {
-    let file =
-        crate::storage::open_regular_file(path).map_err(|_| crate::actions::FileUnavailable)?;
-    crate::actions::ReceivedFile::from_file(path.to_owned(), file)
+    crate::actions::ReceivedFile::open(path).map_err(|_| crate::actions::FileUnavailable.into())
 }
 #[cfg(target_os = "macos")]
 async fn open_recent(file: crate::actions::ReceivedFile) -> Result<()> {
     super::macos::native::open_received_local(file).await
 }
+fn folder_picker_title(current: &Path) -> &'static str {
+    if current.as_os_str().is_empty() {
+        "Send Folder"
+    } else {
+        "Choose Folder"
+    }
+}
 #[cfg(windows)]
 pub async fn choose_folder(current: &Path) -> Result<Option<PathBuf>> {
     Ok(
-        super::windows_picker::choose("Choose Folder", Some(current))
+        super::windows_picker::choose(folder_picker_title(current), Some(current))
             .await?
             .into_iter()
             .next(),
     )
+}
+async fn choose_send_files(folders: bool) -> Result<Option<Vec<PathBuf>>> {
+    #[cfg(target_os = "macos")]
+    {
+        super::macos::native::choose_send(folders).await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = folders;
+        choose_files("Send Files").await
+    }
 }
 #[cfg(windows)]
 pub async fn choose_files(title: &str) -> Result<Option<Vec<PathBuf>>> {
@@ -4480,7 +4714,7 @@ pub async fn choose_files(title: &str) -> Result<Option<Vec<PathBuf>>> {
 #[cfg(target_os = "macos")]
 pub async fn choose_folder(current: &Path) -> Result<Option<PathBuf>> {
     Ok(
-        super::macos::native::choose("Choose Folder", true, Some(current))
+        super::macos::native::choose(folder_picker_title(current), true, Some(current))
             .await?
             .and_then(|paths| paths.into_iter().next()),
     )
@@ -4509,14 +4743,17 @@ async fn choose_folder_on(connection: zbus::Connection, current: &Path) -> Resul
         .await?;
     let mut folder = current.as_os_str().as_bytes().to_vec();
     folder.push(0);
-    let options = HashMap::from([
+    let mut options = HashMap::from([
         ("handle_token", Value::from(request.token.as_str())),
         ("directory", Value::from(true)),
         ("multiple", Value::from(false)),
-        ("current_folder", Value::from(folder)),
     ]);
+    if current.is_absolute() {
+        options.insert("current_folder", Value::from(folder));
+    }
     let path =
-        super::portal::accept(proxy.call("OpenFile", &("", "Choose Folder", options))).await?;
+        super::portal::accept(proxy.call("OpenFile", &("", folder_picker_title(current), options)))
+            .await?;
     let Some(values) = request.response(path).await? else {
         return Ok(None);
     };
@@ -4571,6 +4808,48 @@ async fn choose_files_on(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[test]
+    fn folder_recent_strings_counts_and_phone_refusal() {
+        let ps = peers(&snapshot(two()), &[]);
+        let mut row = transfer("folder", 2, "Trip", "sent", 10, 10);
+        row.folder = Some(crate::folders::Details {
+            items: 1204,
+            links: 2,
+            ..Default::default()
+        });
+        assert_eq!(recent(&ps, &[row.clone()])[0].detail_tone, Tone::Neutral);
+        assert!(
+            recent(&ps, &[row.clone()])[0]
+                .detail
+                .contains("Sent 1,204 of 1,206 items")
+        );
+        row.folder.as_mut().unwrap().failed = 2;
+        assert_eq!(recent(&ps, &[row.clone()])[0].detail_tone, Tone::Warn);
+        row.error = Some("Can't receive folders yet".into());
+        row.state = "failed".into();
+        let failed = recent(&ps, &[row])[0].clone();
+        assert!(!failed.can_retry);
+        assert!(failed.detail.contains("can't receive folders yet"));
+    }
+    #[test]
+    fn folder_changed_is_terminal_on_every_window_surface() {
+        let ps = peers(&snapshot(two()), &[]);
+        let mut row = transfer("folder", 2, "Trip", "failed", 10, 10);
+        row.folder = Some(crate::folders::Details::default());
+        row.error = Some(crate::folders::SourceChanged.to_string());
+        let recent_row = recent(&ps, &[row.clone()])[0].clone();
+        assert!(!recent_row.can_retry);
+        assert_eq!(recent_row.detail, crate::folders::SourceChanged.to_string());
+        let details = recipient_details(&ps, &[row.clone()], &artifact_key(&row));
+        assert!(!details[0].can_retry);
+        row.error = Some("Needs a Pneu update".into());
+        assert_eq!(
+            recipient_details(&ps, &[row.clone()], &artifact_key(&row))[0].detail,
+            "Needs a Pneu update"
+        );
+        row.error = Some("Can't receive folders yet".into());
+        assert!(!recipient_details(&ps, &[row.clone()], &artifact_key(&row))[0].can_retry);
+    }
     #[test]
     fn resume_recent_failure_and_retry_strings() {
         let ps = peers(&snapshot(two()), &[]);
@@ -4901,7 +5180,7 @@ mod tests {
             let ts = [failed];
             assert_eq!(recent(&ps, &ts)[0].detail, expected);
             let details = recipient_details(&ps, &ts, &artifact_key(&ts[0]));
-            assert_eq!(details[0].detail, format!("Failed · {expected}"));
+            assert_eq!(details[0].detail, expected);
         }
     }
 
@@ -5042,7 +5321,7 @@ mod tests {
     }
 
     #[test]
-    fn recent_open_rejects_redirected_paths_and_keeps_an_anchored_file() -> Result<()> {
+    fn recent_open_accepts_linked_parents_and_keeps_an_anchored_file() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let folder = dir.path().join("files");
         std::fs::create_dir(&folder)?;
@@ -5055,8 +5334,11 @@ mod tests {
         assert_eq!(file.read_bounded(100)?, b"original");
         let linked = dir.path().join("linked");
         std::os::unix::fs::symlink(&folder, &linked)?;
-        assert!(recent_file(&linked.join("original.pdf")).is_err());
-        assert!(recent_file(&folder).is_err());
+        assert_eq!(
+            recent_file(&linked.join("original.pdf"))?.read_bounded(100)?,
+            b"original"
+        );
+        assert!(recent_file(&folder)?.is_folder());
         assert!(recent_file(Path::new("relative.pdf")).is_err());
         Ok(())
     }
@@ -5078,7 +5360,13 @@ mod tests {
             "input exceeds bounded read limit"
         );
         std::os::unix::fs::symlink(dir.path().join("child"), dir.path().join("linked"))?;
-        assert!(recent_file(&dir.path().join("linked/../large.bin")).is_err());
+        assert_eq!(
+            recent_file(&dir.path().join("linked/../large.bin"))?
+                .read_bounded(0)
+                .unwrap_err()
+                .to_string(),
+            "input exceeds bounded read limit"
+        );
         std::fs::remove_file(actual)?;
         std::os::unix::fs::symlink("child", dir.path().join("large.bin"))?;
         assert!(recent_file(&selected).is_err());
@@ -5277,6 +5565,40 @@ mod tests {
         flush_ui();
     }
 
+    #[tokio::test]
+    async fn folder_admission_banner_does_not_return_in_a_new_window() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::folder_admission_banner_does_not_return_in_a_new_window",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, _) = model_worker(&window, dir.path());
+        let visible = AtomicBool::new(true);
+        let mut value = status_value(&worker);
+        value["snapshot"]["transfers"] = json!([{
+            "operation":id(50), "transfer_id":id(50), "device":id(0),
+            "file_name":"Empty", "size":0, "sent":0, "state":"failed",
+            "error":"Empty is empty", "finished_at":worker.window_started.saturating_sub(1)
+        }]);
+        worker.refresh(value.clone(), &visible).await?;
+        assert!(worker.action_error.is_empty());
+        value["snapshot"]["transfers"][0]["finished_at"] = json!(worker.window_started + 1);
+        worker.refresh(value.clone(), &visible).await?;
+        assert_eq!(worker.action_error, "Empty is empty");
+        worker.action_error.clear();
+        worker.refresh(value, &visible).await?;
+        assert!(
+            worker.action_error.is_empty(),
+            "dismissed once within this window"
+        );
+        Ok(())
+    }
     #[tokio::test]
     async fn open_folder_controls_follow_save_setting_and_recent_visibility() -> Result<()> {
         if in_offscreen_child(
@@ -8576,6 +8898,23 @@ mod tests {
                     });
                 assert_eq!(*COPIED.lock().unwrap(), DOWNLOAD_PAGE, "{}", scene.name);
             }
+            if scene.name.starts_with("folder-send-menu") {
+                let position = slint::LogicalPosition::new(356.0, 151.0);
+                let button = slint::platform::PointerEventButton::Left;
+                window
+                    .window()
+                    .dispatch_event(slint::platform::WindowEvent::PointerPressed {
+                        position,
+                        button,
+                    });
+                window
+                    .window()
+                    .dispatch_event(slint::platform::WindowEvent::PointerReleased {
+                        position,
+                        button,
+                    });
+                advance_ui();
+            }
             surface.request_redraw();
             let mut pixels = vec![
                     slint::platform::software_renderer::PremultipliedRgbaColor::default();
@@ -8584,6 +8923,38 @@ mod tests {
             surface.draw_if_needed(|renderer| {
                 renderer.render(&mut pixels, size.width as usize);
             });
+            if scene.name.starts_with("folder-send-menu") {
+                let probe_x = if ui.get_folder_reason().is_empty() {
+                    205.0
+                } else {
+                    113.0
+                };
+                let point =
+                    (190.0 * scale) as usize * size.width as usize + (probe_x * scale) as usize;
+                let card = window.global::<Pneu>().get_card();
+                let pixel = &pixels[point];
+                assert_eq!(
+                    (pixel.red, pixel.green, pixel.blue),
+                    (card.red(), card.green(), card.blue()),
+                    "{}: send menu did not open",
+                    scene.name
+                );
+            }
+            if matches!(
+                scene.name,
+                "folder-skipped-items" | "folder-links-skipped-neutral"
+            ) {
+                let warn = window.global::<Pneu>().get_warn();
+                let has_warn = pixels
+                    .iter()
+                    .any(|p| (p.red, p.green, p.blue) == (warn.red(), warn.green(), warn.blue()));
+                assert_eq!(
+                    has_warn,
+                    scene.name == "folder-skipped-items",
+                    "{}: skipped-item tone",
+                    scene.name
+                );
+            }
             if scene.name.starts_with("17-add-") {
                 // At the default size, the Phone page must keep its bottom
                 // padding and must not paint a scrollbar in the right gutter.
@@ -8648,6 +9019,14 @@ mod tests {
                 image::RgbaImage::from_raw(size.width, size.height, bytes)
                     .context("frame")?
                     .save(folder.join(format!("{}-{theme}.png", scene.name)))?;
+            }
+            if scene.name.starts_with("folder-send-menu") {
+                key(&window, slint::platform::Key::Escape);
+                advance_ui();
+                assert!(
+                    window.window().is_visible(),
+                    "Esc closed the window instead of the send menu"
+                );
             }
         }
         assert_eq!(rendered, scenes().len());
@@ -8889,6 +9268,177 @@ mod tests {
         ];
         sending.extend(recent_items());
         let mut list = vec![
+            scene(
+                "folder-send-menu",
+                |w| {
+                    state(w, two(), Vec::new());
+                    w.status["snapshot"]["send_targets"] = json!([target(2, 1, false)]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "folder-send-menu-phone",
+                |w| {
+                    state(
+                        w,
+                        vec![device(1, "Galaxy S25+", true, "connected", 0)],
+                        Vec::new(),
+                    );
+                    let mut unsupported = target(1, 1, false);
+                    unsupported["name"] = json!("Galaxy S25+");
+                    unsupported["folder_reason"] = json!("Can't receive folders yet");
+                    w.status["snapshot"]["send_targets"] = json!([unsupported]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "folder-preparing-counting",
+                |w| {
+                    let mut row = transfer("folder", 2, "Vacation 2026", "staging", 0, 0);
+                    row.folder = Some(crate::folders::Details {
+                        items: 1204,
+                        ..Default::default()
+                    });
+                    state(w, two(), vec![row]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "folder-preparing-reading",
+                |w| {
+                    let mut row = transfer(
+                        "folder",
+                        2,
+                        "Vacation 2026",
+                        "staging",
+                        400_000_000,
+                        1_800_000_000,
+                    );
+                    row.folder = Some(crate::folders::Details {
+                        items: 1204,
+                        ..Default::default()
+                    });
+                    state(w, two(), vec![row]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "folder-skipped-items",
+                |w| {
+                    let mut row = transfer(
+                        "folder",
+                        2,
+                        "Vacation 2026",
+                        "sent",
+                        1_800_000_000,
+                        1_800_000_000,
+                    );
+                    row.path = Some("/Vacation 2026".into());
+                    row.folder = Some(crate::folders::Details {
+                        items: 1204,
+                        failed: 2,
+                        names: vec!["notes.txt".into(), "index.db".into()],
+                        ..Default::default()
+                    });
+                    state(w, two(), vec![row]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "folder-links-skipped-neutral",
+                |w| {
+                    let mut row = transfer("folder", 2, "Project", "sent", 1_800_000, 1_800_000);
+                    row.path = Some("/Project".into());
+                    row.folder = Some(crate::folders::Details {
+                        items: 142,
+                        links: 8,
+                        ..Default::default()
+                    });
+                    state(w, two(), vec![row]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "folder-received",
+                |w| {
+                    let mut row = transfer(
+                        "folder",
+                        2,
+                        "Vacation 2026",
+                        "received",
+                        1_800_000_000,
+                        1_800_000_000,
+                    );
+                    row.direction = Some("incoming".into());
+                    row.path = Some("/Vacation 2026".into());
+                    row.folder = Some(crate::folders::Details {
+                        items: 142,
+                        ..Default::default()
+                    });
+                    state(w, two(), vec![row]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "folder-needs-update",
+                |w| {
+                    let mut row =
+                        transfer("folder", 2, "Vacation 2026", "failed", 0, 1_800_000_000);
+                    row.error = Some("Needs a Pneu update".into());
+                    row.folder = Some(crate::folders::Details {
+                        items: 142,
+                        ..Default::default()
+                    });
+                    state(w, two(), vec![row]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "folder-phone-unsupported",
+                |w| {
+                    let mut row =
+                        transfer("folder", 1, "Vacation 2026", "failed", 0, 1_800_000_000);
+                    row.error = Some("Can't receive folders yet".into());
+                    row.folder = Some(crate::folders::Details {
+                        items: 142,
+                        ..Default::default()
+                    });
+                    state(w, two(), vec![row]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "folder-disabled-picker",
+                |w| state(w, two(), vec![]),
+                |w| {
+                    go(Page::Main, 0, 0)(w);
+                    let ui = w.global::<Ui>();
+                    ui.set_dialog(Dialog::Picker);
+                    ui.set_picker_title("Send Vacation 2026 to".into());
+                    ui.set_picker_count(1);
+                    ui.set_picks(ModelRc::new(VecModel::from(vec![
+                        PickItem {
+                            id: id(1).as_str().into(),
+                            name: "Galaxy S25+".into(),
+                            phone: true,
+                            connected: true,
+                            eligible: false,
+                            status: "Can't receive folders yet".into(),
+                            checked: false,
+                            ..Default::default()
+                        },
+                        PickItem {
+                            id: id(2).as_str().into(),
+                            name: "MacBook Air".into(),
+                            connected: true,
+                            eligible: true,
+                            status: "Connected over Wi-Fi".into(),
+                            checked: true,
+                            ..Default::default()
+                        },
+                    ])));
+                },
+            ),
             scene(
                 "resume-failed",
                 |w| {
@@ -10995,7 +11545,9 @@ mod tests {
             #[zbus(header)] header: zbus::message::Header<'_>,
         ) -> zbus::fdo::Result<zbus::zvariant::OwnedObjectPath> {
             assert!(parent.is_empty());
-            assert_eq!(options.len(), 4);
+            assert!((3..=4).contains(&options.len()));
+            assert!(bool::try_from(options["directory"].try_clone().unwrap()).unwrap());
+            assert!(!bool::try_from(options["multiple"].try_clone().unwrap()).unwrap());
             for key in options.keys() {
                 assert!(
                     matches!(
@@ -11140,7 +11692,14 @@ mod tests {
         // Exercise the actual Action::Open path for both Recent directions.
         // No original receive handle survives these edits/replacements.
         for direction in ["incoming", "outgoing"] {
-            for scenario in ["edited", "replaced", "large", "deleted", "symlink"] {
+            for scenario in [
+                "edited",
+                "replaced",
+                "large",
+                "deleted",
+                "symlink",
+                "final-symlink",
+            ] {
                 let folder = dir.path().join(format!("{direction}-{scenario}"));
                 std::fs::create_dir(&folder)?;
                 let path = folder.join("report.pdf");
@@ -11173,12 +11732,21 @@ mod tests {
                         std::fs::rename(&folder, &moved)?;
                         std::os::unix::fs::symlink(moved, &folder)?;
                     }
+                    "final-symlink" => {
+                        std::fs::rename(&path, folder.join("original.pdf"))?;
+                        std::os::unix::fs::symlink("original.pdf", &path)?;
+                    }
                     _ => unreachable!(),
                 }
                 let before = calls.load(Ordering::SeqCst);
                 worker.act(Action::Open(artifact_key(&row))).await;
-                if matches!(scenario, "deleted" | "symlink") {
-                    let error = job_result(&mut worker.open_job).await.unwrap_err();
+                if matches!(scenario, "deleted" | "final-symlink") {
+                    let error = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        job_result(&mut worker.open_job),
+                    )
+                    .await?
+                    .unwrap_err();
                     assert!(
                         error.is::<crate::actions::FileUnavailable>(),
                         "{direction} {scenario}: {error}"
@@ -11198,6 +11766,7 @@ mod tests {
                         "edited" => assert_eq!(bytes, b"legitimate edit"),
                         "replaced" => assert_eq!(bytes, b"replacement"),
                         "large" => assert_eq!(size, crate::outbox::PEER_BYTES + 1),
+                        "symlink" => assert_eq!(bytes, b"original"),
                         _ => unreachable!(),
                     }
                     assert_eq!(calls.load(Ordering::SeqCst), before + 1);
@@ -11297,7 +11866,7 @@ mod tests {
             .await?;
         let mut job: Option<futures_util::future::BoxFuture<'_, Result<()>>> =
             Some(Box::pin(async {
-                choose_folder_on(client.clone(), dir.path()).await?;
+                choose_folder_on(client.clone(), Path::new("")).await?;
                 Ok(())
             }));
         tokio::select! {result=job_result(&mut job)=>{result?;anyhow::bail!("missing response completed");}, _=entered.notified()=>{}}

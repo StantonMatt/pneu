@@ -526,6 +526,7 @@ mod tests {
             .devices
             .iter()
             .map(|d| crate::outbox::SendTarget {
+                folder_reason: None,
                 device: d.device.clone(),
                 name: d.name.clone(),
                 generation: 1,
@@ -595,6 +596,7 @@ mod tests {
             fingerprint: pneu_proto::Hash::new("ab".repeat(32)).unwrap(),
         };
         tray.snapshot.send_targets = vec![crate::outbox::SendTarget {
+            folder_reason: None,
             device: authority.device.clone(),
             name: "A".into(),
             generation: authority.generation,

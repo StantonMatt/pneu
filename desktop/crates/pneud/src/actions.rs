@@ -45,6 +45,7 @@ pub struct ReceivedFile {
     path: PathBuf,
     file: Arc<std::fs::File>,
     source: Option<ArrivalSource>,
+    folder: Option<Box<(crate::folders::Details, u64)>>,
 }
 impl ReceivedFile {
     pub(crate) fn from_file(path: PathBuf, file: std::fs::File) -> Result<Self> {
@@ -55,7 +56,32 @@ impl ReceivedFile {
             path,
             file: Arc::new(file),
             source: None,
+            folder: None,
         })
+    }
+    pub(crate) fn from_transfer(
+        path: PathBuf,
+        file: std::fs::File,
+        folder: Option<crate::folders::Details>,
+        size: u64,
+    ) -> Result<Self> {
+        if let Some(details) = folder {
+            anyhow::ensure!(
+                file.metadata()?.is_dir(),
+                "received folder must be a directory"
+            );
+            Ok(Self {
+                path,
+                file: Arc::new(file),
+                source: None,
+                folder: Some(Box::new((details, size))),
+            })
+        } else {
+            Self::from_file(path, file)
+        }
+    }
+    pub(crate) fn is_folder(&self) -> bool {
+        self.folder.is_some() || self.file.metadata().is_ok_and(|m| m.is_dir())
     }
     pub(crate) fn with_source(mut self, source: ArrivalSource) -> Self {
         self.source = Some(source);
@@ -63,15 +89,31 @@ impl ReceivedFile {
     }
     fn notice(
         &self,
-        notice: crate::ui::notifications::Notice,
+        mut notice: crate::ui::notifications::Notice,
         clipboard: bool,
     ) -> crate::ui::notifications::Notice {
+        if let Some((details, size)) = self.folder.as_deref() {
+            notice.body = format!(
+                "{}, {}",
+                crate::folders::items(details.items),
+                crate::folders::size_label(details.content_size.unwrap_or(*size))
+            );
+            notice.actions.retain(|(action, _)| *action != "show");
+        }
         self.source.as_ref().map_or_else(
             || notice.clone(),
             |source| source.file_notice(notice.clone(), clipboard),
         )
     }
     pub fn open(path: &Path) -> Result<Self> {
+        if let Ok(folder) = platform_fs::Folder::read(path) {
+            return Ok(Self {
+                path: path.to_owned(),
+                file: folder.file,
+                source: None,
+                folder: None,
+            });
+        }
         let file = platform_fs::open_read(path)?;
         Self::from_file(path.to_owned(), file)
     }
@@ -80,6 +122,9 @@ impl ReceivedFile {
     }
     #[cfg(target_os = "linux")]
     fn viewer_descriptor(&self) -> Result<std::fs::File> {
+        if self.is_folder() {
+            return Ok(self.file.try_clone()?);
+        }
         platform_fs::viewer_descriptor(&self.file)
     }
     #[cfg(target_os = "macos")]
@@ -496,6 +541,24 @@ mod acl_tests {
         crate::platform::private::check(&file)?;
         assert_eq!(std::fs::read_dir(&root)?.count(), 0);
         assert!(clipboard_file(&root).is_err());
+        Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod folder_open_tests {
+    use super::*;
+    #[test]
+    fn ordinary_file_opens_through_a_symlinked_parent() -> Result<()> {
+        let dir = crate::test_support::scratch()?;
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real)?;
+        std::fs::write(real.join("file.txt"), b"abc")?;
+        std::os::unix::fs::symlink(&real, dir.path().join("alias"))?;
+        let file = ReceivedFile::open(&dir.path().join("alias/file.txt"))?;
+        assert_eq!(file.read_bounded(10)?, b"abc");
+        std::os::unix::fs::symlink(real.join("file.txt"), real.join("link"))?;
+        assert!(ReceivedFile::open(&real.join("link")).is_err());
         Ok(())
     }
 }

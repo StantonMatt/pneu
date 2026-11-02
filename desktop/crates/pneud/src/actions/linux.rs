@@ -856,11 +856,15 @@ impl PcActions for DesktopActions {
             .map(|_| ())
     }
     async fn notify_send_admission_failure(&self, reason: &str) -> Result<()> {
-        let mut notice = crate::ui::notifications::Notice::new("Couldn't send files");
-        notice.body = crate::ui::notifications::escape(reason);
-        self.notice(notice, Vec::new(), None, 0, None)
-            .await
-            .map(|_| ())
+        self.notice(
+            crate::ui::notifications::Notice::admission_failure(reason),
+            Vec::new(),
+            None,
+            0,
+            None,
+        )
+        .await
+        .map(|_| ())
     }
     async fn notify_delivery(
         &self,
@@ -869,7 +873,7 @@ impl PcActions for DesktopActions {
     ) -> Result<()> {
         let (notice, retry) = if transfer.state == "sent" {
             (
-                crate::ui::notifications::Notice::sent(&transfer.file_name, &[device_name.into()]),
+                crate::ui::notifications::Notice::sent_transfer(transfer, device_name),
                 None,
             )
         } else {
@@ -935,6 +939,7 @@ impl PcActions for DesktopActions {
         let mut all_saved = saved;
         let mut started = arrived;
         if save_error.is_none()
+            && metadata.folder.is_none()
             && copied != Some(false)
             && let Some(previous) = burst.as_ref()
             && previous.accepts(arrived)
@@ -981,7 +986,7 @@ impl PcActions for DesktopActions {
                 paths.clone(),
             )
             .await?;
-        *burst = if save_error.is_none() && copied != Some(false) {
+        *burst = if !file.is_folder() && save_error.is_none() && copied != Some(false) {
             Some(Burst {
                 id,
                 paths,
@@ -1036,11 +1041,20 @@ pub(crate) async fn begin_open_received_file(
     connection: &zbus::Connection,
     activation_token: Option<&str>,
 ) -> Result<crate::ui::portal::Interaction> {
+    let descriptor = file.viewer_descriptor()?;
+    if file.is_folder() {
+        let path = crate::platform::fs::directory_path(&descriptor)?;
+        let interaction = begin_open_uri(&file_uri(&path)?, connection, activation_token).await;
+        return Ok(Box::pin(async move {
+            let result = interaction.await;
+            drop(descriptor);
+            result
+        }));
+    }
     let request = crate::ui::portal::Request::new(connection).await?;
     let proxy = request
         .method_proxy("org.freedesktop.portal.OpenURI")
         .await?;
-    let descriptor = file.viewer_descriptor()?;
     let fd = zbus::zvariant::Fd::from(&descriptor);
     let path = crate::ui::portal::accept(proxy.call(
         "OpenFile",
@@ -2863,6 +2877,37 @@ mod tests {
             }
         })
         .await?;
+        // A folder keeps its own summary and Open action when an ordinary
+        // file arrives immediately afterwards.
+        *actions.burst.lock().await = None;
+        let folder_path = dir.path().join("Received folder");
+        std::fs::create_dir(&folder_path)?;
+        let folder = ReceivedFile::from_transfer(
+            folder_path.clone(),
+            std::fs::File::open(&folder_path)?,
+            Some(crate::folders::Details {
+                items: 1,
+                content_size: Some(3),
+                ..Default::default()
+            }),
+            200,
+        )?;
+        let mut ordinary_meta = metadata.clone();
+        ordinary_meta.kind = pneu_proto::FileKind::File;
+        let mut folder_meta = ordinary_meta.clone();
+        folder_meta.file_name = "Received folder".into();
+        folder_meta.folder = Some(Box::new(pneu_proto::Folder { manifest_len: 197 }));
+        actions
+            .notify_file(&folder, &folder_meta, true, None, dir.path())
+            .await?;
+        assert!(actions.burst.lock().await.is_none());
+        assert_eq!(notification_copy.lock().unwrap().0, "Received folder");
+        assert_eq!(notification_copy.lock().unwrap().1, "1 item, 3 B");
+        actions
+            .notify_file(&final_file, &ordinary_meta, true, None, dir.path())
+            .await?;
+        assert_eq!(actions.burst.lock().await.as_ref().unwrap().count, 1);
+        assert_eq!(notification_copy.lock().unwrap().0, "final.png");
         // Arrival names survive Core's descriptor handoff. Bursts never merge
         // senders, and clip summaries identify the sender even with one device.
         let source = ArrivalSource {

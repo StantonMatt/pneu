@@ -7,6 +7,7 @@ pub mod config;
 pub mod core;
 mod discovery;
 mod file_recipients;
+mod folders;
 pub mod identity;
 pub mod ipc;
 #[cfg(unix)]

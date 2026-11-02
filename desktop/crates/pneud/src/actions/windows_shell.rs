@@ -54,7 +54,11 @@ async fn sta<T: Send + 'static>(
 
 fn checked_path(file: &ReceivedFile) -> Result<&Path> {
     let check = || -> Result<()> {
-        let named = platform_fs::open_regular_file(file.path())?;
+        let named = if file.is_folder() {
+            platform_fs::Folder::read(file.path())?.file.try_clone()?
+        } else {
+            platform_fs::open_regular_file(file.path())?
+        };
         anyhow::ensure!(
             platform_fs::identity(&named)? == platform_fs::identity(&file.file)?,
             "received file identity changed"

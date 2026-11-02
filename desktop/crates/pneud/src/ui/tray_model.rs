@@ -449,6 +449,7 @@ mod tests {
             route: None,
         });
         snapshot.send_targets.push(crate::outbox::SendTarget {
+            folder_reason: None,
             device: device.clone(),
             name: "Phone & tablet".into(),
             generation: 7,

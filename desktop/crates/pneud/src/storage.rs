@@ -63,8 +63,12 @@ pub(crate) fn cache_basename(name: &str) -> String {
     )
 }
 
-fn numbered_name(name: &str, number: usize) -> String {
-    let (stem, extension) = name_parts(name);
+pub(crate) fn numbered_name(name: &str, number: usize, directory: bool) -> String {
+    let (stem, extension) = if directory {
+        (name, "")
+    } else {
+        name_parts(name)
+    };
     let suffix = format!(" ({number})");
     format!(
         "{}{suffix}{extension}",
@@ -194,6 +198,7 @@ pub(crate) struct StageInner {
     pub name: String,
     pub destination: String,
     placed_name: Mutex<Option<String>>,
+    pub tree: Mutex<Option<crate::folders::Tree>>,
     pub retained: AtomicBool,
     pub cancelled: AtomicBool,
     pub cleanup: Mutex<Option<Cleanup>>,
@@ -223,6 +228,7 @@ impl Stage {
             name,
             destination,
             placed_name: Mutex::new(None),
+            tree: Mutex::new(None),
             retained: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
             cleanup: Mutex::new(None),
@@ -242,6 +248,7 @@ impl Stage {
             name,
             destination,
             placed_name: Mutex::new(None),
+            tree: Mutex::new(None),
             retained: AtomicBool::new(true),
             cancelled: AtomicBool::new(false),
             cleanup: Mutex::new(None),
@@ -276,9 +283,17 @@ impl Stage {
         Ok(self.0.directory.path()?.join(&self.0.name))
     }
     pub fn cleanup(&self) -> Result<()> {
+        self.cleanup_folder()?;
         remove_file(&self.0.directory.file, &self.0.name, &self.0.file)?;
         self.0.directory.file.sync_all()?;
         self.0.cleanup.lock().expect("stage cleanup").take();
+        Ok(())
+    }
+    fn cleanup_folder(&self) -> Result<()> {
+        if let Some(tree) = self.0.tree.lock().expect("folder tree").as_ref() {
+            tree.release();
+            tree.record.cleanup(&self.0.directory, &self.0.name)?;
+        }
         Ok(())
     }
     pub fn place(&self) -> Result<()> {
@@ -289,8 +304,22 @@ impl Stage {
         self.0.file.sync_all()?;
         let mut placed_name = self.0.placed_name.lock().expect("placed name");
         ensure!(placed_name.is_none(), "file has already been placed");
-        let before = fs::identity(&self.0.file)?;
-        let named = fs::identity_at(&self.0.directory.file, &self.0.name)?;
+        let tree = self.0.tree.lock().expect("folder tree");
+        let source_name = if tree.is_some() {
+            format!("{}-tree", self.0.name)
+        } else {
+            self.0.name.clone()
+        };
+        let source = tree
+            .as_ref()
+            .map(|tree| &*tree.root)
+            .unwrap_or(&self.0.file);
+        let before = fs::identity(source)?;
+        if tree.is_some() {
+            source.set_modified(std::time::SystemTime::now())?;
+            fs::sync_plain(source)?;
+        }
+        let named = fs::identity_at(&self.0.directory.file, &source_name)?;
         ensure!(before == named, "staging file was replaced");
         // Only the no-replace rename decides whether a name is free. Every
         // contender is relative to the retained folder FD, including fallback.
@@ -298,7 +327,7 @@ impl Stage {
             let candidate = if attempt == 1 {
                 safe_basename(&self.0.destination, NAME_MAX)
             } else if attempt <= NAME_ATTEMPTS {
-                numbered_name(&self.0.destination, attempt)
+                numbered_name(&self.0.destination, attempt, tree.is_some())
             } else {
                 // Cache fallback names must remain in the disposable namespace.
                 let (namespace, basename) = self
@@ -314,13 +343,36 @@ impl Stage {
                 )
             };
             let candidate = local_name(&candidate, NAME_MAX);
-            match fs::rename(
-                &self.0.directory.file,
-                &self.0.name,
-                &self.0.folder.file,
-                &candidate,
-                false,
-            ) {
+            let rename = || {
+                fs::rename(
+                    &self.0.directory.file,
+                    &source_name,
+                    &self.0.folder.file,
+                    &candidate,
+                    false,
+                )
+            };
+            #[cfg(windows)]
+            let result = {
+                let mut result = rename();
+                for _ in 0..10 {
+                    if !result.as_ref().is_err_and(|error| {
+                        error.chain().any(|e| {
+                            e.downcast_ref::<std::io::Error>()
+                                .is_some_and(|e| matches!(e.raw_os_error(), Some(5 | 32 | 33)))
+                        })
+                    }) {
+                        break;
+                    }
+                    ensure!(!self.0.cancelled.load(Ordering::SeqCst), "stage cancelled");
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    result = rename();
+                }
+                result
+            };
+            #[cfg(not(windows))]
+            let result = rename();
+            match result {
                 Ok(()) => {
                     *placed_name = Some(candidate);
                     break;
@@ -350,7 +402,12 @@ impl Drop for StageInner {
         let Ok(file) = self.file.try_clone() else {
             return;
         };
+        let tree = self.tree.get_mut().ok().and_then(Option::take);
         let clean = move || {
+            if let Some(tree) = tree {
+                tree.release();
+                tree.record.cleanup(&directory, &name)?;
+            }
             remove_file(&directory.file, &name, &file)?;
             directory.file.sync_all()?;
             Ok(())
@@ -427,7 +484,14 @@ pub(crate) fn prune_cache(folder: &Folder, cutoff: std::time::SystemTime) -> Res
             Err(e) => return Err(e),
         };
         let meta = file.metadata()?;
-        if meta.is_file() && meta.modified()? < cutoff {
+        if meta.is_dir() && meta.modified()? < cutoff {
+            if !fs::is_owned_private(&file)? {
+                continue;
+            }
+            crate::platform::private::check(&file)?;
+            wipe(&file)?;
+            remove_directory(&folder.file, name, &file)?;
+        } else if meta.is_file() && meta.modified()? < cutoff {
             crate::platform::private::check(&file)?;
             remove_file(&folder.file, name, &file)?;
         }
@@ -496,6 +560,32 @@ mod tests {
         )?;
         (&stage.0.file).write_all(bytes)?;
         Ok(stage)
+    }
+    #[cfg(unix)]
+    #[test]
+    fn folder_cache_pruning_skips_non_private_entries() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::scratch()?;
+        let folder = Folder::open_private(&dir.path().join("cache"))?;
+        let private = cache_basename("private");
+        let foreign = cache_basename("foreign");
+        fs::create_private_directory_at(&folder.file, &private)?;
+        fs::create_private_directory_at(&folder.file, &foreign)?;
+        for name in [&private, &foreign] {
+            fs::open_directory_at(&folder.file, name)?
+                .set_modified(std::time::SystemTime::UNIX_EPOCH)?;
+        }
+        std::fs::set_permissions(
+            folder.path()?.join(&foreign),
+            std::fs::Permissions::from_mode(0o755),
+        )?;
+        prune_cache(
+            &folder,
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
+        )?;
+        assert!(folder.path()?.join(foreign).is_dir());
+        assert!(!folder.path()?.join(private).exists());
+        Ok(())
     }
     #[test]
     fn placement_keeps_names_and_numbers_collisions_without_overwriting() -> Result<()> {
@@ -594,7 +684,7 @@ mod tests {
                 (stage, expected.to_owned()),
                 (
                     named_stage(&folder, wire, b"received")?,
-                    numbered_name(expected, 2),
+                    numbered_name(expected, 2, false),
                 ),
             ] {
                 stage.place()?;
@@ -738,7 +828,7 @@ mod tests {
             }
         }
         // Larger counters reserve their entire suffix before UTF-8 truncation.
-        let numbered = numbered_name(&format!("{}.png", "界".repeat(83)), NAME_ATTEMPTS);
+        let numbered = numbered_name(&format!("{}.png", "界".repeat(83)), NAME_ATTEMPTS, false);
         assert!(numbered.len() <= NAME_MAX);
         assert!(numbered.ends_with(" (10000).png"));
         Ok(())
@@ -816,7 +906,7 @@ mod tests {
                 let candidate = if number == 1 {
                     name.clone()
                 } else {
-                    numbered_name(&name, number)
+                    numbered_name(&name, number, false)
                 };
                 #[cfg(unix)]
                 std::fs::hard_link(&occupied, dir.path().join(candidate))?;
@@ -836,10 +926,11 @@ mod tests {
             assert_eq!(std::fs::read(path)?, b"received");
             assert_eq!(std::fs::read(dir.path().join(name))?, b"keep");
             assert_eq!(
-                std::fs::read(
-                    dir.path()
-                        .join(numbered_name(&stage.0.destination, NAME_ATTEMPTS))
-                )?,
+                std::fs::read(dir.path().join(numbered_name(
+                    &stage.0.destination,
+                    NAME_ATTEMPTS,
+                    false
+                )))?,
                 b"keep"
             );
         }

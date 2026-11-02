@@ -585,9 +585,15 @@ impl PcActions for DesktopActions {
             .map(|(_, wait)| wait)
     }
     async fn notify_send_admission_failure(&self, reason: &str) -> Result<()> {
-        let mut n = Notice::new("Couldn't send files");
-        n.body = crate::ui::notifications::escape(reason);
-        self.notice(n, Vec::new(), None, 0, None).await.map(|_| ())
+        self.notice(
+            crate::ui::notifications::Notice::admission_failure(reason),
+            Vec::new(),
+            None,
+            0,
+            None,
+        )
+        .await
+        .map(|_| ())
     }
     async fn notify_delivery(
         &self,
@@ -595,10 +601,7 @@ impl PcActions for DesktopActions {
         device_name: &str,
     ) -> Result<()> {
         let (notice, retry) = if transfer.state == "sent" {
-            (
-                Notice::sent(&transfer.file_name, &[device_name.into()]),
-                None,
-            )
+            (Notice::sent_transfer(transfer, device_name), None)
         } else {
             (
                 Notice::send_failed(
@@ -721,6 +724,7 @@ impl PcActions for DesktopActions {
         let mut all_saved = saved;
         let mut started = arrived;
         if save_error.is_none()
+            && metadata.folder.is_none()
             && copied != Some(false)
             && let Some(previous) = burst.as_ref()
             && previous.source == file.source
@@ -762,7 +766,7 @@ impl PcActions for DesktopActions {
                 replaces,
             )
             .await?;
-        *burst = if save_error.is_none() && copied != Some(false) {
+        *burst = if !file.is_folder() && save_error.is_none() && copied != Some(false) {
             Some(Burst {
                 id,
                 paths,

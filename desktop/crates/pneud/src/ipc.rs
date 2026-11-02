@@ -805,7 +805,7 @@ fn parse_send_command(args: &[String], validate_files: bool) -> Result<Command> 
             "unknown send option; use -- before a filename starting with -"
         );
         let path = std::path::absolute(arg)?;
-        if validate_files {
+        if validate_files && crate::storage::Folder::read(&path).is_err() {
             let file = crate::storage::open_regular_file(&path)?;
             ensure!(
                 file.metadata()?.len() <= crate::outbox::PEER_BYTES.min(pneu_proto::MAX_FILE_SIZE),
@@ -816,7 +816,7 @@ fn parse_send_command(args: &[String], validate_files: bool) -> Result<Command> 
     }
     ensure!(
         !paths.is_empty() && paths.len() <= 128,
-        "send needs 1 to 128 regular files"
+        "send needs 1 to 128 files or folders"
     );
     Ok(Command::SendFiles {
         paths,

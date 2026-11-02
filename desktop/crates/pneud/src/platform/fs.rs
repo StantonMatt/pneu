@@ -14,3 +14,12 @@ pub(crate) use windows::*;
 
 #[cfg(all(test, unix))]
 mod tests;
+
+#[derive(Clone, Copy)]
+pub(crate) enum CaptureType {
+    File,
+    Directory,
+    #[cfg_attr(windows, allow(dead_code))]
+    Link,
+    Special,
+}

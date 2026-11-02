@@ -67,6 +67,8 @@ pub struct Transfer {
     pub file_name: String,
     pub size: u64,
     pub sent: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<crate::folders::Details>,
     pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -91,6 +93,10 @@ impl Transfer {
             file_name: begin.file_name.clone(),
             size: begin.size,
             sent: 0,
+            folder: begin
+                .folder
+                .as_ref()
+                .map(|_| crate::folders::Details::default()),
             state: "sending".into(),
             error: None,
             direction: "incoming".into(),
@@ -109,6 +115,8 @@ pub struct SendTarget {
     pub generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<Hash>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder_reason: Option<String>,
     pub eligible: bool,
     pub would_queue: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -168,6 +176,9 @@ pub(crate) struct Outbox {
     view: Arc<Mutex<Vec<Transfer>>>,
     capabilities: Arc<Mutex<HashMap<Id, (u64, bool)>>>,
     recovery: Arc<Mutex<RecoveryClaims>>,
+    folder_capabilities: Arc<Mutex<HashMap<Id, (u64, bool)>>>,
+    preparing: Arc<Mutex<HashMap<Id, Transfer>>>,
+    pub(crate) stopping: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) retry_disconnected: Arc<std::sync::atomic::AtomicBool>,
     operations: Arc<Mutex<Vec<AdmissionOperation>>>,
     // Cancellation outlives visibility/pruning of the operation history until
@@ -188,7 +199,7 @@ pub(super) fn migrate(tx: &Transaction<'_>) -> Result<()> {
     tx.execute_batch("CREATE TABLE IF NOT EXISTS outbox_artifacts(id TEXT PRIMARY KEY,operation TEXT NOT NULL,meta TEXT NOT NULL,staged INTEGER NOT NULL DEFAULT 1);
         CREATE TABLE IF NOT EXISTS outbox_deliveries(artifact TEXT NOT NULL REFERENCES outbox_artifacts(id) ON DELETE CASCADE,device TEXT NOT NULL,generation INTEGER NOT NULL,fingerprint TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'queued',error TEXT,retries INTEGER NOT NULL DEFAULT 0,mismatches INTEGER NOT NULL DEFAULT 0,retry_at INTEGER NOT NULL DEFAULT 0,session INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(artifact,device));
         CREATE INDEX IF NOT EXISTS outbox_peer ON outbox_deliveries(device,state,retry_at);
-        CREATE TRIGGER IF NOT EXISTS outbox_revoke BEFORE DELETE ON peers BEGIN UPDATE outbox_deliveries SET state='cancelled',error='Pairing changed' WHERE device=OLD.id AND state NOT IN ('sent','cancelled'); END;
+        CREATE TRIGGER IF NOT EXISTS outbox_revoke BEFORE DELETE ON peers BEGIN UPDATE outbox_deliveries SET state='cancelled',error='Pairing changed' WHERE device=OLD.id AND state NOT IN ('sent','cancelled','skipped'); END;
         UPDATE outbox_deliveries SET state='queued',error='Connection lost' WHERE state='sending';
         CREATE TABLE IF NOT EXISTS outbox_capabilities(device TEXT PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,generation INTEGER NOT NULL,files INTEGER NOT NULL);
         PRAGMA user_version=3;")?;
@@ -201,6 +212,8 @@ pub(super) fn migrate(tx: &Transaction<'_>) -> Result<()> {
         CREATE TABLE IF NOT EXISTS outbox_requests(request_id TEXT PRIMARY KEY,operation TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS outbox_request_operation ON outbox_requests(operation);
         CREATE TABLE IF NOT EXISTS outbox_operations(id TEXT PRIMARY KEY,request_id TEXT UNIQUE,state TEXT NOT NULL,paths TEXT NOT NULL,recipients TEXT NOT NULL,accepted TEXT NOT NULL DEFAULT '[]',rejected TEXT NOT NULL DEFAULT '[]',dismissed INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL DEFAULT 0,finished_at INTEGER);")?;
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS outbox_folders(id TEXT PRIMARY KEY REFERENCES outbox_artifacts(id) ON DELETE CASCADE,details TEXT NOT NULL,sources TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS folder_capabilities(device TEXT PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,generation INTEGER NOT NULL,supported INTEGER NOT NULL);")?;
     tx.execute_batch("CREATE TABLE IF NOT EXISTS file_pending_cancels(device TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,id TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(device,id));")?;
     for (name, sql) in [
         (
@@ -245,7 +258,7 @@ pub(super) fn migrate(tx: &Transaction<'_>) -> Result<()> {
     tx.execute_batch("CREATE TRIGGER IF NOT EXISTS outbox_finished AFTER UPDATE OF state ON outbox_deliveries WHEN NEW.state != OLD.state BEGIN UPDATE outbox_deliveries SET finished_at=CASE WHEN NEW.state IN ('sent','failed','cancelled') THEN CAST((julianday('now')-2440587.5)*86400000 AS INTEGER) ELSE NULL END WHERE artifact=NEW.artifact AND device=NEW.device; END;")?;
     // Recover capacity hidden by older Remove implementations too. Startup
     // collection below will release the now-terminal staged payloads.
-    tx.execute_batch("UPDATE outbox_deliveries SET state='cancelled',error=NULL WHERE state NOT IN ('sent','cancelled') AND artifact IN (SELECT a.id FROM outbox_artifacts a WHERE EXISTS(SELECT 1 FROM outbox_dismissed h WHERE h.operation=a.operation) OR EXISTS(SELECT 1 FROM outbox_artifact_dismissed h WHERE h.artifact=a.id));")?;
+    tx.execute_batch("UPDATE outbox_deliveries SET state='cancelled',error=NULL WHERE state NOT IN ('sent','cancelled','skipped') AND artifact IN (SELECT a.id FROM outbox_artifacts a WHERE EXISTS(SELECT 1 FROM outbox_dismissed h WHERE h.operation=a.operation) OR EXISTS(SELECT 1 FROM outbox_artifact_dismissed h WHERE h.artifact=a.id));")?;
     Ok(())
 }
 impl Outbox {
@@ -259,6 +272,9 @@ impl Outbox {
             view: Arc::default(),
             capabilities: Arc::default(),
             recovery: Arc::default(),
+            folder_capabilities: Arc::default(),
+            preparing: Arc::default(),
+            stopping: Arc::default(),
             retry_disconnected: Arc::default(),
             operations: Arc::default(),
             cancelled_admissions: Arc::default(),
@@ -290,6 +306,23 @@ impl Outbox {
                 .collect::<Result<_>>()?
             };
             *outbox.capabilities.lock().expect("file capabilities") = capabilities;
+            *outbox
+                .folder_capabilities
+                .lock()
+                .expect("folder capabilities") = c
+                .prepare("SELECT device,generation,supported FROM folder_capabilities")?
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, bool>(2)?,
+                    ))
+                })?
+                .map(|r| {
+                    let (d, g, s) = r?;
+                    Ok((Id::new(d)?, (g as u64, s)))
+                })
+                .collect::<Result<_>>()?;
             Ok(())
         })?;
         outbox.refresh_operations()?;
@@ -349,10 +382,11 @@ impl Outbox {
     fn refresh(&self) -> Result<()> {
         self.store.locked(|c| {
             // Keep every recipient and artifact of each retained operation.
-            let mut q=c.prepare("SELECT a.operation,a.meta,d.device,d.generation,d.state,d.error,d.finished_at,a.path,CASE WHEN d.resume THEN d.sent ELSE 0 END FROM outbox_artifacts a JOIN outbox_deliveries d ON d.artifact=a.id WHERE NOT EXISTS(SELECT 1 FROM outbox_dismissed o WHERE o.operation=a.operation) AND NOT EXISTS(SELECT 1 FROM outbox_artifact_dismissed h WHERE h.artifact=a.id) AND (a.operation IN (SELECT operation FROM outbox_artifacts GROUP BY operation ORDER BY max(rowid) DESC LIMIT 50) OR a.operation IN (SELECT a.operation FROM outbox_artifacts a JOIN outbox_deliveries d ON d.artifact=a.id WHERE d.state NOT IN ('sent','cancelled'))) ORDER BY a.rowid,d.device")?;
+            let mut q=c.prepare("SELECT a.operation,a.meta,d.device,d.generation,d.state,d.error,d.finished_at,a.path,CASE WHEN d.resume THEN d.sent ELSE 0 END FROM outbox_artifacts a JOIN outbox_deliveries d ON d.artifact=a.id WHERE NOT EXISTS(SELECT 1 FROM outbox_dismissed o WHERE o.operation=a.operation) AND NOT EXISTS(SELECT 1 FROM outbox_artifact_dismissed h WHERE h.artifact=a.id) AND (a.operation IN (SELECT operation FROM outbox_artifacts GROUP BY operation ORDER BY max(rowid) DESC LIMIT 50) OR a.operation IN (SELECT a.operation FROM outbox_artifacts a JOIN outbox_deliveries d ON d.artifact=a.id WHERE d.state NOT IN ('sent','cancelled','skipped'))) ORDER BY a.rowid,d.device")?;
             let view=q.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,Option<i64>>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,i64>(8)? as u64)))?.map(|r| {
                 let (operation,meta,device,generation,state,error,finished_at,path,sent)=r?;let begin:FileBegin=serde_json::from_str(&meta)?;
-                Ok(Transfer{operation:Id::new(operation)?,transfer_id:begin.transfer_id,device:Id::new(device)?,file_name:begin.file_name,size:begin.size,sent:if state=="sent" {begin.size} else {sent},state,error,generation:generation as u64,direction:outgoing_direction(),finished_at:finished_at.map(|t| t as u64),path:path.map(PathBuf::from)})
+                let details:Option<String>=c.query_row("SELECT details FROM outbox_folders WHERE id=?",[begin.transfer_id.as_str()],|r|r.get(0)).optional()?;
+                Ok(Transfer{folder:details.map(|s|serde_json::from_str(&s)).transpose()?,operation:Id::new(operation)?,transfer_id:begin.transfer_id,device:Id::new(device)?,file_name:begin.file_name,size:begin.size,sent:if state=="sent" {begin.size} else {sent},state,error,generation:generation as u64,direction:outgoing_direction(),finished_at:finished_at.map(|t| t as u64),path:path.map(PathBuf::from)})
             }).collect::<Result<Vec<_>>>()?;
         let mut old = self.view.lock().expect("outbox view");
         let mut view = view;
@@ -414,10 +448,20 @@ impl Outbox {
                     finished_at: Some(operation.finished_at.unwrap_or(operation.created_at)),
                     path,
 
+                    folder: None,
                     generation: 0,
                 });
             }
             if operation.state == "staging" {
+                if let Some(row) = self
+                    .preparing
+                    .lock()
+                    .expect("folder preparation")
+                    .get(&operation.operation)
+                {
+                    rows.push(row.clone());
+                    continue;
+                }
                 rows.push(Transfer {
                     operation: operation.operation.clone(),
                     transfer_id: operation.operation.clone(),
@@ -431,6 +475,7 @@ impl Outbox {
                     finished_at: None,
                     path: None,
 
+                    folder: None,
                     generation: 0,
                 });
             }
@@ -491,7 +536,7 @@ impl Outbox {
         }).await
     }
     fn capacity(c: &Connection, size: u64, recipients: &[Authority]) -> Result<()> {
-        let (bytes,count):(i64,i64)=c.query_row("SELECT coalesce(sum(json_extract(meta,'$.size')),0),(SELECT count(*) FROM outbox_deliveries WHERE state NOT IN ('sent','cancelled')) FROM outbox_artifacts WHERE staged=1",[],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let (bytes,count):(i64,i64)=c.query_row("SELECT coalesce(sum(coalesce(json_extract(meta,'$.folder.manifest_len'),json_extract(meta,'$.size'))),0),(SELECT count(*) FROM outbox_deliveries WHERE state NOT IN ('sent','cancelled','skipped')) FROM outbox_artifacts WHERE staged=1",[],|r|Ok((r.get(0)?,r.get(1)?)))?;
         ensure!(
             (bytes as u64).saturating_add(size) <= GLOBAL_BYTES
                 && count + recipients.len() as i64 <= GLOBAL_DELIVERIES as i64,
@@ -501,7 +546,7 @@ impl Outbox {
     }
     fn peer_has_capacity(c: &Connection, size: u64, peer: &Authority) -> Result<bool> {
         let (bytes, count): (i64, i64) = c.query_row(
-            "SELECT coalesce(sum(json_extract(a.meta,'$.size')),0),count(*) FROM outbox_deliveries d JOIN outbox_artifacts a ON a.id=d.artifact WHERE device=? AND state NOT IN ('sent','cancelled')",
+            "SELECT coalesce(sum(coalesce(json_extract(a.meta,'$.folder.manifest_len'),json_extract(a.meta,'$.size'))),0),count(*) FROM outbox_deliveries d JOIN outbox_artifacts a ON a.id=d.artifact WHERE device=? AND state NOT IN ('sent','cancelled','skipped')",
             [peer.device.as_str()], |r| Ok((r.get(0)?,r.get(1)?)))?;
         Ok((bytes as u64).saturating_add(size) <= PEER_BYTES && count < PEER_DELIVERIES as i64)
     }
@@ -572,16 +617,18 @@ impl Outbox {
         limit: u64,
         source_device: Id,
     ) -> Result<(Id, Vec<RecipientRejection>)> {
-        // Serialize before reserving any worker; move ownership into the job
-        // so cancellation cannot start a competing copy.
-        let admission = self.admission.clone().lock_owned().await;
+        // A worker owns admission through completion even if its caller
+        // disappears. Never hold this lock while waiting for an I/O slot.
         let this = self.clone();
         self.file_io(move || {
-            let _admission = admission;
             this.collect()?;
             let mut recipients=recipients;
             let mut rejected=Vec::new();
             ensure!(!this.admission_cancelled(&operation),"operation cancelled");
+            if Folder::read(&path).is_ok() {
+                return this.admit_folder(&operation,&path,recipients,limit);
+            }
+            let _admission = this.admission.blocking_lock();
             let mut source=crate::storage::open_regular_file(&path)?;
             #[cfg(test)]
             if let Some(hook)=this.source_hook.lock().unwrap().take() {hook(&path);}
@@ -644,13 +691,27 @@ impl Outbox {
                     // Once committed, admission must not turn into a rejection
                     // because a subsequent projection read failed.
                     let mut view=this.view.lock().expect("outbox view");
-                    for peer in &recipients {view.push(Transfer{operation:operation.clone(),transfer_id:id.clone(),device:peer.device.clone(),file_name:begin.file_name.clone(),size,sent:0,state:"queued".into(),error:None,generation:peer.generation,direction:outgoing_direction(),finished_at:None,path:Some(path.clone())});}
+                    for peer in &recipients {view.push(Transfer{folder:None,operation:operation.clone(),transfer_id:id.clone(),device:peer.device.clone(),file_name:begin.file_name.clone(),size,sent:0,state:"queued".into(),error:None,generation:peer.generation,direction:outgoing_direction(),finished_at:None,path:Some(path.clone())});}
                     Ok(())
                 })
             })();
             if result.is_err() {let _=crate::storage::remove_file(&this.folder.file,id.as_str(),&staged);}
             if let Err(error)=result {return Err(AdmissionFailure {recipient_only:recipients.is_empty(),reason:error.to_string(),rejected}.into());}Ok((id,rejected))
         }).await
+    }
+    pub(crate) fn note_folders(&self, device: Id, generation: u64, supported: bool) {
+        self.folder_capabilities
+            .lock()
+            .expect("folder capabilities")
+            .insert(device, (generation, supported));
+    }
+    pub(crate) fn supports_folders(&self, device: &Id, generation: u64) -> Option<bool> {
+        self.folder_capabilities
+            .lock()
+            .expect("folder capabilities")
+            .get(device)
+            .filter(|(g, _)| *g == generation)
+            .map(|(_, s)| *s)
     }
     pub(crate) async fn negotiate_resume(&self, delivery: Delivery, resume: bool) -> Result<()> {
         let this = self.clone();
@@ -768,16 +829,24 @@ impl Outbox {
         .await
     }
     pub(crate) async fn receipt(&self, delivery: Delivery, code: Option<NackCode>) -> Result<()> {
+        self.receipt_phase(delivery, code, false).await
+    }
+    pub(crate) async fn receipt_phase(
+        &self,
+        delivery: Delivery,
+        code: Option<NackCode>,
+        early: bool,
+    ) -> Result<()> {
         let this = self.clone();
         self.store.blocking(move |_| {
             this.store.locked(|c| {
                 let mismatch=matches!(code,Some(NackCode::HashMismatch|NackCode::SizeMismatch));
                 let (attempts,mismatches):(u32,u32)=c.query_row("SELECT retries,mismatches FROM outbox_deliveries WHERE artifact=? AND device=?",params![delivery.begin.transfer_id.as_str(),delivery.authority.device.as_str()],|r|Ok((r.get(0)?,r.get(1)?)))?;
                 let mismatches=mismatches+u32::from(mismatch);
-                let state=match code {None=>"sent",Some(code) if code.retryable() && (!mismatch || mismatches<=3)=>"queued",_=>"failed"};
+                let state=match code {Some(NackCode::DiskFull) if early && delivery.begin.folder.is_some()=>"failed",None=>"sent",Some(code) if code.retryable() && (!mismatch || mismatches<=3)=>"queued",_=>"failed"};
                 let delay=if mismatch { (2u64.pow(attempts.min(5))).min(60)*1000 } else {60_000};
                 let jitter=rand::random_range(80..=120);
-                c.execute("UPDATE outbox_deliveries SET state=?,error=?,mismatches=?,retry_at=? WHERE artifact=? AND device=? AND generation=? AND session=? AND state='sending'",params![state,code.map(|c|format!("{c:?}")),mismatches,(crate::now_ms()+delay*jitter/100) as i64,delivery.begin.transfer_id.as_str(),delivery.authority.device.as_str(),delivery.authority.generation as i64,delivery.session as i64])?;Ok(())
+                c.execute("UPDATE outbox_deliveries SET state=?,error=?,mismatches=?,retry_at=? WHERE artifact=? AND device=? AND generation=? AND session=? AND state='sending'",params![state,code.map(|c|if early && delivery.begin.folder.is_some() && c==NackCode::DiskFull {format!("Needs {} free",crate::folders::size_label(delivery.begin.size))} else {format!("{c:?}")}),mismatches,(crate::now_ms()+delay*jitter/100) as i64,delivery.begin.transfer_id.as_str(),delivery.authority.device.as_str(),delivery.authority.generation as i64,delivery.session as i64])?;Ok(())
             })?;this.refresh()?;this.collect()
         }).await
     }
@@ -837,9 +906,9 @@ impl Outbox {
                 if staging > 0 { tx.execute("UPDATE outbox_operations SET state='cancelled' WHERE id=? AND state='staging' AND json_array_length(recipients)=0",[operation.as_str()])?; }
                 if retry {tx.execute("DELETE FROM outbox_artifact_dismissed WHERE artifact IN (SELECT id FROM outbox_artifacts WHERE operation=? AND (? IS NULL OR id=?))",params![operation.as_str(),artifact.as_ref().map(Id::as_str),artifact.as_ref().map(Id::as_str)])?;tx.execute("DELETE FROM outbox_dismissed WHERE operation=?",[operation.as_str()])?;tx.execute("UPDATE outbox_operations SET dismissed=0 WHERE id=?",[operation.as_str()])?;}
                 let c=&tx;
-                if !retry {tx.execute("INSERT OR IGNORE INTO file_pending_cancels SELECT d.device,d.artifact,d.generation FROM outbox_deliveries d JOIN outbox_artifacts a ON a.id=d.artifact WHERE a.operation=? AND (? IS NULL OR a.id=?) AND (? IS NULL OR d.device=?) AND d.state NOT IN ('sent','cancelled') AND d.resume=1",params![operation.as_str(),artifact.as_ref().map(Id::as_str),artifact.as_ref().map(Id::as_str),device.as_ref().map(Id::as_str),device.as_ref().map(Id::as_str)])?;}
-                let changed=if retry {c.execute("UPDATE outbox_deliveries SET state='queued',error=NULL,mismatches=0,retry_at=0 WHERE artifact IN (SELECT id FROM outbox_artifacts WHERE operation=? AND staged=1 AND (? IS NULL OR id=?)) AND device=? AND state IN ('failed','queued') AND generation=(SELECT generation FROM peers WHERE id=device) AND fingerprint=(SELECT fp FROM peers WHERE id=device)",params![operation.as_str(),artifact.as_ref().map(Id::as_str),artifact.as_ref().map(Id::as_str),device.as_ref().context("retry needs a device")?.as_str()])?}
-                else {c.execute("UPDATE outbox_deliveries SET state='cancelled',error=NULL WHERE artifact IN (SELECT id FROM outbox_artifacts WHERE operation=? AND (? IS NULL OR id=?)) AND (? IS NULL OR device=?) AND state NOT IN ('sent','cancelled')",params![operation.as_str(),artifact.as_ref().map(Id::as_str),artifact.as_ref().map(Id::as_str),device.as_ref().map(Id::as_str),device.as_ref().map(Id::as_str)])?};
+                if !retry {tx.execute("INSERT OR IGNORE INTO file_pending_cancels SELECT d.device,d.artifact,d.generation FROM outbox_deliveries d JOIN outbox_artifacts a ON a.id=d.artifact WHERE a.operation=? AND (? IS NULL OR a.id=?) AND (? IS NULL OR d.device=?) AND d.state NOT IN ('sent','cancelled','skipped') AND d.resume=1",params![operation.as_str(),artifact.as_ref().map(Id::as_str),artifact.as_ref().map(Id::as_str),device.as_ref().map(Id::as_str),device.as_ref().map(Id::as_str)])?;}
+                let changed=if retry {c.execute("UPDATE outbox_deliveries SET state='queued',error=NULL,mismatches=0,retry_at=0 WHERE artifact IN (SELECT id FROM outbox_artifacts WHERE operation=? AND staged=1 AND (? IS NULL OR id=?)) AND device=? AND state IN ('failed','queued') AND coalesce(error,'')<>? AND generation=(SELECT generation FROM peers WHERE id=device) AND fingerprint=(SELECT fp FROM peers WHERE id=device)",params![operation.as_str(),artifact.as_ref().map(Id::as_str),artifact.as_ref().map(Id::as_str),device.as_ref().context("retry needs a device")?.as_str(),crate::folders::SourceChanged.to_string()])?}
+                else {c.execute("UPDATE outbox_deliveries SET state='cancelled',error=NULL WHERE artifact IN (SELECT id FROM outbox_artifacts WHERE operation=? AND (? IS NULL OR id=?)) AND (? IS NULL OR device=?) AND state NOT IN ('sent','cancelled','skipped')",params![operation.as_str(),artifact.as_ref().map(Id::as_str),artifact.as_ref().map(Id::as_str),device.as_ref().map(Id::as_str),device.as_ref().map(Id::as_str)])?};
                 ensure!(changed+staging>0,"no matching transfer can be changed");
                 let cancelled = staging > 0 && tx.query_row("SELECT state='cancelled' FROM outbox_operations WHERE id=?",[operation.as_str()],|r|r.get::<_,bool>(0))?;
                 tx.commit()?;
@@ -879,7 +948,7 @@ impl Outbox {
             .await
     }
     fn collect(&self) -> Result<()> {
-        let ids=self.store.locked(|c|{let mut q=c.prepare("SELECT id FROM outbox_artifacts a WHERE staged=1 AND NOT EXISTS(SELECT 1 FROM outbox_deliveries d WHERE d.artifact=a.id AND state NOT IN ('sent','cancelled'))")?;Ok(q.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)})?;
+        let ids=self.store.locked(|c|{let mut q=c.prepare("SELECT id FROM outbox_artifacts a WHERE staged=1 AND NOT EXISTS(SELECT 1 FROM outbox_deliveries d WHERE d.artifact=a.id AND state NOT IN ('sent','cancelled','skipped'))")?;Ok(q.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)})?;
         for id in ids {
             match platform_fs::open_read_at(&self.folder.file, id.as_str()) {
                 Ok(fd) => {
@@ -2166,7 +2235,7 @@ mod projection_regression_tests {
         assert!(q.snapshot(&[]).is_empty());
         assert!(!q.folder.path()?.join(artifact.as_str()).exists());
         q.store.call(|c| {
-            assert_eq!(c.query_row("SELECT count(*) FROM outbox_deliveries WHERE state NOT IN ('sent','cancelled')", [], |r| r.get::<_,i64>(0))?, 0);
+            assert_eq!(c.query_row("SELECT count(*) FROM outbox_deliveries WHERE state NOT IN ('sent','cancelled','skipped')", [], |r| r.get::<_,i64>(0))?, 0);
             assert_eq!(c.query_row("SELECT count(*) FROM outbox_artifacts WHERE staged=1", [], |r| r.get::<_,i64>(0))?, 0);
             Ok(())
         }).await?;
@@ -2323,7 +2392,7 @@ mod artifact_action_regressions {
         assert!(!q.folder.path()?.join(a.as_str()).exists());
         assert!(q.folder.path()?.join(b.as_str()).exists());
         q.store.call(move |c| {
-            assert_eq!(c.query_row("SELECT count(*) FROM outbox_deliveries WHERE state NOT IN ('sent','cancelled')", [], |r| r.get::<_,i64>(0))?, 2);
+            assert_eq!(c.query_row("SELECT count(*) FROM outbox_deliveries WHERE state NOT IN ('sent','cancelled','skipped')", [], |r| r.get::<_,i64>(0))?, 2);
             assert_eq!(c.query_row("SELECT count(*) FROM outbox_artifacts WHERE staged=1", [], |r| r.get::<_,i64>(0))?, 1);
             Ok(())
         }).await?;
@@ -2481,7 +2550,7 @@ mod removed_history_recovery_regressions {
         assert!(q.snapshot(&[]).is_empty());
         assert!(!q.folder.path()?.join(artifact.as_str()).exists());
         q.store.call(|c| {
-            assert_eq!(c.query_row("SELECT count(*) FROM outbox_deliveries WHERE state NOT IN ('sent','cancelled')", [], |r| r.get::<_,i64>(0))?, 0);
+            assert_eq!(c.query_row("SELECT count(*) FROM outbox_deliveries WHERE state NOT IN ('sent','cancelled','skipped')", [], |r| r.get::<_,i64>(0))?, 0);
             assert_eq!(c.query_row("SELECT count(*) FROM outbox_artifacts WHERE staged=1", [], |r| r.get::<_,i64>(0))?, 0);
             Ok(())
         }).await?;
@@ -2533,3 +2602,6 @@ mod dismissed_cancellation_regressions {
         Ok(())
     }
 }
+
+#[path = "outbox_folders.rs"]
+mod folders;
