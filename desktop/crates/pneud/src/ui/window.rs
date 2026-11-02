@@ -1773,6 +1773,8 @@ struct UiSender {
     view: Arc<Mutex<View>>,
 }
 impl UiSender {
+    // Capture the displayed frame here, after callers have released any view
+    // guard. Pre-scoping an action while holding that guard would lock it twice.
     fn send(
         &self,
         action: Action,
@@ -1982,12 +1984,8 @@ fn connect(
     ui.on_pair_again_started(with(Action::PairAgain));
     ui.on_send_files(with(Action::SendFiles));
     let ring_commands = commands.clone();
-    let ring_view = view.clone();
     ui.on_ring_phone(move |device, connection, stop| {
-        let _ = ring_commands.send(Action::Scoped(
-            ring_view.lock().expect("view").clone(),
-            Box::new(Action::Ring(device.into(), connection.into(), stop)),
-        ));
+        let _ = ring_commands.send(Action::Ring(device.into(), connection.into(), stop));
     });
     ui.on_send_folder(with(Action::SendFolder));
     ui.on_cancel_item(with(Action::Cancel));
@@ -6163,6 +6161,70 @@ mod tests {
             } => unreachable!(),
         }
         flush_ui();
+    }
+
+    #[tokio::test]
+    async fn ring_callback_during_worker_refresh_does_not_deadlock() -> Result<()> {
+        // The callback can block the UI thread itself, so enforce the deadline
+        // from the parent process, outside that thread's event loop.
+        if tokio::time::timeout(
+            Duration::from_secs(10),
+            in_offscreen_child(
+                "ui::window::tests::ring_callback_during_worker_refresh_does_not_deadlock",
+                &[],
+            ),
+        )
+        .await
+        .context("Ring callback or worker refresh deadlocked")??
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut rx) = model_worker(&window, dir.path());
+        go(Page::Device, 1, 0)(&window);
+        window.global::<Ui>().invoke_navigated();
+        // Ignore the navigation action and capture the frame the click sees.
+        rx.try_recv()?;
+        let origin = worker.view();
+        worker.peer_settings = Some((id(1).to_string(), Value::Null, Instant::now()));
+        let value = json!({"config": Config::default(), "snapshot": worker.snapshot});
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let refresh_ready = ready.clone();
+        let (finished, done) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || -> Result<()> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let visible = AtomicBool::new(true);
+            for stop in [false, true] {
+                refresh_ready.wait();
+                runtime.block_on(worker.refresh(value.clone(), &visible))?;
+                let action = rx.blocking_recv().context("missing ring action")?;
+                let Action::Scoped(captured, action) = action else {
+                    anyhow::bail!("ring action lost its displayed frame");
+                };
+                assert_eq!(captured, origin);
+                assert!(
+                    matches!(*action, Action::Ring(ref device, ref connection, stopping)
+                    if device == id(1).as_str() && connection == "42" && stopping == stop)
+                );
+                finished.send(())?;
+            }
+            Ok(())
+        });
+        for stop in [false, true] {
+            ready.wait();
+            window
+                .global::<Ui>()
+                .invoke_ring_phone(id(1).as_str().into(), "42".into(), stop);
+            done.recv_timeout(Duration::from_secs(3))
+                .context("worker refresh blocked after Ring callback")?;
+            flush_ui();
+        }
+        thread.join().expect("refresh thread panicked")?;
+        Ok(())
     }
 
     #[tokio::test]
