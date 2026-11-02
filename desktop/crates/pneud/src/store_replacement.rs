@@ -509,6 +509,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replacement_folder_resend_preserves_manifest_and_source_catalogue() -> Result<()> {
+        let (dir, s) = fixture().await?;
+        let q = outbox::Outbox::open(s.clone(), &dir.path().join("outbox"))?;
+        let old = Authority {
+            device: id(1),
+            generation: 1,
+            fingerprint: pin(1),
+        };
+        q.note_folders(id(1), 1, true);
+        let source = dir.path().join("Trip.png");
+        fs::create_dir(&source)?;
+        fs::write(source.join("a.txt"), b"folder resend bytes")?;
+        let artifact = q
+            .admit(id(8), source, vec![old], outbox::PEER_BYTES)
+            .await?;
+        pair(&s, 2, DeviceRole::Phone, "galaxy s25+", vec![(id(1), 42)]).await?;
+        s.replacement_decide(id(9), offer(&s), true, |_| {}).await?;
+        q.reconcile().await?;
+        q.note_folders(id(2), 1, true);
+        assert_eq!(
+            q.retry_replaced(
+                id(8),
+                Some(artifact.clone()),
+                id(1),
+                vec![Authority {
+                    device: id(2),
+                    generation: 1,
+                    fingerprint: pin(2)
+                }],
+                id(99)
+            )
+            .await?,
+            Some(id(2))
+        );
+        let delivery = q
+            .claim(id(2), 1, 1)
+            .await?
+            .context("folder resend queued")?;
+        assert_ne!(delivery.begin.transfer_id, artifact);
+        assert!(delivery.begin.folder.is_some());
+        assert!(delivery.begin.hlc.is_none() && delivery.begin.source_device.is_none());
+        let row = q
+            .snapshot(&[])
+            .into_iter()
+            .find(|t| t.transfer_id == delivery.begin.transfer_id)
+            .context("folder projection")?;
+        assert!(row.folder.is_some());
+        let mut reader = q.folder_reader(delivery.clone()).await?;
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 4096];
+        loop {
+            let n = reader.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..n]);
+        }
+        assert_eq!(bytes.len() as u64, delivery.begin.size);
+        assert!(bytes.ends_with(b"folder resend bytes"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn replacement_batch_retry_publishes_committed_items_if_a_later_source_is_missing()
     -> Result<()> {
         let (dir, s) = fixture().await?;

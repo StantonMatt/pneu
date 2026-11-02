@@ -6,9 +6,10 @@ use slint::ComponentHandle;
 use std::{cell::RefCell, os::unix::ffi::OsStrExt, path::PathBuf, rc::Rc};
 
 type Point = (f64, f64);
+type Begin = Rc<dyn Fn(&[PathBuf]) -> bool>;
 #[derive(Clone)]
 pub(crate) struct Callbacks {
-    pub begin: Rc<dyn Fn() -> bool>,
+    pub begin: Begin,
     pub hover: Rc<dyn Fn(Point) -> bool>,
     pub drop: Rc<dyn Fn(Point, Vec<PathBuf>) -> bool>,
     pub cancel: Rc<dyn Fn()>,
@@ -76,7 +77,7 @@ impl State {
                 let Some(paths) = selected_paths(data) else {
                     return false;
                 };
-                if !(self.callbacks.begin)() {
+                if !(self.callbacks.begin)(&paths) {
                     return false;
                 }
                 *self.paths.borrow_mut() = Some(paths);
@@ -201,7 +202,7 @@ mod tests {
     fn enter_outside_rows_leave_repeat_and_rejected_drop_clear_state() {
         let events = Rc::new(RefCell::new(Vec::new()));
         let log = events.clone();
-        let begin = Rc::new(move || {
+        let begin = Rc::new(move |_: &[PathBuf]| {
             log.borrow_mut().push("begin");
             true
         });
@@ -245,6 +246,39 @@ mod tests {
         assert!(state.event(1, (1.0, 2.0), urls));
         assert!(!state.event(3, (1.0, 2.0), b"file:///tmp/b\0"));
         assert_eq!(events.borrow().iter().filter(|&&e| e == "drop").count(), 1);
+    }
+    #[test]
+    fn folder_offer_reaches_shared_admission_and_drop_with_original_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("Trip");
+        std::fs::create_dir(&folder).unwrap();
+        let paths = vec![folder];
+        let offered = format!("{}\0", url::Url::from_file_path(&paths[0]).unwrap());
+        let admitted = Rc::new(RefCell::new(Vec::new()));
+        let delivered = Rc::new(RefCell::new(Vec::new()));
+        let begin_paths = admitted.clone();
+        let drop_paths = delivered.clone();
+        let state = State {
+            callbacks: Callbacks {
+                begin: Rc::new(move |paths| {
+                    assert!(paths[0].is_dir());
+                    *begin_paths.borrow_mut() = paths.to_vec();
+                    true
+                }),
+                hover: Rc::new(|_| true),
+                drop: Rc::new(move |_, paths| {
+                    *drop_paths.borrow_mut() = paths;
+                    true
+                }),
+                cancel: Rc::new(|| {}),
+            },
+            paths: RefCell::new(None),
+        };
+        assert!(state.event(1, (1.0, 2.0), offered.as_bytes()));
+        assert_eq!(*admitted.borrow(), paths);
+        assert!(state.event(3, (1.0, 2.0), offered.as_bytes()));
+        assert_eq!(*delivered.borrow(), paths);
+        assert!(state.paths.borrow().is_none());
     }
     #[test]
     fn local_urls_preserve_unicode_and_unix_bytes() {

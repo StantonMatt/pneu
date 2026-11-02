@@ -40,7 +40,7 @@ class FolderScreensDeviceTest {
     @Test(timeout=600000) fun buttonPreparingAndSkippedInBothThemes()=runBlocking<Unit> {
         val peer=Peer("MJStanton-Desktop","d".repeat(64),"d".repeat(32),emptyList())
         val p=app.preferences.read().copy(setup=true,peer=peer,peers=listOf(peer),paused=false,photos=false,recordings=false)
-        val link=LinkState("Connected","Wi-Fi",capabilities=setOf("files",CAP_FILE_RESUME,CAP_FOLDER))
+        val link=LinkState("Connected","Local network",capabilities=setOf("files",CAP_FILE_RESUME,CAP_FOLDER))
         fun row(name:String,skipped:FolderSkipped)=Outgoing().apply {
             mediaId=name;fileName=name;kind="file";origin="folder";mime=FOLDER_MIME;automatic=false;state="sent";size=1800000000;createdAt=System.currentTimeMillis();text=Gson().toJson(FolderSummary(165,1204,skipped))
         }

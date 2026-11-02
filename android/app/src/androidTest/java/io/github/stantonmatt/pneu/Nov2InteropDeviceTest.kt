@@ -3,6 +3,8 @@ package io.github.stantonmatt.pneu
 import android.Manifest
 import android.content.ComponentName
 import android.content.Intent
+import android.net.Uri
+import android.provider.DocumentsContract
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.core.app.ActivityScenario
 import androidx.test.platform.app.InstrumentationRegistry
@@ -46,7 +48,7 @@ class Nov2InteropDeviceTest {
             socket.connect(java.net.InetSocketAddress("10.0.2.2",InstrumentationRegistry.getArguments().getString("controlPort")!!.toInt()),5000)
             socket.soTimeout=10000
             socket.getOutputStream().write((fields.toString()+"\n").toByteArray())
-            JsonParser.parseString(socket.getInputStream().bufferedReader().readLine()).asJsonObject
+            JsonParser.parseString(checkNotNull(socket.getInputStream().bufferedReader().readLine()) {"Desktop interop host closed during $action"}).asJsonObject
         }
     }
     private suspend fun until(check:(JsonObject)->Boolean):JsonObject=withTimeout(15000) {
@@ -74,9 +76,10 @@ class Nov2InteropDeviceTest {
         app.connection.stop();app.connection.awaitStopped()
         withContext(Dispatchers.Main) {app.ringing.stop(RingStopSource.REVOKED)}
         if(!originalAccess)listener(false)
+        c.contentResolver.call(Uri.parse("content://io.github.stantonmatt.pneu.test.folder-grants"),"revoke",null,null)
         DeviceFixture.reset(preserveIdentity=false)
     }
-    @Test(timeout=180000) fun resumeBatteryRingAndNotificationsCrossRealImplementations()=runBlocking<Unit> {
+    @Test(timeout=270000) fun resumeBatteryRingAndNotificationsCrossRealImplementations()=runBlocking<Unit> {
         app.preferences.toggle("queue",true)
         val uri=InstrumentationRegistry.getArguments().getString("pcUri")!!
         stage("pair")
@@ -157,6 +160,53 @@ class Nov2InteropDeviceTest {
         suffixRelease.countDown()
         withTimeout(20000) {while(app.queue.delivery(row.mediaId,pc.deviceId).state!="sent")delay(30)}
         stage("resume complete")
+        stage("folder capability")
+        until {state->state.getAsJsonObject("snapshot").getAsJsonArray("send_targets").any {
+            it.asJsonObject["device"].asString==phone && it.asJsonObject["folder_reason"].asString=="Can't receive folders yet"
+        }}
+        assertTrue(app.connection.supports(pc.deviceId,CAP_FOLDER))
+        val tree=DocumentsContract.buildTreeDocumentUri("io.github.stantonmatt.pneu.test.folders","root")
+        c.contentResolver.call(Uri.parse("content://io.github.stantonmatt.pneu.test.folder-grants"),"grant",null,null)
+        fun fixture(method:String)=c.contentResolver.call(Uri.parse("content://io.github.stantonmatt.pneu.test.folders"),method,"abc",null)
+        fun authority()=CapturedAuthority(requireNotNull(DeliveryBinding.from(app.prefs.value,pc.deviceId)))
+        stage("folder send")
+        fixture("fixture")
+        app.folderSends.send(tree,authority())
+        withTimeout(15000) {while(app.queue.recentDeliveries().first().none {it.isFolder() && it.state=="sent"})delay(30)}
+        rpc("folder_received",json("large" to false))
+
+        stage("folder resume prefix")
+        fixture("large-fixture")
+        val folderEntered=CompletableDeferred<String>();val folderRelease=CountDownLatch(1).also {releases+=it};val folderFrames=AtomicInteger()
+        // Folder streams can flush the manifest separately from file content.
+        // Pause after enough content frames to cross the durable 4 MiB threshold.
+        app.connection.frameFlushedHookForTest {transfer->if(folderFrames.incrementAndGet()==19) {
+            folderEntered.complete(transfer);check(folderRelease.await(20,TimeUnit.SECONDS))
+        }}
+        app.folderSends.send(tree,authority())
+        val folderId=withTimeout(15000) {folderEntered.await()}
+        val folderCheckpoint=withTimeout(10000) {
+            var offset=rpc("checkpoint",json("transfer" to folderId))["offset"].asLong
+            while(offset<4*1024*1024) {delay(30);offset=rpc("checkpoint",json("transfer" to folderId))["offset"].asLong}
+            offset
+        }
+        app.connection.stop();folderRelease.countDown();app.connection.awaitStopped()
+        val folderPending=app.queue.recentDeliveries().first().single {it.transferId==folderId}
+        folderPending.state="failed";folderPending.error="connection_lost";folderPending.nextAttempt=Long.MAX_VALUE;app.queue.update(folderPending)
+        stage("folder resume reconnect")
+        app.connection.start(app.scope)
+        withTimeout(15000) {while(!app.connection.connected(pc.deviceId))delay(20)}
+        val folderSuffix=CompletableDeferred<Unit>();val folderSuffixRelease=CountDownLatch(1).also {releases+=it};val folderResumedFrames=AtomicInteger()
+        app.connection.frameFlushedHookForTest {transfer->if(transfer==folderId && folderResumedFrames.incrementAndGet()==2) {
+            folderSuffix.complete(Unit);check(folderSuffixRelease.await(20,TimeUnit.SECONDS))
+        }}
+        assertTrue(app.retry(folderPending.mediaId,ConfirmedQueue.from(app.preferences.read(),listOf(folderPending))))
+        withTimeout(15000) {folderSuffix.await()}
+        val folderResumedOffset=withTimeout(5000) {app.connection.devices.first {it[pc.deviceId]?.sent?.let {n->n>=folderCheckpoint}==true}[pc.deviceId]!!.sent}
+        folderSuffixRelease.countDown()
+        withTimeout(20000) {while(app.queue.delivery(folderPending.mediaId,pc.deviceId).state!="sent")delay(30)}
+        stage("folder resume complete")
+        rpc("folder_received",json("large" to true,"checkpoint" to folderCheckpoint,"resumedOffset" to folderResumedOffset,"sha256" to hash))
         rpc("done",json("sha256" to hash,"resumedOffset" to resumedOffset))
     }
 }

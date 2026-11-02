@@ -767,11 +767,6 @@ impl Driver {
                         |(_, event)| !matches!(event, Event::Deadline(old) if *old == token),
                     );
                     if let Some(request) = self.requests.remove(&token) {
-                        if let Some(claim) = request.claim {
-                            self.spawn(Vec::new(), async move {
-                                let _ = claim.discard().await;
-                            });
-                        }
                         let result = match failure {
                             None => Ok(Outcome {
                                 deduplicated,
@@ -779,7 +774,16 @@ impl Driver {
                             }),
                             Some(failure) => Err(failure_error(failure)),
                         };
-                        let _ = request.reply.send(result);
+                        if let Some(claim) = request.claim {
+                            // Release the old reservation before waking a caller
+                            // whose replacement connection may replay this ID.
+                            self.spawn(Vec::new(), async move {
+                                let _ = claim.discard().await;
+                                let _ = request.reply.send(result);
+                            });
+                        } else {
+                            let _ = request.reply.send(result);
+                        }
                     }
                 }
                 Effect::Invalidate(peer) => {

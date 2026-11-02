@@ -38,7 +38,7 @@ class FolderSendDeviceTest {
         val f=LocalPeerFixture(app,setOf("files",CAP_FILE_RESUME,CAP_FOLDER),handle=handle);fixture=f
         assertTrue(app.requestPairing(f.invitation(pc,"Folder PC"),ConfirmedBinding.from(app.preferences.read())))
         app.connection.start(app.scope)
-        withTimeout(15000) {while(!app.connection.connected(pc))delay(20)}
+        withTimeout(15000) {while(!app.connection.connected(pc) || !app.connection.devices.value[pc]?.capabilities.orEmpty().containsAll(setOf(CAP_FILE_RESUME,CAP_FOLDER)))delay(20)}
         return f
     }
     private fun authority()=CapturedAuthority(requireNotNull(app.connection.freezeSession(requireNotNull(DeliveryBinding.from(app.prefs.value,pc)))))

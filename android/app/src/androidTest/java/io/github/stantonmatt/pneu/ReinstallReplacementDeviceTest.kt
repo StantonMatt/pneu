@@ -139,6 +139,28 @@ class ReinstallReplacementDeviceTest {
         assertTrue(app.discard(selected))
         assertEquals("discarded",app.queue.delivery(row.mediaId,oldId).state)
     }
+    @Test(timeout=60000) fun folderResendRetainsSafSourceAndFrozenDescriptor()=runBlocking<Unit> {
+        seed(implied=true)
+        val grants=android.net.Uri.parse("content://io.github.stantonmatt.pneu.test.folder-grants")
+        val provider=android.net.Uri.parse("content://io.github.stantonmatt.pneu.test.folders")
+        val uri=android.provider.DocumentsContract.buildTreeDocumentUri(provider.authority,"root")
+        context.contentResolver.call(grants,"grant",null,null)
+        try {
+            context.contentResolver.call(provider,"fixture","abc",null)
+            val tree=io.github.stantonmatt.pneu.features.SafFolderTree(context,uri)
+            val capture=io.github.stantonmatt.pneu.features.FolderBuilder.prepare(tree,tree.rootId) {_,_,_->}
+            val row=app.queue.delivery("replacement-report",oldId)
+            row.origin="folder";row.mime=FOLDER_MIME;row.uri=uri.toString();row.size=capture.size;row.hash=capture.hash
+            row.text=com.google.gson.Gson().toJson(capture.summary)
+            File(row.path).writeText(capture.encode());app.queue.replacePayload(row)
+            assertTrue(app.retry(row.mediaId,ConfirmedQueue.from(app.preferences.read(),listOf(row))))
+            val resend=app.queue.pendingPeer(freshId).single {it.origin=="folder"}
+            assertEquals(uri.toString(),resend.uri)
+            assertNotEquals(row.path,resend.path)
+            app.folderSends.open(resend).use {it.verify()}
+        } finally {context.contentResolver.call(grants,"revoke",null,null)}
+    }
+
     @Test(timeout=30000) fun backMeansKeepBoth()=runBlocking<Unit> {
         seed()
         launch().use {

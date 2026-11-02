@@ -532,6 +532,8 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
                 mediaId="manual:${io.github.stantonmatt.pneu.protocol.randomId()}"
                 transferId=io.github.stantonmatt.pneu.protocol.randomId()
                 kind=row.kind;origin=row.origin;text=row.text;sensitive=row.sensitive
+                // Folder resends reopen their SAF tree through its retained grant.
+                uri=if(row.isFolder())row.uri else ""
                 path=row.path;fileName=row.fileName;mime=row.mime;size=row.size;hash=row.hash
                 sourceHash=row.sourceHash;optimized=row.optimized;automatic=false;createdAt=time
                 recipients=listOf(target)

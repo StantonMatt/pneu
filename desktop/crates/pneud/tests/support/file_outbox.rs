@@ -548,7 +548,7 @@ async fn desktop_send_parser_errors_reach_the_cli_or_window() -> Result<()> {
     let (stop, rx) = tokio::sync::watch::channel(false);
     let ipc = tokio::spawn(pneud::ipc::serve(h.core.clone(), listener, rx));
     for (args, expected) in [
-        (vec!["send"], "send needs 1 to 128 regular files"),
+        (vec!["send"], "send needs 1 to 128 files or folders"),
         (vec!["send", "--to"], "--to needs a device ID"),
         (vec!["send", "--unknown"], "unknown send option"),
     ] {

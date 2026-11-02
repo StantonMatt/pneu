@@ -21,6 +21,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--serial', default='emulator-5554')
     parser.add_argument('--scratch', type=Path, required=True)
+    parser.add_argument('--avd', default='pneu-test', help='Exact disposable AVD name (including isolated copies)')
     args = parser.parse_args()
     if not args.serial.startswith('emulator-'):
         parser.error('A disposable emulator is required')
@@ -55,10 +56,10 @@ def main():
             device.current_case = SimpleNamespace(tests=(selector,), executed=set())
             with device.emulator_commands(args.serial):
                 avd = device.run([*device.adb, 'emu', 'avd', 'name'], capture_output=True, text=True).stdout
-                if avd.splitlines()[0].strip() != 'pneu-test':
-                    raise RuntimeError('Only pneu-test is permitted; never use another task AVD')
+                if avd.splitlines()[0].strip() != args.avd:
+                    raise RuntimeError(f'Expected disposable AVD {args.avd}; never use another task AVD')
                 device.instrument('android', selector, ['-e', 'pcUri', invitation['uri'],
-                                  '-e', 'controlPort', str(invitation['controlPort'])], 210)
+                                  '-e', 'controlPort', str(invitation['controlPort'])], 300)
             code = child.wait(timeout=30)
             if code:
                 raise RuntimeError(f'Desktop interop assertions failed: {code}')

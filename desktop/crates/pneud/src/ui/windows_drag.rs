@@ -25,9 +25,10 @@ use windows::{
 };
 
 type Point = (f64, f64);
+type Begin = Rc<dyn Fn(&[PathBuf]) -> bool>;
 #[derive(Clone)]
 pub(crate) struct Callbacks {
-    pub begin: Rc<dyn Fn(&[PathBuf]) -> bool>,
+    pub begin: Begin,
     pub hover: Rc<dyn Fn(Point) -> bool>,
     pub drop: Rc<dyn Fn(Point, Vec<PathBuf>) -> bool>,
     pub cancel: Rc<dyn Fn()>,

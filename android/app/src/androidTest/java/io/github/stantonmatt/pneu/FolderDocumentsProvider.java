@@ -21,6 +21,14 @@ public class FolderDocumentsProvider extends DocumentsProvider {
     private File file() { return new File(getContext().getFilesDir(),"folder-fixture.txt"); }
     @Override public Bundle call(String method,String arg,Bundle extras) {
         if(method.equals("pipe-backed")) {pipeBacked=true;return new Bundle();}
+        if(method.equals("large-fixture")) {
+            pipeBacked=false;
+            byte[] bytes=new byte[8*1024*1024];
+            for(int index=0;index<bytes.length;index++)bytes[index]=(byte)(index%251);
+            try(FileOutputStream out=new FileOutputStream(file())) {out.write(bytes);}
+            catch(IOException e) {throw new IllegalStateException(e);}
+            return new Bundle();
+        }
         if(method.equals("fixture")) {
             pipeBacked=false;
             try(FileOutputStream out=new FileOutputStream(file())) { out.write((arg==null?"abc":arg).getBytes(StandardCharsets.UTF_8)); }

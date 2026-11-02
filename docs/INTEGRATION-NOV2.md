@@ -2,7 +2,8 @@
 
 Desktop storage uses `PRAGMA user_version=5`. The startup transaction adds history
 pin order, the retained-file catalogue and pending cancels, and local replacement
-intents together. It publishes v5 only after every migration succeeds. Membership
+intents, folder source/details catalogue and folder capability cache together.
+It publishes v5 only after every migration succeeds. Membership
 and outbox migrations never lower an existing version.
 
 The v4 desktop code at `e5a79cc` checks `version <= 4` before its schema/cleanup
@@ -16,24 +17,31 @@ backup and do not use an unsupported downgrade. No migration lowers v5 for them.
 Android's queue stays on its independent 12 → 13 migration for resume checkpoints,
 progress and pending cancels. Battery/ring preferences, notification consent and
 replacement intents use DataStore and add no Room version. Saved clipboard history
-has its separate 1 → 2 migration. Both Room migrations retain their data/reopen tests.
+has its separate 1 → 2 migration. Both Room migrations retain their data/reopen
+tests. Folder sends reuse existing artifact origin/text/source fields and add no
+Room columns or tables.
 
-Desktop HELLO advertises `files`, `file_resume_v1`, `battery_v1`, `ring_v1` and
-`notifications_v1` alongside the existing clipboard, mesh and setup capabilities.
+Desktop HELLO advertises `files`, `file_resume_v1`, `folder_v1`, `battery_v1`,
+`ring_v1` and `notifications_v1` alongside the existing clipboard, mesh and setup
+capabilities.
 Android advertises `files` and `file_resume_v1`, with `ring_v1` only while ringing
 is allowed; it does not advertise battery or notification receiver support.
-Folder work is outside this integration.
+Android sends folders but does not advertise `folder_v1`: it cannot receive them yet.
 
 Both codec suites consume `docs/protocol-vectors/v1.json`. The existing Android
 real-daemon revocation case remains in `tools/run_device_tests.py`. The new focused
 live extension case uses `heavy python3 android/tools/run_nov2_interop.py --serial
-emulator-5554 --scratch <private-scratch>` with the disposable `pneu-test` AVD.
+emulator-5554 --scratch <private-scratch>` with the disposable `pneu-test` AVD
+(or an isolated copy selected with `--avd`).
 It pairs the real Android client with the production desktop Core/TLS/IPC handlers.
 The desktop integration harness records OS notification effects in memory so
 upserts, replacements and withdrawals can be asserted without a system desktop.
 Android uses its real listener, test-app notification posts and ringing service.
 The case interrupts an 8 MiB upload after a durable 4 MiB checkpoint, reconnects,
 asserts a nonzero READY-based suffix offset and checks the complete received hash.
+It also sends a SAF folder containing a file and an empty directory, interrupts
+and resumes a second 8 MiB folder send, checks exact content and nonzero resume
+offsets, and asserts the desktop phone target says "Can't receive folders yet".
 It also covers battery sharing/clearing, ring start/stop and notification
 update/remove/clear. The desktop host test is ignored in normal suites because it
 requires that external Android fixture. The driver removes private identities and

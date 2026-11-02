@@ -81,18 +81,22 @@ impl Outbox {
                     let previous = begin.transfer_id.clone();
                     let id = Id::new(crate::random_hex(16))?;
                     begin.transfer_id = id.clone();
-                    let stamp = stamps.get(&source_path);
+                    // A folder named *.png is still a folder, never clipboard media.
+                    let stamp = stamps.get(&source_path).filter(|_| begin.folder.is_none());
                     begin.created_at = stamp.map_or_else(crate::now_ms, |s| s.created_at);
                     begin.hlc = stamp.map(|s| s.hlc);
                     begin.source_device = stamp.map(|s| s.source_device.clone());
                     let mut source = platform_fs::open_read_at(&this.folder.file, previous.as_str())?;
                     crate::platform::private::check(&source)?;
-                    this.store.locked(|c| Self::capacity(c, begin.size, &[]))?;
-                    ensure!(this.folder.space()?.saturating_sub(begin.size) >= this.reserve, "outbox disk reserve");
+                    // Folder spools contain only the frozen manifest; their
+                    // content stays in place under the captured source catalogue.
+                    let staged_size = begin.folder.as_ref().map_or(begin.size, |folder| folder.manifest_len);
+                    this.store.locked(|c| Self::capacity(c, staged_size, &[]))?;
+                    ensure!(this.folder.space()?.saturating_sub(staged_size) >= this.reserve, "outbox disk reserve");
                     let mut file = platform_fs::create_private_at(&this.folder.file, id.as_str(), platform_fs::Access::ReadWrite)?;
                     crate::platform::private::created(&file)?;
                     let result = (|| {
-                        ensure!(std::io::copy(&mut source, &mut file)? == begin.size, "retained file changed");
+                        ensure!(std::io::copy(&mut source, &mut file)? == staged_size, "retained file changed");
                         platform_fs::set_read_only(&file)?;
                         file.sync_all()?;
                         this.folder.file.sync_all()?;
@@ -100,10 +104,13 @@ impl Outbox {
                             let tx = c.transaction()?;
                             ensure!(this.authorized(&tx, &new)?, "replacement pairing changed");
                             ensure!(this.operation_allows(&tx, &retry_operation, &new)?, "operation cancelled");
-                            ensure!(Self::peer_has_capacity(&tx, begin.size, &new)?, "device outbox is full");
+                            ensure!(Self::peer_has_capacity(&tx, staged_size, &new)?, "device outbox is full");
                             ensure!(tx.execute("UPDATE outbox_deliveries SET error=NULL WHERE artifact=? AND device=? AND state='cancelled' AND error=?", params![previous.as_str(),old.as_str(),replacement::REPLACED])? == 1, "replacement retry already handled");
-                            Self::capacity(&tx, begin.size, std::slice::from_ref(&new))?;
+                            Self::capacity(&tx, staged_size, std::slice::from_ref(&new))?;
                             tx.execute("INSERT INTO outbox_artifacts(id,operation,meta,path) VALUES(?,?,?,?)", params![id.as_str(),retry_operation.as_str(),serde_json::to_string(&begin)?,path])?;
+                            if begin.folder.is_some() {
+                                ensure!(tx.execute("INSERT INTO outbox_folders(id,details,sources) SELECT ?,details,sources FROM outbox_folders WHERE id=?", params![id.as_str(),previous.as_str()])? == 1, "retained folder catalogue missing");
+                            }
                             tx.execute("INSERT INTO outbox_deliveries(artifact,device,generation,fingerprint) VALUES(?,?,?,?)", params![id.as_str(),new.device.as_str(),new.generation as i64,new.fingerprint.as_str()])?;
                             tx.execute("UPDATE outbox_operations SET accepted=json_insert(accepted,'$[#]',json_object('path',?,'transfer_id',?)) WHERE id=?", params![source_path.to_str(),id.as_str(),retry_operation.as_str()])?;
                             tx.commit()?;

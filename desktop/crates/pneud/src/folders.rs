@@ -1485,18 +1485,30 @@ mod tests {
         std::fs::write(root.join("ok"), b"ok")?;
         std::fs::write(root.join("bad\\name"), b"x")?;
         std::fs::write(root.join("X:"), b"x")?;
-        std::fs::write(root.join(std::ffi::OsString::from_vec(vec![255])), b"x")?;
+        // APFS refuses non-Unicode names before enumeration; Linux filesystems
+        // allow them, so exercise the capture rejection wherever creation works.
+        let non_unicode =
+            match std::fs::write(root.join(std::ffi::OsString::from_vec(vec![255])), b"x") {
+                Ok(()) => true,
+                Err(error)
+                    if cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EILSEQ) =>
+                {
+                    false
+                }
+                Err(error) => return Err(error.into()),
+            };
         std::fs::create_dir(root.join("bad\\subtree"))?;
         std::fs::write(root.join("bad\\subtree/child"), b"x")?;
         let captured = capture(&root, 1000, &|| Ok(()), &|_, _, _| {})?;
         assert_eq!(captured.details.items, 1);
-        assert_eq!(captured.details.failed, 4);
-        assert!(
+        assert_eq!(captured.details.failed, 3 + u64::from(non_unicode));
+        assert_eq!(
             captured
                 .details
                 .diagnostics
                 .iter()
-                .any(|n| n.starts_with("Non-Unicode name:"))
+                .any(|n| n.starts_with("Non-Unicode name:")),
+            non_unicode
         );
         let parsed: FolderManifest = serde_json::from_slice(&captured.manifest)?;
         assert_eq!(parsed.entries.len(), 1);

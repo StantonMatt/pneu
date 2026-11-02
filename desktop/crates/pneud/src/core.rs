@@ -279,7 +279,7 @@ struct ReceiptJob {
 enum NotificationJob {
     File(Box<ActionJob>, DesktopAction),
     Receipt(ReceiptJob),
-    Delivery(crate::outbox::Transfer, String),
+    Delivery(Box<crate::outbox::Transfer>, String),
 }
 impl NotificationJob {
     fn allows(&self) -> bool {
@@ -368,7 +368,10 @@ impl ActionQueue {
     }
     fn delivery(&self, transfer: crate::outbox::Transfer, name: String) {
         let mut pending = self.pending.lock().expect("pending actions");
-        Self::push_notice(&mut pending, NotificationJob::Delivery(transfer, name));
+        Self::push_notice(
+            &mut pending,
+            NotificationJob::Delivery(Box::new(transfer), name),
+        );
         drop(pending);
         self.changed.notify_one();
     }

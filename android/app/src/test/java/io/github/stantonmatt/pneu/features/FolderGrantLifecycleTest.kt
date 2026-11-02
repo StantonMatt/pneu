@@ -34,13 +34,17 @@ class FolderGrantLifecycleTest {
         assertEquals("Restart reconciliation",uris,queue.activeFolderUris())
         assertEquals("Live reconciliation",uris,withTimeout(5000) {queue.folderGrantChanges().first()})
     }
-    @Test fun offlineQueueDisabledConnectionLossKeepsGrantAcrossRestartAndManualRetryResumes()=runBlocking<Unit>(Dispatchers.IO) {
+    @Test(timeout=30000) fun offlineQueueDisabledConnectionLossKeepsGrantAcrossRestartAndManualRetryResumes()=runBlocking<Unit>(Dispatchers.IO) {
         val context=RuntimeEnvironment.getApplication()
         val file=File(context.cacheDir,"folder-grant-${randomId()}.preferences_pb")
         val owner=SupervisorJob()
         val preferences=Preferences(context,PreferenceDataStoreFactory.create(scope=CoroutineScope(owner+Dispatchers.IO)) {file})
         // Keep background services stopped while exercising real recovery/Retry.
-        fun open()=AppGraph(context,preferences,CoroutineScope(SupervisorJob()+StandardTestDispatcher()))
+        fun open()=AppGraph(context,preferences,CoroutineScope(SupervisorJob()+StandardTestDispatcher())).also {
+            // Recovery is invoked explicitly; the frozen background scope never
+            // runs AppGraph startup, while Retry now correctly awaits that fence.
+            it.initialized.complete(Unit)
+        }
         var app=open()
         try {
             preferences.toggle("queue",false)

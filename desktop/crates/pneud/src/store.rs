@@ -731,7 +731,7 @@ impl Store {
         let clipboard_fingerprint_key =
             crate::clipboard_fingerprint::FingerprintKey::load_in(&folder)?;
         clipboard::migrate_fingerprints(&tx, &clipboard_fingerprint_key)?;
-        // One atomic v5 migration covers history pin order, resume and replacement.
+        // One atomic v5 migration covers history pin order, resume, replacement and folders.
         tx.pragma_update(None, "user_version", 5)?;
         tx.commit()?;
         // Remove obsolete raw hashes from the migration WAL as well.
@@ -2275,6 +2275,7 @@ mod tests {
             c.execute("INSERT INTO receipts VALUES(?,?,?,?)", params![id.as_str(), "receipt", "{}", "kept-file"])?;
             c.execute_batch("INSERT INTO clipboard_items(id,digest,text,origin,at) VALUES('clip','digest','saved text','Phone',123);
                 DROP TABLE file_partials; DROP TABLE file_stage_protected; DROP TABLE resume_clock;
+                DROP TABLE outbox_folders; DROP TABLE folder_capabilities;
                 DROP TABLE file_pending_cancels; DROP TRIGGER local_pairing_intent_end; DROP TABLE local_pairing_intents;
                 ALTER TABLE clipboard_items DROP COLUMN pinned;
                 ALTER TABLE outbox_deliveries DROP COLUMN resume;
@@ -2313,6 +2314,8 @@ mod tests {
                         .get::<_, bool>(0))?
                 );
                 for table in [
+                    "outbox_folders",
+                    "folder_capabilities",
                     "file_partials",
                     "file_stage_protected",
                     "resume_clock",
@@ -2346,6 +2349,38 @@ mod tests {
                         .get::<_, i64>(0))?,
                     7
                 );
+                Ok(())
+            })
+            .await?;
+        close_for_restart(store).await
+    }
+
+    #[tokio::test]
+    async fn unreleased_v5_without_folders_gains_catalogue_on_reopen() -> Result<()> {
+        let (dir, store, _) = fixture().await?;
+        let peers = store.peers().await?;
+        store
+            .call(|c| {
+                c.execute_batch("DROP TABLE outbox_folders; DROP TABLE folder_capabilities;
+                    DROP TRIGGER outbox_revoke;
+                    CREATE TRIGGER outbox_revoke BEFORE DELETE ON peers BEGIN UPDATE outbox_deliveries SET state='cancelled',error='Pairing changed' WHERE device=OLD.id AND state NOT IN ('sent','cancelled'); END;
+                    INSERT INTO outbox_artifacts(id,operation,meta) VALUES('folder','operation','{}');
+                    INSERT INTO outbox_deliveries(artifact,device,generation,fingerprint,state) SELECT 'folder',id,generation,fp,'skipped' FROM peers;")?;
+                Ok(())
+            })
+            .await?;
+        close_for_restart(store).await?;
+        let store = Store::open(&dir.path().join("state.sqlite3"))?;
+        assert_eq!(store.peers().await?, peers);
+        store
+            .call(|c| {
+                assert_eq!(
+                    c.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))?,
+                    5
+                );
+                c.prepare("SELECT id,details,sources FROM outbox_folders")?;
+                c.prepare("SELECT device,generation,supported FROM folder_capabilities")?;
+                c.prepare("SELECT resume,sent FROM outbox_deliveries")?;
                 Ok(())
             })
             .await?;

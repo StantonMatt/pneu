@@ -201,7 +201,8 @@ pub(super) fn migrate(tx: &Transaction<'_>) -> Result<()> {
     tx.execute_batch("CREATE TABLE IF NOT EXISTS outbox_artifacts(id TEXT PRIMARY KEY,operation TEXT NOT NULL,meta TEXT NOT NULL,staged INTEGER NOT NULL DEFAULT 1);
         CREATE TABLE IF NOT EXISTS outbox_deliveries(artifact TEXT NOT NULL REFERENCES outbox_artifacts(id) ON DELETE CASCADE,device TEXT NOT NULL,generation INTEGER NOT NULL,fingerprint TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'queued',error TEXT,retries INTEGER NOT NULL DEFAULT 0,mismatches INTEGER NOT NULL DEFAULT 0,retry_at INTEGER NOT NULL DEFAULT 0,session INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(artifact,device));
         CREATE INDEX IF NOT EXISTS outbox_peer ON outbox_deliveries(device,state,retry_at);
-        CREATE TRIGGER IF NOT EXISTS outbox_revoke BEFORE DELETE ON peers BEGIN UPDATE outbox_deliveries SET state='cancelled',error='Pairing changed' WHERE device=OLD.id AND state NOT IN ('sent','cancelled','skipped'); END;
+        DROP TRIGGER IF EXISTS outbox_revoke;
+        CREATE TRIGGER outbox_revoke BEFORE DELETE ON peers BEGIN UPDATE outbox_deliveries SET state='cancelled',error='Pairing changed' WHERE device=OLD.id AND state NOT IN ('sent','cancelled','skipped'); END;
         UPDATE outbox_deliveries SET state='queued',error='Connection lost' WHERE state='sending';
         CREATE TABLE IF NOT EXISTS outbox_capabilities(device TEXT PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,generation INTEGER NOT NULL,files INTEGER NOT NULL);")?;
     let version: u32 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;

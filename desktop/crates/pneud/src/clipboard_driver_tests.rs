@@ -665,6 +665,97 @@ fn receive_operation(token: Token, text: &pneu_proto::Clipboard) -> Operation {
 }
 
 #[tokio::test]
+async fn cancelled_receive_releases_text_claim_before_reply_without_blocking_actor() -> Result<()> {
+    let (_dir, core) = recovery_fixture().await?;
+    let peer = Id::from_bytes([2; 16]);
+    core.store
+        .pair(peer.clone(), pneu_proto::Hash::new(format!("{:064x}", 2))?)
+        .await?;
+    let text = pneu_proto::Clipboard {
+        sensitive: false,
+        transfer_id: Id::from_bytes([22; 16]),
+        text: "retry after failed receive".into(),
+        created_at: 100,
+        origin: pneu_proto::ClipboardOrigin::Clipboard,
+        hlc: Some(100),
+        source_device: Some(peer.clone()),
+    };
+    let claim = core
+        .store
+        .claim_text(peer.clone(), text.clone())
+        .await?
+        .unwrap();
+    let (entered, wait) = oneshot::channel();
+    let (release, blocked) = std::sync::mpsc::channel();
+    let store = core.store.clone();
+    let holder = tokio::spawn(async move {
+        store
+            .call(move |_| {
+                let _ = entered.send(());
+                blocked.recv()?;
+                Ok(())
+            })
+            .await
+    });
+    wait.await?;
+    let handle = &core.clipboard;
+    let token = handle.token();
+    let operation = receive_operation(token, &text);
+    let (reply, mut response) = oneshot::channel();
+    let request = Request {
+        input: ClipboardInput::Text(text.text.clone()),
+        claim: Some(claim),
+        store: core.store.clone(),
+        authority: None,
+        kind: None,
+        policy: vec![],
+        reply,
+    };
+    let permit = handle.admission.clone().acquire_owned().await?;
+    handle
+        .tx
+        .send(Message::Submit(operation, Box::new(request), permit))
+        .unwrap();
+    handle.event(Event::Cancel(token));
+    // Cancellation precedes authorization; the actor reaches idle while cleanup
+    // is held behind storage. The control lane must remain responsive, but the caller
+    // must not be told it can retry until its old reservation is gone.
+    let responsive = tokio::time::timeout(Duration::from_secs(2), handle.barrier()).await;
+    let premature = response.try_recv();
+    let replied_early = premature.is_ok();
+    release.send(())?;
+    holder.await??;
+    let result = match premature {
+        Ok(result) => result,
+        Err(_) => tokio::time::timeout(Duration::from_secs(2), response).await??,
+    };
+    let receipt = core
+        .store
+        .receipt(peer.clone(), text.transfer_id.clone())
+        .await?;
+    let retry = match core.store.claim_text(peer, text).await {
+        Ok(Some(claim)) => {
+            claim.discard().await?;
+            true
+        }
+        _ => false,
+    };
+    core.shutdown_actions().await?;
+    assert!(responsive.is_ok(), "cleanup blocked the actor control lane");
+    assert!(result.is_err(), "cancelled receive was acknowledged");
+    assert!(
+        !replied_early,
+        "receive replied before releasing its text claim"
+    );
+    assert!(
+        receipt.is_none(),
+        "cancelled receive left a pending receipt"
+    );
+    assert!(retry, "cancelled receive prevented an immediate retry");
+    Ok(())
+}
+
+#[tokio::test]
 async fn watcher_clock_and_all_sixteen_real_claims_complete_before_request_deadlines() -> Result<()>
 {
     for debounce in [false, true] {

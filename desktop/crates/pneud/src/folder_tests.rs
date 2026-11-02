@@ -77,7 +77,7 @@ async fn folder_sender_refuses_legacy_before_any_frame()->Result<()> {
         let mut delivery=core.outbox.claim(device,authority.generation,1).await?.unwrap();let reader=core.outbox.reader(delivery.clone()).await?;begin.transfer_id=delivery.begin.transfer_id.clone();delivery.begin=begin;
         let (send,ready)=tokio::sync::oneshot::channel();send.send(Some(0)).unwrap();
         let work=FileWrite{delivery,connection:1,mesh:false,file:Some(reader.into()),ready:Some(ready),receipt_ready:Arc::new(AtomicBool::new(false))};
-        let (_p,mut priority)=mpsc::channel(8);let (_n,mut normal)=mpsc::channel(8);let (_t,mut text)=mpsc::channel(8);let (reports,_)=mpsc::channel(8);let mut wire=Vec::new();
+        let (_p,mut priority)=mpsc::channel(8);let (_n,normal)=mpsc::channel(8);let mut normal=phone_controls::FrameQueue::from(normal);let (_t,mut text)=mpsc::channel(8);let (reports,_)=mpsc::channel(8);let mut wire=Vec::new();
         assert!(transmit_file(&core,&mut wire,work,&mut priority,&mut normal,&mut text,&reports).await.is_err());assert!(wire.is_empty(),"no disguised file BEGIN or child bytes to a legacy receiver");core.shutdown_actions().await?;
     }Ok(())
 }
@@ -253,7 +253,8 @@ async fn folder_sender_file_changed_after_preparing_fails_cleanly() -> Result<()
                 receipt_ready: Arc::new(AtomicBool::new(false)),
             };
             let (_p, mut priority) = mpsc::channel(8);
-            let (_n, mut normal) = mpsc::channel(8);
+            let (_n, normal) = mpsc::channel(8);
+            let mut normal = phone_controls::FrameQueue::from(normal);
             let (_t, mut text) = mpsc::channel(8);
             let (reports, _) = mpsc::channel(8);
             let mut bytes = Vec::new();

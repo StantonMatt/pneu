@@ -1075,7 +1075,9 @@ fn recent(peers: &[Peer], transfers: &[Transfer]) -> Vec<RecentItem> {
             .into();
             if let Some(folder) = &first.folder {
                 let prefix = match sent.as_slice() {
-                    [one, ..] if distinct_recipients(&sent) == 1 => format!("To {} · ", name(&one.device)),
+                    [one, ..] if distinct_recipients(&sent) == 1 => {
+                        format!("To {} · ", name(&one.device))
+                    }
                     many => format!("To {} devices · ", distinct_recipients(many)),
                 };
                 let content = if folder.failed + folder.links + folder.special > 0 {
@@ -5664,7 +5666,7 @@ mod tests {
             let ts = [failed];
             assert_eq!(recent(&ps, &ts)[0].detail, expected);
             let details = recipient_details(&ps, &ts, &artifact_key(&ts[0]));
-            assert_eq!(details[0].detail, expected);
+            assert_eq!(details[0].detail, format!("Failed · {expected}"));
         }
     }
 
@@ -10435,7 +10437,7 @@ mod tests {
                             name: "MacBook Air".into(),
                             connected: true,
                             eligible: true,
-                            status: "Connected over Wi-Fi".into(),
+                            status: "Local network".into(),
                             checked: true,
                             ..Default::default()
                         },

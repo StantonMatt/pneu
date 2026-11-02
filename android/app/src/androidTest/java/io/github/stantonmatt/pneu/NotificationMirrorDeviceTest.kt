@@ -36,12 +36,22 @@ class NotificationMirrorDeviceTest {
     private val i=InstrumentationRegistry.getInstrumentation()
     private val context=i.targetContext
     private val app=context.graph
-    @Before fun reset()=runBlocking<Unit> {DeviceFixture.reset()}
-    @After fun cleanup()=runBlocking<Unit> {DeviceFixture.reset()}
+    private var originalAccess=false
+    private val component get()=ComponentName(context,PhoneNotificationListener::class.java).flattenToString()
+    private fun listener(allow:Boolean) {
+        android.os.ParcelFileDescriptor.AutoCloseInputStream(i.uiAutomation.executeShellCommand("cmd notification ${if(allow)"allow_listener" else "disallow_listener"} $component")).use {it.readBytes()}
+    }
+    @Before fun reset()=runBlocking<Unit> {
+        DeviceFixture.reset();originalAccess=context.notificationAccess()
+        if(!originalAccess)listener(true)
+        withTimeout(10000) {while(!context.notificationAccess())delay(20)}
+    }
+    @After fun cleanup()=runBlocking<Unit> {
+        DeviceFixture.reset()
+        if(!originalAccess)listener(false)
+    }
     @Test fun listenerPostIsEmittedThroughAuthenticatedMeshPeerAndOptOutClears()=runBlocking<Unit> {
-        val component=ComponentName(context,PhoneNotificationListener::class.java).flattenToString()
-        // The host grants access with cmd notification allow_listener before this focused run.
-        assertTrue("Host must grant notification listener access",context.notificationAccess())
+        assertTrue(context.notificationAccess())
         val frames=Channel<NotificationEvent>(128)
         val peer=Peer("Notification test PC","a".repeat(64),"d".repeat(32),emptyList())
         app.preferences.store.edit {PeerRegistry.write(it,listOf(peer))}
