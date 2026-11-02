@@ -418,7 +418,8 @@ fn configured_win32_alias_names_stay_strict_while_receive_names_are_mapped() -> 
     assert!(validate_name(&OsString::from_wide(&[0xd800])).is_err());
     assert!(Folder::open_private(&temp.path().join("new/bad./child")).is_err());
     assert!(!temp.path().join("new").exists());
-    assert_eq!(entries(&folder.file)?.count(), 2);
+    // Only "source" remains: the empty staging root was retired after each stage.
+    assert_eq!(entries(&folder.file)?.count(), 1);
     for path in [
         r"\\?\C:\pneu",
         r"\\.\C:\pneu",
