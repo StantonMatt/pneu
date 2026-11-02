@@ -78,6 +78,22 @@ class NotificationSearchTest {
         compose.onNodeWithText(calendar.label).assertIsOn()
         compose.onNodeWithText(whatsapp.label).assertIsOff()
     }
+    @Test fun largeAppListOnlyComposesVisibleRows() {
+        val manyApps=(0 until 300).map {NotificationPickerApp("0/org.example.app$it","Fixture app %03d".format(it))}
+        compose.setContent {
+            PneuTheme {Surface(Modifier.fillMaxSize(),color=LocalPneuColors.current.bg) {
+                NotificationsContent(Prefs(notificationConsent=NotificationConsent(enabled=true)),true,false,manyApps,{},{},{},{_,_,_->},{})
+            }}
+        }
+        val appRows=hasText("Fixture app",substring=true)
+        val initiallyComposed=compose.onAllNodes(appRows).fetchSemanticsNodes().size
+        assertTrue("Expected only viewport rows, composed $initiallyComposed of 300",initiallyComposed in 1..25)
+        compose.onNodeWithText(manyApps.last().label).assertDoesNotExist()
+        compose.onNode(hasScrollToIndexAction()).performScrollToIndex(155)
+        compose.onNodeWithText(manyApps.first().label).assertDoesNotExist()
+        val afterScroll=compose.onAllNodes(appRows).fetchSemanticsNodes().size
+        assertTrue("Expected a bounded viewport after scrolling, composed $afterScroll",afterScroll in 1..25)
+    }
     @Test fun accessOffCardUsesConditionalRestrictedSettingsAdvice() {
         screen(blocked=true)
         compose.onNodeWithText("Notification access is off").assertIsDisplayed()

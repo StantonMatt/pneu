@@ -9,22 +9,31 @@ import android.graphics.drawable.Drawable
 import android.net.Uri
 import android.os.Process
 import android.provider.Settings
+import android.util.LruCache
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.*
-import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import io.github.stantonmatt.pneu.data.historySearchKey
@@ -50,7 +59,8 @@ import kotlinx.coroutines.*
 internal fun restrictedNotificationSource(source:Int)=source==android.content.pm.PackageInstaller.PACKAGE_SOURCE_LOCAL_FILE ||
     source==android.content.pm.PackageInstaller.PACKAGE_SOURCE_DOWNLOADED_FILE
 
-internal data class NotificationPickerApp(val key:String,val label:String,val icon:Drawable?=null)
+// version: the install path, which changes on every app update, so cached icons refresh after updates.
+internal data class NotificationPickerApp(val key:String,val label:String,val icon:Drawable?=null,val version:String="")
 internal fun notificationAppMatches(app:NotificationPickerApp,query:String):Boolean {
     val key=historySearchKey(query)
     return key.isEmpty() || historySearchKey(app.label).contains(key) || historySearchKey(app.key.substringAfter('/')).contains(key)
@@ -58,7 +68,7 @@ internal fun notificationAppMatches(app:NotificationPickerApp,query:String):Bool
 private fun android.content.Context.notificationPickerApps():List<NotificationPickerApp> =packageManager.queryIntentActivities(
     Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER),PackageManager.ResolveInfoFlags.of(0))
     .filter {it.activityInfo.packageName!=packageName}.distinctBy {it.activityInfo.packageName}
-    .map {NotificationPickerApp(NotificationConsent.app(Process.myUserHandle().hashCode(),it.activityInfo.packageName),it.loadLabel(packageManager).toString(),it.loadIcon(packageManager))}
+    .map {NotificationPickerApp(NotificationConsent.app(Process.myUserHandle().hashCode(),it.activityInfo.packageName),it.loadLabel(packageManager).toString(),version=it.activityInfo.applicationInfo.sourceDir.orEmpty())}
     .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) {it.label})
 
 @Composable internal fun NotificationsScreen(p:Prefs,back:()->Unit) {
@@ -125,8 +135,10 @@ private fun android.content.Context.notificationPickerApps():List<NotificationPi
                 }}}
                 item {Header(stringResource(R.string.notification_apps))}
                 item {PneuSearch(query) {query=it};Spacer(Modifier.height(12.dp))}
-                item {if(visibleApps.isEmpty() && historySearchKey(query).isNotEmpty())PneuSearchNoMatches()
-                    else PneuCard {visibleApps.forEachIndexed {i,app->NotificationChoiceRow(app.label,app.key in consent.apps,app.icon,null,null,i>0) {select(false,app.key,it)}}}}
+                if(visibleApps.isEmpty() && historySearchKey(query).isNotEmpty())item {PneuSearchNoMatches()}
+                itemsIndexed(visibleApps,key={_,app->app.key}) {i,app->
+                    NotificationAppRow(app,app.key in consent.apps,i==0,i==visibleApps.lastIndex) {select(false,app.key,it)}
+                }
             }
         }
     }
@@ -155,14 +167,55 @@ internal fun notificationIconBitmap(icon:Drawable,pixels:Int,fill:Int):Bitmap {
     return bitmap
 }
 
-@Composable private fun NotificationChoiceRow(label:String,checked:Boolean,icon:Drawable?,symbol:Int?,detail:String?,divider:Boolean,change:(Boolean)->Unit) {
+/** A process-local, byte-bounded cache also avoids decoding again after screen re-entry. */
+internal class NotificationIconCache(maxBytes:Int=2*1024*1024) {
+    private data class Key(val app:String,val version:String,val pixels:Int,val fill:Int)
+    private val bitmaps=object:LruCache<Key,Bitmap>(maxBytes) {
+        override fun sizeOf(key:Key,value:Bitmap)=value.allocationByteCount
+    }
+    suspend fun load(app:NotificationPickerApp,pixels:Int,fill:Int,pm:PackageManager):Bitmap?=withContext(Dispatchers.IO) {
+        val key=Key(app.key,app.version,pixels,fill)
+        bitmaps.get(key) ?: try {
+            // Use the launcher activity's icon, as the catalog did before icons became lazy.
+            val pkg=app.key.substringAfter('/')
+            val icon=app.icon ?: pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).setPackage(pkg),PackageManager.ResolveInfoFlags.of(0))
+                .firstOrNull()?.loadIcon(pm) ?: pm.getApplicationIcon(pkg)
+            notificationIconBitmap(icon,pixels,fill).also {bitmaps.put(key,it)}
+        } catch(_:PackageManager.NameNotFoundException) {null}
+          catch(_:android.content.res.Resources.NotFoundException) {null}
+    }
+}
+private val notificationIcons=NotificationIconCache()
+
+@Composable private fun NotificationAppRow(app:NotificationPickerApp,checked:Boolean,first:Boolean,last:Boolean,change:(Boolean)->Unit) {
+    val pm=LocalContext.current.packageManager;val c=LocalPneuColors.current
+    val pixels=with(LocalDensity.current) {36.dp.roundToPx()};val fill=c.fill.toArgb()
+    val bitmap by produceState<Bitmap?>(null,app.key,pixels,fill) {
+        value=notificationIcons.load(app,pixels,fill,pm)
+    }
+    Surface(Modifier.fillMaxWidth().drawWithContent {
+        drawContent()
+        if(c.dark) {
+            // Match PneuCard's 1 dp border without drawing seams between lazy rows.
+            val stroke=1.dp.toPx();val radius=24.dp.toPx()
+            val top=if(first)stroke/2 else -radius
+            val bottom=if(last)size.height-stroke/2 else size.height+radius
+            clipRect {drawRoundRect(c.hairline,Offset(stroke/2,top),Size(size.width-stroke,bottom-top),
+                CornerRadius(radius-stroke/2),style=Stroke(stroke))}
+        }
+    },color=c.surface,
+        shape=RoundedCornerShape(topStart=if(first)24.dp else 0.dp,topEnd=if(first)24.dp else 0.dp,bottomStart=if(last)24.dp else 0.dp,bottomEnd=if(last)24.dp else 0.dp)) {
+        NotificationChoiceRow(app.label,checked,bitmap?.asImageBitmap(),null,null,!first,change)
+    }
+}
+
+@Composable private fun NotificationChoiceRow(label:String,checked:Boolean,icon:ImageBitmap?,symbol:Int?,detail:String?,divider:Boolean,change:(Boolean)->Unit) {
     Row(Modifier.fillMaxWidth().pneuRow(divider,64.dp).pneuToggle(checked,true,onChange=change).heightIn(min=64.dp).padding(horizontal=16.dp,vertical=8.dp),
         verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(12.dp)) {
-        if(icon!=null) {
-            val fill=LocalPneuColors.current.fill.toArgb()
-            val bitmap=remember(icon,fill) {notificationIconBitmap(icon,128,fill).asImageBitmap()}
-            Image(bitmap,null,Modifier.size(36.dp))
-        } else Box(Modifier.size(36.dp).background(if(checked)LocalPneuColors.current.accentSoft else LocalPneuColors.current.fill,RoundedCornerShape(10.dp)),contentAlignment=Alignment.Center) {Symbol(symbol ?: R.drawable.ic_notifications,modifier=Modifier.size(20.dp),tint=if(checked)LocalPneuColors.current.accentText else LocalPneuColors.current.text2)}
+        if(icon!=null)Image(icon,null,Modifier.size(36.dp))
+        else Box(Modifier.size(36.dp).background(if(symbol!=null && checked)LocalPneuColors.current.accentSoft else LocalPneuColors.current.fill,RoundedCornerShape(10.dp)),contentAlignment=Alignment.Center) {
+            if(symbol!=null)Symbol(symbol,modifier=Modifier.size(20.dp),tint=if(checked)LocalPneuColors.current.accentText else LocalPneuColors.current.text2)
+        }
         Column(Modifier.weight(1f)) {Text(label,style=PneuType.body);if(detail!=null)Text(detail,style=PneuType.subhead,color=LocalPneuColors.current.text2)}
         PneuSwitch(checked,onCheckedChange=null)
     }
