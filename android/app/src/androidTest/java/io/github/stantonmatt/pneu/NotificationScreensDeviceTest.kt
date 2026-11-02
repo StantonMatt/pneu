@@ -49,9 +49,18 @@ class NotificationScreensDeviceTest {
             }
             compose.waitForIdle()
             compose.onNodeWithText("Show on computers").assertExists()
-            if(screen=="apps")compose.onNodeWithText("Apps").assertExists()
+            if(screen=="apps") {
+                compose.onNodeWithText("Apps").assertExists()
+                val query=InstrumentationRegistry.getArguments().getString("notificationSearchQuery")
+                if(query!=null) {
+                    compose.onNodeWithContentDescription("Search").performScrollTo().performTextReplacement(query)
+                    compose.onNodeWithContentDescription("Search").performImeAction()
+                    compose.onNodeWithText("WhatsApp").performScrollTo().assertIsDisplayed()
+                    compose.onNodeWithText("Amazon Shopping").assertDoesNotExist()
+                }
+            }
             if(screen=="onboarding")compose.onNodeWithText("Allow notification access").assertExists()
-            if(screen=="blocked")compose.onNodeWithText("Android blocked notification access").assertExists()
+            if(screen=="blocked")compose.onNodeWithText("Notification access is off").assertExists()
             if(gated) {
                 val gate=File(directory,"continue-$name");gate.delete()
                 File(directory,"ready").writeText(name)

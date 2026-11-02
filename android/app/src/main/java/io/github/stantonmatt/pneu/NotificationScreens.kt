@@ -27,6 +27,7 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import io.github.stantonmatt.pneu.data.historySearchKey
 import io.github.stantonmatt.pneu.data.Prefs
 import io.github.stantonmatt.pneu.features.*
 import io.github.stantonmatt.pneu.protocol.CAP_NOTIFICATIONS
@@ -50,6 +51,10 @@ internal fun restrictedNotificationSource(source:Int)=source==android.content.pm
     source==android.content.pm.PackageInstaller.PACKAGE_SOURCE_DOWNLOADED_FILE
 
 internal data class NotificationPickerApp(val key:String,val label:String,val icon:Drawable?=null)
+internal fun notificationAppMatches(app:NotificationPickerApp,query:String):Boolean {
+    val key=historySearchKey(query)
+    return key.isEmpty() || historySearchKey(app.label).contains(key) || historySearchKey(app.key.substringAfter('/')).contains(key)
+}
 private fun android.content.Context.notificationPickerApps():List<NotificationPickerApp> =packageManager.queryIntentActivities(
     Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER),PackageManager.ResolveInfoFlags.of(0))
     .filter {it.activityInfo.packageName!=packageName}.distinctBy {it.activityInfo.packageName}
@@ -99,10 +104,12 @@ private fun android.content.Context.notificationPickerApps():List<NotificationPi
 @Composable internal fun NotificationsContent(p:Prefs,access:Boolean,blocked:Boolean,apps:List<NotificationPickerApp>,back:()->Unit,
     toggle:(Boolean)->Unit,names:(Boolean)->Unit,select:(Boolean,String,Boolean)->Unit,appInfo:()->Unit) {
     val context=LocalContext.current;val consent=p.notificationConsent;val on=consent.enabled && access
+    var query by rememberSaveable {mutableStateOf("")}
+    val visibleApps=remember(apps,query) {apps.filter {notificationAppMatches(it,query)}}
     Scaffold(containerColor=Color.Transparent,contentWindowInsets=WindowInsets.statusBars,topBar={LargeTopAppBar(
         title={Text(stringResource(R.string.notification_title),style=PneuType.largeTitle,maxLines=2)},navigationIcon={NavIcon(back)},
         colors=TopAppBarDefaults.topAppBarColors(containerColor=LocalPneuColors.current.bg))}) {padding->
-        LazyColumn(Modifier.padding(padding).fillMaxSize().navigationBarsPadding(),contentPadding=PaddingValues(horizontal=16.dp,vertical=8.dp)) {
+        LazyColumn(Modifier.padding(padding).fillMaxSize().navigationBarsPadding().imePadding(),contentPadding=PaddingValues(horizontal=16.dp,vertical=8.dp)) {
             item {PneuCard {
                 ToggleRow(stringResource(R.string.notification_show_on),on,divider=false,change=toggle)
                 if(on)ToggleRow(stringResource(R.string.notification_names_only),consent.namesOnly,change=names)
@@ -117,7 +124,9 @@ private fun android.content.Context.notificationPickerApps():List<NotificationPi
                         if(supported==false)stringResource(R.string.notification_update) else null,i>0) {select(true,NotificationConsent.computer(peer),it)}
                 }}}
                 item {Header(stringResource(R.string.notification_apps))}
-                item {PneuCard {apps.forEachIndexed {i,app->NotificationChoiceRow(app.label,app.key in consent.apps,app.icon,null,null,i>0) {select(false,app.key,it)}}}}
+                item {PneuSearch(query) {query=it};Spacer(Modifier.height(12.dp))}
+                item {if(visibleApps.isEmpty() && historySearchKey(query).isNotEmpty())PneuSearchNoMatches()
+                    else PneuCard {visibleApps.forEachIndexed {i,app->NotificationChoiceRow(app.label,app.key in consent.apps,app.icon,null,null,i>0) {select(false,app.key,it)}}}}
             }
         }
     }
@@ -127,7 +136,7 @@ private fun android.content.Context.notificationPickerApps():List<NotificationPi
     PneuCard {Row(Modifier.padding(16.dp),horizontalArrangement=Arrangement.spacedBy(12.dp)) {
         Box(Modifier.size(36.dp).background(LocalPneuColors.current.warnSoft,RoundedCornerShape(10.dp)),contentAlignment=Alignment.Center) {Symbol(R.drawable.ic_warning,tint=LocalPneuColors.current.warn)}
         Column(verticalArrangement=Arrangement.spacedBy(8.dp)) {
-            Text(stringResource(R.string.notification_blocked),style=PneuType.headline)
+            Text(stringResource(R.string.notification_access_off),style=PneuType.headline)
             Text(stringResource(R.string.notification_restricted_hint),style=PneuType.subhead,color=LocalPneuColors.current.text2)
             PneuButton(open,kind=ButtonKind.SmallTonal) {Text(stringResource(R.string.notification_app_info))}
         }

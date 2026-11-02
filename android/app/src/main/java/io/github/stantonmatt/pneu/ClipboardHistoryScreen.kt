@@ -6,19 +6,12 @@ import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
-import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.draw.drawWithContent
-import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
-import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.semantics.*
-import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
@@ -87,11 +80,11 @@ internal fun historyDisplayOrder(previous:List<String>,items:List<SavedClip>,
             colors=TopAppBarDefaults.topAppBarColors(containerColor=c.bg,scrolledContainerColor=c.bg))}) {padding->
         Box(Modifier.padding(padding).fillMaxSize(),contentAlignment=Alignment.TopCenter) {
             LazyColumn(Modifier.widthIn(max=600.dp).fillMaxWidth().imePadding(),contentPadding=PaddingValues(start=16.dp,end=16.dp,bottom=24.dp+WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding())) {
-                if(state.items.isNotEmpty())item(key="search") {HistorySearch(query) {query=it};Spacer(Modifier.height(12.dp))}
+                if(state.items.isNotEmpty())item(key="search") {PneuSearch(query) {query=it};Spacer(Modifier.height(12.dp))}
                 if(rows.isEmpty())item(key="empty") {
-                    PneuCard {Column(Modifier.fillMaxWidth().height(132.dp),horizontalAlignment=Alignment.CenterHorizontally,verticalArrangement=Arrangement.Center) {
-                        Symbol(if(searching)R.drawable.ic_search else R.drawable.ic_content_paste,modifier=Modifier.size(28.dp),tint=c.text3)
-                        Text(stringResource(if(searching)R.string.history_no_matches else R.string.history_empty),Modifier.padding(top=8.dp),style=PneuType.subhead,color=c.text2)
+                    if(searching)PneuSearchNoMatches() else PneuCard {Column(Modifier.fillMaxWidth().height(132.dp),horizontalAlignment=Alignment.CenterHorizontally,verticalArrangement=Arrangement.Center) {
+                        Symbol(R.drawable.ic_content_paste,modifier=Modifier.size(28.dp),tint=c.text3)
+                        Text(stringResource(R.string.history_empty),Modifier.padding(top=8.dp),style=PneuType.subhead,color=c.text2)
                     }}
                 }
                 for((isPinned,group) in listOf(true to pinned,false to recent)) {
@@ -116,22 +109,6 @@ internal fun historyDisplayOrder(previous:List<String>,items:List<SavedClip>,
     }
     if(clear)HistoryDeleteDialog(state.items.count {!it.pinned},false,{clear=false},pinned=state.items.count {it.pinned}) {
         scope.launch {if(actions.run(resources.getString(R.string.ui_error_clear_queue)) {app.savedClips.clear()})clear=false}
-    }
-}
-
-@Composable private fun HistorySearch(query:String,change:(String)->Unit) {
-    val c=LocalPneuColors.current;val keyboard=LocalSoftwareKeyboardController.current
-    val searchLabel=stringResource(R.string.history_search)
-    val interaction=remember {MutableInteractionSource()};val focused by interaction.collectIsFocusedAsState()
-    Surface(shape=RoundedCornerShape(16.dp),color=c.surface,border=if(focused)BorderStroke(2.dp,c.accent)else if(c.dark)BorderStroke(1.dp,c.hairline)else null) {
-        Row(Modifier.fillMaxWidth().height(48.dp).padding(start=16.dp,end=4.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(12.dp)) {
-            Symbol(R.drawable.ic_search,modifier=Modifier.size(22.dp),tint=c.text2)
-            BasicTextField(query,change,interactionSource=interaction,modifier=Modifier.weight(1f).semantics {contentDescription=searchLabel},singleLine=true,
-                textStyle=PneuType.body.copy(color=c.text),cursorBrush=SolidColor(c.accent),
-                keyboardOptions=KeyboardOptions(imeAction=ImeAction.Search),keyboardActions=KeyboardActions(onSearch={keyboard?.hide()}),
-                decorationBox={field->Box {if(query.isEmpty())Text(stringResource(R.string.history_search),style=PneuType.body,color=c.text3);field()}})
-            if(query.isNotEmpty())IconButton(onClick={change("")}) {Symbol(R.drawable.ic_close,stringResource(R.string.history_clear_search),Modifier.size(22.dp),c.text2)}
-        }
     }
 }
 

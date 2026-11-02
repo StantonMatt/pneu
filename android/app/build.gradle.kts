@@ -108,6 +108,8 @@ dependencies {
     implementation(libs.androidx.compose.ui)
     implementation(libs.kotlinx.coroutines.android)
 
+    testImplementation(platform(libs.androidx.compose.bom))
+    testImplementation(libs.androidx.compose.ui.test.junit4)
     testImplementation(libs.junit)
     testImplementation("org.robolectric:robolectric:4.16")
     testImplementation(libs.kotlinx.coroutines.test)

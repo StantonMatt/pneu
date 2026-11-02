@@ -354,8 +354,7 @@
     <string name="notification_allow_title">Allow notification access</string>
     <string name="notification_allow_text">Pneu sends notifications only from the apps you pick, and only to the computers you choose.</string>
     <string name="notification_continue">Continue</string>
-    <string name="notification_blocked">Android blocked notification access</string>
-    <string name="notification_restricted_hint">Open App info, tap ⋮ › Allow restricted settings, then try again.</string>
+    <string name="notification_restricted_hint">Turn on Pneu in notification access. If Android says it\'s restricted, open App info, tap ⋮ › Allow restricted settings, then try again.</string>
     <string name="notification_app_info">Open app info</string>
     <string name="notification_access_off">Notification access is off</string>
     <string name="notification_apps">Apps</string>
