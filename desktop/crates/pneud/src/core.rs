@@ -2788,6 +2788,7 @@ impl Core {
         }
     }
     pub fn request_shutdown(&self) {
+        self.outbox.stopping.store(true, Ordering::SeqCst);
         self.shutdown.send_replace(true);
         self.action_stop.send_replace(true);
     }
@@ -3419,6 +3420,14 @@ impl Core {
                         .pairing_generation(&hello.device_id)
                         .expect("paired generation"),
                     hello.capabilities.iter().any(|c| c == "files"),
+                );
+                self.outbox.note_folders(
+                    hello.device_id.clone(),
+                    self.store
+                        .pairing_generation(&hello.device_id)
+                        .expect("paired generation"),
+                    hello.capabilities.iter().any(|c| c == "folder_v1")
+                        && hello.capabilities.iter().any(|c| c == "file_resume_v1"),
                 );
                 self.publish_phone(&state, connection_id, &hello, peer_address.ip());
                 self.event(Event::PhonePaused {
@@ -4157,12 +4166,19 @@ impl Core {
                     let claim_core=self.clone();let claim_store=store.clone();let claim_device=hello.device_id.clone();
                     match self.outbox.claim_while(hello.device_id.clone(),generation,store.connection_id.expect("connection id"),move ||claim_core.connection_current(&claim_store,&claim_device)).await {
                         Ok(Some(delivery))=>{
+                            if delivery.begin.folder.is_some() && (!store.file_resume || !hello.capabilities.iter().any(|c|c=="folder_v1")) {
+                                let reason = if hello.role == Some(pneu_proto::DeviceRole::Phone) { "Can't receive folders yet" } else { "Needs a Pneu update" };
+                                self.outbox.fail(delivery.clone(),reason.into()).await?;
+                                self.delivery_finished(&delivery);
+                                continue;
+                            }
                             let id=delivery.begin.transfer_id.clone();
                             // Hashing belongs to a preparation job. The transport
                             // writer continues servicing heartbeat and text.
                             let core=self.clone();let preparing=delivery.clone();let connection=store.connection_id.expect("connection id");let mesh=store.mesh;
                             file_preparations.spawn(async move {
-                                let result=core.outbox.reader(preparing.clone()).await.map(|file|FileWrite {delivery:preparing.clone(),connection,mesh,file:Some(file),ready:None,receipt_ready:Arc::new(AtomicBool::new(false))});
+                                let payload=if preparing.begin.folder.is_some() {core.outbox.folder_reader(preparing.clone()).await.map(file_sender::Payload::from)} else {core.outbox.reader(preparing.clone()).await.map(file_sender::Payload::from)};
+                                let result=payload.map(|file|FileWrite {delivery:preparing.clone(),connection,mesh,file:Some(file),ready:None,receipt_ready:Arc::new(AtomicBool::new(false))});
                                 (preparing,result)
                             });
                             file_receipt_ready=None;
@@ -4226,6 +4242,15 @@ impl Core {
                         let mut work=match self.outbox.preparation_result(&delivery,prepared) {
                             Ok(Some(work))=>work,
                             Ok(None)=>{
+                                self.delivery_finished(&delivery);
+                                if pending.as_ref().is_some_and(|p|p.id==id) {pending=None;}
+                                if file_pending.as_ref().is_some_and(|p|p.begin.transfer_id==id) {file_pending=None;}
+                                continue;
+                            }
+                            Err(error) if error.downcast_ref::<crate::folders::SourceChanged>().is_some()=>{
+                                // A changed folder fails only this delivery; the
+                                // session and other work continue.
+                                self.outbox.fail_changed(delivery.clone()).await?;
                                 self.delivery_finished(&delivery);
                                 if pending.as_ref().is_some_and(|p|p.id==id) {pending=None;}
                                 if file_pending.as_ref().is_some_and(|p|p.begin.transfer_id==id) {file_pending=None;}
@@ -4406,6 +4431,7 @@ impl Core {
                                 self.connection_event(&store,&hello.device_id,Event::ClipboardSent {device:hello.device_id.clone(),transfer_id:id});
                             },
                             Message::Nack(nack)=>{
+                                let early_file_nack=file_ready.as_ref().is_some_and(|(id,_,_)|id==&nack.transfer_id);
                                 if let Some((ready,receipt))=cancelled_files.get_mut(&nack.transfer_id){ensure!(*ready||*receipt,"unsolicited cancelled NACK");*ready=false;*receipt=false;continue;}
                                 if file_pending.as_ref().is_some_and(|d|d.begin.transfer_id==nack.transfer_id) && file_ready.is_none(){ensure!(file_receipt_ready.as_ref().is_some_and(|p|p.load(Ordering::SeqCst)),"NACK before END");}
                                 if file_ready.as_ref().is_some_and(|(id,_,_)|id==&nack.transfer_id) && let Some((_,_,reply))=file_ready.take(){let _=reply.send(None);}
@@ -4431,7 +4457,7 @@ impl Core {
                                 ensure!(pending.as_ref().is_some_and(|p|p.id==nack.transfer_id),"wrong or unsolicited NACK ID");
                                 let id=pending.take().unwrap().id;
                                 if let Some(delivery)=file_pending.take() {
-                                    if let Err(error)=self.outbox.receipt(delivery.clone(),Some(nack.code)).await {self.error(Some(hello.device_id.clone()),format!("file NACK persistence deferred: {error}"));break;}
+                                    if let Err(error)=self.outbox.receipt_phase(delivery.clone(),Some(nack.code),early_file_nack).await {self.error(Some(hello.device_id.clone()),format!("file NACK persistence deferred: {error}"));break;}
                                     self.delivery_finished(&delivery);
                                     let _=self.events.send(Event::ConfigChanged);continue;
                                 }
@@ -4650,7 +4676,7 @@ impl Core {
                 Message::FileBegin(begin) => {
                     ensure!(
                         (begin.resume != Some(true) || (store.file_resume && !begin.sensitive))
-                            && begin.folder.is_none(),
+                            && (begin.folder.is_none() || store.file_resume),
                         "unnegotiated file extension"
                     );
                     ensure!(incoming.is_none(), "second FILE_BEGIN");
@@ -4870,7 +4896,6 @@ impl Core {
                         "noncontiguous chunk or size overflow"
                     );
                     if state.receipt.is_none() && !state.deduplicated {
-                        state.hash.update(&chunk.data);
                         #[cfg(test)]
                         {
                             let delay = *self.file_write_delay.lock().expect("file write delay");
@@ -4878,19 +4903,30 @@ impl Core {
                                 tokio::time::sleep(delay).await;
                             }
                         }
-                        let written = async {
-                            if let Some(file) = state.file.as_mut() {
+                        let written: Result<()> = async {
+                            if state.begin.folder.is_some() {
+                                // Manifest bytes go to the stage file and content
+                                // directly into the private tree: no stream spool.
+                                let stage = state.stage.clone().context("missing folder stage")?;
+                                let begin = state.begin.clone();
+                                let from = state.received;
+                                let data = chunk.data.clone();
+                                store
+                                    .blocking(move |_| stage.folder_write(&begin, from, &data))
+                                    .await?;
+                            } else if let Some(file) = state.file.as_mut() {
                                 file.write_all(&chunk.data).await?;
                                 // Tokio File may report a kernel write failure only
                                 // on flush. Keep this chunk until that write resolves.
                                 file.flush().await?;
                             }
-                            Ok::<_, std::io::Error>(())
+                            Ok(())
                         }
                         .await;
                         if let Err(error) = written {
-                            let code = crate::store::save_failure_code(&error.into());
+                            let code = crate::store::save_failure_code(&error);
                             if state.config.save_to_folder
+                                && state.begin.folder.is_none()
                                 && state.save_error.is_none()
                                 && state.begin.kind != FileKind::ClipboardImage
                                 && matches!(code, NackCode::NotWritable | NackCode::DiskFull)
@@ -4917,6 +4953,9 @@ impl Core {
                                 state.file.take();
                                 state.receipt = state.receipt.or(Some(code));
                             }
+                        }
+                        if state.receipt.is_none() {
+                            state.hash.update(&chunk.data);
                         }
                     }
                     state.received += chunk.data.len() as u64;
@@ -5041,10 +5080,23 @@ impl Core {
                             && let Some(stage) = &state.stage
                             && let Ok(path) = stage.destination_path()
                         {
-                            received_file = Some(ReceivedFile::from_file(
+                            received_file = Some(ReceivedFile::from_transfer(
                                 path.clone(),
-                                stage.0.file.try_clone()?,
+                                stage.published_file()?,
+                                stage.folder_details(),
+                                state.begin.size,
                             )?);
+                            if let Some(details) = stage.folder_details()
+                                && let Some(row) =
+                                    self.ui.lock().expect("UI state").incoming.iter_mut().find(
+                                        |r| {
+                                            r.device == *device
+                                                && r.transfer_id == state.begin.transfer_id
+                                        },
+                                    )
+                            {
+                                row.folder = Some(details);
+                            }
                             state.destination = Some(path);
                         }
                         if stored.is_ok() {
@@ -5055,6 +5107,7 @@ impl Core {
                         if let Err(error) = stored {
                             let code = crate::store::save_failure_code(&error);
                             if state.config.save_to_folder
+                                && state.begin.folder.is_none()
                                 && state.save_error.is_none()
                                 && state.begin.kind != FileKind::ClipboardImage
                                 && matches!(code, NackCode::NotWritable | NackCode::DiskFull)
@@ -5488,9 +5541,13 @@ impl Core {
             let destination =
                 if state.begin.kind == FileKind::ClipboardImage || !state.config.save_to_folder {
                     cache_basename(&state.begin.file_name)
+                } else if state.begin.folder.is_some() {
+                    crate::folders::root_name(&state.begin.file_name)
                 } else {
                     local_name(&state.begin.file_name, 255)
                 };
+            // Folders write content straight into their private tree, so the
+            // stream size is also the temporary space a folder needs.
             let size = state.begin.size;
             let stage = match async {
                 if state.config.save_to_folder && state.begin.kind != FileKind::ClipboardImage {
@@ -8495,6 +8552,7 @@ mod tests {
             [
                 "files",
                 "file_resume_v1",
+                "folder_v1",
                 "clipboard_text",
                 "clipboard_image",
                 "mesh",
@@ -13428,7 +13486,7 @@ mod tests {
                 delivery,
                 connection: 1,
                 mesh: false,
-                file: Some(preparing.await??),
+                file: Some(preparing.await??.into()),
                 ready: None,
                 receipt_ready: Arc::new(AtomicBool::new(false)),
             })
@@ -13854,6 +13912,7 @@ mod tests {
         Ok(())
     }
     include!("resume_tests.rs");
+    include!("folder_tests.rs");
 }
 
 #[cfg(all(test, windows))]

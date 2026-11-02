@@ -62,6 +62,10 @@ pub(crate) struct Folder {
     pub file: Arc<File>,
 }
 impl Folder {
+    /// Source trees and folder navigation need no write access.
+    pub fn read(path: &Path) -> Result<Self> {
+        Self::open(path, false)
+    }
     pub fn open(path: &Path, create: bool) -> Result<Self> {
         Self::open_with_mode(path, create, 0o777)
     }
@@ -239,9 +243,14 @@ pub(crate) fn identity_at(parent: &File, name: impl AsRef<OsStr>) -> Result<Iden
     Ok(Identity(stat.st_dev as u64, stat.st_ino))
 }
 /// Metadata proof without pinning a file's blocks after unlink.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Version(Identity, u64, i64, i64, i64, i64);
 impl Version {
+    /// Folder capture uses identity, size and mtime; metadata-only changes are harmless.
+    pub fn same_content_metadata(&self, other: &Self) -> bool {
+        self.0 == other.0 && self.1 == other.1 && self.2 == other.2 && self.3 == other.3
+    }
+
     #[cfg(any(target_os = "macos", test))]
     pub fn read(file: &File) -> Result<Self> {
         Ok(Self::from_metadata(file.metadata()?))
@@ -430,6 +439,9 @@ pub(crate) fn set_read_only(file: &File) -> std::io::Result<()> {
 pub(crate) fn read_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
     file.read_at(bytes, offset)
 }
+pub(crate) fn write_all_at(file: &File, bytes: &[u8], offset: u64) -> std::io::Result<()> {
+    file.write_all_at(bytes, offset)
+}
 pub(crate) fn copy_prefix(source: &File, destination: &File, prefix: u64) -> Result<()> {
     let mut offset = 0;
     let mut bytes = [0; 32768];
@@ -589,4 +601,45 @@ pub(crate) fn lock_error(error: std::fs::TryLockError) -> anyhow::Error {
             None => error.into(),
         },
     }
+}
+
+/// Enumerate type and identity without opening device nodes or socket vnodes.
+pub(crate) fn capture_entry(
+    parent: &File,
+    name: impl AsRef<OsStr>,
+) -> Result<(super::CaptureType, Identity)> {
+    let stat = rustix::fs::statat(parent, name.as_ref(), AtFlags::SYMLINK_NOFOLLOW)?;
+    let kind = match stat.st_mode & libc::S_IFMT {
+        libc::S_IFREG => super::CaptureType::File,
+        libc::S_IFDIR => super::CaptureType::Directory,
+        libc::S_IFLNK => super::CaptureType::Link,
+        _ => super::CaptureType::Special,
+    };
+    Ok((kind, Identity(stat.st_dev as u64, stat.st_ino)))
+}
+
+pub(crate) fn entries_limited(
+    parent: &File,
+    limit: usize,
+) -> Result<impl Iterator<Item = Result<OsString>>> {
+    Ok(entries(parent)?.take(limit.saturating_add(1)))
+}
+
+/// Flush file or directory metadata without a per-file device barrier.
+pub(crate) fn sync_plain(file: &File) -> Result<()> {
+    rustix::fs::fsync(file)?;
+    Ok(())
+}
+
+pub(crate) fn is_unsupported_name(error: &anyhow::Error) -> bool {
+    error.chain().any(|e| {
+        let code = e
+            .downcast_ref::<rustix::io::Errno>()
+            .map(|e| e.raw_os_error())
+            .or_else(|| {
+                e.downcast_ref::<std::io::Error>()
+                    .and_then(|e| e.raw_os_error())
+            });
+        matches!(code, Some(libc::EINVAL | libc::ENAMETOOLONG | libc::EILSEQ))
+    })
 }

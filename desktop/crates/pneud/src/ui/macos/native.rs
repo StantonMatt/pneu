@@ -1008,6 +1008,13 @@ pub(crate) fn request(id: u64, request: Request, descriptor: Option<OwnedFd>, gu
                 return;
             };
             let descriptor = std::fs::File::from(descriptor);
+            if descriptor.metadata().is_ok_and(|m| m.is_dir()) {
+                guard.finish(
+                    crate::platform::fs::directory_path(&descriptor)
+                        .and_then(|path| open_viewer_path(&path, false, &guard)),
+                );
+                return;
+            }
             let reused = STATE.with(|s| {
                 s.borrow_mut()
                     .as_mut()
@@ -1317,6 +1324,17 @@ pub(crate) async fn choose(
     directory: bool,
     current: Option<&Path>,
 ) -> Result<Option<Vec<PathBuf>>> {
+    choose_options(title, directory, !directory, current).await
+}
+pub(crate) async fn choose_send(folders: bool) -> Result<Option<Vec<PathBuf>>> {
+    choose_options("Send Files", false, folders, None).await
+}
+async fn choose_options(
+    title: &str,
+    directory: bool,
+    folders: bool,
+    current: Option<&Path>,
+) -> Result<Option<Vec<PathBuf>>> {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let title = title.to_owned();
     let current = current.map(Path::to_owned);
@@ -1344,9 +1362,12 @@ pub(crate) async fn choose(
         }
         let panel: Retained<AnyObject> = msg_send![class!(NSOpenPanel), openPanel];
         let _: () = msg_send![&*panel, setTitle: &*NSString::from_str(&title)];
-        let _: () = msg_send![&*panel, setCanChooseDirectories: Bool::new(directory)];
+        let _: () = msg_send![&*panel, setCanChooseDirectories: Bool::new(directory || folders)];
         let _: () = msg_send![&*panel, setCanChooseFiles: Bool::new(!directory)];
         let _: () = msg_send![&*panel, setAllowsMultipleSelection: Bool::new(!directory)];
+        if !directory {
+            let _: () = msg_send![&*panel,setPrompt: &*NSString::from_str("Send")];
+        }
         if let Some(current) = current {
             let url = NSURL::fileURLWithPath(&NSString::from_str(&current.to_string_lossy()));
             let _: () = msg_send![&*panel, setDirectoryURL: &*url];
@@ -1796,7 +1817,7 @@ fn test_control(action: &str) -> Result<()> {
                     let directories: Bool = msg_send![&*panel, canChooseDirectories];
                     let files: Bool = msg_send![&*panel, canChooseFiles];
                     ensure!(
-                        directories.as_bool() == (action == "assert-folder-picker")
+                        (action != "assert-folder-picker" || directories.as_bool())
                             && files.as_bool() == (action == "assert-file-picker"),
                         "picker kind mismatch"
                     );

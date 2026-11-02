@@ -54,6 +54,8 @@ struct Partial {
     progress: u64,
     #[serde(default)]
     deleting: bool,
+    #[serde(default)]
+    tree: Option<crate::folders::TreeRecord>,
 }
 #[derive(Debug, thiserror::Error)]
 #[error("resume identity changed")]
@@ -62,7 +64,12 @@ struct IdentityChanged;
 #[error("resume stage missing")]
 struct StageMissing;
 impl Partial {
-    fn open(&self) -> Result<Stage> {
+    /// A folder stores manifest bytes in its stage file and content bytes in
+    /// its private tree, so either way the retained prefix is `offset` bytes.
+    fn stored_bytes(&self) -> u64 {
+        self.offset
+    }
+    fn open_stream(&self) -> Result<Stage> {
         ensure!(
             self.name.len() == 32 && self.name.bytes().all(|b| b.is_ascii_hexdigit()),
             IdentityChanged
@@ -83,29 +90,52 @@ impl Partial {
             pfs::identity(&file)? == self.file_id && file.metadata()?.is_file(),
             IdentityChanged
         );
-        Ok(Stage::reopen(
+        let stage = Stage::reopen(
             folder,
             directory,
             file,
             self.name.clone(),
             self.destination.clone(),
-        ))
+        );
+        Ok(stage)
+    }
+    fn open(&self) -> Result<Stage> {
+        let stage = self.open_stream()?;
+        self.restore_tree(&stage, Instant::now() + Duration::from_secs(90))?;
+        Ok(stage)
+    }
+    fn restore_tree(&self, stage: &Stage, deadline: Instant) -> Result<()> {
+        if self.tree.is_none() && self.begin.folder.is_some() {
+            crate::folders::discard_orphan_tree(stage)?;
+        }
+        if let Some(record) = &self.tree {
+            let tree = crate::folders::Tree::reopen(stage, &self.begin, record.clone(), deadline)?;
+            *stage.0.tree.lock().expect("folder tree") = Some(tree);
+        }
+        Ok(())
     }
     fn rehash(
         &self,
         stage: &Stage,
         cancel: Option<&tokio::sync::watch::Sender<bool>>,
+        deadline: Instant,
     ) -> Result<Sha256> {
+        // A folder's stage file holds only manifest bytes; content lives in
+        // the private tree and is rehashed there in manifest order.
+        let spooled = self
+            .begin
+            .folder
+            .as_ref()
+            .map_or(self.offset, |f| self.offset.min(f.manifest_len));
         ensure!(
-            self.offset <= self.begin.size && stage.0.file.metadata()?.len() >= self.offset,
+            self.offset <= self.begin.size && stage.0.file.metadata()?.len() >= spooled,
             "short checkpoint"
         );
         let mut input = stage.0.file.try_clone()?;
         input.seek(SeekFrom::Start(0))?;
         let mut hash = Sha256::new();
-        let mut remaining = self.offset;
+        let mut remaining = spooled;
         let mut buffer = vec![0; pneu_proto::CHUNK_SIZE];
-        let deadline = Instant::now() + Duration::from_secs(90);
         while remaining > 0 {
             ensure!(Instant::now() < deadline, "resume rehash timeout");
             ensure!(
@@ -118,12 +148,23 @@ impl Partial {
             hash.update(&buffer[..count]);
             remaining -= count as u64;
         }
+        if let Some(folder) = &self.begin.folder {
+            if stage.0.tree.lock().expect("folder tree").is_some() {
+                stage.folder_recover(self.offset, &mut hash, deadline)?;
+            } else {
+                ensure!(
+                    self.offset < folder.manifest_len,
+                    "missing folder tree checkpoint"
+                );
+            }
+        }
+        ensure!(!cancel.is_some_and(|c| *c.borrow()), "resume cancelled");
         ensure!(
             hex::encode(hash.clone().finalize()) == self.checksum,
             "checkpoint checksum mismatch"
         );
-        stage.0.file.set_len(self.offset)?;
-        input.seek(SeekFrom::Start(self.offset))?;
+        stage.0.file.set_len(spooled)?;
+        input.seek(SeekFrom::Start(spooled))?;
         Ok(hash)
     }
 }
@@ -134,6 +175,28 @@ impl Store {
     fn partials(&self) -> Result<Vec<Partial>> {
         self.locked(|c| {
             let mut q = c.prepare("SELECT record FROM file_partials")?;
+            q.query_map([], |r| r.get::<_, String>(0))?
+                .map(|r| Ok(serde_json::from_str(&r?)?))
+                .collect()
+        })
+    }
+    fn partial(&self, device: &Id, id: &Id) -> Result<Option<Partial>> {
+        self.locked(|c| {
+            let record: Option<String> = c
+                .query_row(
+                    "SELECT record FROM file_partials WHERE device=? AND id=?",
+                    params![device.as_str(), id.as_str()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            record.map(|r| Ok(serde_json::from_str(&r)?)).transpose()
+        })
+    }
+    /// Budget/expiry checks need only scalar metadata; load a tree map only
+    /// for the one candidate selected for recovery or deletion.
+    fn partial_summaries(&self) -> Result<Vec<Partial>> {
+        self.locked(|c| {
+            let mut q = c.prepare("SELECT json_remove(record,'$.tree') FROM file_partials")?;
             q.query_map([], |r| r.get::<_, String>(0))?
                 .map(|r| Ok(serde_json::from_str(&r?)?))
                 .collect()
@@ -151,7 +214,14 @@ impl Store {
     fn delete_partial(&self, p: &Partial) -> Result<bool> {
         // Inaccessible storage keeps its identity-bearing, budgeted deletion
         // record. Substituted entries are protected from orphan sweeping.
-        match p.open().and_then(|stage| stage.cleanup()) {
+        match p.open_stream().and_then(|stage| {
+            if let Some(tree) = &p.tree {
+                tree.cleanup(&stage.0.directory, &stage.0.name)?;
+            } else if p.begin.folder.is_some() {
+                crate::folders::discard_orphan_tree(&stage)?;
+            }
+            stage.cleanup()
+        }) {
             Ok(()) => {}
             Err(error) if error.downcast_ref::<StageMissing>().is_some() => {}
             Err(error)
@@ -199,9 +269,11 @@ impl Store {
             let high=c.query_row("SELECT wall FROM resume_clock WHERE singleton=1",[],|r|r.get::<_,i64>(0)).optional()?.map(|n|n as u64).unwrap_or(now);
             let rollback=now.saturating_add(ROLLBACK)<high;
             c.execute("INSERT INTO resume_clock VALUES(1,?) ON CONFLICT(singleton) DO UPDATE SET wall=excluded.wall",[(if rollback{now}else{now.max(high)}) as i64])?;Ok(rollback)})?;
-        let mut rows = self.partials()?;
+        let mut rows = self.partial_summaries()?;
         rows.sort_by_key(|p| p.progress);
-        let mut bytes = rows.iter().fold(0u64, |n, p| n.saturating_add(p.offset));
+        let mut bytes = rows
+            .iter()
+            .fold(0u64, |n, p| n.saturating_add(p.stored_bytes()));
         let mut jobs = rows.len();
         let mut peers = HashMap::<Id, usize>::new();
         for p in &rows {
@@ -233,10 +305,13 @@ impl Store {
                 || jobs > 64
                 || peers[&p.device] > 8
             {
-                if !self.delete_partial(&p)? {
+                let Some(full) = self.partial(&p.device, &p.begin.transfer_id)? else {
+                    continue;
+                };
+                if !self.delete_partial(&full)? {
                     continue;
                 }
-                bytes = bytes.saturating_sub(p.offset);
+                bytes = bytes.saturating_sub(p.stored_bytes());
                 jobs -= 1;
                 *peers.get_mut(&p.device).expect("peer count") -= 1;
                 runtime.progress.remove(&key);
@@ -263,6 +338,7 @@ impl Store {
                 continue;
             }
             retained.insert(p.name.clone());
+            retained.insert(format!("{}-tree", p.name));
             let live = self
                 .resume
                 .lock()
@@ -270,7 +346,13 @@ impl Store {
                 .live
                 .get(&(p.device.clone(), p.begin.transfer_id.clone()))
                 .is_some_and(|s| s.strong_count() > 0);
-            if !live && p.open().and_then(|stage| p.rehash(&stage, None)).is_err() {
+            if !live
+                && p.open()
+                    .and_then(|stage| {
+                        p.rehash(&stage, None, Instant::now() + Duration::from_secs(90))
+                    })
+                    .is_err()
+            {
                 self.delete_partial(&p)?;
                 self.resume
                     .lock()
@@ -307,11 +389,7 @@ impl Store {
     }
     pub(crate) async fn discard_legacy_partial(&self, device: Id, begin: FileBegin) -> Result<()> {
         self.blocking(move |store| {
-            if let Some(p) = store
-                .partials()?
-                .into_iter()
-                .find(|p| p.device == device && p.begin.transfer_id == begin.transfer_id)
-            {
+            if let Some(p) = store.partial(&device, &begin.transfer_id)? {
                 ensure!(p.begin.content_eq(&begin), ReceiptConflict);
                 store.delete_partial(&p)?;
                 store
@@ -343,11 +421,7 @@ impl Store {
         self.blocking(move |store| {
             ensure!(!*cancel.borrow(), "resume cancelled");
             store.prune_partials()?;
-            let Some(p) = store
-                .partials()?
-                .into_iter()
-                .find(|p| p.device == device && p.begin.transfer_id == begin.transfer_id)
-            else {
+            let Some(p) = store.partial(&device, &begin.transfer_id)? else {
                 return Ok(None);
             };
             store.locked(|c| epoch.check(c))?;
@@ -355,17 +429,22 @@ impl Store {
             ensure!(!p.deleting, "resume deletion pending");
             ensure!(!*cancel.borrow(), "resume cancelled");
             let key = (device, begin.transfer_id);
+            let deadline = Instant::now() + Duration::from_secs(90);
             let opened = {
                 let mut runtime = store.resume.lock().expect("resume runtime");
                 ensure!(
                     runtime.live.get(&key).is_none_or(|s| s.strong_count() == 0),
                     "resume stage leased"
                 );
-                p.open().and_then(|stage| {
+                p.open_stream().and_then(|stage| {
                     runtime.lease(key.clone(), &stage)?;
                     Ok(stage)
                 })
             };
+            let opened = opened.and_then(|stage| {
+                p.restore_tree(&stage, deadline)?;
+                Ok(stage)
+            });
             // Apply the same receipt reserve and destination headroom as a
             // fresh receive, charging only bytes still to be written.
             if let Ok(stage) = &opened {
@@ -381,7 +460,7 @@ impl Store {
                     pfs::no_space()
                 );
             }
-            match opened.and_then(|stage| Ok((p.rehash(&stage, Some(&cancel))?, stage))) {
+            match opened.and_then(|stage| Ok((p.rehash(&stage, Some(&cancel), deadline)?, stage))) {
                 Ok((hash, stage)) => {
                     store
                         .resume
@@ -418,34 +497,38 @@ impl Store {
         self.blocking(move |store| {
             ensure!(pfs::identity_at(&stage.0.directory.file,&stage.0.name)?==pfs::identity(&stage.0.file)?,"staging file replaced before checkpoint");
             let now = crate::now_ms();
-            let previous = store.partials()?.into_iter().find(|p| {
-                p.device == device && p.begin.transfer_id == begin.transfer_id
-            });
-            if let Some(p) = previous {
+            let previous: Option<(String, bool)> = store.locked(|c| Ok(c.query_row(
+                "SELECT json_remove(record,'$.tree'),coalesce(json_type(record,'$.tree')='object',0) FROM file_partials WHERE device=? AND id=?",
+                params![device.as_str(), begin.transfer_id.as_str()], |r| Ok((r.get(0)?, r.get(1)?))).optional()?))?;
+            if let Some((record, has_tree)) = previous {
+                let p: Partial = serde_json::from_str(&record)?;
                 ensure!(p.begin.content_eq(&begin),ReceiptConflict);
                 ensure!(p.file_id==pfs::identity(&stage.0.file)? && p.root_id==stage.0.folder.identity()?,"checkpoint lease changed");
                 let small = offset.saturating_sub(p.offset) < 4 * 1024 * 1024;
                 let recent = store.resume.lock().expect("resume runtime").progress.get(&key)
                     .map(|at|at.elapsed()<Duration::from_secs(5))
                     .unwrap_or_else(||now.saturating_sub(p.progress)<5000);
-                if offset == p.offset || (!force && small && recent) { return Ok(()); }
+                if offset == p.offset || (!force && small && recent && has_tree == stage.0.tree.lock().expect("folder tree").is_some()) { return Ok(()); }
             }
             ensure!(!stage.0.cancelled.load(Ordering::SeqCst), "stage cancelled");
-            stage.0.file.sync_all()?;
-            stage.0.directory.file.sync_all()?;
+            pfs::sync_plain(&stage.0.file)?;
+            pfs::sync_plain(&stage.0.directory.file)?;
+            if let Some(tree) = stage.0.tree.lock().expect("folder tree").as_ref() { tree.checkpoint(&stage)?; }
+            else { stage.0.file.sync_all()?; }
             let p = Partial {
                 device: device.clone(), generation: epoch.generation, begin: begin.clone(),
                 root: stage.0.folder.path()?, root_id: stage.0.folder.identity()?,
                 directory_id: stage.0.directory.identity()?, file_id: pfs::identity(&stage.0.file)?,
                 name: stage.0.name.clone(), destination: stage.0.destination.clone(),
                 offset, checksum: hex::encode(hash.finalize()), progress: now, deleting: false,
+                tree: stage.0.tree.lock().expect("folder tree").as_ref().map(|t|t.record.clone()),
             };
             store.peer_write(epoch, |tx| {
                 if let Some((meta,_))=receipt_row(tx,device.as_str(),begin.transfer_id.as_str())? {
                     ensure!(matches!(meta,Metadata::File(ref retained) if retained.content_eq(&begin)),ReceiptConflict);
                     anyhow::bail!("transfer completed during checkpoint");
                 }
-                let previous:Option<String>=tx.query_row("SELECT record FROM file_partials WHERE device=? AND id=?",params![device.as_str(),begin.transfer_id.as_str()],|r|r.get(0)).optional()?;
+                let previous:Option<String>=tx.query_row("SELECT json_remove(record,'$.tree') FROM file_partials WHERE device=? AND id=?",params![device.as_str(),begin.transfer_id.as_str()],|r|r.get(0)).optional()?;
                 if let Some(previous)=previous {
                     let previous:Partial=serde_json::from_str(&previous)?;
                     ensure!(previous.begin.content_eq(&begin),ReceiptConflict);
@@ -512,11 +595,7 @@ impl Store {
         let epoch = self.peer_epoch(&device);
         self.blocking(move |store| {
             store.locked(|c| epoch.check(c))?;
-            if let Some(p) = store
-                .partials()?
-                .into_iter()
-                .find(|p| p.device == device && p.begin.transfer_id == id)
-            {
+            if let Some(p) = store.partial(&device, &id)? {
                 store.delete_partial(&p)?;
             }
             store
@@ -581,6 +660,105 @@ mod tests {
         let path = stage.path()?;
         drop(stage);
         Ok(path)
+    }
+    #[tokio::test]
+    async fn folder_checkpoint_does_not_parse_unrelated_tree_maps() -> Result<()> {
+        let (dir, store, device, begin) = fixture().await?;
+        let stage = store
+            .create_stage(dir.path().join("save"), "a.txt".into(), begin.size)
+            .await?;
+        (&stage.0.file).write_all(b"abc")?;
+        let mut hash = Sha256::new();
+        hash.update(b"ab");
+        store
+            .checkpoint(
+                device.clone(),
+                begin.clone(),
+                stage.clone(),
+                2,
+                hash.clone(),
+                true,
+            )
+            .await?;
+        let peer = device.clone();
+        let original = begin.transfer_id.clone();
+        store.call(move |c| {
+            c.execute("INSERT INTO file_partials SELECT device,?,json_set(record,'$.begin.transfer_id',?,'$.tree','unrelated invalid tree') FROM file_partials WHERE device=? AND id=?",
+                params![Id::from_bytes([90;16]).as_str(),Id::from_bytes([90;16]).as_str(),peer.as_str(),original.as_str()])?;
+            Ok(())
+        }).await?;
+        hash.update(b"c");
+        store
+            .checkpoint(device, begin, stage, 3, hash, true)
+            .await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn folder_checkpoint_restart_truncates_tree_and_rejects_corrupt_prefix() -> Result<()> {
+        for corrupt in [false, true] {
+            let (dir, store, device, mut begin) = fixture().await?;
+            let manifest=br#"{"entries":[{"path":"empty","type":"directory"},{"path":"a.txt","type":"file","size":3,"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}]}"#;
+            let mut bytes = manifest.to_vec();
+            bytes.extend_from_slice(b"abc");
+            begin.file_name = "Trip".into();
+            begin.mime = "application/vnd.pneu.folder".into();
+            begin.size = bytes.len() as u64;
+            begin.sha256 = Hash::new(hex::encode(Sha256::digest(&bytes)))?;
+            begin.folder = Some(Box::new(pneu_proto::Folder {
+                manifest_len: manifest.len() as u64,
+            }));
+            let stage = store
+                .create_stage(dir.path().join("save"), "Trip".into(), begin.size)
+                .await?;
+            stage.folder_write(&begin, 0, &bytes[..167])?;
+            // Content goes straight into the tree; the stage holds the manifest.
+            assert_eq!(fs::metadata(stage.path()?)?.len(), 165);
+            let mut hash = Sha256::new();
+            hash.update(&bytes[..167]);
+            store
+                .checkpoint(
+                    device.clone(),
+                    begin.clone(),
+                    stage.clone(),
+                    167,
+                    hash,
+                    true,
+                )
+                .await?;
+            let spool = stage.path()?;
+            let tree = spool.with_file_name(format!("{}-tree", stage.0.name));
+            drop(stage);
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&spool)?
+                .write_all(b"tail")?;
+            fs::OpenOptions::new()
+                .append(true)
+                .open(tree.join("a.txt"))?
+                .write_all(b"tail")?;
+            if corrupt {
+                fs::write(tree.join("a.txt"), b"xxTAIL")?;
+            }
+            super::super::tests::close_for_restart(store).await?;
+            let store = Store::open(&dir.path().join("state.sqlite3"))?;
+            store.clean_staging(vec![dir.path().join("save")]).await?;
+            let resumed = store.resume_stage(device.clone(), begin.clone()).await?;
+            if corrupt {
+                assert!(resumed.is_none());
+                assert!(!spool.exists());
+                assert!(!tree.exists());
+            } else {
+                let (stage, offset, _) = resumed.context("retained folder")?;
+                assert_eq!(offset, 167);
+                assert_eq!(fs::read(tree.join("a.txt"))?, b"ab");
+                assert!(tree.join("empty").is_dir());
+                assert_eq!(fs::metadata(&spool)?.len(), 165);
+                drop(stage);
+                store.purge_partial(device, begin.transfer_id).await?;
+                assert!(!tree.exists());
+            }
+        }
+        Ok(())
     }
     #[tokio::test]
     async fn advisory_r2_global_resume_pruning_uses_current_trust() -> Result<()> {

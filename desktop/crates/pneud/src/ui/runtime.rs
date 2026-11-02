@@ -410,6 +410,7 @@ mod tests {
         use pneu_proto::{Hash, Id};
         let targets: Vec<_> = (1..=4)
             .map(|n| SendTarget {
+                folder_reason: None,
                 device: Id::from_bytes([n; 16]),
                 name: format!("Device {n}"),
                 generation: n as u64,

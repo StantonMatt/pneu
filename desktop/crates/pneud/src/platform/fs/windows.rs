@@ -642,6 +642,11 @@ pub(crate) struct Folder {
     pub file: Arc<File>,
 }
 impl Folder {
+    pub fn read(path: &Path) -> Result<Self> {
+        Ok(Self {
+            file: Arc::new(walk(path, false, false, READ)?),
+        })
+    }
     pub fn open(path: &Path, create: bool) -> Result<Self> {
         Ok(Self {
             file: Arc::new(walk(path, create, false, WRITE)?),
@@ -1070,9 +1075,14 @@ pub(crate) fn identity(file: &File) -> Result<Identity> {
 pub(crate) fn identity_at(parent: &File, name: impl AsRef<OsStr>) -> Result<Identity> {
     identity(&metadata_file(parent, name)?)
 }
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Version(Identity, i64, i64, i64, i64);
 impl Version {
+    /// Folder capture uses identity, size and mtime; metadata-only changes are harmless.
+    pub fn same_content_metadata(&self, other: &Self) -> bool {
+        self.0 == other.0 && self.1 == other.1 && self.3 == other.3
+    }
+
     /// Finish a Pneu writer after its last write, before retaining ownership.
     pub fn record_written(file: &File) -> Result<Self> {
         file.sync_all()?;
@@ -1212,6 +1222,21 @@ fn reopen(file: &File, access: u32) -> std::io::Result<File> {
 pub(crate) fn read_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
     reopen(file, READ)?.seek_read(bytes, offset)
 }
+/// Positional write on a writable handle. Callers never rely on its cursor.
+pub(crate) fn write_all_at(file: &File, mut bytes: &[u8], mut offset: u64) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        match file.seek_write(bytes, offset) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                bytes = &bytes[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
 pub(crate) fn copy_prefix(source: &File, destination: &File, prefix: u64) -> Result<()> {
     let mut source = reopen(source, READ)?;
     (&*destination).seek(SeekFrom::Start(0))?;
@@ -1235,6 +1260,12 @@ pub(crate) fn sync_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 pub(crate) fn entries(parent: &File) -> Result<impl Iterator<Item = Result<OsString>>> {
+    entries_limited(parent, usize::MAX)
+}
+pub(crate) fn entries_limited(
+    parent: &File,
+    limit: usize,
+) -> Result<impl Iterator<Item = Result<OsString>>> {
     // Serialize this backend's shared directory cursors. Collect before
     // returning so recursive cleanup never holds the enumeration lock.
     static ENUMERATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1287,6 +1318,9 @@ pub(crate) fn entries(parent: &File) -> Result<impl Iterator<Item = Result<OsStr
             });
             if name != "." && name != ".." {
                 names.push(Ok(name));
+                if names.len() > limit {
+                    return Ok(names.into_iter());
+                }
             }
             if info.NextEntryOffset == 0 {
                 break;
@@ -1385,3 +1419,34 @@ pub(crate) fn known_folder(id: &windows_sys::core::GUID) -> Result<PathBuf> {
 mod tests;
 #[cfg(test)]
 pub(crate) use tests::TestDrive;
+
+pub(crate) fn capture_entry(
+    parent: &File,
+    name: impl AsRef<OsStr>,
+) -> Result<(super::CaptureType, Identity)> {
+    let file = metadata_file(parent, name)?;
+    let meta = file.metadata()?;
+    Ok((
+        if meta.is_dir() {
+            super::CaptureType::Directory
+        } else if meta.is_file() {
+            super::CaptureType::File
+        } else {
+            super::CaptureType::Special
+        },
+        identity(&file)?,
+    ))
+}
+
+/// Flush file or directory metadata without a per-file device barrier.
+pub(crate) fn sync_plain(file: &File) -> Result<()> {
+    file.sync_all()?;
+    Ok(())
+}
+
+pub(crate) fn is_unsupported_name(error: &anyhow::Error) -> bool {
+    error.chain().any(|e| {
+        e.downcast_ref::<std::io::Error>()
+            .is_some_and(|e| matches!(e.raw_os_error(), Some(123 | 206 | 1113)))
+    })
+}

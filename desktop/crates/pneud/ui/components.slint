@@ -5,7 +5,7 @@ import { Pneu, Tone, Icons, WindowFocus } from "theme.slint";
 export global Interaction { in-out property <bool> modal-open; }
 
 // A link is a quiet accent-coloured action, such as "Can't connect?".
-export enum ButtonKind { neutral, danger, row, primary, tonal, link }
+export enum ButtonKind { neutral, danger, row, primary, tonal, link, menu }
 
 // Keyboard focus shows a ring; pointer focus doesn't.
 component FocusTarget inherits FocusScope {
@@ -51,17 +51,18 @@ export component PneuButton inherits Rectangle {
     in property <string> focus-key;
     changed focus-key => { if root.autofocus { focus-timer.running = true; } }
     callback clicked();
+    private property <bool> is-menu: kind == ButtonKind.menu;
     private property <bool> is-row: kind == ButtonKind.row;
     private property <bool> is-link: kind == ButtonKind.link;
     private property <length> inset: is-link ? 8px : 14px;
     min-width: content.preferred-width + 2 * inset;
     max-width: is-row || wide ? 10000px : self.min-width;
     horizontal-stretch: is-row || wide ? 1 : 0;
-    min-height: is-row ? 44px : is-link ? 24px : 30px;
+    min-height: is-row ? 44px : is-menu ? 38px : is-link ? 24px : 30px;
     max-height: self.min-height;
     border-radius: is-row ? 0px : 8px;
     background: is-row ? (touch.pressed ? Pneu.button : transparent)
-        : is-link ? transparent
+        : is-link || is-menu ? transparent
         : kind == ButtonKind.danger ? Pneu.danger-fill
         : kind == ButtonKind.primary ? Pneu.accent
         : kind == ButtonKind.tonal ? Pneu.accent-soft : Pneu.button;
@@ -89,7 +90,7 @@ export component PneuButton inherits Rectangle {
     }
     content := HorizontalLayout {
         x: root.inset; width: parent.width - 2 * root.inset; height: parent.height;
-        alignment: root.is-row ? start : center;
+        alignment: root.is-row || root.is-menu ? start : center;
         spacing: 6px;
         if root.icon.width > 0: VerticalLayout {
             alignment: center;
@@ -122,6 +123,8 @@ export component IconButton inherits Rectangle {
     private property <bool> interactive: !Interaction.modal-open || dialog-control;
     in property <bool> enabled: true;
     in property <image> icon;
+    in property <length> icon-size: 18px;
+    in property <color> icon-color: root.tint;
     in property <string> label;
     callback clicked();
     width: 28px; height: 28px; border-radius: 7px;
@@ -131,7 +134,7 @@ export component IconButton inherits Rectangle {
     accessible-label: label;
     accessible-enabled: root.enabled && root.interactive;
     accessible-action-default => { if root.enabled && root.interactive { root.clicked(); } }
-    Image { accessible-role: none; x: 5px; y: 5px; width: 18px; height: 18px; source: root.icon; colorize: root.tint; }
+    Image { accessible-role: none; x: (parent.width - root.icon-size)/2; y: (parent.height - root.icon-size)/2; width: root.icon-size; height: root.icon-size; source: root.icon; colorize: root.icon-color; }
     fs := FocusTarget { active: root.enabled && root.interactive; activate => { if root.enabled && root.interactive { root.clicked(); } } }
     touch := TouchArea { enabled: root.enabled && root.interactive; clicked => { fs.ring = false; fs.focus(); root.clicked(); } }
 }

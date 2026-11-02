@@ -10,7 +10,7 @@ use crate::{
     ui::{
         notifications::Notice,
         portal::Interaction,
-        windows_toast_model::{Record, Targets},
+        windows_toast_model::{Record, Targets, can_burst},
     },
 };
 use std::{
@@ -635,9 +635,15 @@ impl PcActions for DesktopActions {
             .map(|_| ())
     }
     async fn notify_send_admission_failure(&self, reason: &str) -> Result<()> {
-        let mut n = Notice::new("Couldn't send files");
-        n.body = crate::ui::notifications::escape(reason);
-        self.notice(n, Vec::new(), None, 0, None).await.map(|_| ())
+        self.notice(
+            crate::ui::notifications::Notice::admission_failure(reason),
+            Vec::new(),
+            None,
+            0,
+            None,
+        )
+        .await
+        .map(|_| ())
     }
     async fn notify_delivery(
         &self,
@@ -645,10 +651,7 @@ impl PcActions for DesktopActions {
         device_name: &str,
     ) -> Result<()> {
         let (notice, retry) = if transfer.state == "sent" {
-            (
-                Notice::sent(&transfer.file_name, &[device_name.into()]),
-                None,
-            )
+            (Notice::sent_transfer(transfer, device_name), None)
         } else {
             (
                 Notice::send_failed(
@@ -778,7 +781,7 @@ impl PcActions for DesktopActions {
         let mut kind = Some(metadata.kind);
         let mut all_saved = saved;
         let mut started = arrived;
-        if save_error.is_none()
+        if can_burst(metadata, save_error)
             && let Some(previous) = burst.as_ref()
             && previous.source == file.source
             && arrived.saturating_duration_since(previous.arrived)
@@ -820,7 +823,7 @@ impl PcActions for DesktopActions {
                 replaces,
             )
             .await?;
-        *burst = if save_error.is_none() {
+        *burst = if can_burst(metadata, save_error) {
             Some(Burst {
                 id,
                 paths,

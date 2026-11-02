@@ -3,6 +3,13 @@ use super::{notice_lifecycle::Lifecycle, notifications::Notice};
 use anyhow::{Context, Result};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
+pub(crate) fn can_burst(
+    metadata: &pneu_proto::FileBegin,
+    save_error: Option<pneu_proto::NackCode>,
+) -> bool {
+    metadata.folder.is_none() && save_error.is_none()
+}
+
 pub(crate) struct Record<T> {
     pub id: u32,
     pub session: String,
@@ -222,6 +229,57 @@ pub(crate) fn phone_xml(notice: &super::notifications::PhoneNotice) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn folders_neither_replace_nor_start_file_notification_bursts() -> Result<()> {
+        use pneu_proto::{FileBegin, FileKind, Hash, Id, NackCode};
+        let mut metadata = FileBegin {
+            transfer_id: Id::from_bytes([1; 16]),
+            file_name: "report.pdf".into(),
+            mime: "application/pdf".into(),
+            size: 3,
+            sha256: Hash::new("ab".repeat(32))?,
+            kind: FileKind::File,
+            created_at: 0,
+            source_media_id: None,
+            hlc: None,
+            source_device: None,
+            sensitive: false,
+            resume: None,
+            folder: None,
+        };
+        let mut targets = Targets::default();
+        let (first, _) = targets.issue(Notice::new("report.pdf"), (), 0)?;
+        assert!(can_burst(&metadata, None));
+        for error in [NackCode::DiskFull, NackCode::NotWritable] {
+            assert!(!can_burst(&metadata, Some(error)));
+        }
+
+        metadata.folder = Some(Box::new(pneu_proto::Folder { manifest_len: 100 }));
+        assert!(!can_burst(&metadata, None));
+        let replaces = if can_burst(&metadata, None) {
+            first.id
+        } else {
+            0
+        };
+        let mut notice = Notice::new("Trip");
+        notice.actions = vec![("default", "Open"), ("open", "Open")];
+        let (folder, retired) = targets.issue(notice, (), replaces)?;
+        assert!(retired.is_empty());
+        assert_ne!(folder.id, first.id);
+        assert!(first.life.active());
+
+        // A folder also cannot become the candidate replaced by the next file.
+        let candidate = can_burst(&metadata, None).then_some(folder.id);
+        metadata.folder = None;
+        assert!(can_burst(&metadata, None));
+        let (next, retired) = targets.issue(Notice::new("next.pdf"), (), candidate.unwrap_or(0))?;
+        assert!(retired.is_empty());
+        assert_ne!(next.id, folder.id);
+        assert!(targets.take(&folder.argument("open")).is_ok());
+        assert!(first.life.active());
+        Ok(())
+    }
+
     #[tokio::test(start_paused = true)]
     async fn rejects_wrong_session_unknown_expired_replaced_and_unoffered_actions() -> Result<()> {
         let mut targets = Targets::default();

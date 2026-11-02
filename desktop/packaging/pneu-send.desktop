@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Service
-MimeType=application/octet-stream;
+MimeType=application/octet-stream;inode/directory;
 Actions=pneuSend;
 X-KDE-Priority=TopLevel
 

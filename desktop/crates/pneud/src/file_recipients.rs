@@ -103,6 +103,7 @@ mod tests {
     fn modes_share_eligibility_but_keep_explicit_offline_and_captured_authority() -> Result<()> {
         let mut targets: Vec<_> = (1..=4)
             .map(|n| SendTarget {
+                folder_reason: None,
                 device: Id::from_bytes([n; 16]),
                 name: format!("Device {n}"),
                 generation: n as u64,

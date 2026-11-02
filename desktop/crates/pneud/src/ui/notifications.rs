@@ -217,7 +217,80 @@ impl Notice {
     pub fn send_failed(file: &str, device: &str, reason: &str) -> Self {
         let mut n = Self::new(format!("Couldn't send {file} to {}", label(device)));
         n.body = escape(&send_failure_reason(device, reason));
-        n.actions.push(("retry", "Retry"));
+        if retryable_reason(reason) {
+            n.actions.push(("retry", "Retry"));
+        }
+        n
+    }
+    pub(crate) fn admission_failure(reason: &str) -> Self {
+        if reason.ends_with(" is empty")
+            || reason.contains(" is over ")
+            || reason == "Folder contains more than 10,000 entries"
+            || reason.ends_with(" can't receive folders yet")
+        {
+            Self::new(reason)
+        } else {
+            let mut notice = Self::new("Couldn't send files");
+            notice.body = escape(reason);
+            notice
+        }
+    }
+    pub(crate) fn sent_transfer(transfer: &crate::outbox::Transfer, device: &str) -> Self {
+        let mut n = Self::sent(&transfer.file_name, &[device.into()]);
+        if let Some(details) = &transfer.folder {
+            let mut lines = Vec::new();
+            if details.failed > 0 {
+                let names = details
+                    .names
+                    .iter()
+                    .map(|n| escape(&label(n)))
+                    .collect::<Vec<_>>();
+                let list = if details.failed > 3 {
+                    names.join(", ")
+                } else {
+                    match names.as_slice() {
+                        [] => String::new(),
+                        [one] => one.clone(),
+                        [a, b] => format!("{a} and {b}"),
+                        [a, b, c, ..] => format!("{a}, {b} and {c}"),
+                    }
+                };
+                lines.push(format!(
+                    "{} {} couldn't be sent: {}{}",
+                    crate::folders::grouped(details.failed),
+                    if details.failed == 1 { "item" } else { "items" },
+                    list,
+                    if details.failed > 3 {
+                        format!(" and {} more", crate::folders::grouped(details.failed - 3))
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
+            let skipped = details.links + details.special;
+            if skipped > 0 {
+                lines.push(if details.special > 0 {
+                    if skipped == 1 {
+                        "1 special file skipped".into()
+                    } else {
+                        format!(
+                            "{} links and special files skipped",
+                            crate::folders::grouped(skipped)
+                        )
+                    }
+                } else if skipped == 1 {
+                    "1 link skipped".into()
+                } else {
+                    format!("{} links skipped", crate::folders::grouped(skipped))
+                });
+            }
+            if !lines.is_empty() {
+                n.body = lines.join("\n");
+                n.transient = false;
+                n.urgency = 1;
+                n.expires = -1;
+            }
+        }
         n
     }
     pub fn port(port: u16) -> Self {
@@ -232,9 +305,18 @@ fn label(name: &str) -> String {
         .map(|c| if c.is_whitespace() { ' ' } else { c })
         .collect()
 }
+pub(crate) fn retryable_reason(reason: &str) -> bool {
+    reason != "Can't receive folders yet" && reason != crate::folders::SourceChanged.to_string()
+}
 pub(crate) fn send_failure_reason(device: &str, reason: &str) -> String {
     let device = label(device);
     match reason {
+        reason if reason.starts_with("Needs ") && reason.ends_with(" free") => {
+            format!("{device} needs {}", &reason[6..])
+        }
+        "Folder changed after Preparing. Send the folder again." => reason.into(),
+        "Needs a Pneu update" => format!("{device} needs a Pneu update"),
+        "Can't receive folders yet" => format!("{device} can't receive folders yet"),
         "Connection lost" | "Connection interrupted" => "Connection lost".into(),
         "UnsupportedKind" | "unsupported_kind" => {
             format!("Update Pneu on {device} to send this kind of file")
@@ -352,6 +434,70 @@ mod tests {
         );
         assert_eq!((n.urgency, n.transient, n.expires), (0, true, 4000));
         assert!(n.actions.is_empty() && n.urls.is_empty());
+    }
+    #[test]
+    fn folder_skip_and_refusal_notification_contract() {
+        let mut row = crate::outbox::Transfer::received(
+            pneu_proto::Id::from_bytes([1; 16]),
+            &metadata(FileKind::File),
+        );
+        row.file_name = "Trip".into();
+        row.folder = Some(crate::folders::Details {
+            items: 3,
+            failed: 4,
+            links: 2,
+            names: vec!["a.txt".into(), "b.txt".into(), "c.txt".into()],
+            ..Default::default()
+        });
+        let notice = Notice::sent_transfer(&row, "MacBook Air");
+        assert_eq!(notice.summary, "Trip sent to MacBook Air");
+        assert_eq!(
+            notice.body,
+            "4 items couldn't be sent: a.txt, b.txt, c.txt and 1 more\n2 links skipped"
+        );
+        assert!(!notice.transient);
+        assert!(notice.actions.is_empty());
+        row.folder.as_mut().unwrap().diagnostic_count = 1;
+        row.folder
+            .as_mut()
+            .unwrap()
+            .diagnostics
+            .push("Docs: Couldn't enumerate subtree".into());
+        assert!(
+            !Notice::sent_transfer(&row, "MacBook Air")
+                .body
+                .contains("Couldn't enumerate subtree")
+        );
+        let refused = Notice::send_failed("Trip", "Galaxy S25+", "Can't receive folders yet");
+        assert_eq!(refused.body, "Galaxy S25+ can't receive folders yet");
+        assert!(refused.actions.is_empty());
+        let changed = Notice::send_failed(
+            "Trip",
+            "Desktop",
+            &crate::folders::SourceChanged.to_string(),
+        );
+        assert_eq!(changed.body, crate::folders::SourceChanged.to_string());
+        assert!(changed.actions.is_empty());
+        row.folder.as_mut().unwrap().links = 0;
+        row.folder.as_mut().unwrap().special = 1;
+        assert!(
+            Notice::sent_transfer(&row, "Desktop")
+                .body
+                .ends_with("1 special file skipped")
+        );
+        row.folder.as_mut().unwrap().failed = 1204;
+        assert!(
+            Notice::sent_transfer(&row, "Desktop")
+                .body
+                .starts_with("1,204 items couldn't be sent:")
+        );
+        let empty = Notice::admission_failure("Trip is empty");
+        assert_eq!(empty.summary, "Trip is empty");
+        assert!(empty.body.is_empty());
+        assert_eq!(
+            send_failure_reason("MacBook Air", "Needs 1.8 GB free"),
+            "MacBook Air needs 1.8 GB free"
+        );
     }
     #[test]
     fn blocked_copy_is_device_neutral_and_decision_actions_are_negative_first() {

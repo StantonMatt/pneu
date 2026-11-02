@@ -39,6 +39,29 @@ impl Core {
                     None
                 };
                 outbox::SendTarget {
+                    folder_reason: if d.role == "phone"
+                        && self
+                            .outbox
+                            .supports_folders(&d.device, generation.unwrap_or_default())
+                            != Some(true)
+                    {
+                        Some("Can't receive folders yet".into())
+                    } else if connected
+                        .map(|s| {
+                            !s.capabilities.iter().any(|c| c == "folder_v1")
+                                || !s.capabilities.iter().any(|c| c == "file_resume_v1")
+                        })
+                        .or_else(|| {
+                            generation
+                                .and_then(|g| self.outbox.supports_folders(&d.device, g))
+                                .map(|s| !s)
+                        })
+                        == Some(true)
+                    {
+                        Some("Needs a Pneu update".into())
+                    } else {
+                        None
+                    },
                     device: d.device.clone(),
                     name: d.name.clone(),
                     generation: generation.unwrap_or_default(),
@@ -214,12 +237,35 @@ impl Core {
                 }
                 match result {
                     Ok((id, failures)) => {
+                        if core.config().notification_preview && !core.window_focused() {
+                            let snapshot = core.ui_snapshot();
+                            for transfer in snapshot.transfers.iter().filter(|t| {
+                                t.transfer_id == id && t.folder.is_some() && t.state == "failed"
+                            }) {
+                                let name = snapshot
+                                    .devices
+                                    .iter()
+                                    .find(|d| d.device == transfer.device)
+                                    .map(|d| d.name.clone())
+                                    .unwrap_or_else(|| "device".into());
+                                core.action_queue.delivery(transfer.clone(), name);
+                            }
+                        }
                         accepted.push(serde_json::json!({"path":path,"transfer_id":id}));
                         for failure in failures {
                             rejected.push(serde_json::json!({"path":path,"device":failure.device,"reason":failure.reason}));
                         }
                     }
                     Err(error) => {
+                        let text = error.to_string();
+                        if (text.ends_with(" is empty")
+                            || text.contains(" is over ")
+                            || text == "Folder contains more than 10,000 entries"
+                            || text.ends_with(" can't receive folders yet"))
+                            && !core.window_focused()
+                        {
+                            core.notify_send_admission_failure(&text).await;
+                        }
                         let failure = error.downcast_ref::<outbox::AdmissionFailure>();
                         if let Some(failure) = failure {
                             for recipient in &failure.rejected {
@@ -476,11 +522,107 @@ impl Core {
             && self.outbox.current(delivery)
     }
 }
+/// What a delivery streams: a frozen staged file, or a folder read in place.
+pub(crate) enum Payload {
+    File(tokio::fs::File),
+    Folder(Option<Box<crate::folders::FolderSource>>),
+}
+impl From<tokio::fs::File> for Payload {
+    fn from(file: tokio::fs::File) -> Self {
+        Self::File(file)
+    }
+}
+impl From<crate::folders::FolderSource> for Payload {
+    fn from(source: crate::folders::FolderSource) -> Self {
+        Self::Folder(Some(Box::new(source)))
+    }
+}
+impl Payload {
+    async fn folder<T: Send + 'static>(
+        &mut self,
+        work: impl FnOnce(&mut crate::folders::FolderSource) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let Self::Folder(slot) = self else {
+            bail!("not a folder payload");
+        };
+        let mut source = slot.take().context("folder source in use")?;
+        let (source, result) = tokio::task::spawn_blocking(move || {
+            let result = work(&mut source);
+            (source, result)
+        })
+        .await?;
+        *slot = Some(source);
+        result
+    }
+    async fn seek(&mut self, offset: u64) -> Result<()> {
+        if let Self::File(file) = self {
+            file.seek(std::io::SeekFrom::Start(offset)).await?;
+            return Ok(());
+        }
+        self.folder(move |source| source.seek(offset)).await
+    }
+    async fn read(&mut self, buffer: &mut [u8]) -> Result<usize> {
+        if let Self::File(file) = self {
+            return Ok(file.read(buffer).await?);
+        }
+        let len = buffer.len();
+        let data = self
+            .folder(move |source| {
+                let mut data = vec![0; len];
+                let n = source.read(&mut data)?;
+                data.truncate(n);
+                Ok(data)
+            })
+            .await?;
+        buffer[..data.len()].copy_from_slice(&data);
+        Ok(data.len())
+    }
+    /// Check that nothing follows the declared stream, including empty files.
+    async fn finish(&mut self) -> Result<()> {
+        if matches!(self, Self::File(_)) {
+            return Ok(());
+        }
+        self.folder(|source| source.finish()).await
+    }
+}
+/// A folder file changed after Preparing: fail the row with the clear error,
+/// and CANCEL so the receiver purges what it kept (no END is sent).
+async fn source_changed<W: tokio::io::AsyncWrite + Unpin>(
+    core: &Core,
+    writer: &mut W,
+    work: &FileWrite,
+    resumable: bool,
+) -> Result<bool> {
+    core.outbox.fail_changed(work.delivery.clone()).await?;
+    core.delivery_finished(&work.delivery);
+    if resumable {
+        send(
+            writer,
+            &Message::Cancel(pneu_proto::Cancel {
+                transfer_id: work.delivery.begin.transfer_id.clone(),
+            }),
+        )
+        .await?;
+        core.outbox
+            .cancel_sent(
+                work.delivery.authority.device.clone(),
+                work.delivery.begin.transfer_id.clone(),
+                work.delivery.authority.generation,
+            )
+            .await?;
+    }
+    Ok(false)
+}
+fn is_source_changed(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::folders::SourceChanged>()
+        .is_some()
+}
 pub(super) struct FileWrite {
     pub delivery: Delivery,
     pub connection: u64,
     pub mesh: bool,
-    pub file: Option<tokio::fs::File>,
+    pub file: Option<Payload>,
     pub ready: Option<tokio::sync::oneshot::Receiver<Option<u64>>>,
     pub receipt_ready: Arc<AtomicBool>,
 }
@@ -570,6 +712,21 @@ pub(super) async fn transmit_file<W: tokio::io::AsyncWrite + Unpin>(
     let mut file = work.file.take().context("verified file reader")?;
     let mut begin = work.delivery.begin.clone();
     let resumable = work.ready.is_some();
+    if begin.folder.is_some() {
+        ensure!(
+            resumable
+                && core
+                    .sessions
+                    .lock()
+                    .expect("sessions")
+                    .sessions
+                    .get(&work.delivery.authority.device)
+                    .is_some_and(|s| s.id == work.connection
+                        && s.capabilities.iter().any(|c| c == "folder_v1")
+                        && s.capabilities.iter().any(|c| c == "file_resume_v1")),
+            "folder receiver needs a Pneu update"
+        );
+    }
     if resumable {
         begin.resume = Some(true);
     }
@@ -605,7 +762,13 @@ pub(super) async fn transmit_file<W: tokio::io::AsyncWrite + Unpin>(
             }
         }
     }
-    file.seek(std::io::SeekFrom::Start(offset)).await?;
+    match file.seek(offset).await {
+        Ok(()) => {}
+        Err(error) if is_source_changed(&error) => {
+            return source_changed(core, &mut *writer.writer, &work, resumable).await;
+        }
+        Err(error) => return Err(error),
+    }
     core.outbox.progress(&work.delivery, offset);
     let mut checkpoint = outbox::ProgressCheckpoint::new(offset);
     let mut buffer = vec![0; CHUNK_SIZE];
@@ -623,7 +786,13 @@ pub(super) async fn transmit_file<W: tokio::io::AsyncWrite + Unpin>(
             }
             bail!("file delivery cancelled");
         }
-        let n = file.read(&mut buffer).await?;
+        let n = match file.read(&mut buffer).await {
+            Ok(n) => n,
+            Err(error) if is_source_changed(&error) => {
+                return source_changed(core, &mut *writer.writer, &work, resumable).await;
+            }
+            Err(error) => return Err(error),
+        };
         ensure!(n > 0, "staged file truncated");
         send_pending_messages(core, &mut *writer.writer, priority, normal, Some(reports)).await?;
         send_pending_clipboard_text(
@@ -667,6 +836,13 @@ pub(super) async fn transmit_file<W: tokio::io::AsyncWrite + Unpin>(
         )
         .await?;
         return Ok(false);
+    }
+    match file.finish().await {
+        Ok(()) => {}
+        Err(error) if is_source_changed(&error) => {
+            return source_changed(core, &mut *writer.writer, &work, resumable).await;
+        }
+        Err(error) => return Err(error),
     }
     if resumable {
         core.optional(

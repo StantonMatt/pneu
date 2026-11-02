@@ -1097,6 +1097,7 @@ impl Store {
                         return Ok(());
                     }
                     tx.execute("INSERT INTO outbox_capabilities SELECT id,generation,? FROM peers WHERE id=? ON CONFLICT(device) DO UPDATE SET generation=excluded.generation,files=excluded.files",params![hello.capabilities.iter().any(|c|c=="files"),hello.device_id.as_str()])?;
+                    tx.execute("INSERT INTO folder_capabilities SELECT id,generation,? FROM peers WHERE id=? ON CONFLICT(device) DO UPDATE SET generation=excluded.generation,supported=excluded.supported",params![hello.capabilities.iter().any(|c|c=="files") && hello.capabilities.iter().any(|c|c=="folder_v1") && hello.capabilities.iter().any(|c|c=="file_resume_v1"),hello.device_id.as_str()])?;
                     tx.execute("INSERT INTO settings_support VALUES(?,?) ON CONFLICT(device) DO UPDATE SET supported=excluded.supported",params![hello.device_id.as_str(),hello.capabilities.iter().any(|c|c=="mesh")])?;
                     let role = match hello.role {
                         Some(pneu_proto::DeviceRole::Computer) => "computer",
@@ -1468,10 +1469,21 @@ impl Store {
             store.fault("commit_file_checked")?;
             let begin = verified.metadata();
             ensure!(
-                stage.0.file.metadata()?.len() == begin.size,
+                stage.0.file.metadata()?.len() == spooled_len(&begin),
                 "staging size mismatch"
             );
-            stage.0.file.sync_all()?;
+            if begin.folder.is_some() {
+                stage
+                    .0
+                    .tree
+                    .lock()
+                    .expect("folder tree")
+                    .as_ref()
+                    .context("missing folder tree")?
+                    .verify(&stage)?;
+            } else {
+                stage.0.file.sync_all()?;
+            }
             let mut obsolete_cache = None;
             // Serialize journal changes and ownership publication/retirement.
             let mut owners = store.cache_owners.lock().expect("cache ownership");
@@ -1554,9 +1566,10 @@ impl Store {
             store.fault("commit_cache")?;
             let begin = verified.metadata();
             ensure!(
-                stage.0.file.metadata()?.len() == begin.size,
+                stage.0.file.metadata()?.len() == spooled_len(&begin),
                 "cache staging size mismatch"
             );
+            ensure!(begin.folder.is_none(), "folders use the direct tree commit");
             stage.0.file.sync_all()?;
             let mut owners = store.cache_owners.lock().expect("cache ownership");
             let key = (device.clone(), begin.transfer_id.clone());
@@ -1825,6 +1838,10 @@ fn replace_outgoing(
     )?;
     Ok(())
 }
+/// Bytes held by a stage file: a folder's holds only its manifest.
+fn spooled_len(begin: &FileBegin) -> u64 {
+    begin.folder.as_ref().map_or(begin.size, |f| f.manifest_len)
+}
 fn capacity(folder: &Folder, reserve: u64) -> Result<()> {
     ensure!(
         folder.space()? >= reserve.saturating_add(256 * 1024),
@@ -1878,6 +1895,9 @@ pub(crate) fn save_failure_code(error: &anyhow::Error) -> NackCode {
         }
         if cause.downcast_ref::<ReceiptConflict>().is_some() {
             return NackCode::IdConflict;
+        }
+        if let Some(code) = crate::folders::failure(cause) {
+            return code;
         }
         if let Some(code) = crate::platform::fs::storage_failure(cause) {
             return code;

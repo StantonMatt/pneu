@@ -74,7 +74,7 @@ async fn resume_sender_ready_offsets_early_nack_and_legacy_wire() -> Result<()> 
         let file=core.outbox.reader(delivery.clone()).await?;
         core.outbox.negotiate_resume(delivery.clone(),selected.is_some()).await?;
         let ready=selected.map(|offset|{let (tx,rx)=tokio::sync::oneshot::channel();tx.send(offset).unwrap();rx});
-        let work=FileWrite{delivery:delivery.clone(),connection:1,mesh:false,file:Some(file),ready,receipt_ready:Arc::new(AtomicBool::new(false))};
+        let work=FileWrite{delivery:delivery.clone(),connection:1,mesh:false,file:Some(file.into()),ready,receipt_ready:Arc::new(AtomicBool::new(false))};
         let (_p,mut priority)=mpsc::channel(8);let (_n,normal)=mpsc::channel(8);let mut normal=phone_controls::FrameQueue::from(normal);let (_t,mut text)=mpsc::channel(8);let (reports,_)=mpsc::channel(8);
         let mut bytes=Vec::new();
         let sent=transmit_file(&core,&mut bytes,work,&mut priority,&mut normal,&mut text,&reports).await?;

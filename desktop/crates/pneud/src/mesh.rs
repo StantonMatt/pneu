@@ -249,6 +249,7 @@ impl Core {
             capabilities: vec![
                 "files".into(),
                 "file_resume_v1".into(),
+                "folder_v1".into(),
                 "clipboard_text".into(),
                 "clipboard_image".into(),
                 "mesh".into(),
@@ -3632,6 +3633,141 @@ mod tests {
         server.await??;
         let _ = tokio::time::timeout(Duration::from_secs(5), second).await?;
         a.shutdown_actions().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn folder_resume_after_connection_drop_preserves_exact_tree() -> Result<()> {
+        let (da, a, la) = core().await?;
+        let (_db, b, lb) = core().await?;
+        drop(la);
+        let address = lb.local_addr()?.to_string();
+        computer_route(&a, &b, address.clone()).await?;
+        bind(&b, &a).await?;
+        a.set_setting("queue_offline".into(), false.into()).await?;
+        *b.file_write_delay.lock().unwrap() = Duration::from_millis(15);
+        let server = Task::spawn(b.clone().serve(lb, false));
+        let dialing = a.clone();
+        let route = address.clone();
+        let pin = b.identity.fingerprint.clone();
+        let first = Task::spawn(resume_test_link(dialing, route, pin));
+        until(|| a.connected_devices().contains(&b.identity.device_id)).await?;
+        let bytes: Vec<u8> = (0..12 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let source = da.path().join("Trip");
+        std::fs::create_dir_all(source.join("empty/nested"))?;
+        std::fs::create_dir_all(source.join("docs"))?;
+        std::fs::write(source.join("first.txt"), b"first")?;
+        std::fs::write(source.join("docs/resume.bin"), &bytes)?;
+        std::fs::write(source.join("zero"), b"")?;
+        let mut events = b.subscribe();
+        let reply = a
+            .send_files(
+                vec![source],
+                crate::outbox::Targets::Devices(vec![b.identity.device_id.clone()]),
+            )
+            .await?;
+        let operation = Id::new(reply["operation"].as_str().unwrap().to_owned())?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Event::TransferProgress { received, .. } = events.recv().await?
+                    && received >= 5 * 1024 * 1024
+                {
+                    break;
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        b.sessions.lock().unwrap().sessions[&a.identity.device_id]
+            .close
+            .send_replace(Some(CloseReason::Error(ErrorCode::Closing)));
+        let _ = first.await?;
+        until(|| {
+            a.ui_snapshot()
+                .transfers
+                .iter()
+                .any(|t| t.operation == operation && t.state == "failed")
+        })
+        .await?;
+        until(|| b.connected_devices().is_empty()).await?;
+        tokio::time::timeout(Duration::from_secs(10), b.store.drain()).await?;
+        let sender = a.identity.device_id.clone();
+        let durable = b
+            .store
+            .call(move |c| {
+                let record: String = c.query_row(
+                    "SELECT record FROM file_partials WHERE device=?",
+                    [sender.as_str()],
+                    |r| r.get(0),
+                )?;
+                Ok(serde_json::from_str::<Value>(&record)?["offset"]
+                    .as_u64()
+                    .unwrap())
+            })
+            .await?;
+        assert!(
+            durable > 0 && durable < bytes.len() as u64,
+            "durable prefix {durable}"
+        );
+        // A sender can be ahead of the receiver's fsynced prefix. Deliberately
+        // persist a misleading UI offset; READY must still select the suffix.
+        let advisory_offset = bytes.len() as i64;
+        a.store
+            .call(move |c| {
+                c.execute(
+                    "UPDATE outbox_deliveries SET sent=? WHERE state='failed'",
+                    [advisory_offset],
+                )?;
+                Ok(())
+            })
+            .await?;
+        let mut events = b.subscribe();
+        a.retry_transfer(operation.clone(), b.identity.device_id.clone())
+            .await?;
+        let dialing = a.clone();
+        let pin = b.identity.fingerprint.clone();
+        let second = Task::spawn(resume_test_link(dialing, address, pin));
+        let resumed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Event::TransferProgress { received, .. } = events.recv().await? {
+                    return Ok::<_, anyhow::Error>(received);
+                }
+            }
+        })
+        .await??;
+        assert_eq!(
+            resumed, durable,
+            "first receiver progress is the READY offset"
+        );
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !a
+                .ui_snapshot()
+                .transfers
+                .iter()
+                .any(|t| t.operation == operation && t.state == "sent")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(
+            std::fs::read(b.config().save_path.join("Trip/docs/resume.bin"))?,
+            bytes
+        );
+        assert_eq!(
+            std::fs::read(b.config().save_path.join("Trip/first.txt"))?,
+            b"first"
+        );
+        assert!(b.config().save_path.join("Trip/empty/nested").is_dir());
+        assert_eq!(
+            std::fs::metadata(b.config().save_path.join("Trip/zero"))?.len(),
+            0
+        );
+        a.request_shutdown();
+        b.request_shutdown();
+        server.await??;
+        let _ = tokio::time::timeout(Duration::from_secs(5), second).await?;
+        a.shutdown_actions().await?;
+        b.shutdown_actions().await?;
         Ok(())
     }
     #[tokio::test]

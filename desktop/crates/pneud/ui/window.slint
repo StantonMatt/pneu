@@ -42,6 +42,7 @@ export struct RecentItem {
     detail: string,
     detail-tone: Tone,
     picture: bool,
+    folder: bool,
     video: bool,
     clipboard: bool,
     progress: float,
@@ -83,7 +84,7 @@ export enum LinkRow { none, link, waiting, theirs, asked, update, separate }
 // The device page's last card: the row above Unpair or Remove from all devices.
 export struct DeviceLink { row: LinkRow, title: string, sub: string, via: string, member: bool, waiting: int }
 
-export struct DropItem { name: string, enabled: bool }
+export struct DropItem { name: string, enabled: bool, sub: string }
 export struct DropGeometry { x: float, y: float, width: float, height: float, scroll: float }
 
 export global Ui {
@@ -203,6 +204,9 @@ export global Ui {
     // "" sends to every connected device (or asks, with Choose devices each time).
     callback send-files(string);
     callback ring-phone(string, string, bool);
+    callback send-folder(string);
+    in property <string> folder-reason;
+    in property <string> device-folder-reason;
     callback send-clipboard();
     callback cancel-item(string);
     callback retry-item(string);
@@ -354,7 +358,7 @@ component RecentRow inherits NavRow {
                 width: 36px; height: 36px; border-radius: 8px; background: Pneu.button;
                 Image { accessible-role: none;
                     x: 9px; y: 9px; width: 18px; height: 18px; colorize: Pneu.text2;
-                    source: root.item.clipboard ? Icons.paste : root.item.picture ? Icons.picture : root.item.video ? Icons.video : Icons.file;
+                    source: root.item.folder ? Icons.folder : root.item.clipboard ? Icons.paste : root.item.picture ? Icons.picture : root.item.video ? Icons.video : Icons.file;
                 }
             }
         }
@@ -578,6 +582,45 @@ component HelpRow inherits HorizontalLayout {
     }
 }
 
+// Same file action on every platform, with separate folder selection where
+// native pickers cannot choose files and directories together.
+component SendButton inherits Rectangle {
+    in property <bool> enabled: true;
+    in property <bool> align-left;
+    in property <string> reason;
+    callback files(); callback folder();
+    horizontal-stretch: 1;
+    min-width: Ui.is-mac ? 125px : 153px;
+    min-height: 30px; max-height: 30px;
+    border-radius: 8px; background: Pneu.accent-soft.transparentize(root.enabled ? 0 : 0.6);
+    HorizontalLayout { spacing: 0;
+        PneuButton { enabled: root.enabled; text: "Send Files…"; icon: Icons.upload; kind: ButtonKind.tonal; wide: true; clicked => { root.files(); } }
+        if !Ui.is-mac: Rectangle { width: 28px;
+            Rectangle { x: 0; y: 7px; width: 1px; height: 16px; background: Pneu.on-accent-soft; opacity: 0.22; }
+            IconButton { enabled: root.enabled; icon: Icons.expand-more; icon-size: 14px; icon-color: Pneu.on-accent-soft; label: "More Send Options"; clicked => { options.show(); } }
+        }
+    }
+    options := PopupWindow {
+        x: root.align-left ? 0px : root.width - self.width; y: root.height + 4px;
+        width: root.reason == "" ? 168px : 260px; height: root.reason == "" ? 94px : 116px;
+        close-policy: close-on-click-outside;
+        Rectangle { background: Pneu.card; border-radius: 8px; border-width: 1px; border-color: Pneu.card-border;
+            FocusScope { width: parent.width; height: parent.height;
+            key-pressed(event) => { if event.text == Key.Escape { options.close(); return accept; } return reject; }
+            VerticalLayout { padding: 6px; spacing: 0;
+                PneuButton { autofocus: true; text: "Send Files…"; icon: Icons.upload; kind: ButtonKind.menu; wide: true; clicked => { options.close(); root.files(); } }
+                Rectangle { height: root.reason == "" ? 44px : 66px;
+                    VerticalLayout { alignment: center; spacing: 2px;
+                        PneuButton { enabled: root.reason == ""; text: "Send Folder…"; icon: Icons.folder; kind: ButtonKind.menu; wide: true; clicked => { options.close(); root.folder(); } }
+                        if root.reason != "": HorizontalLayout { padding-left: 36px; Text { text: root.reason; color: Pneu.text2; font-size: Pneu.label-size; overflow: elide; } }
+                    }
+                }
+            }
+            }
+        }
+    }
+}
+
 export component PneuWindow inherits Window {
     title: "Pneu";
     out property <DropGeometry> drop-geometry: {
@@ -772,10 +815,8 @@ export component PneuWindow inherits Window {
                         text-line: text-line.preferred-height; title-line: title-line.preferred-height;
                         HorizontalLayout {
                             padding-top: 14px; spacing: 8px;
-                            PneuButton {
-                                text: Ui.pair-again ? "Pair Again…" : "Send Files…"; icon: Ui.pair-again ? Icons.qr-code : Icons.upload; kind: Ui.pair-again ? ButtonKind.primary : ButtonKind.tonal; wide: true;
-                                clicked => { if Ui.pair-again { root.open-add(0); } else { Ui.send-files(""); } }
-                            }
+                            if Ui.pair-again: PneuButton { text: "Pair Again…"; icon: Icons.qr-code; kind: ButtonKind.primary; wide: true; clicked => { root.open-add(0); } }
+                            if !Ui.pair-again: SendButton { reason: Ui.folder-reason; files => { Ui.send-files(""); } folder => { Ui.send-folder(""); } }
                             if Ui.manual-clipboard && !Ui.pair-again: PneuButton {
                                 text: "Send Clipboard"; icon: Icons.send-clipboard; kind: ButtonKind.tonal; wide: true;
                                 clicked => { Ui.send-clipboard(); }
@@ -870,9 +911,8 @@ export component PneuWindow inherits Window {
                         text-line: text-line.preferred-height; title-line: title-line.preferred-height;
                         HorizontalLayout {
                             padding-top: 14px; spacing: 8px;
-                            if Ui.device-action == "send": PneuButton { enabled: root.device-ready;
-                                text: "Send Files…"; icon: Icons.upload; kind: ButtonKind.tonal; wide: true;
-                                clicked => { Ui.send-files(Ui.device-id); }
+                            if Ui.device-action == "send": SendButton { enabled: root.device-ready; align-left: true; reason: Ui.device-folder-reason;
+                                files => { Ui.send-files(Ui.device-id); } folder => { Ui.send-folder(Ui.device-id); }
                             }
                             if Ui.device.ring-supported: PneuButton {
                                 enabled: root.device-ready && Ui.device.ring-connection != "";
@@ -1374,8 +1414,10 @@ export component PneuWindow inherits Window {
                         border-radius: 8px;
                         background: Ui.drop-hover == index && item.enabled ? Pneu.accent-soft : transparent;
                         border-color: Ui.drop-hover == index && item.enabled ? Pneu.accent : transparent; border-width: 1px;
-                        Text { x: 12px; width: parent.width - 24px; height: parent.height; text: item.name;
-                            color: item.enabled ? Pneu.text : Pneu.text2; overflow: elide; vertical-alignment: center; }
+                        VerticalLayout { x: 12px; width: parent.width - 24px; height: parent.height; alignment: center;
+                            Text { text: item.name; color: Pneu.text; opacity: item.enabled ? 1 : 0.4; overflow: elide; }
+                            if item.sub != "": Text { text: item.sub; color: Pneu.text2; font-size: Pneu.label-size; overflow: elide; }
+                        }
                     }
                 }
             }
@@ -1489,11 +1531,10 @@ export component PneuWindow inherits Window {
                                 }
                                 HorizontalLayout {
                                     padding-top: 8px; padding-bottom: 8px; padding-left: 8px; padding-right: 8px; spacing: 12px;
-                                    opacity: pick.eligible ? 1 : 0.45;
-                                    VerticalLayout { alignment: center; Tile { icon: pick.phone ? Icons.smartphone : Icons.computer; tone: pick.tone; } }
+                                    VerticalLayout { opacity: pick.eligible ? 1 : 0.45; alignment: center; Tile { icon: pick.phone ? Icons.smartphone : Icons.computer; tone: pick.tone; } }
                                     VerticalLayout {
                                         alignment: center; horizontal-stretch: 1;
-                                        Text { text: pick.name; font-weight: 600; color: Pneu.text; overflow: elide; }
+                                        Text { text: pick.name; opacity: pick.eligible ? 1 : 0.45; font-weight: 600; color: Pneu.text; overflow: elide; }
                                         Text {
                                             text: pick.eligible && !pick.connected && pick.checked ? "Sends when connected" : pick.status;
                                             font-size: Pneu.label-size; color: Pneu.text2; overflow: elide;
