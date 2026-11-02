@@ -45,6 +45,7 @@ internal data class DeviceLine(val text:String,val tone:LinkTone,val color:Color
     return when {
         state.peer.pairingLost->DeviceLine(resources.getString(R.string.status_pairing_lost),LinkTone.Danger,c.danger)
         state.peer.setupRefused->DeviceLine(resources.getString(R.string.setup_refused,state.peer.name),LinkTone.Warn,c.warn)
+        DeviceProjection.replacementOffline(p,state.peer,link)->DeviceLine(resources.getString(R.string.device_not_connected),LinkTone.Neutral,c.text2)
         link.connectionStatus==ConnectionStatus.FINGERPRINT_MISMATCH->DeviceLine(resources.getString(R.string.status_fingerprint_mismatch),LinkTone.Danger,c.danger)
         link.connectionStatus==ConnectionStatus.UPDATE_REQUIRED->DeviceLine(resources.getString(R.string.device_update_required),LinkTone.Warn,c.warn)
         connected(p,state)->DeviceLine(if(link.route.isEmpty())resources.getString(R.string.status_connected) else resources.getString(R.string.device_connected,UiPresentation.status(context,link.route)),LinkTone.On,c.text2)
@@ -116,7 +117,7 @@ private fun automaticKinds(context:android.content.Context,p:Prefs):String? {
 
 /** One pair: status card, the pair's sharing switches, then linking and Remove from all devices or Unpair. */
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable internal fun DeviceScreen(p:Prefs,state:DeviceState,back:()->Unit,pair:()->Unit,unpair:()->Unit,sendFiles:()->Unit,setup:SetupActions=SetupActions(),sendFolder:()->Unit={},setSwitch:(String,Boolean)->Unit) {
+@Composable internal fun DeviceScreen(p:Prefs,state:DeviceState,back:()->Unit,pair:()->Unit,unpair:()->Unit,sendFiles:()->Unit,setup:SetupActions=SetupActions(),sendFolder:()->Unit={},preparation:FolderPreparing?=null,setSwitch:(String,Boolean)->Unit) {
     val context=LocalContext.current;val resources=LocalResources.current;val c=LocalPneuColors.current
     val peer=state.peer;val link=state.connection;val online=connected(p,state)
     val scroll=rememberScrollState()
@@ -147,7 +148,9 @@ private fun automaticKinds(context:android.content.Context,p:Prefs):String? {
                     Column(Modifier.padding(start=20.dp,end=20.dp,top=22.dp,bottom=20.dp),horizontalAlignment=Alignment.CenterHorizontally) {
                         LinkView(link.copy(status=status.key),sending=online && link.transferMediaId.isNotEmpty(),receiving=online && link.incoming!=null)
                         Column(Modifier.fillMaxWidth().semantics(mergeDescendants=true) {},horizontalAlignment=Alignment.CenterHorizontally) {
-                            Text(title,Modifier.fillMaxWidth().padding(top=14.dp),style=PneuType.title2,textAlign=TextAlign.Center)
+                            val transfer=if(online)UiPresentation.deviceTransfer(context,link) else null
+                            val preparing=preparation?.let {resources.getString(R.string.device_preparing,it.name)}
+                            Text(transfer ?: preparing ?: title,Modifier.fillMaxWidth().padding(top=14.dp),style=PneuType.title2,textAlign=TextAlign.Center)
                             if(detail.isNotEmpty())Text(detail,Modifier.padding(top=4.dp),style=PneuType.subhead,color=c.text2,maxLines=2,overflow=TextOverflow.Ellipsis,textAlign=TextAlign.Center)
                         }
                         Spacer(Modifier.height(20.dp))
@@ -216,7 +219,8 @@ private fun automaticKinds(context:android.content.Context,p:Prefs):String? {
                     recipient.state in setOf("discarded","superseded","skipped")->resources.getString(when(recipient.state) {
                         "discarded"->R.string.delivery_stopped;"superseded"->R.string.delivery_superseded;else->R.string.delivery_skipped
                     }) to c.text2
-                    sending->resources.getString(R.string.item_sending,android.text.format.Formatter.formatShortFileSize(context,recipient.sent),android.text.format.Formatter.formatShortFileSize(context,recipient.total)) to c.accentText
+                    sending->UiPresentation.sendingProgress(context,recipient.sent,recipient.total) to c.accentText
+                    recipient.preparing->resources.getString(R.string.item_preparing) to c.text2
                     connectionLost!=null->connectionLost to c.danger
                     recipient.state=="failed"->(UiPresentation.failureReason(recipient.error)?.let {resources.getString(R.string.delivery_failed,resources.getString(it))} ?: resources.getString(R.string.item_failed)) to c.danger
                     !online->resources.getString(R.string.delivery_waiting_offline) to c.text2

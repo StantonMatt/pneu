@@ -129,6 +129,57 @@ class ReinstallReplacementTest {
         assertFalse(state.member(a)?.active==true);assertTrue(state.barriers.getValue(member.key).authored==true)
         assertTrue(state.denies(a,old.pin));assertTrue(state.member(b)!!.active)
     }
+    @Test fun finishedHistoryMovesWithoutMigratingQueuedWorkOrReceiptAuthority()=runBlocking<Unit>(Dispatchers.IO) {
+        val db=Room.inMemoryDatabaseBuilder(RuntimeEnvironment.getApplication(),QueueDatabase::class.java).build()
+        try {
+            val q=db.queue()
+            for(state in listOf("sent","waiting","failed","discarded"))q.insert(Outgoing().apply {mediaId=state;transferId=state;peerId=a;bindingGeneration=1;this.state=state})
+            q.insertReceivedFile(ReceivedFile().apply {peerId=a;transferId="received";generation=1;state="complete";senderName=old.name})
+            q.insertReceipt(Receipt().apply {peerId=a;transferId="received";state="applied";origin="file"})
+            repeat(2) {db.runInTransaction {
+                q.reattributeFinished(a,1,b,2,fresh.name);q.cancelReplacedPeer(a,1);q.clearPeer(a)
+            }}
+            assertEquals("sent",q.delivery("sent",b).state);assertEquals(2L,q.delivery("sent",b).bindingGeneration)
+            assertEquals(ReinstallReplacement.CANCELLED,q.delivery("waiting",a).error)
+            assertEquals(ReinstallReplacement.CANCELLED,q.delivery("failed",a).error)
+            assertNull(q.delivery("waiting",b));assertNull(q.delivery("discarded",b))
+            val received=q.receivedFile(b,"received")
+            assertEquals("complete",received.state);assertEquals(fresh.name,received.senderName)
+            assertNull(q.receipt(b,"received"));assertNull(q.receipt(a,"received"))
+        } finally {db.close()}
+    }
+    @Test fun finishedHistoryWinsCollisionsWithoutReplacingActiveDeliveries()=runBlocking<Unit>(Dispatchers.IO) {
+        val db=Room.inMemoryDatabaseBuilder(RuntimeEnvironment.getApplication(),QueueDatabase::class.java).build()
+        try {
+            val q=db.queue()
+            for(state in listOf("failed","waiting","sending","sent")) {
+                q.insert(Outgoing().apply {mediaId=state;transferId=state;peerId=a;bindingGeneration=1;this.state="sent";sentBytes=40})
+                q.insert(Outgoing().apply {mediaId=state;transferId=state;peerId=b;bindingGeneration=2;this.state=state;sentBytes=5;error=if(state=="failed")"connection_lost" else ""})
+            }
+            for(state in listOf("failed","writing","complete")) {
+                q.insertReceivedFile(ReceivedFile().apply {peerId=a;transferId=state;generation=1;this.state="complete";uri="content://old/$state";senderName=old.name})
+                q.insertReceivedFile(ReceivedFile().apply {peerId=b;transferId=state;generation=2;this.state=state;uri="content://fresh/$state";senderName=fresh.name})
+            }
+            repeat(2) {db.runInTransaction {
+                q.reattributeFinished(a,1,b,2,fresh.name);q.cancelReplacedPeer(a,1);q.clearPeer(a)
+            }}
+            for(state in listOf("failed","waiting","sending","sent")) {
+                val active=state in listOf("waiting","sending")
+                val row=q.delivery(state,b)
+                assertEquals("fresh $state collision",if(active)state else "sent",row.state)
+                assertEquals(if(active)5L else 40L,row.sentBytes)
+                assertEquals(2L,row.bindingGeneration);assertEquals("",row.error)
+                assertNull(q.delivery(state,a))
+            }
+            for(state in listOf("failed","writing","complete")) {
+                val row=q.receivedFile(b,state)
+                // The fresh peer's row always survives: a writing receive owns a live journal entry and receipt.
+                assertEquals(state,row.state);assertEquals(2L,row.generation);assertEquals(fresh.name,row.senderName)
+                assertEquals("content://fresh/$state",row.uri)
+                assertNull(q.receivedFile(a,state));assertNull(q.receipt(b,state))
+            }
+        } finally {db.close()}
+    }
     @Test fun interruptedCleanupCancelsOnlyOldRecipientAndRetainsResendablePayload()=runBlocking<Unit>(Dispatchers.IO) {
         val context=RuntimeEnvironment.getApplication();val file=File(context.cacheDir,"replace-${randomId()}.preferences_pb")
         val job=SupervisorJob();val store=PreferenceDataStoreFactory.create(scope=CoroutineScope(job+Dispatchers.IO)) {file}

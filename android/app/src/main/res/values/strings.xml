@@ -93,9 +93,11 @@
 <string name="kind_photo">Photo</string>
 <string name="kind_recording">Screen recording</string>
 <string name="item_clipboard_time">Clipboard · %1$s</string>
+<string name="device_preparing">Preparing %1$s</string>
+<string name="item_preparing">Preparing</string>
 <string name="item_waiting">Waiting</string>
 <string name="item_waiting_wifi">Waiting for Wi-Fi</string>
-<string name="item_sending">Sending · %1$s of %2$s</string>
+<string name="item_sending">Sending · %1$s</string>
 <string name="item_failed_disk">Failed · Computer storage is full</string>
 <string name="item_failed_write">Failed · Computer can\'t save files</string>
 <string name="cd_dont_send">Don\'t send</string>
@@ -239,7 +241,7 @@
 <string name="item_failed_on">Failed on %1$s</string>
 <plurals name="item_failed_computers"><item quantity="one">Failed on %d device</item><item quantity="other">Failed on %d devices</item></plurals>
 <string name="item_failed_on_reason">Failed on %1$s · %2$s</string>
-<string name="item_sending_devices">Sending to %1$d devices · %2$s of %3$s</string>
+<string name="item_sending_devices">Sending to %1$d devices · %2$s</string>
 <string name="item_waiting_for">Waiting for %1$s</string>
 <plurals name="item_waiting_for_devices"><item quantity="one">Waiting for %d device</item><item quantity="other">Waiting for %d devices</item></plurals>
 <string name="recent_to_device">To %1$s · %2$s</string>
@@ -330,7 +332,7 @@
         <item quantity="other">This deletes %d pinned items.</item>
     </plurals>
     <string name="item_connection_lost">Connection lost</string>
-    <string name="item_connection_lost_progress">Connection lost · %1$s of %2$s sent</string>
+    <string name="item_connection_lost_progress">Connection lost · %1$s sent</string>
     <string name="group_computers">Computers</string>
     <string name="pref_show_battery">Show battery level</string>
     <string name="pref_allow_ringing">Allow ringing</string>
@@ -387,7 +389,7 @@
     <string name="folder_needs_free">%1$s needs %2$s free</string>
     <string name="folder_to">To %1$s ·\u0020</string>
     <string name="folder_preparing_count">Preparing · %1$s</string>
-    <string name="folder_preparing_bytes">Preparing · %1$s of %2$s</string>
+    <string name="folder_preparing_bytes">Preparing · %1$s</string>
     <string name="folder_sent_some">Sent %1$s of %2$s · %3$s</string>
     <string name="folder_sent">%1$s, %2$s · %3$s</string>
     <string name="folder_sent_to">%1$s sent to %2$s</string>

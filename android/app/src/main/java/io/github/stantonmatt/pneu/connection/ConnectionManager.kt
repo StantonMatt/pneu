@@ -22,7 +22,7 @@ import javax.net.ssl.SSLSocket
 import kotlin.random.Random
 
 data class LinkState(val status: String = "PC unreachable", val route: String = "", val pairing: String = "", val sent: Long = 0, val total: Long = 0, val transferMediaId: String = "", val cellular: Boolean = false, val pairingPin: String = "", val transferKind: String = "", val transferFileName: String = "",
-    val capabilities:Set<String> = emptySet(),val incoming:IncomingTransfer?=null,val pairingFeedback:UiFeedback?=pairing.takeIf(String::isNotEmpty)?.let {UiFeedback(it)},val pairingGeneration:Long=0) {
+    val capabilities:Set<String> = emptySet(),val incoming:IncomingTransfer?=null,val pairingFeedback:UiFeedback?=pairing.takeIf(String::isNotEmpty)?.let {UiFeedback(it)},val pairingGeneration:Long=0,val mismatchPin:String="") {
     val connectionStatus get()=ConnectionStatus.fromKey(status)
     /** Emit a new pairing result even when its copy matches the preceding one.
      * Ordinary route/progress copies preserve the existing event identity. */
@@ -66,7 +66,8 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
     private val serviceCallbacks = linkedMapOf<String, NsdManager.ServiceInfoCallback>()
     private val multicast = context.getSystemService(WifiManager::class.java).createMulticastLock("pneu.discovery").apply { setReferenceCounted(false) }
     private var job: Job? = null
-    @Volatile private var lastIssue:ConnectionStatus?=null
+    private data class DialFailure(val status:ConnectionStatus,val observedPin:String="")
+    @Volatile private var lastIssue:DialFailure?=null
     @Volatile private var socket: Socket? = null
     @Volatile private var tcpSocket:Socket?=null
     private data class CapturedConnection(val ssl:SSLSocket,val tcp:Socket?)
@@ -230,7 +231,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                             setupRefreshRedial.set(true)
                         }
                         issue=ConnectionStatus.remoteError(e.code)
-                        if(issue!=null)lastIssue=issue
+                        if(issue!=null)lastIssue=DialFailure(issue)
                         if(issue!=null) {attempt?.let {app.rejectPairing(it,issue)};break}
                         if (e.code == "unauthorized") {
                             if(invitation==null)authenticatedBinding?.let {app.preferences.introducedRefusal(it,pinnedLeafVerified)}
@@ -247,7 +248,8 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                         if (e.code == "connection_replaced") break
                     } catch (e: Exception) {
                         if(generateSequence<Throwable>(e) {it.cause}.any {it is FingerprintMismatch}) {
-                            issue=ConnectionStatus.FINGERPRINT_MISMATCH;lastIssue=issue;attemptIssue=issue
+                            val mismatch=generateSequence<Throwable>(e) {it.cause}.filterIsInstance<FingerprintMismatch>().first()
+                            issue=ConnectionStatus.FINGERPRINT_MISMATCH;lastIssue=DialFailure(issue,mismatch.observedPin);attemptIssue=issue
                         }
                         // Only exception classes are logged; never endpoints, tokens, or user content.
                         android.util.Log.w("PneuConnection", generateSequence<Throwable>(e) { it.cause }.joinToString(" <- ") { it.javaClass.simpleName })
@@ -261,12 +263,12 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                         // Reconcile even if a subsequent pairing-loss persistence step fails.
                         // Runtime authority and disconnected UI are mandatory:
                         // publish before any fallible durable maintenance.
-                        publishDisconnected(if(scoped(app.prefs.value).pairingLost)"Pairing lost" else (issue ?: lastIssue)?.key ?: "PC unreachable")
+                        publishDisconnected(if(scoped(app.prefs.value).pairingLost)"Pairing lost" else (issue ?: lastIssue?.status)?.key ?: "PC unreachable")
                         withContext(NonCancellable) {retryClipboardCleanup();recoverSession(endingBinding)}
                         try {
                             if(invitation == null && epoch==dialEpoch.get() && prefs.peer!=null && rejections.record("${prefs.peer.pin}:${prefs.peer.deviceId}:${prefs.peer.generation}",rejected)) lost(prefs.peer,prefs.deviceId,outcome)
                         } finally {
-                            publishDisconnected(if(scoped(app.prefs.value).pairingLost)"Pairing lost" else (issue ?: lastIssue)?.key ?: "PC unreachable")
+                            publishDisconnected(if(scoped(app.prefs.value).pairingLost)"Pairing lost" else (issue ?: lastIssue?.status)?.key ?: "PC unreachable")
                         }
                     }
                     if (succeeded) break
@@ -291,8 +293,9 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
         return next
     }
     private fun publishDisconnected(status:String) {
+        val mismatchPin=lastIssue?.takeIf {it.status.key==status}?.observedPin.orEmpty()
         state.update {
-            val disconnected=it.copy(status=status,route="",cellular=false,sent=0,total=0,transferMediaId="",transferKind="",transferFileName="",pairingPin="",incoming=null)
+            val disconnected=it.copy(status=status,route="",cellular=false,sent=0,total=0,transferMediaId="",transferKind="",transferFileName="",pairingPin="",incoming=null,mismatchPin=mismatchPin)
             if(disconnected.pairing.startsWith("Paired with "))disconnected.withPairing("") else disconnected
         }
     }

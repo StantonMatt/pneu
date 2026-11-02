@@ -161,6 +161,73 @@ class ReinstallReplacementDeviceTest {
         } finally {context.contentResolver.call(grants,"revoke",null,null)}
     }
 
+    @Test(timeout=30000) fun finishedRecentAndClipboardHistoryFollowReplacement()=runBlocking<Unit> {
+        val choice=seed()
+        app.queue.insert(Outgoing().apply {mediaId="finished";transferId=randomId();peerId=oldId;bindingGeneration=1;state="sent";kind="file";fileName="Finished.pdf"})
+        app.queue.insertReceivedFile(ReceivedFile().apply {peerId=oldId;transferId="finished-incoming";generation=1;state="complete";senderName=name;fileName="Received.pdf"})
+        app.savedClips.setEnabled(true)
+        app.savedClips.recordText("Finished clipboard",name,source=oldId)
+        app.replaceReinstalledDevice(choice)
+        assertEquals("sent",app.queue.delivery("finished",freshId).state)
+        assertEquals(choice.fresh.revision,app.queue.delivery("finished",freshId).bindingGeneration)
+        assertNull(app.queue.delivery("finished",oldId))
+        assertEquals(name,app.queue.receivedFile(freshId,"finished-incoming").senderName)
+        assertNull(app.queue.receivedFile(oldId,"finished-incoming"))
+        val clip=app.savedClips.state.value.items.single {it.text=="Finished clipboard"}
+        assertEquals(freshId,clip.source);assertEquals(name,clip.sender)
+        assertEquals(ReinstallReplacement.CANCELLED,app.queue.delivery("replacement-report",oldId).error)
+        assertNull(app.queue.delivery("replacement-report",freshId))
+        app.completePeerReset(oldId)
+        assertNotNull(app.queue.delivery("finished",freshId));assertNotNull(app.queue.receivedFile(freshId,"finished-incoming"))
+    }
+    @Test(timeout=60000) fun connectedRetryPreparesThenDevicePageShowsTransferAndReturnsToNormal()=runBlocking<Unit> {
+        seed(implied=true)
+        val old=app.queue.delivery("replacement-report",oldId)
+        assertTrue(app.discard(ConfirmedQueue.from(app.preferences.read(),listOf(old))))
+        val file=File(context.cacheDir,"live-progress.pdf").apply {writeText("Live progress fixture")}
+        val row=Outgoing().apply {
+            mediaId="live-progress";transferId=randomId();peerId=freshId;bindingGeneration=app.preferences.read().devices.single().generation
+            kind="file";fileName="Progress.pdf";automatic=false;state="failed";error="disk_full";nextAttempt=Long.MAX_VALUE
+            path=file.path;size=file.length();hash=sha256(file.readBytes());mime="application/pdf"
+        }
+        val allowSend=CompletableDeferred<Unit>()
+        app.connection.beforeFirstFrame={allowSend.await()}
+        DeviceFixture.insert(app,row)
+        launch().use {
+            compose.waitUntil(5000) {compose.onAllNodesWithContentDescription("Retry").fetchSemanticsNodes().isNotEmpty()}
+            compose.onNodeWithContentDescription("Retry").performClick()
+            compose.waitUntil(5000) {compose.onAllNodesWithText("Preparing").fetchSemanticsNodes().isNotEmpty()}
+            compose.onNodeWithText("Waiting").assertDoesNotExist();compose.onNodeWithText("1 waiting").assertDoesNotExist()
+            allowSend.complete(Unit)
+            // The fixture deliberately withholds ACK, holding a real in-flight transfer.
+            withTimeout(10000) {app.connection.devices.first {it[freshId]?.transferMediaId==row.mediaId}}
+            compose.onAllNodesWithText(name).onLast().performClick()
+            val progress="Sending Progress.pdf · ${io.github.stantonmatt.pneu.features.UiPresentation.sizePair(row.size,row.size)}"
+            compose.waitUntil(5000) {compose.onAllNodesWithText(progress).fetchSemanticsNodes().isNotEmpty()}
+            compose.onNodeWithText(progress).assertIsDisplayed();captureBarrier("live-device-progress")
+            localPeers.last().sendControl(Frame.Control(Type.ACK,json("transfer_id" to row.transferId,"deduplicated" to false)))
+            withTimeout(5000) {while(app.queue.delivery(row.mediaId,freshId).state!="sent")delay(20)}
+            compose.waitUntil(5000) {compose.onAllNodesWithText("Connected").fetchSemanticsNodes().isNotEmpty()}
+            compose.onNodeWithText("Send files").assertIsDisplayed();compose.onNodeWithText(progress).assertDoesNotExist()
+        }
+    }
+    @Test(timeout=60000) fun knownPairedAddressIsNeutralWhilePromptedAndAfterKeepBoth()=runBlocking<Unit> {
+        seed()
+        val peers=app.preferences.read().devices
+        val addresses=peers.single {it.deviceId==freshId}.addresses
+        app.preferences.edit {p->PeerRegistry.write(p,PeerRegistry.read(p).map {if(it.deviceId==oldId)it.copy(addresses=addresses) else it})}
+        app.connection.retryPeer("a".repeat(64))
+        withTimeout(15000) {app.connection.devices.first {it[oldId]?.mismatchPin==peers.single {peer->peer.deviceId==freshId}.pin}}
+        launch().use {
+            compose.waitUntil(5000) {compose.onAllNodesWithText("Keep both").fetchSemanticsNodes().isNotEmpty()}
+            compose.onNodeWithText("Couldn't verify computer").assertDoesNotExist()
+            captureBarrier("known-address-prompt")
+            compose.onNodeWithText("Keep both").performClick()
+            compose.waitUntil(5000) {compose.onAllNodesWithText("Not connected").fetchSemanticsNodes().isNotEmpty()}
+            compose.onNodeWithText("Couldn't verify computer").assertDoesNotExist()
+            captureBarrier("known-address-kept")
+        }
+    }
     @Test(timeout=30000) fun backMeansKeepBoth()=runBlocking<Unit> {
         seed()
         launch().use {

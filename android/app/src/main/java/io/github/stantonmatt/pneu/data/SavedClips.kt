@@ -83,6 +83,9 @@ internal class SavedClips(private val context:Context,scope:CoroutineScope,
         val retained=dao.all().flatMap {listOf(it.image,it.thumbnail)}.toSet()
         directory.listFiles()?.filter {it.name !in retained}?.forEach(::removeFile)
     }
+    suspend fun reattribute(old:String,fresh:String,name:String)=locked {
+        database.runInTransaction {dao.reattribute(old,fresh,name)};publish()
+    }
     suspend fun delete(id:String)=locked {val item=dao.all().find {it.id==id} ?: return@locked;database.runInTransaction {removeFiles(item);dao.delete(id)};publish()}
     private fun save(item:SavedClip,arrived:Boolean=true) {
         dao.all().find {it.id==item.id}?.let {item.pinned=it.pinned;item.pinPosition=it.pinPosition}

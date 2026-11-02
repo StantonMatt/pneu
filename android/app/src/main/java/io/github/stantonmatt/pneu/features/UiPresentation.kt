@@ -7,6 +7,21 @@ import io.github.stantonmatt.pneu.data.ReinstallReplacement
 import io.github.stantonmatt.pneu.protocol.Endpoint
 
 object UiPresentation {
+    /** Desktop's decimal units, chosen once from the total for both numbers. */
+    fun sizePair(sent:Long,total:Long):String {
+        val size=total.coerceAtLeast(0)
+        val (unit,scale)=when {size<1_000->"B" to 1.0;size<1_000_000->"KB" to 1e3;size<1_000_000_000->"MB" to 1e6;else->"GB" to 1e9}
+        fun number(bytes:Long):String {
+            val value=bytes/scale
+            val digits=if(value<10 && scale>1 && (unit=="GB" || value%1>=.05))1 else 0
+            return String.format(java.util.Locale.ROOT,"%.${digits}f",value)
+        }
+        return "${number(sent.coerceIn(0,size))} of ${number(size)} $unit"
+    }
+    fun sendingProgress(context:android.content.Context,sent:Long,total:Long)=context.getString(R.string.item_sending,sizePair(sent,total))
+    fun deviceTransfer(context:android.content.Context,link:io.github.stantonmatt.pneu.connection.LinkState):String? =
+        sending(context,link)?.let {"$it · ${sizePair(link.sent,link.total)}"}
+
     fun clipboardReceiveLabel(context:android.content.Context,p:io.github.stantonmatt.pneu.data.Prefs,peer:io.github.stantonmatt.pneu.data.Peer)=
         if(p.devices.size==1)context.getString(R.string.pref_clipboard_from_pc) else context.getString(R.string.pref_clipboard_from_device,peer.name)
     fun connectionDetail(context:android.content.Context,p:io.github.stantonmatt.pneu.data.Prefs,
@@ -38,9 +53,8 @@ object UiPresentation {
             failureReason(failed.error)?.let {context.getString(R.string.item_failed_on_reason,name,context.getString(it))} ?: context.getString(R.string.item_failed_on,name)
         }
         item.failed.isNotEmpty() -> context.resources.getQuantityString(R.plurals.item_failed_computers,item.failed.size,item.failed.size)
-        item.sending -> context.getString(R.string.item_sending_devices,item.recipients.size,
-            android.text.format.Formatter.formatShortFileSize(context,item.sent),
-            android.text.format.Formatter.formatShortFileSize(context,item.total))
+        item.sending -> context.getString(R.string.item_sending_devices,item.recipients.size,sizePair(item.sent,item.total))
+        item.recipients.any {it.preparing} -> context.getString(R.string.item_preparing)
         item.sentCount==0 -> context.getString(R.string.item_waiting)
         item.waiting.size==1 -> context.getString(R.string.item_waiting_for,item.waiting.single().name.ifEmpty {context.getString(R.string.computer)})
         else -> context.resources.getQuantityString(R.plurals.item_waiting_for_devices,item.waiting.size,item.waiting.size)
@@ -103,7 +117,7 @@ object UiPresentation {
 
     fun connectionLost(context:android.content.Context,resumable:Boolean,sent:Long,total:Long):String =
         if(resumable && sent>0)context.getString(R.string.item_connection_lost_progress,
-            android.text.format.Formatter.formatShortFileSize(context,sent),android.text.format.Formatter.formatShortFileSize(context,total))
+            sizePair(sent,total))
         else context.getString(R.string.item_connection_lost)
 
     fun failedItem(error:String):Int = when(error) {

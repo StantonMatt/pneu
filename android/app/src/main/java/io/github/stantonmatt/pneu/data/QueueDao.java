@@ -97,6 +97,12 @@ import kotlinx.coroutines.flow.Flow;
     }
     @Query("DELETE FROM deliveries WHERE peerId=:peer AND error!='old_device_replaced'") void deletePeerDeliveries(String peer);
     @Query("UPDATE deliveries SET state='failed',error='old_device_replaced',nextAttempt=9223372036854775807,revision=revision+1 WHERE peerId=:peer AND bindingGeneration=:generation AND state IN ('waiting','sending','failed') AND error!='old_device_replaced'") void cancelReplacedPeer(String peer,long generation);
+    // Sent history wins inactive delivery collisions; any existing fresh receive row (it may own a live journal/receipt) is kept.
+    @Query("UPDATE OR REPLACE deliveries SET peerId=:fresh,bindingGeneration=:revision WHERE peerId=:old AND bindingGeneration=:generation AND state='sent' AND mediaId NOT IN (SELECT mediaId FROM deliveries WHERE peerId=:fresh AND state IN ('waiting','sending'))") void reattributeSent(String old,long generation,String fresh,long revision);
+    @Query("UPDATE OR REPLACE received_files SET peerId=:fresh,generation=:revision,senderName=:name WHERE peerId=:old AND generation=:generation AND state='complete' AND transferId NOT IN (SELECT transferId FROM received_files WHERE peerId=:fresh)") void reattributeReceived(String old,long generation,String fresh,long revision,String name);
+    @Transaction default void reattributeFinished(String old,long generation,String fresh,long revision,String name) {
+        reattributeSent(old,generation,fresh,revision);reattributeReceived(old,generation,fresh,revision,name);
+    }
     @Query("DELETE FROM deliveries WHERE mediaId=:id AND peerId=:peer") void deleteDelivery(String id,String peer);
     @Query("DELETE FROM receipts WHERE peerId=:peer") void deletePeerReceipts(String peer);
     @Query("DELETE FROM clipboard_clock WHERE peerId=:peer") void deletePeerClock(String peer);
@@ -125,7 +131,7 @@ import kotlinx.coroutines.flow.Flow;
     // Limit artifacts, not recipient rows: partial failures remain visible and
     // every selected artifact carries its complete frozen recipient set.
     @Query("SELECT * FROM outgoing WHERE mediaId IN (SELECT mediaId FROM outgoing GROUP BY mediaId HAVING SUM(CASE WHEN state IN ('waiting','sending','failed','sent') THEN 1 ELSE 0 END)>0 ORDER BY MIN(CASE WHEN state='sending' THEN 0 WHEN state IN ('waiting','failed') THEN 1 ELSE 2 END), CASE WHEN SUM(CASE WHEN state IN ('waiting','sending','failed') THEN 1 ELSE 0 END)>0 THEN MIN(orderId) ELSE -MAX(orderId) END,mediaId LIMIT 50) ORDER BY orderId,mediaId,peerId") Flow<List<Outgoing>> recentDeliveries();
-    @Query("SELECT COUNT(DISTINCT mediaId) FROM outgoing WHERE state IN ('waiting','sending','failed') AND error!='old_device_replaced'") Flow<Integer> waitingCount();
+    @Query("SELECT COUNT(DISTINCT mediaId) FROM outgoing WHERE state='waiting'") Flow<Integer> waitingCount();
     @Query("UPDATE deliveries SET state=CASE WHEN :offline THEN 'waiting' ELSE 'failed' END,error='connection_lost',nextAttempt=CASE WHEN :offline THEN 0 ELSE 9223372036854775807 END WHERE state='sending' AND resumable=1 AND (:peer='' OR (peerId=:peer AND bindingGeneration=:generation))")
     void recoverResumable(String peer,long generation,boolean offline);
     @Query("UPDATE deliveries SET state='waiting' WHERE state='sending'") void recoverSending();

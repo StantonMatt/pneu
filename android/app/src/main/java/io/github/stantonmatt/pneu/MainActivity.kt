@@ -310,8 +310,9 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
                     // Unpaired here or on the other device: the page has nothing left to show.
                     val state=deviceStates.find {it.peer.deviceId==id}
                     LaunchedEffect(state==null,p.devices) {if(state==null && p.devices.none {it.deviceId==id} && screen==visibleScreen)navigate("home")}
+                    val preparations by app.folderSends.preparing.collectAsState()
                     if(state!=null)DeviceScreen(p,state,{navigate("home")},{replaceOld=ConfirmedBinding.from(p,id);navigate("pair")},{unpair=ConfirmedBinding.from(p,id)},{sendFiles(id)},
-                        SetupActions(link={displayedBindings[id]?.let {linkDevices(it,displayedAllPrompts)}},allow={answer(displayedPrompts,true)},remove={SetupPresentation.memberKey(p,state.peer)?.let(::askRemove)}),sendFolder={sendFolder(id)}) {key,value->
+                        SetupActions(link={displayedBindings[id]?.let {linkDevices(it,displayedAllPrompts)}},allow={answer(displayedPrompts,true)},remove={SetupPresentation.memberKey(p,state.peer)?.let(::askRemove)}),sendFolder={sendFolder(id)},preparation=preparations.firstOrNull {it.row.peerId==id}) {key,value->
                         val authority=DeliveryBinding.from(p,id)?.let(::CapturedAuthority)
                         if(authority!=null)scope.launch {actions.run(resources.getString(R.string.ui_error_setting)) {devicesModel.setPairSwitch(authority,key,value)}}
                     }
@@ -727,8 +728,6 @@ internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired
     val clipboardReady=rememberClipboardAvailable(p,links)
     var queueMenu by remember { mutableStateOf(false) }
     val waiting by app.waitingCount.collectAsState()
-    var showProgress by remember(link.transferMediaId) {mutableStateOf(false)}
-    LaunchedEffect(link.transferMediaId) {if(link.transferMediaId.isNotEmpty()){delay(1000);showProgress=true}}
     val title=if(p.pairingLost) ConnectionStatus.PAIRING_LOST else if(p.paused) ConnectionStatus.PAUSED else link.connectionStatus
     val network=RoutePolicy.active(context.getSystemService(android.net.ConnectivityManager::class.java))
     val hint=unreachableHint(title==ConnectionStatus.UNREACHABLE,p.devices,p.tailscale)
@@ -805,7 +804,7 @@ internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired
                     val outcome=outcomes[row.mediaId]
                     val multi=outcome!=null && outcome.recipients.size>1
                     val settled=outcome?.let {!it.actionable} ?: (row.state !in setOf("waiting","sending","failed"))
-                    val progress=outcome?.sending==true || link.transferMediaId==row.mediaId && showProgress
+                    val progress=outcome?.sending==true || link.transferMediaId==row.mediaId
                     val sent=if(outcome?.sending==true)outcome.sent else link.sent
                     val total=if(outcome?.sending==true)outcome.total else link.total
                     Row(Modifier.fillMaxWidth().pneuRow(!first,76.dp).heightIn(min=68.dp).pneuClick(enabled=multi && !settled || row.state=="sent" && (if(row.kind=="text")row.text.matches(Regex("""https?://\S+""")) else row.uri.isNotEmpty())) {if(multi && !settled)details=row.mediaId else scope.launch {actions.run(resources.getString(R.string.toast_cant_read)) {
@@ -831,7 +830,8 @@ internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired
                                 outcome?.received!=null -> UiPresentation.recentReceived(context,outcome,time,p.devices.size)!!
                                 several && settled -> UiPresentation.recentSent(context,outcome,clipboard,time) ?: time
                                 several && failing -> UiPresentation.recentOutcome(context,outcome!!)
-                                progress -> if(multi)UiPresentation.recentOutcome(context,outcome!!) else resources.getString(R.string.item_sending,android.text.format.Formatter.formatShortFileSize(context,sent),android.text.format.Formatter.formatShortFileSize(context,total))
+                                progress -> if(multi)UiPresentation.recentOutcome(context,outcome!!) else UiPresentation.sendingProgress(context,sent,total)
+                                outcome?.recipients?.any {it.preparing}==true -> resources.getString(R.string.item_preparing)
                                 row.state=="sent" -> if(clipboard)resources.getString(R.string.item_clipboard_time,time) else time
                                 connectionLost!=null -> connectionLost
                                 row.state=="failed" -> resources.getString(UiPresentation.failedItem(row.error))
@@ -839,7 +839,7 @@ internal fun pairingScanBlocked(attemptPending:Boolean,installed:Boolean,expired
                                 several -> UiPresentation.recentOutcome(context,outcome!!)
                                 else -> resources.getString(R.string.item_waiting)
                             }
-                            Text(supporting,style=MaterialTheme.typography.bodyMedium,color=if(row.error==ReinstallReplacement.CANCELLED)LocalPneuColors.current.warn else if(row.state=="failed" || several && failing) LocalPneuColors.current.danger else if(row.state=="sent" && folderSummary?.skipped?.let {it.unreadable>0 || it.directories>0}==true)LocalPneuColors.current.warn else if(progress)LocalPneuColors.current.accentText else LocalPneuColors.current.text2,maxLines=1,overflow=TextOverflow.Ellipsis)
+                            Text(supporting,style=MaterialTheme.typography.bodyMedium,color=if(row.error==ReinstallReplacement.CANCELLED)LocalPneuColors.current.warn else if(row.state=="failed" || several && failing) LocalPneuColors.current.danger else if(row.state=="sent" && folderSummary?.skipped?.let {it.unreadable>0 || it.directories>0}==true)LocalPneuColors.current.warn else if(progress)LocalPneuColors.current.accentText else LocalPneuColors.current.text2,maxLines=if(row.state=="failed" && row.error !in setOf("folder_changed","folder_access_lost"))Int.MAX_VALUE else 1,overflow=TextOverflow.Ellipsis)
                             if(progress)LinearProgressIndicator(progress={if(total>0)(sent.toFloat()/total).coerceIn(0f,1f)else 0f},modifier=Modifier.fillMaxWidth().padding(top=7.dp).height(3.dp).clip(RoundedCornerShape(2.dp)),color=LocalPneuColors.current.accent,trackColor=LocalPneuColors.current.fill2,gapSize=0.dp,drawStopIndicator={})
                         }
                         if(row.state=="failed" && row.error !in setOf("folder_changed","folder_access_lost")) IconButton(modifier=Modifier.size(40.dp),onClick={val reference=ConfirmedItem.from(row);scope.launch {actions.run(resources.getString(R.string.ui_error_retry_item)) {val selected=app.confirmArtifact(p,reference);check(app.retry(reference.mediaId,selected)) {"Queue item changed"}}}}) {Symbol(R.drawable.ic_refresh,resources.getString(R.string.cd_retry),modifier=Modifier.size(22.dp),tint=LocalPneuColors.current.text2)}

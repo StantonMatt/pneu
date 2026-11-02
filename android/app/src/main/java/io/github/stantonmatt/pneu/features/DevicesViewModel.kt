@@ -20,8 +20,16 @@ data class DeviceState(val peer:Peer,val connection:LinkState,val pendingSwitche
 }
 /** Connected devices first, then by last seen. No manual reordering. */
 internal object DeviceProjection {
+    fun replacementOffline(prefs:Prefs,peer:Peer,link:LinkState):Boolean {
+        val pending=prefs.replacements.offers.any {it.old.pcId==peer.deviceId && it.old.matches(prefs)}
+        val knownOther=link.mismatchPin.isNotEmpty() && prefs.devices.any {it.deviceId!=peer.deviceId && it.pin==link.mismatchPin && !it.pairingLost}
+        return pending && link.connectionStatus!=ConnectionStatus.CONNECTED || knownOther && link.connectionStatus in setOf(ConnectionStatus.FINGERPRINT_MISMATCH,ConnectionStatus.UNREACHABLE,ConnectionStatus.CONNECTING)
+    }
+    fun displayLink(prefs:Prefs,peer:Peer,link:LinkState)=
+        if(replacementOffline(prefs,peer,link))link.copy(status=ConnectionStatus.UNREACHABLE.key) else link
+
     fun states(prefs:Prefs,links:Map<String,LinkState>)=prefs.devices.map {peer->
-        DeviceState(peer,links[peer.deviceId] ?: LinkState(),
+        DeviceState(peer,displayLink(prefs,peer,links[peer.deviceId] ?: LinkState()),
             PairSettings.keys(prefs.deviceId,peer.deviceId).zip(listOf("sendClipboard","receiveClipboard","automaticMedia"))
                 .filter {it.first in peer.localSettingsEdits}.map {it.second}.toSet(),peer.settingsSupported)
     }.sortedWith(compareByDescending<DeviceState> {it.connection.connectionStatus==ConnectionStatus.CONNECTED}.thenByDescending {it.lastSeen})

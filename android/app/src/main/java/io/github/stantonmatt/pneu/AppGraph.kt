@@ -87,7 +87,6 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
     private fun currentOutcome(token:ConnectionOutcome?)=token==null || outcomes.getOrDefault(token.peerId,0)==token.revision
     val initialized=CompletableDeferred<Unit>()
     val recent = queue.recent().recoverReads().stateIn(scope, SharingStarted.Eagerly, emptyList())
-    val waitingCount = queue.waitingCount().recoverReads().stateIn(scope, SharingStarted.Eagerly, 0)
     val work = queue.work().recoverReads().stateIn(scope, SharingStarted.Eagerly, emptyList())
     @Volatile internal var onMediaObserverReady:()->Unit={}
     val mediaRefresh=MutableStateFlow(0L)
@@ -101,6 +100,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
     val receivedRecent get()=receivedFiles.recent
     val phoneNotifications = PhoneNotifications()
     val connection = Connections(this)
+    val waitingCount = combine(work,connection.devices,RecentProjection::waitingCount).stateIn(scope, SharingStarted.Eagerly, 0)
     internal val tileInputs=combine(prefs,connection.state,connection.devices) {p,s,devices->
         TilePolicy.inputs(p,s,devices,connection.clipboardAvailable(p))
     }.distinctUntilChanged().shareIn(scope,SharingStarted.Eagerly,replay=1)
@@ -189,9 +189,13 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
         receivedFiles.forget(peerId);queue.deletePeerCancels(peerId)
         val replacement=preferences.read().replacements.replaced.lastOrNull {it.old.pcId==peerId}
         database.runInTransaction {
-            if(replacement!=null)queue.cancelReplacedPeer(peerId,replacement.old.revision)
+            if(replacement!=null) {
+                queue.reattributeFinished(peerId,replacement.old.revision,requireNotNull(replacement.fresh.pcId),replacement.fresh.revision,replacement.fresh.pcName.orEmpty())
+                queue.cancelReplacedPeer(peerId,replacement.old.revision)
+            }
             queue.clearPeer(peerId)
         }
+        if(replacement!=null)savedClips.reattribute(peerId,requireNotNull(replacement.fresh.pcId),replacement.fresh.pcName.orEmpty())
         pruneOrphansLocked()
         releaseTerminalBytesLocked()
     }

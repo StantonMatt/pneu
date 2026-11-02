@@ -22,6 +22,21 @@ class RecentProjectionTest {
     private fun delivery(peer:Peer,state:String,id:String="artifact",order:Long=1)=Outgoing().apply {
         mediaId=id;peerId=peer.deviceId;transferId=id;this.state=state;size=100;orderId=order;error=if(state=="failed")"disk_full" else ""
     }
+    @Test fun compactConnectionLostUsesOneSharedUnit() {
+        val context=RuntimeEnvironment.getApplication()
+        assertEquals("Connection lost · 265 of 432 MB sent",UiPresentation.connectionLost(context,true,265_000_000,432_000_000))
+        assertEquals("Connection lost · 0.6 of 1.8 GB sent",UiPresentation.connectionLost(context,true,600_000_000,1_800_000_000))
+    }
+    @Test fun waitingHeaderExcludesSendingAndFailedRetry()=runBlocking<Unit>(Dispatchers.IO) {
+        val db=Room.inMemoryDatabaseBuilder(RuntimeEnvironment.getApplication(),QueueDatabase::class.java).build()
+        try {
+            val q=db.queue()
+            q.insert(delivery(a,"sending","sending"));q.insert(delivery(a,"failed","failed"))
+            assertEquals(0,q.waitingCount().first())
+            q.insert(delivery(a,"waiting","waiting"));q.insert(delivery(b,"waiting","waiting"))
+            assertEquals(1,q.waitingCount().first())
+        } finally {db.close()}
+    }
     @Test fun automaticConnectionLostRetryKeepsWaitingCopyInHomeAndRecipientRows() {
         val context=RuntimeEnvironment.getApplication()
         val delivery=delivery(a,"waiting").apply {error="connection_lost";resumable=true;sentBytes=40}

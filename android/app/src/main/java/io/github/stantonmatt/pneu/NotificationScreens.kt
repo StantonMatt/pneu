@@ -23,6 +23,7 @@ import androidx.compose.ui.*
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
@@ -44,6 +45,9 @@ import kotlinx.coroutines.*
     }
     SettingRow(stringResource(R.string.notification_show),detail,error=consent.enabled && !access,divider=false,click=open)
 }
+
+internal fun restrictedNotificationSource(source:Int)=source==android.content.pm.PackageInstaller.PACKAGE_SOURCE_LOCAL_FILE ||
+    source==android.content.pm.PackageInstaller.PACKAGE_SOURCE_DOWNLOADED_FILE
 
 internal data class NotificationPickerApp(val key:String,val label:String,val icon:Drawable?=null)
 private fun android.content.Context.notificationPickerApps():List<NotificationPickerApp> =packageManager.queryIntentActivities(
@@ -67,7 +71,7 @@ private fun android.content.Context.notificationPickerApps():List<NotificationPi
         if(awaiting) {
             awaiting=false
             if(access) {blocked=false;change {context.graph.preferences.notificationMaster(true)}}
-            else blocked=runCatching {context.packageManager.getInstallSourceInfo(context.packageName).packageSource!=android.content.pm.PackageInstaller.PACKAGE_SOURCE_STORE}.getOrDefault(true)
+            else blocked=runCatching {restrictedNotificationSource(context.packageManager.getInstallSourceInfo(context.packageName).packageSource)}.getOrDefault(false)
         }
     }
     val lifecycle by androidx.lifecycle.compose.LocalLifecycleOwner.current.lifecycle.currentStateFlow.collectAsState()
@@ -130,12 +134,25 @@ private fun android.content.Context.notificationPickerApps():List<NotificationPi
     }}
 }
 
+/** Rasterize launcher drawables into the same tile, including adaptive/transparent icons. */
+internal fun notificationIconBitmap(icon:Drawable,pixels:Int,fill:Int):Bitmap {
+    val bitmap=Bitmap.createBitmap(pixels,pixels,Bitmap.Config.ARGB_8888)
+    val canvas=Canvas(bitmap);val scale=pixels/36f
+    val outline=android.graphics.Path().apply {addRoundRect(0f,0f,pixels.toFloat(),pixels.toFloat(),10*scale,10*scale,android.graphics.Path.Direction.CW)}
+    canvas.clipPath(outline);canvas.drawColor(fill)
+    val inset=kotlin.math.round(4*scale).toInt()
+    val original=android.graphics.Rect(icon.bounds)
+    try {icon.setBounds(inset,inset,pixels-inset,pixels-inset);icon.draw(canvas)} finally {icon.bounds=original}
+    return bitmap
+}
+
 @Composable private fun NotificationChoiceRow(label:String,checked:Boolean,icon:Drawable?,symbol:Int?,detail:String?,divider:Boolean,change:(Boolean)->Unit) {
     Row(Modifier.fillMaxWidth().pneuRow(divider,64.dp).pneuToggle(checked,true,onChange=change).heightIn(min=64.dp).padding(horizontal=16.dp,vertical=8.dp),
         verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(12.dp)) {
         if(icon!=null) {
-            val bitmap=remember(icon) {Bitmap.createBitmap(64,64,Bitmap.Config.ARGB_8888).also {icon.setBounds(0,0,64,64);icon.draw(Canvas(it))}.asImageBitmap()}
-            Image(bitmap,null,Modifier.size(36.dp).clip(RoundedCornerShape(10.dp)))
+            val fill=LocalPneuColors.current.fill.toArgb()
+            val bitmap=remember(icon,fill) {notificationIconBitmap(icon,128,fill).asImageBitmap()}
+            Image(bitmap,null,Modifier.size(36.dp))
         } else Box(Modifier.size(36.dp).background(if(checked)LocalPneuColors.current.accentSoft else LocalPneuColors.current.fill,RoundedCornerShape(10.dp)),contentAlignment=Alignment.Center) {Symbol(symbol ?: R.drawable.ic_notifications,modifier=Modifier.size(20.dp),tint=if(checked)LocalPneuColors.current.accentText else LocalPneuColors.current.text2)}
         Column(Modifier.weight(1f)) {Text(label,style=PneuType.body);if(detail!=null)Text(detail,style=PneuType.subhead,color=LocalPneuColors.current.text2)}
         PneuSwitch(checked,onCheckedChange=null)
