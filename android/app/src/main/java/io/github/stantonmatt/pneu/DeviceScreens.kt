@@ -116,7 +116,7 @@ private fun automaticKinds(context:android.content.Context,p:Prefs):String? {
 
 /** One pair: status card, the pair's sharing switches, then linking and Remove from all devices or Unpair. */
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable internal fun DeviceScreen(p:Prefs,state:DeviceState,back:()->Unit,pair:()->Unit,unpair:()->Unit,sendFiles:()->Unit,setup:SetupActions=SetupActions(),setSwitch:(String,Boolean)->Unit) {
+@Composable internal fun DeviceScreen(p:Prefs,state:DeviceState,back:()->Unit,pair:()->Unit,unpair:()->Unit,sendFiles:()->Unit,setup:SetupActions=SetupActions(),sendFolder:()->Unit={},setSwitch:(String,Boolean)->Unit) {
     val context=LocalContext.current;val resources=LocalResources.current;val c=LocalPneuColors.current
     val peer=state.peer;val link=state.connection;val online=connected(p,state)
     val scroll=rememberScrollState()
@@ -153,9 +153,12 @@ private fun automaticKinds(context:android.content.Context,p:Prefs):String? {
                         Spacer(Modifier.height(20.dp))
                         if(peer.pairingLost || peer.setupRefused || SetupPresentation.introducedStatus(peer)==IntroducedStatus.SILENT && status==ConnectionStatus.UNREACHABLE)PneuButton(pair,Modifier.fillMaxWidth().height(48.dp)) {Symbol(R.drawable.ic_qr_code_scanner,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_pair_again))}
                         // Unreachable: the Link card's action first, then Send files (files wait for the device).
-                        else PneuButtonPair(Modifier.fillMaxWidth()) {
-                            if(hint?.hasAction()==true)UnreachableAction(hint,Modifier.height(48.dp)) {anywhere=true}
-                            PneuTonalButton(sendFiles,Modifier.height(48.dp)) {Symbol(R.drawable.ic_upload,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_send_files),maxLines=1,overflow=TextOverflow.Ellipsis)}
+                        else {
+                            if(hint?.hasAction()==true)UnreachableAction(hint,Modifier.fillMaxWidth().padding(bottom=8.dp).height(48.dp)) {anywhere=true}
+                            PneuButtonPair(Modifier.fillMaxWidth()) {
+                                PneuTonalButton(sendFiles,Modifier.height(48.dp)) {Symbol(R.drawable.ic_upload,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_send_files),maxLines=1,overflow=TextOverflow.Ellipsis)}
+                                PneuTonalButton(sendFolder,Modifier.height(48.dp)) {Symbol(R.drawable.ic_folder,modifier=Modifier.size(20.dp));Spacer(Modifier.width(8.dp));Text(resources.getString(R.string.action_send_folder),maxLines=1,overflow=TextOverflow.Ellipsis)}
+                            }
                         }
                         if(anywhere)ConnectAnywhereSheet(p.tailscale,listOf(peer)) {anywhere=false}
                     }

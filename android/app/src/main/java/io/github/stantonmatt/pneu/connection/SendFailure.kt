@@ -13,8 +13,12 @@ internal object SendFailures {
         is io.github.stantonmatt.pneu.features.LocalCapacityException->"local_capacity"
         else->"local_storage"
     }
-    fun retryAfter(code:String)=if(code=="invalid_payload")Long.MAX_VALUE else 60000L
+    fun retryAfter(code:String)=if(code in setOf("invalid_payload","folder_changed","folder_access_lost"))Long.MAX_VALUE else 60000L
     suspend fun <T> local(code:String,body:suspend ()->T):T=try {body()}
         catch(e:CancellationException) {throw e}
-        catch(e:Exception) {throw LocalSendFailure(code,e)}
+        catch(e:Exception) {throw LocalSendFailure(when(e) {
+            is io.github.stantonmatt.pneu.features.FolderChanged->"folder_changed"
+            is SecurityException->if(code=="folder_read")"folder_access_lost" else code
+            else->if(code=="folder_read")"local_read" else code
+        },e)}
 }

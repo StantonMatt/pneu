@@ -717,8 +717,8 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                 var row=selection.row
                 if(row==null)continue
                 selected=row
-                val supported=if(text) "clipboard_text" in capabilities else "files" in capabilities && (row.kind!="clipboard_image" || "clipboard_image" in capabilities)
-                if(!supported) {row.state="failed";row.error="unsupported_kind";row.nextAttempt=Long.MAX_VALUE;row.rejectedCapabilities=capabilities.sorted().joinToString(",");updateRow(row);waitMillis=0;continue}
+                val supported=if(text) "clipboard_text" in capabilities else "files" in capabilities && (row.kind!="clipboard_image" || "clipboard_image" in capabilities) && (!row.isFolder() || capabilities.containsAll(setOf(CAP_FILE_RESUME,CAP_FOLDER)))
+                if(!supported) {row.state="failed";row.error=if(row.isFolder())"folder_update_required" else "unsupported_kind";row.nextAttempt=Long.MAX_VALUE;row.rejectedCapabilities=capabilities.sorted().joinToString(",");updateRow(row);waitMillis=0;continue}
                     val processed=if(text) transferText(row,sessionBinding,retries)
                     else {
                         if(DeliveryPolicy.optimize(row.kind,row.mime,network.mobile,prefs.originals,(row.attempted || row.payloadAttempted),row.optimized)) {
@@ -952,33 +952,54 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
         }
     }
     private fun readControl(ssl: SSLSocket): Frame.Control = Protocol.read(ssl.inputStream).also { require(it is Frame.Control) } as Frame.Control
+    @Volatile private var activeFolderRead:Pair<String,java.util.concurrent.atomic.AtomicBoolean>?=null
     internal var openPayload:(File)->java.io.FileInputStream={it.inputStream()}
     private suspend fun transfer(row: Outgoing,binding:DeliveryBinding,retries:RetryDeadlines):Boolean {
         val file = File(row.path)
         if (!file.exists()) { row.state="failed";row.error="local_file_missing";row.nextAttempt=Long.MAX_VALUE;updateRow(row);return true }
-        if (file.length() != row.size) { localMismatch(row,"size_mismatch",retries);return true }
-        val input=SendFailures.local("local_read") {openPayload(file)}
+        val folder=row.isFolder()
+        val readCancelled=java.util.concurrent.atomic.AtomicBoolean(false)
+        if (!folder && file.length() != row.size) { localMismatch(row,"size_mismatch",retries);return true }
+        val folderInput=if(folder)SendFailures.local("folder_read") {app.folderSends.open(row) {readCancelled.get() || filePhase?.cancelled==true}} else null
+        val input=if(folder)null else SendFailures.local("local_read") {openPayload(file)}
+        suspend fun seek(offset:Long) {if(folderInput!=null)folderInput.seek(offset) else requireNotNull(input).channel.position(offset)}
+        suspend fun read(buffer:ByteArray,limit:Int):Int=if(folderInput!=null) {
+            val b=if(limit==buffer.size)buffer else ByteArray(limit)
+            folderInput.read(b).also {if(it>0 && b!==buffer)b.copyInto(buffer,0,0,it)}
+        }else requireNotNull(input).read(buffer,0,limit)
+        val readError=if(folder)"folder_read" else "local_read"
         var began=false;var ended=false
+        if(folder)activeFolderRead=row.mediaId to readCancelled
         try {
-            val digest=java.security.MessageDigest.getInstance("SHA-256")
-            SendFailures.local("local_read") {
-                val buffer=ByteArray(CHUNK_SIZE)
-                while(true) {currentCoroutineContext().ensureActive();val n=input.read(buffer);if(n<0)break;digest.update(buffer,0,n)}
-                input.channel.position(0)
+            // Register before checking durable state: a discard either reaches
+            // this token or is already visible here, including before BEGIN.
+            if(folder) {
+                val current=app.queue.delivery(row.mediaId,row.peerId)
+                if(current==null || current.state !in setOf("waiting","failed","sending") || current.revision!=row.revision)return true
             }
-            if(digest.digest().hex()!=row.hash) {localMismatch(row,"hash_mismatch",retries);return true}
+            val digest=java.security.MessageDigest.getInstance("SHA-256")
+            SendFailures.local(readError) {
+                if(folderInput!=null) {if(row.attempted)folderInput.verify()} else {
+                    val buffer=ByteArray(CHUNK_SIZE)
+                    while(true) {currentCoroutineContext().ensureActive();val n=requireNotNull(input).read(buffer);if(n<0)break;digest.update(buffer,0,n)}
+                    requireNotNull(input).channel.position(0)
+                }
+            }
+            if(!folder && digest.digest().hex()!=row.hash) {localMismatch(row,"hash_mismatch",retries);return true}
             val resume=CAP_FILE_RESUME in capabilities && "files" in capabilities && !row.sensitive
             val phase=FileSendPhase(row.transferId,row.size,resume);filePhase=phase
             row.resumable=resume
             val receipt=phase.receipt;activeReceipt=row.transferId to receipt
             val emission=QueuedEmission(row,binding);fileEmission=emission
-            if(!send(Frame.Control(Type.FILE_BEGIN,Staging.metadata(row).apply {if(resume)addProperty("resume",true);if("mesh" in capabilities && row.hlc.isNotEmpty()) {addProperty("hlc",row.hlc.toBigInteger());addProperty("source_device",row.sourceDevice)}}),emission))return false
+            if(!send(Frame.Control(Type.FILE_BEGIN,Staging.metadata(row).apply {if(resume)addProperty("resume",true);if(!folder && "mesh" in capabilities && row.hlc.isNotEmpty()) {addProperty("hlc",row.hlc.toBigInteger());addProperty("source_device",row.sourceDevice)}}),emission))return false
             began=true
             val readiness=if(resume)withTimeoutOrNull(120_000) {phase.readiness.await()} ?: throw TransportFailure(java.net.SocketTimeoutException("READY deadline expired")) else null
             if(phase.cancelled)return true
             val early=readiness?.takeIf {it.type==Type.NACK}
             var offset=readiness?.takeIf {it.type==Type.FILE_READY}?.body?.get("offset")?.asLong ?: 0L
-            if(early==null)SendFailures.local("local_read") {input.channel.position(offset)}
+            if(early==null)SendFailures.local(readError) {
+                seek(offset)
+            }
             row.sentBytes=offset
             state.update {it.copy(sent=offset)}
             val buffer=ByteArray(CHUNK_SIZE)
@@ -986,7 +1007,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
             while(early==null && offset<row.size) {
                 currentCoroutineContext().ensureActive()
                 if(phase.cancelled)return true
-                val n=SendFailures.local("local_read") {input.read(buffer,0,minOf(buffer.size.toLong(),row.size-offset).toInt()).also {if(it<=0)throw java.io.EOFException()}}
+                val n=SendFailures.local(readError) {read(buffer,minOf(buffer.size.toLong(),row.size-offset).toInt()).also {if(it<=0)throw java.io.EOFException()}}
                 send(Frame.Chunk(row.transferId,offset,buffer.copyOf(n)));offset+=n
                 row.sentBytes=offset
                 if(offset-durableSent>=ReceiveSpool.CHECKPOINT_BYTES) {PostCommit.maintainSuspending {updateRow(row)};durableSent=offset}
@@ -995,6 +1016,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
             }
             if(phase.cancelled)return true
             val response=if(early!=null)early else {
+                SendFailures.local(readError) {folderInput?.finish()}
                 phase.ending();receiptReady=true
                 send(Frame.Control(Type.FILE_END,json("transfer_id" to row.transferId)));ended=true
                 beforeFileReceiptWait()
@@ -1003,9 +1025,9 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
             if(phase.cancelled)return true
             if(response.type==Type.ACK) {
                 if(row.kind=="clipboard_image")PostCommit.maintainSuspending {app.savedClips.recordImage(row.mime,sensitive=row.sensitive) {file.inputStream()}}
-                row.state="sent";row.error="";app.staging.completeFile(row)
+                row.state="sent";row.error="";if(app.staging.completeFile(row) && folder)PostCommit.maintainSuspending {app.withAuthority(CapturedAuthority(binding,admissionSession)) {FolderSentNotifications.show(app.context,row,binding.pcId,readPrefs().devices)}}
             } else {
-                val code=response.body["code"].asString;row.error=code;row.state="failed";if(code=="unsupported_kind")row.rejectedCapabilities=emission.rejectedCapabilities
+                val code=response.body["code"].asString;row.error=if(folder && early!=null && code=="disk_full")"folder_disk_full_early" else code;row.state="failed";if(code=="unsupported_kind")row.rejectedCapabilities=emission.rejectedCapabilities
                 val decision=RetryPolicy.nack(code,row.mismatches,Random.nextDouble(.8,1.2))
                 row.mismatches=decision.mismatches;retries.retryAfter(row,decision.waitMillis);updateRow(row)
                 // A newer settings sync can finish before this NACK. Revalidate
@@ -1014,7 +1036,20 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
             }
             return true
         } catch(e:LocalSendFailure) {
-            if(began && !ended) {
+            if(filePhase?.cancelled==true || readCancelled.get())return true
+            if(folder && e.code in setOf("folder_changed","folder_access_lost") && !ended && (began || row.attempted)) {
+                filePhase?.cancel()
+                // Keep the existing durable cancel intent if this lane drops
+                // before the control frame can be flushed.
+                app.withAuthority(CapturedAuthority(binding)) {
+                    app.queue.insertPendingCancel(PendingCancel().apply {
+                        peerId=binding.pcId;transferId=row.transferId;pin=binding.pin;generation=binding.generation
+                    })
+                }
+                try {
+                    if(send(Frame.Control(Type.CANCEL,json("transfer_id" to row.transferId))))app.queue.deletePendingCancel(binding.pcId,row.transferId)
+                }catch(_:TransportFailure) {retry()}
+            }else if(began && !ended) {
                 // A local read failed between complete frames. END with fewer bytes is
                 // normative NACK size_mismatch and returns the peer's file lane to IDLE.
                 filePhase?.ending();receiptReady=true
@@ -1026,7 +1061,8 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
             if(app.queue.delivery(row.mediaId,row.peerId)?.state!="discarded") {row.state=if(!row.resumable || app.preferences.read().queue)"waiting" else "failed";row.error="connection_lost";row.nextAttempt=if(row.state=="failed")Long.MAX_VALUE else 0;runCatching {updateRow(row)}}
             throw e
         } finally {
-            runCatching {input.close()}
+            runCatching {input?.close();folderInput?.close()}
+            if(activeFolderRead?.second===readCancelled)activeFolderRead=null
             if(began && row.state=="sending" && filePhase?.cancelled!=true)withContext(NonCancellable) {
                 if(app.queue.delivery(row.mediaId,row.peerId)?.state!="discarded") {row.state=if(!row.resumable || app.preferences.read().queue)"waiting" else "failed";row.error="connection_lost";row.nextAttempt=if(row.state=="failed")Long.MAX_VALUE else 0;runCatching {updateRow(row)}}
             }
@@ -1220,6 +1256,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
             } else retry()
         }
         flush?.start()
+        activeFolderRead?.takeIf {it.first==mediaId}?.second?.set(true)
         // Already-emitted text consumes its own ACK/NACK without resetting files.
         textEmission?.takeIf {it.row.mediaId==mediaId}?.cancel()
     }

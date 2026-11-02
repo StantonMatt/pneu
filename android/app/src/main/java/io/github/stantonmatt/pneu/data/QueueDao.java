@@ -78,6 +78,11 @@ import kotlinx.coroutines.flow.Flow;
     // State mutations never overwrite another recipient or the shared payload.
     default void update(Outgoing row) {updateRecipient(Delivery.from(row));}
     @Transaction default void replacePayload(Outgoing row) {updateArtifact(Artifact.from(row));update(row);}
+    // A disabled automatic retry can still be retried manually after restart.
+    // Release access for final failures, not merely an infinite retry deadline.
+    String FOLDER_GRANT_URIS="SELECT DISTINCT uri FROM outgoing WHERE origin='folder' AND (state IN ('waiting','sending') OR (state='failed' AND error NOT IN ('folder_changed','folder_access_lost','folder_update_required','unsupported_kind','invalid_payload','id_conflict','local_file_missing')))";
+    @Query(FOLDER_GRANT_URIS) List<String> activeFolderUris();
+    @Query(FOLDER_GRANT_URIS) Flow<List<String>> folderGrantChanges();
     @Query("SELECT * FROM outgoing WHERE mediaId=:id AND peerId=:peer") Outgoing delivery(String id,String peer);
     @Query("SELECT * FROM outgoing WHERE mediaId=:id") List<Outgoing> deliveries(String id);
     @Query("SELECT * FROM outgoing WHERE peerId=:peer AND state IN ('waiting','sending','failed') AND error!='old_device_replaced' ORDER BY orderId,mediaId") List<Outgoing> pendingPeer(String peer);
@@ -130,7 +135,7 @@ import kotlinx.coroutines.flow.Flow;
         recoverSendingLane(text);
         if(text) supersedeOlderText();
     }
-    @Query("UPDATE artifacts SET uri='' WHERE automatic=0 AND kind!='text' AND uri NOT LIKE :privateUris") void forgetManualSources(String privateUris);
+    @Query("UPDATE artifacts SET uri='' WHERE automatic=0 AND kind!='text' AND origin!='folder' AND uri NOT LIKE :privateUris") void forgetManualSources(String privateUris);
     @Query("UPDATE deliveries SET state='superseded',revision=revision+1 WHERE state IN ('waiting','failed') AND mediaId IN (SELECT o.mediaId FROM outgoing o WHERE o.peerId=deliveries.peerId AND o.kind='text' AND o.orderId<(SELECT MAX(n.orderId) FROM outgoing n WHERE n.peerId=o.peerId AND n.kind='text' AND n.state IN ('waiting','failed'))) AND error!='old_device_replaced'") void supersedeOlderText();
     @Transaction default void recover() { recoverSending();supersedeOlderText(); }
     @Query("SELECT COUNT(*) FROM outgoing WHERE path=:path") int anyPath(String path);
