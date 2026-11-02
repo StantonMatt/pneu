@@ -1954,7 +1954,7 @@ async fn changing_save_path_applies_to_new_transfers_without_waiting_for_active_
         end(&mut c, first.transfer_id).await?,
         Message::Ack(_)
     ));
-    assert_eq!(std::fs::read_dir(old.join(".pneu-staging"))?.count(), 0);
+    assert!(!old.join(".pneu-staging").exists());
     assert_eq!(
         std::fs::read_dir(&old)?
             .filter(|e| e.as_ref().is_ok_and(|e| e.path().is_file()))
@@ -1967,7 +1967,7 @@ async fn changing_save_path_applies_to_new_transfers_without_waiting_for_active_
         end(&mut c, second.transfer_id).await?,
         Message::Ack(_)
     ));
-    assert!(h.core.config().save_path.join(".pneu-staging").is_dir());
+    assert!(!h.core.config().save_path.join(".pneu-staging").exists());
     assert_eq!(h.saved()?.len(), 1);
     assert_eq!(
         h.core.connected_devices(),
@@ -6115,17 +6115,9 @@ async fn phone_notifications_fake_peer_updates_removes_clears_and_disconnects_wi
         .icon
         .clone()
         .expect("cached icon");
-    if let Some(path) = icon.file_path() {
-        assert!(path.exists());
-    }
-    #[cfg(target_os = "linux")]
-    {
-        assert!(matches!(
-            icon,
-            pneud::ui::notifications::PhoneIcon::Pixels { .. }
-        ));
-        assert!(!h.core.paths.cache.join("phone-notification-icons").exists());
-    }
+    let icon_path = icon.file_path().context("private cached icon file")?;
+    assert!(icon_path.exists());
+    assert!(icon_path.starts_with(h.core.paths.cache.join("phone-notification-icons")));
     write_frame(&mut tls,&notification(serde_json::json!({"action":"upsert", "key":format!("{:032x}",1),"app_package":"org.chat","app_label":"Chat","title":"Ana <&>","text":"¿Llegaste?\nNow", "time":0}))).await?;
     phone_counts(&h.actions, 2, 0).await?;
     {
@@ -6153,9 +6145,10 @@ async fn phone_notifications_fake_peer_updates_removes_clears_and_disconnects_wi
     phone_counts(&h.actions, 4, 3).await?;
     write_frame(&mut tls, &phone_upsert(1)).await?;
     phone_counts(&h.actions, 5, 3).await?;
-    if let Some(path) = icon.file_path() {
-        assert!(path.exists(), "clear must retain the connection icon cache");
-    }
+    assert!(
+        icon_path.exists(),
+        "clear must retain the connection icon cache"
+    );
     let mut events = h.core.subscribe();
     drop(tls);
     phone_counts(&h.actions, 5, 4).await?;
@@ -6169,12 +6162,10 @@ async fn phone_notifications_fake_peer_updates_removes_clears_and_disconnects_wi
         )
     })
     .await?;
-    if let Some(path) = icon.file_path() {
-        assert!(
-            !path.exists(),
-            "disconnect must delete private icon exports"
-        );
-    }
+    assert!(
+        !icon_path.exists(),
+        "disconnect must delete private icon exports"
+    );
     let mut tls = mesh_phone(&h, &phone).await?;
     // A fresh HELLO and keepalive cause no mirror replay or notification ACK.
     write_frame(

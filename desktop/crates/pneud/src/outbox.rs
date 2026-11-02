@@ -486,6 +486,7 @@ impl Outbox {
                 });
             }
         }
+        self.store.attribute_finished_transfers(&mut rows);
         rows = recent_operations(rows);
         rows.into_iter()
             .map(|mut row| {

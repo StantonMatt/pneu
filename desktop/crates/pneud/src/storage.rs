@@ -16,6 +16,10 @@ pub(crate) use fs::{Folder, open_regular_file, remove_directory, remove_file};
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) mod windows_names;
 
+// Hold from opening/creating the root through creating a stage entry, or while
+// removing its last entry and retiring the empty root. Never hold during stream reads/writes.
+pub(crate) static STAGING_LIFECYCLE: Mutex<()> = Mutex::new(());
+
 pub(crate) const STAGING_DIR: &str = ".pneu-staging";
 pub(crate) const CACHE_PREFIX: &str = ".pneu-cache-";
 const NAME_MAX: usize = 255;
@@ -84,6 +88,7 @@ pub(crate) fn clean_staging(folder: &Folder) -> Result<()> {
             let directory = owned_staging(fd)?;
             wipe(&directory.file)?;
             directory.file.sync_all()?;
+            remove_empty_staging(folder, &directory)?;
         }
         Err(error) if fs::is_missing(&error) => {}
         Err(e) => return Err(e),
@@ -140,6 +145,19 @@ pub(crate) fn staging_directory(folder: &Folder) -> Result<Folder> {
         crate::platform::private::created(&file)?;
     }
     owned_staging(file)
+}
+/// Caller serializes with stage admission. Nonempty roots include live receives
+/// and retained resume prefixes, and must stay linked.
+pub(crate) fn remove_empty_staging(folder: &Folder, directory: &Folder) -> Result<()> {
+    for entry in fs::entries(&directory.file)? {
+        let name = entry?;
+        if name != std::ffi::OsStr::new(".") && name != std::ffi::OsStr::new("..") {
+            return Ok(());
+        }
+    }
+    remove_directory(&folder.file, STAGING_DIR, &directory.file)?;
+    folder.file.sync_all()?;
+    Ok(())
 }
 fn owned_staging(file: File) -> Result<Folder> {
     crate::platform::private::check(&file)?;
@@ -283,9 +301,11 @@ impl Stage {
         Ok(self.0.directory.path()?.join(&self.0.name))
     }
     pub fn cleanup(&self) -> Result<()> {
+        let _lifecycle = STAGING_LIFECYCLE.lock().expect("staging lifecycle");
         self.cleanup_folder()?;
         remove_file(&self.0.directory.file, &self.0.name, &self.0.file)?;
         self.0.directory.file.sync_all()?;
+        remove_empty_staging(&self.0.folder, &self.0.directory)?;
         self.0.cleanup.lock().expect("stage cleanup").take();
         Ok(())
     }
@@ -395,6 +415,7 @@ impl Drop for StageInner {
         if self.retained.load(Ordering::SeqCst) {
             return;
         }
+        let folder = self.folder.clone();
         let directory = self.directory.clone();
         let name = self.name.clone();
         // If FD duplication fails, startup can sweep the disposable stage;
@@ -404,12 +425,14 @@ impl Drop for StageInner {
         };
         let tree = self.tree.get_mut().ok().and_then(Option::take);
         let clean = move || {
+            let _lifecycle = STAGING_LIFECYCLE.lock().expect("staging lifecycle");
             if let Some(tree) = tree {
                 tree.release();
                 tree.record.cleanup(&directory, &name)?;
             }
             remove_file(&directory.file, &name, &file)?;
             directory.file.sync_all()?;
+            remove_empty_staging(&folder, &directory)?;
             Ok(())
         };
         if let Some(cleanup) = self.cleanup.get_mut().ok().and_then(Option::take) {
@@ -693,7 +716,8 @@ mod tests {
                 assert_eq!(std::fs::read(&path)?, b"received");
                 only_default_stream(&path)?;
             }
-            assert_eq!(fs::entries(&staging.file)?.count(), 0);
+            drop(staging);
+            assert!(!dir.path().join(STAGING_DIR).exists());
         }
         assert!(!dir.path().join("a").exists(), "ADS base file was created");
         assert!(!dir.path().join("a:b.jpg").exists());
@@ -988,9 +1012,12 @@ mod tests {
             dir.path().join(STAGING_DIR),
             std::fs::Permissions::from_mode(0o500),
         )?;
-        clean_staging(&folder)?;
         staging_directory(&folder)?;
         assert_eq!(staging.file.metadata()?.permissions().mode() & 0o777, 0o500);
+        clean_staging(&folder)?;
+        assert!(!dir.path().join(STAGING_DIR).exists());
+        assert_eq!(staging.file.metadata()?.permissions().mode() & 0o777, 0o500);
+        let staging = staging_directory(&folder)?;
         // A publicly writable root is refused without silently changing it.
         std::fs::set_permissions(
             dir.path().join(STAGING_DIR),

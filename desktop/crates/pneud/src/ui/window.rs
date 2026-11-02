@@ -1475,6 +1475,85 @@ pub fn run(paths: Paths) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", pneu_qt_drag),
+    windows,
+    all(test, unix)
+))]
+fn drop_choices(
+    origin: &View,
+    devices: &[DeviceItem],
+    folders: bool,
+) -> (Vec<DropItem>, Vec<Vec<contract::CapturedTarget>>) {
+    let mut bindings = origin.targets.clone().unwrap_or_default();
+    if folders {
+        for target in &mut bindings {
+            if let Some(reason) = &target.folder_reason {
+                target.eligible = false;
+                target.reason = Some(reason.clone());
+            }
+        }
+    }
+    let all = contract::resolve_files(&bindings, crate::file_recipients::Selection::ConnectedOnly)
+        .unwrap_or_default();
+    let any_supported = !all.is_empty();
+    let selected = if folders {
+        contract::resolve_files(
+            origin.targets.as_deref().unwrap_or_default(),
+            crate::file_recipients::Selection::ConnectedOnly,
+        )
+        .unwrap_or_default()
+    } else {
+        all
+    };
+    let mut targets = Vec::new();
+    let mut labels = Vec::new();
+    if devices.len() != 1 {
+        targets.push(selected);
+        labels.push(DropItem {
+            sub: "".into(),
+            name: "All connected devices".into(),
+            enabled: any_supported,
+        });
+    }
+    for device in devices {
+        let authority = bindings
+            .iter()
+            .find(|t| t.device == device.id.as_str())
+            .and_then(|t| {
+                Some(contract::CapturedTarget {
+                    device: t.device.clone(),
+                    generation: t.generation,
+                    fingerprint: t.fingerprint.clone()?,
+                })
+            });
+        labels.push(DropItem {
+            sub: bindings
+                .iter()
+                .find(|t| t.device == device.id.as_str())
+                .and_then(|t| {
+                    if folders {
+                        t.folder_reason.clone()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default()
+                .into(),
+            name: device.name.clone(),
+            enabled: device.connected
+                && authority.is_some()
+                && bindings
+                    .iter()
+                    .find(|t| t.device == device.id.as_str())
+                    .is_none_or(|t| t.eligible),
+        });
+        targets.push(authority.into_iter().collect());
+    }
+    (labels, targets)
+}
+
 #[cfg(any(target_os = "macos", all(target_os = "linux", pneu_qt_drag), windows))]
 fn install_drop(
     window: &PneuWindow,
@@ -1494,6 +1573,7 @@ fn install_drop(
         targets: Vec<Vec<contract::CapturedTarget>>,
         enabled: Vec<bool>,
         folders: bool,
+        all_connected: bool,
     }
     impl DropSession {
         fn enabled_now(&self, window: &PneuWindow) -> Vec<bool> {
@@ -1508,7 +1588,8 @@ fn install_drop(
                                 .iter()
                                 .map(|target| target.device.as_str()),
                             |id| {
-                                let supported = index != 0
+                                let supported = !self.all_connected
+                                    || index != 0
                                     || !self.folders
                                     || self
                                         .origin
@@ -1566,68 +1647,8 @@ fn install_drop(
         }
         let origin = frame.lock().expect("drop frame").clone();
         let folders = paths.iter().any(|p| p.is_dir());
-        let mut bindings = origin.targets.clone().unwrap_or_default();
-        if folders {
-            for target in &mut bindings {
-                if let Some(reason) = &target.folder_reason {
-                    target.eligible = false;
-                    target.reason = Some(reason.clone());
-                }
-            }
-        }
-        let all =
-            contract::resolve_files(&bindings, crate::file_recipients::Selection::ConnectedOnly)
-                .unwrap_or_default();
-        let any_supported = !all.is_empty();
-        let selected = if folders {
-            contract::resolve_files(
-                origin.targets.as_deref().unwrap_or_default(),
-                crate::file_recipients::Selection::ConnectedOnly,
-            )
-            .unwrap_or_default()
-        } else {
-            all
-        };
-        let mut targets = vec![selected];
-        let mut labels = vec![DropItem {
-            sub: "".into(),
-            name: "All connected devices".into(),
-            enabled: any_supported,
-        }];
-        for device in ui.get_devices().iter() {
-            let authority = bindings
-                .iter()
-                .find(|t| t.device == device.id.as_str())
-                .and_then(|t| {
-                    Some(contract::CapturedTarget {
-                        device: t.device.clone(),
-                        generation: t.generation,
-                        fingerprint: t.fingerprint.clone()?,
-                    })
-                });
-            labels.push(DropItem {
-                sub: bindings
-                    .iter()
-                    .find(|t| t.device == device.id.as_str())
-                    .and_then(|t| {
-                        if folders {
-                            t.folder_reason.clone()
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default()
-                    .into(),
-                name: device.name,
-                enabled: device.connected
-                    && authority.is_some()
-                    && bindings
-                        .iter()
-                        .find(|t| t.device == device.id.as_str())
-                        .is_none_or(|t| t.eligible),
-            });
-            targets.push(authority.into_iter().collect());
-        }
+        let devices = ui.get_devices().iter().collect::<Vec<_>>();
+        let (labels, targets) = drop_choices(&origin, &devices, folders);
         let enabled = labels.iter().map(|l| l.enabled).collect();
         ui.set_drop_items(ModelRc::new(VecModel::from(labels)));
         ui.set_drop_active(true);
@@ -1636,6 +1657,7 @@ fn install_drop(
             targets,
             enabled,
             folders,
+            all_connected: devices.len() != 1,
         });
         true
     });
@@ -1712,7 +1734,7 @@ fn install_drop(
                 files,
                 targets,
                 origin: session.origin,
-                targeted: index != 0,
+                targeted: !session.all_connected || index != 0,
             })
             .is_ok()
     });
@@ -5261,6 +5283,50 @@ async fn choose_files_on(
 mod tests {
     use super::*;
     #[test]
+    fn drop_choices_name_a_single_device_once_and_preserve_authority() {
+        for (connected, eligible, folders, expected) in [
+            (true, true, false, true),
+            (false, true, false, false),
+            (true, false, false, false),
+            (true, true, true, false),
+        ] {
+            let mut binding: SendTarget = serde_json::from_value(target(1, 7, !connected)).unwrap();
+            binding.eligible = eligible;
+            binding.folder_reason = Some("Can't receive folders yet".into());
+            let origin = View {
+                targets: Some(vec![binding.clone()]),
+                ..Default::default()
+            };
+            let d = DeviceItem {
+                id: id(1).to_string().into(),
+                name: "Galaxy S25+".into(),
+                connected,
+                ..Default::default()
+            };
+            let (labels, targets) = drop_choices(&origin, std::slice::from_ref(&d), folders);
+            assert_eq!(labels.len(), 1);
+            assert_eq!(labels[0].name, "Galaxy S25+");
+            assert_eq!(labels[0].enabled, expected);
+            assert_eq!(targets[0][0].device, id(1).as_str());
+            assert_eq!(targets[0][0].generation, 7);
+            assert_eq!(
+                targets[0][0].fingerprint,
+                binding.fingerprint.clone().unwrap()
+            );
+            if folders {
+                assert_eq!(labels[0].sub, "Can't receive folders yet");
+            }
+            let other = DeviceItem {
+                id: id(2).to_string().into(),
+                name: "MacBook Air".into(),
+                ..d.clone()
+            };
+            let (labels, _) = drop_choices(&origin, &[d, other], folders);
+            assert_eq!(labels.len(), 3);
+            assert_eq!(labels[0].name, "All connected devices");
+        }
+    }
+    #[test]
     fn folder_recent_strings_counts_and_phone_refusal() {
         let ps = peers(&snapshot(two()), &[]);
         let mut row = transfer("folder", 2, "Trip", "sent", 10, 10);
@@ -5269,6 +5335,12 @@ mod tests {
             links: 2,
             ..Default::default()
         });
+        row.finished_at = Some(crate::now_ms() - 60_000);
+        let expected = format!(
+            "To MacBook Air · Sent 1,204 of 1,206 items · {}",
+            super::super::last_seen(row.finished_at.unwrap())
+        );
+        assert_eq!(recent(&ps, &[row.clone()])[0].detail, expected);
         assert_eq!(recent(&ps, &[row.clone()])[0].detail_tone, Tone::Neutral);
         assert!(
             recent(&ps, &[row.clone()])[0]
@@ -5276,6 +5348,10 @@ mod tests {
                 .contains("Sent 1,204 of 1,206 items")
         );
         row.folder.as_mut().unwrap().failed = 2;
+        assert_eq!(
+            recent(&ps, &[row.clone()])[0].detail,
+            expected.replace("1,206", "1,208")
+        );
         assert_eq!(recent(&ps, &[row.clone()])[0].detail_tone, Tone::Warn);
         row.error = Some("Can't receive folders yet".into());
         row.state = "failed".into();
@@ -9806,6 +9882,7 @@ mod tests {
             );
             let ui = window.global::<Ui>();
             ui.set_dialog(Dialog::None);
+            ui.set_drop_active(false);
             ui.set_page(Page::Main);
             // Tear down the previous scene before constructing the next one's
             // autofocus controls; captures must not inherit pending focus timers.
@@ -9922,6 +9999,58 @@ mod tests {
             surface.draw_if_needed(|renderer| {
                 renderer.render(&mut pixels, size.width as usize);
             });
+            if scene.name.starts_with("drop-") {
+                assert!(ui.get_drop_supported() && ui.get_drop_active());
+                let pixel = &pixels
+                    [(100.0 * scale) as usize * size.width as usize + (5.0 * scale) as usize];
+                let background = window.global::<Pneu>().get_background();
+                assert_ne!(
+                    (pixel.red, pixel.green, pixel.blue),
+                    (background.red(), background.green(), background.blue()),
+                    "{}: drop overlay must paint its dimmer",
+                    scene.name
+                );
+            }
+            if scene.name == "115-battery-normal-page" {
+                // Merge small text/divider gaps, then measure each complete
+                // button. Splitting the image in half would hide an oversized
+                // Send button that crosses the row's midpoint.
+                let fill = window.global::<Pneu>().get_accent_soft();
+                let mut widths = [0usize; 2];
+                for row in pixels.chunks_exact(size.width as usize) {
+                    let mut spans: Vec<(usize, usize)> = Vec::new();
+                    for (x, pixel) in row.iter().enumerate() {
+                        if (pixel.red, pixel.green, pixel.blue)
+                            != (fill.red(), fill.green(), fill.blue())
+                        {
+                            continue;
+                        }
+                        if let Some((_, end)) = spans
+                            .last_mut()
+                            .filter(|(_, end)| x - *end - 1 <= (2.0 * scale) as usize)
+                        {
+                            *end = x;
+                        } else {
+                            spans.push((x, x));
+                        }
+                    }
+                    let wide: Vec<_> = spans
+                        .iter()
+                        .map(|(start, end)| end - start + 1)
+                        .filter(|w| *w > (100.0 * scale) as usize)
+                        .collect();
+                    if let [left, right] = wide.as_slice() {
+                        widths[0] = widths[0].max(*left);
+                        widths[1] = widths[1].max(*right);
+                    }
+                }
+                assert!(
+                    widths[0] > 0 && widths[0].abs_diff(widths[1]) <= scale.ceil() as usize,
+                    "Send including arrow {}px != Ring {}px",
+                    widths[0],
+                    widths[1]
+                );
+            }
             if scene.name == "89-history-searching" {
                 assert_eq!(ui.get_history_query(), "pneu");
                 assert_eq!(ui.get_pinned_history().row_count(), 1);
@@ -10400,6 +10529,7 @@ mod tests {
                         1_800_000_000,
                         1_800_000_000,
                     );
+                    row.finished_at = Some(crate::now_ms() - 60_000);
                     row.path = Some("/Vacation 2026".into());
                     row.folder = Some(crate::folders::Details {
                         items: 1204,
@@ -10415,6 +10545,7 @@ mod tests {
                 "folder-links-skipped-neutral",
                 |w| {
                     let mut row = transfer("folder", 2, "Project", "sent", 1_800_000, 1_800_000);
+                    row.finished_at = Some(crate::now_ms() - 60_000);
                     row.path = Some("/Project".into());
                     row.folder = Some(crate::folders::Details {
                         items: 142,
@@ -10595,7 +10726,14 @@ mod tests {
                     state(
                         w,
                         vec![device(3, "Galaxy S25+", true, "connected", 0)],
-                        vec![row],
+                        vec![row, {
+                            let mut received =
+                                transfer("received", 3, "Lisbon 2026.jpg", "sent", 2048, 2048);
+                            received.direction = Some("incoming".into());
+                            received.finished_at = Some(crate::now_ms() - 60_000);
+                            received.path = Some("/Lisbon 2026.jpg".into());
+                            received
+                        }],
                     );
                 },
                 go(Page::Main, 0, 0),
@@ -11590,6 +11728,78 @@ mod tests {
             },
             go(Page::Device, 1, 0),
         ));
+        for (name, devices, folders) in [
+            (
+                "drop-one-connected",
+                vec![device(1, "Galaxy S25+", true, "connected", 0)],
+                false,
+            ),
+            (
+                "drop-one-offline",
+                vec![device(1, "Galaxy S25+", true, "disconnected", 0)],
+                false,
+            ),
+            (
+                "drop-one-folder-disabled",
+                vec![device(1, "Galaxy S25+", true, "connected", 0)],
+                true,
+            ),
+            ("drop-two-connected", two(), false),
+        ] {
+            list.push(scene(
+                name,
+                move |w| {
+                    state(w, devices.clone(), vec![]);
+                    let mut bindings = vec![target(1, 1, devices[0].state != "connected")];
+                    bindings[0]["folder_reason"] = json!("Can't receive folders yet");
+                    if devices.len() > 1 {
+                        bindings.push(target(2, 1, false));
+                    }
+                    w.status["snapshot"]["send_targets"] = json!(bindings);
+                },
+                move |w| {
+                    go(Page::Main, 0, 0)(w);
+                    let ui = w.global::<Ui>();
+                    let devices = ui.get_devices().iter().collect::<Vec<_>>();
+                    let origin = View {
+                        targets: Some(
+                            devices
+                                .iter()
+                                .enumerate()
+                                .map(|(i, d)| {
+                                    let mut t: SendTarget = serde_json::from_value(target(
+                                        (i + 1) as u8,
+                                        1,
+                                        !d.connected,
+                                    ))
+                                    .unwrap();
+                                    if d.phone {
+                                        t.folder_reason = Some("Can't receive folders yet".into());
+                                    }
+                                    t
+                                })
+                                .collect(),
+                        ),
+                        ..Default::default()
+                    };
+                    let (labels, _) = drop_choices(&origin, &devices, folders);
+                    assert_eq!(
+                        labels.len(),
+                        if devices.len() == 1 {
+                            1
+                        } else {
+                            devices.len() + 1
+                        }
+                    );
+                    if devices.len() == 1 {
+                        assert_eq!(labels[0].name, "Galaxy S25+");
+                    }
+                    ui.set_drop_items(ModelRc::new(VecModel::from(labels)));
+                    ui.set_drop_supported(true);
+                    ui.set_drop_active(true);
+                },
+            ));
+        }
         list.extend(history_scenes());
         list.extend(linking_scenes());
         list
