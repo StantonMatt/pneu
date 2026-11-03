@@ -143,7 +143,7 @@ android:
     - bash ci/android-sdk.sh
   script:
     - cd android
-    - ./gradlew --no-daemon testDebugUnitTest lintDebug
+    - ./gradlew --no-daemon --max-workers=1 -Pkotlin.compiler.execution.strategy=in-process testDebugUnitTest lintDebug
   artifacts:
     when: always
     expire_in: 7 days

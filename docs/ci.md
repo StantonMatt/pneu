@@ -12,7 +12,8 @@ builds stay on Ubuntu 24.04 for the glibc/Qt baseline. Linux compiles one Cargo
 job at a time, omits test debug information and disables incremental test
 compilation to fit the 4 GiB runner. Release
 builds retain the workspace release profile. Android uses Java 21 and
-SDK platform `android-37.2` / build tools `37.0.0`, without release signing.
+SDK platform `android-37.2` / build tools `37.0.0`, without release signing. It
+uses one Gradle worker and compiles Kotlin in the Gradle process to fit the VM.
 Windows uses GitLab's `saas-windows-medium-amd64` runner with MSVC and Windows
 SDK tools. It installs the workspace Rust version if needed. These Windows jobs
 spend hosted-runner minutes. Both the Windows test and Store MSIX release jobs
