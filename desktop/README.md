@@ -6,7 +6,7 @@ the [wire protocol](../docs/PROTOCOL.md) defines mesh negotiation and delivery.
 Nothing in this directory installs automatically.
 
 Linux releases include a .deb and a prebuilt tarball with a per-user installer.
-Download them from the [latest release](https://github.com/StantonMatt/pneu/releases/latest).
+Download them from the [latest release](https://gitlab.com/stantonmatthewj/pneu/-/releases/permalink/latest).
 See the [Linux guide](../docs/linux.md) for installation, uninstalling, package
 building and source-install precedence. Supported: Plasma 6 Wayland; GNOME/Mutter
 lacks data-control, so file transfers can run but automatic clipboard sync and

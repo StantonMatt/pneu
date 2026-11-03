@@ -96,7 +96,7 @@
 <string name="pref_permissions">Permissions and battery</string>
 <string name="pref_permissions_ok">All set</string>
 <string name="pref_privacy">Privacy policy</string>
-<string name="privacy_url" translatable="false">https://github.com/StantonMatt/pneu/blob/main/PRIVACY.md</string>
+<string name="privacy_url" translatable="false">https://gitlab.com/stantonmatthewj/pneu/-/blob/main/PRIVACY.md</string>
 <string name="version">Version %1$s</string>
 <string name="unpair_title">Unpair from %1$s?</string>
 <string name="action_unpair">Unpair</string>
