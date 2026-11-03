@@ -8,7 +8,9 @@ checks reproducible `.deb` and tarball packaging. Superseded test jobs cancel;
 release and Pages jobs finish without cancellation. Fork MRs run in their fork.
 
 Linux and Android use disposable Docker jobs tagged `ci-public`. Linux release
-builds stay on Ubuntu 24.04 for the glibc/Qt baseline. Android uses Java 21 and
+builds stay on Ubuntu 24.04 for the glibc/Qt baseline. Linux compiles one Cargo
+job at a time and omits test debug information to fit the 4 GiB runner. Release
+builds retain the workspace release profile. Android uses Java 21 and
 SDK platform `android-37.2` / build tools `37.0.0`, without release signing.
 Windows uses GitLab's `saas-windows-medium-amd64` runner with MSVC and Windows
 SDK tools. It installs the workspace Rust version if needed. These Windows jobs

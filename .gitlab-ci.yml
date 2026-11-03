@@ -54,6 +54,7 @@ default:
   tags: [ci-public]
   variables:
     QMAKE: qmake6
+    CARGO_BUILD_JOBS: "1"
     DEBIAN_FRONTEND: noninteractive
   before_script:
     - apt-get update
@@ -87,6 +88,8 @@ linux:
   extends: [.linux, .rust-cache, .test-rules]
   stage: test
   timeout: 45m
+  variables:
+    CARGO_PROFILE_TEST_DEBUG: "0"
   script:
     - python3 -B ci/test_publish.py
     - source ci/rust.sh desktop
