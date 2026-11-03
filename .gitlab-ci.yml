@@ -8,7 +8,9 @@ workflow:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v/'
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-    - if: '($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api") && ($RELEASE_TAG || $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH)'
+    # Keep empty-tag Pages and tagged-release routes separate for GitLab's evaluator.
+    - if: '($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api") && $RELEASE_TAG'
+    - if: '($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api") && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
 stages: [test, build, publish]
 
