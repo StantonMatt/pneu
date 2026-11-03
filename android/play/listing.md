@@ -14,7 +14,7 @@ Send clipboard, photos and files directly between your phone and computers.
 
 Pneu connects your Android phone to your own computers so you can send clipboard content, photos and files between them.
 
-Requires the free Pneu desktop app on Linux or macOS; Windows is coming to the Microsoft Store. Download it and find setup instructions at https://github.com/StantonMatt/pneu. Android 14 or later is required.
+Requires the free Pneu desktop app on Linux or macOS; Windows is coming to the Microsoft Store. Download it and find setup instructions at https://gitlab.com/stantonmatthewj/pneu. Android 14 or later is required.
 
 Pair each computer by scanning its QR code and confirming in Pneu. Connections go directly over your local network or Tailscale, with TLS 1.3 encryption and pinned mutual authentication. There is no Pneu server or account.
 
@@ -32,11 +32,11 @@ Pneu collects no data and shares no data with the developer or third parties. It
 - Category suggestion: Tools.
 - Price: Free.
 - Developer name suggestion: Matthew Stanton (must match verified account details).
-- Website: https://github.com/StantonMatt/pneu
+- Website: https://gitlab.com/stantonmatthewj/pneu
 - Support email: OWNER MUST PROVIDE a monitored public support address; GitHub issues cannot replace Play's required email field.
-- Support URL / feedback URL where accepted: https://github.com/StantonMatt/pneu/issues
+- Support URL / feedback URL where accepted: https://gitlab.com/stantonmatthewj/pneu/-/issues
 - Phone: optional; supply only if you want it public or Console requires it for your account.
-- Privacy policy: https://github.com/StantonMatt/pneu/blob/main/PRIVACY.md (publish it first).
+- Privacy policy: https://gitlab.com/stantonmatthewj/pneu/-/blob/main/PRIVACY.md (publish it first).
 
 ## First closed-test release
 

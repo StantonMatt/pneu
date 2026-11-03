@@ -66,6 +66,6 @@ The release workflow passes the Store identity values above and retains the
 **unsigned** MSIX as the `Pneu-Windows-Store-msix` workflow artifact only. Its
 version defaults to the workspace version plus `.0` (2.2.2.0 for this release).
 Partner Center accepts unsigned packages and signs them for distribution. The
-workflow does not attach the MSIX to the public GitHub release, sign it locally,
+workflow does not attach the MSIX to the public GitLab release, sign it locally,
 or submit to Partner Center. Logo assets are reproducible via
 `generate-assets.py` with Pillow; no image tooling is needed in the build job.

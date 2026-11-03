@@ -1,0 +1,241 @@
+workflow:
+  auto_cancel:
+    on_new_commit: interruptible
+  rules:
+    # Fork pipelines must run in the fork, never on our shell runner.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_SOURCE_PROJECT_ID != $CI_PROJECT_ID'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v/'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api") && ($RELEASE_TAG || $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH)'
+
+stages: [test, build, publish]
+
+variables:
+  RELEASE_TAG:
+    value: ""
+    description: "Existing v* tag for an artifact-only manual release build; leave empty to deploy Pages on main."
+  CACHE_POLICY: pull
+  CARGO_HOME: "$CI_PROJECT_DIR/.ci-cache/cargo"
+
+default:
+  interruptible: true
+
+.test-rules:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      variables:
+        CACHE_POLICY: pull-push
+
+.release-rules:
+  interruptible: false
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v/'
+      variables:
+        RELEASE_TAG: "$CI_COMMIT_TAG"
+    - if: '($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api") && $RELEASE_TAG'
+
+.rust-cache:
+  cache:
+    key:
+      prefix: "$CI_JOB_NAME"
+      files: [desktop/Cargo.lock]
+    paths:
+      - .ci-cache/cargo/registry/
+      - .ci-cache/cargo/git/
+      - desktop/target/
+      - release-source/desktop/target/
+    policy: $CACHE_POLICY
+
+.linux:
+  image: ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
+  tags: [ci-public]
+  variables:
+    QMAKE: qmake6
+    DEBIAN_FRONTEND: noninteractive
+  before_script:
+    - apt-get update
+    - >-
+      apt-get install --no-install-recommends -y
+      ca-certificates curl git python3 build-essential pkg-config
+      qt6-base-dev qt6-base-dev-tools qmake6 libfontconfig-dev
+      libwayland-dev libxkbcommon-dev libudev-dev dbus-daemon dpkg-dev lintian
+    - qmake6 -query QT_VERSION
+
+.macos:
+  tags: [macos]
+  variables:
+    MACOSX_DEPLOYMENT_TARGET: "15.4"
+  before_script:
+    - export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$HOME/.local/bin:$PATH"
+    - test "$(uname -m)" = arm64
+    - ulimit -n 4096
+    - mkdir -p "$HOME/.cache/pneu-ci/$CI_JOB_ID"
+    - export TMPDIR="$(cd "$HOME/.cache/pneu-ci/$CI_JOB_ID" && pwd -P)"
+  after_script:
+    - export PATH="/opt/homebrew/bin:$PATH"
+    - python3 -c 'import os,shutil; shutil.rmtree(os.path.join(os.environ["HOME"], ".cache/pneu-ci", os.environ["CI_JOB_ID"]), ignore_errors=True)'
+
+.windows:
+  tags: [saas-windows-medium-amd64]
+  before_script:
+    - $ErrorActionPreference = 'Stop'
+
+linux:
+  extends: [.linux, .rust-cache, .test-rules]
+  stage: test
+  timeout: 45m
+  script:
+    - python3 -B ci/test_publish.py
+    - source ci/rust.sh desktop
+    - cd desktop
+    - cargo test --locked
+    - version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+    - packaging/linux/check-packages.sh target/debug/pneud "$version" "$CI_PROJECT_DIR/.ci-cache/packaging"
+
+macos:
+  extends: [.macos, .rust-cache, .test-rules]
+  stage: test
+  timeout: 45m
+  script:
+    - source ci/rust.sh desktop
+    - cd desktop
+    - heavy cargo test --locked
+
+windows:
+  extends: [.windows, .rust-cache, .test-rules]
+  stage: test
+  timeout: 45m
+  script:
+    - . ./ci/windows.ps1
+    - Set-Location desktop
+    - cargo test --locked -p pneud --features windows-package
+    - if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+android:
+  extends: .test-rules
+  image: eclipse-temurin:21-jdk-noble@sha256:114cabb73033ca4ce7ceec3deb62396bc1b716282bae051ed3c1d82e38fcab2d
+  tags: [ci-public]
+  stage: test
+  timeout: 30m
+  variables:
+    ANDROID_HOME: "$CI_PROJECT_DIR/.ci-cache/android-sdk"
+    GRADLE_USER_HOME: "$CI_PROJECT_DIR/.ci-cache/gradle"
+  cache:
+    key:
+      prefix: android
+      files: [android/gradle/wrapper/gradle-wrapper.properties, android/app/build.gradle.kts]
+    paths: [.ci-cache/android-sdk/, .ci-cache/gradle/]
+    policy: $CACHE_POLICY
+  before_script:
+    - apt-get update
+    - apt-get install --no-install-recommends -y ca-certificates curl unzip
+    - bash ci/android-sdk.sh
+  script:
+    - cd android
+    - ./gradlew --no-daemon testDebugUnitTest lintDebug
+  artifacts:
+    when: always
+    expire_in: 7 days
+    reports:
+      junit: android/app/build/test-results/testDebugUnitTest/*.xml
+    paths: [android/app/build/reports/]
+
+pages:
+  image: ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
+  tags: [ci-public]
+  stage: test
+  timeout: 10m
+  interruptible: false
+  resource_group: pages
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes: [site/**/*]
+    - if: '($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api") && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $RELEASE_TAG == ""'
+  script:
+    - cp -a site public
+  pages:
+    publish: public
+  artifacts:
+    paths: [public]
+
+release-macos:
+  extends: [.macos, .rust-cache, .release-rules]
+  stage: build
+  timeout: 60m
+  resource_group: release-macos-$RELEASE_TAG
+  variables:
+    CACHE_POLICY: pull-push
+  script:
+    - source ci/release-source.sh
+    - source ci/rust.sh release-source/desktop
+    - mkdir -p release
+    - release-source/desktop/packaging/macos/build-app.sh --profile release --out "$CI_PROJECT_DIR/.ci-cache/macos-release"
+    - ditto -c -k --sequesterRsrc --keepParent "$CI_PROJECT_DIR/.ci-cache/macos-release/Pneu.app" release/Pneu-macOS.zip
+    - cd release
+    - shasum -a 256 Pneu-macOS.zip > macOS-SHA256SUMS.txt
+  artifacts:
+    name: Pneu-macOS
+    paths: [release/Pneu-macOS.zip, release/macOS-SHA256SUMS.txt]
+    expire_in: 7 days
+
+release-linux:
+  extends: [.linux, .rust-cache, .release-rules]
+  stage: build
+  timeout: 60m
+  resource_group: release-linux-$RELEASE_TAG
+  variables:
+    CACHE_POLICY: pull-push
+  script:
+    - source ci/release-source.sh
+    - source ci/rust.sh release-source/desktop
+    - cd release-source/desktop
+    - cargo build --release --locked -p pneud
+    - packaging/linux/build-packages.sh target/release/pneud "${RELEASE_TAG#v}" "$CI_PROJECT_DIR/release"
+  artifacts:
+    name: Pneu-Linux
+    paths: [release/*.deb, release/pneu-linux-x86_64.tar.gz]
+    expire_in: 7 days
+
+release-windows-msix:
+  extends: [.windows, .rust-cache, .release-rules]
+  stage: build
+  timeout: 60m
+  resource_group: release-windows-$RELEASE_TAG
+  variables:
+    CACHE_POLICY: pull-push
+  script:
+    - . ./ci/windows.ps1 -Release
+    - ./release-source/desktop/packaging/windows/build-msix.ps1 -IdentityName MatthewStanton.Pneu -Publisher 'CN=68A11A39-FF28-48D5-9C3E-D4758423D785' -PublisherDisplayName 'Matthew Stanton' -OutDir "$env:CI_PROJECT_DIR/release"
+  artifacts:
+    name: Pneu-Windows-Store-msix
+    paths: [release/*.msix]
+    expire_in: 7 days
+
+.publish:
+  interruptible: false
+  image: python:3.13-slim@sha256:ae14d4ce8771606477a81446e7ef429edd6762305fc50c84507c1041fa8285d1
+  tags: [ci-public]
+  stage: publish
+  timeout: 10m
+  resource_group: release-$RELEASE_TAG
+  # The Store package remains an artifact; it is never published or submitted.
+  needs: [release-macos, release-linux]
+  script:
+    - python3 ci/publish.py
+
+publish:
+  extends: .publish
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v/'
+      variables:
+        RELEASE_TAG: "$CI_COMMIT_TAG"
+
+republish:
+  extends: .publish
+  rules:
+    - if: '($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api") && $RELEASE_TAG'
+      when: manual
+      allow_failure: true
