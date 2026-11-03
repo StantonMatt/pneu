@@ -90,6 +90,7 @@ linux:
   timeout: 45m
   variables:
     CARGO_PROFILE_TEST_DEBUG: "0"
+    CARGO_INCREMENTAL: "0"
   script:
     - python3 -B ci/test_publish.py
     - source ci/rust.sh desktop
