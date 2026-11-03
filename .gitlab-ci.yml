@@ -108,6 +108,10 @@ windows:
   extends: [.windows, .rust-cache, .test-rules]
   stage: test
   timeout: 45m
+  rules:
+    - if: '$PNEU_HOSTED_WINDOWS != "true"'
+      when: never
+    - !reference [.test-rules, rules]
   script:
     - . ./ci/windows.ps1
     - Set-Location desktop
@@ -204,6 +208,10 @@ release-windows-msix:
   stage: build
   timeout: 60m
   resource_group: release-windows-$RELEASE_TAG
+  rules:
+    - if: '$PNEU_HOSTED_WINDOWS != "true"'
+      when: never
+    - !reference [.release-rules, rules]
   variables:
     CACHE_POLICY: pull-push
   script:

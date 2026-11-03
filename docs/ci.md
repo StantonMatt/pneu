@@ -12,7 +12,17 @@ builds stay on Ubuntu 24.04 for the glibc/Qt baseline. Android uses Java 21 and
 SDK platform `android-37.2` / build tools `37.0.0`, without release signing.
 Windows uses GitLab's `saas-windows-medium-amd64` runner with MSVC and Windows
 SDK tools. It installs the workspace Rust version if needed. These Windows jobs
-spend hosted-runner minutes.
+spend hosted-runner minutes. Both the Windows test and Store MSIX release jobs
+are omitted unless the project CI/CD variable `PNEU_HOSTED_WINDOWS` equals
+`true`. It is unset while GitLab identity verification is pending. To enable
+Windows later:
+
+1. Complete GitLab account identity verification.
+2. Re-enable instance runners in the project CI/CD settings and set the project
+   CI/CD variable `PNEU_HOSTED_WINDOWS` to `true`.
+
+Until then, a green pipeline covers Linux, macOS and Android; Windows tests and
+the unsigned Store MSIX artifact are unavailable.
 
 The `macos` shell runner is Matthew's Apple Silicon Mac and runs only while it
 is awake. It needs Xcode command-line tools, Python 3.11+, rustup and
@@ -32,7 +42,7 @@ GitLab Release assets; there is no GitHub OIDC or Pages deployment credential.
 ## Releases
 
 Push a `v*` tag matching `desktop/Cargo.toml` to build the macOS zip, Linux `.deb`
-and tarball, and unsigned Store MSIX. The release jobs build the tag's source,
+and tarball, and (when `PNEU_HOSTED_WINDOWS=true`) unsigned Store MSIX. The release jobs build the tag's source,
 while retaining CI scripts from the pipeline ref. The macOS and Linux artifacts
 are checksummed and uploaded with `CI_JOB_TOKEN` to the generic package registry;
 GitLab Release links provide stable latest-download URLs. Each publishing job
