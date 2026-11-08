@@ -95,7 +95,10 @@ class ReceivedFiles internal constructor(private val app:AppGraph,
                     when(admission) {
                         FileAdmission.RETAINED_REPLAY->ReceiveAdmission(reply=ReceiveReply(deduplicated=true))
                         FileAdmission.RETAINED_CONFLICT->ReceiveAdmission(reply=ReceiveReply("id_conflict"))
-                        FileAdmission.UNFINISHED->ReceiveAdmission(reply=ReceiveReply("storage_failed"))
+                        FileAdmission.UNFINISHED->{
+                            ReceiveDiagnostics.warn(binding.pcId,metadata.id,metadata.kind,"unfinished_recovery")
+                            ReceiveAdmission(reply=ReceiveReply("storage_failed"))
+                        }
                         FileAdmission.NEW->{
                             val p=app.preferences.read();val peer=requireNotNull(p.devices.find {it.deviceId==binding.pcId})
                             val refusal=ReceivePolicy.newTransfer(metadata.kind,p.paused,peer.clipboardReceive,ReceivePolicy.automaticEnabled(peer,p.deviceId),mesh)
@@ -109,7 +112,7 @@ class ReceivedFiles internal constructor(private val app:AppGraph,
                 }
             } ?: throw ReceiveViolation("closing")
         }
-        return FileReceiveMachine(ReceiveBackend {error("Fenced legacy backend required")},legacyBackend=legacy,resumeCapable=resumeCapable,
+        return FileReceiveMachine(ReceiveBackend {error("Fenced legacy backend required")},legacyBackend=legacy,resumeCapable=resumeCapable,peerId=binding.pcId,
             resumeBackend={meta,cancelled->admitResume(authority,mesh,current,meta,cancelled)},
             cancelPartial={id->app.withBinding(binding) {
                 app.preferences.policy.locked {
@@ -138,7 +141,10 @@ class ReceivedFiles internal constructor(private val app:AppGraph,
             var admission=journal.admission(binding.pcId,metadata)
             if(admission==FileAdmission.UNFINISHED) {
                 val prior=requireNotNull(app.queue.receivedFile(binding.pcId,metadata.id))
-                if(leases.containsKey(leaseKey))return@locked ReceiveAdmission(reply=ReceiveReply("storage_failed"))
+                if(leases.containsKey(leaseKey)) {
+                    ReceiveDiagnostics.warn(binding.pcId,metadata.id,metadata.kind,"lease_conflict")
+                    return@locked ReceiveAdmission(reply=ReceiveReply("storage_failed"))
+                }
                 recoverRow(prior)
                 admission=journal.admission(binding.pcId,metadata)
             }
@@ -148,8 +154,11 @@ class ReceivedFiles internal constructor(private val app:AppGraph,
             val refusal=ReceivePolicy.newTransfer(metadata.kind,p.paused,peer.clipboardReceive,ReceivePolicy.automaticEnabled(peer,p.deviceId),mesh)
             if(refusal!=null)return@locked ReceiveAdmission(reply=refusal)
             if(!ReceivePolicy.acceptsMime(metadata.mime))return@locked ReceiveAdmission(reply=ReceiveReply("unsupported_kind"))
-            if(leases.containsKey(leaseKey))return@locked ReceiveAdmission(reply=ReceiveReply("storage_failed"))
-            evictPartials(binding.pcId.takeIf {app.queue.receivedFile(binding.pcId,metadata.id)==null})
+            if(leases.containsKey(leaseKey)) {
+                ReceiveDiagnostics.warn(binding.pcId,metadata.id,metadata.kind,"lease_conflict")
+                return@locked ReceiveAdmission(reply=ReceiveReply("storage_failed"))
+            }
+            evictPartials(binding.pcId.takeIf {app.queue.receivedFile(binding.pcId,metadata.id)==null},binding.pcId,metadata)
             row=app.queue.receivedFile(binding.pcId,metadata.id)
             // The retained prefix already consumes space. Budget the suffix plus
             // the entire publication copy, and check the destination volume too.
@@ -298,7 +307,7 @@ class ReceivedFiles internal constructor(private val app:AppGraph,
             }
         }
     }
-    private fun evictPartials(peer:String?) {
+    private fun evictPartials(peer:String?,diagnosticPeer:String?=peer,metadata:ReceivedMetadata?=null) {
         val inactive=app.queue.unfinishedReceivedFiles().filter {it.state=="writing" && it.stagePath.isNotEmpty() && !leases.containsKey(key(it.peerId,it.transferId))}.sortedBy {it.progressWall}.toMutableList()
         fun discard(row:ReceivedFile) {journal.abandon(row);inactive.remove(row)}
         inactive.toList().filter {spool.expired(it)}.forEach(::discard)
@@ -308,7 +317,11 @@ class ReceivedFiles internal constructor(private val app:AppGraph,
         while(inactive.isNotEmpty() && (inactive.sumOf {it.checkpoint}>ReceiveSpool.BYTE_LIMIT || inactive.size+live.size+extra>64 || peerFull())) {
             discard(if(peerFull())inactive.firstOrNull {it.peerId==peer} ?: inactive.first() else inactive.first())
         }
-        if(live.size+extra>64 || peer!=null && live.count {it.peerId==peer}+extra>8)throw ReceiveStorageException("storage_failed")
+        if(live.size+extra>64 || peer!=null && live.count {it.peerId==peer}+extra>8) {
+            ReceiveDiagnostics.warn(diagnosticPeer ?: "unknown",metadata?.id ?: "none",metadata?.kind ?: "file","partial_capacity",
+                counts=" peer_count=${live.count {it.peerId==diagnosticPeer}} peer_limit=8 global_count=${live.size} global_limit=64 requested=$extra")
+            throw ReceiveStorageException("storage_failed")
+        }
     }
     companion object {internal const val SPACE_RESERVE=16L*1024*1024}
     private fun prepare(authority:CapturedAuthority,name:String,metadata:ReceivedMetadata,mesh:Boolean,current:()->Boolean):ReceiveAdmission {

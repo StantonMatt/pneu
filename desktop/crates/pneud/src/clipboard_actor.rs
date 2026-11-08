@@ -66,6 +66,22 @@ pub(super) struct Operation {
     pub observation: Option<Token>,
 }
 impl Operation {
+    fn storage_diagnostic(&self, phase: &str, effects: &mut Vec<Effect>) {
+        if self.received {
+            let kind = match self.payload.as_deref() {
+                Some(Payload::Content(Content::Text(_)))
+                | Some(Payload::Input(crate::actions::ClipboardInput::Text(_))) => "text",
+                _ => "image",
+            };
+            effects.push(Effect::Diagnostic {
+                device: self.source.clone(),
+                message: format!(
+                    "clipboard receive refused: transfer={} kind={kind} phase={phase} code=StorageFailed",
+                    self.id,
+                ),
+            });
+        }
+    }
     fn fingerprint(&self) -> Fingerprint {
         Fingerprint {
             id: self.id.clone(),
@@ -173,6 +189,10 @@ pub(super) enum Event {
 }
 #[derive(Clone, Debug)]
 pub(super) enum Effect {
+    Diagnostic {
+        device: Id,
+        message: String,
+    },
     ImageTooLarge {
         fingerprint: [u8; 32],
         offer: ClipboardOffer,
@@ -1545,6 +1565,18 @@ impl State {
                 // Three reserved slots cover a local observation clock, the
                 // active local persistence and its latest deferred replacement.
                 if self.shutdown || self.pending_count() >= 61 {
+                    operation.storage_diagnostic(
+                        &format!(
+                            "{} pending={} limit=61",
+                            if self.shutdown {
+                                "actor_shutdown"
+                            } else {
+                                "actor_capacity"
+                            },
+                            self.pending_count()
+                        ),
+                        &mut effects,
+                    );
                     effects.push(Effect::Reply {
                         token: operation.token,
                         applied: false,
@@ -1753,12 +1785,14 @@ impl State {
                         .filter(|i| i.operation.token == token)
                         .map(|i| i.ticket)
                     {
+                        operation.storage_diagnostic("actor_clock", &mut effects);
                         self.terminate_install(
                             ticket,
                             Terminal::Failed(Failure::Storage),
                             &mut effects,
                         );
                     } else {
+                        operation.storage_diagnostic("actor_clock", &mut effects);
                         effects.push(Effect::Reply {
                             applied: false,
                             token,
@@ -1820,6 +1854,9 @@ impl State {
                     if success {
                         install.phase = Phase::Ready;
                     } else {
+                        install
+                            .operation
+                            .storage_diagnostic("actor_history", &mut effects);
                         self.terminate_install(
                             ticket,
                             Terminal::Failed(Failure::Storage),
@@ -1859,6 +1896,11 @@ impl State {
             }
             Event::Persisted { token, success } => {
                 if let Some(pending) = self.persistence.remove(&token) {
+                    if !success {
+                        pending
+                            .operation
+                            .storage_diagnostic("actor_persist", &mut effects);
+                    }
                     let explicit = !pending.operation.received
                         && pending.operation.history_id.is_none()
                         && !pending.operation.repair

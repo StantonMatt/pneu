@@ -784,7 +784,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                 }
             }
         }
-        val fileLane=FileReceiveLane(receiver::requestFailure)
+        val fileLane=FileReceiveLane(receiver::requestFailure,peerId=sessionBinding.pcId)
         val incomingPhase=FileReceiveState()
         // Cleanup owns an ID only while queued/running (at most 65 IDs).
         // Keep it fenced until both the file worker and purge have retired it.

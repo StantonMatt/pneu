@@ -52,6 +52,38 @@ fn remote(token: u64, source: u8, hlc: u64, value: &str) -> Operation {
         observation: None,
     }
 }
+#[test]
+fn capacity_diagnostic_is_content_free_and_reports_the_limit() {
+    let mut state = State::default();
+    for token in 1..=61 {
+        state
+            .queue
+            .push_back(remote(token, 2, token, "private pending clip"));
+    }
+    let operation = remote(62, 3, 62, "private rejected clip");
+    let effects = state.step(Event::Submit(operation));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Reply {
+            token: 62,
+            failure: Some(Failure::Storage),
+            ..
+        }
+    )));
+    let (peer, message) = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Diagnostic { device, message } => Some((device, message)),
+            _ => None,
+        })
+        .expect("capacity diagnostic");
+    assert_eq!(peer, &id(3));
+    assert!(message.contains(&format!("transfer={}", id(62))));
+    assert!(
+        message.contains("kind=text phase=actor_capacity pending=61 limit=61 code=StorageFailed")
+    );
+    assert!(!message.contains("private"));
+}
 #[derive(Default)]
 struct Compositor {
     state: State,
@@ -211,7 +243,7 @@ impl Compositor {
                 Effect::CancelRead(token) => {
                     self.read_timeouts.remove(&token);
                 }
-                Effect::Invalidate(_) => {}
+                Effect::Invalidate(_) | Effect::Diagnostic { .. } => {}
             }
         }
     }

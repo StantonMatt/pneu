@@ -68,25 +68,36 @@ class ClipboardDelivery(private val app: AppGraph, private val applyText:(suspen
         if(binding?.pcId!=peerId)throw java.io.IOException("Binding changed")
         // A local receipt/settings read failure is a recoverable NACK, not a TLS failure.
         // Binding revocation remains outside this catch and invalidates the old session.
+        var phase="binding_prefs"
         val result=try {app.withBinding(binding) {
-            try {app.preferences.policy.locked {receiveCurrent(peerId,requireNotNull(binding).generation,body,stamp)}}
+            try {app.preferences.policy.locked {receiveCurrent(peerId,requireNotNull(binding).generation,body,stamp) {phase=it}}}
             catch(e:CancellationException) {throw e}
-            catch(_:Exception) {Frame.Control(Type.NACK,json("transfer_id" to body["transfer_id"].asString,"code" to "storage_failed","retryable" to true))}
-        }} catch(e:java.io.IOException) {Frame.Control(Type.NACK,json("transfer_id" to body["transfer_id"].asString,"code" to "storage_failed","retryable" to true))}
+            catch(e:Exception) {
+                ReceiveDiagnostics.warn(peerId,body["transfer_id"].asString,"text",phase,e)
+                Frame.Control(Type.NACK,json("transfer_id" to body["transfer_id"].asString,"code" to "storage_failed","retryable" to true))
+            }
+        }} catch(e:java.io.IOException) {
+            ReceiveDiagnostics.warn(peerId,body["transfer_id"].asString,"text",phase,e)
+            Frame.Control(Type.NACK,json("transfer_id" to body["transfer_id"].asString,"code" to "storage_failed","retryable" to true))
+        }
         result ?: throw java.io.IOException("Binding changed")
     }
-    private suspend fun receiveCurrent(peerId:String,generation:Long,body:com.google.gson.JsonObject,stamp:ClipboardStamp?):Frame.Control {
+    private suspend fun receiveCurrent(peerId:String,generation:Long,body:com.google.gson.JsonObject,stamp:ClipboardStamp?,phase:(String)->Unit):Frame.Control {
+        phase("read_body")
         val sensitive=body["sensitive"]?.asBoolean==true
         val id=body["transfer_id"].asString;val text=body["text"].asString
         val hash=sha256(text.toByteArray());val timestamp=body["created_at"].asLong;val origin=body["origin"]?.asString ?: "clipboard"
         fun nack(code: String)=Frame.Control(Type.NACK,json("transfer_id" to id,"code" to code,"retryable" to (code !in setOf("id_conflict","unsupported_kind"))))
-        if(stamp!=null)app.preferences.observeClipboard(stamp)
+        if(stamp!=null) {phase("observe_hlc");app.preferences.observeClipboard(stamp)}
         // Retained-ID conflicts are decided before fallible journal recovery.
+        phase("receipt_lookup")
         val reserved=app.queue.receipt(peerId,id)
         fun conflicts(record:Receipt)=record.sensitive!=sensitive || record.hash!=hash || record.createdAt!=timestamp || record.origin!=origin || record.hlc!=stamp?.hlc?.toString().orEmpty() || record.sourceDevice!=stamp?.source.orEmpty()
         if(reserved!=null && conflicts(reserved))return nack("id_conflict")
         // Conflicts remain authoritative even when recovery storage is failing.
+        phase("reconcile")
         reconcileCurrent()
+        phase("receipt_lookup")
         val existing=app.queue.receipt(peerId,id)
         if(existing != null) {
             if(conflicts(existing))return nack("id_conflict")
@@ -96,13 +107,15 @@ class ClipboardDelivery(private val app: AppGraph, private val applyText:(suspen
         }
         // Old pending reservations predate this journal and never proved an
         // effect. New reserved rows retain metadata through completion failures.
-        if(existing?.state=="pending")app.queue.deleteReceipt(peerId,id)
+        if(existing?.state=="pending") {phase("delete_legacy");app.queue.deleteReceipt(peerId,id)}
         val record=Receipt().apply {this.sensitive=sensitive;this.peerId=peerId;transferId=id;this.hash=hash;createdAt=timestamp;this.origin=origin;hlc=stamp?.hlc?.toString().orEmpty();sourceDevice=stamp?.source.orEmpty();state="reserved"}
         suspend fun finish(applied:Boolean) {
+            phase("receipt_complete")
             record.state="applied"
             if(applied)app.queue.completeReceipt(record) else app.queue.retainClipboardReceipt(record)
             PostCommit.maintainSuspending {app.preferences.finishClipboardCompletion(peerId,generation,id)}
         }
+        phase("read_state")
         val p=app.preferences.read()
         val peer=p.devices.find {it.deviceId==peerId}
         if(peer?.clipboardReceive!=true)return disabledDirection(id,stamp!=null)
@@ -111,19 +124,26 @@ class ClipboardDelivery(private val app: AppGraph, private val applyText:(suspen
         if(!stale && !p.paused) {
             // Reserve the full wire metadata before touching the OS. A changed
             // retry must conflict even when the final receipt write failed.
+            phase("reserve")
             if(existing?.state!="reserved")check(app.queue.insertReceipt(record)!=-1L)
+            phase("read_state")
             val appliedStamp=stamp ?: app.preferences.legacyClipboardStamp(peerId)
             var effected=false
             withContext(NonCancellable) {
+                phase("apply")
                 try {
                     if(applyText!=null)applyText.invoke(text,hash) else withContext(Dispatchers.Main) {
                         val clipboard=app.context.getSystemService(ClipboardManager::class.java)
                         deduplicated=ClipboardContent.textMatches(runCatching {clipboard.primaryClip}.getOrNull(),text) && (!sensitive || clipboard.primaryClipDescription?.extras?.getBoolean(android.content.ClipDescription.EXTRA_IS_SENSITIVE)==true)
                         if(!deduplicated)clipboard.setPrimaryClip(receivedClip(app.context.getString(R.string.app_name),text,hash,peerId,id,appliedStamp.hlc.toString(),generation,sensitive))
                     }
-                }catch(e:CancellationException) {app.queue.deleteReceipt(peerId,id);throw e}
-                catch(_:Exception) {app.queue.deleteReceipt(peerId,id);return@withContext}
+                }catch(e:CancellationException) {phase("apply_cleanup");app.queue.deleteReceipt(peerId,id);throw e}
+                catch(e:Exception) {
+                    ReceiveDiagnostics.warn(peerId,id,"text","apply",e,code="clipboard_unavailable")
+                    phase("apply_cleanup");app.queue.deleteReceipt(peerId,id);return@withContext
+                }
                 effected=true
+                phase("applied_prefs")
                 app.preferences.recordClipboardEffect(appliedStamp,hash,peerId,generation,id)
                 app.preferences.appliedClipboard(appliedStamp,hash,peerId,generation,id)
             }

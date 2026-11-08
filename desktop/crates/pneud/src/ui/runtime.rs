@@ -119,7 +119,7 @@ pub async fn run(
             Some(_)=sending.join_next(),if !sending.is_empty()=>{update_tray=false;},
             Some(())=theme_rx.recv()=>{themes.changed(Instant::now());refresh_icons=true;},
             event=events.recv()=>match event {
-                Ok(Event::Error {message,..})=>eprintln!("pneud: {message}"),
+                Ok(Event::Error {device,message})=>eprintln!("{}",crate::diagnostics::error_line(device.as_ref(),&message)),
                 Ok(Event::Blocked {address,fingerprint})=>{
                     if last_blocked.is_none_or(|time:Instant|time.elapsed()>=Duration::from_secs(3600)) {
                         last_blocked=Some(Instant::now());let mut notice=Notice::blocked(&address);notice.blocked_pin=Some(fingerprint);let _=actions.notice(notice,Vec::new(),None,0,None).await;
