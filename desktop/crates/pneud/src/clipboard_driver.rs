@@ -498,7 +498,7 @@ impl Driver {
                     self.spawn(
                         vec![Event::Failed(ticket), Event::Stopped(ticket)],
                         async move {
-                            #[cfg(windows)]
+                            #[cfg(any(target_os = "macos", windows))]
                             let install_authority = authority.clone();
                             let revoked = async move {
                                 if let Some(mut authority) = authority {
@@ -538,7 +538,7 @@ impl Driver {
                                 result=authorized=>result.is_ok(),
                             };
                             if commit {
-                                #[cfg(windows)]
+                                #[cfg(any(target_os = "macos", windows))]
                                 {
                                     let stopped = stopped.clone();
                                     prepared.set_install_authority(move || {
@@ -963,7 +963,7 @@ mod tests;
 
 /// Authority is watched independently from the event loop. A blocked install
 /// future is dropped on revocation before the helper is stopped and reaped.
-#[cfg_attr(windows, derive(Clone))]
+#[cfg_attr(any(target_os = "macos", windows), derive(Clone))]
 struct Authority {
     core: Weak<Core>,
     scope: ActionScope,

@@ -218,7 +218,7 @@ pub struct PreparedClipboard {
     pub(crate) test_exited: bool,
 }
 impl PreparedClipboard {
-    #[cfg(windows)]
+    #[cfg(any(target_os = "macos", windows))]
     pub(crate) fn set_install_authority(
         &mut self,
         authority: impl Fn() -> bool + Send + Sync + 'static,

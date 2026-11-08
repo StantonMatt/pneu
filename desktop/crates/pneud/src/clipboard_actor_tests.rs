@@ -242,8 +242,19 @@ impl Compositor {
         panic!("model did not quiesce");
     }
     fn copy(&mut self, token: u64, value: Option<Content>, recipients: &[u8]) {
+        self.observe(token, value, recipients, true);
+    }
+    fn reoffer(&mut self, token: u64, value: Option<Content>, recipients: &[u8]) {
+        self.observe(token, value, recipients, false);
+    }
+    fn observe(&mut self, token: u64, value: Option<Content>, recipients: &[u8], local: bool) {
         self.os = value.clone();
         self.event(Event::Observe {
+            kind: if local {
+                ObservationKind::Local
+            } else {
+                ObservationKind::Marker
+            },
             history: None,
             token,
             id: id(token as u8),
@@ -333,6 +344,7 @@ fn delayed_local_read_before_marker_is_restored_after_marker() {
     }
     model.os = Some(content("Y"));
     model.event(Event::Observe {
+        kind: ObservationKind::Local,
         history: None,
         token: 20,
         id: id(20),
@@ -340,8 +352,9 @@ fn delayed_local_read_before_marker_is_restored_after_marker() {
         origin: false,
         clear: false,
     });
-    model.tick();
-    assert_eq!(model.os, Some(content("X")));
+    assert!(!model.state.confirms_install(1));
+    model.os = Some(content("X")); // OS request already submitted before cancellation
+    model.event(Event::Installed(1));
     model.event(Event::Read {
         token: 20,
         content: Some(content("Y")),
@@ -416,6 +429,7 @@ fn explicit_mesh_share_stops_unresolved_install_before_accepting_new_origination
 fn recipient_sets_only_narrow_across_settings_unpair_and_late_connections() {
     let mut model = Compositor::default();
     model.event(Event::Observe {
+        kind: ObservationKind::Local,
         history: None,
         token: 20,
         id: id(20),
@@ -500,7 +514,7 @@ fn persisted_history_is_bounded_pins_current_and_survives_helper_loss_and_restar
     assert!(restarted.echo(&content("X")));
 }
 #[test]
-fn three_computers_do_not_manufacture_an_origination_or_forward_received_x_over_y() {
+fn three_computers_suppress_echo_delivery_but_preserve_a_new_local_recopy() {
     let mut computers = [
         Compositor::default(),
         Compositor::default(),
@@ -539,7 +553,13 @@ fn three_computers_do_not_manufacture_an_origination_or_forward_received_x_over_
             computers[n].settle();
             computers[n].consistent();
         }
-        assert_eq!(computers[n].state.register, y.key);
+        if n == 2 {
+            assert!(computers[n].state.register > y.key);
+            assert_eq!(computers[n].os, Some(content("X")));
+        } else {
+            assert_eq!(computers[n].state.register, y.key);
+            assert_eq!(computers[n].os, Some(content("Y")));
+        }
         assert_eq!(computers[n].published.len(), usize::from(n == 0));
     }
 }
@@ -550,6 +570,7 @@ fn filtered_and_targetless_local_observations_cancel_slow_preparation_and_fence_
         model.event(Event::Submit(remote(10, 2, 100, "remote")));
         model.os = readable.then(|| content("local"));
         model.event(Event::Observe {
+            kind: ObservationKind::Local,
             history: None,
             token: 20,
             id: id(20),
@@ -624,6 +645,7 @@ fn identical_incoming_cannot_skip_an_unfinished_local_restoration() {
         model.tick();
     }
     model.event(Event::Observe {
+        kind: ObservationKind::Local,
         history: None,
         token: 20,
         id: id(20),
@@ -653,7 +675,7 @@ fn identical_incoming_cannot_skip_an_unfinished_local_restoration() {
     assert_eq!(model.os, Some(content("Y")));
 }
 #[test]
-fn a_manager_echo_cannot_cancel_a_local_read_before_or_after_the_marker() {
+fn a_proven_marker_echo_cannot_cancel_a_local_read_before_or_after_confirmation() {
     for before_marker in [true, false] {
         let mut model = Compositor::default();
         model.event(Event::Submit(remote(10, 2, 100, "received")));
@@ -669,6 +691,7 @@ fn a_manager_echo_cannot_cancel_a_local_read_before_or_after_the_marker() {
         }
         model.os = Some(content("human"));
         model.event(Event::Observe {
+            kind: ObservationKind::Local,
             history: None,
             token: 20,
             id: id(20),
@@ -681,6 +704,7 @@ fn a_manager_echo_cannot_cancel_a_local_read_before_or_after_the_marker() {
         }
         model.os = Some(content("received"));
         model.event(Event::Observe {
+            kind: ObservationKind::Marker,
             history: None,
             token: 30,
             id: id(30),
@@ -720,6 +744,7 @@ fn a_canceled_helper_marker_and_its_clear_do_not_steal_a_local_copy() {
     model.copy(20, Some(content("human")), &[2, 3]);
     model.event(Event::Installed(1)); // ordered watcher evidence queued before reaping
     model.event(Event::Observe {
+        kind: ObservationKind::Local,
         history: None,
         token: 30,
         id: id(30),
@@ -750,6 +775,7 @@ fn unshareable_representation_hashes_suppress_received_original_and_converted_ec
     let before = model.state.register.clone();
     for (token, hash) in [(20, original), (30, converted)] {
         model.event(Event::Observe {
+            kind: ObservationKind::Local,
             history: None,
             token,
             id: id(token as u8),
@@ -764,7 +790,7 @@ fn unshareable_representation_hashes_suppress_received_original_and_converted_ec
             debounce: false,
         });
         model.settle();
-        assert_eq!(model.state.register, before);
+        assert!(model.state.register > before);
         assert!(model.published.is_empty());
     }
 }
@@ -778,6 +804,7 @@ fn new_offer_revokes_unflushed_delivery_and_a_late_persist_cannot_republish_it()
     }
     let pending = model.state.persistence.keys().copied().collect::<Vec<_>>();
     model.event(Event::Observe {
+        kind: ObservationKind::Local,
         history: None,
         token: 20,
         id: id(20),
@@ -862,7 +889,7 @@ fn identical_operations_keep_all_still_served_representations_pinned_across_hist
             model.event(Event::Cancel(n));
             model.settle();
         }
-        model.copy(220, Some(original), &[2, 3]);
+        model.reoffer(220, Some(original), &[2, 3]);
         model.settle();
         assert_eq!(
             model.state.register, winner,
@@ -1086,6 +1113,7 @@ fn randomized_interleavings(mut seed: u64, seconds: u64, case_limit: u64) {
                     let value = format!("human-{token}");
                     model.os = Some(content(&value));
                     let observe = Event::Observe {
+                        kind: ObservationKind::Local,
                         history: None,
                         token,
                         id: id(token as u8),
@@ -1125,6 +1153,7 @@ fn randomized_interleavings(mut seed: u64, seconds: u64, case_limit: u64) {
                     token += 1;
                     model.os = Some(value.clone());
                     let observe = Event::Observe {
+                        kind: ObservationKind::Local,
                         history: None,
                         token,
                         id: id(token as u8),
@@ -1187,6 +1216,7 @@ fn randomized_interleavings(mut seed: u64, seconds: u64, case_limit: u64) {
                     let local = token;
                     model.os = Some(content(&format!("saturated-{local}")));
                     let observe = Event::Observe {
+                        kind: ObservationKind::Local,
                         history: None,
                         token: local,
                         id: id(local as u8),
@@ -1241,6 +1271,7 @@ fn randomized_interleavings(mut seed: u64, seconds: u64, case_limit: u64) {
                     token += 1;
                     model.os = Some(content(&format!("unread-{token}")));
                     Event::Observe {
+                        kind: ObservationKind::Local,
                         history: None,
                         token,
                         id: id(token as u8),
@@ -1370,6 +1401,7 @@ fn review_human_read_may_be_delayed_across_arbitrary_other_completions() {
         }
         model.os = Some(content("human"));
         model.event(Event::Observe {
+            kind: ObservationKind::Local,
             history: None,
             token: 20,
             id: id(20),
@@ -1412,6 +1444,7 @@ fn review_copy_after_stop_requested_but_before_marker_must_be_restored() {
         // Reaping clears the helper's now-current selection.
         model.os = None;
         model.event(Event::Observe {
+            kind: ObservationKind::Local,
             history: None,
             token: 30,
             id: id(30),
@@ -1470,7 +1503,7 @@ fn review_mixed_local_formats_must_keep_served_received_representation_pinned() 
     let published = model.published.len();
     // The physical mixed selection still serves the original received text.
     // A manager may take only its text representation.
-    model.copy(200, Some(content("received text")), &[2, 3]);
+    model.reoffer(200, Some(content("received text")), &[2, 3]);
     model.settle();
     assert_eq!(
         model.published.len(),
@@ -1558,6 +1591,7 @@ fn local_observations_coalesce_persistence_and_leave_receipt_capacity() {
     let mut state = State::default();
     for token in 1..=256 {
         state.step(Event::Observe {
+            kind: ObservationKind::Local,
             history: None,
             token,
             id: id(token as u8),
@@ -1616,7 +1650,7 @@ fn binding_reset_keeps_keyed_physical_echo_provenance() {
     model.copy(200, Some(content("1234")), &[3]);
     model.settle();
     assert!(model.published.is_empty());
-    assert_eq!(model.state.register, key);
+    assert!(model.state.register > key);
 }
 #[test]
 fn every_install_terminal_path_retires_legacy_clock_and_ignores_late_results() {
@@ -1710,7 +1744,7 @@ fn mixed_local_restoration_keeps_full_physical_selection_and_received_provenance
         restarted.echo(&content("received text")),
         "physical provenance was evicted from durable history"
     );
-    model.copy(200, Some(content("received text")), &[3]);
+    model.reoffer(200, Some(content("received text")), &[3]);
     model.settle();
     assert_eq!(model.published.len(), published);
     assert_eq!(model.state.register, register);
@@ -1734,6 +1768,7 @@ fn saturated_admitted_receipts_and_local_burst_share_the_pending_cap() {
     assert_eq!(state.persistence.len(), 61);
     for token in 100..=355 {
         state.step(Event::Observe {
+            kind: ObservationKind::Local,
             history: None,
             token,
             id: id(token as u8),
@@ -1837,7 +1872,7 @@ fn retired_markers_reoffer_received_formats_and_restore_the_register_winner() {
             let winner = model.state.register.clone();
             // The watcher asks the actor before treating a MIME as confirmation.
             assert!(!model.state.confirms_install(retired));
-            model.copy(30, offered, &[2, 3]);
+            model.reoffer(30, offered, &[2, 3]);
             model.settle();
             model.consistent();
             assert_eq!(model.state.register, winner);
@@ -1914,7 +1949,7 @@ fn repair_payload_tracks_local_and_deduplicated_winners_across_all_formats() {
                 operation.hashes = hashes(&older);
                 model.event(Event::Submit(operation));
                 model.settle();
-                model.copy(20, Some(winner.clone()), &[2, 3]);
+                model.reoffer(20, Some(winner.clone()), &[2, 3]);
                 model.settle();
                 let before = model.installed.len();
                 if let Some(duplicate) = duplicate {
@@ -1935,7 +1970,7 @@ fn repair_payload_tracks_local_and_deduplicated_winners_across_all_formats() {
                 let register = model.state.register.clone();
                 let physical_hashes = model.state.current_hashes.clone();
                 let publications = model.published.len();
-                model.copy(40, Some(older.clone()), &[2, 3]);
+                model.reoffer(40, Some(older.clone()), &[2, 3]);
                 model.settle();
                 assert_eq!(model.os, Some(winner.clone()));
                 assert_eq!(model.state.register, register);
@@ -1966,6 +2001,7 @@ fn restart_repairs_only_when_winner_payload_was_captured() {
         model.stopped.clear();
         model.os = Some(content("winner"));
         model.event(Event::Observe {
+            kind: ObservationKind::Initial,
             history: None,
             token: 30,
             id: id(30),
@@ -1989,7 +2025,7 @@ fn restart_repairs_only_when_winner_payload_was_captured() {
             captured
         );
         let register = model.state.register.clone();
-        model.copy(50, Some(content("older")), &[2]);
+        model.reoffer(50, Some(content("older")), &[2]);
         model.settle();
         assert_eq!(model.installed.len(), usize::from(captured));
         assert_eq!(
@@ -2013,7 +2049,7 @@ fn repair_rejects_prepared_bytes_that_no_longer_match_the_winner() {
     model.event(Event::Submit(remote(20, 2, 200, "winner")));
     model.settle();
     let register = model.state.register.clone();
-    model.copy(30, Some(content("older")), &[2]);
+    model.reoffer(30, Some(content("older")), &[2]);
     let ticket = model.state.installing.as_ref().unwrap().ticket;
     model
         .pending
@@ -2037,6 +2073,7 @@ fn local_clock_completes_with_all_claims_retained_during_read_or_debounce() {
             ..Default::default()
         };
         model.event(Event::Observe {
+            kind: ObservationKind::Local,
             history: None,
             token: 1,
             id: id(1),
@@ -2174,6 +2211,7 @@ fn failed_clock_retry_is_retired_by_newer_local_cancellation_and_shutdown() {
 fn lost_reader_completion_has_a_terminal_timer_and_cannot_block_reception() {
     let mut model = Compositor::default();
     model.event(Event::Observe {
+        kind: ObservationKind::Local,
         history: None,
         token: 10,
         id: id(10),
@@ -2219,6 +2257,7 @@ fn initial_selection_is_manual_only_across_modes_and_watcher_restarts() {
                     m.os = Some(value.clone());
                     // Every watcher generation starts without an automatic offer.
                     m.event(Event::Observe {
+                        kind: ObservationKind::Local,
                         history: None,
                         token,
                         id: id(token as u8),
@@ -2306,6 +2345,7 @@ fn initial_received_echo_restores_payload_without_advancing_or_repairing_registe
             m.event(Event::Mode(ClipboardMode::Automatic));
             m.os = Some(value.clone());
             m.event(Event::Observe {
+                kind: ObservationKind::Initial,
                 history: None,
                 token: 30,
                 id: id(30),
@@ -2326,7 +2366,7 @@ fn initial_received_echo_restores_payload_without_advancing_or_repairing_registe
             assert!(m.installed.is_empty());
             assert!(m.replies[&30].0);
             // A stripped-marker manager reoffer is still an echo after capture.
-            m.copy(40, Some(value.clone()), &[2, 3]);
+            m.reoffer(40, Some(value.clone()), &[2, 3]);
             m.settle();
             assert_eq!(m.state.register, Some(register));
             assert!(m.published.is_empty());
@@ -2383,6 +2423,7 @@ fn initial_older_echo_can_recover_the_current_winner_payload_on_next_observation
     };
     m.os = Some(content("older"));
     m.event(Event::Observe {
+        kind: ObservationKind::Initial,
         history: None,
         token: 10,
         id: id(10),
@@ -2401,7 +2442,7 @@ fn initial_older_echo_can_recover_the_current_winner_payload_on_next_observation
         m.state.current.as_ref().unwrap().key,
         Some(register.clone())
     );
-    m.copy(20, Some(content("winner")), &[2, 3, 4]);
+    m.reoffer(20, Some(content("winner")), &[2, 3, 4]);
     m.settle();
     assert_eq!(m.state.register, Some(register.clone()));
     assert_eq!(m.state.current.as_ref().unwrap().key, Some(register));
@@ -2460,6 +2501,7 @@ fn initial_mixed_echo_keeps_each_representations_received_source() {
     };
     m.os = Some(value.clone());
     m.event(Event::Observe {
+        kind: ObservationKind::Initial,
         history: None,
         token: 10,
         id: id(10),
@@ -2503,6 +2545,7 @@ fn initial_read_timeout_recovers_on_next_watcher_snapshot_without_publication() 
     let mut m = Compositor::default();
     m.event(Event::Mode(ClipboardMode::Off));
     m.event(Event::Observe {
+        kind: ObservationKind::Local,
         history: None,
         token: 10,
         id: id(10),
@@ -2517,6 +2560,7 @@ fn initial_read_timeout_recovers_on_next_watcher_snapshot_without_publication() 
     assert!(m.published.is_empty());
     m.os = Some(content("recovered"));
     m.event(Event::Observe {
+        kind: ObservationKind::Local,
         history: None,
         token: 20,
         id: id(20),
@@ -2555,6 +2599,7 @@ fn clipboard_mode_matrix_preserves_ordering_and_received_provenance() {
         m.event(Event::Mode(mode));
         m.os = Some(content("human"));
         m.event(Event::Observe {
+            kind: ObservationKind::Local,
             history: None,
             token: 1,
             id: id(1),
@@ -2630,6 +2675,7 @@ fn changing_clipboard_mode_cannot_republish_pending_or_late_manual_content() {
     m.event(Event::Mode(ClipboardMode::Manual));
     m.os = Some(content("human"));
     m.event(Event::Observe {
+        kind: ObservationKind::Local,
         history: None,
         token: 1,
         id: id(1),
@@ -2666,6 +2712,7 @@ fn pairing_link_hint_is_local_current_and_does_not_change_sharing() {
         let mut state = State::default();
         state.step(Event::Mode(mode));
         state.step(Event::Observe {
+            kind: ObservationKind::Local,
             history: None,
             token: 1,
             id: id(1),
@@ -2692,6 +2739,7 @@ fn pairing_link_hint_is_local_current_and_does_not_change_sharing() {
         assert_eq!(local.content, Some(link));
         assert_eq!(local.offer.is_some(), mode == ClipboardMode::Automatic);
         let effects = state.step(Event::Observe {
+            kind: ObservationKind::Local,
             history: None,
             token: 2,
             id: id(2),
@@ -2901,6 +2949,7 @@ fn marker_read_observation_keeps_recipients_frozen_across_policy_expansion() {
     // The macOS watcher must capture this before its marker subprocess, exactly
     // as Wayland captures policy before reading an offered secret-hint marker.
     model.event(Event::Observe {
+        kind: ObservationKind::Local,
         history: None,
         token: 20,
         id: id(20),
@@ -2926,12 +2975,13 @@ fn marker_read_observation_keeps_recipients_frozen_across_policy_expansion() {
 }
 
 #[test]
-fn discarded_reader_then_manager_echo_releases_incoming_install_without_read_timeout() {
+fn fresh_recopy_retires_the_previous_reader_without_waiting_for_its_timeout() {
     let mut model = Compositor::default();
     model.event(Event::Submit(remote(10, 2, 100, "received")));
     model.settle();
     for token in [20, 30] {
         model.event(Event::Observe {
+            kind: ObservationKind::Local,
             history: None,
             token,
             id: id(token as u8),
@@ -2940,9 +2990,9 @@ fn discarded_reader_then_manager_echo_releases_incoming_install_without_read_tim
             clear: false,
         });
     }
-    assert_eq!(model.state.held_observations.len(), 1);
-    // Reaping reader 20 must also retire its held actor observation. Completing
-    // only the manager echo at 30 would retain 20 until the six-second timeout.
+    assert!(model.state.held_observations.is_empty());
+    // The fresh selection already canceled reader 20; its eventual retirement
+    // is harmless and cannot hold incoming work until the six-second timeout.
     model.event(Event::AbandonRead(20));
     model.event(Event::Read {
         token: 30,
@@ -2974,6 +3024,7 @@ fn confirmed_marker_retires_provisional_observation_without_a_local_clock() {
         }
         let ticket = model.state.installing.as_ref().unwrap().ticket;
         model.event(Event::Observe {
+            kind: ObservationKind::Marker,
             history: None,
             token: 20,
             id: id(20),
@@ -3003,6 +3054,7 @@ async fn history_capture_follows_echo_classification_and_only_records_once() -> 
     model.settle();
     for (token, text, expected) in [(20, "received", false), (30, "new human copy", true)] {
         model.state.step(Event::Observe {
+            kind: ObservationKind::Local,
             token,
             id: id(token as u8),
             offer: None,
@@ -3043,6 +3095,7 @@ async fn history_reversed_read_completions_keep_copy_order_after_restart() -> an
     model.settle();
     for token in [20, 30] {
         model.state.step(Event::Observe {
+            kind: ObservationKind::Local,
             token,
             id: id(token as u8),
             offer: None,
@@ -3113,6 +3166,7 @@ fn oversized_read(
     origin: bool,
 ) -> Vec<Effect> {
     state.step(Event::Observe {
+        kind: ObservationKind::Local,
         token,
         id: id(token as u8),
         offer,
@@ -3238,6 +3292,7 @@ fn manual_oversized_share_reports_too_large_each_attempt_and_new_copy_clears_it(
         );
     }
     state.step(Event::Observe {
+        kind: ObservationKind::Local,
         token: 40,
         id: id(40),
         offer: None,
@@ -3254,6 +3309,7 @@ fn manual_mixed_oversized_image_offer_shares_eligible_text() {
         let mut model = Compositor::default();
         model.event(Event::Mode(ClipboardMode::Manual));
         model.event(Event::Observe {
+            kind: ObservationKind::Local,
             token: 10,
             id: id(10),
             offer: None,
@@ -3322,4 +3378,224 @@ fn manual_share_load_failure_keeps_too_large_reason() {
             ..
         }
     )));
+}
+
+#[test]
+fn recopy_of_received_content_keeps_the_human_selection_and_fences_delayed_remote() {
+    for value in repair_formats("older remote") {
+        let mut m = Compositor::default();
+        let mut older = remote(10, 2, 100, "older remote");
+        older.content = Some(value.clone());
+        older.hashes = hashes(&value);
+        m.event(Event::Submit(older));
+        m.settle();
+        m.event(Event::Submit(remote(20, 3, 200, "newer remote")));
+        m.settle();
+        let installs = m.installed.len();
+        m.clock = 300;
+        m.copy(30, Some(value.clone()), &[2, 3]);
+        m.settle();
+        assert_eq!(
+            m.os,
+            Some(value.clone()),
+            "a fresh re-copy was repaired away"
+        );
+        assert_eq!(m.installed.len(), installs, "re-copy must not write the OS");
+        assert!(
+            m.published.is_empty(),
+            "received bytes must not auto-forward"
+        );
+        assert!(m.state.register.as_ref().unwrap().hlc > 300);
+        m.event(Event::Submit(remote(40, 3, 250, "delayed old remote")));
+        m.settle();
+        assert_eq!(m.os, Some(value));
+        assert_eq!(m.installed.len(), installs);
+    }
+}
+
+#[test]
+fn fresh_local_metadata_stops_every_pending_install_before_read_or_debounce() {
+    for boundary in 0..3 {
+        let mut m = Compositor::default();
+        m.event(Event::Submit(remote(10, 2, 100, "pending remote")));
+        for _ in 0..boundary {
+            assert!(m.tick());
+        }
+        let ticket = m.state.installing.as_ref().unwrap().ticket;
+        m.os = Some(content("fresh human copy"));
+        m.event(Event::Observe {
+            kind: ObservationKind::Local,
+            history: None,
+            token: 20,
+            id: id(20),
+            offer: Some(offer(20, &[2])),
+            origin: false,
+            clear: false,
+        });
+        assert!(m.stopped.contains(&ticket), "phase boundary {boundary}");
+        assert!(!m.state.confirms_install(ticket));
+        // No provider result is needed to revoke permission for the OS write.
+        m.settle();
+        assert_eq!(m.os, Some(content("fresh human copy")));
+        m.event(Event::Read {
+            token: 20,
+            content: Some(content("fresh human copy")),
+            fingerprints: vec![],
+            debounce: false,
+        });
+        m.settle();
+        assert_eq!(m.os, Some(content("fresh human copy")));
+        assert_eq!(m.published.len(), 1);
+    }
+}
+
+#[test]
+fn recopy_cancels_a_pending_repair_of_an_older_remote_selection() {
+    for boundary in 0..3 {
+        let mut m = Compositor::default();
+        m.event(Event::Submit(remote(10, 2, 100, "older")));
+        m.settle();
+        m.event(Event::Submit(remote(20, 3, 200, "previous winner")));
+        m.settle();
+        m.reoffer(30, Some(content("older")), &[2, 3]);
+        assert!(m.state.installing.as_ref().unwrap().operation.repair);
+        for _ in 0..boundary {
+            assert!(m.tick());
+        }
+        m.copy(40, Some(content("older")), &[2, 3]);
+        m.settle();
+        assert_eq!(m.os, Some(content("older")), "repair boundary {boundary}");
+        assert!(m.state.register.as_ref().unwrap().hlc > 200);
+        assert!(m.published.is_empty());
+        assert!(m.state.idle());
+    }
+}
+
+#[tokio::test]
+async fn known_human_recopy_supersedes_an_older_local_read_debounce_or_clock_even_if_unreadable()
+-> anyhow::Result<()> {
+    let dir = crate::test_support::scratch()?;
+    let store = crate::store::Store::open(&dir.path().join("state.sqlite3"))?;
+    store.history_configure(true, true).await?;
+    for history in [false, true] {
+        for phase in 0..3 {
+            for readable in [false, true] {
+                let mut m = Compositor::default();
+                m.event(Event::Submit(remote(10, 2, 100, "known received")));
+                m.settle();
+                m.os = Some(content("older human copy"));
+                m.event(Event::Observe {
+                    kind: ObservationKind::Local,
+                    history: history.then(|| store.history_capture()).flatten(),
+                    token: 20,
+                    id: id(20),
+                    offer: Some(offer(20, &[2, 3])),
+                    origin: false,
+                    clear: false,
+                });
+                if phase > 0 {
+                    m.event(Event::Read {
+                        token: 20,
+                        content: m.os.clone(),
+                        fingerprints: vec![],
+                        debounce: phase == 1,
+                    });
+                }
+                m.os = Some(content("known received"));
+                m.event(Event::Observe {
+                    kind: ObservationKind::Local,
+                    history: history.then(|| store.history_capture()).flatten(),
+                    token: 30,
+                    id: id(30),
+                    offer: Some(offer(30, &[2, 3])),
+                    origin: false,
+                    clear: false,
+                });
+                if !history {
+                    assert!(m.read_timeouts.iter().all(|token| *token != 20));
+                }
+                assert!(
+                    !m.state.held_selection(),
+                    "history-only reads blocked the fresh selection"
+                );
+                if readable {
+                    m.event(Event::Read {
+                        token: 30,
+                        content: m.os.clone(),
+                        fingerprints: vec![],
+                        debounce: false,
+                    });
+                } else {
+                    m.event(Event::ReadTimeout(30));
+                }
+                // A provider or Store job can still deliver its retired completion.
+                m.event(Event::Read {
+                    token: 20,
+                    content: Some(content("older human copy")),
+                    fingerprints: vec![],
+                    debounce: false,
+                });
+                m.settle();
+                assert_eq!(
+                    m.os,
+                    Some(content("known received")),
+                    "phase {phase}, readable {readable}"
+                );
+                assert!(m.published.is_empty());
+                assert!(m.state.idle());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_fresh_local_selection_retires_queued_receives_before_they_can_get_a_new_clock() {
+    for legacy in [false, true] {
+        for readable in [false, true] {
+            let mut m = Compositor::default();
+            m.event(Event::Submit(remote(10, 2, 100, "current")));
+            m.settle();
+            let installs = m.installed.len();
+            m.event(Event::Observe {
+                kind: ObservationKind::Local,
+                history: None,
+                token: 20,
+                id: id(20),
+                offer: Some(offer(20, &[2])),
+                origin: false,
+                clear: false,
+            });
+            let mut queued = remote(25, 3, 200, "old queued remote");
+            queued.legacy = legacy;
+            if legacy {
+                queued.key = None;
+            }
+            m.event(Event::Submit(queued));
+            assert!(m.state.queue.iter().any(|o| o.received));
+            m.clock = 500;
+            m.os = Some(content("fresh human selection"));
+            m.event(Event::Observe {
+                kind: ObservationKind::Local,
+                history: None,
+                token: 30,
+                id: id(30),
+                offer: Some(offer(30, &[2])),
+                origin: false,
+                clear: false,
+            });
+            assert!(!m.state.queue.iter().any(|o| o.received));
+            m.event(Event::Read {
+                token: 30,
+                content: readable.then(|| content("fresh human selection")),
+                fingerprints: vec![],
+                debounce: false,
+            });
+            m.settle();
+            assert_eq!(m.os, Some(content("fresh human selection")));
+            assert_eq!(m.installed.len(), installs);
+            assert_eq!(m.replies[&25], (true, None));
+            assert!(m.state.register.as_ref().unwrap().hlc > 500);
+        }
+    }
 }

@@ -9,13 +9,19 @@ use sha2::{Digest, Sha256};
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicIsize, Ordering},
     },
     time::Duration,
 };
 
 pub const ORIGIN_MIME: &str = "io.github.stantonmatt.pneu.origin";
 pub use crate::ui::clipboard_content::MAX_IMAGE;
+// Updated only after the corresponding observation has entered the actor's
+// ordered mailbox. An unobserved change must also invalidate a pending install.
+static OBSERVED_COUNT: AtomicIsize = AtomicIsize::new(-1);
+pub(crate) fn observed_count() -> isize {
+    OBSERVED_COUNT.load(Ordering::SeqCst)
+}
 const TEXT: &str = "public.utf8-plain-text";
 const IMAGE_TYPES: [(&str, &str); 5] = [
     ("public.png", "image/png"),
@@ -84,6 +90,8 @@ fn combine(text: Option<String>, png: Option<Vec<u8>>) -> Option<Content> {
 pub(crate) struct Offer {
     representations: Vec<(String, Vec<u8>)>,
     ticket: u128,
+    expected_count: Option<isize>,
+    authority: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 impl Offer {
     #[cfg(test)]
@@ -128,7 +136,18 @@ impl Offer {
         Ok(Self {
             representations,
             ticket,
+            expected_count: None,
+            authority: None,
         })
+    }
+    pub(crate) fn guard_count(&mut self, count: isize) {
+        self.expected_count = Some(count);
+    }
+    pub(crate) fn set_authority(&mut self, authority: impl Fn() -> bool + Send + Sync + 'static) {
+        self.authority = Some(Box::new(authority));
+    }
+    fn authorized(&self) -> bool {
+        self.authority.as_ref().is_none_or(|allowed| allowed())
     }
     pub(crate) fn hashes(&self) -> Vec<[u8; 32]> {
         self.representations
@@ -162,8 +181,19 @@ impl Offer {
             );
             // Polling must never submit the intermediate empty selection.
             let _publication = super::pasteboard_reader::PUBLICATION.lock().unwrap();
-            pb.clearContents();
+            ensure!(
+                self.authorized()
+                    && self
+                        .expected_count
+                        .is_none_or(|count| pb.changeCount() == count),
+                "clipboard changed before installation"
+            );
+            let cleared = pb.clearContents();
             after_clear();
+            ensure!(
+                self.authorized() && pb.changeCount() == cleared,
+                "clipboard changed during installation"
+            );
             let writing = ProtocolObject::<dyn NSPasteboardWriting>::from_ref(&*item);
             ensure!(
                 pb.writeObjects(&NSArray::from_slice(&[writing])),
@@ -344,6 +374,8 @@ fn poll(
         if class == Classification::Sensitive && !marker {
             pending.take();
             invalidate(core);
+            // Metadata still establishes a local generation; no payload read.
+            OBSERVED_COUNT.store(count, Ordering::SeqCst);
             return;
         }
         if initial && !marker {
@@ -351,11 +383,13 @@ fn poll(
             // pre-existing selection. Only an origin marker can witness a
             // write that raced startup/restart/access recovery.
             pending.take();
+            OBSERVED_COUNT.store(count, Ordering::SeqCst);
             return;
         }
         // Capture the new policy before reaping the previous provider, but never
         // start a second subprocess until the old one has been reaped.
         let change = observe_change(core, count, marker, initial);
+        OBSERVED_COUNT.store(count, Ordering::SeqCst);
         pending.take();
         match change.start(read_command) {
             Ok(read) => *pending = Some(read),
@@ -669,6 +703,50 @@ mod tests {
             }
             let expected_restore = saved.clone();
             let restore = Restore(saved);
+            let local_copy = || {
+                let item = NSPasteboardItem::new();
+                assert!(item.setData_forType(
+                    &NSData::with_bytes(b"new human selection"),
+                    &NSString::from_str(TEXT)
+                ));
+                pb.clearContents();
+                let writing = ProtocolObject::<dyn NSPasteboardWriting>::from_ref(&*item);
+                assert!(pb.writeObjects(&NSArray::from_slice(&[writing])));
+            };
+            let mut stale = Offer::prepare(
+                &crate::actions::ClipboardInput::Text("stale remote".into()),
+                41,
+            )?;
+            stale.guard_count(pb.changeCount());
+            local_copy();
+            let local_count = pb.changeCount();
+            assert!(
+                stale.install().is_err(),
+                "pending install overwrote a local copy"
+            );
+            assert_eq!(
+                pb.changeCount(),
+                local_count,
+                "stale install cleared the clipboard"
+            );
+            stale.guard_count(local_count);
+            assert!(
+                stale.install_with(local_copy).is_err(),
+                "write ignored a copy in the clear/write gap"
+            );
+            assert_eq!(
+                pb.stringForType(&NSString::from_str(TEXT))
+                    .map(|s| s.to_string()),
+                Some("new human selection".into())
+            );
+            stale.guard_count(pb.changeCount());
+            stale.set_authority(|| false);
+            let local_count = pb.changeCount();
+            assert!(
+                stale.install().is_err(),
+                "cancelled install reached clearContents"
+            );
+            assert_eq!(pb.changeCount(), local_count);
             let mut png = std::io::Cursor::new(Vec::new());
             image::DynamicImage::new_rgb8(1, 1).write_to(&mut png, image::ImageFormat::Png)?;
             let png = png.into_inner();
