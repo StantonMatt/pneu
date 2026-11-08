@@ -8,7 +8,7 @@ supported desktop). No Rust toolchain is needed for a release download.
 ## Install
 
 Download `pneu_<version>_amd64.deb` from the
-[latest release](https://github.com/StantonMatt/pneu/releases/latest), then:
+[latest release](https://gitlab.com/stantonmatthewj/pneu/-/releases/permalink/latest), then:
 
 ```sh
 sudo apt install ./pneu_*_amd64.deb
@@ -22,7 +22,7 @@ services. On upgrade, restart your own service or log out and back in to run
 the new binary.
 
 For other distributions, download
-[pneu-linux-x86_64.tar.gz](https://github.com/StantonMatt/pneu/releases/latest/download/pneu-linux-x86_64.tar.gz),
+[pneu-linux-x86_64.tar.gz](https://gitlab.com/stantonmatthewj/pneu/-/releases/permalink/latest/downloads/pneu-linux-x86_64.tar.gz),
 install the Qt 6 Core/Gui/Widgets/Network/DBus libraries and Qt Wayland/QPA plugins
 with your package manager, then:
 

@@ -352,7 +352,7 @@ class DeviceScreensDeviceTest {
         instrumentation.addMonitor(monitor)
         try {
             compose.onNodeWithText("Privacy policy").performClick()
-            assertEquals("https://github.com/StantonMatt/pneu/blob/main/PRIVACY.md",withTimeout(5000) {opened.await()}.dataString)
+            assertEquals("https://gitlab.com/stantonmatthewj/pneu/-/blob/main/PRIVACY.md",withTimeout(5000) {opened.await()}.dataString)
         } finally {instrumentation.removeMonitor(monitor)}
     }
     @Test(timeout=30000) fun addDeviceAlreadyPaired()=runBlocking<Unit> {

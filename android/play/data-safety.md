@@ -17,7 +17,7 @@ Local storage and on-device QR processing are also outside collection. ZXing cor
 5. **Account-deletion URL?** Not applicable; no Pneu accounts. Do not invent an account-deletion website.
 6. **Independent security review / MASA badge?** No; no qualifying assessment has been performed.
 7. **Other badges (payments, Families)?** None. This is not a payment app or a child-directed app.
-8. **Privacy-policy URL?** https://github.com/StantonMatt/pneu/blob/main/PRIVACY.md — must be live before submission and accessible within the app.
+8. **Privacy-policy URL?** https://gitlab.com/stantonmatthewj/pneu/-/blob/main/PRIVACY.md — must be live before submission and accessible within the app.
 
 ## Data types and usage answers
 

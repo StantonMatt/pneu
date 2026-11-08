@@ -35,4 +35,4 @@ Pneu runs in the tray or menu bar; closing the window keeps it running. Choose Q
 
 Notifications may show file names and received text previews. Turning off Show notifications in Settings stops routine notifications, but alerts about failed transfers or saves can still name the file; use your system's notification settings to hide all of them.
 
-For privacy questions, [open a GitHub issue](https://github.com/StantonMatt/pneu/issues). Issues are public: do not include private content, pairing codes or keys.
+For privacy questions, [open a GitLab issue](https://gitlab.com/stantonmatthewj/pneu/-/issues). Issues are public: do not include private content, pairing codes or keys.
