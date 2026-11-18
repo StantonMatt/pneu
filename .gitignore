@@ -22,10 +22,3 @@ captures/
 # Private signing material
 *.jks
 *.keystore
-
-# GitLab CI job-local caches and release artifacts
-/.ci-cache/
-/release-source/
-/release-source.tar
-/release/
-/public/
