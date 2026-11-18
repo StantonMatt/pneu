@@ -2,7 +2,7 @@
 
 Send files and share clipboard text between your phone and computers.
 
-[Download Pneu](https://stantonmatthewj.gitlab.io/pneu/).
+[Download Pneu](https://stantonmatt.github.io/pneu/).
 
 Pronounced “new”, after pneumatic tubes.
 
@@ -42,13 +42,13 @@ More phones and computers can join by pairing directly. See the [wire protocol](
 
 ## Install
 
-On Linux, download `pneu_<version>_amd64.deb` from the [latest release](https://gitlab.com/stantonmatthewj/pneu/-/releases/permalink/latest), then run:
+On Linux, download `pneu_<version>_amd64.deb` from the [latest release](https://github.com/StantonMatt/pneu/releases/latest), then run:
 
 ```sh
 sudo apt install ./pneu_*_amd64.deb
 ```
 
-Open **Pneu** from the app menu. Alternatively, extract [pneu-linux-x86_64.tar.gz](https://gitlab.com/stantonmatthewj/pneu/-/releases/permalink/latest/downloads/pneu-linux-x86_64.tar.gz) and run its `./install.sh` as your regular user. That installs the prebuilt binary into `~/.local` and enables its user service; `./install.sh --uninstall` removes it while preserving your data. See the [Linux guide](docs/linux.md) for dependencies, upgrades and switching from an existing source installation.
+Open **Pneu** from the app menu. Alternatively, extract [pneu-linux-x86_64.tar.gz](https://github.com/StantonMatt/pneu/releases/latest/download/pneu-linux-x86_64.tar.gz) and run its `./install.sh` as your regular user. That installs the prebuilt binary into `~/.local` and enables its user service; `./install.sh --uninstall` removes it while preserving your data. See the [Linux guide](docs/linux.md) for dependencies, upgrades and switching from an existing source installation.
 
 To build and install from source:
 
@@ -57,7 +57,7 @@ cd desktop
 ./install.sh
 ```
 
-On the Mac, download [Pneu-macOS.zip from GitLab Releases](https://gitlab.com/stantonmatthewj/pneu/-/releases/permalink/latest/downloads/Pneu-macOS.zip), unzip it and move **Pneu.app** to Applications. The app is ad-hoc signed, without notarization. If macOS blocks it, try opening it, then go to **System Settings → Privacy & Security → Open Anyway** and confirm.
+On the Mac, download [Pneu-macOS.zip from GitHub Releases](https://github.com/StantonMatt/pneu/releases/latest/download/Pneu-macOS.zip), unzip it and move **Pneu.app** to Applications. The app is ad-hoc signed, without notarization. If macOS blocks it, try opening it, then go to **System Settings → Privacy & Security → Open Anyway** and confirm.
 
 To build and install from source, run from the repo root:
 
@@ -153,7 +153,7 @@ Device suites use [android/tools/run_device_tests.py](android/tools/run_device_t
 
 ## Status and limitations
 
-Personal project: desktop **2.2.2**, Android **2.2.0**. Physical acceptance for 2.1.0 was completed with a Kubuntu 26.04 PC, a MacBook Air (macOS 26.6, arm64) and a Galaxy S25+, all three paired over Tailscale. This does not establish every Wi-Fi/mobile transition, OEM background condition or battery-use scenario. The Android app is in Google Play closed testing (join through the [download page](https://stantonmatthewj.gitlab.io/pneu/)) and can be sideloaded. The Mac app is ad-hoc signed, without Developer ID signing or notarization. Windows is in the Microsoft Store and also works from source or as a sideloaded MSIX; physical-hardware acceptance remains pending.
+Personal project: desktop **2.2.2**, Android **2.2.0**. Physical acceptance for 2.1.0 was completed with a Kubuntu 26.04 PC, a MacBook Air (macOS 26.6, arm64) and a Galaxy S25+, all three paired over Tailscale. This does not establish every Wi-Fi/mobile transition, OEM background condition or battery-use scenario. The Android app is in Google Play closed testing (join through the [download page](https://stantonmatt.github.io/pneu/)) and can be sideloaded. The Mac app is ad-hoc signed, without Developer ID signing or notarization. Windows is in the Microsoft Store and also works from source or as a sideloaded MSIX; physical-hardware acceptance remains pending.
 
 The phone supports up to 16 paired computers. Each link is direct: pairing a phone with two computers does not pair those computers with each other. Clipboard is connected-only, and phone clipboard sending requires a tap. Supported clipboard image formats and desktop actions have limits; a crash in the short window before a desktop file receipt is committed can leave a duplicate visible file after retry. Read the accepted behaviours in the [protocol's transfer section](docs/PROTOCOL.md#transfer-and-delivery-state-machines), the [desktop README](desktop/README.md) and the [Android README](android/README.md#accepted-behaviours).
 
@@ -163,6 +163,7 @@ The phone supports up to 16 paired computers. Each link is direct: pairing a pho
 
 ## CI and releases
 
-GitLab runs desktop and Android checks for merge requests and pushes to `main`.
-See [CI and releases](docs/ci.md) for runner requirements, Pages, release dry runs
-and switching back to GitHub.
+GitHub Actions checks Linux, macOS, Windows and Android on pull requests and
+pushes to `main`. Pages deploys `site/` from `main`; `v*` tags build desktop
+artifacts and publish a GitHub Release. See [CI and releases](docs/ci.md) for
+checks, release assets and manual dry runs.

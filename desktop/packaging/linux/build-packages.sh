@@ -55,7 +55,7 @@ Architecture: amd64
 Maintainer: Matthew Stanton <stantonmatthewj@gmail.com>
 Section: utils
 Priority: optional
-Homepage: ${PNEU_SITE_URL:-https://stantonmatthewj.gitlab.io/pneu/}
+Homepage: https://stantonmatt.github.io/pneu/
 Installed-Size: 0
 Depends: $shlibs, init-system-helpers (>= 1.52), qt6-qpa-plugins, qt6-wayland
 Recommends: systemd, dbus-user-session, xdg-desktop-portal

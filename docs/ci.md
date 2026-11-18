@@ -1,85 +1,43 @@
 # CI and releases
 
-[GitLab](https://gitlab.com/stantonmatthewj/pneu) is the current host.
-`.gitlab-ci.yml` tests merge requests and pushes to `main`: the complete desktop
-workspace on Linux and Apple Silicon macOS, the Windows-compilable `pneud`
-targets with `windows-package`, and Android debug unit tests and lint. Linux also
-checks reproducible `.deb` and tarball packaging. Superseded test jobs cancel;
-release and Pages jobs finish without cancellation. Fork MRs run in their fork.
+[GitHub](https://github.com/StantonMatt/pneu) is the main host.
+GitLab is a read-only mirror updated from GitHub every five minutes; do not push
+or open merge requests there.
 
-Linux and Android use disposable Docker jobs tagged `ci-public`. Linux release
-builds stay on Ubuntu 24.04 for the glibc/Qt baseline. Linux compiles one Cargo
-job at a time, omits test debug information and disables incremental test
-compilation to fit the 4 GiB runner. Release
-builds retain the workspace release profile. Android uses Java 21 and
-SDK platform `android-37.2` / build tools `37.0.0`, without release signing. It
-uses one Gradle worker and compiles Kotlin in the Gradle process to fit the VM.
-Windows uses GitLab's `saas-windows-medium-amd64` runner with MSVC and Windows
-SDK tools. It installs the workspace Rust version if needed. These Windows jobs
-spend hosted-runner minutes. Both the Windows test and Store MSIX release jobs
-are omitted unless the project CI/CD variable `PNEU_HOSTED_WINDOWS` equals
-`true`. It is unset while GitLab identity verification is pending. To enable
-Windows later:
+## Checks
 
-1. Complete GitLab account identity verification.
-2. Re-enable instance runners in the project CI/CD settings and set the project
-   CI/CD variable `PNEU_HOSTED_WINDOWS` to `true`.
+[CI](../.github/workflows/ci.yml) runs on pull requests and pushes to `main`,
+using GitHub-hosted runners:
 
-Until then, a green pipeline covers Linux, macOS and Android; Windows tests and
-the unsigned Store MSIX artifact are unavailable.
+- `ubuntu-latest`: the complete desktop Rust test suite with Qt 6, then the Linux
+  package reproducibility and lint checks on the CI-built binary.
+- `macos-15` (Apple Silicon, arm64): the complete desktop Rust test suite.
+- `windows-latest`: the Windows filesystem and shared daemon tests with
+  `cargo test --locked -p pneud --features windows-package`.
+- `ubuntu-latest` for Android: Java 21, the Android SDK, debug unit tests and
+  debug lint, without release signing.
 
-The `macos` shell runner is Matthew's Apple Silicon Mac and runs only while it
-is awake. It needs Xcode command-line tools, Python 3.11+, rustup and
-`~/.local/bin/heavy`. Jobs select the workspace Rust version without changing
-the user's default toolchain, and use a job-local temporary directory. No Qt,
-Java or Android SDK is required on the Mac. Only trusted project contributors
-may run pipelines against this shell runner.
+## Download site
 
-## Pages
+[Pages](../.github/workflows/pages.yml) deploys `site/` to
+https://stantonmatt.github.io/pneu/ when it changes on `main`, or through a manual
+workflow dispatch. Deployment uses the `github-pages` environment and GitHub's
+Pages artifact and OIDC actions.
 
-The `pages` job publishes `site/` on pushes to `main` changing `site/**`, or a
-manual pipeline on `main` with `RELEASE_TAG` empty. The public site is
-https://stantonmatthewj.gitlab.io/pneu/. Project Pages access must be **Everyone**
-and unique domains disabled to retain that URL. The site links directly to
-GitLab Release assets; there is no GitHub OIDC or Pages deployment credential.
+## Desktop releases
 
-## Releases
+[Desktop release](../.github/workflows/release.yml) builds `v*` tags and checks
+that the tag matches the desktop workspace version. It uses GitHub-hosted
+`macos-15`, `ubuntu-24.04` and `windows-latest` runners:
 
-Push a `v*` tag matching `desktop/Cargo.toml` to build the macOS zip, Linux `.deb`
-and tarball, and (when `PNEU_HOSTED_WINDOWS=true`) unsigned Store MSIX. The release jobs build the tag's source,
-while retaining CI scripts from the pipeline ref. The macOS and Linux artifacts
-are checksummed and uploaded with `CI_JOB_TOKEN` to the generic package registry;
-GitLab Release links provide stable latest-download URLs. Each publishing job
-uses a fresh package version so a retry can update links without overwriting an
-existing package. Existing release notes are replaced with the installation
-link. The MSIX stays a seven-day pipeline artifact for Partner Center; CI does
-not submit or sign it for the Store. Publication depends on macOS and Linux,
-as in the previous workflow, independently of Windows packaging.
+- macOS: an ad-hoc-signed `Pneu-macOS.zip`, without notarization.
+- Linux: `pneu_<version>_amd64.deb` and `pneu-linux-x86_64.tar.gz`, built on the
+  Ubuntu 24.04 glibc/Qt baseline.
+- Windows: an unsigned Store MSIX retained as a workflow artifact. Store
+  submission and signing are separate; the MSIX is not attached to the release.
 
-For a dry run, choose **Build → Pipelines → New pipeline**, select the CI branch,
-and set `RELEASE_TAG` to an existing version tag (for example `v2.2.2`). Or run:
-
-```sh
-glab ci run --branch gitlab-ci --variables-env RELEASE_TAG:v2.2.2
-```
-
-Manual/web/API builds keep artifacts for seven days and publish nothing automatically. This
-also lets the migration branch validate existing tags before CI is on `main`.
-After verifying the dry-run artifacts and pipeline, play the optional manual
-`republish` job to publish that existing release on GitLab. This is an explicit
-publication gate, separate from the dry run. Do not play it until its dry run
-has been checked.
-
-## If moving back to GitHub
-
-`.github/workflows/` is the inactive GitHub version and is preserved unchanged.
-Keep it in sync by hand only if a switch back happens. Re-enable those workflows
-and deactivate GitLab pipelines; GitHub release publication still uses its
-original `gh release` path. Point `origin` back to the saved `github` SSH remote,
-restore GitHub Pages and the repository's GitHub Actions permissions, and change
-site/download/privacy links back to `https://stantonmatt.github.io/pneu/` and
-`https://github.com/StantonMatt/pneu` (including Android's privacy URL and test).
-For Linux package metadata, set
-`PNEU_SITE_URL=https://stantonmatt.github.io/pneu/` when building. Also restore
-the manpage URL and external Play/Store listing URLs. The GitLab equivalents
-are listed in the migration report outside the repository.
+Tag pushes publish the macOS and Linux downloads plus `SHA256SUMS.txt` to the
+[GitHub Release](https://github.com/StantonMatt/pneu/releases/latest). Publication
+waits for the macOS and Linux builds and creates the release or replaces its
+assets. A manual workflow dispatch takes an existing `tag` and builds artifacts
+only, without publishing a release.
