@@ -10820,11 +10820,11 @@ mod tests {
     async fn file_progress_deadline_runs_while_clipboard_is_blocked() -> Result<()> {
         let actions = Arc::new(BlockingText(tokio::sync::Notify::new()));
         let (_dir, core, device) = fixture(actions.clone()).await?;
-        let (writer, _rx) = mpsc::channel(4);
+        let (writer, mut receipts) = mpsc::channel(4);
         let text_core = core.clone();
         let text_device = device.clone();
         let text_writer = writer.clone();
-        let text = tokio::spawn(async move {
+        let mut text = tokio::spawn(async move {
             text_core
                 .receive_test(
                     &text_core.store,
@@ -10860,20 +10860,39 @@ mod tests {
         while !matches!(events.recv().await?, Event::TransferStarted { .. }) {}
         tokio::task::yield_now().await;
         tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(11)).await;
+        // Advancing time only wakes timers. Join the independent actor reply
+        // and its Store cleanup before checking completion, while the file's
+        // 60-second progress deadline is still pending.
+        let text_result = tokio::time::timeout(Duration::from_secs(48), &mut text).await;
+        let file_still_waiting = !worker.is_finished() && closed.borrow().is_none();
+        if text_result.is_err() {
+            text.abort();
+            let _ = text.await;
+        }
         tokio::time::advance(Duration::from_secs(61)).await;
         let result = worker.await?;
         let code = *closed.borrow();
-        let text_still_blocked = !text.is_finished();
-        text.abort();
-        let _ = text.await;
         tokio::time::resume();
         core.shutdown_actions().await?;
         assert!(result.is_err());
         assert!(matches!(code, Some(CloseReason::Error(ErrorCode::Timeout))));
         assert!(
-            !text_still_blocked,
+            text_result.is_ok(),
             "actor must time out the blocked helper independently"
         );
+        text_result???;
+        assert!(
+            file_still_waiting,
+            "file expired before its progress deadline"
+        );
+        assert!(matches!(
+            receipts.recv().await,
+            Some(Message::Nack(Nack {
+                code: NackCode::ClipboardUnavailable,
+                ..
+            }))
+        ));
         assert!(
             std::fs::read_dir(core.config().save_path)?.all(|e| e.is_ok_and(|e| e.path().is_dir()))
         );
