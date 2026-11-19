@@ -90,6 +90,28 @@ async fn pair(a: &Core, b: &Core, scope: bool) -> Result<()> {
     .await
 }
 
+// Settings on reciprocal current sessions rule out transient pairing links.
+fn synchronized_link(a: &Core, b: &Core) -> bool {
+    let ready = |local: &Core, remote: &Core| {
+        let sessions = local.sessions.lock().unwrap();
+        sessions
+            .sessions
+            .get(&remote.identity.device_id)
+            .filter(|session| {
+                !session.close.is_closed()
+                    && session.close.borrow().is_none()
+                    && local
+                        .settings_ready
+                        .lock()
+                        .unwrap()
+                        .get(&remote.identity.device_id)
+                        == Some(&session.id)
+            })
+            .map(|session| session.outbound)
+    };
+    matches!((ready(a, b), ready(b, a)), (Some(x), Some(y)) if x != y)
+}
+
 // Matching IDs and ConnectionChanged(true) can precede setup's HELLO refresh.
 // Wait for MEMBERS receipts and settings on the current, reciprocal READY link
 // before capturing its authority or deliberately closing it.
@@ -113,27 +135,11 @@ async fn synchronized_setup(a: &Core, b: &Core) -> Result<()> {
                     })
                     .await?;
             }
-            let ready = |local: &Core, remote: &Core| {
-                let sessions = local.sessions.lock().unwrap();
-                sessions
-                    .sessions
-                    .get(&remote.identity.device_id)
-                    .filter(|session| {
-                        session.close.borrow().is_none()
-                            && local
-                                .settings_ready
-                                .lock()
-                                .unwrap()
-                                .get(&remote.identity.device_id)
-                                == Some(&session.id)
-                    })
-                    .map(|session| session.outbound)
-            };
             let setup = a.store.setup_state().setup_id;
             if received
                 && setup.is_some()
                 && setup == b.store.setup_state().setup_id
-                && matches!((ready(a, b), ready(b, a)), (Some(x), Some(y)) if x != y)
+                && synchronized_link(a, b)
             {
                 return Ok::<_, anyhow::Error>(());
             }
@@ -184,12 +190,13 @@ async fn replacement_two_daemons_propagate_existing_members_tombstone() -> Resul
         )
         .await?;
     until(|| {
-        b.core
-            .store
-            .setup_state()
-            .roster
-            .iter()
-            .any(|m| m.device_id == old && m.status == MemberStatus::Member)
+        b.core.paired_devices().contains(&old)
+            && b.core
+                .store
+                .setup_state()
+                .roster
+                .iter()
+                .any(|m| m.device_id == old && m.status == MemberStatus::Member)
     })
     .await?;
     assert!(b.core.paired_devices().contains(&old));
@@ -970,22 +977,7 @@ async fn setup_withdrawal_cancels_unrelated_preexisting_preview_without_reciproc
     })
     .await?;
     pair(&b.core, &c.core, false).await?;
-    until(|| {
-        let sessions = b.core.sessions.lock().unwrap();
-        sessions
-            .sessions
-            .get(&c.core.identity.device_id)
-            .is_some_and(|session| {
-                session.close.borrow().is_none()
-                    && b.core
-                        .settings_ready
-                        .lock()
-                        .unwrap()
-                        .get(&c.core.identity.device_id)
-                        == Some(&session.id)
-            })
-    })
-    .await?;
+    until(|| synchronized_link(&b.core, &c.core)).await?;
     let unscoped = b
         .core
         .sessions
@@ -1053,20 +1045,13 @@ async fn setup_tombstone_cancels_matching_preview_but_preserves_other_pin_attemp
     let b = Running::new().await?;
     let c = Running::new().await?;
     pair(&a.core, &b.core, true).await?;
-    until(|| {
-        b.core.store.setup_state().setup_id.is_some()
-            && b.core.store.setup_state().setup_id == a.core.store.setup_state().setup_id
-            && b.core
-                .connected_devices()
-                .contains(&a.core.identity.device_id)
-    })
-    .await?;
     let uri = c
         .core
         .start_pairing_with_addresses(vec![format!("127.0.0.1:{}", c.core.bound_port())])
         .await?;
     let preview = b.core.join(&uri.build()?).await?;
     let attempt = preview["attempt"].as_str().unwrap();
+    synchronized_setup(&a.core, &b.core).await?;
     let mut captured = b.core.store.with_current_pairing();
     captured.connection_id = Some(
         b.core
@@ -1075,7 +1060,7 @@ async fn setup_tombstone_cancels_matching_preview_but_preserves_other_pin_attemp
             .unwrap()
             .sessions
             .get(&a.core.identity.device_id)
-            .unwrap()
+            .context("synchronized setup session")?
             .id,
     );
     captured.setup_generation = Some(b.core.store.setup_state().generation);
@@ -1134,14 +1119,12 @@ async fn setup_own_tombstone_flushes_durable_ack_before_closing_transport() -> R
     let mut a = Running::new().await?;
     let b = Running::new().await?;
     pair(&a.core, &b.core, true).await?;
-    until(|| {
-        a.core.store.setup_state().setup_id.is_some()
-            && a.core.store.setup_state().setup_id == b.core.store.setup_state().setup_id
-    })
-    .await?;
+    synchronized_setup(&a.core, &b.core).await?;
     a.core.request_shutdown();
     a.server.take().unwrap().await??;
-    until(|| b.core.connected_devices().is_empty()).await?;
+    // A closing session is already absent from connected_devices(), but can
+    // still win simultaneous-dial ranking against the test-owned raw stream.
+    until(|| b.core.sessions.lock().unwrap().sessions.is_empty()).await?;
     let config = crate::tls::client_config(&a.core.identity, b.core.identity.fingerprint.clone())?;
     let tcp = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", b.core.bound_port())).await?;
     let mut tls = tokio_rustls::TlsConnector::from(Arc::new(config))
@@ -1327,22 +1310,24 @@ async fn setup_advisory_remove_bindingless_member_fences_absence_and_cancels_pre
     let b = Running::new().await?;
     let c = Running::new().await?;
     pair(&a.core, &b.core, true).await?;
-    until(|| {
-        b.core.store.setup_state().setup_id.is_some()
-            && b.core
-                .connected_devices()
-                .contains(&a.core.identity.device_id)
-    })
-    .await?;
     let uri = c
         .core
         .start_pairing_with_addresses(vec![format!("127.0.0.1:{}", c.core.bound_port())])
         .await?;
     let preview = b.core.join(&uri.build()?).await?;
     let attempt = preview["attempt"].as_str().unwrap();
+    synchronized_setup(&a.core, &b.core).await?;
     let mut captured = b.core.store.with_current_pairing();
-    captured.connection_id =
-        Some(b.core.sessions.lock().unwrap().sessions[&a.core.identity.device_id].id);
+    captured.connection_id = Some(
+        b.core
+            .sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .get(&a.core.identity.device_id)
+            .context("synchronized setup session")?
+            .id,
+    );
     captured.setup_generation = Some(b.core.store.setup_state().generation);
     let hello = a.core.computer_hello();
     let fence = b.core.setup_fence(&captured, &hello)?;
@@ -1512,6 +1497,7 @@ async fn setup_known_peer_consumes_only_matching_invitation_and_preserves_bindin
     let a = Running::new().await?;
     let b = Running::new().await?;
     pair(&a.core, &b.core, false).await?;
+    until(|| synchronized_link(&a.core, &b.core)).await?;
     let device = b.core.identity.device_id.clone();
     let generation = a.core.store.pairing_generation(&device);
     let uri = a
@@ -1555,7 +1541,7 @@ async fn setup_known_peer_consumes_only_matching_invitation_and_preserves_bindin
     let hello = b.core.computer_hello();
     // Stop its automatic dials so they cannot replace this test-owned stream.
     b.stop().await?;
-    until(|| a.core.connected_devices().is_empty()).await?;
+    until(|| a.core.sessions.lock().unwrap().sessions.is_empty()).await?;
     let tcp = TcpStream::connect(("127.0.0.1", a.core.bound_port())).await?;
     let mut tls: TlsStream<TcpStream> = tokio_rustls::TlsConnector::from(Arc::new(config))
         .connect(rustls::pki_types::ServerName::try_from("pneu.local")?, tcp)
@@ -1780,14 +1766,7 @@ async fn setup_live_rename_reaches_direct_peer_without_reconnect() -> Result<()>
     let a = Running::new().await?;
     let b = Running::new().await?;
     pair(&a.core, &b.core, true).await?;
-    until(|| {
-        a.core.store.setup_state().setup_id.is_some()
-            && a.core.store.setup_state().setup_id == b.core.store.setup_state().setup_id
-            && a.core
-                .connected_devices()
-                .contains(&b.core.identity.device_id)
-    })
-    .await?;
+    synchronized_setup(&a.core, &b.core).await?;
     let generation = a.core.store.pairing_generation(&b.core.identity.device_id);
     b.core.rename("Office-PC 2".into()).await?;
     until(|| {
