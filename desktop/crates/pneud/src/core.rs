@@ -2286,6 +2286,13 @@ impl Core {
             id: Id::new(crate::random_hex(16)).expect("random id"),
             offer: offer.clone(),
             origin,
+            kind: if owned {
+                clipboard_actor::ObservationKind::Marker
+            } else if initial {
+                clipboard_actor::ObservationKind::Initial
+            } else {
+                clipboard_actor::ObservationKind::Local
+            },
             clear,
         });
         (offer, token)

@@ -436,8 +436,10 @@ impl PcActions for DesktopActions {
         ticket: u128,
         sensitive: bool,
     ) -> Result<PreparedClipboard> {
+        let count = crate::ui::clipboard::observed_count();
         crate::work::blocking(self.jobs.clone(), move || {
-            let native = Offer::prepare_sensitive(&input, ticket, sensitive)?;
+            let mut native = Offer::prepare_sensitive(&input, ticket, sensitive)?;
+            native.guard_count(count);
             Ok(PreparedClipboard {
                 hashes: native.hashes(),
                 marker_confirmation: true,

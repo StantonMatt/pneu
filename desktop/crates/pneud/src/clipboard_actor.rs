@@ -91,6 +91,12 @@ pub(super) enum Failure {
     TooLarge,
     Cancelled,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ObservationKind {
+    Initial,
+    Local,
+    Marker,
+}
 #[derive(Clone, Debug)]
 pub(super) enum Event {
     Mode(ClipboardMode),
@@ -113,6 +119,7 @@ pub(super) enum Event {
         id: Id,
         offer: Option<ClipboardOffer>,
         origin: bool,
+        kind: ObservationKind,
         clear: bool,
         history: Option<Arc<HistoryCapture>>,
     },
@@ -216,6 +223,9 @@ pub(super) enum Effect {
 }
 #[derive(Clone, Debug)]
 struct Observation {
+    // Superseded reads may finish history capture, but cannot order or install.
+    superseded: bool,
+    kind: ObservationKind,
     history: Option<Arc<HistoryCapture>>,
     oversized: Option<[u8; 32]>,
     token: Token,
@@ -705,6 +715,9 @@ impl State {
         }
         self.queue = kept;
     }
+    fn held_selection(&self) -> bool {
+        self.held_observations.iter().any(|o| !o.superseded)
+    }
     fn read_slot(&mut self, token: Token) -> Option<&mut Observation> {
         if self.observation.as_ref().is_some_and(|o| o.token == token) {
             return self.observation.as_mut();
@@ -744,6 +757,15 @@ impl State {
                 });
             }
         }
+        if observation.superseded {
+            effects.push(Effect::Reply {
+                token,
+                applied: false,
+                deduplicated: false,
+                failure: Some(Failure::Cancelled),
+            });
+            return;
+        }
         let (original, fingerprints) = observation.read.unwrap();
         let mut fingerprints = self.fingerprint_key.hashes(&fingerprints);
         if fingerprints.is_empty()
@@ -753,10 +775,15 @@ impl State {
         }
         let content = self.local_formats(original.clone());
         self.observe_physical(&fingerprints);
-        if content.is_none()
+        let echo = content.is_none()
             && !fingerprints.is_empty()
-            && fingerprints.iter().all(|hash| self.known_hash(hash))
-        {
+            && fingerprints.iter().all(|hash| self.known_hash(hash));
+        // Hashes identify received representations, not human intent. An
+        // unmarked re-copy of received bytes is also a fresh selection: fence
+        // older remote operations, but never forward those bytes automatically.
+        // Only a native marker can prove an echo. A newer unmarked copy must
+        // supersede an older human read even when its bytes were received.
+        if echo && (observation.kind != ObservationKind::Local || token != self.os_token) {
             if self
                 .current
                 .as_ref()
@@ -798,8 +825,12 @@ impl State {
             self.os_current = fingerprints
                 .iter()
                 .any(|hash| self.current_hashes.contains(hash));
-            if !self.os_current
+            // Only a native Pneu marker proves a stale installation, rather
+            // than an unmarked human re-copy of the same received bytes.
+            if observation.kind == ObservationKind::Marker
+                && !self.os_current
                 && let Some(mut current) = self.current.clone()
+                && current.key == self.register
                 && current.payload.is_some()
             {
                 self.next_repair += 1;
@@ -818,11 +849,11 @@ impl State {
             });
             return;
         }
-        // A genuinely newer local selection cancels older reads and pending
-        // originations. An echo never cancels them, including after our marker.
+        // A fresh unmarked selection supersedes older reads and originations.
+        // Only proven marker echoes took the suppression path above.
         let mut kept = VecDeque::new();
         for old in self.held_observations.drain(..) {
-            if old.token < token {
+            if old.token < token && !old.superseded {
                 effects.push(Effect::CancelRead(old.token));
             } else {
                 kept.push_back(old);
@@ -831,7 +862,7 @@ impl State {
         self.held_observations = kept;
         self.cancel_local_before(token, effects);
         self.invalidate_publications(effects);
-        let hashes = content.as_ref().map(|c| self.hashes(c)).unwrap_or_default();
+        let hashes = fingerprints;
         let operation = Operation {
             sensitive: false,
             history: None,
@@ -846,10 +877,10 @@ impl State {
             key: None,
             created_at: 0,
             hashes,
-            restore: content.is_some() && (observation.restore || token != self.os_token),
+            restore: original.is_some() && (observation.restore || token != self.os_token),
             content,
             payload: original.map(Payload::Content).map(Arc::new),
-            offer: if self.mode == ClipboardMode::Automatic {
+            offer: if !echo && self.mode == ClipboardMode::Automatic {
                 observation.offer.filter(|o| !o.recipients.is_empty())
             } else {
                 None
@@ -871,7 +902,7 @@ impl State {
                     && *physical == self.os_token
                     && self.os_current
                     && self.observation.is_none()
-                    && self.held_observations.is_empty()
+                    && !self.held_selection()
                     && (key == &self.register
                         || (operation.key.is_some() && operation.key == self.register))
                     && operation
@@ -908,7 +939,7 @@ impl State {
     fn pump(&mut self, effects: &mut Vec<Effect>) {
         if self.shutdown
             || self.observation.is_some()
-            || !self.held_observations.is_empty()
+            || self.held_selection()
             || self.clocking.is_some()
             || self.stopping.is_some()
         {
@@ -948,7 +979,7 @@ impl State {
                     .observation
                     .is_some_and(|token| token != self.os_token)
             {
-                operation.restore = operation.content.is_some();
+                operation.restore = operation.payload.is_some();
             }
             // A repair reasserts the register winner, rather than admitting a
             // new remote operation. Its own legacy timestamp must remain valid.
@@ -1178,7 +1209,7 @@ impl State {
                     && payload.is_none()
                     && self.mode == ClipboardMode::Manual
                     && self.observation.is_none()
-                    && self.held_observations.is_empty()
+                    && !self.held_selection()
                     && !self.shutdown
                     && offer.recipients.iter().any(|r| r.image)
                 {
@@ -1194,7 +1225,7 @@ impl State {
                     || self.mode != ClipboardMode::Manual
                     || !self.os_current
                     || self.observation.is_some()
-                    || !self.held_observations.is_empty()
+                    || self.held_selection()
                     || offer.recipients.is_empty()
                     || payload.is_none()
                     || self.current.as_ref().is_some_and(|o| o.sensitive)
@@ -1246,7 +1277,7 @@ impl State {
                         && physical == self.os_token
                         && key == self.register
                         && self.observation.is_none()
-                        && self.held_observations.is_empty()
+                        && !self.held_selection()
                         && self.os_current
                         && let Ok(content) = content
                     {
@@ -1309,6 +1340,7 @@ impl State {
                 id,
                 offer,
                 origin,
+                kind,
                 clear,
                 history,
             } => {
@@ -1328,13 +1360,19 @@ impl State {
                     // must never keep already-prepared wire content authorized.
                     self.invalidate_publications(&mut effects);
                     self.last_marker = None;
-                    if let Some(old) = self.observation.take() {
-                        if !self.history.is_empty()
-                            || self.current.as_ref().is_some_and(|o| o.restore)
+                    if let Some(mut old) = self.observation.take() {
+                        if (kind == ObservationKind::Marker
+                            && (!self.history.is_empty()
+                                || self.current.as_ref().is_some_and(|o| o.restore)))
+                            || old.history.is_some()
                         {
+                            if kind != ObservationKind::Marker {
+                                old.superseded = true;
+                                old.offer = None;
+                            }
                             // Eight outstanding offers bound descriptors/content.
-                            // Keep earlier reads across unknown offers: the new
-                            // owner may be a manager re-offering received bytes.
+                            // A proven Pneu marker must not discard a pending
+                            // human read whose bytes may need restoration.
                             if self.held_observations.len() == 7
                                 && let Some(old) = self.held_observations.pop_front()
                             {
@@ -1353,7 +1391,35 @@ impl State {
                         .as_ref()
                         .is_some_and(|i| i.phase == Phase::Authorized)
                         || !self.stopping_markers.is_empty();
+                    if kind == ObservationKind::Local {
+                        // Do not let preparation/history IO finish over a copy
+                        // while its provider read or debounce is still pending.
+                        self.stop_install(&mut effects);
+                        self.cancel_local_before(token, &mut effects);
+                        // Admission predates this physical copy. In particular,
+                        // a queued legacy receive must not get a new clock
+                        // after the local fence and then overwrite it.
+                        for operation in std::mem::take(&mut self.queue) {
+                            if operation.received {
+                                self.finish(operation, true, false, &mut effects);
+                            } else {
+                                self.queue.push_back(operation);
+                            }
+                        }
+                        self.held_observations.retain_mut(|old| {
+                            if old.history.is_some() {
+                                old.superseded = true;
+                                old.offer = None;
+                                true
+                            } else {
+                                effects.push(Effect::CancelRead(old.token));
+                                false
+                            }
+                        });
+                    }
                     self.observation = Some(Observation {
+                        superseded: false,
+                        kind,
                         history,
                         oversized: None,
                         token,
@@ -1413,7 +1479,7 @@ impl State {
                 }
                 if let Some(observation) = self.read_slot(token) {
                     observation.read = Some((content, fingerprints));
-                    if !debounce {
+                    if !debounce || observation.superseded {
                         observation.due = true;
                     }
                     self.resolve_read(token, &mut effects);
@@ -1615,7 +1681,7 @@ impl State {
                     && operation.key.is_none()
                     && self.clocking.is_none()
                     && self.observation.is_none()
-                    && self.held_observations.is_empty()
+                    && !self.held_selection()
                 {
                     effects.push(Effect::Clock {
                         token: operation.token,

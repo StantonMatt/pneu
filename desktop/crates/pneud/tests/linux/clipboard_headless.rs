@@ -241,9 +241,29 @@ fn key(db: &rusqlite::Connection) -> Result<String> {
         |r| r.get(0),
     )?)
 }
-async fn unchanged(db: &rusqlite::Connection, before: &str, b: &mut PhoneConnection) -> Result<()> {
+async fn settled_without_forwarding(
+    db: &rusqlite::Connection,
+    before: &str,
+    b: &mut PhoneConnection,
+    local_copy: bool,
+) -> Result<()> {
     delay(650).await;
-    ensure!(key(db)? == before, "manager echo changed register");
+    let after = key(db)?;
+    if local_copy {
+        let hlc = |key: &str| -> Result<u64> {
+            Ok(key
+                .split_once('/')
+                .ok_or_else(|| anyhow::anyhow!("missing clock source"))?
+                .0
+                .parse()?)
+        };
+        ensure!(
+            hlc(&after)? > hlc(before)?,
+            "local re-copy did not fence old remote operations"
+        );
+    } else {
+        ensure!(after == before, "proven marker echo changed register");
+    }
     ensure!(
         b.read(Duration::from_millis(200)).await.is_err(),
         "unexpected forwarded content"
@@ -609,8 +629,16 @@ async fn run() -> Result<()> {
         .to_owned();
     let before = key(&db)?;
     let mut owner = copy(text.text.as_bytes(), "text/plain;charset=utf-8").await?;
-    unchanged(&db, &before, &mut bc).await?;
-    println!("PASS text install + stripped-marker takeover/reoffer; no origination/forward");
+    settled_without_forwarding(&db, &before, &mut bc, true).await?;
+    ensure!(
+        offered("text/plain;charset=utf-8").await? == text.text.as_bytes(),
+        "text re-copy was overwritten"
+    );
+    ensure!(
+        owner.try_wait()?.is_none(),
+        "Pneu replaced the local text owner"
+    );
+    println!("PASS text re-copy: local fence, original owner retained, no forwarding");
     let replay = ac.send_text(text.clone()).await?;
     ensure!(replay.deduplicated, "text replay not deduplicated");
     let newer = a.text("newer-remote-winner".into(), ClipboardOrigin::Clipboard)?;
@@ -627,7 +655,7 @@ async fn run() -> Result<()> {
         .spawn()?;
     delay(100).await;
     converged(newer.text.as_bytes()).await?;
-    unchanged(&db, &before, &mut bc).await?;
+    settled_without_forwarding(&db, &before, &mut bc, false).await?;
     ensure!(
         ac.send_text(newer).await?.deduplicated,
         "restored winner replay was not deduplicated"
@@ -637,6 +665,22 @@ async fn run() -> Result<()> {
     println!(
         "PASS retired install-marker + origin reoffer restores winner; no origination/forward"
     );
+    // Re-copy older received bytes while a different remote clip is current.
+    // This is a human selection, unlike the proven marker reoffer above.
+    let before = key(&db)?;
+    let _ = owner.kill().await;
+    let _ = owner.wait().await;
+    owner = copy(text.text.as_bytes(), "text/plain;charset=utf-8").await?;
+    settled_without_forwarding(&db, &before, &mut bc, true).await?;
+    ensure!(
+        offered("text/plain;charset=utf-8").await? == text.text.as_bytes(),
+        "older received re-copy was repaired away"
+    );
+    ensure!(
+        owner.try_wait()?.is_none(),
+        "old remote repair replaced the human selection"
+    );
+    println!("PASS older received text re-copy stays put over a different remote winner");
     let before = key(&db)?;
     let meta = a
         .file_metadata(&png, FileKind::ClipboardImage, "image/png".into())
@@ -648,8 +692,16 @@ async fn run() -> Result<()> {
     let _ = owner.kill().await;
     let _ = owner.wait().await;
     owner = copy(&png_bytes, "image/png").await?;
-    unchanged(&db, &before, &mut bc).await?;
-    println!("PASS PNG install + stripped-marker takeover/reoffer; no origination/forward");
+    settled_without_forwarding(&db, &before, &mut bc, true).await?;
+    ensure!(
+        offered("image/png").await? == png_bytes,
+        "PNG re-copy was overwritten"
+    );
+    ensure!(
+        owner.try_wait()?.is_none(),
+        "Pneu replaced the local PNG owner"
+    );
+    println!("PASS PNG re-copy: local fence, original owner retained, no forwarding");
     ac.send_file(meta, &png).await?;
     // Fresh local observations must publish once after remote installs and echoes.
     let _ = owner.kill().await;

@@ -135,6 +135,7 @@ fn watcher_flood_has_bounded_admission() {
     let (handle, rx) = Handle::channel();
     for token in 1..=100_000 {
         handle.event(Event::Observe {
+            kind: ObservationKind::Local,
             history: None,
             token,
             id: Id::from_bytes([1; 16]),
@@ -151,6 +152,7 @@ async fn watcher_coalescing_cancels_reads_and_preserves_marker_and_completion_or
     let (handle, mut rx) = Handle::channel();
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     handle.event(Event::Observe {
+        kind: ObservationKind::Local,
         history: None,
         token: 1,
         id: Id::from_bytes([1; 16]),
@@ -170,6 +172,7 @@ async fn watcher_coalescing_cancels_reads_and_preserves_marker_and_completion_or
     handle.event(Event::Stopped(42));
     for token in 2..=100_000 {
         handle.event(Event::Observe {
+            kind: ObservationKind::Local,
             history: None,
             token,
             id: Id::from_bytes([1; 16]),
@@ -232,6 +235,7 @@ async fn queued_request_during_persistent_clock_failure_times_out_and_shutdown_d
         .fail_next("local_observation_checked", usize::MAX);
     let observation = handle.token();
     handle.event(Event::Observe {
+        kind: ObservationKind::Local,
         history: None,
         token: observation,
         id: Id::from_bytes([12; 16]),
@@ -405,7 +409,7 @@ async fn retired_marker_scenario(legacy: bool) -> Result<()> {
         "retired ticket consumed the clipboard observation"
     );
     *actions.clipboard.lock().unwrap() = "old remote".into();
-    let (_, token) = core.observe_watched_clipboard(false);
+    let (_, token) = core.observe_watched_clipboard_metadata(false, false, false, true);
     core.clipboard_observed(token, Some(Content::Text("old remote".into())), false);
     tokio::time::timeout(Duration::from_secs(3), core.clipboard_test_idle()).await?;
     assert_eq!(&*actions.clipboard.lock().unwrap(), "winner");
@@ -550,6 +554,12 @@ async fn observe_payload(core: &Arc<Core>, content: Content) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(3), core.clipboard_test_idle()).await?;
     Ok(())
 }
+async fn observe_marked_payload(core: &Arc<Core>, content: Content) -> Result<()> {
+    let (_, token) = core.observe_watched_clipboard_metadata(false, false, false, true);
+    core.clipboard_observed(token, Some(content), false);
+    tokio::time::timeout(Duration::from_secs(3), core.clipboard_test_idle()).await?;
+    Ok(())
+}
 #[tokio::test]
 async fn repair_uses_local_winner_after_no_write_dedup_for_text_image_and_mixed() -> Result<()> {
     for older in payload_formats("older") {
@@ -578,7 +588,7 @@ async fn repair_uses_local_winner_after_no_write_dedup_for_text_image_and_mixed(
                     assert_eq!(actions.installed.lock().unwrap().len(), 1);
                 }
                 let register = core.store.clipboard_snapshot().await?.0;
-                observe_payload(&core, older.clone()).await?;
+                observe_marked_payload(&core, older.clone()).await?;
                 assert_eq!(
                     *actions.installed.lock().unwrap(),
                     vec![older.clone(), winner.clone()]
@@ -611,7 +621,7 @@ async fn repair_declines_a_changed_file_backing_the_register_winner() -> Result<
             std::fs::write(path, b"changed image")?;
         }
     }
-    observe_payload(&core, older.clone()).await?;
+    observe_marked_payload(&core, older.clone()).await?;
     assert_eq!(*actions.installed.lock().unwrap(), vec![older, winner]);
     assert_eq!(actions.prepared.lock().unwrap().len(), 3);
     assert_eq!(core.store.clipboard_snapshot().await?.0, register);
@@ -783,6 +793,7 @@ async fn watcher_clock_and_all_sixteen_real_claims_complete_before_request_deadl
         let token = handle.token();
         let observed = handle.waiter(token);
         handle.event(Event::Observe {
+            kind: ObservationKind::Local,
             history: None,
             token,
             id: Id::from_bytes([1; 16]),
@@ -851,6 +862,7 @@ async fn transient_watcher_clock_failure_recovers_without_another_observation() 
     let token = handle.token();
     let observed = handle.waiter(token);
     handle.event(Event::Observe {
+        kind: ObservationKind::Local,
         history: None,
         token,
         id: Id::from_bytes([1; 16]),
@@ -910,6 +922,7 @@ async fn lost_read_completion_expires_and_releases_the_actor_without_user_activi
     let observed = handle.waiter(token);
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     handle.event(Event::Observe {
+        kind: ObservationKind::Local,
         history: None,
         token,
         id: Id::from_bytes([1; 16]),
