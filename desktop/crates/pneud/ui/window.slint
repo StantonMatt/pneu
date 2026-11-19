@@ -1,18 +1,17 @@
 // The Pneu window: main page, device pages, Add Device, Pairing Code and
 // Settings, with in-window popups. Rust drives everything through `Ui`.
-import { Palette } from "std-widgets.slint";
 import { Pneu, Tone, Icons, WindowFocus } from "theme.slint";
 import {
     PneuButton, ButtonKind, IconButton, Card, Row, Divider, SectionLabel, Tile, GhostTile,
     PneuSpinner, ProgressBar, SwitchRow, Segmented, Segment, Checkbox, Header, NavRow, QrCard,
-    TextField, Interaction
+    TextField, Interaction, DownloadQrCard
 } from "components.slint";
 import { Link, LinkState, LinkTile, Tube } from "link.slint";
 
 export { WindowFocus, Tone, Tube, LinkState, LinkTile }
 
-export enum Page { main, device, add, code, settings, scan }
-export enum Dialog { none, unpair, rename, picker, message, details }
+export enum Page { main, device, add, code, settings, scan, history }
+export enum Dialog { none, unpair, remove, rename, picker, message, details, help, history-clear, history-off }
 export enum CodeState { showing, expired, offline, pairing, paired }
 export enum ScanState { requesting, scanning, denied, unavailable, failed }
 
@@ -26,8 +25,16 @@ export struct DeviceItem {
     // Below zero when nothing is moving.
     progress: float,
     connected: bool,
+    battery: int,
+    charging: bool,
+    ring-supported: bool,
+    ringing: bool,
+    ring-connection: string,
 }
 
+export struct HistoryItem {
+    id: string, title: string, detail: string, url: bool, picture: bool, thumbnail: image, pinned: bool, search: string,
+}
 export struct RecentItem {
     id: string,
     batch: bool,
@@ -35,6 +42,7 @@ export struct RecentItem {
     detail: string,
     detail-tone: Tone,
     picture: bool,
+    folder: bool,
     video: bool,
     clipboard: bool,
     progress: float,
@@ -50,7 +58,7 @@ export struct RecipientItem {
     detail: string, progress: float, can-stop: bool, can-retry: bool,
 }
 
-export struct SettingItem { key: string, label: string, sub: string, on: bool }
+export struct SettingItem { key: string, label: string, sub: string, on: bool, enabled: bool }
 
 export struct PickItem {
     id: string,
@@ -68,7 +76,15 @@ export struct Message { title: string, text: string, tile: int, primary: string,
 
 export struct Summary { title: string, detail: string, link: LinkState }
 
-export struct DropItem { name: string, enabled: bool }
+// Pair once, join your devices (window_setup.rs). The screens say "your
+// devices" and "linked", never "setup".
+export enum TopKind { none, offer, waiting, request, readmit, diagnostic }
+export struct TopCard { kind: TopKind, title: string, phone: bool, error: string, key: string }
+export enum LinkRow { none, link, waiting, theirs, asked, update, separate }
+// The device page's last card: the row above Unpair or Remove from all devices.
+export struct DeviceLink { row: LinkRow, title: string, sub: string, via: string, member: bool, waiting: int }
+
+export struct DropItem { name: string, enabled: bool, sub: string }
 export struct DropGeometry { x: float, y: float, width: float, height: float, scroll: float }
 
 export global Ui {
@@ -102,6 +118,8 @@ export global Ui {
     in property <[DeviceItem]> devices;
     in property <[RecentItem]> recent;
     in property <bool> manual-clipboard;
+    in property <bool> pair-again;
+    callback pair-again-started(string);
     in property <bool> motion: true;
 
     in property <DeviceItem> device;
@@ -109,13 +127,24 @@ export global Ui {
     in property <string> device-action;
     in property <[SettingItem]> device-settings;
     in property <string> device-note;
+    in property <DeviceLink> device-link;
+    in property <TopCard> top;
 
     in property <bool> first-run;
     in property <image> qr;
+    // The Phone tab can swap its pairing code for the download page's code.
+    in-out property <bool> download;
+    in property <image> download-qr;
     in property <bool> network: true;
     in property <string> pairing;
     in property <string> paired;
+    in property <string> replacement-intent;
     in property <string> offer;
+    // Also link with your other devices, on every pairing confirmation.
+    in-out property <bool> link-on: true;
+    in property <bool> link-full;
+    in property <string> paired-detail;
+    in property <bool> paired-only;
 
     in property <image> code-qr;
     in property <CodeState> code-state;
@@ -125,6 +154,25 @@ export global Ui {
 
     in property <int> clipboard-mode;
     in property <bool> include-images;
+    in property <bool> keep-history;
+    in property <[HistoryItem]> history;
+    in property <int> history-pins;
+    in-out property <string> history-query;
+    in-out property <int> history-focus;
+    changed page => { history-query = ""; }
+    pure callback filter-history([HistoryItem], string, bool) -> [HistoryItem];
+    pure callback history-searching(string) -> bool;
+    out property <bool> searching: Ui.history-searching(Ui.history-query);
+    out property <[HistoryItem]> pinned-history: Ui.filter-history(Ui.history, Ui.history-query, true);
+    out property <[HistoryItem]> recent-history: Ui.filter-history(Ui.history, Ui.history-query, false);
+    callback pin-history(string, bool);
+    pure callback elide-history-title(string, length, length) -> string;
+    in-out property <string> history-copied;
+    callback copy-history(string);
+    callback delete-history(string);
+    callback clear-history();
+    callback disable-empty-history();
+    in-out property <int> history-off-count;
     in property <bool> choose-each-time;
     in property <bool> queue-offline;
     in property <bool> save-to-folder;
@@ -136,6 +184,9 @@ export global Ui {
 
     in-out property <string> unpair-id;
     in-out property <string> unpair-name;
+    in-out property <string> remove-id;
+    in-out property <string> remove-name;
+    in-out property <int> remove-waiting;
     in-out property <string> rename-text;
     in property <string> picker-title;
     in-out property <[PickItem]> picks;
@@ -143,11 +194,19 @@ export global Ui {
     in property <Message> message;
     in property <string> details-title;
     in property <[RecipientItem]> recipients;
+    // No paired device can be reached: the main page offers Can't connect?
+    in property <bool> unreachable;
+    // Tailscale runs on this computer, so the popup doesn't offer it.
+    in property <bool> tailscale;
 
     callback navigated();
     callback close();
     // "" sends to every connected device (or asks, with Choose devices each time).
     callback send-files(string);
+    callback ring-phone(string, string, bool);
+    callback send-folder(string);
+    in property <string> folder-reason;
+    in property <string> device-folder-reason;
     callback send-clipboard();
     callback cancel-item(string);
     callback retry-item(string);
@@ -159,6 +218,7 @@ export global Ui {
     callback set-peer(string, bool);
     callback unpair(string);
     callback choose-folder();
+    callback open-folder();
     callback set-mode(int);
     callback set-flag(string, bool);
     callback rename(string);
@@ -168,11 +228,22 @@ export global Ui {
     callback scanned-link(string);
     // Add Device reads the clipboard once for a link from another computer.
     callback probed(string);
-    callback offer-pair();
+    callback offer-pair(bool);
+    // A pairing confirmation's Pair, with its switch.
+    callback confirm-join(bool);
+    // The top card: Link or Allow (true), Don't Allow (false), and ✕.
+    callback top-action(bool);
+    callback top-close();
+    callback link-device(string);
+    callback answer(string, bool);
+    // Remove from all devices: shown, then confirmed.
+    callback removing(string);
+    callback remove(string);
     callback offer-dismiss();
     callback message-action(string, bool);
     callback picker-send();
     callback picker-cancel();
+    callback get-tailscale();
 }
 
 component Banner inherits Rectangle {
@@ -188,22 +259,56 @@ component Banner inherits Rectangle {
     }
 }
 
+component Battery inherits HorizontalLayout {
+    in property <int> level: -1;
+    in property <bool> charging;
+    property <color> ink: level <= 15 && !charging ? Pneu.danger : Pneu.text2;
+    spacing: 6px; alignment: center; horizontal-stretch: 0;
+    accessible-role: text;
+    accessible-label: level + "%" + (charging ? ", charging" : "");
+    VerticalLayout {
+        alignment: center;
+        Rectangle {
+            width: 20px; height: 10px;
+            Rectangle { x: 0px; width: 18px; height: 10px; border-radius: 3px; border-width: 1.3px; border-color: root.ink;
+                Rectangle { x: 2px; y: 2px; height: 6px; width: 14px * max(0.07, root.level / 100); border-radius: 1px; background: root.charging ? Pneu.accent : root.ink; }
+            }
+            Rectangle { x: 19px; y: 3px; width: 2px; height: 4px; border-top-right-radius: 1px; border-bottom-right-radius: 1px; background: root.ink; }
+        }
+    }
+    if charging: VerticalLayout { alignment: center; Rectangle { width: 7px; height: 12px; Image { x: -2px; width: 12px; height: 12px; source: Icons.bolt; colorize: Pneu.accent; } } }
+    Text { text: root.level + "%"; font-size: Pneu.label-size; color: root.ink; vertical-alignment: center; }
+}
+
 component LinkCard inherits Card {
     in property <Summary> summary;
+    in property <int> battery: -1;
+    in property <bool> charging;
+    in property <bool> ringing;
     in property <bool> motion;
     in property <length> text-line;
     in property <length> title-line;
+    in property <bool> wrap-text: false;
     VerticalLayout {
         padding-top: 16px; padding-bottom: 14px; padding-left: 14px; padding-right: 14px; spacing: 0px;
         Link { state: root.summary.link; motion: root.motion; }
         Rectangle { height: 12px; }
         Text {
             text: root.summary.title; font-size: Pneu.title-size; font-weight: 700; color: Pneu.text;
-            overflow: elide; max-height: root.title-line; horizontal-alignment: center;
+            wrap: root.wrap-text ? word-wrap : no-wrap;
+            overflow: elide; max-height: root.wrap-text ? self.preferred-height : root.title-line; horizontal-alignment: center;
         }
-        if root.summary.detail != "": Text {
+        if root.battery < 0 && !root.ringing && root.summary.detail != "": Text {
             text: root.summary.detail; color: Pneu.text2;
-            overflow: elide; max-height: root.text-line; horizontal-alignment: center;
+            wrap: root.wrap-text ? word-wrap : no-wrap;
+            overflow: elide; max-height: root.wrap-text ? self.preferred-height : root.text-line; horizontal-alignment: center;
+        }
+        if root.ringing: Text { text: "Ringing…"; color: Pneu.accent-text; font-weight: 600; horizontal-alignment: center; }
+        if root.battery >= 0 && !root.ringing: HorizontalLayout {
+            alignment: center; spacing: 6px; height: root.text-line;
+            if root.summary.detail != "": Text { text: root.summary.detail; color: Pneu.text2; }
+            if root.summary.detail != "": Text { text: "·"; color: Pneu.text2; }
+            Battery { level: root.battery; charging: root.charging; }
         }
         @children
     }
@@ -211,7 +316,7 @@ component LinkCard inherits Card {
 
 component DeviceRow inherits NavRow {
     in property <DeviceItem> item;
-    accessible-label: item.name + ", " + item.status;
+    accessible-label: item.name + ", " + item.status + (item.battery >= 0 ? ", Battery " + item.battery + "%" + (item.charging ? ", charging" : "") : "");
     min-height: 56px;
     HorizontalLayout {
         padding-top: 10px; padding-bottom: 10px; padding-left: 12px; padding-right: 12px; spacing: 12px;
@@ -229,6 +334,7 @@ component DeviceRow inherits NavRow {
                 ProgressBar { value: root.item.progress; }
             }
         }
+        if root.item.battery >= 0: Battery { level: root.item.battery; charging: root.item.charging; }
         VerticalLayout {
             alignment: center;
             Image { accessible-role: none; width: 16px; height: 16px; source: Icons.chevron-right; colorize: Pneu.text2; }
@@ -252,7 +358,7 @@ component RecentRow inherits NavRow {
                 width: 36px; height: 36px; border-radius: 8px; background: Pneu.button;
                 Image { accessible-role: none;
                     x: 9px; y: 9px; width: 18px; height: 18px; colorize: Pneu.text2;
-                    source: root.item.clipboard ? Icons.paste : root.item.picture ? Icons.picture : root.item.video ? Icons.video : Icons.file;
+                    source: root.item.folder ? Icons.folder : root.item.clipboard ? Icons.paste : root.item.picture ? Icons.picture : root.item.video ? Icons.video : Icons.file;
                 }
             }
         }
@@ -261,7 +367,7 @@ component RecentRow inherits NavRow {
             Text { text: root.item.title; color: Pneu.text; overflow: elide; }
             Text {
                 text: root.item.detail; font-size: Pneu.label-size; overflow: elide;
-                color: root.item.detail-tone == Tone.danger ? Pneu.danger : root.item.detail-tone == Tone.accent ? Pneu.accent-text : Pneu.text2;
+                color: root.item.detail-tone == Tone.danger ? Pneu.danger : root.item.detail-tone == Tone.accent ? Pneu.accent-text : root.item.detail-tone == Tone.warn ? Pneu.warn : Pneu.text2;
             }
             if root.item.progress >= 0: VerticalLayout {
                 padding-top: 5px;
@@ -283,9 +389,80 @@ component RecentRow inherits NavRow {
     }
 }
 
+component HistoryRow inherits NavRow {
+    in property <HistoryItem> item;
+    in property <length> line-height;
+    callback copy();
+    callback remove();
+    callback pin();
+    min-height: 56px;
+    accessible-label: item.title + ", " + item.detail;
+    delete-enabled: true;
+    clicked => {root.copy();}
+    deleted => {root.remove();}
+    HorizontalLayout {
+        padding-top: 10px; padding-bottom: 10px; padding-left: 12px; padding-right: 12px; spacing: 12px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 36px; height: 36px; border-radius: 8px; background: Pneu.button; clip: true;
+                if root.item.thumbnail.width > 0: Image { accessible-role: none; width: 36px; height: 36px; source: root.item.thumbnail; image-fit: cover; }
+                if root.item.thumbnail.width == 0: Image {
+                    accessible-role: none; x: 9px; y: 9px; width: 18px; height: 18px; colorize: Pneu.text2;
+                    source: root.item.picture ? Icons.picture : root.item.url ? Icons.link : Icons.paste;
+                }
+            }
+        }
+        VerticalLayout {
+            alignment: center; spacing: 0px; horizontal-stretch: 1;
+            // Keep horizontal layout independent of the fitted text, whose
+            // measurement depends on the width assigned by that layout.
+            Rectangle {
+                min-width: 0px; preferred-width: 0px;
+                height: min(title.preferred-height, root.line-height * 2);
+                title := Text {
+                    x: 0px; y: 0px; width: parent.width; height: parent.height;
+                    text: root.item.url || root.item.picture ? root.item.title
+                        : Ui.elide-history-title(root.item.title, self.width, root.line-height * 2);
+                    color: Pneu.text; overflow: elide;
+                    wrap: root.item.url || root.item.picture ? no-wrap : word-wrap;
+                }
+            }
+            HorizontalLayout {
+                spacing: 4px;
+                if Ui.history-copied == root.item.id: VerticalLayout {alignment: center; Image {accessible-role: none; width: 14px; height: 14px; source: Icons.check; colorize: Pneu.accent-text;} }
+                Text {text: Ui.history-copied == root.item.id ? "Copied" : root.item.detail; font-size: Pneu.label-size; overflow: elide; color: Ui.history-copied == root.item.id ? Pneu.accent-text : Pneu.text2; horizontal-stretch: 1;}
+            }
+        }
+        HorizontalLayout {
+            spacing: 2px;
+            VerticalLayout {alignment: center; IconButton {icon: root.item.pinned ? Icons.pin-filled : Icons.pin; tint: root.item.pinned ? Pneu.accent-text : Pneu.text2; label: root.item.pinned ? "Unpin" : "Pin"; clicked => {root.pin();}} }
+            VerticalLayout {alignment: center; IconButton {icon: Icons.close; label: "Delete"; clicked => {root.remove();}} }
+        }
+    }
+}
+
+component HistoryCard inherits Card {
+    in property <[HistoryItem]> items;
+    in property <length> line-height;
+    VerticalLayout {
+        spacing: 0px;
+        for item[i] in root.items: VerticalLayout {
+            spacing: 0px;
+            if i > 0: Divider {}
+            HistoryRow {item: item; line-height: root.line-height; copy => {Ui.copy-history(item.id);} remove => {Ui.delete-history(item.id);} pin => {Ui.pin-history(item.id, !item.pinned);} }
+        }
+    }
+}
+
 component Done inherits VerticalLayout {
     in property <string> name;
+    in property <length> reserved-bottom;
+    // "Also linked: …", or why it was paired with that device only.
+    in property <string> detail;
+    in property <bool> only;
     alignment: center; spacing: 14px;
+    padding-bottom: root.reserved-bottom;
     HorizontalLayout {
         alignment: center;
         Rectangle {
@@ -293,9 +470,13 @@ component Done inherits VerticalLayout {
             Image { accessible-role: none; x: 12px; y: 12px; width: 32px; height: 32px; source: Icons.check; colorize: white; }
         }
     }
-    Text {
-        text: "Paired with " + root.name; font-weight: 600; color: Pneu.text;
-        horizontal-alignment: center; overflow: elide;
+    VerticalLayout {
+        spacing: 2px;
+        Text {
+            text: "Paired with " + root.name + (root.only ? " only" : ""); font-weight: 600; color: Pneu.text;
+            horizontal-alignment: center; overflow: elide;
+        }
+        if root.detail != "": Text { text: root.detail; color: Pneu.text2; horizontal-alignment: center; wrap: word-wrap; }
     }
 }
 
@@ -315,19 +496,127 @@ component Notice inherits VerticalLayout {
     Text { text: root.text; color: Pneu.text; horizontal-alignment: center; wrap: word-wrap; }
 }
 
+// Also link with your other devices: off and disabled at the limit.
+component LinkSwitch inherits Rectangle {
+    in property <bool> dialog-control;
+    background: Pneu.button; border-radius: 10px;
+    SwitchRow {
+        dialog-control: root.dialog-control;
+        label: "Also link with your other devices";
+        sub: Ui.link-full ? "Your devices are at the limit of 17" : "";
+        checked: Ui.link-on && !Ui.link-full; enabled: !Ui.link-full;
+        toggled(on) => { Ui.link-on = on; }
+    }
+}
+
+// The main page's top card: the one-time offer, what's left after Link, or a request.
+component LinkCardTop inherits Card {
+    in property <TopCard> card;
+    callback act(bool);
+    callback close();
+    border-width: 1.5px; border-color: Pneu.accent;
+    HorizontalLayout {
+        padding-top: 12px; padding-bottom: 12px; padding-left: 12px; padding-right: 8px; spacing: 12px;
+        VerticalLayout {
+            alignment: start;
+            Tile {
+                icon: root.card.kind == TopKind.request ? (root.card.phone ? Icons.smartphone : Icons.computer) : Icons.link;
+                tone: root.card.kind == TopKind.waiting ? Tone.neutral : Tone.accent;
+            }
+        }
+        VerticalLayout {
+            alignment: start; horizontal-stretch: 1; spacing: 1px;
+            Text { text: root.card.title; font-weight: 600; color: Pneu.text; wrap: word-wrap; }
+            if root.card.error != "": Text { text: root.card.error; font-size: Pneu.label-size; color: Pneu.danger; wrap: word-wrap; }
+            if root.card.kind != TopKind.readmit && root.card.kind != TopKind.diagnostic: Text { text: "New devices then pair just once."; font-size: Pneu.label-size; color: Pneu.text2; wrap: word-wrap; }
+            if root.card.kind != TopKind.waiting && root.card.kind != TopKind.diagnostic: HorizontalLayout {
+                padding-top: 10px; spacing: 8px; alignment: end;
+                if root.card.kind == TopKind.request || root.card.kind == TopKind.readmit: PneuButton { focus-key: root.card.key; autofocus: root.card.kind == TopKind.readmit; text: root.card.kind == TopKind.readmit ? "Keep removed" : "Don't Allow"; clicked => { root.act(false); } }
+                PneuButton {
+                    text: root.card.kind == TopKind.request || root.card.kind == TopKind.readmit ? "Allow" : "Link"; kind: ButtonKind.primary;
+                    clicked => { root.act(true); }
+                }
+            }
+        }
+        VerticalLayout {
+            alignment: start;
+            IconButton { icon: Icons.close; label: "Close"; clicked => { root.close(); } }
+        }
+    }
+}
+
+// The open popup's full height, so a short page grows to show all of it.
+global Popup { in-out property <length> needed; }
+
 component PopupCard inherits Rectangle {
     in property <length> card-width: 320px;
     in property <length> limit;
+    in property <bool> low;
+    private property <length> needed: body.preferred-height + 32px;
+    init => { Popup.needed = self.needed; }
+    changed needed => { Popup.needed = self.needed; }
     background: Pneu.dim;
     TouchArea {}
     Card {
-        x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+        x: (parent.width - self.width) / 2; y: root.low ? max(16px, parent.height - self.height - 24px) : (parent.height - self.height) / 2;
         width: min(root.card-width, root.width - 32px);
         height: max(0px, min(body.preferred-height, root.limit));
         drop-shadow-blur: 28px; drop-shadow-offset-y: 8px; drop-shadow-color: Pneu.dark ? #000000B3 : #14161A33;
         body := VerticalLayout {
             padding: 20px; spacing: 0px;
             @children
+        }
+    }
+}
+
+component HelpRow inherits HorizontalLayout {
+    in property <image> icon;
+    in property <string> title;
+    in property <string> text;
+    padding-top: 8px; padding-bottom: 8px; spacing: 12px;
+    VerticalLayout { alignment: start; Tile { size: 32px; icon-size: 18px; icon: root.icon; tone: Tone.neutral; } }
+    VerticalLayout {
+        alignment: center; horizontal-stretch: 1; spacing: 1px;
+        Text { text: root.title; font-weight: 600; color: Pneu.text; wrap: word-wrap; }
+        Text { text: root.text; font-size: Pneu.label-size; color: Pneu.text2; wrap: word-wrap; }
+    }
+}
+
+// Same file action on every platform, with separate folder selection where
+// native pickers cannot choose files and directories together.
+component SendButton inherits Rectangle {
+    in property <bool> enabled: true;
+    in property <bool> align-left;
+    in property <string> reason;
+    callback files(); callback folder();
+    horizontal-stretch: 1;
+    min-width: Ui.is-mac ? 125px : 153px;
+    min-height: 30px; max-height: 30px;
+    border-radius: 8px; background: Pneu.accent-soft.transparentize(root.enabled ? 0 : 0.6);
+    HorizontalLayout { spacing: 0;
+        PneuButton { enabled: root.enabled; text: "Send Files…"; icon: Icons.upload; kind: ButtonKind.tonal; wide: true; clicked => { root.files(); } }
+        if !Ui.is-mac: Rectangle { width: 28px;
+            Rectangle { x: 0; y: 7px; width: 1px; height: 16px; background: Pneu.on-accent-soft; opacity: 0.22; }
+            IconButton { enabled: root.enabled; icon: Icons.expand-more; icon-size: 14px; icon-color: Pneu.on-accent-soft; label: "More Send Options"; clicked => { options.show(); } }
+        }
+    }
+    options := PopupWindow {
+        x: root.align-left ? 0px : root.width - self.width; y: root.height + 4px;
+        width: root.reason == "" ? 168px : 260px; height: root.reason == "" ? 94px : 116px;
+        close-policy: close-on-click-outside;
+        Rectangle { background: Pneu.card; border-radius: 8px; border-width: 1px; border-color: Pneu.card-border;
+            FocusScope { width: parent.width; height: parent.height;
+            key-pressed(event) => { if event.text == Key.Escape { options.close(); return accept; } return reject; }
+            VerticalLayout { padding: 6px; spacing: 0;
+                PneuButton { autofocus: true; text: "Send Files…"; icon: Icons.upload; kind: ButtonKind.menu; wide: true; clicked => { options.close(); root.files(); } }
+                Rectangle { height: root.reason == "" ? 44px : 66px;
+                    VerticalLayout { alignment: center; spacing: 2px;
+                        PneuButton { enabled: root.reason == ""; text: "Send Folder…"; icon: Icons.folder; kind: ButtonKind.menu; wide: true; clicked => { options.close(); root.folder(); } }
+                        if root.reason != "": HorizontalLayout { padding-left: 36px; Text { text: root.reason; color: Pneu.text2; font-size: Pneu.label-size; overflow: elide; } }
+                    }
+                }
+            }
+            }
         }
     }
 }
@@ -339,26 +628,39 @@ export component PneuWindow inherits Window {
         width: drop-list.width / 1px, height: drop-list.height / 1px, scroll: drop-list.viewport-y / 1px
     };
     icon: @image-url("../../../assets/pneu.svg");
-    background: Palette.background;
+    background: Pneu.background;
     // Keep the last real QR size across invitation/pairing transitions.
     private property <int> last-qr-size: 292;
     changed qr => { if root.qr.width > 0 { root.last-qr-size = root.qr.width; } }
     private property <image> qr: Ui.page == Page.code ? Ui.code-qr : Ui.qr;
     private property <length> qr-card-height: last-qr-size * 1px + 28px;
     private property <length> pairing-height: qr-card-height + 12px + caption.preferred-height;
-    // Reserve the whole Phone page from the QR and measured caption, including
-    // the outer bottom padding, even while the invitation is loading.
+    // Under either code: the download code's address and Pairing Code links.
+    // Get Pneu for Android sits where Pairing Code does, so the codes swap
+    // without resizing the window or moving the link.
+    private property <length> link-height: 24px;
+    private property <length> phone-link-height: 2px + link-height + 4px + link-height;
+    // Reserve the whole Phone page from the QR, measured caption and link,
+    // including the outer bottom padding, even while the invitation is loading.
     private property <length> phone-page-height: 32px + (Ui.first-run ? 0px : 30px + 12px)
-        + 30px + 12px + pairing-height;
+        + 30px + 12px + pairing-height + phone-link-height;
     private property <length> window-width: max(400px, last-qr-size * 1px + 60px);
     private property <length> max-window-height: 720px;
-    private property <bool> copied;
+    // window.rs DOWNLOAD_PAGE
+    private property <string> download-page: "https://stantonmatt.github.io/pneu/";
+    // The text last copied, so only its button shows Copied.
+    private property <string> copied;
     private property <bool> device-ready: Ui.device.id == Ui.device-id && Ui.device-id != "" && Ui.device-revision == Ui.navigation-revision;
     private property <bool> modal-open: Ui.dialog != Dialog.none;
-    changed modal-open => { Interaction.modal-open = root.modal-open; }
+    private property <length> replacement-space: Ui.dialog == Dialog.message && Ui.message.action == "replace-device" ? Popup.needed : 0px;
+    changed modal-open => {
+        Interaction.modal-open = root.modal-open;
+        if !root.modal-open { Popup.needed = 0; }
+    }
     min-width: window-width; max-width: window-width;
     out property <length> content-height: min(max(body.preferred-height,
-        Ui.page == Page.add && Ui.add-tab == 0 ? phone-page-height : 0px), max-window-height);
+        Ui.page == Page.add && Ui.add-tab == 0 ? phone-page-height : 0px,
+        Ui.dialog != Dialog.none ? Popup.needed : 0px), max-window-height);
     min-height: content-height;
     max-height: content-height;
 
@@ -370,11 +672,20 @@ export component PneuWindow inherits Window {
 
     public function go(page: Page) {
         Ui.dialog = Dialog.none;
+        Ui.download = false;
+        Ui.history-query = "";
         Ui.page = page;
         flick.viewport-y = 0;
         Ui.navigated();
         keys.focus();
+        if page == Page.history { Ui.history-focus += 1; }
     }
+    public function history-copied(id: string) {
+        Ui.history-copied = id;
+        history-copy-timer.running = true;
+        history-copy-timer.restart();
+    }
+    history-copy-timer := Timer {interval: 2s; running: false; triggered => {Ui.history-copied = "";self.running = false;} }
     public function open-device(id: string) {
         Ui.device-id = id;
         root.go(Page.device);
@@ -387,14 +698,26 @@ export component PneuWindow inherits Window {
         root.go(Page.code);
         Ui.show-code();
     }
+    // Esc first returns from the download code to the pairing code; the
+    // header's Back leaves the page at once.
     public function back() {
+        if Ui.page == Page.add && Ui.add-tab == 0 && Ui.download { root.show-download(false); }
+        else { root.leave(); }
+    }
+    function leave() {
         if Ui.page == Page.code || Ui.page == Page.scan { root.open-add(1); }
         else if Ui.page == Page.add && Ui.first-run { root.close-window(); }
         else if Ui.page != Page.main { root.go(Page.main); }
         else { root.close-window(); }
     }
+    function show-download(on: bool) {
+        Ui.download = on;
+        keys.focus();
+    }
     function close-window() {
+        Ui.history-query = "";
         Ui.dialog = Dialog.none;
+        Ui.download = false;
         Ui.close();
     }
     public function prepare-unpair() {
@@ -408,6 +731,19 @@ export component PneuWindow inherits Window {
         Ui.unpair(Ui.unpair-id);
         keys.focus();
     }
+    public function prepare-remove() {
+        if !root.device-ready || !Ui.device-link.member { return; }
+        Ui.remove-id = Ui.device-id;
+        Ui.remove-name = Ui.device.name;
+        Ui.remove-waiting = Ui.device-link.waiting;
+        Ui.removing(Ui.device-id);
+        Ui.dialog = Dialog.remove;
+    }
+    public function submit-remove() {
+        Ui.dialog = Dialog.none;
+        Ui.remove(Ui.remove-id);
+        keys.focus();
+    }
     function dismiss() {
         if Ui.dialog == Dialog.message {
             Ui.message-action(Ui.message.action, Ui.message.secondary == "");
@@ -417,12 +753,12 @@ export component PneuWindow inherits Window {
         Ui.dialog = Dialog.none;
         keys.focus();
     }
-    function copy-link() {
-        clipboard.text = Ui.code-link;
+    function copy(text: string) {
+        clipboard.text = text;
         clipboard.select-all();
         clipboard.copy();
         clipboard.text = "";
-        root.copied = true;
+        root.copied = text;
         copied-timer.running = true;
     }
     function paste-link() {
@@ -439,7 +775,7 @@ export component PneuWindow inherits Window {
     }
     copied-timer := Timer {
         interval: 2s; running: false;
-        triggered => { root.copied = false; self.running = false; }
+        triggered => { root.copied = ""; self.running = false; }
     }
 
     forward-focus: keys;
@@ -448,6 +784,9 @@ export component PneuWindow inherits Window {
         focus-lost(reason) => { if reason == FocusReason.window-activation { WindowFocus.changed(false); } }
         focus-on-tab-navigation: false;
         key-pressed(event) => {
+            if Ui.page == Page.history && Ui.dialog == Dialog.none && (event.modifiers.control || (Ui.is-mac && event.modifiers.meta)) && event.text.to-lowercase() == "f" {
+                Ui.history-focus += 1; return accept;
+            }
             if event.text == Key.Escape {
                 if Ui.drop-active { Ui.drop-active = false; return accept; }
                 if Ui.dialog != Dialog.none { root.dismiss(); } else { root.back(); }
@@ -466,19 +805,26 @@ export component PneuWindow inherits Window {
                 // ---- Main page ----
                 if Ui.page == Page.main: VerticalLayout {
                     spacing: 12px;
+                    if Ui.top.kind != TopKind.none: LinkCardTop {
+                        card: Ui.top;
+                        act(yes) => { Ui.top-action(yes); }
+                        close => { Ui.top-close(); }
+                    }
                     LinkCard {
                         summary: Ui.summary; motion: Ui.motion;
                         text-line: text-line.preferred-height; title-line: title-line.preferred-height;
                         HorizontalLayout {
                             padding-top: 14px; spacing: 8px;
-                            PneuButton {
-                                text: "Send Files…"; icon: Icons.upload; kind: ButtonKind.tonal; wide: true;
-                                clicked => { Ui.send-files(""); }
-                            }
-                            if Ui.manual-clipboard: PneuButton {
+                            if Ui.pair-again: PneuButton { text: "Pair Again…"; icon: Icons.qr-code; kind: ButtonKind.primary; wide: true; clicked => { root.open-add(0); } }
+                            if !Ui.pair-again: SendButton { reason: Ui.folder-reason; files => { Ui.send-files(""); } folder => { Ui.send-folder(""); } }
+                            if Ui.manual-clipboard && !Ui.pair-again: PneuButton {
                                 text: "Send Clipboard"; icon: Icons.send-clipboard; kind: ButtonKind.tonal; wide: true;
                                 clicked => { Ui.send-clipboard(); }
                             }
+                        }
+                        if Ui.unreachable: HorizontalLayout {
+                            padding-top: 6px; alignment: center;
+                            PneuButton { text: "Can't connect?"; kind: ButtonKind.link; clicked => { Ui.dialog = Dialog.help; } }
                         }
                     }
                     VerticalLayout {
@@ -506,7 +852,15 @@ export component PneuWindow inherits Window {
                     }
                     if Ui.recent.length > 0: VerticalLayout {
                         spacing: 6px;
-                        SectionLabel { text: "Recent"; }
+                        HorizontalLayout {
+                            recent-label := SectionLabel { text: "Recent"; horizontal-stretch: 1; }
+                            if Ui.save-to-folder: PneuButton {
+                                text: "Open Folder"; icon: Icons.folder-open; kind: ButtonKind.link;
+                                icon-size: 15px; font-size: Pneu.label-size;
+                                min-height: recent-label.preferred-height; max-height: self.min-height;
+                                clicked => { Ui.open-folder(); }
+                            }
+                        }
                         Card {
                             VerticalLayout {
                                 for item[i] in Ui.recent: VerticalLayout {
@@ -523,6 +877,17 @@ export component PneuWindow inherits Window {
                         }
                     }
                     Card {
+                        VerticalLayout {
+                        if Ui.keep-history: NavRow {
+                            accessible-label: "Clipboard History";
+                            clicked => {root.go(Page.history);}
+                            Row {
+                                VerticalLayout {alignment: center; Image {accessible-role: none; width: 18px; height: 18px; source: Icons.paste; colorize: Pneu.text2;} }
+                                Text {text: "Clipboard History"; color: Pneu.text; vertical-alignment: center; horizontal-stretch: 1;}
+                                VerticalLayout {alignment: center; Image {accessible-role: none; width: 16px; height: 16px; source: Icons.chevron-right; colorize: Pneu.text2;} }
+                            }
+                        }
+                        if Ui.keep-history: Divider {}
                         NavRow {
                             accessible-label: "Settings";
                             clicked => { root.go(Page.settings); }
@@ -533,6 +898,7 @@ export component PneuWindow inherits Window {
                                 VerticalLayout { alignment: center; Image { accessible-role: none; width: 16px; height: 16px; source: Icons.chevron-right; colorize: Pneu.text2; } }
                             }
                         }
+                        }
                     }
                 }
 
@@ -541,17 +907,26 @@ export component PneuWindow inherits Window {
                     spacing: 12px;
                     Header { title: Ui.device.name; go-back => { root.back(); } }
                     LinkCard {
-                        summary: Ui.device-summary; motion: Ui.motion;
+                        summary: Ui.device-summary; battery: Ui.device.id != "" ? Ui.device.battery : -1; charging: Ui.device.charging; ringing: Ui.device.ringing; motion: Ui.motion; wrap-text: true;
                         text-line: text-line.preferred-height; title-line: title-line.preferred-height;
                         HorizontalLayout {
-                            padding-top: 14px;
-                            if Ui.device-action == "send": PneuButton { enabled: root.device-ready;
-                                text: "Send Files…"; icon: Icons.upload; kind: ButtonKind.tonal; wide: true;
-                                clicked => { Ui.send-files(Ui.device-id); }
+                            padding-top: 14px; spacing: 8px;
+                            if Ui.device-action == "send": SendButton {
+                                min-width: 0px; preferred-width: 0px;
+                                enabled: root.device-ready; align-left: true; reason: Ui.device-folder-reason;
+                                files => { Ui.send-files(Ui.device-id); } folder => { Ui.send-folder(Ui.device-id); }
                             }
-                            if Ui.device-action == "pair": PneuButton { enabled: root.device-ready;
-                                text: "Pair Again…"; icon: Icons.qr-code; kind: ButtonKind.primary; wide: true;
-                                clicked => { root.open-add(Ui.device.phone ? 0 : 1); }
+                            if Ui.device.ring-supported: PneuButton {
+                                min-width: 0px; preferred-width: 0px;
+                                enabled: root.device-ready && Ui.device.ring-connection != "";
+                                text: Ui.device.ringing ? "Stop Ringing" : "Ring Phone";
+                                icon: Ui.device.ringing ? Icons.stop : Icons.ring;
+                                kind: Ui.device.ringing ? ButtonKind.primary : ButtonKind.tonal; wide: true;
+                                clicked => { Ui.ring-phone(Ui.device-id, Ui.device.ring-connection, Ui.device.ringing); }
+                            }
+                            if Ui.device-action == "pair" || Ui.device-action == "pair-warning": PneuButton { enabled: root.device-ready;
+                                text: "Pair Again…"; icon: Icons.qr-code; kind: Ui.device-action == "pair" ? ButtonKind.primary : ButtonKind.tonal; wide: true;
+                                clicked => { Ui.pair-again-started(Ui.device-id); root.open-add(Ui.device.phone ? 0 : 1); }
                             }
                         }
                     }
@@ -562,7 +937,7 @@ export component PneuWindow inherits Window {
                             VerticalLayout {
                                 for setting[i] in Ui.device-settings: VerticalLayout {
                                     if i > 0: Divider {}
-                                    SwitchRow { enabled: root.device-ready;
+                                    SwitchRow { enabled: root.device-ready && setting.enabled;
                                         label: setting.label; sub: setting.sub; checked: setting.on;
                                         toggled(on) => { Ui.set-peer(setting.key, on); }
                                     }
@@ -574,31 +949,108 @@ export component PneuWindow inherits Window {
                         }
                     }
                     Card {
-                        PneuButton { enabled: root.device-ready; text: "Unpair…"; kind: ButtonKind.row; clicked => { root.prepare-unpair(); } }
+                        VerticalLayout {
+                            if Ui.device-link.row != LinkRow.none: Row {
+                                VerticalLayout {
+                                    alignment: center; horizontal-stretch: 1; spacing: 1px;
+                                    Text {
+                                        text: Ui.device-link.title; wrap: word-wrap;
+                                        color: Ui.device-link.row == LinkRow.update ? Pneu.text2 : Pneu.text;
+                                    }
+                                    if Ui.device-link.sub != "": Text {
+                                        text: Ui.device-link.sub; font-size: Pneu.label-size; color: Pneu.text2; wrap: word-wrap;
+                                    }
+                                }
+                                if Ui.device-link.row == LinkRow.link: VerticalLayout {
+                                    alignment: center;
+                                    PneuButton { enabled: root.device-ready; text: "Link"; clicked => { Ui.link-device(Ui.device-id); } }
+                                }
+                                if Ui.device-link.row == LinkRow.asked: HorizontalLayout {
+                                    alignment: center; spacing: 8px;
+                                    VerticalLayout { alignment: center;
+                                        PneuButton { enabled: root.device-ready; text: "Don't Allow"; clicked => { Ui.answer(Ui.device-id, false); } }
+                                    }
+                                    VerticalLayout { alignment: center;
+                                        PneuButton { enabled: root.device-ready; text: "Allow"; kind: ButtonKind.primary; clicked => { Ui.answer(Ui.device-id, true); } }
+                                    }
+                                }
+                            }
+                            if Ui.device-link.row != LinkRow.none: Divider {}
+                            if Ui.device-link.via != "": Row {
+                                Text { text: "Added via " + Ui.device-link.via; color: Pneu.text2; overflow: elide; horizontal-stretch: 1; }
+                            }
+                            if Ui.device-link.via != "": Divider {}
+                            PneuButton {
+                                enabled: root.device-ready; kind: ButtonKind.row;
+                                text: Ui.device-link.member ? "Remove from All Devices…" : "Unpair…";
+                                clicked => { if Ui.device-link.member { root.prepare-remove(); } else { root.prepare-unpair(); } }
+                            }
+                        }
                     }
                 }
 
                 // ---- Add Device ----
                 if Ui.page == Page.add: VerticalLayout {
                     spacing: 12px;
-                    if !Ui.first-run: Header { title: "Add Device"; go-back => { root.back(); } }
+                    if !Ui.first-run: Header { title: "Add Device"; go-back => { root.leave(); } }
                     Segmented {
                         items: [{ label: "Phone", icon: Icons.smartphone }, { label: "Computer", icon: Icons.computer }];
                         selected: Ui.add-tab;
-                        select(i) => { Ui.add-tab = i; Ui.navigated(); }
+                        select(i) => { Ui.download = false; Ui.add-tab = i; Ui.navigated(); }
                     }
-                    if Ui.paired != "": Done { height: root.pairing-height; name: Ui.paired; }
+                    if Ui.paired != "": Done {
+                        reserved-bottom: root.replacement-space;
+                        height: root.pairing-height + (Ui.add-tab == 0 ? root.phone-link-height : 0px); name: Ui.paired;
+                        detail: Ui.paired-detail; only: Ui.paired-only;
+                    }
                     if Ui.paired == "" && Ui.pairing != "": Busy {
-                        height: root.pairing-height; motion: Ui.motion; text: "Pairing with " + Ui.pairing + "…";
+                        height: root.pairing-height + (Ui.add-tab == 0 ? root.phone-link-height : 0px);
+                        motion: Ui.motion; text: "Pairing with " + Ui.pairing + "…";
                     }
-                    if Ui.paired == "" && Ui.pairing == "" && Ui.add-tab == 0: VerticalLayout {
-                        height: root.pairing-height;
-                        spacing: 12px;
-                        if Ui.network && Ui.qr.width > 0: HorizontalLayout { alignment: center; QrCard { qr: Ui.qr; } }
-                        if Ui.network && Ui.qr.width > 0: Text { text: caption.text; color: Pneu.text; horizontal-alignment: center; }
-                        if Ui.network && Ui.qr.width == 0: Rectangle { height: root.pairing-height; }
-                        if !Ui.network: Notice {
-                            height: root.pairing-height; icon: Icons.no-network; text: "Connect this PC to a network to pair";
+                    if Ui.paired == "" && Ui.pairing == "" && Ui.add-tab == 0 && !Ui.download: VerticalLayout {
+                        spacing: root.phone-link-height - root.link-height;
+                        VerticalLayout {
+                            height: root.pairing-height;
+                            spacing: 12px;
+                            if Ui.network && Ui.qr.width > 0: HorizontalLayout { alignment: center; QrCard { qr: Ui.qr; } }
+                            if Ui.network && Ui.qr.width > 0: Text { text: caption.text; color: Pneu.text; horizontal-alignment: center; }
+                            if Ui.network && Ui.qr.width == 0: Rectangle { height: root.pairing-height; }
+                            if !Ui.network: Notice {
+                                height: root.pairing-height; icon: Icons.no-network; text: "Connect this PC to a network to pair";
+                            }
+                        }
+                        HorizontalLayout {
+                            alignment: center;
+                            PneuButton {
+                                text: "Get Pneu for Android"; icon: Icons.smartphone; kind: ButtonKind.link;
+                                clicked => { root.show-download(true); }
+                            }
+                        }
+                    }
+                    // The pairing code stays live underneath and returns as it was.
+                    if Ui.paired == "" && Ui.pairing == "" && Ui.add-tab == 0 && Ui.download: VerticalLayout {
+                        spacing: 0px;
+                        HorizontalLayout { alignment: center; DownloadQrCard { qr: Ui.download-qr; size: root.last-qr-size * 1px; } }
+                        Rectangle { height: 12px; }
+                        Text { text: "Scan with your phone's camera"; color: Pneu.text; horizontal-alignment: center; }
+                        Rectangle { height: 2px; }
+                        HorizontalLayout {
+                            alignment: center;
+                            PneuButton {
+                                text: root.copied == root.download-page ? "Copied" : "stantonmatt.github.io/pneu";
+                                icon: root.copied == root.download-page ? Icons.check : Icons.copy;
+                                kind: ButtonKind.link;
+                                accessible-description: "Copy the address";
+                                clicked => { root.copy(root.download-page); }
+                            }
+                        }
+                        Rectangle { height: 4px; }
+                        HorizontalLayout {
+                            alignment: center;
+                            PneuButton {
+                                text: "Pairing Code"; icon: Icons.chevron-left; kind: ButtonKind.link;
+                                clicked => { root.show-download(false); }
+                            }
                         }
                     }
                     if Ui.paired == "" && Ui.pairing == "" && Ui.add-tab == 1: VerticalLayout {
@@ -614,10 +1066,12 @@ export component PneuWindow inherits Window {
                                     horizontal-alignment: center; overflow: elide;
                                 }
                                 Text { text: "Link on the clipboard"; color: Pneu.text2; horizontal-alignment: center; }
+                                // This card pairs without the popup, so it carries the switch itself.
+                                VerticalLayout { padding-top: 14px; LinkSwitch {} }
                                 HorizontalLayout {
-                                    padding-top: 14px; spacing: 8px; alignment: center;
+                                    padding-top: 12px; spacing: 8px; alignment: center;
                                     PneuButton { text: "Not Now"; clicked => { Ui.offer-dismiss(); } }
-                                    PneuButton { text: "Pair"; kind: ButtonKind.primary; clicked => { Ui.offer-pair(); } }
+                                    PneuButton { text: "Pair"; kind: ButtonKind.primary; clicked => { Ui.offer-pair(Ui.link-on && !Ui.link-full); } }
                                 }
                             }
                         }
@@ -681,7 +1135,7 @@ export component PneuWindow inherits Window {
                 if Ui.is-mac && Ui.page == Page.scan: VerticalLayout {
                     spacing: 12px;
                     Header { title: "Scan QR Code"; go-back => { root.back(); } }
-                    if Ui.paired != "": Done { height: root.pairing-height; name: Ui.paired; }
+                    if Ui.paired != "": Done { reserved-bottom: root.replacement-space; height: root.pairing-height; name: Ui.paired; detail: Ui.paired-detail; only: Ui.paired-only; }
                     if Ui.paired == "" && (Ui.scan-state == ScanState.requesting || Ui.scan-state == ScanState.scanning): VerticalLayout {
                         spacing: 12px;
                         Rectangle {
@@ -724,9 +1178,10 @@ export component PneuWindow inherits Window {
                         HorizontalLayout {
                             alignment: center;
                             PneuButton {
-                                text: root.copied ? "Copied" : "Copy Link"; icon: root.copied ? Icons.check : Icons.copy;
+                                text: root.copied == Ui.code-link ? "Copied" : "Copy Link";
+                                icon: root.copied == Ui.code-link ? Icons.check : Icons.copy;
                                 kind: ButtonKind.tonal;
-                                clicked => { root.copy-link(); }
+                                clicked => { root.copy(Ui.code-link); }
                             }
                         }
                         Text { text: Ui.code-expires; font-size: Pneu.label-size; color: Pneu.text2; horizontal-alignment: center; }
@@ -750,7 +1205,43 @@ export component PneuWindow inherits Window {
                     if Ui.code-state == CodeState.pairing: Busy {
                         height: root.pairing-height; motion: Ui.motion; text: "Pairing with " + Ui.pairing + "…";
                     }
-                    if Ui.code-state == CodeState.paired: Done { height: root.pairing-height; name: Ui.paired; }
+                    if Ui.code-state == CodeState.paired: Done { reserved-bottom: root.replacement-space; height: root.pairing-height; name: Ui.paired; detail: Ui.paired-detail; only: Ui.paired-only; }
+                }
+
+                if Ui.page == Page.history && Ui.keep-history: VerticalLayout {
+                    spacing: 14px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Header {title: "Clipboard History"; horizontal-stretch: 1; go-back => {root.back();} }
+                        if Ui.history.length > Ui.history-pins && Ui.history-query == "": PneuButton {text: "Clear All…"; clicked => { Ui.dialog = Dialog.history-clear;} }
+                    }
+                    if Ui.history.length > 0: TextField {
+                        text <=> Ui.history-query; label: "Search"; placeholder: "Search"; leading-icon: Icons.search; clearable: true;
+                        autofocus: true; focus-request: Ui.history-focus; enabled: !Interaction.modal-open;
+                        accepted => {
+                            if Ui.pinned-history.length > 0 { Ui.copy-history(Ui.pinned-history[0].id); }
+                            else if Ui.recent-history.length > 0 { Ui.copy-history(Ui.recent-history[0].id); }
+                        }
+                        escaped => { if Ui.history-query != "" { Ui.history-query = ""; } else { root.back(); } }
+                    }
+                    if Ui.pinned-history.length > 0: VerticalLayout {
+                        spacing: 6px;
+                        SectionLabel {text: "Pinned";}
+                        HistoryCard {items: Ui.pinned-history; line-height: text-line.preferred-height;}
+                    }
+                    if Ui.recent-history.length > 0: VerticalLayout {
+                        spacing: 6px;
+                        if Ui.history-pins > 0: SectionLabel {text: "Recent";}
+                        HistoryCard {items: Ui.recent-history; line-height: text-line.preferred-height;}
+                    }
+                    if Ui.pinned-history.length + Ui.recent-history.length == 0: Card {
+                        height: 132px;
+                        VerticalLayout {
+                            height: 132px; alignment: center; spacing: 8px;
+                            HorizontalLayout {alignment: center; Image {accessible-role: none; width: 28px; height: 28px; source: Ui.searching ? Icons.search : Icons.paste; colorize: Pneu.text2;} }
+                            Text {text: Ui.searching ? "No matches" : "Nothing copied yet"; color: Pneu.text2; horizontal-alignment: center;}
+                        }
+                    }
                 }
 
                 // ---- Settings ----
@@ -776,6 +1267,14 @@ export component PneuWindow inherits Window {
                                 SwitchRow {
                                     label: "Include images"; checked: Ui.include-images; enabled: Ui.clipboard-mode != 2;
                                     toggled(on) => { Ui.set-flag("clipboard_include_images", on); }
+                                }
+                                Divider {}
+                                SwitchRow {
+                                    label: "Keep history"; checked: Ui.keep-history;
+                                    toggled(on) => {
+                                        if on {Ui.set-flag("clipboard_history",true);}
+                                        else {Ui.disable-empty-history();}
+                                    }
                                 }
                             }
                         }
@@ -815,7 +1314,11 @@ export component PneuWindow inherits Window {
                                     }
                                     VerticalLayout {
                                         alignment: center;
-                                        PneuButton { text: "Change…"; clicked => { Ui.choose-folder(); } }
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            PneuButton { text: "Open"; clicked => { Ui.open-folder(); } }
+                                            PneuButton { text: "Change…"; clicked => { Ui.choose-folder(); } }
+                                        }
                                     }
                                 }
                                 Divider {}
@@ -914,14 +1417,39 @@ export component PneuWindow inherits Window {
                         border-radius: 8px;
                         background: Ui.drop-hover == index && item.enabled ? Pneu.accent-soft : transparent;
                         border-color: Ui.drop-hover == index && item.enabled ? Pneu.accent : transparent; border-width: 1px;
-                        Text { x: 12px; width: parent.width - 24px; height: parent.height; text: item.name;
-                            color: item.enabled ? Pneu.text : Pneu.text2; overflow: elide; vertical-alignment: center; }
+                        VerticalLayout { x: 12px; width: parent.width - 24px; height: parent.height; alignment: center;
+                            Text { text: item.name; color: Pneu.text; opacity: item.enabled ? 1 : 0.4; overflow: elide; }
+                            if item.sub != "": Text { text: item.sub; color: Pneu.text2; font-size: Pneu.label-size; overflow: elide; }
+                        }
                     }
                 }
             }
         }
 
         // ---- Popups ----
+        if Ui.dialog == Dialog.history-clear || Ui.dialog == Dialog.history-off: PopupCard {
+            limit: root.height - 32px;
+            Text {text: Ui.dialog == Dialog.history-off ? "Turn off clipboard history?" : "Clear clipboard history?";font-size: Pneu.title-size;font-weight: 700;color: Pneu.text;wrap: word-wrap;}
+            Rectangle {height: 8px;}
+            Text {
+                private property <int> count: Ui.dialog == Dialog.history-off ? Ui.history-off-count : Ui.history.length - Ui.history-pins;
+                text: Ui.dialog == Dialog.history-off && Ui.history-pins > 0
+                    ? (self.count == Ui.history-pins ? (self.count == 1 ? "This deletes 1 pinned item." : "This deletes " + self.count + " pinned items.")
+                        : "This deletes " + self.count + " saved items, including " + Ui.history-pins + " pinned.")
+                    : (self.count == 1 ? "This deletes 1 saved item." : "This deletes " + self.count + " saved items.")
+                        + (Ui.dialog == Dialog.history-clear && Ui.history-pins > 0 ? " Pinned items stay." : "");color: Pneu.text2;wrap: word-wrap;}
+            Rectangle {height: 20px;}
+            HorizontalLayout {
+                spacing: 8px; alignment: end;
+                PneuButton {dialog-control: true;text: "Cancel";autofocus: true;focus-key: Ui.dialog == Dialog.history-off ? "off" : "clear";clicked => {root.dismiss();} }
+                PneuButton {dialog-control: true;text: Ui.dialog == Dialog.history-off ? "Turn Off" : "Clear";kind: ButtonKind.danger;
+                    clicked => {
+                        if Ui.dialog == Dialog.history-off {Ui.set-flag("clipboard_history",false);} else {Ui.clear-history();}
+                        Ui.dialog = Dialog.none;keys.focus();
+                    }
+                }
+            }
+        }
         if Ui.dialog == Dialog.unpair: PopupCard {
             limit: root.height - 32px;
             Text {
@@ -934,6 +1462,29 @@ export component PneuWindow inherits Window {
                 spacing: 8px; alignment: end;
                 PneuButton { dialog-control: true; text: "Cancel"; autofocus: true; clicked => { root.dismiss(); } }
                 PneuButton { dialog-control: true; text: "Unpair"; kind: ButtonKind.danger; clicked => { root.submit-unpair(); } }
+            }
+        }
+        if Ui.dialog == Dialog.remove: PopupCard {
+            card-width: 352px;
+            limit: root.height - 32px;
+            Text {
+                text: "Remove " + Ui.remove-name + " from all devices?";
+                font-size: Pneu.title-size; font-weight: 700; color: Pneu.text; wrap: word-wrap;
+            }
+            Rectangle { height: 6px; }
+            // Removed here now; the others remove it as they connect. Nothing claims more.
+            Text {
+                text: "It's removed from " + (Ui.is-mac ? "this Mac" : "this computer")
+                    + " now, and from your other devices when they next connect."
+                    + (Ui.remove-waiting == 1 ? " 1 waiting item won't be sent to it."
+                        : Ui.remove-waiting > 1 ? " " + Ui.remove-waiting + " waiting items won't be sent to it." : "");
+                color: Pneu.text2; wrap: word-wrap;
+            }
+            Rectangle { height: 18px; }
+            HorizontalLayout {
+                spacing: 8px; alignment: end;
+                PneuButton { dialog-control: true; text: "Cancel"; autofocus: true; clicked => { root.dismiss(); } }
+                PneuButton { dialog-control: true; text: "Remove"; kind: ButtonKind.danger; clicked => { root.submit-remove(); } }
             }
         }
         if Ui.dialog == Dialog.rename: PopupCard {
@@ -983,11 +1534,10 @@ export component PneuWindow inherits Window {
                                 }
                                 HorizontalLayout {
                                     padding-top: 8px; padding-bottom: 8px; padding-left: 8px; padding-right: 8px; spacing: 12px;
-                                    opacity: pick.eligible ? 1 : 0.45;
-                                    VerticalLayout { alignment: center; Tile { icon: pick.phone ? Icons.smartphone : Icons.computer; tone: pick.tone; } }
+                                    VerticalLayout { opacity: pick.eligible ? 1 : 0.45; alignment: center; Tile { icon: pick.phone ? Icons.smartphone : Icons.computer; tone: pick.tone; } }
                                     VerticalLayout {
                                         alignment: center; horizontal-stretch: 1;
-                                        Text { text: pick.name; font-weight: 600; color: Pneu.text; overflow: elide; }
+                                        Text { text: pick.name; opacity: pick.eligible ? 1 : 0.45; font-weight: 600; color: Pneu.text; overflow: elide; }
                                         Text {
                                             text: pick.eligible && !pick.connected && pick.checked ? "Sends when connected" : pick.status;
                                             font-size: Pneu.label-size; color: Pneu.text2; overflow: elide;
@@ -1018,6 +1568,7 @@ export component PneuWindow inherits Window {
             }
         }
         if Ui.dialog == Dialog.message: PopupCard {
+            low: Ui.message.action == "replace-device";
             card-width: 352px;
             limit: root.height - 32px;
             if Ui.message.tile != 0: HorizontalLayout {
@@ -1031,18 +1582,53 @@ export component PneuWindow inherits Window {
             Text { text: Ui.message.title; font-size: Pneu.title-size; font-weight: 700; color: Pneu.text; wrap: word-wrap; }
             if Ui.message.text != "": Rectangle { height: 6px; }
             if Ui.message.text != "": Text { text: Ui.message.text; color: Pneu.text2; wrap: word-wrap; }
+            // The joining computer's confirmation. The computer showing the code has none.
+            if Ui.message.action == "join-confirm": VerticalLayout { padding-top: 14px; LinkSwitch { dialog-control: true; } }
             Rectangle { height: 18px; }
             HorizontalLayout {
                 spacing: 8px; alignment: end;
                 if Ui.message.secondary != "": PneuButton { dialog-control: true;
                     text: Ui.message.secondary;
-                    autofocus: true;
+                    autofocus: Ui.message.action != "replace-device";
                     clicked => { Ui.dialog = Dialog.none; Ui.message-action(Ui.message.action, false); keys.focus(); }
                 }
                 PneuButton { dialog-control: true;
                     text: Ui.message.primary; kind: ButtonKind.primary;
-                    autofocus: Ui.message.secondary == "";
-                    clicked => { Ui.dialog = Dialog.none; Ui.message-action(Ui.message.action, true); keys.focus(); }
+                    autofocus: Ui.message.secondary == "" || Ui.message.action == "replace-device";
+                    clicked => {
+                        Ui.dialog = Dialog.none;
+                        if Ui.message.action == "join-confirm" { Ui.confirm-join(Ui.link-on && !Ui.link-full); }
+                        else { Ui.message-action(Ui.message.action, true); }
+                        keys.focus();
+                    }
+                }
+            }
+        }
+
+        if Ui.dialog == Dialog.help: PopupCard {
+            card-width: 352px;
+            limit: root.height - 32px;
+            Text {
+                text: Ui.devices.length == 1 ? "Can't connect to " + Ui.devices[0].name : "Can't connect to your devices";
+                font-size: Pneu.title-size; font-weight: 700; color: Pneu.text; wrap: word-wrap;
+            }
+            Rectangle { height: 8px; }
+            HelpRow { icon: Icons.wifi; title: "On the same Wi-Fi"; text: "Pneu connects by itself."; }
+            Divider { inset: 8px; }
+            HelpRow {
+                icon: Icons.globe; title: "Away from it";
+                text: Ui.tailscale
+                    ? (Ui.devices.length == 1 ? "Tailscale is on here.\nUse it on " + Ui.devices[0].name + " too."
+                        : "Tailscale is on here.\nUse it on your other devices too.")
+                    : Ui.devices.length == 1 ? "Use Tailscale, a free app, on both devices." : "Use Tailscale, a free app, on each device.";
+            }
+            Rectangle { height: 18px; }
+            HorizontalLayout {
+                spacing: 8px; alignment: end;
+                PneuButton { dialog-control: true; text: "Close"; autofocus: true; clicked => { root.dismiss(); } }
+                if !Ui.tailscale: PneuButton { dialog-control: true;
+                    text: "Get Tailscale…"; kind: ButtonKind.primary;
+                    clicked => { Ui.dialog = Dialog.none; Ui.get-tailscale(); keys.focus(); }
                 }
             }
         }
@@ -1064,7 +1650,7 @@ export component PneuWindow inherits Window {
                                 VerticalLayout {
                                     alignment: center; horizontal-stretch: 1;
                                     Text { text: recipient.name; font-weight: 600; color: Pneu.text; overflow: elide; }
-                                    Text { text: recipient.detail; font-size: Pneu.label-size; color: recipient.tone == Tone.danger ? Pneu.danger : Pneu.text2; wrap: word-wrap; }
+                                    Text { text: recipient.detail; font-size: Pneu.label-size; color: recipient.tone == Tone.danger ? Pneu.danger : recipient.tone == Tone.warn ? Pneu.warn : Pneu.text2; wrap: word-wrap; }
                                     if recipient.progress >= 0: ProgressBar { value: recipient.progress; }
                                 }
                                 if recipient.can-retry: VerticalLayout { alignment: center;

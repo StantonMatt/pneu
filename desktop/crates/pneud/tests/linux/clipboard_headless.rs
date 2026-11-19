@@ -358,6 +358,7 @@ async fn mesh_connect(core: &Core, phone: &Phone) -> Result<MeshTls> {
     write_frame(
         &mut tls,
         &Message::Hello(Hello {
+            setup: None,
             version: 1,
             device_id: phone.identity.device_id.clone(),
             name: "Headless mesh sender".into(),

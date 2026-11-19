@@ -5,7 +5,6 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
-#[cfg(target_os = "linux")]
 use std::collections::HashMap;
 use std::{
     collections::HashSet,
@@ -19,14 +18,29 @@ use std::{
 
 slint::slint! {
     export {
-        PneuWindow, Ui, WindowFocus, Page, Dialog, CodeState, ScanState, DeviceItem, RecentItem, SettingItem,
-        PickItem, RecipientItem, Message, Summary, Tone, Tube, LinkState, LinkTile, DropItem, DropGeometry
+        PneuWindow, Ui, WindowFocus, Page, Dialog, CodeState, ScanState, DeviceItem, RecentItem, HistoryItem, SettingItem,
+        PickItem, RecipientItem, Message, Summary, Tone, Tube, LinkState, LinkTile, DropItem, DropGeometry,
+        TopKind, TopCard, LinkRow, DeviceLink
     } from "../../ui/window.slint";
     export { Palette } from "std-widgets.slint";
     export { Pneu } from "../../ui/theme.slint";
 }
 
 pub(crate) use super::send_request::SendRequest;
+use super::window_setup::{self as setup, Remembered, Removal, Row, Setup, Top};
+
+/// The download page, shown as a code on Add Device → Phone (window.slint
+/// copies it too, and prints it without the scheme).
+const DOWNLOAD_PAGE: &str = "https://stantonmatt.github.io/pneu/";
+const TAILSCALE_DOWNLOAD: &str = "https://tailscale.com/download";
+
+fn clipboard_send_error(error: &str, from_menu: bool) -> Option<&'static str> {
+    if error.contains("clipboard image too large") {
+        (!from_menu).then_some("Couldn't send the clipboard. The image is over 20 MB")
+    } else {
+        Some("Couldn't send the clipboard")
+    }
+}
 
 fn is_pairing_page(page: Page) -> bool {
     matches!(page, Page::Add | Page::Code | Page::Scan)
@@ -54,6 +68,7 @@ pub(crate) mod contract {
         pub file_name: String,
         pub size: u64,
         pub sent: u64,
+        pub folder: Option<crate::folders::Details>,
         pub state: String,
         pub error: Option<String>,
         pub direction: Option<String>,
@@ -70,6 +85,7 @@ pub(crate) mod contract {
     pub struct SendTarget {
         pub device: String,
         pub name: String,
+        pub folder_reason: Option<String>,
         pub eligible: bool,
         pub would_queue: bool,
         pub generation: u64,
@@ -129,6 +145,7 @@ pub(crate) mod contract {
                 file_name: t.file_name.clone(),
                 size: t.size,
                 sent: t.sent,
+                folder: t.folder.clone(),
                 state: t.state.clone(),
                 error: t.error.clone(),
                 direction: Some(t.direction.clone()),
@@ -175,6 +192,9 @@ struct View {
     add_tab: i32,
     // The bindings displayed by this UI frame, including queued callbacks.
     targets: Option<Vec<SendTarget>>,
+    // State installed with the displayed frame, carried through queued actions.
+    setup: Arc<Setup>,
+    top: Arc<Top>,
 }
 
 // Status updates may change connectivity while a picker is open. They do not
@@ -194,7 +214,7 @@ enum Action {
     Close,
     #[cfg(target_os = "macos")]
     Native(super::macos::native::MenuAction),
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", all(target_os = "linux", pneu_qt_drag), windows))]
     DropFiles {
         files: Vec<PathBuf>,
         targets: Vec<contract::CapturedTarget>,
@@ -203,11 +223,21 @@ enum Action {
     },
     Navigated,
     Folder,
+    OpenFolder,
     Unpair(String),
+    PairAgain(String),
+    ReplacementAnswer(String, bool),
     SendFiles(String),
+    Ring(String, String, bool),
+    SendFolder(String),
     PickerSend(Vec<String>),
     PickerCancel,
     SendClipboard,
+    CopyHistory(String),
+    DisableEmptyHistory,
+    DeleteHistory(String),
+    PinHistory(String, bool),
+    ClearHistory,
     Cancel(String),
     Retry(String),
     Dismiss(String),
@@ -225,9 +255,18 @@ enum Action {
     PasteLink(String),
     ScannedLink(String),
     Probed(String),
-    OfferPair,
+    Focused,
+    OfferPair(bool),
     OfferDismiss,
+    ConfirmJoin(bool),
+    TopCard(bool),
+    TopCardClose,
+    LinkDevice(String),
+    Answer(String, bool),
+    Removing(String),
+    Remove(String),
     Message(String, bool),
+    GetTailscale,
 }
 
 /// IPC currently exposes daemon rejections as this prefix; socket/timeout/
@@ -317,6 +356,11 @@ pub(crate) struct Peer {
     pub id: String,
     pub name: String,
     pub phone: bool,
+    pub battery: Option<u8>,
+    pub charging: bool,
+    pub ring_supported: bool,
+    pub ringing: bool,
+    pub ring_connection: Option<u64>,
     health: Health,
     pub last_seen: u64,
     pub route: Option<String>,
@@ -327,18 +371,18 @@ impl Peer {
     pub(crate) fn connected(&self) -> bool {
         self.health.connected()
     }
-    /// v2's per-device line, without transfers ("Connected over Wi-Fi").
+    /// v2's per-device line, without transfers ("Connected over local network").
     pub(crate) fn connection(&self) -> String {
         match self.health {
             Health::Connected => match &self.route {
-                Some(route) => format!("Connected over {route}"),
+                Some(route) => format!("Connected over {}", super::route_in_sentence(route)),
                 None => "Connected".into(),
             },
             Health::Paused => "Paused on phone".into(),
             Health::Connecting => "Connecting…".into(),
             Health::Update => "Update required".into(),
             Health::Lost | Health::Mismatch => "Pairing lost".into(),
-            Health::Offline if self.last_seen == 0 => "Not connected".into(),
+            Health::Offline if self.last_seen == 0 => "Not connected yet".into(),
             Health::Offline => format!("Not connected · last seen {}", seen(self.last_seen)),
         }
     }
@@ -354,7 +398,7 @@ impl Peer {
     pub(crate) fn receiving(&self) -> bool {
         self.receiving.is_some()
     }
-    /// Tooltip line: "Galaxy S25+ · Wi-Fi", "Office-PC · last seen 9:02 AM".
+    /// Tooltip line: "Galaxy S25+ · Local network", "Office-PC · last seen 9:02 AM".
     pub(crate) fn short(&self) -> String {
         let state = match self.health {
             Health::Connected => self.route.clone().unwrap_or_else(|| "Connected".into()),
@@ -362,7 +406,16 @@ impl Peer {
             Health::Offline if self.last_seen != 0 => format!("last seen {}", seen(self.last_seen)),
             _ => self.connection(),
         };
-        format!("{} · {state}", self.name)
+        let battery = self
+            .battery
+            .map(|level| {
+                format!(
+                    " · Battery {level}%{}",
+                    if self.charging { ", charging" } else { "" }
+                )
+            })
+            .unwrap_or_default();
+        format!("{} · {state}{battery}", self.name)
     }
     fn item(&self) -> DeviceItem {
         let (status, progress) = if let Some(t) = &self.sending {
@@ -383,6 +436,15 @@ impl Peer {
             id: self.id.as_str().into(),
             name: self.name.as_str().into(),
             phone: self.phone,
+            battery: self.battery.map_or(-1, i32::from),
+            charging: self.charging,
+            ring_supported: self.ring_supported,
+            ringing: self.ringing,
+            ring_connection: self
+                .ring_connection
+                .map(|c| c.to_string())
+                .unwrap_or_default()
+                .into(),
             tone: self.health.tone(),
             status: status.into(),
             status_tone: match self.health {
@@ -413,7 +475,16 @@ pub(crate) fn peers(snapshot: &super::Snapshot, transfers: &[Transfer]) -> Vec<P
         .map(|d| {
             let id = d.device.as_str().to_owned();
             let paused = d.role == "phone" && snapshot.paused_devices.contains(&d.device);
-            let health = Health::of(&d.state, paused);
+            let mut health = Health::of(&d.state, paused);
+            if snapshot.refreshing_devices.contains(&d.device)
+                && matches!(health, Health::Offline | Health::Connecting)
+            {
+                health = if paused {
+                    Health::Paused
+                } else {
+                    Health::Connected
+                };
+            }
             let active = |incoming: bool| {
                 transfers
                     .iter()
@@ -421,7 +492,17 @@ pub(crate) fn peers(snapshot: &super::Snapshot, transfers: &[Transfer]) -> Vec<P
                     .cloned()
             };
             let route = health.connected().then(|| d.route.clone()).flatten();
+            let control = snapshot.phone_controls.get(&d.device);
+            let live = d.role == "phone"
+                && d.state == "connected"
+                && !paused
+                && snapshot.connected_devices.contains(&d.device);
             Peer {
+                battery: control.filter(|_| live).and_then(|c| c.battery),
+                charging: live && control.is_some_and(|c| c.charging),
+                ring_supported: d.role == "phone" && control.is_some_and(|c| c.ring_supported),
+                ringing: live && control.is_some_and(|c| c.ringing),
+                ring_connection: control.filter(|_| live).and_then(|c| c.connection),
                 name: display_peer_text(&d.name),
                 phone: d.role == "phone",
                 health,
@@ -513,19 +594,8 @@ fn summary(peers: &[Peer], transfers: &[Transfer]) -> SummaryData {
             },
         )
     } else if let [one] = peers {
-        // With exactly one device the window keeps v2's name and status.
-        let detail = if one.health == Health::Paused {
-            "Paused on phone".into()
-        } else if let Some(t) = sending {
-            format!("Sending {}…", t.file_name)
-        } else if one.receiving.is_some() {
-            "Receiving…".into()
-        } else if one.health == Health::Offline && one.last_seen != 0 {
-            format!("Not connected · last seen {}", seen(one.last_seen))
-        } else {
-            one.connection()
-        };
-        (one.name.clone(), detail)
+        let device = device_summary(one).0;
+        (device.title, device.detail)
     } else if paused {
         ("Paused".into(), "Automatic sending is off".into())
     } else if !connected.is_empty() {
@@ -558,6 +628,21 @@ fn summary(peers: &[Peer], transfers: &[Transfer]) -> SummaryData {
     }
 }
 
+/// No paired device can be reached, so the main page offers Can't connect?.
+/// A device that answered (even to refuse the pairing) counts as reachable.
+fn unreachable(peers: &[Peer]) -> bool {
+    !peers.is_empty()
+        && peers
+            .iter()
+            .all(|p| matches!(p.health, Health::Offline | Health::Connecting))
+}
+
+/// Tailscale runs here when one of this computer's addresses is in its ranges.
+fn tailscale_running() -> bool {
+    crate::discovery::candidates()
+        .is_ok_and(|addresses| addresses.iter().any(|a| super::route(a.ip) == "Tailscale"))
+}
+
 /// The device page's status card: one-to-one Link, title, detail and action.
 fn device_summary(peer: &Peer) -> (SummaryData, &'static str) {
     let h = peer.health;
@@ -571,7 +656,9 @@ fn device_summary(peer: &Peer) -> (SummaryData, &'static str) {
     let (title, detail) = match h {
         Health::Connected => (
             "Connected".to_owned(),
-            if let Some(t) = &peer.sending {
+            if peer.battery.is_some() || peer.ringing {
+                peer.route.clone().unwrap_or_default()
+            } else if let Some(t) = &peer.sending {
                 format!("Sending {} · {}", t.file_name, size_pair(t.sent, t.size))
             } else if let Some(t) = &peer.receiving {
                 format!("Receiving {} · {}%", t.file_name, percent(t.sent, t.size))
@@ -597,7 +684,7 @@ fn device_summary(peer: &Peer) -> (SummaryData, &'static str) {
             "Not connected".into(),
             format!("Last connected {}", seen(peer.last_seen)),
         ),
-        Health::Offline => ("Not connected".into(), String::new()),
+        Health::Offline => ("Not connected yet".into(), String::new()),
     };
     let capsule = match (&peer.sending, &peer.receiving) {
         _ if tube != Tube::Solid => 0,
@@ -626,11 +713,17 @@ fn device_summary(peer: &Peer) -> (SummaryData, &'static str) {
 }
 
 /// Switch labels describe the pair from this computer's side.
-fn device_settings(peer: &Peer, reply: &Value) -> (Vec<SettingItem>, String) {
+fn device_settings(peer: &Peer, reply: &Value, mode: ClipboardMode) -> (Vec<SettingItem>, String) {
     if peer.health.lost() {
         return (Vec::new(), String::new());
     }
     if reply["can_sync"] == json!(false) {
+        if peer.last_seen == 0 && !peer.connected() {
+            return (
+                Vec::new(),
+                format!("Switches sync when {} connects.", peer.name),
+            );
+        }
         return (
             Vec::new(),
             format!("Update Pneu on {} to sync these switches.", peer.name),
@@ -655,12 +748,16 @@ fn device_settings(peer: &Peer, reply: &Value) -> (Vec<SettingItem>, String) {
                 SettingItem {
                     key: key.into(),
                     label: label.into(),
-                    sub: if s["pending"] == json!(true) {
+                    enabled: order != 0 || mode != ClipboardMode::Off,
+                    sub: if order == 0 && mode == ClipboardMode::Off {
+                        "Off for all devices in Settings".into()
+                    } else if s["pending"] == json!(true) && !peer.connected() {
                         format!("Applies when {} connects", peer.name).into()
                     } else {
                         SharedString::new()
                     },
-                    on: s["enabled"].as_bool().unwrap_or(true),
+                    on: !(order == 0 && mode == ClipboardMode::Off)
+                        && s["enabled"].as_bool().unwrap_or(true),
                 },
             ))
         })
@@ -697,6 +794,9 @@ fn artifact_key(t: &Transfer) -> String {
 fn artifact_id(t: &Transfer) -> Option<&str> {
     (!t.transfer_id.is_empty() && t.transfer_id != t.operation).then_some(t.transfer_id.as_str())
 }
+fn replaced(t: &Transfer) -> bool {
+    t.state == "cancelled" && t.error.as_deref() == Some(crate::store::replacement::REPLACED)
+}
 fn has_recipient(t: &Transfer) -> bool {
     !(t.transfer_id == t.operation && t.device == "00000000000000000000000000000000")
 }
@@ -722,17 +822,29 @@ fn recipient_details(peers: &[Peer], transfers: &[Transfer], key: &str) -> Vec<R
                 "sending" => format!("Sending · {}", size_pair(t.sent, t.size)),
                 "staging" => "Preparing…".into(),
                 "queued" | "waiting_for_device" => "Waiting · not connected".into(),
-                "failed" => format!(
-                    "Failed · {}",
-                    super::notifications::send_failure_reason(
+                "failed" if t.error.as_deref() == Some("Needs a Pneu update") => {
+                    "Needs a Pneu update".into()
+                }
+                "failed" => {
+                    let failure = transfer_failure(
+                        t,
                         peer.map(|p| p.name.as_str()).unwrap_or("a removed device"),
-                        t.error.as_deref().unwrap_or_default(),
-                    )
-                ),
+                    );
+                    if matches!(
+                        t.error.as_deref(),
+                        Some("Connection lost" | "Connection interrupted")
+                    ) {
+                        failure
+                    } else {
+                        format!("Failed · {failure}")
+                    }
+                }
                 "sent" => t
                     .finished_at
                     .map(|at| format!("Sent · {}", super::last_seen(at)))
                     .unwrap_or_else(|| "Sent".into()),
+                "cancelled" if replaced(t) => "Not sent · replaced".into(),
+                "skipped" => t.error.clone().unwrap_or_default(),
                 "cancelled" => "Stopped".into(),
                 other => other.into(),
             };
@@ -744,7 +856,9 @@ fn recipient_details(peers: &[Peer], transfers: &[Transfer], key: &str) -> Vec<R
                     .unwrap_or("a removed device")
                     .into(),
                 phone: peer.is_some_and(|p| p.phone),
-                tone: if t.state == "failed" {
+                tone: if replaced(t) {
+                    Tone::Warn
+                } else if t.state == "failed" {
                     Tone::Danger
                 } else {
                     peer.map(|p| p.health.tone()).unwrap_or_default()
@@ -756,20 +870,45 @@ fn recipient_details(peers: &[Peer], transfers: &[Transfer], key: &str) -> Vec<R
                     -1.0
                 },
                 can_stop: active,
-                can_retry: t.state == "failed" && artifact_id(t).is_some(),
+                can_retry: replaced(t)
+                    || (t.state == "failed"
+                        && artifact_id(t).is_some()
+                        && super::notifications::retryable_reason(
+                            t.error.as_deref().unwrap_or_default(),
+                        )),
             }
         })
         .collect()
 }
 
+fn transfer_failure(t: &Transfer, name: &str) -> String {
+    if matches!(
+        t.error.as_deref(),
+        Some("Connection lost" | "Connection interrupted")
+    ) {
+        if t.sent > 0 {
+            format!("Connection lost · {} sent", size_pair(t.sent, t.size))
+        } else {
+            "Connection lost".into()
+        }
+    } else {
+        super::notifications::send_failure_reason(name, t.error.as_deref().unwrap_or_default())
+    }
+}
+
 /// Recent: active, waiting and failed items first, then the last three done.
 fn recent(peers: &[Peer], transfers: &[Transfer]) -> Vec<RecentItem> {
     let name = |id: &str| {
-        peers
+        let name = peers
             .iter()
             .find(|p| p.id == id)
             .map(|p| p.name.clone())
-            .unwrap_or_else(|| "a removed device".into())
+            .unwrap_or_else(|| "a removed device".into());
+        if name.chars().count() > 24 {
+            format!("{}…", name.chars().take(23).collect::<String>())
+        } else {
+            name
+        }
     };
     let mut operations: Vec<(String, Vec<&Transfer>)> = Vec::new();
     for t in transfers {
@@ -782,14 +921,13 @@ fn recent(peers: &[Peer], transfers: &[Transfer]) -> Vec<RecentItem> {
     operations.sort_by_key(|(_, list)| {
         std::cmp::Reverse(list.iter().filter_map(|t| t.finished_at).max().unwrap_or(0))
     });
-    let several = peers.len() > 1;
     let (mut open, mut done) = (Vec::new(), Vec::new());
     for (operation, list) in operations {
         let first = list[0];
         let live: Vec<_> = list
             .iter()
             .copied()
-            .filter(|t| t.state != "cancelled")
+            .filter(|t| (t.state != "cancelled" || replaced(t)) && t.state != "skipped")
             .collect();
         if live.is_empty() {
             continue;
@@ -800,7 +938,8 @@ fn recent(peers: &[Peer], transfers: &[Transfer]) -> Vec<RecentItem> {
             can_details: !first.incoming() && list.iter().any(|t| has_recipient(t)),
             title: first.file_name.as_str().into(),
             batch: artifact_id(first).is_none(),
-            picture,
+            picture: picture && first.folder.is_none(),
+            folder: first.folder.is_some(),
             video: is_video(&first.file_name),
             progress: -1.0,
             ..Default::default()
@@ -835,31 +974,48 @@ fn recent(peers: &[Peer], transfers: &[Transfer]) -> Vec<RecentItem> {
             if !sending.is_empty() {
                 continue; // The sender's device row shows incoming progress.
             }
-            item.detail = with_time(if several {
-                format!("From {}", name(&first.device))
-            } else {
-                String::new()
-            })
-            .into();
+            item.detail = with_time(format!("From {}", name(&first.device))).into();
+            if let Some(folder) = &first.folder {
+                let prefix = format!("From {} · ", name(&first.device));
+                item.detail = with_time(format!(
+                    "{prefix}{}, {}",
+                    crate::folders::items(folder.items),
+                    crate::folders::size_label(folder.content_size.unwrap_or(first.size))
+                ))
+                .into();
+            }
             item.can_open = first.path.is_some();
             done.push(item);
             continue;
         }
         if !sending.is_empty() {
-            let (sent, size) = live
+            let active: Vec<_> = live.iter().copied().filter(|t| !replaced(t)).collect();
+            let (sent, size) = active
                 .iter()
                 .fold((0, 0), |(s, z), t| (s + t.sent, z + t.size));
             item.detail = if sending.iter().all(|t| t.state == "staging") {
-                "Preparing…".into()
+                if let Some(folder) = &first.folder {
+                    if first.size > 0 {
+                        format!("Preparing · {}", size_pair(first.sent, first.size))
+                    } else {
+                        format!("Preparing · {}", crate::folders::items(folder.items))
+                    }
+                } else {
+                    "Preparing…".into()
+                }
             } else {
-                match distinct_recipients(&live) {
+                match distinct_recipients(&active) {
                     1 => format!("Sending · {}", size_pair(sent, size)),
                     n => format!("Sending to {n} devices · {}", size_pair(sent, size)),
                 }
             }
             .into();
             item.progress = if sending.iter().all(|t| t.state == "staging") {
-                -1.0
+                if first.folder.is_some() && first.size > 0 {
+                    fraction(first.sent, first.size)
+                } else {
+                    -1.0
+                }
             } else {
                 fraction(sent, size)
             };
@@ -876,21 +1032,29 @@ fn recent(peers: &[Peer], transfers: &[Transfer]) -> Vec<RecentItem> {
             .into();
             item.can_cancel = true;
             open.push(item);
+        } else if distinct_recipients(&list) == 1 && live.iter().any(|t| replaced(t)) {
+            item.detail = "Not sent · old device replaced".into();
+            item.detail_tone = Tone::Warn;
+            item.can_retry = true;
+            item.can_dismiss = true;
+            open.push(item);
         } else if !failed.is_empty() {
             item.detail = match failed.as_slice() {
                 [one] if !has_recipient(one) => one
                     .error
                     .clone()
                     .unwrap_or_else(|| "Couldn't send this item".into()),
-                [one] => super::notifications::send_failure_reason(
-                    &name(&one.device),
-                    one.error.as_deref().unwrap_or_default(),
-                ),
+                [one] => transfer_failure(one, &name(&one.device)),
                 many => format!("Failed on {} devices", distinct_recipients(many)),
             }
             .into();
             item.detail_tone = Tone::Danger;
-            item.can_retry = failed.iter().any(|t| artifact_id(t).is_some());
+            item.can_retry = failed.iter().any(|t| {
+                artifact_id(t).is_some()
+                    && super::notifications::retryable_reason(
+                        t.error.as_deref().unwrap_or_default(),
+                    )
+            });
             item.can_dismiss = !transfers.iter().any(|t| {
                 (if artifact_id(first).is_some() {
                     artifact_key(t) == artifact_key(first)
@@ -905,11 +1069,37 @@ fn recent(peers: &[Peer], transfers: &[Transfer]) -> Vec<RecentItem> {
         } else {
             let sent: Vec<_> = live.iter().filter(|t| t.state == "sent").copied().collect();
             item.detail = with_time(match sent.as_slice() {
-                _ if !several => String::new(),
-                [one] => format!("To {}", name(&one.device)),
+                [one, ..] if distinct_recipients(&sent) == 1 => format!("To {}", name(&one.device)),
                 many => format!("To {} devices", distinct_recipients(many)),
             })
             .into();
+            if let Some(folder) = &first.folder {
+                let prefix = match sent.as_slice() {
+                    [one, ..] if distinct_recipients(&sent) == 1 => {
+                        format!("To {} · ", name(&one.device))
+                    }
+                    many => format!("To {} devices · ", distinct_recipients(many)),
+                };
+                let content = if folder.failed + folder.links + folder.special > 0 {
+                    if folder.failed > 0 {
+                        item.detail_tone = Tone::Warn;
+                    }
+                    format!(
+                        "Sent {} of {} items",
+                        crate::folders::grouped(folder.items),
+                        crate::folders::grouped(
+                            folder.items + folder.failed + folder.links + folder.special
+                        )
+                    )
+                } else {
+                    format!(
+                        "{}, {}",
+                        crate::folders::items(folder.items),
+                        crate::folders::size_label(folder.content_size.unwrap_or(first.size))
+                    )
+                };
+                item.detail = with_time(format!("{prefix}{content}")).into();
+            }
             item.can_open = first.path.is_some();
             done.push(item);
         }
@@ -926,6 +1116,35 @@ fn seen(timestamp: u64) -> String {
         time => time,
     }
 }
+fn replacement_text(offer: &crate::store::replacement::Offer) -> String {
+    let when = if offer.last_seen == 0 {
+        "It hasn't connected yet.".into()
+    } else {
+        let label = chrono::DateTime::from_timestamp_millis(offer.last_seen as i64)
+            .map(|t| {
+                let time = t.with_timezone(&chrono::Local);
+                let today = chrono::Local::now().date_naive();
+                if time.date_naive() == today {
+                    format!("today at {}", super::last_seen(offer.last_seen))
+                } else if Some(time.date_naive()) == today.pred_opt() {
+                    "yesterday".into()
+                } else {
+                    time.format("%b %-d").to_string()
+                }
+            })
+            .unwrap_or_else(|| seen(offer.last_seen));
+        format!("It last connected {label}.")
+    };
+    format!(
+        "{when} Replace it if this is the same {}.",
+        if offer.role == "phone" {
+            "phone"
+        } else {
+            "computer"
+        }
+    )
+}
+
 fn is_picture(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     [
@@ -952,22 +1171,9 @@ fn percent(sent: u64, size: u64) -> u32 {
 }
 /// "12 of 40 MB": both numbers in the total's unit.
 fn size_pair(sent: u64, size: u64) -> String {
-    let (unit, scale) = match size {
-        0..1_000 => ("B", 1.0),
-        1_000..1_000_000 => ("KB", 1e3),
-        1_000_000..1_000_000_000 => ("MB", 1e6),
-        _ => ("GB", 1e9),
-    };
-    let number = |bytes: u64| {
-        let value = bytes as f64 / scale;
-        if value < 10.0 && scale > 1.0 && value.fract() >= 0.05 {
-            format!("{value:.1}")
-        } else {
-            format!("{value:.0}")
-        }
-    };
-    format!("{} of {} {unit}", number(sent.min(size)), number(size))
+    crate::folders::size_pair(sent, size)
 }
+
 pub(crate) fn files_title(paths: &[PathBuf], prefix: &str) -> String {
     match paths {
         [one] => format!(
@@ -983,17 +1189,26 @@ pub(crate) fn files_title(paths: &[PathBuf], prefix: &str) -> String {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Frame {
+    targets: Vec<SendTarget>,
     error: String,
     summary: SummaryData,
     devices: Vec<DeviceItem>,
     recent: Vec<RecentItem>,
+    history: Vec<crate::store::history::Item>,
+    keep_history: bool,
     manual_clipboard: bool,
+    pair_again: bool,
     motion: bool,
     device: DeviceItem,
     device_summary: SummaryData,
     device_action: String,
     device_settings: Vec<SettingItem>,
     device_note: String,
+    device_link: DeviceLink,
+    top: TopCard,
+    link_full: bool,
+    paired_detail: String,
+    paired_only: bool,
     first_run: bool,
     network: bool,
     pairing: String,
@@ -1013,6 +1228,8 @@ struct Frame {
     copy_images: bool,
     viewer: bool,
     name: String,
+    unreachable: bool,
+    tailscale: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1025,9 +1242,16 @@ struct Join {
     cancel_requested: bool,
     // The offer card's attempt is a preview the user hasn't chosen yet.
     offer: bool,
+    // Also link with your other devices, frozen when the user confirms.
+    #[serde(default = "linked_by_default")]
+    link: bool,
     #[serde(skip)]
     origin: View,
     reported: String,
+}
+
+fn linked_by_default() -> bool {
+    true
 }
 
 struct Paired {
@@ -1035,6 +1259,20 @@ struct Paired {
     name: String,
     device: Option<String>,
     at: Instant,
+    linked_at: Option<Instant>,
+    linked: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PairAgainAttempt {
+    Invitation(pneu_proto::Hash),
+    Join(String),
+    Paired(pneu_proto::Id),
+}
+
+struct PairAgain {
+    old: crate::outbox::Authority,
+    attempt: Option<PairAgainAttempt>,
 }
 
 #[derive(Default)]
@@ -1113,11 +1351,15 @@ pub fn run(paths: Paths) -> Result<()> {
     ));
     let focused = Arc::new(AtomicBool::new(false));
     let view = Arc::new(Mutex::new(View::default()));
-    let focus = focused.clone();
-    window.global::<WindowFocus>().on_changed(move |value| {
-        focus.store(value, Ordering::SeqCst);
-    });
     let (commands, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let focus = focused.clone();
+    let focus_commands = commands.clone();
+    window.global::<WindowFocus>().on_changed(move |value| {
+        let was_focused = focus.swap(value, Ordering::SeqCst);
+        if value && !was_focused {
+            let _ = focus_commands.send(Action::Focused);
+        }
+    });
     connect(&window, &commands, &view);
     let c = commands.clone();
     window.window().on_close_requested(move || {
@@ -1142,6 +1384,8 @@ pub fn run(paths: Paths) -> Result<()> {
         window.global::<Ui>().set_drop_supported(true);
         install_drop(&window, &view, &commands);
     }
+    #[cfg(all(target_os = "linux", pneu_qt_drag))]
+    install_drop(&window, &view, &commands);
     #[cfg(windows)]
     let _login_poll = super::windows_login::install(&window);
     let weak = window.as_weak();
@@ -1160,6 +1404,7 @@ pub fn run(paths: Paths) -> Result<()> {
                     _ = async {invitation_job.as_mut().expect("invitation subscription").await} => {invitation_job=None;},
                     _ = timer.tick() => {},
                     result = job_result(&mut worker.folder_job) => { worker.folder_job = None; if let Some(origin) = worker.folder_origin.take() { worker.origin = origin; if let Err(error) = result { worker.fail("Couldn't change the folder", error); } } },
+                    result = job_result(&mut worker.open_folder_job) => { worker.opened_folder(result); },
                     result = job_result(&mut worker.open_job) => { worker.open_job = None; if let Some(origin) = worker.open_origin.take() { worker.origin = origin; if let Err(error) = result { let message = if error.is::<crate::actions::FileUnavailable>() { "The file was moved or deleted" } else { "Couldn't open it" }; worker.fail(message, error); } } },
                     result = job_result(&mut worker.chooser) => { worker.chooser = None; if let Some(origin) = worker.chooser_origin.take() { worker.origin = origin; if worker.current() { worker.chosen(result).await; } } },
                     command = rx.recv() => {
@@ -1174,14 +1419,14 @@ pub fn run(paths: Paths) -> Result<()> {
                         }
                     }
                 }
-                let _ = ipc::request(&worker.paths.socket,ipc::Command::WindowFocus { request: worker.request, focused: visible.load(Ordering::SeqCst) && focused.load(Ordering::SeqCst) }).await;
+                let _ = ipc::request(&worker.paths.socket,ipc::Command::WindowFocus { request: worker.request, focused: visible.load(Ordering::SeqCst) && focused.load(Ordering::SeqCst), visible: visible.load(Ordering::SeqCst) }).await;
                 let value = match ipc::request(&worker.paths.socket,ipc::Command::UiStatus).await {
                     Ok(value) => value,
                     Err(error) => { worker.status_failed(error); continue; }
                 };
                 if let Err(error) = worker.refresh(value, &visible).await { worker.status_failed(error); }
             }
-            let _ = ipc::request(&worker.paths.socket,ipc::Command::WindowFocus { request: worker.request, focused: false }).await;
+            let _ = ipc::request(&worker.paths.socket,ipc::Command::WindowFocus { request: worker.request, focused: false, visible: false }).await;
             drop(invitation_job);
             worker.release().await;
             let _ = slint::quit_event_loop();
@@ -1221,6 +1466,8 @@ pub fn run(paths: Paths) -> Result<()> {
     super::macos::native::cleanup();
     #[cfg(windows)]
     super::windows_drag::cleanup();
+    #[cfg(all(target_os = "linux", pneu_qt_drag))]
+    super::linux_drag::cleanup();
     drop(window);
     drop(commands);
     let _ = worker.join();
@@ -1228,12 +1475,93 @@ pub fn run(paths: Paths) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", pneu_qt_drag),
+    windows,
+    all(test, unix)
+))]
+fn drop_choices(
+    origin: &View,
+    devices: &[DeviceItem],
+    folders: bool,
+) -> (Vec<DropItem>, Vec<Vec<contract::CapturedTarget>>) {
+    let mut bindings = origin.targets.clone().unwrap_or_default();
+    if folders {
+        for target in &mut bindings {
+            if let Some(reason) = &target.folder_reason {
+                target.eligible = false;
+                target.reason = Some(reason.clone());
+            }
+        }
+    }
+    let all = contract::resolve_files(&bindings, crate::file_recipients::Selection::ConnectedOnly)
+        .unwrap_or_default();
+    let any_supported = !all.is_empty();
+    let selected = if folders {
+        contract::resolve_files(
+            origin.targets.as_deref().unwrap_or_default(),
+            crate::file_recipients::Selection::ConnectedOnly,
+        )
+        .unwrap_or_default()
+    } else {
+        all
+    };
+    let mut targets = Vec::new();
+    let mut labels = Vec::new();
+    if devices.len() != 1 {
+        targets.push(selected);
+        labels.push(DropItem {
+            sub: "".into(),
+            name: "All connected devices".into(),
+            enabled: any_supported,
+        });
+    }
+    for device in devices {
+        let authority = bindings
+            .iter()
+            .find(|t| t.device == device.id.as_str())
+            .and_then(|t| {
+                Some(contract::CapturedTarget {
+                    device: t.device.clone(),
+                    generation: t.generation,
+                    fingerprint: t.fingerprint.clone()?,
+                })
+            });
+        labels.push(DropItem {
+            sub: bindings
+                .iter()
+                .find(|t| t.device == device.id.as_str())
+                .and_then(|t| {
+                    if folders {
+                        t.folder_reason.clone()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default()
+                .into(),
+            name: device.name.clone(),
+            enabled: device.connected
+                && authority.is_some()
+                && bindings
+                    .iter()
+                    .find(|t| t.device == device.id.as_str())
+                    .is_none_or(|t| t.eligible),
+        });
+        targets.push(authority.into_iter().collect());
+    }
+    (labels, targets)
+}
+
+#[cfg(any(target_os = "macos", all(target_os = "linux", pneu_qt_drag), windows))]
 fn install_drop(
     window: &PneuWindow,
     view: &Arc<Mutex<View>>,
     commands: &tokio::sync::mpsc::UnboundedSender<Action>,
 ) {
+    #[cfg(all(target_os = "linux", pneu_qt_drag))]
+    use super::linux_drag as native_drop;
     #[cfg(target_os = "macos")]
     use super::macos::drag as native_drop;
     #[cfg(windows)]
@@ -1244,6 +1572,8 @@ fn install_drop(
         origin: View,
         targets: Vec<Vec<contract::CapturedTarget>>,
         enabled: Vec<bool>,
+        folders: bool,
+        all_connected: bool,
     }
     impl DropSession {
         fn enabled_now(&self, window: &PneuWindow) -> Vec<bool> {
@@ -1258,9 +1588,19 @@ fn install_drop(
                                 .iter()
                                 .map(|target| target.device.as_str()),
                             |id| {
-                                peers
-                                    .iter()
-                                    .any(|peer| peer.id.as_str() == id && peer.connected)
+                                let supported = !self.all_connected
+                                    || index != 0
+                                    || !self.folders
+                                    || self
+                                        .origin
+                                        .targets
+                                        .as_ref()
+                                        .and_then(|targets| targets.iter().find(|t| t.device == id))
+                                        .is_some_and(|t| t.folder_reason.is_none());
+                                supported
+                                    && peers
+                                        .iter()
+                                        .any(|peer| peer.id.as_str() == id && peer.connected)
                             },
                         )
                 })
@@ -1293,7 +1633,7 @@ fn install_drop(
     let pending = session.clone();
     let weak = window.as_weak();
     let frame = view.clone();
-    let begin = std::rc::Rc::new(move || {
+    let begin = std::rc::Rc::new(move |paths: &[PathBuf]| {
         let Some(w) = weak.upgrade() else {
             return false;
         };
@@ -1306,32 +1646,9 @@ fn install_drop(
             return false;
         }
         let origin = frame.lock().expect("drop frame").clone();
-        let bindings = origin.targets.clone().unwrap_or_default();
-        let all =
-            contract::resolve_files(&bindings, crate::file_recipients::Selection::ConnectedOnly)
-                .unwrap_or_default();
-        let mut targets = vec![all];
-        let mut labels = vec![DropItem {
-            name: "All connected devices".into(),
-            enabled: !targets[0].is_empty(),
-        }];
-        for device in ui.get_devices().iter() {
-            let authority = bindings
-                .iter()
-                .find(|t| t.device == device.id.as_str())
-                .and_then(|t| {
-                    Some(contract::CapturedTarget {
-                        device: t.device.clone(),
-                        generation: t.generation,
-                        fingerprint: t.fingerprint.clone()?,
-                    })
-                });
-            labels.push(DropItem {
-                name: device.name,
-                enabled: device.connected && authority.is_some(),
-            });
-            targets.push(authority.into_iter().collect());
-        }
+        let folders = paths.iter().any(|p| p.is_dir());
+        let devices = ui.get_devices().iter().collect::<Vec<_>>();
+        let (labels, targets) = drop_choices(&origin, &devices, folders);
         let enabled = labels.iter().map(|l| l.enabled).collect();
         ui.set_drop_items(ModelRc::new(VecModel::from(labels)));
         ui.set_drop_active(true);
@@ -1339,6 +1656,8 @@ fn install_drop(
             origin,
             targets,
             enabled,
+            folders,
+            all_connected: devices.len() != 1,
         });
         true
     });
@@ -1355,7 +1674,7 @@ fn install_drop(
             .and_then(|s| s.hit(&w, point));
         w.global::<Ui>()
             .set_drop_hover(selected.map(|i| i as i32).unwrap_or(-1));
-        #[cfg(windows)]
+        #[cfg(any(target_os = "linux", windows))]
         if selected.is_none() && w.global::<Ui>().get_drop_active() {
             return outside_drop_list(&w, point);
         }
@@ -1380,7 +1699,7 @@ fn install_drop(
             return false;
         }
         let index = session.hit(&w, point);
-        #[cfg(windows)]
+        #[cfg(any(target_os = "linux", windows))]
         if index.is_none() && outside_drop_list(&w, point) {
             return output
                 .send(Action::DropFiles {
@@ -1415,7 +1734,7 @@ fn install_drop(
                 files,
                 targets,
                 origin: session.origin,
-                targeted: index != 0,
+                targeted: !session.all_connected || index != 0,
             })
             .is_ok()
     });
@@ -1443,6 +1762,10 @@ fn install_drop(
         }
         EventResult::Propagate
     });
+    #[cfg(all(target_os = "linux", pneu_qt_drag))]
+    window
+        .global::<Ui>()
+        .set_drop_supported(native_drop::install(window, callbacks));
     // Share the existing event filter: Slint can create its HWND after show()
     // and before the first native event, later than a zero-duration timer.
     #[cfg(windows)]
@@ -1451,7 +1774,7 @@ fn install_drop(
     });
 }
 
-#[cfg(windows)]
+#[cfg(any(all(target_os = "linux", pneu_qt_drag), windows))]
 fn outside_drop_list(window: &PneuWindow, point: (f64, f64)) -> bool {
     let g = window.get_drop_geometry();
     point.0.is_finite()
@@ -1462,22 +1785,125 @@ fn outside_drop_list(window: &PneuWindow, point: (f64, f64)) -> bool {
             && point.1 < (g.y + g.height) as f64)
 }
 
+#[cfg(all(test, target_os = "linux", pneu_qt_drag))]
+#[path = "linux_drag_tests.rs"]
+mod linux_drag_tests;
+
 #[derive(Clone)]
 struct UiSender {
     commands: tokio::sync::mpsc::UnboundedSender<Action>,
     view: Arc<Mutex<View>>,
 }
 impl UiSender {
+    // Capture the displayed frame here, after callers have released any view
+    // guard. Pre-scoping an action while holding that guard would lock it twice.
     fn send(
         &self,
         action: Action,
-    ) -> std::result::Result<(), tokio::sync::mpsc::error::SendError<Action>> {
+    ) -> std::result::Result<(), Box<tokio::sync::mpsc::error::SendError<Action>>> {
         if matches!(action, Action::Close) {
-            return self.commands.send(action);
+            return self.commands.send(action).map_err(Box::new);
         }
         let view = self.view.lock().expect("window view").clone();
-        self.commands.send(Action::Scoped(view, Box::new(action)))
+        self.commands
+            .send(Action::Scoped(view, Box::new(action)))
+            .map_err(Box::new)
     }
+}
+
+// Slint 1.15 elides horizontal overflow but silently drops extra wrapped lines.
+// Use its renderer for the exact window font, fallback fonts and scale. These
+// internals are available through Slint's re-exports; Slint is pinned to 1.15.1.
+fn update_history_order(
+    order: &mut Vec<String>,
+    old: &[crate::store::history::Item],
+    items: &[crate::store::history::Item],
+    open: bool,
+) {
+    if !open {
+        *order = items.iter().map(|i| i.id.clone()).collect();
+        return;
+    }
+    order.retain(|id| items.iter().any(|i| &i.id == id));
+    // Only the unpinned row moves. Other Recent rows keep their displayed order,
+    // even if selecting one updated its copy time while this page was open.
+    for (rank, item) in items.iter().enumerate() {
+        if item.pinned.is_none() && old.iter().any(|i| i.id == item.id && i.pinned.is_some()) {
+            order.retain(|id| id != &item.id);
+            let position = order
+                .iter()
+                .position(|id| {
+                    items
+                        .iter()
+                        .position(|i| &i.id == id && i.pinned.is_none())
+                        .is_some_and(|r| r > rank)
+                })
+                .unwrap_or(order.len());
+            order.insert(position, item.id.clone());
+        }
+    }
+    let mut new: Vec<_> = items
+        .iter()
+        .filter(|i| !order.contains(&i.id))
+        .map(|i| i.id.clone())
+        .collect();
+    new.append(order);
+    *order = new;
+}
+
+fn history_text_size(window: &PneuWindow, text: &str, width: f32) -> (f32, f32) {
+    use slint::private_unstable_api::re_exports::{
+        ComplexText, ItemRc, LogicalLength, TextWrap, WindowInner,
+    };
+    let inner = WindowInner::from_pub(window.window());
+    let adapter = inner.window_adapter();
+    let item = ItemRc::new(inner.component(), 0);
+    let probe = std::pin::pin!(ComplexText::default());
+    probe.text.set(text.into());
+    let size = adapter.renderer().text_size(
+        probe.as_ref(),
+        &item,
+        Some(LogicalLength::new(width)),
+        TextWrap::WordWrap,
+    );
+    (size.width, size.height)
+}
+
+fn history_title(window: &PneuWindow, text: &str, width: f32, height: f32) -> SharedString {
+    if width <= 0.0 || height <= 0.0 {
+        return SharedString::default();
+    }
+    fit_history_title(text, |candidate| {
+        let (w, h) = history_text_size(window, candidate, width.floor());
+        w <= width && h.ceil() <= height
+    })
+    .into()
+}
+
+fn fit_history_title(text: &str, mut fits: impl FnMut(&str) -> bool) -> String {
+    use slint::private_unstable_api::re_exports::UnicodeSegmentation;
+    if fits(text) {
+        return text.into();
+    }
+    if !fits("…") {
+        return String::new();
+    }
+    // Search complete graphemes, including the ellipsis in every measurement.
+    let ends: Vec<_> = text.grapheme_indices(true).map(|(i, _)| i).collect();
+    let mut low = 0;
+    let mut high = ends.len();
+    let mut result = String::from("…");
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let candidate = format!("{}…", text[..ends[mid]].trim_end());
+        if fits(&candidate) {
+            result = candidate;
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    result
 }
 
 fn connect(
@@ -1492,8 +1918,20 @@ fn connect(
     let ui = window.global::<Ui>();
     ui.set_devices(ModelRc::new(VecModel::<DeviceItem>::default()));
     ui.set_recent(ModelRc::new(VecModel::<RecentItem>::default()));
+    ui.set_history(ModelRc::new(VecModel::<HistoryItem>::default()));
+    let weak = window.as_weak();
+    ui.on_elide_history_title(move |text, width, height| {
+        weak.upgrade()
+            .map(|window| history_title(&window, &text, width, height))
+            .unwrap_or_default()
+    });
     ui.set_recipients(ModelRc::new(VecModel::<RecipientItem>::default()));
     ui.set_device_settings(ModelRc::new(VecModel::<SettingItem>::default()));
+    // High error correction keeps the code readable under Pneu's icon.
+    match qr_image(DOWNLOAD_PAGE, qrcode::EcLevel::H, 1) {
+        Ok(pixels) => ui.set_download_qr(slint::Image::from_rgba8(pixels)),
+        Err(error) => eprintln!("pneud window: download code: {error:#}"),
+    }
     let send = |action: fn() -> Action| {
         let c = commands.clone();
         move || {
@@ -1522,14 +1960,56 @@ fn connect(
         });
     }
     ui.on_choose_folder(send(|| Action::Folder));
+    ui.on_open_folder(send(|| Action::OpenFolder));
     ui.on_send_clipboard(send(|| Action::SendClipboard));
+    ui.on_history_searching(|query| !crate::store::history::search_key(&query).is_empty());
+    ui.on_filter_history(|items, query, pinned| {
+        let query = crate::store::history::search_key(&query);
+        ModelRc::new(slint::FilterModel::new(items, move |i| {
+            i.pinned == pinned && (query.is_empty() || (!i.picture && i.search.contains(&query)))
+        }))
+    });
+    let pin_tx = commands.clone();
+    ui.on_pin_history(move |id, pinned| {
+        let _ = pin_tx.send(Action::PinHistory(id.to_string(), pinned));
+    });
+    ui.on_copy_history(with(Action::CopyHistory));
+    ui.on_disable_empty_history(send(|| Action::DisableEmptyHistory));
+    ui.on_delete_history(with(Action::DeleteHistory));
+    ui.on_clear_history(send(|| Action::ClearHistory));
     ui.on_show_code(send(|| Action::ShowCode));
     ui.on_new_code(send(|| Action::NewCode));
-    ui.on_offer_pair(send(|| Action::OfferPair));
+    let c = commands.clone();
+    ui.on_offer_pair(move |link| {
+        let _ = c.send(Action::OfferPair(link));
+    });
+    let c = commands.clone();
+    ui.on_confirm_join(move |link| {
+        let _ = c.send(Action::ConfirmJoin(link));
+    });
+    let c = commands.clone();
+    ui.on_top_action(move |yes| {
+        let _ = c.send(Action::TopCard(yes));
+    });
+    ui.on_top_close(send(|| Action::TopCardClose));
+    ui.on_link_device(with(Action::LinkDevice));
+    let c = commands.clone();
+    ui.on_answer(move |device, allow| {
+        let _ = c.send(Action::Answer(device.into(), allow));
+    });
+    ui.on_removing(with(Action::Removing));
+    ui.on_remove(with(Action::Remove));
     ui.on_offer_dismiss(send(|| Action::OfferDismiss));
     ui.on_picker_cancel(send(|| Action::PickerCancel));
+    ui.on_get_tailscale(send(|| Action::GetTailscale));
     ui.on_unpair(with(Action::Unpair));
+    ui.on_pair_again_started(with(Action::PairAgain));
     ui.on_send_files(with(Action::SendFiles));
+    let ring_commands = commands.clone();
+    ui.on_ring_phone(move |device, connection, stop| {
+        let _ = ring_commands.send(Action::Ring(device.into(), connection.into(), stop));
+    });
+    ui.on_send_folder(with(Action::SendFolder));
     ui.on_cancel_item(with(Action::Cancel));
     ui.on_retry_item(with(Action::Retry));
     ui.on_dismiss_item(with(Action::Dismiss));
@@ -1562,8 +2042,18 @@ fn connect(
         let _ = c.send(Action::SetMode(mode));
     });
     let c = commands.clone();
+    let weak = window.as_weak();
     ui.on_message_action(move |action, primary| {
-        let _ = c.send(Action::Message(action.into(), primary));
+        if action == "replace-device" {
+            if let Some(window) = weak.upgrade() {
+                let _ = c.send(Action::ReplacementAnswer(
+                    window.global::<Ui>().get_replacement_intent().into(),
+                    primary,
+                ));
+            }
+        } else {
+            let _ = c.send(Action::Message(action.into(), primary));
+        }
     });
     let c = commands.clone();
     let weak = window.as_weak();
@@ -1591,6 +2081,8 @@ fn connect(
             device: ui.get_device_id().into(),
             add_tab: ui.get_add_tab(),
             targets: current.targets.clone(),
+            setup: current.setup.clone(),
+            top: current.top.clone(),
         };
         drop(current);
         #[cfg(target_os = "macos")]
@@ -1606,6 +2098,11 @@ type Chosen = (
     View,
     Option<Vec<PathBuf>>,
 );
+
+/// Window choices about linking that outlive the window (window_setup.rs).
+fn setup_state_path(paths: &Paths) -> PathBuf {
+    paths.data.join("pneu-window-linking.json")
+}
 
 fn join_journal_path(paths: &Paths) -> PathBuf {
     #[cfg(windows)]
@@ -1649,6 +2146,8 @@ struct Worker {
     invitation_revision: u64,
     folder_job: Option<futures_util::future::BoxFuture<'static, Result<()>>>,
     folder_origin: Option<View>,
+    open_folder_job: Option<futures_util::future::BoxFuture<'static, Result<()>>>,
+    open_folder_origin: Option<(View, PathBuf)>,
     open_job: Option<futures_util::future::BoxFuture<'static, Result<()>>>,
     open_origin: Option<View>,
     chooser_origin: Option<View>,
@@ -1660,6 +2159,9 @@ struct Worker {
     picker_clipboard: bool,
     send_request_id: Option<String>,
     handled_send: Option<String>,
+    folder_errors: HashSet<String>,
+    window_started: u64,
+    choosing_folder: bool,
     details: Option<String>,
     origin: View,
     restored_join: bool,
@@ -1668,6 +2170,8 @@ struct Worker {
     status_error: String,
     status: Value,
     snapshot: super::Snapshot,
+    history_order: Vec<String>,
+    history_search: HashMap<String, String>,
     transfers: Vec<Transfer>,
     pushed: Option<Frame>,
     phone_token: Option<pneu_proto::Hash>,
@@ -1679,12 +2183,24 @@ struct Worker {
     live_pairing_link: Option<String>,
     live_pairing_revision: u64,
     probed: bool,
-    known: HashSet<String>,
-    lost: HashSet<String>,
+    seen_pairing_token: Option<pneu_proto::Hash>,
     paired: Option<Paired>,
+    pair_again_choice: Option<PairAgain>,
+    replacement: Option<crate::store::replacement::Offer>,
+    replacement_shown: HashSet<pneu_proto::Id>,
     peer_settings: Option<(String, Value, Instant)>,
     last_view: View,
     requested_page: Option<Page>,
+    tailscale: Option<(bool, Instant)>,
+    setup: Setup,
+    remembered: Remembered,
+    // Remove from all devices, as the confirmation showed it.
+    removal: Option<Removal>,
+    // Your devices when a pairing page opened, for "Also linked".
+    known_roster: HashSet<String>,
+    removed_shown: Option<u64>,
+    // A notification's Remove… asked for this device's confirmation.
+    remove_request: Option<String>,
 }
 
 impl Worker {
@@ -1694,6 +2210,7 @@ impl Worker {
         view: Arc<Mutex<View>>,
         request: u64,
     ) -> Self {
+        let remembered = Remembered::load(&setup_state_path(&paths));
         Self {
             paths,
             weak,
@@ -1702,6 +2219,8 @@ impl Worker {
             invitation_revision: 0,
             folder_job: None,
             folder_origin: None,
+            open_folder_job: None,
+            open_folder_origin: None,
             open_job: None,
             open_origin: None,
             chooser_origin: None,
@@ -1713,6 +2232,9 @@ impl Worker {
             picker_clipboard: false,
             send_request_id: None,
             handled_send: None,
+            folder_errors: HashSet::new(),
+            window_started: crate::now_ms(),
+            choosing_folder: false,
             details: None,
             origin: View::default(),
             restored_join: false,
@@ -1721,6 +2243,8 @@ impl Worker {
             status_error: String::new(),
             status: Value::Null,
             snapshot: Default::default(),
+            history_order: Vec::new(),
+            history_search: HashMap::new(),
             transfers: Vec::new(),
             pushed: None,
             phone_token: None,
@@ -1732,11 +2256,20 @@ impl Worker {
             live_pairing_link: None,
             live_pairing_revision: 0,
             probed: false,
-            known: HashSet::new(),
-            lost: HashSet::new(),
+            seen_pairing_token: None,
             paired: None,
+            pair_again_choice: None,
+            replacement: None,
+            replacement_shown: HashSet::new(),
             peer_settings: None,
             requested_page: None,
+            tailscale: None,
+            setup: Setup::default(),
+            remembered,
+            removal: None,
+            known_roster: HashSet::new(),
+            removed_shown: None,
+            remove_request: None,
             last_view: View {
                 page: Page::Main,
                 ..Default::default()
@@ -1800,6 +2333,34 @@ impl Worker {
         eprintln!("pneud window: {message}: {error:#}");
         if self.current() {
             self.action_error = format!("{message}.");
+        }
+    }
+    fn start_open_folder(&mut self) {
+        if self.open_folder_job.is_some() {
+            return;
+        }
+        let folder = PathBuf::from(
+            self.status["config"]["save_path"]
+                .as_str()
+                .unwrap_or_default(),
+        );
+        self.open_folder_origin = Some((self.view(), folder.clone()));
+        let socket = self.socket();
+        self.open_folder_job = Some(Box::pin(async move { open_folder(&socket, &folder).await }));
+    }
+    fn opened_folder(&mut self, result: Result<()>) {
+        self.open_folder_job = None;
+        if let Some((origin, folder)) = self.open_folder_origin.take() {
+            self.origin = origin;
+            if let Err(error) = result {
+                eprintln!(
+                    "pneud window: couldn't open {}: {error:#}",
+                    folder.display()
+                );
+                if self.current() {
+                    self.action_error = format!("Couldn't open {}", super::display_path(&folder));
+                }
+            }
         }
     }
     fn socket(&self) -> PathBuf {
@@ -1878,14 +2439,6 @@ impl Worker {
             }
         });
     }
-    fn device_ids(&self) -> HashSet<String> {
-        self.snapshot
-            .devices
-            .iter()
-            .map(|d| d.device.as_str().to_owned())
-            .collect()
-    }
-
     async fn act(&mut self, action: Action) {
         let action = match action {
             Action::Scoped(view, action) => {
@@ -1893,9 +2446,16 @@ impl Worker {
                 // eventual UI feedback is still gated by the originating view.
                 let global_write = matches!(
                     *action,
-                    Action::SetMode(_) | Action::SetFlag(_, _) | Action::Rename(_)
+                    Action::SetMode(_)
+                        | Action::SetFlag(_, _)
+                        | Action::Rename(_)
+                        | Action::DisableEmptyHistory
                 );
-                if self.view() != view && !global_write {
+                let pair_again_navigation = matches!(*action, Action::PairAgain(_))
+                    && view.page == Page::Device
+                    && self.view().page == Page::Add
+                    && self.view().revision == view.revision.wrapping_add(1);
+                if self.view() != view && !global_write && !pair_again_navigation {
                     return;
                 }
                 self.origin = view;
@@ -1913,11 +2473,48 @@ impl Worker {
             Action::Scoped(_, _) => unreachable!("nested UI action"),
             Action::Close => {}
             Action::Navigated => self.navigated(true).await,
+            Action::Focused => {
+                if self.view().page == Page::Add && self.join.is_none() {
+                    self.ui(|w| w.invoke_probe_clipboard());
+                }
+            }
             Action::Folder => {
                 if self.folder_job.is_none() {
                     self.folder_origin = Some(self.view());
                     let socket = self.socket();
                     self.folder_job = Some(Box::pin(async move { change_folder(&socket).await }));
+                }
+            }
+            Action::OpenFolder => self.start_open_folder(),
+            Action::PairAgain(device) => {
+                self.pair_again_choice = self
+                    .origin
+                    .targets
+                    .as_ref()
+                    .into_iter()
+                    .flatten()
+                    .find(|t| t.device == device)
+                    .and_then(|t| {
+                        Some(crate::outbox::Authority {
+                            device: pneu_proto::Id::new(&t.device).ok()?,
+                            generation: t.generation,
+                            fingerprint: pneu_proto::Hash::new(t.fingerprint.as_ref()?).ok()?,
+                        })
+                    })
+                    .map(|old| PairAgain { old, attempt: None });
+            }
+            Action::ReplacementAnswer(intent, replace) => {
+                if self
+                    .replacement
+                    .as_ref()
+                    .is_some_and(|o| o.id.as_str() == intent)
+                {
+                    self.answer_replacement(replace, None).await;
+                } else {
+                    self.fail(
+                        "Replacement incomplete",
+                        anyhow::anyhow!("The pairing changed. Confirm the current choice."),
+                    );
                 }
             }
             Action::Unpair(device) => match pneu_proto::Id::new(device.as_str()) {
@@ -1929,13 +2526,53 @@ impl Worker {
                 }
                 Err(error) => self.fail("Couldn't unpair", error.into()),
             },
+            Action::Ring(device, connection, stop) => {
+                let result = async {
+                    self.command(ipc::Command::Ring {
+                        device: pneu_proto::Id::new(device)?,
+                        connection: connection.parse()?,
+                        action: if stop {
+                            pneu_proto::RingAction::Stop
+                        } else {
+                            pneu_proto::RingAction::Start
+                        },
+                    })
+                    .await
+                }
+                .await;
+                if let Err(error) = result {
+                    self.fail("Couldn't ring phone", error);
+                }
+            }
+            Action::SendFolder(target) => {
+                if self.chooser.is_none() {
+                    self.choosing_folder = true;
+                    self.chooser_origin = Some(self.view());
+                    let bindings = self.captured_targets(&target);
+                    let origin = self.view();
+                    self.chooser = Some(Box::pin(async move {
+                        Ok((
+                            target,
+                            bindings,
+                            origin,
+                            choose_folder(Path::new("")).await?.map(|p| vec![p]),
+                        ))
+                    }));
+                }
+            }
             Action::SendFiles(target) => {
                 if self.chooser.is_none() {
                     self.chooser_origin = Some(self.view());
                     let bindings = self.captured_targets(&target);
                     let origin = self.view();
+                    self.choosing_folder = false;
+                    let folders = self.snapshot.send_targets.iter().any(|t| {
+                        (target.is_empty() || t.device.as_str() == target)
+                            && t.eligible
+                            && t.folder_reason.is_none()
+                    });
                     self.chooser = Some(Box::pin(async move {
-                        Ok((target, bindings, origin, choose_files("Send Files").await?))
+                        Ok((target, bindings, origin, choose_send_files(folders).await?))
                     }));
                 }
             }
@@ -1967,7 +2604,7 @@ impl Worker {
                 self.picker_files.clear();
                 self.picker_targets.clear();
             }
-            #[cfg(any(target_os = "macos", windows))]
+            #[cfg(any(target_os = "macos", all(target_os = "linux", pneu_qt_drag), windows))]
             Action::DropFiles {
                 files,
                 targets,
@@ -1978,7 +2615,7 @@ impl Worker {
                     let result = async {
                         let targets: Vec<crate::outbox::Authority> =
                             serde_json::from_value(serde_json::to_value(targets)?)?;
-                        #[cfg(windows)]
+                        #[cfg(any(target_os = "linux", windows))]
                         if targets.is_empty() {
                             self.command(ipc::Command::PresentFiles {
                                 paths: files,
@@ -2025,37 +2662,8 @@ impl Worker {
                         .await
                         .map(|_| ()),
                     MenuAction::Folder => {
-                        let folder = self.status["config"]["save_path"]
-                            .as_str()
-                            .map(PathBuf::from)
-                            .context("save folder");
-                        match folder {
-                            Ok(folder) => {
-                                let create = folder.clone();
-                                let created = tokio::task::spawn_blocking(move || {
-                                    crate::storage::Folder::open(&create, true)
-                                })
-                                .await;
-                                match created {
-                                    Ok(Ok(_anchor)) => {
-                                        let (send, receive) = tokio::sync::oneshot::channel();
-                                        match slint::invoke_from_event_loop(move || {
-                                            let _ =
-                                                send.send(super::macos::native::open_path(&folder));
-                                        }) {
-                                            Ok(()) => receive
-                                                .await
-                                                .map_err(anyhow::Error::from)
-                                                .and_then(|result| result),
-                                            Err(error) => Err(error.into()),
-                                        }
-                                    }
-                                    Ok(Err(error)) => Err(error),
-                                    Err(error) => Err(error.into()),
-                                }
-                            }
-                            Err(error) => Err(error),
-                        }
+                        self.start_open_folder();
+                        Ok(())
                     }
                     MenuAction::Settings => {
                         let result = self
@@ -2072,6 +2680,70 @@ impl Worker {
                 };
                 if let Err(error) = result {
                     self.fail("Couldn't complete the menu action", error);
+                }
+            }
+            Action::DisableEmptyHistory => {
+                match self
+                    .command(ipc::Command::DisableEmptyClipboardHistory)
+                    .await
+                {
+                    Ok(count) => {
+                        let Some(count) = count.as_u64() else {
+                            self.fail(
+                                "Couldn't save setting",
+                                anyhow::anyhow!("invalid history count"),
+                            );
+                            return;
+                        };
+                        if count > 0 {
+                            self.ui(move |w| {
+                                let ui = w.global::<Ui>();
+                                ui.set_history_off_count(count.min(i32::MAX as u64) as i32);
+                                ui.set_dialog(Dialog::HistoryOff);
+                            });
+                        }
+                    }
+                    Err(error) => self.fail("Couldn't save setting", error),
+                }
+            }
+            Action::CopyHistory(id) => {
+                match self
+                    .command(ipc::Command::CopyClipboardHistory { id: id.clone() })
+                    .await
+                {
+                    Ok(_) => self.ui(move |w| w.invoke_history_copied(id.into())),
+                    Err(error) => self.fail("Couldn't copy", error),
+                }
+            }
+            Action::PinHistory(id, pinned) => {
+                match self
+                    .command(ipc::Command::PinClipboardHistory { id, pinned })
+                    .await
+                {
+                    Ok(_) => (),
+                    Err(error)
+                        if error
+                            .to_string()
+                            .contains(crate::store::history::PIN_LIMIT_ERROR) =>
+                    {
+                        if self.current() {
+                            self.action_error = crate::store::history::PIN_LIMIT_ERROR.into();
+                        }
+                    }
+                    Err(error) => self.fail("Couldn't change pin", error),
+                }
+            }
+            Action::DeleteHistory(id) => {
+                if let Err(error) = self
+                    .command(ipc::Command::DeleteClipboardHistory { id })
+                    .await
+                {
+                    self.fail("Couldn't delete", error);
+                }
+            }
+            Action::ClearHistory => {
+                if let Err(error) = self.command(ipc::Command::ClearClipboardHistory).await {
+                    self.fail("Couldn't clear history", error);
                 }
             }
             Action::SendClipboard => {
@@ -2102,7 +2774,13 @@ impl Worker {
                     .transfers
                     .iter()
                     .filter(|t| {
-                        artifact_key(t) == item && t.state == "failed" && artifact_id(t).is_some()
+                        artifact_key(t) == item
+                            && (replaced(t)
+                                || (t.state == "failed"
+                                    && super::notifications::retryable_reason(
+                                        t.error.as_deref().unwrap_or_default(),
+                                    )))
+                            && artifact_id(t).is_some()
                     })
                     .map(|t| t.device.clone())
                     .collect();
@@ -2269,11 +2947,30 @@ impl Worker {
                     self.paste(text, true).await;
                 }
             }
-            Action::OfferPair => self.confirm_join().await,
+            Action::OfferPair(link) | Action::ConfirmJoin(link) => {
+                if let Some(join) = &mut self.join {
+                    join.link = link;
+                }
+                self.confirm_join().await
+            }
+            Action::TopCard(yes) => self.top_action(yes).await,
+            Action::TopCardClose => self.top_close(),
+            Action::LinkDevice(device) => {
+                self.link(&device).await;
+            }
+            Action::Answer(device, allow) => self.answer(&[device], allow).await,
+            Action::Removing(device) => self.removal = self.origin.setup.removal(&device),
+            Action::Remove(device) => self.remove(&device).await,
             Action::OfferDismiss => {
                 if let Some(join) = self.join.take() {
                     self.dismissed_offer = Some(join.uri.clone());
                     self.cancel_join(&join).await;
+                }
+            }
+            Action::GetTailscale => {
+                if self.open_job.is_none() {
+                    self.open_origin = Some(self.view());
+                    self.open_job = Some(Box::pin(open_web(TAILSCALE_DOWNLOAD)));
                 }
             }
             Action::Message(action, primary) => match action.as_str() {
@@ -2286,12 +2983,25 @@ impl Worker {
                         self.cancel_join(&join).await;
                     }
                 }
+                "removed-ok" => {
+                    let generation = self.setup.generation;
+                    self.remember(|r| r.removed = Some(generation));
+                }
                 _ => {}
             },
         }
     }
 
     async fn navigated(&mut self, probe_clipboard: bool) {
+        if self.view().page == Page::History {
+            self.history_order = self
+                .snapshot
+                .clipboard_history
+                .iter()
+                .map(|i| i.id.clone())
+                .collect();
+        }
+
         let view = self.view();
         self.pushed = None;
         self.action_error.clear();
@@ -2304,11 +3014,18 @@ impl Worker {
             self.paired = None;
         }
         let previous = std::mem::replace(&mut self.last_view, view.clone());
+        if !is_pairing_page(view.page) {
+            self.pair_again_choice = None;
+        }
         if is_pairing_page(view.page) && !is_pairing_page(previous.page) {
-            self.known = self.device_ids();
-            self.lost = self.lost_ids();
+            self.known_roster = self.setup.roster_ids();
             self.paired = None;
             self.probed = false;
+            // Pair Again starts its own invitation. Adopting an existing code
+            // cannot grant removal authority to its earlier pairing attempt.
+            if self.pair_again_choice.is_some() {
+                self.show_code(true).await;
+            }
         }
         if probe_clipboard && view.page == Page::Add && !self.probed {
             // A usable link from another computer on the clipboard is offered at once.
@@ -2335,15 +3052,14 @@ impl Worker {
         if view.page == Page::Device {
             self.peer_settings = None;
         }
+        if self
+            .remove_request
+            .as_ref()
+            .is_some_and(|d| view.page != Page::Device || view.device != *d)
+        {
+            self.remove_request = None;
+        }
     }
-    fn lost_ids(&self) -> HashSet<String> {
-        peers(&self.snapshot, &[])
-            .into_iter()
-            .filter(|p| p.health.lost())
-            .map(|p| p.id)
-            .collect()
-    }
-
     async fn set_flag(&self, key: &str, on: bool) -> Result<()> {
         anyhow::ensure!(
             matches!(
@@ -2354,6 +3070,7 @@ impl Worker {
                     | "notification_preview"
                     | "copy_image_to_clipboard"
                     | "open_in_viewer"
+                    | "clipboard_history"
                     | "clipboard_include_images"
             ),
             "unknown setting {key}"
@@ -2367,6 +3084,7 @@ impl Worker {
     }
 
     async fn chosen(&mut self, result: Result<Chosen>) {
+        let choosing_folder = std::mem::take(&mut self.choosing_folder);
         let (target, bindings, origin, files) = match result {
             Ok((target, bindings, origin, Some(files))) if !files.is_empty() => {
                 (target, bindings, origin, files)
@@ -2377,7 +3095,14 @@ impl Worker {
             }
             Err(error) => {
                 self.send_request_id = None;
-                return self.fail("Couldn't choose files", error);
+                return self.fail(
+                    if choosing_folder {
+                        "Couldn't choose a folder"
+                    } else {
+                        "Couldn't choose files"
+                    },
+                    error,
+                );
             }
         };
         self.select_send(files, bindings, origin, !target.is_empty(), false)
@@ -2422,18 +3147,26 @@ impl Worker {
             .unwrap_or_default()
         };
         let peers = peers(&self.snapshot, &self.transfers);
+        let folders = files.iter().any(|p| p.is_dir());
         let picks: Vec<PickItem> = peers
             .iter()
             .map(|p| {
                 let target = targets.iter().find(|t| t.device == p.id);
                 let eligible = bindings.iter().any(|t| t.device == p.id)
+                    && (!folders || target.is_none_or(|t| t.folder_reason.is_none()))
                     && if clipboard {
                         p.connected()
                     } else {
                         eligible_files.iter().any(|t| t.device == p.id)
                     };
                 let would_queue = target.is_some_and(|t| t.would_queue);
-                let status = match target.and_then(|t| t.reason.clone()) {
+                let status = match target.and_then(|t| {
+                    if folders {
+                        t.folder_reason.clone().or_else(|| t.reason.clone())
+                    } else {
+                        t.reason.clone()
+                    }
+                }) {
                     Some(reason) if !eligible => reason,
                     _ if !eligible => p.connection(),
                     _ if would_queue => "Not connected".into(),
@@ -2472,15 +3205,21 @@ impl Worker {
     }
 
     async fn send_clipboard(&mut self, targets: &[contract::CapturedTarget]) {
-        self.send_request_id = None;
+        let notify_too_large = self.send_request_id.take().is_some();
         let result = async {
             let targets: crate::outbox::Targets =
                 serde_json::from_value(serde_json::to_value(targets)?)?;
-            self.command(ipc::Command::SendClipboard { targets }).await
+            self.command(ipc::Command::SendClipboard {
+                targets,
+                notify_too_large,
+            })
+            .await
         }
         .await;
-        if let Err(error) = result {
-            self.fail("Couldn't send the clipboard", error);
+        if let Err(error) = result
+            && let Some(message) = clipboard_send_error(&error.to_string(), notify_too_large)
+        {
+            self.fail(message, error);
         }
     }
 
@@ -2491,6 +3230,15 @@ impl Worker {
             self.send_request_id = None;
             return;
         }
+        let folders = self.snapshot.send_targets.iter().any(|t| {
+            t.eligible
+                && t.folder_reason.is_none()
+                && (!request.targeted
+                    || request
+                        .targets
+                        .iter()
+                        .any(|a| a.device == t.device && a.generation == t.generation))
+        });
         let bindings = request
             .targets
             .into_iter()
@@ -2515,7 +3263,7 @@ impl Worker {
                 String::new()
             };
             self.chooser = Some(Box::pin(async move {
-                Ok((target, bindings, origin, choose_files("Send Files").await?))
+                Ok((target, bindings, origin, choose_send_files(folders).await?))
             }));
         }
     }
@@ -2560,10 +3308,25 @@ impl Worker {
         }
         match reply {
             Ok(uri) => {
+                if new && let Some(choice) = &mut self.pair_again_choice {
+                    choice.attempt = Some(PairAgainAttempt::Invitation(uri.token.clone()));
+                }
                 self.code.error.clear();
                 self.code.offline = false;
                 self.status["invitation"] = serde_json::to_value(&uri).expect("pairing URI");
-                self.adopt_code(&uri);
+                if self.view().page == Page::Add && self.view().add_tab == 0 {
+                    // A phone QR still closes with the window. Only visiting
+                    // Pairing Code gives an invitation that longer lifetime.
+                    self.phone_token = Some(uri.token.clone());
+                    self.phone_failed = false;
+                    if let Ok(link) = uri.build()
+                        && let Ok(pixels) = qr_pixels(&link)
+                    {
+                        self.ui(move |w| w.global::<Ui>().set_qr(slint::Image::from_rgba8(pixels)));
+                    }
+                } else {
+                    self.adopt_code(&uri);
+                }
             }
             Err(error) => {
                 eprintln!("pneud window: pairing code unavailable: {error:#}");
@@ -2677,6 +3440,11 @@ impl Worker {
         let name = display_peer_text(reply["name"].as_str().unwrap_or("the other computer"));
         let state = reply["state"].as_str().unwrap_or_default();
         if state == "confirmation" {
+            if let Some(choice) = &mut self.pair_again_choice {
+                choice.attempt = Some(PairAgainAttempt::Join(
+                    reply["attempt"].as_str().unwrap_or_default().into(),
+                ));
+            }
             self.join = Some(Join {
                 attempt: reply["attempt"].as_str().unwrap_or_default().into(),
                 uri: text,
@@ -2684,9 +3452,12 @@ impl Worker {
                 confirmed: false,
                 cancel_requested: false,
                 offer,
+                link: true,
                 origin: self.view(),
                 reported: String::new(),
             });
+            // Every confirmation starts with the switch on.
+            self.ui(|w| w.global::<Ui>().set_link_on(true));
             if let Some(join) = &self.join
                 && let Err(error) = self.save_join(join)
             {
@@ -2704,18 +3475,23 @@ impl Worker {
                     self.ui(|w| w.invoke_open_add(1));
                 }
             } else {
-                self.message(
-                    format!("Pair with {name}?"),
-                    String::new(),
-                    1,
-                    "Cancel",
-                    "Pair",
-                    "join-confirm",
-                );
+                self.ask_pair(&name, true);
             }
         } else if !offer {
             self.join_message(state, &name);
         }
+    }
+    /// The joining computer's confirmation, with Also link with your other devices.
+    fn ask_pair(&self, name: &str, link: bool) {
+        self.ui(move |w| w.global::<Ui>().set_link_on(link));
+        self.message(
+            format!("Pair with {name}?"),
+            String::new(),
+            1,
+            "Cancel",
+            "Pair",
+            "join-confirm",
+        );
     }
     fn join_message(&self, state: &str, name: &str) {
         let (title, text, tile, secondary, primary, action) = match state {
@@ -2777,7 +3553,7 @@ impl Worker {
             ),
             "unreachable" => (
                 format!("Can't reach {name}"),
-                "Make sure both are on the same Wi-Fi, or that Tailscale is connected.".into(),
+                "Make sure both are on the same network, or that Tailscale is connected.".into(),
                 0,
                 "Cancel",
                 "Try Again",
@@ -2853,8 +3629,9 @@ impl Worker {
             return;
         }
         let reply = self
-            .command(ipc::Command::JoinConfirm {
+            .command(ipc::Command::JoinConfirmScoped {
                 attempt: join.attempt.clone(),
+                enabled: join.link,
             })
             .await;
         if !self.current() {
@@ -2874,6 +3651,267 @@ impl Worker {
             }
         }
     }
+    // ---------- Linking your devices (window_setup.rs) ----------
+
+    fn remember(&mut self, change: impl FnOnce(&mut Remembered)) {
+        change(&mut self.remembered);
+        if let Err(error) = self.remembered.save(&setup_state_path(&self.paths)) {
+            eprintln!("pneud window: couldn't keep a linking choice: {error:#}");
+        }
+    }
+    async fn top_action(&mut self, yes: bool) {
+        match self.origin.top.as_ref().clone() {
+            Top::Offer { device } if yes && self.setup.requests().is_empty() => {
+                if self.link(&device).await {
+                    self.remember(|r| r.offer = Some(setup::LINKED.into()));
+                }
+            }
+            Top::Readmit { record } => {
+                if let Err(error) = self
+                    .command(ipc::Command::ReadmissionDecision {
+                        key: record.key,
+                        allow: yes,
+                    })
+                    .await
+                {
+                    self.fail("Couldn't save the answer", error);
+                }
+            }
+            Top::Request { devices, .. } => {
+                self.answer_from(&self.origin.setup.clone(), &devices, yes)
+                    .await;
+            }
+            _ => {}
+        }
+    }
+    /// ✕ hides the offer for good; a request waits until Pneu restarts.
+    fn top_close(&mut self) {
+        match self.origin.top.as_ref().clone() {
+            Top::Offer { .. } => self.remember(|r| r.offer = Some(setup::DISMISSED.into())),
+            Top::Waiting { .. } => self.remember(|r| r.offer = Some(setup::DONE.into())),
+            Top::Request { devices, .. } => {
+                let keys: Vec<String> = devices
+                    .iter()
+                    .filter_map(|d| self.origin.setup.link(d))
+                    .map(|l| setup::request_key(&self.origin.setup, l))
+                    .collect();
+                self.remember(|r| r.close(keys));
+            }
+            Top::Diagnostic { key, .. } => self.remember(|r| r.close([key])),
+            Top::Readmit { record } => {
+                self.remember(|r| r.close([setup::readmission_key(&record.key)]))
+            }
+            Top::None => {}
+        }
+    }
+    /// Link covers every pairing here that isn't decided yet, and this one.
+    async fn link(&mut self, device: &str) -> bool {
+        let shown = &self.origin.setup;
+        let Some(binding) = shown.binding_generations.get(device).copied().flatten() else {
+            return false;
+        };
+        let Some(scope) = shown.link(device).and_then(|link| {
+            serde_json::from_value::<pneu_proto::SetupScope>(json!(link.scope)).ok()
+        }) else {
+            return false;
+        };
+        let result = match pneu_proto::Id::new(device) {
+            Ok(device) => {
+                self.command(ipc::Command::LinkExistingDevice {
+                    device,
+                    binding_generation: Some(binding),
+                    expected_scope: Some(scope),
+                })
+                .await
+            }
+            Err(error) => Err(error.into()),
+        };
+        match result {
+            Ok(reply) => reply != json!(false),
+            Err(error) => {
+                self.fail("Couldn't link", error);
+                false
+            }
+        }
+    }
+    /// Allow answers every device that asked, and the daemon also links this
+    /// device's other undecided pairings. Don't allow answers only these.
+    async fn answer(&mut self, devices: &[String], allow: bool) {
+        self.answer_from(&self.origin.setup.clone(), devices, allow)
+            .await;
+    }
+    async fn answer_from(&mut self, shown: &Setup, devices: &[String], allow: bool) {
+        let requests = devices
+            .iter()
+            .filter_map(|device| {
+                shown.link(device).filter(|l| l.prompt)?;
+                Some(setup::Decision {
+                    readmission: None,
+                    device: pneu_proto::Id::new(device.as_str()).ok()?,
+                    setup_generation: shown.generation,
+                    binding_generation: shown.binding_generations.get(device).copied().flatten()?,
+                })
+            })
+            .collect();
+        if let Err(error) = self
+            .command(ipc::Command::SetupDecisions { requests, allow })
+            .await
+        {
+            self.fail(
+                if allow {
+                    "Couldn't link"
+                } else {
+                    "Couldn't save the answer"
+                },
+                error,
+            );
+        }
+    }
+    /// Remove from all devices, exactly as the confirmation showed it. The
+    /// daemon refuses a changed membership, so nothing is claimed then.
+    async fn remove(&mut self, device: &str) {
+        let Some(removal) = self.removal.take().filter(|r| r.device == device) else {
+            return;
+        };
+        let name = peers(&self.snapshot, &[])
+            .into_iter()
+            .find(|p| p.id == device)
+            .map(|p| p.name)
+            .unwrap_or_else(|| "the device".into());
+        let result = async {
+            let command = ipc::Command::RemoveFromSetup {
+                device: pneu_proto::Id::new(removal.device.as_str())?,
+                setup_generation: removal.setup_generation,
+                binding_generation: removal.binding_generation,
+                fingerprint: pneu_proto::Hash::new(removal.fingerprint.as_str())?,
+            };
+            self.command(command).await
+        }
+        .await;
+        match result {
+            // The page closes and the row goes; nothing follows later.
+            Ok(_) => self.ui(|w| w.invoke_go(Page::Main)),
+            Err(error) if daemon_rejection(&error) => {
+                eprintln!("pneud window: couldn't remove: {error:#}");
+                self.message(
+                    format!("Couldn't remove {name}"),
+                    "Nothing was changed. Try again.".into(),
+                    0,
+                    "",
+                    "OK",
+                    "ok",
+                );
+            }
+            // A lost reply says nothing about whether it was removed.
+            Err(error) => self.fail(&format!("Couldn't remove {name}"), error),
+        }
+    }
+    fn device_link(&self, peer: &Peer) -> DeviceLink {
+        let row = setup::row(&self.setup, peer);
+        let (title, sub) = setup::row_text(row, &peer.name);
+        let member = self.setup.member(&peer.id).is_some();
+        let via = self
+            .setup
+            .link(&peer.id)
+            .and_then(|l| l.introducer_name.as_deref())
+            .filter(|_| member)
+            .map(display_peer_text)
+            .unwrap_or_default();
+        let waiting = self
+            .transfers
+            .iter()
+            .filter(|t| t.device == peer.id && !t.incoming() && t.state == "waiting_for_device")
+            .map(artifact_key)
+            .collect::<HashSet<_>>()
+            .len();
+        DeviceLink {
+            row: match row {
+                Row::None => LinkRow::None,
+                Row::Link => LinkRow::Link,
+                Row::Waiting => LinkRow::Waiting,
+                Row::Theirs => LinkRow::Theirs,
+                Row::Asked => LinkRow::Asked,
+                Row::Update => LinkRow::Update,
+                Row::Separate => LinkRow::Separate,
+            },
+            title: title.into(),
+            sub: sub.into(),
+            via: via.into(),
+            member,
+            waiting: waiting as i32,
+        }
+    }
+    fn device_item(&self, peer: &Peer) -> DeviceItem {
+        let mut item = peer.item();
+        if let Some(link) = self.setup.link(&peer.id)
+            && link.introduced_by.is_some()
+        {
+            if peer.health == Health::Lost {
+                item.status = format!("Not allowed on {} yet", peer.name).into();
+                item.tone = Tone::Warn;
+                item.status_tone = Tone::Warn;
+            } else if !link.ready && matches!(peer.health, Health::Offline | Health::Connecting) {
+                item.status = format!("Waiting for {}", peer.name).into();
+                item.tone = Tone::Neutral;
+                item.status_tone = Tone::Neutral;
+            }
+        }
+        item
+    }
+    fn top_card(&self, peers: &[Peer]) -> TopCard {
+        match setup::top(&self.setup, peers, &self.remembered) {
+            Top::Diagnostic { title, .. } => TopCard {
+                kind: TopKind::Diagnostic,
+                title: title.into(),
+                error: String::new().into(),
+                key: String::new().into(),
+                phone: false,
+            },
+            Top::Readmit { record } => TopCard {
+                kind: TopKind::Readmit,
+                title: setup::readmission_text(&record).into(),
+                key: setup::readmission_key(&record.key).into(),
+                error: record.error.unwrap_or_default().into(),
+                phone: false,
+            },
+            Top::None => TopCard::default(),
+            Top::Offer { .. } if !self.snapshot.refreshing_devices.is_empty() => TopCard::default(),
+            Top::Offer { .. } => TopCard {
+                kind: TopKind::Offer,
+                title: "Link your devices".into(),
+                error: String::new().into(),
+                key: String::new().into(),
+                phone: false,
+            },
+            Top::Waiting { title } => TopCard {
+                kind: TopKind::Waiting,
+                title: title.into(),
+                error: String::new().into(),
+                key: String::new().into(),
+                phone: false,
+            },
+            Top::Request { title, phone, .. } => TopCard {
+                kind: TopKind::Request,
+                title: title.into(),
+                error: String::new().into(),
+                key: String::new().into(),
+                phone,
+            },
+        }
+    }
+    /// The done screen: what the new device linked with, or why it didn't.
+    fn paired_detail(&self) -> (String, bool) {
+        let Some(device) = self.paired.as_ref().and_then(|p| p.device.as_deref()) else {
+            return Default::default();
+        };
+        if self.setup.link(device).is_some_and(|l| l.separate()) {
+            return (setup::OWN.into(), true);
+        }
+        let me = self.status["self_id"].as_str().unwrap_or_default();
+        let learned = self.setup.learned(&self.known_roster, &[device, me]);
+        (setup::also_linked(&learned), false)
+    }
+
     async fn cancel_join(&self, join: &Join) {
         let mut cancellation = join.clone();
         cancellation.cancel_requested = true;
@@ -2891,6 +3929,114 @@ impl Worker {
             Err(_) => {}
         }
     }
+    fn complete_pair_again(&mut self, attempt: PairAgainAttempt, device: pneu_proto::Id) {
+        if let Some(choice) = &mut self.pair_again_choice
+            && choice.attempt.as_ref() == Some(&attempt)
+        {
+            choice.attempt = Some(PairAgainAttempt::Paired(device));
+        }
+    }
+
+    async fn answer_replacement(
+        &mut self,
+        replace: bool,
+        implied_old: Option<crate::outbox::Authority>,
+    ) {
+        let Some(offer) = self.replacement.take() else {
+            return;
+        };
+        self.replacement_shown.insert(offer.id.clone());
+        if let Err(error) = self
+            .command(ipc::Command::ReplacementDecision {
+                intent: offer.id.clone(),
+                replace,
+                implied_old,
+            })
+            .await
+        {
+            self.replacement_shown.remove(&offer.id);
+            self.fail("Replacement incomplete", error);
+        }
+    }
+
+    async fn poll_replacement(&mut self) {
+        if let Some(current) = &self.replacement {
+            if self
+                .snapshot
+                .replacements
+                .iter()
+                .any(|o| o.id == current.id)
+            {
+                return;
+            }
+            self.replacement = None;
+            self.ui(|w| {
+                let ui = w.global::<Ui>();
+                if ui.get_dialog() == Dialog::Message && ui.get_message().action == "replace-device"
+                {
+                    ui.set_dialog(Dialog::None);
+                }
+            });
+        }
+        let view = self.view();
+        let offer = self
+            .snapshot
+            .replacements
+            .iter()
+            .find(|o| {
+                !self.replacement_shown.contains(&o.id)
+                    && self
+                        .paired
+                        .as_ref()
+                        .and_then(|p| p.device.as_deref())
+                        .is_none_or(|d| d == o.new.device.as_str())
+            })
+            .cloned();
+        let Some(offer) = offer else {
+            return;
+        };
+        // An unconfirmed intent survives a window/daemon restart. Restore its
+        // successful pairing screen before presenting the same exact choice.
+        if view.page == Page::Main {
+            let tab = if offer.role == "phone" { 0 } else { 1 };
+            self.ui(move |w| w.invoke_open_add(tab));
+            return;
+        }
+        if !is_pairing_page(view.page) {
+            return;
+        }
+        if self.paired.is_none() {
+            self.paired = Some(Paired {
+                origin: view,
+                name: offer.name.clone(),
+                device: Some(offer.new.device.to_string()),
+                at: Instant::now(),
+                linked_at: None,
+                linked: String::new(),
+            });
+        }
+        self.replacement = Some(offer.clone());
+        if self.pair_again_choice.as_ref().is_some_and(|choice| {
+            choice.attempt.as_ref() == Some(&PairAgainAttempt::Paired(offer.new.device.clone()))
+        }) && let Some(choice) = self.pair_again_choice.take()
+            && offer.choices.iter().any(|(a, _)| a == &choice.old)
+        {
+            self.answer_replacement(true, Some(choice.old)).await;
+            return;
+        }
+        let text = replacement_text(&offer);
+        let intent = offer.id.to_string();
+        self.ui(move |w| w.global::<Ui>().set_replacement_intent(intent.into()));
+        self.message(
+            format!("Replace the old {}?", offer.name),
+            text,
+            0,
+            "Keep Both",
+            "Replace",
+            "replace-device",
+        );
+    }
+
     async fn poll_join(&mut self) {
         let Some(join) = self.join.as_ref().filter(|j| j.confirmed) else {
             return;
@@ -2920,15 +4066,8 @@ impl Worker {
             "pairing" => {}
             "confirmation" => {
                 join.confirmed = false;
-                let name = join.name.clone();
-                self.message(
-                    format!("Pair with {name}?"),
-                    String::new(),
-                    1,
-                    "Cancel",
-                    "Pair",
-                    "join-confirm",
-                );
+                let (name, link) = (join.name.clone(), join.link);
+                self.ask_pair(&name, link);
             }
             "paired" => {
                 // Only the daemon's authenticated outcome identifies this peer.
@@ -2939,12 +4078,18 @@ impl Worker {
                     return;
                 };
                 let join = self.join.take().expect("join");
+                self.complete_pair_again(
+                    PairAgainAttempt::Join(join.attempt.clone()),
+                    pneu_proto::Id::new(device).expect("validated device"),
+                );
                 self.forget_join();
                 self.paired = Some(Paired {
                     origin: self.view(),
                     name: join.name,
                     device: Some(device.into()),
                     at: Instant::now(),
+                    linked_at: None,
+                    linked: String::new(),
                 });
                 self.ui(|w| {
                     if w.global::<Ui>().get_dialog() == Dialog::Message {
@@ -2974,10 +4119,14 @@ impl Worker {
 
     async fn close(&mut self, visible: &AtomicBool) {
         self.folder_job = None;
+        self.open_folder_job = None;
+        self.open_folder_origin = None;
         self.open_job = None;
         self.open_origin = None;
         self.chooser = None;
         self.paired = None;
+        self.replacement = None;
+        self.pair_again_choice = None;
         self.picker_active = false;
         self.send_request_id = None;
         self.picker_files.clear();
@@ -3016,11 +4165,74 @@ impl Worker {
 
     async fn refresh(&mut self, value: Value, visible: &AtomicBool) -> Result<()> {
         self.origin = self.view();
-        let snapshot: super::Snapshot = serde_json::from_value(value["snapshot"].clone())?;
+        let mut snapshot: super::Snapshot = serde_json::from_value(value["snapshot"].clone())?;
+        // Text is immutable for an ID. Fetch complete search keys once rather
+        // than retransmitting up to 75 MiB on every status refresh.
+        self.history_search
+            .retain(|id, _| snapshot.clipboard_history.iter().any(|i| &i.id == id));
+        let ids: Vec<_> = snapshot
+            .clipboard_history
+            .iter()
+            .filter(|i| !i.image && !self.history_search.contains_key(&i.id))
+            .map(|i| i.id.clone())
+            .collect();
+        if !ids.is_empty() {
+            let chunks = self
+                .command(ipc::Command::ClipboardHistorySearch { ids: ids.clone() })
+                .await?;
+            for id in ids {
+                self.history_search.insert(id, String::new());
+            }
+            for chunk in chunks.as_array().context("invalid history search reply")? {
+                if let (Some(id), Some(text)) = (chunk["id"].as_str(), chunk["text"].as_str())
+                    && let Some(key) = self.history_search.get_mut(id)
+                {
+                    key.push_str(text);
+                }
+            }
+        }
+        for item in &mut snapshot.clipboard_history {
+            item.search = self
+                .history_search
+                .get(&item.id)
+                .cloned()
+                .unwrap_or_default();
+        }
+        if let Some(failure) = &snapshot.ring_failure
+            && self.snapshot.ring_failure.as_ref() != Some(failure)
+            && failure.request == self.request
+            && visible.load(Ordering::SeqCst)
+        {
+            self.action_error = failure.message.clone();
+        }
         let config: Config = serde_json::from_value(value["config"].clone())?;
         self.status_error.clear();
         self.invitation_revision = value["invitation_revision"].as_u64().unwrap_or(0);
         self.transfers = snapshot.transfers.iter().map(Transfer::from).collect();
+        self.transfers.retain(|t| {
+            if let Some(error) = &t.error
+                && (error.ends_with(" is empty")
+                    || error.contains(" is over ")
+                    || error == "Folder contains more than 10,000 entries"
+                    || error.ends_with(" can't receive folders yet"))
+            {
+                if t.finished_at.is_some_and(|at| at >= self.window_started)
+                    && self.folder_errors.insert(artifact_key(t))
+                {
+                    self.action_error = error.clone();
+                }
+                false
+            } else {
+                true
+            }
+        });
+        let history_open = self.view().page == Page::History;
+        update_history_order(
+            &mut self.history_order,
+            &self.snapshot.clipboard_history,
+            &snapshot.clipboard_history,
+            history_open,
+        );
         self.snapshot = snapshot;
         #[cfg(target_os = "macos")]
         {
@@ -3032,6 +4244,7 @@ impl Worker {
         }
         let initial_status = self.status.is_null();
         self.status = value;
+        self.setup = Setup::parse(&self.status);
         let saved_join = if initial_status || self.join.is_none() {
             self.load_join()
         } else {
@@ -3060,21 +4273,32 @@ impl Worker {
                 && !join.confirmed
                 && !join.offer
             {
-                self.message(
-                    format!("Pair with {}?", join.name),
-                    String::new(),
-                    1,
-                    "Cancel",
-                    "Pair",
-                    "join-confirm",
-                );
+                self.ask_pair(&join.name, join.link);
             }
         }
         let first_run = self.snapshot.devices.is_empty();
         let current = self.status["window_request"].as_u64().unwrap_or(0);
         let add_device = self.status["add_device"].as_bool().unwrap_or(false);
-        if !self.restored_join && (current != self.request || (initial_status && add_device)) {
+        let history_page =
+            config.clipboard_history && self.status["history_page"].as_bool().unwrap_or(false);
+        // A joined notification's Remove… also applies when this child was
+        // launched with the same request number in PNEU_WINDOW_REQUEST.
+        let remove_device = self.status["remove_device"]
+            .as_str()
+            .filter(|id| pneu_proto::Id::new(*id).is_ok())
+            .filter(|id| {
+                self.snapshot
+                    .devices
+                    .iter()
+                    .any(|d| d.device.as_str() == *id)
+            })
+            .map(String::from);
+        if !self.restored_join
+            && (current != self.request
+                || (initial_status && (add_device || history_page || remove_device.is_some())))
+        {
             self.request = current;
+            self.remove_request = remove_device.clone();
             let was_visible = visible.swap(true, Ordering::SeqCst);
             let choose_folder = current & 1 != 0;
             let preserve_send = !self.status["pending_send"].is_null()
@@ -3090,12 +4314,21 @@ impl Worker {
                 super::macos::native::activate(w);
                 #[cfg(windows)]
                 super::windows_window::activate(w);
+                if history_page {
+                    w.invoke_go(Page::History);
+                    return;
+                }
                 if let Some(page) = requested_page {
                     w.invoke_go(page);
                     return;
                 }
                 // A Windows tray click presents the existing page and its state.
-                if cfg!(windows) && was_visible && !choose_folder && !add_device {
+                if cfg!(windows)
+                    && was_visible
+                    && !choose_folder
+                    && !add_device
+                    && remove_device.is_none()
+                {
                     return;
                 }
                 // Reopening starts at the top: Add Device without devices, else
@@ -3103,7 +4336,9 @@ impl Worker {
                 if preserve_send {
                     return;
                 }
-                if first_run || add_device {
+                if let Some(device) = remove_device {
+                    w.invoke_open_device(device.into());
+                } else if first_run || add_device {
                     w.invoke_open_add(0);
                 } else if choose_folder {
                     w.invoke_go(Page::Settings);
@@ -3125,11 +4360,35 @@ impl Worker {
         if first_run
             && !is_pairing_page(view.page)
             && self.paired.is_none()
-            && !(cfg!(target_os = "macos") && view.page == Page::Settings)
+            && !matches!(view.page, Page::Settings | Page::History)
         {
             // Unpairing the last device returns to Add Device.
             self.ui(|w| w.invoke_open_add(0));
             return Ok(());
+        }
+        // A removed device says so once, then shows what it has left.
+        let generation = self.setup.generation;
+        if self.setup.withdrawn
+            && self.remembered.removed != Some(generation)
+            && self.removed_shown != Some(generation)
+            && self.join.is_none()
+            && !self.picker_active
+        {
+            self.removed_shown = Some(generation);
+            let this = this_computer();
+            self.message(
+                format!("T{} was removed from your devices", &this[1..]),
+                String::new(),
+                0,
+                "",
+                "OK",
+                "removed-ok",
+            );
+        }
+        if self.remembered.offer.as_deref() == Some(setup::LINKED)
+            && self.setup.unanswered().is_empty()
+        {
+            self.remember(|r| r.offer = Some(setup::DONE.into()));
         }
         if let Ok(request) =
             serde_json::from_value::<SendRequest>(self.status["pending_send"].clone())
@@ -3195,12 +4454,58 @@ impl Worker {
         {
             self.ui(|w| w.invoke_go(Page::Main));
         }
+        if view.page == Page::History && !config.clipboard_history {
+            self.ui(|w| w.invoke_go(Page::Main));
+        }
         let now = crate::now_ms();
         let mut invitation = serde_json::from_value::<Option<pneu_proto::PairingUri>>(
             self.status["invitation"].clone(),
         )
         .unwrap_or(None);
 
+        self.poll_join().await;
+
+        // Finish only for the displayed invitation that was actually consumed,
+        // including a direct pairing to a device already in the list.
+        if is_pairing_page(view.page)
+            && self.join.is_none()
+            && self.current()
+            && self.paired.is_none()
+            && let Some(peer) = peers.iter().find(|p| {
+                self.snapshot
+                    .pairing_completion
+                    .as_ref()
+                    .is_some_and(|done| {
+                        done.device.as_str() == p.id
+                            && self.seen_pairing_token.as_ref() != Some(&done.token)
+                            && (self.phone_token.as_ref() == Some(&done.token)
+                                || self.code.token.as_ref() == Some(&done.token))
+                    })
+                    && !p.name.is_empty()
+            })
+        {
+            self.seen_pairing_token = self
+                .snapshot
+                .pairing_completion
+                .as_ref()
+                .map(|done| done.token.clone());
+            if let Some(done) = self.snapshot.pairing_completion.clone() {
+                self.complete_pair_again(PairAgainAttempt::Invitation(done.token), done.device);
+            }
+            self.paired = Some(Paired {
+                origin: view.clone(),
+                name: peer.name.clone(),
+                device: Some(peer.id.clone()),
+                at: Instant::now(),
+                linked_at: None,
+                linked: String::new(),
+            });
+            #[cfg(target_os = "macos")]
+            if view.page == Page::Scan {
+                self.ui(|_| super::macos::camera::close());
+            }
+        }
+        self.poll_replacement().await;
         // Phone pairing QR (v2): keep an invitation open while the tab shows.
         let phone_tab = view.page == Page::Add && view.add_tab == 0;
         if phone_tab {
@@ -3215,7 +4520,7 @@ impl Worker {
                 }
             } else {
                 // Never show a URI which Core no longer accepts.
-                if self.phone_token.take().is_some() {
+                if self.phone_token.is_some() {
                     self.ui(|w| w.global::<Ui>().set_qr(slint::Image::default()));
                 }
                 if self.snapshot.pairing.is_none()
@@ -3239,30 +4544,6 @@ impl Worker {
         {
             self.adopt_code(invitation);
         }
-        self.poll_join().await;
-
-        // A device that appears (or recovers from a lost pairing) while a
-        // pairing page shows was just paired: check, then its page.
-        if is_pairing_page(view.page)
-            && self.join.is_none()
-            && self.current()
-            && self.paired.is_none()
-            && let Some(peer) = peers.iter().find(|p| {
-                (!self.known.contains(&p.id) || (self.lost.contains(&p.id) && !p.health.lost()))
-                    && !p.name.is_empty()
-            })
-        {
-            self.paired = Some(Paired {
-                origin: view.clone(),
-                name: peer.name.clone(),
-                device: Some(peer.id.clone()),
-                at: Instant::now(),
-            });
-            #[cfg(target_os = "macos")]
-            if view.page == Page::Scan {
-                self.ui(|_| super::macos::camera::close());
-            }
-        }
         if self
             .paired
             .as_ref()
@@ -3270,13 +4551,38 @@ impl Worker {
         {
             self.paired = None;
         }
+        let (detail, _) = self.paired_detail();
+        if let Some(paired) = &mut self.paired
+            && detail.starts_with("Also linked:")
+            && paired.linked != detail
+        {
+            paired.linked = detail;
+            paired.linked_at = Some(Instant::now());
+        }
+        // MEMBERS and READY can arrive in several batches after direct pairing.
+        // Keep a five-second discovery window even before the first introduction,
+        // then leave each updated line readable for three seconds.
+        let linking = self.paired.as_ref().is_some_and(|p| {
+            p.device.as_deref().is_some_and(|device| {
+                self.setup
+                    .link(device)
+                    .is_none_or(|l| l.scope == "enabled" && !l.separate())
+            })
+        });
         if let Some(paired) = &self.paired
-            && paired.at.elapsed() >= Duration::from_millis(1500)
+            && self.replacement.is_none()
+            && paired.at.elapsed()
+                >= if linking {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::from_millis(1500)
+                }
+            && paired
+                .linked_at
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(3))
         {
             let device = paired.device.clone();
             self.paired = None;
-            self.known = self.device_ids();
-            self.lost = self.lost_ids();
             self.ui(move |w| match device {
                 Some(device) => w.invoke_open_device(device.into()),
                 None => w.invoke_go(Page::Main),
@@ -3305,6 +4611,16 @@ impl Worker {
             }
         }
 
+        // Checked only while Can't connect? shows, and at most every 5 s.
+        if view.page == Page::Main
+            && unreachable(&peers)
+            && self
+                .tailscale
+                .is_none_or(|(_, at)| at.elapsed() >= Duration::from_secs(5))
+        {
+            self.tailscale = Some((tailscale_running(), Instant::now()));
+        }
+
         if !self.current() {
             return Ok(());
         }
@@ -3318,12 +4634,34 @@ impl Worker {
             now,
         );
         let targets = contract::list::<SendTarget>(&self.status, "send_targets");
-        if self.pushed.as_ref() != Some(&frame) || self.view().targets.as_ref() != Some(&targets) {
+        let view = self.view();
+        let remove = frame.device_link.member
+            && view.page == Page::Device
+            && self.remove_request.as_ref() == Some(&view.device);
+        if remove {
+            self.remove_request = None;
+        }
+        let shown_setup = Arc::new(self.setup.clone());
+        let shown_top = Arc::new(setup::top(&self.setup, &peers, &self.remembered));
+        if self.pushed.as_ref() != Some(&frame)
+            || self.view().setup != shown_setup
+            || self.view().top != shown_top
+            || self.view().targets.as_ref() != Some(&targets)
+            || remove
+        {
             self.pushed = Some(frame.clone());
             let view = self.view.clone();
             self.ui(move |w| {
-                view.lock().expect("window view").targets = Some(targets);
+                {
+                    let mut shown = view.lock().expect("window view");
+                    shown.targets = Some(targets);
+                    shown.setup = shown_setup;
+                    shown.top = shown_top;
+                }
                 apply(w, frame);
+                if remove {
+                    w.invoke_prepare_remove();
+                }
             });
         }
         Ok(())
@@ -3385,32 +4723,143 @@ impl Worker {
             CodeState::Expired
         };
         let left = self.code.expires_at.saturating_sub(now).div_ceil(1000);
+        let (paired_detail, paired_only) = self.paired_detail();
         let (device_item, device_summary, device_action, device_settings, device_note) =
             match device {
                 Some(peer) => {
-                    let (summary, action) = device_summary(peer);
-                    let (settings, note) = self
+                    let (mut summary, mut action) = device_summary(peer);
+                    let introduced = self
+                        .setup
+                        .link(&peer.id)
+                        .is_some_and(|l| l.introduced_by.is_some());
+                    if introduced
+                        && self.setup.link(&peer.id).is_some_and(|l| !l.ready)
+                        && matches!(peer.health, Health::Offline | Health::Connecting)
+                    {
+                        summary.title = format!("Waiting for {}", peer.name);
+                        summary.detail =
+                            format!("Open Pneu on {}, or pair with it directly", peer.name);
+                        action = "pair-warning";
+                    }
+                    if introduced && peer.health == Health::Lost {
+                        summary.title = format!("{} hasn't allowed this computer", peer.name);
+                        summary.detail =
+                            format!("Allow it on {}, or pair with it directly", peer.name);
+                        summary.link.tube = Tube::Dashed;
+                        summary.link.tiles[0].tone = Tone::Warn;
+                        action = "pair-warning";
+                    }
+                    let (settings, mut note) = self
                         .peer_settings
                         .as_ref()
                         .filter(|(id, _, _)| *id == peer.id)
-                        .map(|(_, reply, _)| device_settings(peer, reply))
+                        .map(|(_, reply, _)| device_settings(peer, reply, mode))
                         .unwrap_or_default();
-                    (peer.item(), summary, action.to_owned(), settings, note)
+                    if introduced
+                        && self.setup.link(&peer.id).is_some_and(|l| !l.hello_seen)
+                        && note.starts_with("Update Pneu")
+                    {
+                        note = format!("Switches sync when {} connects.", peer.name);
+                    }
+                    (
+                        self.device_item(peer),
+                        summary,
+                        action.to_owned(),
+                        settings,
+                        note,
+                    )
                 }
                 None => Default::default(),
             };
+        // Phones never accept a desktop dial, so they cannot report refusal.
+        // A fresh phone connection is evidence that this computer still belongs.
+        let pair_again = !peers.is_empty()
+            && ((peers.iter().all(Peer::lost)
+                && peers.iter().all(|p| {
+                    p.health != Health::Lost
+                        || self
+                            .setup
+                            .link(&p.id)
+                            .is_none_or(|l| l.introduced_by.is_none())
+                }))
+                || (self.snapshot.setup_refusal_since.is_some()
+                    && peers.iter().any(|p| !p.phone)
+                    && peers
+                        .iter()
+                        .filter(|p| !p.phone)
+                        .all(|p| p.health == Health::Lost)
+                    && peers.iter().filter(|p| p.phone).all(|p| {
+                        !p.connected()
+                            && p.last_seen <= self.snapshot.setup_refusal_since.unwrap_or(0)
+                    })));
+        let presented: Vec<_> = peers
+            .iter()
+            .cloned()
+            .map(|mut p| {
+                if p.health == Health::Lost
+                    && self
+                        .setup
+                        .link(&p.id)
+                        .is_some_and(|l| l.introduced_by.is_some())
+                {
+                    p.health = Health::Offline;
+                }
+                p
+            })
+            .collect();
+        let mut hero = summary(&presented, &self.transfers);
+        if pair_again {
+            hero.title = "Pairing lost".into();
+            hero.detail = format!("Your devices don't recognize {}", this_computer());
+        } else if peers.iter().all(|p| !p.connected())
+            && peers.iter().any(|p| {
+                p.health == Health::Lost
+                    && self
+                        .setup
+                        .link(&p.id)
+                        .is_some_and(|l| l.introduced_by.is_some())
+            })
+        {
+            hero.title = "Waiting for your devices".into();
+            hero.detail.clear();
+            hero.link.tube = Tube::Dashed;
+        }
         Frame {
+            targets: contract::list(&self.status, "send_targets"),
             error,
-            summary: summary(peers, &self.transfers),
-            devices: peers.iter().map(Peer::item).collect(),
+            summary: hero,
+            devices: peers.iter().map(|p| self.device_item(p)).collect(),
             recent: recent(peers, &self.transfers),
+            history: {
+                let mut items: Vec<_> = self
+                    .history_order
+                    .iter()
+                    .filter_map(|id| {
+                        self.snapshot
+                            .clipboard_history
+                            .iter()
+                            .find(|i| &i.id == id)
+                            .cloned()
+                    })
+                    .collect();
+                // Stable sorting keeps Recent frozen and puts new pins first.
+                items.sort_by_key(|i| (i.pinned.is_none(), std::cmp::Reverse(i.pinned)));
+                items
+            },
+            keep_history: config.clipboard_history,
             manual_clipboard: mode == ClipboardMode::Manual,
+            pair_again,
             motion: animations_enabled(&super::palette::globals()),
             device: device_item,
             device_summary,
             device_action,
             device_settings,
             device_note,
+            device_link: device.map(|p| self.device_link(p)).unwrap_or_default(),
+            top: self.top_card(peers),
+            link_full: self.setup.full(),
+            paired_detail,
+            paired_only,
             first_run,
             network: !self.phone_failed,
             pairing,
@@ -3438,11 +4887,13 @@ impl Worker {
             choose_each_time: flag("choose_devices_each_time"),
             queue_offline: flag("queue_offline"),
             save_to_folder: config.save_to_folder,
-            folder: middle_elide(&super::display_path(&config.save_path), 40),
+            folder: middle_elide(&super::display_path(&config.save_path), 26),
             notifications: config.notification_preview,
             copy_images: config.copy_image_to_clipboard,
             viewer: config.open_in_viewer,
             name: display_peer_text(&config.name),
+            unreachable: unreachable(peers),
+            tailscale: self.tailscale.is_some_and(|(on, _)| on),
         }
     }
 }
@@ -3451,16 +4902,91 @@ fn apply(w: &PneuWindow, frame: Frame) {
     let ui = w.global::<Ui>();
     ui.set_error(frame.error.into());
     ui.set_summary(frame.summary.summary());
+    ui.set_pair_again(frame.pair_again);
     sync(ui.get_devices(), &frame.devices);
     sync(ui.get_recent(), &frame.recent);
+    ui.set_keep_history(frame.keep_history);
+    if frame.history.is_empty() {
+        ui.set_history_query("".into());
+    }
+    ui.set_history_pins(frame.history.iter().filter(|i| i.pinned.is_some()).count() as i32);
+    let history: Vec<_> = frame
+        .history
+        .iter()
+        .map(|item| HistoryItem {
+            id: item.id.clone().into(),
+            title: item.title.clone().into(),
+            search: item.search.clone().into(),
+            pinned: item.pinned.is_some(),
+            url: item.url,
+            picture: item.image,
+            detail: format!(
+                "{} · {}",
+                item.origin
+                    .as_ref()
+                    .map(|o| format!("From {}", display_peer_text(o)))
+                    .unwrap_or_else(|| if cfg!(target_os = "macos") {
+                        "This Mac".into()
+                    } else {
+                        "This computer".into()
+                    }),
+                seen(item.at)
+            )
+            .into(),
+            thumbnail: item
+                .thumbnail
+                .as_ref()
+                .and_then(|p| slint::Image::load_from_path(p).ok())
+                .unwrap_or_default(),
+        })
+        .collect();
+    sync(ui.get_history(), &history);
     ui.set_manual_clipboard(frame.manual_clipboard);
     ui.set_motion(frame.motion);
     ui.set_device_revision(ui.get_navigation_revision());
     ui.set_device(frame.device);
     ui.set_device_summary(frame.device_summary.summary());
     ui.set_device_action(frame.device_action.into());
+    let targets = frame.targets.as_slice();
+    let reason = if targets
+        .iter()
+        .any(|t| t.eligible && t.folder_reason.is_none())
+    {
+        String::new()
+    } else if let [one] = targets {
+        one.folder_reason
+            .as_ref()
+            .map(|r| {
+                format!(
+                    "{} {}",
+                    one.name,
+                    if r == "Can't receive folders yet" {
+                        "can't receive folders yet"
+                    } else {
+                        "needs a Pneu update"
+                    }
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        "No device can receive folders yet".into()
+    };
+    ui.set_folder_reason(reason.into());
+    ui.set_device_folder_reason(
+        targets
+            .iter()
+            .find(|t| t.device == ui.get_device_id().as_str())
+            .and_then(|t| t.folder_reason.clone())
+            .unwrap_or_default()
+            .into(),
+    );
     sync(ui.get_device_settings(), &frame.device_settings);
     ui.set_device_note(frame.device_note.into());
+    ui.set_device_link(frame.device_link);
+    ui.set_top(frame.top);
+    ui.set_link_full(frame.link_full);
+    ui.set_paired_detail(frame.paired_detail.into());
+    ui.set_paired_only(frame.paired_only);
     ui.set_first_run(frame.first_run);
     ui.set_network(frame.network);
     ui.set_pairing(frame.pairing.into());
@@ -3480,6 +5006,8 @@ fn apply(w: &PneuWindow, frame: Frame) {
     ui.set_copy_images(frame.copy_images);
     ui.set_viewer(frame.viewer);
     ui.set_name(frame.name.into());
+    ui.set_unreachable(frame.unreachable);
+    ui.set_tailscale(frame.tailscale);
 }
 
 /// Update a list in place so rows (and their keyboard focus) survive polling.
@@ -3532,9 +5060,16 @@ fn animations_enabled(ini: &str) -> bool {
         .is_none_or(|factor| factor > 0.0)
 }
 pub fn qr_pixels(uri: &str) -> Result<slint::SharedPixelBuffer<slint::Rgba8Pixel>> {
-    let code = qrcode::QrCode::with_error_correction_level(uri.as_bytes(), qrcode::EcLevel::M)?;
+    qr_image(uri, qrcode::EcLevel::M, 4)
+}
+/// Modules of `scale` pixels inside a four-module white quiet zone.
+fn qr_image(
+    text: &str,
+    level: qrcode::EcLevel,
+    scale: usize,
+) -> Result<slint::SharedPixelBuffer<slint::Rgba8Pixel>> {
+    let code = qrcode::QrCode::with_error_correction_level(text.as_bytes(), level)?;
     let modules = code.width();
-    let scale = 4;
     let offset = 4 * scale;
     let size = (modules + 8) * scale;
     let mut image = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(size as u32, size as u32);
@@ -3561,6 +5096,48 @@ async fn job_result<T>(
         None => std::future::pending().await,
     }
 }
+/// Opens a web page in the default browser.
+async fn open_web(url: &'static str) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::actions::open_uri(url, &zbus::Connection::session().await?).await
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        slint::invoke_from_event_loop(move || {
+            let _ = send.send(super::macos::native::open_url(url));
+        })?;
+        receive.await?
+    }
+    #[cfg(windows)]
+    {
+        crate::actions::open_url(url).await
+    }
+}
+async fn open_folder(socket: &Path, folder: &Path) -> Result<()> {
+    #[cfg(any(target_os = "linux", windows))]
+    {
+        let _ = folder;
+        ipc::request(socket, ipc::Command::OpenFolder).await?;
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = socket;
+        let folder = folder.to_owned();
+        let create = folder.clone();
+        let _anchor =
+            tokio::task::spawn_blocking(move || crate::storage::Folder::open(&create, true))
+                .await??;
+        let (send, receive) = tokio::sync::oneshot::channel();
+        slint::invoke_from_event_loop(move || {
+            let _ = send.send(super::macos::native::open_path(&folder));
+        })?;
+        receive.await?
+    }
+}
+
 async fn change_folder(socket: &Path) -> Result<()> {
     let value = ipc::request(socket, ipc::Command::UiStatus).await?;
     let config: Config = serde_json::from_value(value["config"].clone())?;
@@ -3570,22 +5147,38 @@ async fn change_folder(socket: &Path) -> Result<()> {
     Ok(())
 }
 fn recent_file(path: &Path) -> Result<crate::actions::ReceivedFile> {
-    let file =
-        crate::storage::open_regular_file(path).map_err(|_| crate::actions::FileUnavailable)?;
-    crate::actions::ReceivedFile::from_file(path.to_owned(), file)
+    crate::actions::ReceivedFile::open(path).map_err(|_| crate::actions::FileUnavailable.into())
 }
 #[cfg(target_os = "macos")]
 async fn open_recent(file: crate::actions::ReceivedFile) -> Result<()> {
     super::macos::native::open_received_local(file).await
 }
+fn folder_picker_title(current: &Path) -> &'static str {
+    if current.as_os_str().is_empty() {
+        "Send Folder"
+    } else {
+        "Choose Folder"
+    }
+}
 #[cfg(windows)]
 pub async fn choose_folder(current: &Path) -> Result<Option<PathBuf>> {
     Ok(
-        super::windows_picker::choose("Choose Folder", Some(current))
+        super::windows_picker::choose(folder_picker_title(current), Some(current))
             .await?
             .into_iter()
             .next(),
     )
+}
+async fn choose_send_files(folders: bool) -> Result<Option<Vec<PathBuf>>> {
+    #[cfg(target_os = "macos")]
+    {
+        super::macos::native::choose_send(folders).await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = folders;
+        choose_files("Send Files").await
+    }
 }
 #[cfg(windows)]
 pub async fn choose_files(title: &str) -> Result<Option<Vec<PathBuf>>> {
@@ -3595,7 +5188,7 @@ pub async fn choose_files(title: &str) -> Result<Option<Vec<PathBuf>>> {
 #[cfg(target_os = "macos")]
 pub async fn choose_folder(current: &Path) -> Result<Option<PathBuf>> {
     Ok(
-        super::macos::native::choose("Choose Folder", true, Some(current))
+        super::macos::native::choose(folder_picker_title(current), true, Some(current))
             .await?
             .and_then(|paths| paths.into_iter().next()),
     )
@@ -3624,14 +5217,17 @@ async fn choose_folder_on(connection: zbus::Connection, current: &Path) -> Resul
         .await?;
     let mut folder = current.as_os_str().as_bytes().to_vec();
     folder.push(0);
-    let options = HashMap::from([
+    let mut options = HashMap::from([
         ("handle_token", Value::from(request.token.as_str())),
         ("directory", Value::from(true)),
         ("multiple", Value::from(false)),
-        ("current_folder", Value::from(folder)),
     ]);
+    if current.is_absolute() {
+        options.insert("current_folder", Value::from(folder));
+    }
     let path =
-        super::portal::accept(proxy.call("OpenFile", &("", "Choose Folder", options))).await?;
+        super::portal::accept(proxy.call("OpenFile", &("", folder_picker_title(current), options)))
+            .await?;
     let Some(values) = request.response(path).await? else {
         return Ok(None);
     };
@@ -3687,6 +5283,134 @@ async fn choose_files_on(
 mod tests {
     use super::*;
     #[test]
+    fn drop_choices_name_a_single_device_once_and_preserve_authority() {
+        for (connected, eligible, folders, expected) in [
+            (true, true, false, true),
+            (false, true, false, false),
+            (true, false, false, false),
+            (true, true, true, false),
+        ] {
+            let mut binding: SendTarget = serde_json::from_value(target(1, 7, !connected)).unwrap();
+            binding.eligible = eligible;
+            binding.folder_reason = Some("Can't receive folders yet".into());
+            let origin = View {
+                targets: Some(vec![binding.clone()]),
+                ..Default::default()
+            };
+            let d = DeviceItem {
+                id: id(1).to_string().into(),
+                name: "Galaxy S25+".into(),
+                connected,
+                ..Default::default()
+            };
+            let (labels, targets) = drop_choices(&origin, std::slice::from_ref(&d), folders);
+            assert_eq!(labels.len(), 1);
+            assert_eq!(labels[0].name, "Galaxy S25+");
+            assert_eq!(labels[0].enabled, expected);
+            assert_eq!(targets[0][0].device, id(1).as_str());
+            assert_eq!(targets[0][0].generation, 7);
+            assert_eq!(
+                targets[0][0].fingerprint,
+                binding.fingerprint.clone().unwrap()
+            );
+            if folders {
+                assert_eq!(labels[0].sub, "Can't receive folders yet");
+            }
+            let other = DeviceItem {
+                id: id(2).to_string().into(),
+                name: "MacBook Air".into(),
+                ..d.clone()
+            };
+            let (labels, _) = drop_choices(&origin, &[d, other], folders);
+            assert_eq!(labels.len(), 3);
+            assert_eq!(labels[0].name, "All connected devices");
+        }
+    }
+    #[test]
+    fn folder_recent_strings_counts_and_phone_refusal() {
+        let ps = peers(&snapshot(two()), &[]);
+        let mut row = transfer("folder", 2, "Trip", "sent", 10, 10);
+        row.folder = Some(crate::folders::Details {
+            items: 1204,
+            links: 2,
+            ..Default::default()
+        });
+        row.finished_at = Some(crate::now_ms() - 60_000);
+        let expected = format!(
+            "To MacBook Air · Sent 1,204 of 1,206 items · {}",
+            super::super::last_seen(row.finished_at.unwrap())
+        );
+        assert_eq!(recent(&ps, &[row.clone()])[0].detail, expected);
+        assert_eq!(recent(&ps, &[row.clone()])[0].detail_tone, Tone::Neutral);
+        assert!(
+            recent(&ps, &[row.clone()])[0]
+                .detail
+                .contains("Sent 1,204 of 1,206 items")
+        );
+        row.folder.as_mut().unwrap().failed = 2;
+        assert_eq!(
+            recent(&ps, &[row.clone()])[0].detail,
+            expected.replace("1,206", "1,208")
+        );
+        assert_eq!(recent(&ps, &[row.clone()])[0].detail_tone, Tone::Warn);
+        row.error = Some("Can't receive folders yet".into());
+        row.state = "failed".into();
+        let failed = recent(&ps, &[row])[0].clone();
+        assert!(!failed.can_retry);
+        assert!(failed.detail.contains("can't receive folders yet"));
+    }
+    #[test]
+    fn folder_changed_is_terminal_on_every_window_surface() {
+        let ps = peers(&snapshot(two()), &[]);
+        let mut row = transfer("folder", 2, "Trip", "failed", 10, 10);
+        row.folder = Some(crate::folders::Details::default());
+        row.error = Some(crate::folders::SourceChanged.to_string());
+        let recent_row = recent(&ps, &[row.clone()])[0].clone();
+        assert!(!recent_row.can_retry);
+        assert_eq!(recent_row.detail, crate::folders::SourceChanged.to_string());
+        let details = recipient_details(&ps, &[row.clone()], &artifact_key(&row));
+        assert!(!details[0].can_retry);
+        row.error = Some("Needs a Pneu update".into());
+        assert_eq!(
+            recipient_details(&ps, &[row.clone()], &artifact_key(&row))[0].detail,
+            "Needs a Pneu update"
+        );
+        row.error = Some("Can't receive folders yet".into());
+        assert!(!recipient_details(&ps, &[row.clone()], &artifact_key(&row))[0].can_retry);
+    }
+    #[test]
+    fn resume_recent_failure_and_retry_strings() {
+        let ps = peers(&snapshot(two()), &[]);
+        let mut failed = transfer(
+            "resume",
+            1,
+            "Recording.mp4",
+            "failed",
+            1_200_000_000,
+            4_000_000_000,
+        );
+        failed.error = Some("Connection lost".into());
+        assert_eq!(
+            transfer_failure(&failed, "Desktop"),
+            format!(
+                "Connection lost · {} sent",
+                size_pair(failed.sent, failed.size)
+            )
+        );
+        assert!(
+            recent(&ps, &[failed.clone()])[0]
+                .detail
+                .contains("Connection lost ·")
+        );
+        failed.sent = 0;
+        assert_eq!(recent(&ps, &[failed.clone()])[0].detail, "Connection lost");
+        failed.state = "sending".into();
+        failed.sent = 1_200_000_000;
+        let rows = recent(&ps, &[failed]);
+        assert_eq!(rows[0].progress, 0.3);
+        assert!(rows[0].detail.starts_with("Sending ·"));
+    }
+    #[test]
     fn peer_labels_normalize_a_protocol_limit_name_and_unicode_line_breaks() {
         let name = format!("{}xy", "Phone\n".repeat(21));
         assert_eq!(name.len(), 128);
@@ -3723,7 +5447,7 @@ mod tests {
             state: state.into(),
             last_seen,
             dialer: None,
-            route: (state == "connected").then(|| "Wi-Fi".into()),
+            route: (state == "connected").then(|| "Local network".into()),
         }
     }
     fn snapshot(devices: Vec<crate::core::mesh::DeviceSnapshot>) -> super::super::Snapshot {
@@ -3794,8 +5518,11 @@ mod tests {
             s(vec![mac("unauthorized"), office("pairing_lost")]).2,
             Tube::Broken
         );
-        // One device keeps v2's name and status line.
-        assert_eq!(s(vec![phone()]).0, "Galaxy S25+");
+        // One device uses its page status; the Devices row retains the name.
+        assert_eq!(
+            s(vec![phone()]),
+            ("Connected".into(), "Local network".into(), Tube::Solid)
+        );
         let mut paused = snapshot(vec![phone()]);
         paused.paused_devices = vec![id(1)];
         assert_eq!(summary(&peers(&paused, &[]), &[]).link.tube, Tube::Paused);
@@ -3819,6 +5546,29 @@ mod tests {
     }
 
     #[test]
+    fn cant_connect_shows_only_when_no_device_can_be_reached() {
+        let with = |states: &[&str]| {
+            let devices = states
+                .iter()
+                .enumerate()
+                .map(|(i, state)| device(i as u8 + 1, "Device", i == 0, state, 0))
+                .collect();
+            unreachable(&peers(&snapshot(devices), &[]))
+        };
+        assert!(!with(&[]));
+        assert!(with(&["disconnected"]));
+        assert!(with(&["disconnected", "connecting"]));
+        assert!(!with(&["disconnected", "connected"]));
+        // A paused phone is still connected.
+        let mut paused = snapshot(vec![device(1, "Phone", true, "connected", 0)]);
+        paused.paused_devices = vec![id(1)];
+        assert!(!unreachable(&peers(&paused, &[])));
+        // Devices which answered need re-pairing or an update, not a network.
+        assert!(!with(&["disconnected", "unauthorized"]));
+        assert!(!with(&["update_required"]));
+    }
+
+    #[test]
     fn per_device_routes_and_receive_capsules_use_their_own_device() {
         let mut mac = device(2, "Mac", false, "connected", 0);
         mac.route = Some("Tailscale".into());
@@ -3826,7 +5576,7 @@ mod tests {
         let mut incoming = transfer("in", 2, "report.pdf", "sending", 5, 10);
         incoming.direction = Some("incoming".into());
         let peers = peers(&snap, &[incoming]);
-        assert_eq!(peers[0].connection(), "Connected over Wi-Fi");
+        assert_eq!(peers[0].connection(), "Connected over local network");
         assert_eq!(peers[1].connection(), "Connected over Tailscale");
         assert!(!peers[0].receiving());
         assert!(peers[1].receiving());
@@ -3930,6 +5680,35 @@ mod tests {
         for name in ["", "capture", "capture.", "mp4", "capturemp4"] {
             assert!(!is_picture(name), "{name}");
             assert!(!is_video(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn replacement_recent_preserves_sibling_success_and_failure() {
+        let ps = peers(&snapshot(two()), &[]);
+        let mut old = transfer("operation", 1, "report.pdf", "cancelled", 0, 10);
+        old.error = Some(crate::store::replacement::REPLACED.into());
+        for (state, detail, tone) in [
+            ("sent", "To MacBook Air", Tone::Neutral),
+            ("failed", "MacBook Air's disk is full", Tone::Danger),
+        ] {
+            let mut sibling = transfer("operation", 2, "report.pdf", state, 10, 10);
+            sibling.error = (state == "failed").then(|| "DiskFull".into());
+            let transfers = [old.clone(), sibling];
+            let rows = recent(&ps, &transfers);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].detail, detail);
+            assert_eq!(rows[0].detail_tone, tone);
+            let details = recipient_details(&ps, &transfers, &rows[0].id);
+            assert_eq!(details.len(), 2);
+            assert_eq!(details[0].detail, "Not sent · replaced");
+            assert_eq!(details[0].tone, Tone::Warn);
+            assert!(details[0].can_retry && !details[0].can_stop);
+            assert!(
+                details[1]
+                    .detail
+                    .starts_with(if state == "sent" { "Sent" } else { "Failed" })
+            );
         }
     }
 
@@ -4040,7 +5819,7 @@ mod tests {
             {"key": format!("{it}/{me}/clipboard"), "enabled": false, "pending": true},
             {"key": format!("{me}/{it}/clipboard"), "enabled": true, "pending": false},
         ]});
-        let (items, note) = device_settings(phone, &reply);
+        let (items, note) = device_settings(phone, &reply, ClipboardMode::Automatic);
         assert!(note.is_empty());
         assert_eq!(
             items
@@ -4057,16 +5836,143 @@ mod tests {
                 ("Receive automatic photos", true, ""),
             ]
         );
-        let (items, note) = device_settings(phone, &json!({"can_sync": false, "settings": []}));
+        let (items, note) = device_settings(
+            phone,
+            &json!({"can_sync": false, "settings": []}),
+            ClipboardMode::Automatic,
+        );
         assert!(items.is_empty());
-        assert_eq!(note, "Update Pneu on Galaxy S25+ to sync these switches.");
+        assert_eq!(note, "Switches sync when Galaxy S25+ connects.");
+        let mut seen = phone.clone();
+        seen.last_seen = 1;
+        assert_eq!(
+            device_settings(&seen, &json!({"can_sync": false}), ClipboardMode::Automatic).1,
+            "Update Pneu on Galaxy S25+ to sync these switches."
+        );
+        let mut connected = phone.clone();
+        connected.health = Health::Connected;
+        let (items, _) = device_settings(&connected, &reply, ClipboardMode::Automatic);
+        assert!(
+            items.iter().all(|s| s.sub.is_empty()),
+            "connected settings must not say waiting to connect"
+        );
+        assert_eq!(phone.connection(), "Not connected yet");
     }
 
+    #[test]
+    fn manual_image_limit_maps_to_window_banner_or_menu_notice_only() {
+        assert_eq!(
+            clipboard_send_error("clipboard image too large", false),
+            Some("Couldn't send the clipboard. The image is over 20 MB")
+        );
+        assert_eq!(
+            clipboard_send_error("clipboard image too large", true),
+            None
+        );
+        for from_menu in [false, true] {
+            assert_eq!(
+                clipboard_send_error("clipboard unavailable", from_menu),
+                Some("Couldn't send the clipboard")
+            );
+        }
+    }
+    #[test]
+    fn share_off_disables_only_send_clipboard_without_changing_pair_settings() {
+        let ps = peers(
+            &snapshot(vec![device(1, "Galaxy S25+", true, "disconnected", 0)]),
+            &[],
+        );
+        let reply = json!({"can_sync":true,"settings":[
+            {"key":format!("{}/{}/clipboard", id(9), id(1)),"enabled":true,"pending":true},
+            {"key":format!("{}/{}/clipboard", id(1), id(9)),"enabled":true,"pending":true}
+        ]});
+        for mode in [
+            ClipboardMode::Automatic,
+            ClipboardMode::Manual,
+            ClipboardMode::Off,
+        ] {
+            let (items, _) = device_settings(&ps[0], &reply, mode);
+            assert_eq!(items[0].enabled, mode != ClipboardMode::Off);
+            assert_eq!(items[0].on, mode != ClipboardMode::Off);
+            assert_eq!(
+                items[0].sub,
+                if mode == ClipboardMode::Off {
+                    "Off for all devices in Settings"
+                } else {
+                    "Applies when Galaxy S25+ connects"
+                }
+            );
+            assert!(items[1].enabled && items[1].on);
+            assert_eq!(items[1].sub, "Applies when Galaxy S25+ connects");
+        }
+        assert_eq!(reply["settings"][0]["enabled"], true);
+    }
+    #[test]
+    fn one_device_status_matches_device_page_for_every_health_and_progress_state() {
+        for state in [
+            "connected",
+            "connecting",
+            "disconnected",
+            "unauthorized",
+            "update_required",
+        ] {
+            for last in [0, crate::now_ms() - 60_000] {
+                let snap = snapshot(vec![device(1, "Galaxy S25+", true, state, last)]);
+                let ps = peers(&snap, &[]);
+                let main = summary(&ps, &[]);
+                let page = device_summary(&ps[0]).0;
+                assert_eq!((main.title, main.detail), (page.title, page.detail));
+                assert_eq!(ps[0].item().name, "Galaxy S25+");
+            }
+        }
+        for incoming in [false, true] {
+            let snap = snapshot(vec![device(1, "Galaxy S25+", true, "connected", 0)]);
+            let mut t = transfer("s", 1, "report.pdf", "sending", 5, 10);
+            if incoming {
+                t.direction = Some("incoming".into());
+            }
+            let ps = peers(&snap, std::slice::from_ref(&t));
+            assert_eq!(summary(&ps, &[t]).detail, device_summary(&ps[0]).0.detail);
+        }
+        let mut snap = snapshot(vec![device(1, "Galaxy S25+", true, "connected", 0)]);
+        snap.paused_devices = vec![id(1)];
+        let ps = peers(&snap, &[]);
+        assert_eq!(summary(&ps, &[]).title, "Paused");
+        assert_eq!(summary(&ps, &[]).detail, "Automatic sending is off");
+    }
+    #[test]
+    fn recent_direction_always_names_one_device_and_limits_name_before_time() {
+        for name in ["Galaxy S25+".to_owned(), "é".repeat(25)] {
+            let ps = peers(&snapshot(vec![device(1, &name, true, "connected", 0)]), &[]);
+            for incoming in [false, true] {
+                let mut t = transfer("done", 1, "report.pdf", "sent", 10, 10);
+                t.finished_at = Some(crate::now_ms() - 60_000);
+                if incoming {
+                    t.direction = Some("incoming".into());
+                }
+                let row = recent(&ps, std::slice::from_ref(&t)).remove(0);
+                let short = if name.chars().count() > 24 {
+                    format!("{}…", name.chars().take(23).collect::<String>())
+                } else {
+                    name.clone()
+                };
+                assert_eq!(
+                    row.detail,
+                    format!(
+                        "{} {short} · {}",
+                        if incoming { "From" } else { "To" },
+                        super::super::last_seen(t.finished_at.unwrap())
+                    )
+                );
+            }
+        }
+    }
     #[test]
     fn sizes_titles_and_modes() {
         assert_eq!(size_pair(12_000_000, 40_000_000), "12 of 40 MB");
         assert_eq!(size_pair(1_200_000, 2_400_000), "1.2 of 2.4 MB");
         assert_eq!(size_pair(320, 900), "320 of 900 B");
+        assert_eq!(size_pair(1_200_000_000, 4_000_000_000), "1.2 of 4.0 GB");
         assert_eq!(
             files_title(&[PathBuf::from("/a/report.pdf")], "Send"),
             "Send report.pdf to"
@@ -4087,7 +5993,7 @@ mod tests {
     }
 
     #[test]
-    fn recent_open_rejects_redirected_paths_and_keeps_an_anchored_file() -> Result<()> {
+    fn recent_open_accepts_linked_parents_and_keeps_an_anchored_file() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let folder = dir.path().join("files");
         std::fs::create_dir(&folder)?;
@@ -4100,8 +6006,11 @@ mod tests {
         assert_eq!(file.read_bounded(100)?, b"original");
         let linked = dir.path().join("linked");
         std::os::unix::fs::symlink(&folder, &linked)?;
-        assert!(recent_file(&linked.join("original.pdf")).is_err());
-        assert!(recent_file(&folder).is_err());
+        assert_eq!(
+            recent_file(&linked.join("original.pdf"))?.read_bounded(100)?,
+            b"original"
+        );
+        assert!(recent_file(&folder)?.is_folder());
         assert!(recent_file(Path::new("relative.pdf")).is_err());
         Ok(())
     }
@@ -4123,7 +6032,13 @@ mod tests {
             "input exceeds bounded read limit"
         );
         std::os::unix::fs::symlink(dir.path().join("child"), dir.path().join("linked"))?;
-        assert!(recent_file(&dir.path().join("linked/../large.bin")).is_err());
+        assert_eq!(
+            recent_file(&dir.path().join("linked/../large.bin"))?
+                .read_bounded(0)
+                .unwrap_err()
+                .to_string(),
+            "input exceeds bounded read limit"
+        );
         std::fs::remove_file(actual)?;
         std::os::unix::fs::symlink("child", dir.path().join("large.bin"))?;
         assert!(recent_file(&selected).is_err());
@@ -4157,8 +6072,13 @@ mod tests {
         }
         slint::platform::update_timers_and_animations();
     }
+    // What the window last copied; tests never reach the system clipboard.
+    static COPIED: Mutex<String> = Mutex::new(String::new());
     struct Headless(std::rc::Rc<slint::platform::software_renderer::MinimalSoftwareWindow>);
     impl slint::platform::Platform for Headless {
+        fn set_clipboard_text(&self, text: &str, _: slint::platform::Clipboard) {
+            *COPIED.lock().unwrap() = text.into();
+        }
         fn new_event_loop_proxy(&self) -> Option<Box<dyn slint::platform::EventLoopProxy>> {
             Some(Box::new(TestProxy(
                 UI_EVENTS.get_or_init(Default::default).clone(),
@@ -4289,6 +6209,8 @@ mod tests {
         window: &PneuWindow,
         dir: &Path,
     ) -> (Worker, tokio::sync::mpsc::UnboundedReceiver<Action>) {
+        #[cfg(not(windows))]
+        let dir = dir.canonicalize().expect("canonical fixture root");
         let view = Arc::new(Mutex::new(View::default()));
         let (commands, rx) = tokio::sync::mpsc::unbounded_channel();
         connect(window, &commands, &view);
@@ -4317,6 +6239,238 @@ mod tests {
         flush_ui();
     }
 
+    #[tokio::test]
+    async fn ring_callback_during_worker_refresh_does_not_deadlock() -> Result<()> {
+        // The callback can block the UI thread itself, so enforce the deadline
+        // from the parent process, outside that thread's event loop.
+        if tokio::time::timeout(
+            Duration::from_secs(10),
+            in_offscreen_child(
+                "ui::window::tests::ring_callback_during_worker_refresh_does_not_deadlock",
+                &[],
+            ),
+        )
+        .await
+        .context("Ring callback or worker refresh deadlocked")??
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut rx) = model_worker(&window, dir.path());
+        go(Page::Device, 1, 0)(&window);
+        window.global::<Ui>().invoke_navigated();
+        // Ignore the navigation action and capture the frame the click sees.
+        rx.try_recv()?;
+        let origin = worker.view();
+        worker.peer_settings = Some((id(1).to_string(), Value::Null, Instant::now()));
+        let value = json!({"config": Config::default(), "snapshot": worker.snapshot});
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let refresh_ready = ready.clone();
+        let (finished, done) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || -> Result<()> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let visible = AtomicBool::new(true);
+            for stop in [false, true] {
+                refresh_ready.wait();
+                runtime.block_on(worker.refresh(value.clone(), &visible))?;
+                let action = rx.blocking_recv().context("missing ring action")?;
+                let Action::Scoped(captured, action) = action else {
+                    anyhow::bail!("ring action lost its displayed frame");
+                };
+                assert_eq!(captured, origin);
+                assert!(
+                    matches!(*action, Action::Ring(ref device, ref connection, stopping)
+                    if device == id(1).as_str() && connection == "42" && stopping == stop)
+                );
+                finished.send(())?;
+            }
+            Ok(())
+        });
+        for stop in [false, true] {
+            ready.wait();
+            window
+                .global::<Ui>()
+                .invoke_ring_phone(id(1).as_str().into(), "42".into(), stop);
+            done.recv_timeout(Duration::from_secs(3))
+                .context("worker refresh blocked after Ring callback")?;
+            flush_ui();
+        }
+        thread.join().expect("refresh thread panicked")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn folder_admission_banner_does_not_return_in_a_new_window() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::folder_admission_banner_does_not_return_in_a_new_window",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, _) = model_worker(&window, dir.path());
+        let visible = AtomicBool::new(true);
+        let mut value = status_value(&worker);
+        value["snapshot"]["transfers"] = json!([{
+            "operation":id(50), "transfer_id":id(50), "device":id(0),
+            "file_name":"Empty", "size":0, "sent":0, "state":"failed",
+            "error":"Empty is empty", "finished_at":worker.window_started.saturating_sub(1)
+        }]);
+        worker.refresh(value.clone(), &visible).await?;
+        assert!(worker.action_error.is_empty());
+        value["snapshot"]["transfers"][0]["finished_at"] = json!(worker.window_started + 1);
+        worker.refresh(value.clone(), &visible).await?;
+        assert_eq!(worker.action_error, "Empty is empty");
+        worker.action_error.clear();
+        worker.refresh(value, &visible).await?;
+        assert!(
+            worker.action_error.is_empty(),
+            "dismissed once within this window"
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn open_folder_controls_follow_save_setting_and_recent_visibility() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::open_folder_controls_follow_save_setting_and_recent_visibility",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        let surface = headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (_worker, mut actions) = model_worker(&window, dir.path());
+        let ui = window.global::<Ui>();
+        window.show()?;
+        let mut recent_height = None;
+        for page in [Page::Main, Page::Settings] {
+            for save in [false, true] {
+                for has_recent in [false, true] {
+                    ui.set_page(page);
+                    ui.set_save_to_folder(save);
+                    ui.set_recent(ModelRc::new(VecModel::from(if has_recent {
+                        vec![RecentItem {
+                            title: "report.pdf".into(),
+                            ..Default::default()
+                        }]
+                    } else {
+                        Vec::new()
+                    })));
+                    let height = window.get_content_height();
+                    if page == Page::Main && has_recent {
+                        if let Some(previous) = recent_height {
+                            assert_eq!(
+                                height, previous,
+                                "the link must not enlarge the Recent header"
+                            );
+                        }
+                        recent_height = Some(height);
+                    }
+                    surface.set_size(slint::LogicalSize::new(400.0, height).to_physical(1.0));
+                    let mut found = false;
+                    // Exercise the actual hit targets, including hidden and
+                    // disabled controls, rather than duplicating the Slint rule.
+                    for y in (0..height as usize).step_by(4) {
+                        ui.set_page(page);
+                        ui.set_dialog(Dialog::None);
+                        let position = slint::LogicalPosition::new(
+                            if page == Page::Main { 330.0 } else { 235.0 },
+                            y as f32,
+                        );
+                        let button = slint::platform::PointerEventButton::Left;
+                        window.window().dispatch_event(
+                            slint::platform::WindowEvent::PointerPressed { position, button },
+                        );
+                        window.window().dispatch_event(
+                            slint::platform::WindowEvent::PointerReleased { position, button },
+                        );
+                        while let Ok(action) = actions.try_recv() {
+                            if matches!(action, Action::Scoped(_, action) if matches!(*action, Action::OpenFolder))
+                            {
+                                found = true;
+                            }
+                        }
+                    }
+                    assert_eq!(
+                        found,
+                        page == Page::Settings || (save && has_recent),
+                        "page {page:?}, save {save}, Recent {has_recent}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn open_folder_uses_daemon_command_and_reports_full_path_without_blocking_window()
+    -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::open_folder_uses_daemon_command_and_reports_full_path_without_blocking_window",
+            &[],
+        ).await? { return Ok(()); }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        let folder = dir
+            .path()
+            .join("A long received-files folder with spaces and 日本語");
+        worker.status["config"]["save_path"] = json!(folder);
+        worker.status["config"]["save_to_folder"] = json!(false);
+        let mock = mock_ipc(&worker.paths.socket, |command| {
+            assert_eq!(command, &json!({"command":"open_folder"}));
+            (false, json!("opener unavailable"))
+        })?;
+        window.global::<Ui>().invoke_open_folder();
+        worker.act(actions.try_recv()?).await;
+        assert!(worker.open_folder_job.is_some());
+        // Repeated clicks coalesce; other window actions remain available.
+        worker.act(Action::OpenFolder).await;
+        worker.act(Action::Focused).await;
+        let result = job_result(&mut worker.open_folder_job).await;
+        worker.opened_folder(result);
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+        let config: Config = serde_json::from_value(worker.status["config"].clone())?;
+        let frame = worker.frame(&config, &[], None, None, false, crate::now_ms());
+        assert_eq!(frame.folder.chars().count(), 26);
+        apply(&window, frame);
+        assert_eq!(
+            window.global::<Ui>().get_error().as_str(),
+            format!("Couldn't open {}", super::super::display_path(&folder))
+        );
+        worker.act(Action::Navigated).await;
+        assert!(
+            worker.action_error.is_empty(),
+            "normal navigation clears the banner"
+        );
+        worker.act(Action::OpenFolder).await;
+        let result = job_result(&mut worker.open_folder_job).await;
+        worker.view.lock().unwrap().page = Page::Settings;
+        worker.opened_folder(result);
+        assert!(
+            worker.action_error.is_empty(),
+            "late failures stay on the originating view"
+        );
+        worker.act(Action::OpenFolder).await;
+        worker.close(&AtomicBool::new(true)).await;
+        assert!(worker.open_folder_job.is_none());
+        assert!(worker.open_folder_origin.is_none());
+        Ok(())
+    }
+
     fn status_value(worker: &Worker) -> Value {
         json!({"snapshot":worker.snapshot, "config":Config::default(), "window_request":0, "invitation":null})
     }
@@ -4341,7 +6495,7 @@ mod tests {
                     Some("join") => {
                         json!({"state":"confirmation", "attempt":"first-scan", "name":"Other Mac"})
                     }
-                    Some("join_confirm") => json!({"state":"pairing"}),
+                    Some("join_confirm_scoped") => json!({"state":"pairing"}),
                     Some("join_status") => json!({"state":"paired", "device":id(2)}),
                     _ => Value::Null,
                 };
@@ -4400,7 +6554,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .iter()
-                    .any(|r| r["command"] == "join_confirm")
+                    .any(|r| r["command"] == "join_confirm_scoped")
             );
             // Match the confirmation buttons: dismiss the popup and submit its choice.
             window.global::<Ui>().set_dialog(Dialog::None);
@@ -4425,7 +6579,7 @@ mod tests {
                     worker.paired.as_ref().unwrap().device.as_deref(),
                     Some(id(2).as_str())
                 );
-                worker.paired.as_mut().unwrap().at = Instant::now() - Duration::from_secs(2);
+                worker.paired.as_mut().unwrap().at = Instant::now() - Duration::from_millis(5100);
                 worker.refresh(status_value(&worker), &visible).await?;
                 flush_ui();
                 while let Ok(action) = actions.try_recv() {
@@ -4452,7 +6606,7 @@ mod tests {
             assert_eq!(
                 requests
                     .iter()
-                    .filter(|r| r["command"] == "join_confirm")
+                    .filter(|r| r["command"] == "join_confirm_scoped")
                     .count(),
                 usize::from(confirm)
             );
@@ -4490,10 +6644,8 @@ mod tests {
         while let Ok(action) = actions.try_recv() {
             worker.act(action).await;
         }
-        let known = worker.device_ids();
-        let lost = worker.lost_ids();
-        assert_eq!(worker.known, known);
-        assert_eq!(worker.lost, lost);
+        let token = pneu_proto::PairingUri::parse(&sample_uri())?.token;
+        worker.code.token = Some(token.clone());
         assert!(worker.probed);
         // A peer appears while Scan is open. Returning to Add must not absorb
         // that peer into the baseline and hide the pairing-success transition.
@@ -4515,8 +6667,10 @@ mod tests {
         }
         assert_eq!(worker.view().page, Page::Add);
         assert_eq!(worker.view().add_tab, 1);
-        assert_eq!(worker.known, known);
-        assert_eq!(worker.lost, lost);
+        worker.snapshot.pairing_completion = Some(super::super::PairingCompletion {
+            token: token.clone(),
+            device: id(2),
+        });
         assert!(worker.probed);
         worker
             .refresh(status_value(&worker), &AtomicBool::new(true))
@@ -4531,12 +6685,16 @@ mod tests {
         while let Ok(action) = actions.try_recv() {
             worker.act(action).await;
         }
-        assert_eq!(worker.known, worker.device_ids());
-        assert_eq!(worker.lost, worker.lost_ids());
-        assert!(worker.lost.is_empty());
+        assert_eq!(worker.seen_pairing_token, Some(token));
         assert!(worker.paired.is_none());
         assert!(!worker.probed);
         // Newly paired peers are also recognized while Scan itself is open.
+        let next_token = pneu_proto::Hash::new("bc".repeat(32))?;
+        worker.code.token = Some(next_token.clone());
+        worker.snapshot.pairing_completion = Some(super::super::PairingCompletion {
+            token: next_token,
+            device: id(3),
+        });
         worker
             .snapshot
             .devices
@@ -4550,7 +6708,7 @@ mod tests {
             Some(id(3).as_str())
         );
         assert_eq!(window.global::<Ui>().get_paired(), "Office PC");
-        worker.paired.as_mut().unwrap().at = Instant::now() - Duration::from_secs(2);
+        worker.paired.as_mut().unwrap().at = Instant::now() - Duration::from_millis(5100);
         worker
             .refresh(status_value(&worker), &AtomicBool::new(true))
             .await?;
@@ -4809,7 +6967,11 @@ mod tests {
             requests.iter().filter(|r| r["command"] == "join").count(),
             5
         );
-        assert!(!requests.iter().any(|r| r["command"] == "join_confirm"));
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r["command"] == "join_confirm_scoped")
+        );
         Ok(())
     }
     #[tokio::test]
@@ -5341,13 +7503,14 @@ mod tests {
             confirmed: false,
             cancel_requested: false,
             offer: false,
+            link: true,
             origin: worker.view(),
             reported: String::new(),
         });
         let journal = worker.journal_path();
         let mut polls = 0;
         let mock = mock_ipc(&worker.paths.socket, move |command| {
-            if command["command"] == "join_confirm" {
+            if command["command"] == "join_confirm_scoped" {
                 assert!(journal.exists());
                 return (true, json!({"state":"pairing"}));
             }
@@ -5407,7 +7570,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|c| c["command"] == "join_confirm")
+                .filter(|c| c["command"] == "join_confirm_scoped")
                 .count(),
             1
         );
@@ -5505,6 +7668,7 @@ mod tests {
             confirmed: true,
             cancel_requested: false,
             offer: false,
+            link: true,
             origin: worker.view(),
             reported: String::new(),
         };
@@ -5754,6 +7918,179 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn download_code_and_cant_connect_follow_their_interaction_rules() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::download_code_and_cant_connect_follow_their_interaction_rules",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        let surface = headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (_worker, mut rx) = model_worker(&window, dir.path());
+        let ui = window.global::<Ui>();
+        ui.set_motion(false);
+        window.show()?;
+        surface.set_size(slint::PhysicalSize::new(400, 700));
+        window
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::WindowActiveChanged(true));
+        let draw = || {
+            surface.request_redraw();
+            surface.draw_if_needed(|renderer| {
+                let mut pixels = vec![
+                    slint::platform::software_renderer::PremultipliedRgbaColor::default();
+                    400 * 700
+                ];
+                renderer.render(&mut pixels, 400);
+            });
+            advance_ui();
+        };
+        let mut tailscale_requests = || {
+            let mut count = 0;
+            while let Ok(action) = rx.try_recv() {
+                if let Action::Scoped(_, action) = action
+                    && matches!(*action, Action::GetTailscale)
+                {
+                    count += 1;
+                }
+            }
+            count
+        };
+
+        // Esc returns from the download code to the pairing code, then leaves.
+        window.invoke_open_add(0);
+        ui.set_download(true);
+        draw();
+        key(&window, slint::platform::Key::Escape);
+        assert!(!ui.get_download());
+        assert_eq!(ui.get_page(), Page::Add);
+        key(&window, slint::platform::Key::Escape);
+        assert_eq!(ui.get_page(), Page::Main);
+        // Any navigation starts again on the pairing code.
+        ui.set_download(true);
+        window.invoke_open_add(0);
+        assert!(!ui.get_download());
+        // The header's Back leaves Add Device straight from the download code.
+        ui.set_download(true);
+        draw();
+        key(&window, slint::platform::Key::Tab); // Back
+        key(&window, slint::platform::Key::Return);
+        assert_eq!(ui.get_page(), Page::Main);
+        assert!(!ui.get_download());
+        // The printed address copies the whole download page.
+        window.invoke_open_add(0);
+        ui.set_download(true);
+        draw();
+        key(&window, slint::platform::Key::Tab); // Back
+        key(&window, slint::platform::Key::Tab); // Phone / Computer
+        key(&window, slint::platform::Key::Tab); // stantonmatt.github.io/pneu
+        key(&window, slint::platform::Key::Return);
+        assert_eq!(*COPIED.lock().unwrap(), DOWNLOAD_PAGE);
+        assert_eq!(ui.get_page(), Page::Add);
+        assert!(ui.get_download());
+
+        // Get Tailscale… asks the worker to open the page and closes the popup.
+        window.invoke_go(Page::Main);
+        ui.set_unreachable(true);
+        ui.set_dialog(Dialog::Help);
+        draw();
+        key(&window, slint::platform::Key::Tab);
+        key(&window, slint::platform::Key::Return);
+        assert_eq!(ui.get_dialog(), Dialog::None);
+        assert_eq!(tailscale_requests(), 1);
+        // Close and Esc only dismiss it.
+        for close in [slint::platform::Key::Return, slint::platform::Key::Escape] {
+            draw();
+            ui.set_dialog(Dialog::Help);
+            draw();
+            key(&window, close);
+            assert_eq!(ui.get_dialog(), Dialog::None);
+        }
+        // With Tailscale running here, Close is the only button.
+        ui.set_tailscale(true);
+        draw();
+        ui.set_dialog(Dialog::Help);
+        draw();
+        key(&window, slint::platform::Key::Tab);
+        key(&window, slint::platform::Key::Return);
+        assert_eq!(ui.get_dialog(), Dialog::None);
+        assert_eq!(tailscale_requests(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_code_resets_when_leaving_the_phone_tab() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::download_code_resets_when_leaving_the_phone_tab",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        let surface = headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (_worker, _rx) = model_worker(&window, dir.path());
+        let ui = window.global::<Ui>();
+        ui.set_motion(false);
+        ui.set_first_run(true);
+        let pairing_qr = slint::Image::from_rgba8(qr_pixels(&sample_uri())?);
+        ui.set_qr(pairing_qr.clone());
+        window.show()?;
+        surface.set_size(slint::PhysicalSize::new(400, 700));
+        window
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::WindowActiveChanged(true));
+        let draw = || {
+            surface.request_redraw();
+            surface.draw_if_needed(|renderer| {
+                let mut pixels = vec![
+                    slint::platform::software_renderer::PremultipliedRgbaColor::default();
+                    400 * 700
+                ];
+                renderer.render(&mut pixels, 400);
+            });
+            advance_ui();
+        };
+
+        window.invoke_open_add(0);
+        draw();
+        key(&window, slint::platform::Key::Tab); // Phone / Computer
+        key(&window, slint::platform::Key::Tab); // Get Pneu for Android
+        key(&window, slint::platform::Key::Return);
+        assert!(ui.get_download());
+        draw();
+        key(&window, slint::platform::Key::Tab);
+        key(&window, slint::platform::Key::RightArrow); // Computer
+        assert_eq!(ui.get_add_tab(), 1);
+        draw();
+        key(&window, slint::platform::Key::LeftArrow); // Phone
+        draw();
+        assert_eq!(ui.get_add_tab(), 0);
+        assert!(!ui.get_download(), "Phone must return to the pairing QR");
+        assert_eq!(ui.get_qr(), pairing_qr);
+
+        key(&window, slint::platform::Key::Tab); // Get Pneu for Android
+        key(&window, slint::platform::Key::Return);
+        assert!(ui.get_download());
+        draw();
+        key(&window, slint::platform::Key::Tab);
+        key(&window, slint::platform::Key::RightArrow); // Computer
+        assert_eq!(ui.get_add_tab(), 1);
+        ui.set_first_run(false);
+        draw();
+        key(&window, slint::platform::Key::Escape);
+        assert_eq!(ui.get_page(), Page::Main, "Esc must leave Add Device");
+        assert!(!ui.get_download());
+        Ok(())
+    }
+
     // A native test fixture for private KWin/AT-SPI checks. Normal cargo tests
     // return immediately; no daemon, clipboard, session bus, or user data is used.
     #[test]
@@ -5852,6 +8189,1628 @@ mod tests {
         Ok(())
     }
 
+    fn linked_status(worker: &Worker, setup: &Value) -> Value {
+        let mut value = status_value(worker);
+        value["setup"] = setup.clone();
+        value["self_id"] = json!(id(9));
+        value
+    }
+    async fn drain(
+        worker: &mut Worker,
+        actions: &mut tokio::sync::mpsc::UnboundedReceiver<Action>,
+    ) {
+        flush_ui();
+        while let Ok(action) = actions.try_recv() {
+            act_with_ui(worker, action).await;
+        }
+    }
+    /// Draw once so popups exist, then let them focus their default button.
+    fn settle(surface: &slint::platform::software_renderer::MinimalSoftwareWindow) {
+        surface.request_redraw();
+        surface.draw_if_needed(|renderer| {
+            let mut pixels = vec![
+                    slint::platform::software_renderer::PremultipliedRgbaColor::default();
+                    400 * 720
+                ];
+            renderer.render(&mut pixels, 400);
+        });
+        advance_ui();
+    }
+    fn sent(mock: &MockIpc, command: &str) -> Vec<Value> {
+        mock.requests.lock().unwrap().iter().flat_map(|request| {
+            if command == "setup_decision" && request["command"] == "setup_decisions" {
+                request["requests"].as_array().unwrap().iter().map(|r| json!({
+                    "command":"setup_decision", "device":r["device"],
+                    "setup_generation":r["setup_generation"], "binding_generation":r["binding_generation"], "allow":request["allow"],
+                })).collect()
+            } else if request["command"] == command { vec![request.clone()] }
+            else { vec![] }
+        }).collect()
+    }
+
+    #[tokio::test]
+    async fn pairing_switch_is_frozen_into_the_confirmation() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::pairing_switch_is_frozen_into_the_confirmation",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        use slint::platform::Key;
+        let surface = headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        let mock = mock_ipc(&worker.paths.socket, |command| {
+            let reply = match command["command"].as_str() {
+                Some("join") => {
+                    json!({"state":"confirmation", "attempt":"popup", "name":"MJStanton-Desktop"})
+                }
+                Some("join_confirm_scoped") => json!({"state":"pairing"}),
+                Some("join_status") => json!({"state":"confirmation"}),
+                _ => Value::Null,
+            };
+            (true, reply)
+        })?;
+        let ui = window.global::<Ui>();
+        ui.set_motion(false);
+        window.show()?;
+        surface.set_size(slint::PhysicalSize::new(400, 720));
+        window
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::WindowActiveChanged(true));
+        window.invoke_open_add(1);
+        drain(&mut worker, &mut actions).await;
+
+        // Paste Link: the popup asks, with the switch on.
+        worker.paste(sample_uri(), false).await;
+        flush_ui();
+        assert_eq!(ui.get_dialog(), Dialog::Message);
+        assert_eq!(ui.get_message().action, "join-confirm");
+        assert!(ui.get_link_on());
+        settle(&surface);
+        // Cancel has focus. Shift+Tab reaches the switch; Return turns it off,
+        // then Pair confirms with the switch as shown.
+        key(&window, Key::Backtab);
+        key(&window, Key::Return);
+        assert!(!ui.get_link_on());
+        key(&window, Key::Tab);
+        key(&window, Key::Tab);
+        key(&window, Key::Return);
+        assert_eq!(ui.get_dialog(), Dialog::None);
+        drain(&mut worker, &mut actions).await;
+        let confirmed = sent(&mock, "join_confirm_scoped");
+        assert_eq!(confirmed.len(), 1);
+        assert_eq!(confirmed[0]["attempt"], "popup");
+        assert_eq!(confirmed[0]["enabled"], false);
+        assert!(!worker.load_join().unwrap().link);
+
+        // Turning the switch on afterwards changes nothing: asked again, the
+        // popup shows the choice that was frozen.
+        ui.set_link_on(true);
+        worker.poll_join().await;
+        flush_ui();
+        assert_eq!(ui.get_dialog(), Dialog::Message);
+        assert!(!ui.get_link_on());
+        ui.set_dialog(Dialog::None);
+        ui.invoke_message_action("join-confirm".into(), false);
+        drain(&mut worker, &mut actions).await;
+        settle(&surface);
+
+        // At the limit the switch is off and disabled; Pair makes a plain pairing.
+        worker.paste(sample_uri(), false).await;
+        flush_ui();
+        ui.set_link_full(true);
+        settle(&surface);
+        key(&window, Key::Tab);
+        key(&window, Key::Return);
+        drain(&mut worker, &mut actions).await;
+        let confirmed = sent(&mock, "join_confirm_scoped");
+        assert_eq!(confirmed.len(), 2);
+        assert_eq!(confirmed[1]["enabled"], false);
+        assert!(
+            ui.get_link_on(),
+            "the limit doesn't change the user's choice"
+        );
+        ui.set_link_full(false);
+        worker.join = None;
+
+        // Link on the clipboard pairs without the popup, with its own switch.
+        worker.paste(sample_uri(), true).await;
+        flush_ui();
+        assert!(worker.join.as_ref().is_some_and(|j| j.offer));
+        assert!(ui.get_link_on());
+        ui.set_link_on(false);
+        ui.invoke_offer_pair(ui.get_link_on() && !ui.get_link_full());
+        drain(&mut worker, &mut actions).await;
+        let confirmed = sent(&mock, "join_confirm_scoped");
+        assert_eq!(confirmed.len(), 3);
+        assert_eq!(confirmed[2]["enabled"], false);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn requests_offer_and_device_rows_answer_and_link() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::requests_offer_and_device_rows_answer_and_link",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        std::fs::create_dir_all(&worker.paths.data)?;
+        let mock = mock_ipc(&worker.paths.socket, |_| (true, Value::Null))?;
+        let ui = window.global::<Ui>();
+        let visible = AtomicBool::new(true);
+        let mut devices = trio();
+        devices.push(device(4, "Office-PC", false, "connected", 0));
+        state(&mut worker, devices, Vec::new());
+        let asked = |n| with(link_of(n, "ask"), "prompt", json!(true));
+
+        // One device asked: Allow answers it and nothing else.
+        let setup = setup_json(vec![asked(1), link_of(2, "ask"), link_of(4, "ask")], &[]);
+        worker
+            .refresh(linked_status(&worker, &setup), &visible)
+            .await?;
+        flush_ui();
+        let top = ui.get_top();
+        assert_eq!(top.kind, TopKind::Request);
+        assert_eq!(top.title, "Galaxy S25+ wants to link your devices");
+        assert!(top.phone);
+        ui.invoke_top_action(true);
+        drain(&mut worker, &mut actions).await;
+        let answers = sent(&mock, "setup_decision");
+        assert_eq!(answers.len(), 1);
+        assert_eq!(
+            answers[0],
+            json!({"command":"setup_decision", "device": id(1), "setup_generation": 2,
+                "binding_generation": 3, "allow": true})
+        );
+
+        // Two asked: Don't Allow answers both, and only them.
+        let setup = setup_json(vec![asked(1), asked(2), link_of(4, "ask")], &[]);
+        worker
+            .refresh(linked_status(&worker, &setup), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(
+            ui.get_top().title,
+            "Galaxy S25+ and MacBook Air want to link your devices"
+        );
+        ui.invoke_top_action(false);
+        drain(&mut worker, &mut actions).await;
+        let answers = sent(&mock, "setup_decision");
+        assert_eq!(answers.len(), 3);
+        assert!(answers[1..].iter().all(|a| a["allow"] == false));
+        assert_eq!(answers[1]["device"], json!(id(1)));
+        assert_eq!(answers[2]["device"], json!(id(2)));
+
+        // ✕ leaves them waiting; a third device asking shows the card again.
+        ui.invoke_top_close();
+        drain(&mut worker, &mut actions).await;
+        worker
+            .refresh(linked_status(&worker, &setup), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(ui.get_top().kind, TopKind::None);
+        let three = setup_json(vec![asked(1), asked(2), asked(4)], &[]);
+        worker
+            .refresh(linked_status(&worker, &three), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(
+            ui.get_top().title,
+            "Galaxy S25+ and 2 other devices want to link your devices"
+        );
+        // Closing is kept until Pneu restarts, even after the window does.
+        ui.invoke_top_close();
+        drain(&mut worker, &mut actions).await;
+        let reopened = Worker::new(
+            worker.paths.clone(),
+            window.as_weak(),
+            worker.view.clone(),
+            0,
+        );
+        assert_eq!(
+            setup::top(
+                &Setup::parse(&json!({"setup": three})),
+                &peers(&worker.snapshot, &[]),
+                &reopened.remembered
+            ),
+            Top::None
+        );
+        let mut restarted = reopened.remembered.clone();
+        restarted.daemon = "an earlier run".into();
+        assert!(matches!(
+            setup::top(
+                &Setup::parse(&json!({"setup": three})),
+                &peers(&worker.snapshot, &[]),
+                &restarted
+            ),
+            Top::Request { .. }
+        ));
+
+        // The offer: Link covers every undecided pairing, then says where to finish.
+        let undecided = setup_json(
+            vec![link_of(1, "ask"), link_of(2, "ask"), link_of(4, "ask")],
+            &[],
+        );
+        worker
+            .refresh(linked_status(&worker, &undecided), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(ui.get_top().kind, TopKind::Offer);
+        assert_eq!(ui.get_top().title, "Link your devices");
+        ui.invoke_top_action(true);
+        drain(&mut worker, &mut actions).await;
+        assert_eq!(
+            sent(&mock, "link_existing_device"),
+            vec![json!({"command":"link_existing_device", "device": id(1),
+                "binding_generation": 3, "expected_scope": "ask"})]
+        );
+        assert_eq!(worker.remembered.offer.as_deref(), Some(setup::LINKED));
+        let waiting = |n: u8| with(link_of(n, "enabled"), "participating", json!(false));
+        let linking_now = setup_json(
+            vec![link_of(1, "enabled"), waiting(2), waiting(4)],
+            &[(1, "Galaxy S25+")],
+        );
+        worker
+            .refresh(linked_status(&worker, &linking_now), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(ui.get_top().kind, TopKind::Waiting);
+        assert_eq!(
+            ui.get_top().title,
+            "Allow linking on MacBook Air and Office-PC"
+        );
+        // When the last one answers, the card goes for good.
+        let linked = setup_json(
+            vec![
+                link_of(1, "enabled"),
+                link_of(2, "enabled"),
+                link_of(4, "enabled"),
+            ],
+            &[(1, "Galaxy S25+"), (2, "MacBook Air"), (4, "Office-PC")],
+        );
+        worker
+            .refresh(linked_status(&worker, &linked), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(ui.get_top().kind, TopKind::None);
+        assert_eq!(worker.remembered.offer.as_deref(), Some(setup::DONE));
+
+        // ✕ on a fresh offer hides it for good, across windows.
+        worker.remembered = Remembered::default();
+        worker
+            .refresh(linked_status(&worker, &undecided), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(ui.get_top().kind, TopKind::Offer);
+        ui.invoke_top_close();
+        drain(&mut worker, &mut actions).await;
+        let reopened = Worker::new(
+            worker.paths.clone(),
+            window.as_weak(),
+            worker.view.clone(),
+            0,
+        );
+        assert_eq!(reopened.remembered.offer.as_deref(), Some(setup::DISMISSED));
+
+        // A device page links or answers just that pairing.
+        ui.invoke_link_device(id(2).as_str().into());
+        drain(&mut worker, &mut actions).await;
+        assert_eq!(
+            sent(&mock, "link_existing_device")[1]["device"],
+            json!(id(2))
+        );
+        worker
+            .refresh(linked_status(&worker, &three), &visible)
+            .await?;
+        flush_ui();
+        ui.invoke_answer(id(4).as_str().into(), true);
+        drain(&mut worker, &mut actions).await;
+        let answers = sent(&mock, "setup_decision");
+        assert_eq!(answers.last().unwrap()["device"], json!(id(4)));
+        assert_eq!(answers.last().unwrap()["allow"], true);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remove_from_all_devices_confirms_what_it_showed() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::remove_from_all_devices_confirms_what_it_showed",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        use slint::platform::Key;
+        let surface = headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        let refuse = Arc::new(AtomicBool::new(false));
+        let refusing = refuse.clone();
+        let mock = mock_ipc(&worker.paths.socket, move |command| {
+            if command["command"] == "remove_from_setup" && refusing.load(Ordering::SeqCst) {
+                (false, json!("stale setup removal confirmation"))
+            } else {
+                (true, Value::Null)
+            }
+        })?;
+        let ui = window.global::<Ui>();
+        ui.set_motion(false);
+        window.show()?;
+        surface.set_size(slint::PhysicalSize::new(400, 720));
+        window
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::WindowActiveChanged(true));
+        let visible = AtomicBool::new(true);
+        state(&mut worker, trio(), Vec::new());
+        let via = with(
+            link_of(2, "enabled"),
+            "introducer_name",
+            json!("Galaxy S25+"),
+        );
+        let setup = setup_json(
+            vec![link_of(1, "enabled"), via],
+            &[(1, "Galaxy S25+"), (2, "MacBook Air")],
+        );
+        window.invoke_open_device(id(2).as_str().into());
+        drain(&mut worker, &mut actions).await;
+        worker
+            .refresh(linked_status(&worker, &setup), &visible)
+            .await?;
+        flush_ui();
+        let link = ui.get_device_link();
+        assert!(link.member);
+        assert_eq!(link.via, "Galaxy S25+");
+        assert_eq!(link.row, LinkRow::None);
+
+        // Cancel has focus: Return keeps the device.
+        window.invoke_prepare_remove();
+        settle(&surface);
+        assert_eq!(ui.get_dialog(), Dialog::Remove);
+        assert_eq!(ui.get_remove_name(), "MacBook Air");
+        key(&window, Key::Return);
+        assert_eq!(ui.get_dialog(), Dialog::None);
+        drain(&mut worker, &mut actions).await;
+        assert!(sent(&mock, "remove_from_setup").is_empty());
+        // Let the closed popup leave the component tree before reopening.
+        settle(&surface);
+
+        // Couldn't remove: nothing changed, and it says so.
+        refuse.store(true, Ordering::SeqCst);
+        window.invoke_prepare_remove();
+        settle(&surface);
+        key(&window, Key::Tab);
+        key(&window, Key::Return);
+        drain(&mut worker, &mut actions).await;
+        assert_eq!(ui.get_dialog(), Dialog::Message);
+        let message = ui.get_message();
+        assert_eq!(message.title, "Couldn't remove MacBook Air");
+        assert_eq!(message.text, "Nothing was changed. Try again.");
+        assert_eq!(message.primary, "OK");
+        assert_eq!(worker.view().page, Page::Device);
+        ui.set_dialog(Dialog::None);
+        settle(&surface);
+
+        // Remove sends the membership the confirmation showed, even when the
+        // status changes before even the queued popup-open action is processed.
+        refuse.store(false, Ordering::SeqCst);
+        window.invoke_prepare_remove();
+        let mut newer = setup.clone();
+        newer["generation"] = json!(5);
+        newer["binding_generations"][id(2).as_str()] = json!(9);
+        newer["roster"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|m| m["device_id"] == json!(id(2)))
+            .unwrap()["fingerprint"] = json!("09".repeat(32));
+        worker
+            .refresh(linked_status(&worker, &newer), &visible)
+            .await?;
+        settle(&surface);
+        key(&window, Key::Tab);
+        key(&window, Key::Return);
+        drain(&mut worker, &mut actions).await;
+        let removed = sent(&mock, "remove_from_setup");
+        assert_eq!(removed.len(), 2);
+        assert_eq!(
+            removed[1],
+            json!({"command":"remove_from_setup", "device": id(2), "setup_generation": 2,
+                "binding_generation": 3, "fingerprint": "02".repeat(32)})
+        );
+        assert_eq!(worker.view().page, Page::Main);
+        assert_eq!(ui.get_dialog(), Dialog::None);
+        // Plain pairings keep Unpair….
+        assert!(sent(&mock, "unpair").is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn top_card_queued_actions_keep_displayed_askers_and_fences() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::top_card_queued_actions_keep_displayed_askers_and_fences",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        std::fs::create_dir_all(&worker.paths.data)?;
+        let mock = mock_ipc(&worker.paths.socket, |_| (true, Value::Null))?;
+        let ui = window.global::<Ui>();
+        let visible = AtomicBool::new(true);
+        state(&mut worker, trio(), vec![]);
+        let asked = |n| with(link_of(n, "ask"), "prompt", json!(true));
+        let shown = setup_json(vec![asked(1), link_of(2, "ask")], &[]);
+        let mut newer = setup_json(vec![asked(1), asked(2)], &[]);
+        newer["generation"] = json!(5);
+        newer["binding_generations"][id(1).as_str()] = json!(9);
+        for allow in [false, true] {
+            worker
+                .refresh(linked_status(&worker, &shown), &visible)
+                .await?;
+            flush_ui();
+            worker
+                .refresh(linked_status(&worker, &newer), &visible)
+                .await?;
+            // The worker refreshed; its new frame has not reached the UI yet.
+            ui.invoke_top_action(allow);
+            drain(&mut worker, &mut actions).await;
+        }
+        let decisions = sent(&mock, "setup_decision");
+        assert_eq!(decisions.len(), 2);
+        for (decision, allow) in decisions.iter().zip([false, true]) {
+            assert_eq!(
+                *decision,
+                json!({"command":"setup_decision", "device":id(1), "setup_generation":2, "binding_generation":3, "allow":allow})
+            );
+        }
+        worker
+            .refresh(linked_status(&worker, &shown), &visible)
+            .await?;
+        flush_ui();
+        ui.invoke_top_close();
+        worker
+            .refresh(linked_status(&worker, &newer), &visible)
+            .await?;
+        drain(&mut worker, &mut actions).await;
+        assert!(worker.remembered.closed(&format!("{}/2/3", id(1))));
+        assert!(!worker.remembered.closed(&format!("{}/5/9", id(1))));
+        assert!(!worker.remembered.closed(&format!("{}/5/3", id(2))));
+        worker
+            .refresh(linked_status(&worker, &newer), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(ui.get_top().kind, TopKind::Request);
+
+        // An offer click must not become an implicit Allow of a new asker.
+        worker.remembered = Remembered::default();
+        let offer = setup_json(vec![link_of(1, "ask"), link_of(2, "ask")], &[]);
+        worker
+            .refresh(linked_status(&worker, &offer), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(ui.get_top().kind, TopKind::Offer);
+        ui.invoke_top_action(true);
+        worker
+            .refresh(linked_status(&worker, &newer), &visible)
+            .await?;
+        drain(&mut worker, &mut actions).await;
+        assert!(sent(&mock, "link_existing_device").is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn device_page_queued_answer_keeps_displayed_prompt_fences() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::device_page_queued_answer_keeps_displayed_prompt_fences",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        let mock = mock_ipc(&worker.paths.socket, |_| (true, Value::Null))?;
+        let ui = window.global::<Ui>();
+        let visible = AtomicBool::new(true);
+        state(&mut worker, trio(), vec![]);
+        window.invoke_open_device(id(1).as_str().into());
+        drain(&mut worker, &mut actions).await;
+        let shown = setup_json(vec![with(link_of(1, "ask"), "prompt", json!(true))], &[]);
+        for (generation, binding) in [(2, 9), (5, 3)] {
+            for allow in [false, true] {
+                worker
+                    .refresh(linked_status(&worker, &shown), &visible)
+                    .await?;
+                flush_ui();
+                assert_eq!(ui.get_device_link().row, LinkRow::Asked);
+                let mut newer = shown.clone();
+                newer["generation"] = json!(generation);
+                newer["binding_generations"][id(1).as_str()] = json!(binding);
+                worker
+                    .refresh(linked_status(&worker, &newer), &visible)
+                    .await?;
+                // The refreshed frame has not yet reached the device page.
+                ui.invoke_answer(id(1).as_str().into(), allow);
+                drain(&mut worker, &mut actions).await;
+            }
+        }
+        let decisions = sent(&mock, "setup_decision");
+        assert_eq!(decisions.len(), 4);
+        for (decision, allow) in decisions.iter().zip([false, true, false, true]) {
+            assert_eq!(
+                *decision,
+                json!({"command":"setup_decision", "device":id(1),
+                "setup_generation":2, "binding_generation":3, "allow":allow})
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queued_link_actions_keep_displayed_binding_and_scope() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::queued_link_actions_keep_displayed_binding_and_scope",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        std::fs::create_dir_all(&worker.paths.data)?;
+        let mock = mock_ipc(&worker.paths.socket, |_| (true, json!(false)))?;
+        let ui = window.global::<Ui>();
+        let visible = AtomicBool::new(true);
+        state(&mut worker, trio(), vec![]);
+        let shown = setup_json(vec![link_of(1, "ask"), link_of(2, "ask")], &[]);
+        for top in [true, false] {
+            if !top {
+                window.invoke_open_device(id(1).as_str().into());
+                drain(&mut worker, &mut actions).await;
+            }
+            worker
+                .refresh(linked_status(&worker, &shown), &visible)
+                .await?;
+            flush_ui();
+            let mut newer = shown.clone();
+            newer["binding_generations"][id(1).as_str()] = json!(9);
+            newer["links"][0]["scope"] = json!("disabled");
+            worker
+                .refresh(linked_status(&worker, &newer), &visible)
+                .await?;
+            if top {
+                ui.invoke_top_action(true);
+            } else {
+                ui.invoke_link_device(id(1).as_str().into());
+            }
+            drain(&mut worker, &mut actions).await;
+            assert_ne!(worker.remembered.offer.as_deref(), Some(setup::LINKED));
+            assert_eq!(ui.get_dialog(), Dialog::None);
+        }
+        let links = sent(&mock, "link_existing_device");
+        assert_eq!(links.len(), 2);
+        for link in links {
+            assert_eq!(
+                link,
+                json!({"command":"link_existing_device", "device":id(1),
+                "binding_generation":3, "expected_scope":"ask"})
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn consumed_invitation_completes_existing_device_and_focus_reprobes_clipboard()
+    -> Result<()> {
+        if in_offscreen_child("ui::window::tests::consumed_invitation_completes_existing_device_and_focus_reprobes_clipboard", &[]).await? { return Ok(()); }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        let _mock = mock_ipc(&worker.paths.socket, |_| (true, Value::Null))?;
+        state(&mut worker, trio(), vec![]);
+        window.invoke_open_add(0);
+        drain(&mut worker, &mut actions).await;
+        let token = pneu_proto::PairingUri::parse(&sample_uri())?.token;
+        worker.phone_token = Some(token.clone());
+        worker.snapshot.pairing_completion = Some(super::super::PairingCompletion {
+            token,
+            device: id(2),
+        });
+        let probes = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = probes.clone();
+        window
+            .global::<Ui>()
+            .on_probed(move |_| count.set(count.get() + 1));
+        worker.act(Action::Focused).await;
+        flush_ui();
+        assert_eq!(probes.get(), 1);
+        worker
+            .refresh(status_value(&worker), &AtomicBool::new(true))
+            .await?;
+        flush_ui();
+        assert_eq!(
+            worker.paired.as_ref().and_then(|p| p.device.as_deref()),
+            Some(id(2).as_str())
+        );
+        assert_eq!(window.global::<Ui>().get_paired(), "MacBook Air");
+        let mut lost = peers(&worker.snapshot, &[]);
+        for peer in &mut lost {
+            peer.health = Health::Lost;
+        }
+        let frame = worker.frame(
+            &Config::default(),
+            &lost,
+            None,
+            None,
+            false,
+            crate::now_ms(),
+        );
+        assert!(frame.pair_again);
+        apply(&window, frame);
+        assert!(window.global::<Ui>().get_pair_again());
+        let never = peers(
+            &snapshot(vec![device(2, "MacBook Air", false, "disconnected", 0)]),
+            &[],
+        );
+        assert_eq!(device_summary(&never[0]).0.title, "Not connected yet");
+        Ok(())
+    }
+
+    #[test]
+    fn scope_refresh_preserves_connection_presentation_and_lost_devices_offer_pair_again() {
+        let mut snap = snapshot(vec![device(1, "Phone", true, "disconnected", 123)]);
+        snap.refreshing_devices = vec![id(1)];
+        let refreshed = peers(&snap, &[]);
+        assert!(refreshed[0].connected());
+        assert!(!unreachable(&refreshed));
+        assert_eq!(device_summary(&refreshed[0]).0.title, "Connected");
+        snap.refreshing_devices.clear();
+        assert!(!peers(&snap, &[])[0].connected());
+        snap.devices[0].state = "unauthorized".into();
+        snap.refreshing_devices = vec![id(1)];
+        assert!(
+            peers(&snap, &[])[0].lost(),
+            "a refresh never hides pairing loss"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_run_phone_completion_survives_renewal_and_linked_result_stays_readable()
+    -> Result<()> {
+        if in_offscreen_child("ui::window::tests::first_run_phone_completion_survives_renewal_and_linked_result_stays_readable", &[]).await? { return Ok(()); }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        let mock = mock_ipc(&worker.paths.socket, |_| (true, Value::Null))?;
+        state(&mut worker, vec![], vec![]);
+        window.invoke_open_add(0);
+        drain(&mut worker, &mut actions).await;
+        let invitation = pneu_proto::PairingUri::parse(&sample_uri())?;
+        let mut initial = status_value(&worker);
+        initial["invitation"] = serde_json::to_value(&invitation)?;
+        let visible = AtomicBool::new(true);
+        worker.refresh(initial, &visible).await?;
+        flush_ui();
+        assert_eq!(worker.phone_token.as_ref(), Some(&invitation.token));
+        assert!(
+            window.global::<Ui>().get_link_on(),
+            "first run defaults to linking"
+        );
+        state(&mut worker, trio(), vec![]);
+        worker.snapshot.pairing_completion = Some(super::super::PairingCompletion {
+            token: invitation.token.clone(),
+            device: id(1),
+        });
+        let introduced = with(
+            with(link_of(2, "enabled"), "introduced_by", json!(id(1))),
+            "ready",
+            json!(false),
+        );
+        let mut setup = setup_json(
+            vec![link_of(1, "enabled"), introduced],
+            &[(1, "Galaxy S25+"), (2, "MacBook Air")],
+        );
+        let mut next = linked_status(&worker, &setup);
+        let mut renewed = invitation.clone();
+        renewed.token = pneu_proto::Hash::new("ef".repeat(32))?;
+        next["invitation"] = serde_json::to_value(&renewed)?;
+        worker.refresh(next, &visible).await?;
+        flush_ui();
+        assert_eq!(window.global::<Ui>().get_paired(), "Galaxy S25+");
+        assert!(worker.paired.is_some());
+        assert!(
+            sent(&mock, "pairing_scope")
+                .iter()
+                .all(|r| r["enabled"] == true)
+        );
+        // No READY yet: the old 1.5-second deadline must not dismiss the page.
+        worker.paired.as_mut().unwrap().at = Instant::now() - Duration::from_secs(2);
+        worker
+            .refresh(linked_status(&worker, &setup), &visible)
+            .await?;
+        assert!(worker.paired.is_some());
+        // READY in separate batches updates in place and keeps the full list readable.
+        worker.paired.as_mut().unwrap().at = Instant::now() - Duration::from_secs(4);
+        setup["links"][1]["ready"] = json!(true);
+        worker
+            .refresh(linked_status(&worker, &setup), &visible)
+            .await?;
+        assert_eq!(worker.paired_detail().0, "Also linked: MacBook Air");
+        assert!(
+            worker.paired.as_ref().unwrap().linked_at.unwrap().elapsed()
+                < Duration::from_millis(500)
+        );
+        let second = with(
+            with(link_of(3, "enabled"), "introduced_by", json!(id(1))),
+            "ready",
+            json!(false),
+        );
+        setup["links"].as_array_mut().unwrap().push(second);
+        setup["roster"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"device_id": id(3), "fingerprint": "03".repeat(32), "name": "Office-PC", "status": "member"}));
+        worker.paired.as_mut().unwrap().linked_at =
+            Some(Instant::now() - Duration::from_millis(3100));
+        worker
+            .refresh(linked_status(&worker, &setup), &visible)
+            .await?;
+        assert!(
+            worker.paired.is_some(),
+            "a partial list waits for late introductions"
+        );
+        worker.paired.as_mut().unwrap().at = Instant::now() - Duration::from_millis(4900);
+        setup["links"][2]["ready"] = json!(true);
+        worker
+            .refresh(linked_status(&worker, &setup), &visible)
+            .await?;
+        assert_eq!(
+            worker.paired_detail().0,
+            "Also linked: MacBook Air and Office-PC"
+        );
+        worker.paired.as_mut().unwrap().at = Instant::now() - Duration::from_millis(5100);
+        worker.paired.as_mut().unwrap().linked_at =
+            Some(Instant::now() - Duration::from_millis(2900));
+        worker
+            .refresh(linked_status(&worker, &setup), &visible)
+            .await?;
+        assert!(
+            worker.paired.is_some(),
+            "Also linked is readable for three seconds"
+        );
+        worker.paired.as_mut().unwrap().linked_at =
+            Some(Instant::now() - Duration::from_millis(3100));
+        worker
+            .refresh(linked_status(&worker, &setup), &visible)
+            .await?;
+        flush_ui();
+        assert!(worker.paired.is_none());
+        assert_eq!(worker.view().page, Page::Device);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn setup_shared_readmission_silent_keeper_vector() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::setup_shared_readmission_silent_keeper_vector",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, _actions) = model_worker(&window, dir.path());
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../../../../protocol-vectors/readmission.json"
+        ))?;
+        let scenario = vectors["scenarios"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "silent-keeper-neutral-status")
+            .unwrap();
+        state(
+            &mut worker,
+            vec![device(1, "Phone", true, "disconnected", 0)],
+            vec![],
+        );
+        linking(
+            &mut worker,
+            vec![with(
+                with(link_of(1, "enabled"), "introduced_by", json!(id(4))),
+                "hello_seen",
+                json!(false),
+            )],
+            &[(1, "Phone")],
+        );
+        worker.setup.links[0].ready = false;
+        for step in scenario["steps"].as_array().unwrap() {
+            if let Some(action) = step["local_action"].as_str() {
+                match action {
+                    "arrange-introduced-phone-keeps-B-removed-and-stays-silent"
+                    | "observe-without-authenticated-refusal" => {}
+                    "receive-authenticated-unauthorized-from-A" => {
+                        worker.snapshot.devices[0].state = "unauthorized".into()
+                    }
+                    "authenticate-A-ready" => {
+                        worker.snapshot.devices[0].state = "connected".into();
+                        worker.setup.links[0].ready = true;
+                        worker.setup.links[0].hello_seen = true;
+                    }
+                    _ => panic!("unhandled action {action}"),
+                }
+            } else {
+                assert_eq!(step["receive"], "later-introduction-claimed");
+            }
+            let peers = peers(&worker.snapshot, &[]);
+            let frame = worker.frame(
+                &Config::default(),
+                &peers,
+                Some(&peers[0]),
+                None,
+                false,
+                crate::now_ms(),
+            );
+            for (key, expected) in step["expect"].as_object().into_iter().flatten() {
+                match key.as_str() {
+                    "remote_refusal_claimed" => {
+                        assert_eq!(peers[0].lost(), expected.as_bool().unwrap())
+                    }
+                    "remote_keep_removed_claimed" => {
+                        assert_eq!(expected, false);
+                        assert!(!frame.device_summary.detail.contains("Keep removed"));
+                    }
+                    "status" => {
+                        assert_eq!(expected, "neutral");
+                        assert_eq!(frame.devices[0].status_tone, Tone::Neutral);
+                    }
+                    "status_example" => {
+                        assert_eq!(frame.device_summary.title, "Waiting for Phone");
+                        assert_eq!(
+                            frame.device_summary.detail,
+                            "Open Pneu on Phone, or pair with it directly"
+                        );
+                    }
+                    "also_linked" => {
+                        assert_eq!(worker.setup.links[0].ready, expected.as_bool().unwrap())
+                    }
+                    "diagnostic" => {
+                        assert_eq!(
+                            frame.device_summary.detail,
+                            "Allow it on Phone, or pair with it directly"
+                        );
+                        assert!(
+                            expected
+                                .as_str()
+                                .unwrap()
+                                .ends_with("Pair with it directly")
+                        );
+                    }
+                    "trust_A_retained" => assert_eq!(
+                        !worker.snapshot.devices.is_empty(),
+                        expected.as_bool().unwrap()
+                    ),
+                    "refusal_status_cleared" => {
+                        assert_eq!(expected, true);
+                        assert!(peers[0].connected());
+                        assert!(!frame.device_summary.detail.contains("doesn't recognize"));
+                    }
+                    _ => panic!("unhandled assertion {key}"),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn removed_self_with_offline_phone_and_ambiguous_refusal_have_distinct_presentations()
+    -> Result<()> {
+        if in_offscreen_child("ui::window::tests::removed_self_with_offline_phone_and_ambiguous_refusal_have_distinct_presentations", &[]).await? { return Ok(()); }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, _actions) = model_worker(&window, dir.path());
+        state(
+            &mut worker,
+            vec![
+                device(1, "Phone", true, "disconnected", 100),
+                device(2, "MacBook Air", false, "unauthorized", 100),
+            ],
+            vec![],
+        );
+        worker.snapshot.setup_refusal_since = Some(200);
+        linking(
+            &mut worker,
+            vec![
+                link_of(1, "enabled"),
+                with(link_of(2, "enabled"), "introduced_by", json!(id(1))),
+            ],
+            &[(1, "Phone"), (2, "MacBook Air")],
+        );
+        let frame = |w: &Worker| {
+            let peers = peers(&w.snapshot, &[]);
+            w.frame(
+                &Config::default(),
+                &peers,
+                peers.iter().find(|p| p.id == id(2).as_str()),
+                None,
+                false,
+                crate::now_ms(),
+            )
+        };
+        let removed = frame(&worker);
+        assert!(removed.pair_again);
+        assert_eq!(removed.summary.title, "Pairing lost");
+        // The phone has connected since the refusal: the computer may still be deciding.
+        worker.snapshot.devices[0].last_seen = 300;
+        let waiting = frame(&worker);
+        assert!(!waiting.pair_again);
+        let row = waiting
+            .devices
+            .iter()
+            .find(|d| d.id == id(2).as_str())
+            .unwrap();
+        assert_eq!(row.status, "Not allowed on MacBook Air yet");
+        assert_eq!(row.tone, Tone::Warn);
+        assert_eq!(row.status_tone, Tone::Warn);
+        assert_eq!(waiting.device.status, row.status);
+        assert_eq!(waiting.device_summary.link.tiles[0].tone, Tone::Warn);
+        assert_eq!(waiting.device_summary.link.tube, Tube::Dashed);
+        assert_eq!(waiting.device_action, "pair-warning");
+        assert_eq!(
+            waiting.device_summary.title,
+            "MacBook Air hasn't allowed this computer"
+        );
+        assert_eq!(
+            waiting.device_summary.detail,
+            "Allow it on MacBook Air, or pair with it directly"
+        );
+        assert_eq!(waiting.summary.title, "Waiting for your devices");
+        worker.snapshot.devices.retain(|d| d.role != "phone");
+        worker.snapshot.setup_refusal_since = None;
+        let ambiguous = frame(&worker);
+        assert!(!ambiguous.pair_again);
+        assert_eq!(ambiguous.summary.title, "Waiting for your devices");
+        worker.setup.links[1].introduced_by = None;
+        let direct = frame(&worker);
+        assert_eq!(direct.device_summary.title, "Pairing lost");
+        assert_eq!(direct.device_action, "pair");
+        assert_eq!(direct.device.status_tone, Tone::Danger);
+        worker.setup.links[1].introduced_by = Some(id(1).to_string());
+        worker.snapshot.devices[0].state = "fingerprint_mismatch".into();
+        let mismatch = frame(&worker);
+        assert_eq!(mismatch.device_summary.title, "Pairing lost");
+        assert_eq!(mismatch.device_action, "pair");
+        assert_eq!(mismatch.device.status_tone, Tone::Danger);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn introduced_waiting_page_offers_direct_pairing() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::introduced_waiting_page_offers_direct_pairing",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, _actions) = model_worker(&window, dir.path());
+        state(
+            &mut worker,
+            vec![device(1, "sdk_gphone16k_x86_64", true, "disconnected", 0)],
+            vec![],
+        );
+        linking(
+            &mut worker,
+            vec![with(
+                with(link_of(1, "enabled"), "introduced_by", json!(id(2))),
+                "ready",
+                json!(false),
+            )],
+            &[(1, "sdk_gphone16k_x86_64")],
+        );
+        let peers = peers(&worker.snapshot, &[]);
+        let frame = worker.frame(
+            &Config::default(),
+            &peers,
+            Some(&peers[0]),
+            None,
+            false,
+            crate::now_ms(),
+        );
+        assert_eq!(
+            frame.device_summary.detail,
+            "Open Pneu on sdk_gphone16k_x86_64, or pair with it directly"
+        );
+        assert_eq!(frame.device_action, "pair-warning");
+        window.invoke_open_add(if frame.device.phone { 0 } else { 1 });
+        assert_eq!(window.global::<Ui>().get_page(), Page::Add);
+        assert_eq!(window.global::<Ui>().get_add_tab(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dont_allow_submits_every_displayed_asker_in_one_batch() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::dont_allow_submits_every_displayed_asker_in_one_batch",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        let mock = mock_ipc(&worker.paths.socket, |_| (true, Value::Null))?;
+        state(&mut worker, trio(), vec![]);
+        let setup = setup_json(
+            vec![
+                with(link_of(1, "ask"), "prompt", json!(true)),
+                with(link_of(2, "ask"), "prompt", json!(true)),
+            ],
+            &[],
+        );
+        worker
+            .refresh(linked_status(&worker, &setup), &AtomicBool::new(true))
+            .await?;
+        flush_ui();
+        window.global::<Ui>().invoke_top_action(false);
+        drain(&mut worker, &mut actions).await;
+        let batches = sent(&mock, "setup_decisions");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0]["allow"], false);
+        assert_eq!(batches[0]["requests"].as_array().unwrap().len(), 2);
+        assert!(
+            mock.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|r| r["command"] != "setup_decision")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn introduced_peer_does_not_complete_pairing_but_is_also_linked() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::introduced_peer_does_not_complete_pairing_but_is_also_linked",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        let _mock = mock_ipc(&worker.paths.socket, |_| (true, Value::Null))?;
+        let visible = AtomicBool::new(true);
+        state(
+            &mut worker,
+            vec![device(1, "Galaxy S25+", true, "connected", 0)],
+            vec![],
+        );
+        let initial = setup_json(vec![link_of(1, "enabled")], &[(1, "Galaxy S25+")]);
+        worker
+            .refresh(linked_status(&worker, &initial), &visible)
+            .await?;
+        flush_ui();
+        window.invoke_open_add(1);
+        drain(&mut worker, &mut actions).await;
+        let introduced = with(
+            with(
+                with(link_of(2, "enabled"), "introduced_by", json!(id(1))),
+                "ready",
+                json!(false),
+            ),
+            "hello_seen",
+            json!(false),
+        );
+        let mut roster = setup_json(
+            vec![link_of(1, "enabled"), introduced.clone()],
+            &[(1, "Galaxy S25+"), (2, "MacBook Air")],
+        );
+        state(&mut worker, trio(), vec![]);
+        worker
+            .refresh(linked_status(&worker, &roster), &visible)
+            .await?;
+        flush_ui();
+        assert!(
+            worker.paired.is_none(),
+            "introduction is not a pairing result"
+        );
+        let mut devices = trio();
+        devices.push(device(3, "New computer", false, "connected", 0));
+        state(&mut worker, devices, vec![]);
+        let token = pneu_proto::PairingUri::parse(&sample_uri())?.token;
+        worker.code.token = Some(token.clone());
+        worker.snapshot.pairing_completion = Some(super::super::PairingCompletion {
+            token,
+            device: id(3),
+        });
+        roster = setup_json(
+            vec![link_of(1, "enabled"), introduced, link_of(3, "enabled")],
+            &[(1, "Galaxy S25+"), (2, "MacBook Air"), (3, "New computer")],
+        );
+        worker
+            .refresh(linked_status(&worker, &roster), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(
+            worker.paired.as_ref().and_then(|p| p.device.as_deref()),
+            Some(id(3).as_str())
+        );
+        assert_eq!(worker.paired_detail(), (String::new(), false));
+        roster["links"][1]["hello_seen"] = json!(true);
+        worker
+            .refresh(linked_status(&worker, &roster), &visible)
+            .await?;
+        assert_eq!(worker.paired_detail(), (String::new(), false));
+        roster["links"][1]["ready"] = json!(true);
+        worker
+            .refresh(linked_status(&worker, &roster), &visible)
+            .await?;
+        assert_eq!(
+            worker.paired_detail(),
+            ("Also linked: MacBook Air".into(), false)
+        );
+        assert!(
+            worker.setup.notices.is_empty(),
+            "done screen uses the roster"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn removed_computer_and_joined_remove_request() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::removed_computer_and_joined_remove_request",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        std::fs::create_dir_all(&worker.paths.data)?;
+        let _mock = mock_ipc(&worker.paths.socket, |_| (true, Value::Null))?;
+        let ui = window.global::<Ui>();
+        let visible = AtomicBool::new(true);
+
+        // Removed with nothing left: back on Add Device, saying so once.
+        state(&mut worker, Vec::new(), Vec::new());
+        let mut withdrawn = setup_json(vec![], &[]);
+        withdrawn["withdrawn"] = json!(true);
+        withdrawn["generation"] = json!(4);
+        for _ in 0..2 {
+            worker
+                .refresh(linked_status(&worker, &withdrawn), &visible)
+                .await?;
+            drain(&mut worker, &mut actions).await;
+        }
+        assert_eq!(worker.view().page, Page::Add);
+        assert_eq!(ui.get_dialog(), Dialog::Message);
+        let message = ui.get_message();
+        assert_eq!(
+            message.title,
+            if cfg!(target_os = "macos") {
+                "This Mac was removed from your devices"
+            } else {
+                "This computer was removed from your devices"
+            }
+        );
+        assert_eq!(
+            (message.text.as_str(), message.primary.as_str()),
+            ("", "OK")
+        );
+        ui.set_dialog(Dialog::None);
+        worker
+            .refresh(linked_status(&worker, &withdrawn), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(ui.get_dialog(), Dialog::None, "said once per window");
+        ui.invoke_message_action("removed-ok".into(), true);
+        drain(&mut worker, &mut actions).await;
+        let mut reopened = Worker::new(
+            worker.paths.clone(),
+            window.as_weak(),
+            worker.view.clone(),
+            0,
+        );
+        assert_eq!(reopened.remembered.removed, Some(4));
+        state(&mut reopened, Vec::new(), Vec::new());
+        reopened
+            .refresh(linked_status(&reopened, &withdrawn), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(ui.get_dialog(), Dialog::None, "said once across windows");
+
+        // A joined notification's Remove… opens that page with its confirmation.
+        state(&mut worker, trio(), Vec::new());
+        let setup = setup_json(
+            vec![
+                link_of(1, "enabled"),
+                with(
+                    link_of(2, "enabled"),
+                    "introducer_name",
+                    json!("Galaxy S25+"),
+                ),
+            ],
+            &[(1, "Galaxy S25+"), (2, "MacBook Air")],
+        );
+        let mut status = linked_status(&worker, &setup);
+        status["window_request"] = json!(2);
+        status["remove_device"] = json!(id(2));
+        for fresh in [false, true] {
+            if fresh {
+                ui.set_dialog(Dialog::None);
+                window.invoke_go(Page::Main);
+                drain(&mut worker, &mut actions).await;
+                worker = Worker::new(
+                    worker.paths.clone(),
+                    window.as_weak(),
+                    worker.view.clone(),
+                    2,
+                );
+                state(&mut worker, trio(), vec![]);
+                worker.status = Value::Null;
+            }
+            worker.refresh(status.clone(), &visible).await?;
+            drain(&mut worker, &mut actions).await;
+            assert_eq!(worker.view().page, Page::Device, "fresh={fresh}");
+            assert_eq!(worker.view().device, id(2).as_str());
+            worker.refresh(status.clone(), &visible).await?;
+            drain(&mut worker, &mut actions).await;
+            assert_eq!(ui.get_dialog(), Dialog::Remove);
+            assert_eq!(ui.get_remove_name(), "MacBook Air");
+            assert_eq!(
+                worker.removal.as_ref().map(|r| r.device.as_str()),
+                Some(id(2).as_str())
+            );
+        }
+        Ok(())
+    }
+
+    fn replacement_offer() -> crate::store::replacement::Offer {
+        let old = crate::outbox::Authority {
+            device: id(1),
+            generation: 7,
+            fingerprint: pneu_proto::Hash::new("ab".repeat(32)).unwrap(),
+        };
+        crate::store::replacement::Offer {
+            id: id(8),
+            old: old.clone(),
+            new: crate::outbox::Authority {
+                device: id(3),
+                generation: 1,
+                fingerprint: pneu_proto::Hash::new("cd".repeat(32)).unwrap(),
+            },
+            name: "Galaxy S25+".into(),
+            role: "phone".into(),
+            last_seen: 0,
+            choices: vec![(old, 0)],
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_ui_offer_escape_replace_pair_again_and_recent_states() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::replacement_ui_offer_escape_replace_pair_again_and_recent_states",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        let surface = headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        let mock = mock_ipc(&worker.paths.socket, |_| (true, Value::Null))?;
+        window.invoke_open_add(0);
+        drain(&mut worker, &mut actions).await;
+        let offer = replacement_offer();
+        worker.snapshot.replacements = vec![offer.clone()];
+        worker.poll_replacement().await;
+        flush_ui();
+        let ui = window.global::<Ui>();
+        assert_eq!(ui.get_dialog(), Dialog::Message);
+        assert_eq!(ui.get_message().title, "Replace the old Galaxy S25+?");
+        assert_eq!(
+            ui.get_message().text,
+            "It hasn't connected yet. Replace it if this is the same phone."
+        );
+        assert!(worker.paired.is_some());
+        assert!(
+            mock.requests.lock().unwrap().is_empty(),
+            "matching only offers"
+        );
+        window.show()?;
+        surface.set_size(slint::PhysicalSize::new(400, 700));
+        window
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::WindowActiveChanged(true));
+        let draw = || {
+            flush_ui();
+            surface.request_redraw();
+            surface.draw_if_needed(|renderer| {
+                let mut pixels = vec![
+                        slint::platform::software_renderer::PremultipliedRgbaColor::default();
+                        400 * 700
+                    ];
+                renderer.render(&mut pixels, 400);
+            });
+            advance_ui();
+        };
+        draw();
+        key(&window, slint::platform::Key::Escape);
+        drain(&mut worker, &mut actions).await;
+        draw();
+        assert_eq!(ui.get_dialog(), Dialog::None);
+        assert_eq!(sent(&mock, "replacement_decision")[0]["replace"], false);
+        worker.poll_replacement().await;
+        flush_ui();
+        assert_eq!(
+            ui.get_dialog(),
+            Dialog::None,
+            "decline doesn't reprompt from stale snapshots"
+        );
+        worker.replacement_shown.clear();
+        worker.poll_replacement().await;
+        draw();
+        key(&window, slint::platform::Key::Return);
+        drain(&mut worker, &mut actions).await;
+        assert_eq!(sent(&mock, "replacement_decision")[1]["replace"], true);
+        // An offer left pending by an earlier pairing needs confirmation even
+        // after Pair Again captures exactly the same old entry.
+        worker.replacement_shown.clear();
+        window.invoke_open_device(id(1).to_string().into());
+        drain(&mut worker, &mut actions).await;
+        worker.view.lock().unwrap().targets = Some(vec![SendTarget {
+            device: offer.old.device.to_string(),
+            generation: offer.old.generation,
+            fingerprint: Some(offer.old.fingerprint.to_string()),
+            ..Default::default()
+        }]);
+        ui.invoke_pair_again_started(id(1).to_string().into());
+        window.invoke_open_add(0);
+        drain(&mut worker, &mut actions).await;
+        assert_eq!(
+            worker.pair_again_choice.as_ref().map(|c| &c.old),
+            Some(&offer.old)
+        );
+        worker.poll_replacement().await;
+        flush_ui();
+        assert_eq!(sent(&mock, "replacement_decision").len(), 2);
+        assert_eq!(ui.get_dialog(), Dialog::Message);
+        assert_eq!(ui.get_message().action, "replace-device");
+        worker
+            .act(Action::ReplacementAnswer(offer.id.to_string(), false))
+            .await;
+        worker.replacement_shown.clear();
+        let mut lookalike = offer.old.clone();
+        lookalike.generation += 1;
+        worker.pair_again_choice = Some(PairAgain {
+            old: lookalike,
+            attempt: Some(PairAgainAttempt::Paired(offer.new.device.clone())),
+        });
+        worker.poll_replacement().await;
+        flush_ui();
+        assert_eq!(
+            sent(&mock, "replacement_decision").len(),
+            3,
+            "lookalike never implies removal"
+        );
+        assert_eq!(ui.get_dialog(), Dialog::Message);
+        // A queued answer belongs to the displayed operation, even if another
+        // fresh pairing replaces the offer before the worker handles the click.
+        let mut newer = offer.clone();
+        newer.id = id(7);
+        worker.replacement = Some(newer);
+        worker
+            .act(Action::ReplacementAnswer(offer.id.to_string(), true))
+            .await;
+        assert_eq!(sent(&mock, "replacement_decision").len(), 3);
+        worker.snapshot.replacements.clear();
+        worker.poll_replacement().await;
+        flush_ui();
+        assert_eq!(
+            ui.get_dialog(),
+            Dialog::None,
+            "a stale binding dismisses its offer"
+        );
+        let mut cancelled = transfer("old", 1, "Holiday video.mp4", "cancelled", 0, 10);
+        cancelled.error = Some(crate::store::replacement::REPLACED.into());
+        let key = artifact_key(&cancelled);
+        let rows = recent(&[], std::slice::from_ref(&cancelled));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].detail, "Not sent · old device replaced");
+        assert_eq!(rows[0].detail_tone, Tone::Warn);
+        assert!(rows[0].can_retry && rows[0].can_dismiss);
+        let recipients = recipient_details(&[], &[cancelled], &key);
+        assert_eq!(recipients[0].detail, "Not sent · replaced");
+        assert!(recipients[0].can_retry && !recipients[0].can_stop);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replacement_pair_again_authority_requires_its_authenticated_attempt() -> Result<()> {
+        if in_offscreen_child("ui::window::tests::replacement_pair_again_authority_requires_its_authenticated_attempt", &[]).await? { return Ok(()); }
+        headless()?;
+        for case in ["invitation", "other-token", "join", "restored-join"] {
+            let window = PneuWindow::new()?;
+            let dir = tempfile::tempdir()?;
+            let (mut worker, mut actions) = model_worker(&window, dir.path());
+            let uri = sample_uri();
+            let pair_uri = uri.clone();
+            let mock = mock_ipc(&worker.paths.socket, move |request| {
+                let reply = match request["command"].as_str().unwrap_or_default() {
+                    "pair" => json!({"uri":pair_uri}),
+                    "join" => {
+                        json!({"state":"confirmation", "attempt":"fresh-join", "name":"Galaxy S25+"})
+                    }
+                    "join_confirm_scoped" => json!({"state":"pairing"}),
+                    "join_status" => json!({"state":"paired", "device":id(3)}),
+                    _ => Value::Null,
+                };
+                (true, reply)
+            })?;
+            let offer = replacement_offer();
+            window.invoke_open_device(id(1).to_string().into());
+            drain(&mut worker, &mut actions).await;
+            worker.view.lock().unwrap().targets = Some(vec![SendTarget {
+                device: offer.old.device.to_string(),
+                generation: offer.old.generation,
+                fingerprint: Some(offer.old.fingerprint.to_string()),
+                ..Default::default()
+            }]);
+            window
+                .global::<Ui>()
+                .invoke_pair_again_started(id(1).to_string().into());
+            window.invoke_open_add(0);
+            drain(&mut worker, &mut actions).await;
+            assert_eq!(sent(&mock, "pair").len(), 1, "{case}: fresh invitation");
+            assert!(sent(&mock, "replacement_decision").is_empty());
+            if case.ends_with("join") {
+                worker.paste(uri.clone(), false).await;
+                worker.confirm_join().await;
+                if case == "restored-join" {
+                    // A restored or unrelated handle cannot inherit authority
+                    // from the fresh join, even for the very same new peer.
+                    worker.join.as_mut().unwrap().attempt = "restored-handle".into();
+                }
+                worker.poll_join().await;
+                worker.snapshot.replacements = vec![offer.clone()];
+                worker.poll_replacement().await;
+            } else {
+                state(
+                    &mut worker,
+                    vec![device(3, "Galaxy S25+", true, "connected", 0)],
+                    vec![],
+                );
+                let mut token = pneu_proto::PairingUri::parse(&uri)?.token;
+                if case == "other-token" {
+                    token = pneu_proto::Hash::new("ef".repeat(32))?;
+                }
+                worker.snapshot.pairing_completion = Some(super::super::PairingCompletion {
+                    token,
+                    device: id(3),
+                });
+                worker.snapshot.replacements = vec![offer.clone()];
+                let mut status = status_value(&worker);
+                status["invitation"] = serde_json::to_value(pneu_proto::PairingUri::parse(&uri)?)?;
+                worker.refresh(status, &AtomicBool::new(true)).await?;
+            }
+            flush_ui();
+            let requests = sent(&mock, "replacement_decision");
+            if matches!(case, "invitation" | "join") {
+                assert_eq!(requests.len(), 1, "{case}");
+                assert_eq!(
+                    requests[0]["implied_old"],
+                    serde_json::to_value(&offer.old)?,
+                    "{case}"
+                );
+                assert_eq!(requests[0]["replace"], true);
+            } else {
+                assert!(
+                    requests.is_empty(),
+                    "{case}: unrelated attempt must confirm"
+                );
+                assert_eq!(
+                    window.global::<Ui>().get_dialog(),
+                    Dialog::Message,
+                    "{case}"
+                );
+                assert_eq!(window.global::<Ui>().get_message().action, "replace-device");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replacement_unanswered_offer_returns_after_window_close() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::replacement_unanswered_offer_returns_after_window_close",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        let mock = mock_ipc(&worker.paths.socket, |_| (true, Value::Null))?;
+        window.invoke_open_add(0);
+        drain(&mut worker, &mut actions).await;
+        let offer = replacement_offer();
+        worker.snapshot.replacements = vec![offer.clone()];
+        worker.poll_replacement().await;
+        flush_ui();
+        let ui = window.global::<Ui>();
+        assert_eq!(ui.get_dialog(), Dialog::Message);
+        let visible = AtomicBool::new(true);
+        worker.close(&visible).await;
+        flush_ui();
+        assert_eq!(ui.get_dialog(), Dialog::None);
+        assert!(!visible.load(Ordering::SeqCst));
+        assert!(sent(&mock, "replacement_decision").is_empty());
+        window.show()?;
+        visible.store(true, Ordering::SeqCst);
+        worker.poll_replacement().await;
+        flush_ui();
+        assert_eq!(ui.get_dialog(), Dialog::Message);
+        assert_eq!(ui.get_replacement_intent(), offer.id.as_str());
+        worker
+            .act(Action::ReplacementAnswer(offer.id.to_string(), true))
+            .await;
+        let requests = sent(&mock, "replacement_decision");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["replace"], true);
+        window.hide()?;
+        Ok(())
+    }
+
     /// Every page and popup, rendered with the software renderer. Each must
     /// stay 400 px wide and at most 720 px tall. With PNEU_WINDOW_SHOTS set to
     /// a folder, the renders are also saved there as PNG files.
@@ -5892,6 +9851,21 @@ mod tests {
             "default" => (),
             _ => anyhow::bail!("unknown window theme: {theme}"),
         }
+        // Qt's NativePalette reads QPalette colors independently of its scheme.
+        // Supply both colors for the headless theme fixture, never the session.
+        if theme != "default" {
+            let dark = theme == "dark";
+            window.global::<Pneu>().set_text(if dark {
+                slint::Color::from_rgb_u8(239, 240, 241)
+            } else {
+                slint::Color::from_rgb_u8(35, 38, 41)
+            });
+            window.global::<Pneu>().set_background(if dark {
+                slint::Color::from_rgb_u8(27, 30, 32)
+            } else {
+                slint::Color::from_rgb_u8(239, 240, 241)
+            });
+        }
         let mut rendered = 0;
         for scene in scenes() {
             let paths = Paths {
@@ -5908,6 +9882,16 @@ mod tests {
             );
             let ui = window.global::<Ui>();
             ui.set_dialog(Dialog::None);
+            ui.set_drop_active(false);
+            ui.set_page(Page::Main);
+            // Tear down the previous scene before constructing the next one's
+            // autofocus controls; captures must not inherit pending focus timers.
+            let _ = window.get_content_height();
+            advance_ui();
+            ui.set_is_mac(false);
+            ui.set_history_copied("".into());
+            ui.set_history_query("".into());
+            ui.set_download(false);
             ui.set_qr(slint::Image::from_rgba8(qr_pixels(&sample_uri())?));
             ui.set_code_qr(slint::Image::from_rgba8(qr_pixels(&sample_uri())?));
             (scene.setup)(&mut worker);
@@ -5929,6 +9913,19 @@ mod tests {
             );
             apply(&window, frame);
             (scene.ui)(&window);
+            // Evaluate the layout before advancing timers: conditional controls
+            // must exist before their popup/search autofocus timers can run.
+            let _ = window.get_content_height();
+            if (scene.name.starts_with("11") || scene.name.starts_with("120-"))
+                && scene.name.ends_with("-page")
+            {
+                assert_eq!(
+                    ui.get_device().name,
+                    "Galaxy S25+",
+                    "{} must select the phone before projecting its page",
+                    scene.name
+                );
+            }
             // Popups focus their default button on a short timer.
             slint::platform::update_timers_and_animations();
             std::thread::sleep(Duration::from_millis(5));
@@ -5939,8 +9936,54 @@ mod tests {
                 "{}: {height}px",
                 scene.name
             );
+            if scene.name.contains("-download") {
+                // Swapping the codes must not resize the window.
+                ui.set_download(false);
+                let pairing = window.get_content_height();
+                ui.set_download(true);
+                assert_eq!(pairing, height, "{}: pairing code height", scene.name);
+            }
             let size = slint::LogicalSize::new(400.0, height).to_physical(scale);
             surface.set_size(size);
+            // Layout creates conditional popup buttons lazily. Let their
+            // focus timers run after geometry is resolved, before capture.
+            advance_ui();
+            if scene.name.ends_with("-copied") && !scene.name.contains("history") {
+                // Click the address, which sits just above Pairing Code.
+                let position =
+                    slint::LogicalPosition::new(200.0, height - 16.0 - 24.0 - 4.0 - 12.0);
+                let button = slint::platform::PointerEventButton::Left;
+                window
+                    .window()
+                    .dispatch_event(slint::platform::WindowEvent::PointerPressed {
+                        position,
+                        button,
+                    });
+                window
+                    .window()
+                    .dispatch_event(slint::platform::WindowEvent::PointerReleased {
+                        position,
+                        button,
+                    });
+                assert_eq!(*COPIED.lock().unwrap(), DOWNLOAD_PAGE, "{}", scene.name);
+            }
+            if scene.name.starts_with("folder-send-menu") {
+                let position = slint::LogicalPosition::new(356.0, 151.0);
+                let button = slint::platform::PointerEventButton::Left;
+                window
+                    .window()
+                    .dispatch_event(slint::platform::WindowEvent::PointerPressed {
+                        position,
+                        button,
+                    });
+                window
+                    .window()
+                    .dispatch_event(slint::platform::WindowEvent::PointerReleased {
+                        position,
+                        button,
+                    });
+                advance_ui();
+            }
             surface.request_redraw();
             let mut pixels = vec![
                     slint::platform::software_renderer::PremultipliedRgbaColor::default();
@@ -5949,6 +9992,118 @@ mod tests {
             surface.draw_if_needed(|renderer| {
                 renderer.render(&mut pixels, size.width as usize);
             });
+            // The first draw creates root-level popup controls. Capture their
+            // settled autofocus state, as the next real event-loop frame does.
+            advance_ui();
+            surface.request_redraw();
+            surface.draw_if_needed(|renderer| {
+                renderer.render(&mut pixels, size.width as usize);
+            });
+            if scene.name.starts_with("drop-") {
+                assert!(ui.get_drop_supported() && ui.get_drop_active());
+                let pixel = &pixels
+                    [(100.0 * scale) as usize * size.width as usize + (5.0 * scale) as usize];
+                let background = window.global::<Pneu>().get_background();
+                assert_ne!(
+                    (pixel.red, pixel.green, pixel.blue),
+                    (background.red(), background.green(), background.blue()),
+                    "{}: drop overlay must paint its dimmer",
+                    scene.name
+                );
+            }
+            if scene.name == "115-battery-normal-page" {
+                // Merge small text/divider gaps, then measure each complete
+                // button. Splitting the image in half would hide an oversized
+                // Send button that crosses the row's midpoint.
+                let fill = window.global::<Pneu>().get_accent_soft();
+                let mut widths = [0usize; 2];
+                for row in pixels.chunks_exact(size.width as usize) {
+                    let mut spans: Vec<(usize, usize)> = Vec::new();
+                    for (x, pixel) in row.iter().enumerate() {
+                        if (pixel.red, pixel.green, pixel.blue)
+                            != (fill.red(), fill.green(), fill.blue())
+                        {
+                            continue;
+                        }
+                        if let Some((_, end)) = spans
+                            .last_mut()
+                            .filter(|(_, end)| x - *end - 1 <= (2.0 * scale) as usize)
+                        {
+                            *end = x;
+                        } else {
+                            spans.push((x, x));
+                        }
+                    }
+                    let wide: Vec<_> = spans
+                        .iter()
+                        .map(|(start, end)| end - start + 1)
+                        .filter(|w| *w > (100.0 * scale) as usize)
+                        .collect();
+                    if let [left, right] = wide.as_slice() {
+                        widths[0] = widths[0].max(*left);
+                        widths[1] = widths[1].max(*right);
+                    }
+                }
+                assert!(
+                    widths[0] > 0 && widths[0].abs_diff(widths[1]) <= scale.ceil() as usize,
+                    "Send including arrow {}px != Ring {}px",
+                    widths[0],
+                    widths[1]
+                );
+            }
+            if scene.name == "89-history-searching" {
+                assert_eq!(ui.get_history_query(), "pneu");
+                assert_eq!(ui.get_pinned_history().row_count(), 1);
+                assert_eq!(ui.get_recent_history().row_count(), 0);
+            }
+            if scene.name == "90-history-no-matches" {
+                assert_eq!(ui.get_history_query(), "invoice");
+                assert_eq!(
+                    ui.get_pinned_history().row_count() + ui.get_recent_history().row_count(),
+                    0
+                );
+            }
+            if matches!(ui.get_dialog(), Dialog::HistoryClear | Dialog::HistoryOff) {
+                assert!(
+                    pixels
+                        .iter()
+                        .any(|p| (p.red, p.green, p.blue) == (79, 91, 255)),
+                    "{}: Cancel must show its accent focus ring",
+                    scene.name
+                );
+            }
+            if scene.name.starts_with("folder-send-menu") {
+                let probe_x = if ui.get_folder_reason().is_empty() {
+                    205.0
+                } else {
+                    113.0
+                };
+                let point =
+                    (190.0 * scale) as usize * size.width as usize + (probe_x * scale) as usize;
+                let card = window.global::<Pneu>().get_card();
+                let pixel = &pixels[point];
+                assert_eq!(
+                    (pixel.red, pixel.green, pixel.blue),
+                    (card.red(), card.green(), card.blue()),
+                    "{}: send menu did not open",
+                    scene.name
+                );
+            }
+            if matches!(
+                scene.name,
+                "folder-skipped-items" | "folder-links-skipped-neutral"
+            ) {
+                let warn = window.global::<Pneu>().get_warn();
+                let has_warn = pixels
+                    .iter()
+                    .any(|p| (p.red, p.green, p.blue) == (warn.red(), warn.green(), warn.blue()));
+                assert_eq!(
+                    has_warn,
+                    scene.name == "folder-skipped-items",
+                    "{}: skipped-item tone",
+                    scene.name
+                );
+            }
             if scene.name.starts_with("17-add-") {
                 // At the default size, the Phone page must keep its bottom
                 // padding and must not paint a scrollbar in the right gutter.
@@ -6014,6 +10169,14 @@ mod tests {
                     .context("frame")?
                     .save(folder.join(format!("{}-{theme}.png", scene.name)))?;
             }
+            if scene.name.starts_with("folder-send-menu") {
+                key(&window, slint::platform::Key::Escape);
+                advance_ui();
+                assert!(
+                    window.window().is_visible(),
+                    "Esc closed the window instead of the send menu"
+                );
+            }
         }
         assert_eq!(rendered, scenes().len());
         Ok(())
@@ -6060,7 +10223,7 @@ mod tests {
             .is_some_and(|d| d.role == "phone" && d.state == "connected")
         {
             w.snapshot.device = Some(id(1));
-            w.snapshot.phone.route = "Wi-Fi".into();
+            w.snapshot.phone.route = "Local network".into();
         }
         w.transfers = transfers;
         let config = Config {
@@ -6188,6 +10351,51 @@ mod tests {
         ui.set_picks(ModelRc::new(VecModel::from(picks)));
         ui.set_dialog(Dialog::Picker);
     }
+    fn offline_phone(w: &mut Worker) {
+        let mut phone = device(1, "Galaxy S25+", true, "disconnected", 0);
+        phone.last_seen = crate::now_ms() - 7_200_000;
+        let waiting = transfer("w", 1, "notes.md", "waiting_for_device", 0, 9);
+        state(w, vec![phone], vec![waiting]);
+    }
+    fn offline_devices(w: &mut Worker) {
+        let mut list = vec![
+            transfer("w", 1, "notes.md", "waiting_for_device", 0, 9),
+            transfer("w", 2, "notes.md", "waiting_for_device", 0, 9),
+        ];
+        list.extend(recent_items()[..1].to_vec());
+        state(
+            w,
+            vec![
+                device(
+                    1,
+                    "Galaxy S25+",
+                    true,
+                    "disconnected",
+                    crate::now_ms() - 7_200_000,
+                ),
+                device(
+                    2,
+                    "MacBook Air",
+                    false,
+                    "disconnected",
+                    crate::now_ms() - 9_000_000,
+                ),
+            ],
+            list,
+        );
+    }
+    fn help(w: &PneuWindow) {
+        go(Page::Main, 0, 0)(w);
+        w.global::<Ui>().set_dialog(Dialog::Help);
+    }
+    fn download(tab: i32, mac: bool) -> impl Fn(&PneuWindow) {
+        move |w: &PneuWindow| {
+            go(Page::Add, 0, tab)(w);
+            w.global::<Ui>().set_is_mac(mac);
+            w.global::<Ui>().set_download(true);
+        }
+    }
+    include!("phone_control_tests.rs");
     fn scenes() -> Vec<Scene> {
         let peer = |device: u8, pending: bool| {
             let (me, it) = (id(9), id(device));
@@ -6209,7 +10417,327 @@ mod tests {
             transfer("s", 2, "report.pdf", "sending", 31_000_000, 40_000_000),
         ];
         sending.extend(recent_items());
-        vec![
+        let mut list = vec![
+            scene(
+                "polish-one-device-recent",
+                |w| {
+                    let mut incoming =
+                        transfer("received", 1, "Screenshot_20261101.png", "sent", 10, 10);
+                    incoming.direction = Some("incoming".into());
+                    incoming.finished_at = Some(crate::now_ms() - 60_000);
+                    let mut outgoing =
+                        transfer("sent", 1, "Quarterly report final v3.pdf", "sent", 10, 10);
+                    outgoing.finished_at = Some(crate::now_ms() - 120_000);
+                    state(
+                        w,
+                        vec![device(1, "Galaxy S25+", true, "connected", 0)],
+                        vec![incoming, outgoing],
+                    );
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "polish-share-off-device",
+                move |w| {
+                    state(
+                        w,
+                        vec![device(1, "Galaxy S25+", true, "connected", 0)],
+                        Vec::new(),
+                    );
+                    w.status["config"]["clipboard_mode"] = json!("off");
+                    w.peer_settings =
+                        Some((id(1).as_str().into(), phone_settings(), Instant::now()));
+                    open(w, Page::Device, 1, 0);
+                },
+                go(Page::Device, 1, 0),
+            ),
+            scene(
+                "polish-image-too-large-banner",
+                |w| {
+                    state(
+                        w,
+                        vec![device(1, "Galaxy S25+", true, "connected", 0)],
+                        Vec::new(),
+                    );
+                    w.status["config"]["clipboard_mode"] = json!("manual");
+                    w.action_error = "Couldn't send the clipboard. The image is over 20 MB.".into();
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "folder-send-menu",
+                |w| {
+                    state(w, two(), Vec::new());
+                    w.status["snapshot"]["send_targets"] = json!([target(2, 1, false)]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "folder-send-menu-phone",
+                |w| {
+                    state(
+                        w,
+                        vec![device(1, "Galaxy S25+", true, "connected", 0)],
+                        Vec::new(),
+                    );
+                    let mut unsupported = target(1, 1, false);
+                    unsupported["name"] = json!("Galaxy S25+");
+                    unsupported["folder_reason"] = json!("Can't receive folders yet");
+                    w.status["snapshot"]["send_targets"] = json!([unsupported]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "folder-preparing-counting",
+                |w| {
+                    let mut row = transfer("folder", 2, "Vacation 2026", "staging", 0, 0);
+                    row.folder = Some(crate::folders::Details {
+                        items: 1204,
+                        ..Default::default()
+                    });
+                    state(w, two(), vec![row]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "folder-preparing-reading",
+                |w| {
+                    let mut row = transfer(
+                        "folder",
+                        2,
+                        "Vacation 2026",
+                        "staging",
+                        400_000_000,
+                        1_800_000_000,
+                    );
+                    row.folder = Some(crate::folders::Details {
+                        items: 1204,
+                        ..Default::default()
+                    });
+                    state(w, two(), vec![row]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "folder-skipped-items",
+                |w| {
+                    let mut row = transfer(
+                        "folder",
+                        2,
+                        "Vacation 2026",
+                        "sent",
+                        1_800_000_000,
+                        1_800_000_000,
+                    );
+                    row.finished_at = Some(crate::now_ms() - 60_000);
+                    row.path = Some("/Vacation 2026".into());
+                    row.folder = Some(crate::folders::Details {
+                        items: 1204,
+                        failed: 2,
+                        names: vec!["notes.txt".into(), "index.db".into()],
+                        ..Default::default()
+                    });
+                    state(w, two(), vec![row]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "folder-links-skipped-neutral",
+                |w| {
+                    let mut row = transfer("folder", 2, "Project", "sent", 1_800_000, 1_800_000);
+                    row.finished_at = Some(crate::now_ms() - 60_000);
+                    row.path = Some("/Project".into());
+                    row.folder = Some(crate::folders::Details {
+                        items: 142,
+                        links: 8,
+                        ..Default::default()
+                    });
+                    state(w, two(), vec![row]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "folder-received",
+                |w| {
+                    let mut row = transfer(
+                        "folder",
+                        2,
+                        "Vacation 2026",
+                        "received",
+                        1_800_000_000,
+                        1_800_000_000,
+                    );
+                    row.direction = Some("incoming".into());
+                    row.path = Some("/Vacation 2026".into());
+                    row.folder = Some(crate::folders::Details {
+                        items: 142,
+                        ..Default::default()
+                    });
+                    state(w, two(), vec![row]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "folder-needs-update",
+                |w| {
+                    let mut row =
+                        transfer("folder", 2, "Vacation 2026", "failed", 0, 1_800_000_000);
+                    row.error = Some("Needs a Pneu update".into());
+                    row.folder = Some(crate::folders::Details {
+                        items: 142,
+                        ..Default::default()
+                    });
+                    state(w, two(), vec![row]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "folder-phone-unsupported",
+                |w| {
+                    let mut row =
+                        transfer("folder", 1, "Vacation 2026", "failed", 0, 1_800_000_000);
+                    row.error = Some("Can't receive folders yet".into());
+                    row.folder = Some(crate::folders::Details {
+                        items: 142,
+                        ..Default::default()
+                    });
+                    state(w, two(), vec![row]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "folder-disabled-picker",
+                |w| state(w, two(), vec![]),
+                |w| {
+                    go(Page::Main, 0, 0)(w);
+                    let ui = w.global::<Ui>();
+                    ui.set_dialog(Dialog::Picker);
+                    ui.set_picker_title("Send Vacation 2026 to".into());
+                    ui.set_picker_count(1);
+                    ui.set_picks(ModelRc::new(VecModel::from(vec![
+                        PickItem {
+                            id: id(1).as_str().into(),
+                            name: "Galaxy S25+".into(),
+                            phone: true,
+                            connected: true,
+                            eligible: false,
+                            status: "Can't receive folders yet".into(),
+                            checked: false,
+                            ..Default::default()
+                        },
+                        PickItem {
+                            id: id(2).as_str().into(),
+                            name: "MacBook Air".into(),
+                            connected: true,
+                            eligible: true,
+                            status: "Local network".into(),
+                            checked: true,
+                            ..Default::default()
+                        },
+                    ])));
+                },
+            ),
+            scene(
+                "resume-failed",
+                |w| {
+                    let mut row = transfer(
+                        "resume",
+                        1,
+                        "Recording.mp4",
+                        "failed",
+                        1_200_000_000,
+                        4_000_000_000,
+                    );
+                    row.error = Some("Connection lost".into());
+                    state(w, two(), vec![row]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "resume-retry",
+                |w| {
+                    state(
+                        w,
+                        two(),
+                        vec![transfer(
+                            "resume",
+                            1,
+                            "Recording.mp4",
+                            "sending",
+                            1_200_000_000,
+                            4_000_000_000,
+                        )],
+                    )
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "resume-legacy-failed",
+                |w| {
+                    let mut row =
+                        transfer("legacy", 1, "Recording.mp4", "failed", 0, 4_000_000_000);
+                    row.error = Some("Connection lost".into());
+                    state(w, two(), vec![row]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "90-replacement-popup",
+                |w| {
+                    state(
+                        w,
+                        vec![
+                            device(1, "Galaxy S25+", true, "disconnected", 0),
+                            device(3, "Galaxy S25+", true, "connected", 0),
+                        ],
+                        vec![],
+                    );
+                    open(w, Page::Add, 0, 0);
+                    w.paired = Some(Paired {
+                        origin: w.view(),
+                        name: "Galaxy S25+".into(),
+                        device: Some(id(3).to_string()),
+                        at: Instant::now(),
+                        linked_at: None,
+                        linked: String::new(),
+                    });
+                },
+                |w| {
+                    go(Page::Add, 0, 0)(w);
+                    let ui = w.global::<Ui>();
+                    ui.set_message(Message {
+                        title: "Replace the old Galaxy S25+?".into(),
+                        text: "It last connected Oct 12. Replace it if this is the same phone."
+                            .into(),
+                        primary: "Replace".into(),
+                        secondary: "Keep Both".into(),
+                        action: "replace-device".into(),
+                        ..Default::default()
+                    });
+                    ui.set_dialog(Dialog::Message);
+                },
+            ),
+            scene(
+                "91-replacement-recent",
+                |w| {
+                    let mut row =
+                        transfer("old", 1, "Holiday video.mp4", "cancelled", 0, 1_800_000_000);
+                    row.error = Some(crate::store::replacement::REPLACED.into());
+                    state(
+                        w,
+                        vec![device(3, "Galaxy S25+", true, "connected", 0)],
+                        vec![row, {
+                            let mut received =
+                                transfer("received", 3, "Lisbon 2026.jpg", "sent", 2048, 2048);
+                            received.direction = Some("incoming".into());
+                            received.finished_at = Some(crate::now_ms() - 60_000);
+                            received.path = Some("/Lisbon 2026.jpg".into());
+                            received
+                        }],
+                    );
+                },
+                go(Page::Main, 0, 0),
+            ),
             scene(
                 "40-main-status-unavailable",
                 |w| {
@@ -6229,6 +10757,19 @@ mod tests {
             scene(
                 "01-main-connected",
                 |w| state(w, two(), recent_items()),
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "01-main-save-folder-off",
+                |w| {
+                    state(w, two(), recent_items());
+                    w.status["config"]["save_to_folder"] = json!(false);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "01-main-no-recent",
+                |w| state(w, two(), Vec::new()),
                 go(Page::Main, 0, 0),
             ),
             scene(
@@ -6321,6 +10862,29 @@ mod tests {
                     );
                 },
                 go(Page::Main, 0, 0),
+            ),
+            scene("06-main-cant-connect", offline_devices, help),
+            scene(
+                "06-main-cant-connect-tailscale",
+                |w| {
+                    offline_devices(w);
+                    w.tailscale = Some((true, Instant::now()));
+                },
+                help,
+            ),
+            scene(
+                "09-main-one-device-unreachable",
+                offline_phone,
+                go(Page::Main, 0, 0),
+            ),
+            scene("09-main-cant-connect", offline_phone, help),
+            scene(
+                "09-main-cant-connect-tailscale",
+                |w| {
+                    offline_phone(w);
+                    w.tailscale = Some((true, Instant::now()));
+                },
+                help,
             ),
             scene(
                 "07-main-many-devices",
@@ -6484,6 +11048,49 @@ mod tests {
                 },
             ),
             scene(
+                "17-add-first-run-download",
+                |w| state(w, Vec::new(), Vec::new()),
+                download(0, false),
+            ),
+            scene(
+                "17-add-phone-download",
+                |w| state(w, two(), Vec::new()),
+                download(0, false),
+            ),
+            scene(
+                "17-add-phone-large-qr-download",
+                |w| state(w, two(), Vec::new()),
+                |w| {
+                    download(0, false)(w);
+                    let uri = sample_uri().replace(
+                        "MJStanton-Desktop",
+                        "A longer desktop name for checking QR layout sizing",
+                    );
+                    w.global::<Ui>()
+                        .set_qr(slint::Image::from_rgba8(qr_pixels(&uri).unwrap()));
+                },
+            ),
+            scene(
+                "17-add-first-run-mac",
+                |w| state(w, Vec::new(), Vec::new()),
+                |w| {
+                    go(Page::Add, 0, 0)(w);
+                    w.global::<Ui>().set_is_mac(true);
+                },
+            ),
+            scene(
+                "17-add-first-run-mac-download",
+                |w| state(w, Vec::new(), Vec::new()),
+                download(0, true),
+            ),
+            // Clicked after sizing; the 2 s Copied feedback outlasts the
+            // remaining scenes, so no later one shows the download code.
+            scene(
+                "17-add-phone-download-copied",
+                |w| state(w, two(), Vec::new()),
+                download(0, false),
+            ),
+            scene(
                 "18-add-phone-pairing",
                 |w| {
                     state(w, two(), Vec::new());
@@ -6515,6 +11122,7 @@ mod tests {
                         confirmed: false,
                         cancel_requested: false,
                         offer: true,
+                        link: true,
                         origin: View::default(),
                         reported: String::new(),
                     });
@@ -6532,6 +11140,7 @@ mod tests {
                         confirmed: true,
                         cancel_requested: false,
                         offer: false,
+                        link: true,
                         origin: View::default(),
                         reported: String::new(),
                     });
@@ -6547,6 +11156,8 @@ mod tests {
                         name: "MacBook Air".into(),
                         device: None,
                         at: Instant::now(),
+                        linked_at: None,
+                        linked: String::new(),
                     });
                 },
                 go(Page::Add, 0, 1),
@@ -6638,7 +11249,7 @@ mod tests {
                     message(
                         w,
                         "Can't reach Office-PC",
-                        "Make sure both are on the same Wi-Fi, or that Tailscale is connected.",
+                        "Make sure both are on the same network, or that Tailscale is connected.",
                         0,
                         "Cancel",
                         "Try Again",
@@ -6711,6 +11322,8 @@ mod tests {
                         name: "MacBook Air".into(),
                         device: None,
                         at: Instant::now(),
+                        linked_at: None,
+                        linked: String::new(),
                     });
                 },
                 go(Page::Code, 0, 1),
@@ -6718,6 +11331,26 @@ mod tests {
             scene(
                 "38-settings",
                 |w| state(w, two(), Vec::new()),
+                go(Page::Settings, 0, 0),
+            ),
+            scene(
+                "38-settings-save-folder-off",
+                |w| {
+                    state(w, two(), Vec::new());
+                    w.status["config"]["save_to_folder"] = json!(false);
+                    w.status["config"]["save_path"] = json!(
+                        PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+                            .join("Pictures/A very long received-files folder/Pneu")
+                    );
+                },
+                go(Page::Settings, 0, 0),
+            ),
+            scene(
+                "38-settings-open-folder-error",
+                |w| {
+                    state(w, two(), Vec::new());
+                    w.action_error = "Couldn't open ~/Pictures/Received files/Pneu".into();
+                },
                 go(Page::Settings, 0, 0),
             ),
             scene(
@@ -6757,7 +11390,14 @@ mod tests {
                     picks(
                         w,
                         &[
-                            (1, "Galaxy S25+", true, true, true, "Connected over Wi-Fi"),
+                            (
+                                1,
+                                "Galaxy S25+",
+                                true,
+                                true,
+                                true,
+                                "Connected over local network",
+                            ),
                             (2, "MacBook Air", false, true, true, "Connected"),
                             (3, "Office-PC", false, false, true, "Not connected"),
                             (4, "Old Laptop", false, false, false, "Update required"),
@@ -6778,7 +11418,14 @@ mod tests {
                     picks(
                         w,
                         &[
-                            (1, "Galaxy S25+", true, true, true, "Connected over Wi-Fi"),
+                            (
+                                1,
+                                "Galaxy S25+",
+                                true,
+                                true,
+                                true,
+                                "Connected over local network",
+                            ),
                             (2, "MacBook Air", false, true, true, "Connected"),
                             (3, "Office-PC", false, false, false, "Not connected"),
                         ],
@@ -6992,6 +11639,8 @@ mod tests {
                         name: "Other Mac".into(),
                         device: Some(id(2).as_str().into()),
                         at: Instant::now(),
+                        linked_at: None,
+                        linked: String::new(),
                     });
                 },
                 |w| {
@@ -6999,6 +11648,1593 @@ mod tests {
                     w.global::<Ui>().set_is_mac(true);
                     w.global::<Ui>().set_scan_state(ScanState::Scanning);
                 },
+            ),
+        ];
+        for (name, level, charging, ringing, supported, page) in [
+            ("110-battery-normal-row", 82, false, false, true, Page::Main),
+            ("111-battery-low-row", 15, false, false, true, Page::Main),
+            (
+                "112-battery-charging-row",
+                12,
+                true,
+                false,
+                true,
+                Page::Main,
+            ),
+            ("113-ringing-row", 82, false, true, true, Page::Main),
+            ("114-ringing-off-row", 82, false, false, false, Page::Main),
+            (
+                "115-battery-normal-page",
+                82,
+                false,
+                false,
+                true,
+                Page::Device,
+            ),
+            ("116-battery-low-page", 15, false, false, true, Page::Device),
+            (
+                "117-battery-charging-page",
+                12,
+                true,
+                false,
+                true,
+                Page::Device,
+            ),
+            ("118-ringing-page", 82, false, true, true, Page::Device),
+            (
+                "119-ringing-off-page",
+                82,
+                false,
+                false,
+                false,
+                Page::Device,
+            ),
+        ] {
+            list.push(scene(
+                name,
+                move |w| {
+                    state(w, two(), recent_items());
+                    if page == Page::Device {
+                        open(w, Page::Device, 1, 0);
+                        w.peer_settings =
+                            Some((id(1).as_str().into(), phone_settings(), Instant::now()));
+                    }
+                    w.snapshot.phone_controls.insert(
+                        id(1),
+                        super::super::PhoneControl {
+                            battery: Some(level),
+                            charging,
+                            ringing,
+                            ring_supported: supported,
+                            connection: Some(42),
+                        },
+                    );
+                },
+                go(page, if page == Page::Device { 1 } else { 0 }, 0),
+            ));
+        }
+        list.push(scene(
+            "120-ring-offline-page",
+            |w| {
+                offline_phone(w);
+                open(w, Page::Device, 1, 0);
+                w.snapshot.phone_controls.insert(
+                    id(1),
+                    super::super::PhoneControl {
+                        ring_supported: true,
+                        ..Default::default()
+                    },
+                );
+            },
+            go(Page::Device, 1, 0),
+        ));
+        for (name, devices, folders) in [
+            (
+                "drop-one-connected",
+                vec![device(1, "Galaxy S25+", true, "connected", 0)],
+                false,
+            ),
+            (
+                "drop-one-offline",
+                vec![device(1, "Galaxy S25+", true, "disconnected", 0)],
+                false,
+            ),
+            (
+                "drop-one-folder-disabled",
+                vec![device(1, "Galaxy S25+", true, "connected", 0)],
+                true,
+            ),
+            ("drop-two-connected", two(), false),
+        ] {
+            list.push(scene(
+                name,
+                move |w| {
+                    state(w, devices.clone(), vec![]);
+                    let mut bindings = vec![target(1, 1, devices[0].state != "connected")];
+                    bindings[0]["folder_reason"] = json!("Can't receive folders yet");
+                    if devices.len() > 1 {
+                        bindings.push(target(2, 1, false));
+                    }
+                    w.status["snapshot"]["send_targets"] = json!(bindings);
+                },
+                move |w| {
+                    go(Page::Main, 0, 0)(w);
+                    let ui = w.global::<Ui>();
+                    let devices = ui.get_devices().iter().collect::<Vec<_>>();
+                    let origin = View {
+                        targets: Some(
+                            devices
+                                .iter()
+                                .enumerate()
+                                .map(|(i, d)| {
+                                    let mut t: SendTarget = serde_json::from_value(target(
+                                        (i + 1) as u8,
+                                        1,
+                                        !d.connected,
+                                    ))
+                                    .unwrap();
+                                    if d.phone {
+                                        t.folder_reason = Some("Can't receive folders yet".into());
+                                    }
+                                    t
+                                })
+                                .collect(),
+                        ),
+                        ..Default::default()
+                    };
+                    let (labels, _) = drop_choices(&origin, &devices, folders);
+                    assert_eq!(
+                        labels.len(),
+                        if devices.len() == 1 {
+                            1
+                        } else {
+                            devices.len() + 1
+                        }
+                    );
+                    if devices.len() == 1 {
+                        assert_eq!(labels[0].name, "Galaxy S25+");
+                    }
+                    ui.set_drop_items(ModelRc::new(VecModel::from(labels)));
+                    ui.set_drop_supported(true);
+                    ui.set_drop_active(true);
+                },
+            ));
+        }
+        list.extend(history_scenes());
+        list.extend(linking_scenes());
+        list
+    }
+
+    #[test]
+    fn history_pin_changes_preserve_other_rows_frozen_copy_order() -> Result<()> {
+        let item = |id: &str, pin| -> Result<crate::store::history::Item> {
+            Ok(serde_json::from_value(
+                json!({"id":id,"title":id,"pinned":pin,"url":false,"image":false,"origin":null,"at":1,"thumbnail":null}),
+            )?)
+        };
+        let old = vec![item("pin", Some(1))?, item("b", None)?, item("a", None)?];
+        let mut order = vec!["pin".into(), "a".into(), "b".into()];
+        update_history_order(&mut order, &old, &old, true);
+        assert_eq!(order, ["pin", "a", "b"]);
+        let unpinned = vec![item("b", None)?, item("pin", None)?, item("a", None)?];
+        update_history_order(&mut order, &old, &unpinned, true);
+        assert_eq!(order, ["pin", "a", "b"], "unpin does not move a and b");
+        update_history_order(&mut order, &unpinned, &unpinned, false);
+        assert_eq!(
+            order,
+            ["b", "pin", "a"],
+            "reopening takes the latest copy order"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn history_search_focus_enter_escape_and_shortcut() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::history_search_focus_enter_escape_and_shortcut",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        let surface = headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (_worker, mut rx) = model_worker(&window, dir.path());
+        let ui = window.global::<Ui>();
+        ui.set_keep_history(true);
+        ui.set_is_mac(cfg!(target_os = "macos"));
+        ui.set_history_pins(1);
+        let row = |id: &str, text: &str, pinned, picture| HistoryItem {
+            id: id.into(),
+            title: text.into(),
+            search: crate::store::history::search_key(text).into(),
+            pinned,
+            picture,
+            ..Default::default()
+        };
+        sync(
+            ui.get_history(),
+            &[
+                row("recent", "Café mañana", false, false),
+                row("pin", "CAFÉ au lait", true, false),
+                row("image", "Image", false, true),
+                row(
+                    "long",
+                    &format!("{} tail https://example.org", "x".repeat(600)),
+                    false,
+                    false,
+                ),
+            ],
+        );
+        window.invoke_go(Page::History);
+        window.show()?;
+        surface.set_size(slint::PhysicalSize::new(400, 600));
+        window
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::WindowActiveChanged(true));
+        let draw = || {
+            surface.request_redraw();
+            surface.draw_if_needed(|renderer| {
+                let mut pixels = vec![
+                        slint::platform::software_renderer::PremultipliedRgbaColor::default();
+                        400 * 600
+                    ];
+                renderer.render(&mut pixels, 400);
+            });
+            advance_ui();
+        };
+        let text = |text: &str| {
+            window
+                .window()
+                .dispatch_event(slint::platform::WindowEvent::KeyPressed { text: text.into() });
+            window
+                .window()
+                .dispatch_event(slint::platform::WindowEvent::KeyReleased { text: text.into() });
+            flush_ui();
+        };
+        draw();
+        while rx.try_recv().is_ok() {}
+        text("cafe");
+        assert_eq!(ui.get_history_query(), "cafe", "search takes focus on open");
+        assert_eq!(ui.get_pinned_history().row_count(), 1);
+        assert_eq!(ui.get_recent_history().row_count(), 1);
+        let model = ui.get_history();
+        let rows = model
+            .as_any()
+            .downcast_ref::<VecModel<HistoryItem>>()
+            .unwrap();
+        rows.push(row("arrival", "CAFÉ from a new copy", false, false));
+        assert_eq!(
+            ui.get_recent_history().row_count(),
+            2,
+            "matching arrivals update an active search"
+        );
+        rows.remove(4);
+        let mut pin = rows.row_data(1).unwrap();
+        pin.pinned = false;
+        rows.set_row_data(1, pin.clone());
+        assert_eq!(
+            ui.get_pinned_history().row_count(),
+            0,
+            "unpin updates the active groups"
+        );
+        assert_eq!(ui.get_recent_history().row_count(), 2);
+        pin.pinned = true;
+        rows.set_row_data(1, pin);
+        key(&window, slint::platform::Key::Return);
+        assert!(
+            matches!(rx.try_recv()?, Action::Scoped(_, action) if matches!(*action, Action::CopyHistory(ref id) if id == "pin"))
+        );
+        key(&window, slint::platform::Key::Escape);
+        assert_eq!(ui.get_history_query(), "");
+        assert_eq!(ui.get_page(), Page::History);
+        text("invoice");
+        assert_eq!(
+            ui.get_pinned_history().row_count() + ui.get_recent_history().row_count(),
+            0
+        );
+        assert!(
+            window.get_content_height() >= 256.0,
+            "No matches keeps its 132px card"
+        );
+        key(&window, slint::platform::Key::Return);
+        assert!(rx.try_recv().is_err(), "Enter with no results does nothing");
+        key(&window, slint::platform::Key::Escape);
+        text("tail HTTPS://");
+        assert_eq!(
+            ui.get_recent_history().row_count(),
+            1,
+            "full text and URL scheme match"
+        );
+        key(&window, slint::platform::Key::Tab);
+        let modifier = if cfg!(target_os = "macos") {
+            slint::platform::Key::Meta
+        } else {
+            slint::platform::Key::Control
+        };
+        window
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::KeyPressed {
+                text: modifier.into(),
+            });
+        text("f");
+        window
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::KeyReleased {
+                text: modifier.into(),
+            });
+        text("mañana");
+        assert_eq!(
+            ui.get_history_query(),
+            "mañana",
+            "shortcut focuses and selects all text"
+        );
+        window.invoke_go(Page::Main);
+        assert_eq!(ui.get_history_query(), "");
+        window.invoke_go(Page::History);
+        draw();
+        key(&window, slint::platform::Key::Escape);
+        assert_eq!(ui.get_page(), Page::Main);
+        window.invoke_go(Page::Settings);
+        ui.set_dialog(Dialog::HistoryOff);
+        draw();
+        window.invoke_go(Page::History); // Show All also closes an open popup.
+        draw();
+        text("cafe");
+        assert_eq!(
+            ui.get_history_query(),
+            "cafe",
+            "Show All focuses search after dismissing a popup"
+        );
+        key(&window, slint::platform::Key::Escape);
+        ui.set_dialog(Dialog::HistoryClear);
+        draw();
+        key(&window, slint::platform::Key::Return);
+        assert_eq!(
+            ui.get_dialog(),
+            Dialog::None,
+            "Cancel owns Enter when search previously had focus"
+        );
+        while let Ok(action) = rx.try_recv() {
+            assert!(
+                !matches!(action, Action::Scoped(_, action) if matches!(*action, Action::CopyHistory(_)))
+            );
+        }
+        window.hide()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn history_keyboard_copies_deletes_and_confirmations_default_to_cancel() -> Result<()> {
+        if in_offscreen_child("ui::window::tests::history_keyboard_copies_deletes_and_confirmations_default_to_cancel",&[]).await? {return Ok(());}
+        let surface = headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut rx) = model_worker(&window, dir.path());
+        let ui = window.global::<Ui>();
+        ui.set_keep_history(true);
+        ui.set_motion(false);
+        let row = HistoryItem {
+            id: "row".into(),
+            title: "A saved copy".into(),
+            detail: "This computer · 10:41".into(),
+            ..Default::default()
+        };
+        sync(ui.get_history(), &[row]);
+        window.invoke_go(Page::History);
+        window.show()?;
+        surface.set_size(slint::PhysicalSize::new(400, 400));
+        window
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::WindowActiveChanged(true));
+        let draw = || {
+            surface.request_redraw();
+            surface.draw_if_needed(|renderer| {
+                let mut pixels = vec![
+                        slint::platform::software_renderer::PremultipliedRgbaColor::default();
+                        400 * 400
+                    ];
+                renderer.render(&mut pixels, 400);
+            });
+            advance_ui();
+        };
+        draw();
+        key(&window, slint::platform::Key::Tab);
+        key(&window, slint::platform::Key::Return);
+        key(&window, slint::platform::Key::Delete);
+        let mut copied = 0;
+        let mut deleted = 0;
+        while let Ok(Action::Scoped(_, action)) = rx.try_recv() {
+            match *action {
+                Action::CopyHistory(ref id) if id == "row" => copied += 1,
+                Action::DeleteHistory(ref id) if id == "row" => deleted += 1,
+                _ => {}
+            }
+        }
+        assert_eq!((copied, deleted), (1, 1));
+        for dialog in [Dialog::HistoryClear, Dialog::HistoryOff] {
+            ui.set_dialog(dialog);
+            draw();
+            key(&window, slint::platform::Key::Return);
+            assert_eq!(ui.get_dialog(), Dialog::None);
+            assert!(ui.get_keep_history());
+            ui.set_dialog(dialog);
+            draw();
+            key(&window, slint::platform::Key::Escape);
+            assert_eq!(ui.get_dialog(), Dialog::None);
+            assert!(ui.get_keep_history());
+        }
+        assert!(rx.try_recv().is_err());
+        window.invoke_history_copied("row".into());
+        assert_eq!(ui.get_history_copied(), "row");
+        flush_ui();
+        std::thread::sleep(Duration::from_millis(1200));
+        flush_ui();
+        window.invoke_history_copied("another row".into());
+        flush_ui();
+        std::thread::sleep(Duration::from_millis(1100));
+        flush_ui();
+        assert_eq!(
+            ui.get_history_copied(),
+            "another row",
+            "second copy did not restart timer"
+        );
+        std::thread::sleep(Duration::from_millis(1000));
+        flush_ui();
+        assert_eq!(ui.get_history_copied(), "");
+        key(&window, slint::platform::Key::Escape);
+        assert_eq!(ui.get_page(), Page::Main);
+        // The empty window model must still ask the daemon before disabling.
+        sync(ui.get_history(), &[]);
+        let mock = mock_ipc(&worker.paths.socket, |command| {
+            assert_eq!(command["command"], "disable_empty_clipboard_history");
+            (true, json!(2))
+        })?;
+        ui.invoke_disable_empty_history();
+        while let Ok(action) = rx.try_recv() {
+            if matches!(&action, Action::Scoped(_, action) if matches!(**action, Action::DisableEmptyHistory))
+            {
+                act_with_ui(&mut worker, action).await;
+            }
+        }
+        assert_eq!(ui.get_dialog(), Dialog::HistoryOff);
+        assert_eq!(ui.get_history_off_count(), 2);
+        assert!(ui.get_keep_history());
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn history_title_search_keeps_graphemes_and_measures_the_ellipsis() {
+        use slint::private_unstable_api::re_exports::UnicodeSegmentation;
+        let fits = |text: &str| text.graphemes(true).count() <= 6;
+        assert_eq!(fit_history_title("", fits), "");
+        assert_eq!(fit_history_title("Short", fits), "Short");
+        assert_eq!(fit_history_title("Exact!", fits), "Exact!");
+        assert_eq!(fit_history_title("A e\u{301}👩‍💻XYZ", fits), "A e\u{301}👩‍💻X…");
+        assert_eq!(fit_history_title("abcd efghi", fits), "abcd…");
+        assert_eq!(
+            fit_history_title("WWWiiii", |text| {
+                text.chars()
+                    .map(|c| match c {
+                        'W' => 4,
+                        '…' => 2,
+                        _ => 1,
+                    })
+                    .sum::<usize>()
+                    <= 10
+            }),
+            "WW…"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_titles_fit_two_lines_after_width_and_scale_changes() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::history_titles_fit_two_lines_after_width_and_scale_changes",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        let surface = headless()?;
+        let window = PneuWindow::new()?;
+        connect(
+            &window,
+            &tokio::sync::mpsc::unbounded_channel().0,
+            &Arc::new(Mutex::new(View::default())),
+        );
+        window.show()?;
+        for scale in [1.0, 2.0] {
+            surface.dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged {
+                scale_factor: scale,
+            });
+            for width in [240.0, 480.0, 120.0, 240.0] {
+                let line_height = history_text_size(&window, "Ag", width).1.ceil();
+                for text in [
+                    "The meeting has moved to Thursday. Please send the updated notes before lunch. ".repeat(6),
+                    "W".repeat(160),
+                    "é👩‍💻界".repeat(100),
+                ] {
+                    let result = window.global::<Ui>().invoke_elide_history_title(text.clone().into(), width, line_height * 2.0);
+                    assert!(result.ends_with('…'), "{width}px at {scale}x: {result}");
+                    assert!(text.starts_with(result.trim_end_matches('…')));
+                    let (w, h) = history_text_size(&window, &result, width);
+                    assert!(w <= width && h.ceil() <= line_height * 2.0,
+                        "{width}px at {scale}x: {w}x{h}: {result}");
+                    assert!(h > line_height, "long text should use its second line: {result}");
+                }
+                assert_eq!(
+                    window.global::<Ui>().invoke_elide_history_title(
+                        "Short".into(),
+                        width,
+                        line_height * 2.0
+                    ),
+                    "Short"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn history_fixture(w: &mut Worker, empty: bool) {
+        state(w, trio(), recent_items());
+        w.status["config"]["clipboard_history"] = json!(true);
+        let at = crate::now_ms() - 60_000;
+        w.snapshot.clipboard_history = if empty {
+            vec![]
+        } else {
+            [
+            ("Remember to bring the keys",None,false),
+            ("example.org/plans?view=week",Some("Galaxy S25+"),false),
+            ("Image",Some("MacBook Air"),true),
+            ("The meeting has moved to Thursday. Please send the updated notes before lunch so everyone has time to read them.",None,false),
+            ("averylongwordwithoutanyspaces".repeat(8).as_str(),Some("The computer with an unusually long device name that must be elided"),false),
+        ].into_iter().enumerate().map(|(i,(text,origin,image))|crate::store::history::Item {id:format!("{i:032x}"),title:text.into(),search:crate::store::history::search_key(text),pinned:None,url:i==1,image,origin:origin.map(str::to_owned),at,thumbnail:None}).collect()
+        };
+        w.history_order = w
+            .snapshot
+            .clipboard_history
+            .iter()
+            .map(|i| i.id.clone())
+            .collect();
+    }
+    fn pinned_history_fixture(w: &mut Worker) {
+        history_fixture(w, false);
+        let pins = [
+            "Calle Los Aromos 1840, Depto 52, Providencia",
+            "meet.example.com/pneu-weekly",
+            "Guest Wi-Fi: lantern-orbit-42",
+        ];
+        for (n, text) in pins.into_iter().enumerate() {
+            w.snapshot.clipboard_history.insert(
+                n,
+                crate::store::history::Item {
+                    id: format!("{:032x}", 100 + n),
+                    title: text.into(),
+                    search: crate::store::history::search_key(text),
+                    pinned: Some(3 - n as i64),
+                    url: n == 1,
+                    image: false,
+                    origin: None,
+                    at: crate::now_ms() - 86_400_000,
+                    thumbnail: None,
+                },
+            );
+        }
+        w.history_order = w
+            .snapshot
+            .clipboard_history
+            .iter()
+            .map(|i| i.id.clone())
+            .collect();
+    }
+    fn history_scenes() -> Vec<Scene> {
+        vec![
+            scene(
+                "88-history-pinned-recent",
+                pinned_history_fixture,
+                go(Page::History, 0, 0),
+            ),
+            scene("89-history-searching", pinned_history_fixture, |w| {
+                go(Page::History, 0, 0)(w);
+                let _ = w.get_content_height();
+                advance_ui();
+                w.global::<Ui>().set_history_query("pneu".into());
+            }),
+            scene("90-history-no-matches", pinned_history_fixture, |w| {
+                go(Page::History, 0, 0)(w);
+                let _ = w.get_content_height();
+                advance_ui();
+                w.global::<Ui>().set_history_query("invoice".into());
+            }),
+            scene(
+                "91-history-pin-limit",
+                |w| {
+                    pinned_history_fixture(w);
+                    let template = w.snapshot.clipboard_history[0].clone();
+                    for n in 3..25 {
+                        let mut item = template.clone();
+                        item.id = format!("{:032x}", 100 + n);
+                        item.title = format!("Saved item {}", n + 1);
+                        item.pinned = Some(3 - n);
+                        w.snapshot.clipboard_history.push(item);
+                    }
+                    w.history_order = w
+                        .snapshot
+                        .clipboard_history
+                        .iter()
+                        .map(|i| i.id.clone())
+                        .collect();
+                    w.action_error = crate::store::history::PIN_LIMIT_ERROR.into();
+                },
+                go(Page::History, 0, 0),
+            ),
+            scene("92-history-clear-keeps-pins", pinned_history_fixture, |w| {
+                go(Page::History, 0, 0)(w);
+                w.global::<Ui>().set_dialog(Dialog::HistoryClear);
+            }),
+            scene(
+                "93-history-off-includes-pins",
+                pinned_history_fixture,
+                |w| {
+                    go(Page::Settings, 0, 0)(w);
+                    w.global::<Ui>().set_history_off_count(8);
+                    w.global::<Ui>().set_dialog(Dialog::HistoryOff);
+                },
+            ),
+            scene(
+                "94-history-only-pins",
+                |w| {
+                    pinned_history_fixture(w);
+                    w.snapshot.clipboard_history.retain(|i| i.pinned.is_some());
+                },
+                go(Page::History, 0, 0),
+            ),
+            scene(
+                "95-history-off-only-pins",
+                |w| {
+                    pinned_history_fixture(w);
+                    w.snapshot.clipboard_history.retain(|i| i.pinned.is_some());
+                },
+                |w| {
+                    go(Page::Settings, 0, 0)(w);
+                    w.global::<Ui>().set_history_off_count(3);
+                    w.global::<Ui>().set_dialog(Dialog::HistoryOff);
+                },
+            ),
+            scene(
+                "80-history-main",
+                |w| history_fixture(w, false),
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "81-history-items",
+                |w| history_fixture(w, false),
+                go(Page::History, 0, 0),
+            ),
+            scene(
+                "82-history-empty",
+                |w| history_fixture(w, true),
+                go(Page::History, 0, 0),
+            ),
+            scene(
+                "83-history-copied",
+                |w| history_fixture(w, false),
+                |w| {
+                    go(Page::History, 0, 0)(w);
+                    w.invoke_history_copied(format!("{:032x}", 1).into());
+                },
+            ),
+            scene(
+                "84-history-clear",
+                |w| history_fixture(w, false),
+                |w| {
+                    go(Page::History, 0, 0)(w);
+                    w.global::<Ui>().set_dialog(Dialog::HistoryClear);
+                },
+            ),
+            scene(
+                "85-history-turn-off",
+                |w| history_fixture(w, false),
+                |w| {
+                    go(Page::Settings, 0, 0)(w);
+                    w.global::<Ui>().set_history_off_count(5);
+                    w.global::<Ui>().set_dialog(Dialog::HistoryOff);
+                },
+            ),
+            scene(
+                "86-history-setting",
+                |w| history_fixture(w, true),
+                go(Page::Settings, 0, 0),
+            ),
+            scene(
+                "87-history-image",
+                |w| history_fixture(w, false),
+                |w| {
+                    go(Page::History, 0, 0)(w);
+                    let mut pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(72, 72);
+                    for (i, pixel) in pixels.make_mut_slice().iter_mut().enumerate() {
+                        *pixel = slint::Rgba8Pixel {
+                            r: (i % 72 * 3) as u8,
+                            g: (i / 72 * 3) as u8,
+                            b: 145,
+                            a: 255,
+                        };
+                    }
+                    let model = w.global::<Ui>().get_history();
+                    if let Some(mut row) = model.row_data(2) {
+                        row.thumbnail = slint::Image::from_rgba8(pixels);
+                        model
+                            .as_any()
+                            .downcast_ref::<VecModel<HistoryItem>>()
+                            .unwrap()
+                            .set_row_data(2, row);
+                    }
+                },
+            ),
+        ]
+    }
+
+    // ---------- Pair once, join your devices ----------
+
+    /// MJStanton-Desktop (this computer) with Galaxy S25+ and MacBook Air.
+    fn trio() -> Vec<crate::core::mesh::DeviceSnapshot> {
+        vec![
+            device(1, "Galaxy S25+", true, "connected", 0),
+            device(2, "MacBook Air", false, "connected", 0),
+        ]
+    }
+    /// MacBook Air (this Mac) with Galaxy S25+ and MJStanton-Desktop.
+    fn mac_trio() -> Vec<crate::core::mesh::DeviceSnapshot> {
+        vec![
+            device(1, "Galaxy S25+", true, "connected", 0),
+            device(3, "MJStanton-Desktop", false, "connected", 0),
+        ]
+    }
+    fn link_of(n: u8, scope: &str) -> Value {
+        json!({"device": id(n), "scope": scope, "prompt": false, "introduced_by": null,
+            "introducer_name": null, "outcome": null, "negotiated": true,
+            "participating": scope == "enabled", "hello_seen": true, "ready": scope == "enabled"})
+    }
+    fn with(mut link: Value, key: &str, value: Value) -> Value {
+        link[key] = value;
+        link
+    }
+    /// The daemon's setup status (setup.rs). `members` are your other devices;
+    /// this device (9) joins the roster when there are any.
+    fn linking(w: &mut Worker, links: Vec<Value>, members: &[(u8, &str)]) {
+        w.status["self_id"] = json!(id(9));
+        w.status["setup"] = setup_json(links, members);
+        w.setup = Setup::parse(&w.status);
+    }
+    fn setup_json(links: Vec<Value>, members: &[(u8, &str)]) -> Value {
+        let member = |n: u8, name: &str, hlc: u64| {
+            json!({"device_id": id(n), "fingerprint": format!("{n:02x}").repeat(32),
+                "role": "computer", "name": name, "status": "member", "hlc": hlc,
+                "writer_device": id(n)})
+        };
+        let mut roster = Vec::new();
+        if !members.is_empty() {
+            roster.push(member(9, "This computer", 10));
+            roster.extend(
+                members
+                    .iter()
+                    .map(|(n, name)| member(*n, name, 20 + u64::from(*n))),
+            );
+        }
+        let generations: serde_json::Map<String, Value> = links
+            .iter()
+            .map(|l| (l["device"].as_str().unwrap().to_owned(), json!(3)))
+            .collect();
+        json!({"generation": 2, "withdrawn": false, "roster": roster,
+            "links": links, "pending_link": false, "waiting_for": null,
+            "binding_generations": generations, "notices": []})
+    }
+    fn mac(ui: impl Fn(&PneuWindow) + 'static) -> impl Fn(&PneuWindow) + 'static {
+        move |w: &PneuWindow| {
+            ui(w);
+            w.global::<Ui>().set_is_mac(true);
+        }
+    }
+    fn device_page(w: &mut Worker, n: u8) {
+        let (me, it) = (id(9), id(n));
+        open(w, Page::Device, n, 0);
+        w.peer_settings = Some((
+            it.as_str().into(),
+            json!({"can_sync": true, "settings": [
+                {"key": format!("{me}/{it}/clipboard"), "enabled": true, "pending": false},
+                {"key": format!("{it}/{me}/clipboard"), "enabled": true, "pending": false},
+            ]}),
+            Instant::now(),
+        ));
+    }
+    fn join_confirm(link: bool) -> impl Fn(&PneuWindow) {
+        move |w: &PneuWindow| {
+            message(w, "Pair with MJStanton-Desktop?", "", 1, "Cancel", "Pair");
+            let ui = w.global::<Ui>();
+            let mut m = ui.get_message();
+            m.action = "join-confirm".into();
+            ui.set_message(m);
+            ui.set_link_on(link);
+        }
+    }
+    fn offer_card(w: &mut Worker) {
+        w.join = Some(Join {
+            attempt: "a".into(),
+            uri: String::new(),
+            name: "MJStanton-Desktop".into(),
+            confirmed: false,
+            cancel_requested: false,
+            offer: true,
+            link: true,
+            origin: View::default(),
+            reported: String::new(),
+        });
+    }
+    fn removed(w: &PneuWindow) {
+        let ui = w.global::<Ui>();
+        go(Page::Add, 0, 0)(w);
+        let title = if ui.get_is_mac() {
+            "This Mac was removed from your devices"
+        } else {
+            "This computer was removed from your devices"
+        };
+        ui.set_message(Message {
+            title: title.into(),
+            text: "".into(),
+            tile: 0,
+            primary: "OK".into(),
+            secondary: "".into(),
+            action: "removed-ok".into(),
+        });
+        ui.set_dialog(Dialog::Message);
+    }
+    fn full(w: &mut Worker) {
+        let others: Vec<(u8, String)> = (20..36).map(|n| (n, format!("Lab-PC-{n}"))).collect();
+        let others: Vec<(u8, &str)> = others.iter().map(|(n, s)| (*n, s.as_str())).collect();
+        linking(w, vec![], &others);
+    }
+    fn paired_with(w: &mut Worker, n: u8, name: &str) {
+        w.paired = Some(Paired {
+            origin: w.view(),
+            name: name.into(),
+            device: Some(id(n).as_str().into()),
+            at: Instant::now(),
+            linked_at: None,
+            linked: String::new(),
+        });
+    }
+    fn readmission_record() -> crate::store::members::Readmission {
+        serde_json::from_value(json!({
+            "key": {"device":id(2), "fingerprint":"02".repeat(32), "removal_hlc":10,
+                "removal_writer":id(1), "setup_generation":2},
+            "removed_name":"MacBook Air", "value": {"device_id":id(2), "fingerprint":"02".repeat(32),
+                "role":"computer", "name":"MacBook Air", "status":"member", "hlc":20,"writer_device":id(1)},
+            "introducer":id(1), "introducer_name":"Galaxy S25+", "decision":"pending"
+        })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn readmission_card_keeps_focus_and_captured_authority() -> Result<()> {
+        if in_offscreen_child(
+            "ui::window::tests::readmission_card_keeps_focus_and_captured_authority",
+            &[],
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        let surface = headless()?;
+        let window = PneuWindow::new()?;
+        let dir = tempfile::tempdir()?;
+        let (mut worker, mut actions) = model_worker(&window, dir.path());
+        std::fs::create_dir_all(&worker.paths.data)?;
+        let mock = mock_ipc(&worker.paths.socket, |_| (true, Value::Null))?;
+        let visible = AtomicBool::new(true);
+        state(&mut worker, trio(), vec![]);
+        let record = readmission_record();
+        let mut status = setup_json(vec![link_of(1, "enabled")], &[(1, "Galaxy S25+")]);
+        status["readmissions"] = json!([record]);
+        window.show()?;
+        surface.set_size(slint::PhysicalSize::new(400, 720));
+        window
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::WindowActiveChanged(true));
+        worker
+            .refresh(linked_status(&worker, &status), &visible)
+            .await?;
+        flush_ui();
+        assert_eq!(window.global::<Ui>().get_page(), Page::Main);
+        settle(&surface);
+        assert_eq!(window.global::<Ui>().get_top().kind, TopKind::Readmit);
+        // The native keyboard path must choose Keep removed by default.
+        slint::platform::update_timers_and_animations();
+        key(&window, slint::platform::Key::Return);
+        drain(&mut worker, &mut actions).await;
+        let commands = sent(&mock, "readmission_decision");
+        assert_eq!(
+            commands,
+            vec![json!({"command":"readmission_decision","key":record.key,"allow":false})]
+        );
+        // A click already queued from this frame keeps its old barrier/generation.
+        worker
+            .refresh(linked_status(&worker, &status), &visible)
+            .await?;
+        flush_ui();
+        window.global::<Ui>().invoke_top_action(true);
+        let mut next = status.clone();
+        next["readmissions"][0]["key"]["removal_hlc"] = json!(30);
+        next["readmissions"][0]["key"]["setup_generation"] = json!(9);
+        worker
+            .refresh(linked_status(&worker, &next), &visible)
+            .await?;
+        drain(&mut worker, &mut actions).await;
+        assert_eq!(
+            sent(&mock, "readmission_decision")[1],
+            json!({"command":"readmission_decision","key":record.key,"allow":true})
+        );
+        worker
+            .refresh(linked_status(&worker, &next), &visible)
+            .await?;
+        flush_ui();
+        key(&window, slint::platform::Key::Tab); // leave Keep removed on the old card
+        next["readmissions"][0]["key"]["removal_hlc"] = json!(40);
+        worker
+            .refresh(linked_status(&worker, &next), &visible)
+            .await?;
+        flush_ui();
+        settle(&surface);
+        key(&window, slint::platform::Key::Return);
+        drain(&mut worker, &mut actions).await;
+        assert_eq!(
+            sent(&mock, "readmission_decision")[2],
+            json!({"command":"readmission_decision","key":next["readmissions"][0]["key"],"allow":false})
+        );
+        // Dismissal is window-local, and does not decide or consume the prompt.
+        worker
+            .refresh(linked_status(&worker, &status), &visible)
+            .await?;
+        flush_ui();
+        window.global::<Ui>().invoke_top_close();
+        drain(&mut worker, &mut actions).await;
+        assert_eq!(sent(&mock, "readmission_decision").len(), 3);
+        assert!(matches!(
+            setup::top(
+                &worker.setup,
+                &peers(&worker.snapshot, &[]),
+                &worker.remembered
+            ),
+            Top::None
+        ));
+        assert!(matches!(
+            setup::top(
+                &worker.setup,
+                &peers(&worker.snapshot, &[]),
+                &Remembered::default()
+            ),
+            Top::Readmit { .. }
+        ));
+        Ok(())
+    }
+
+    fn linking_scenes() -> Vec<Scene> {
+        let both = || vec![link_of(1, "ask"), link_of(2, "ask")];
+        let member = |link: Value| {
+            move |w: &mut Worker| {
+                state(w, trio(), Vec::new());
+                linking(
+                    w,
+                    vec![link_of(1, "enabled"), link.clone()],
+                    &[(1, "Galaxy S25+"), (2, "MacBook Air")],
+                );
+                device_page(w, 2);
+            }
+        };
+        let plain = |link: Value| {
+            move |w: &mut Worker| {
+                state(w, trio(), Vec::new());
+                linking(w, vec![link_of(1, "ask"), link.clone()], &[]);
+                device_page(w, 2);
+            }
+        };
+        let via = with(
+            link_of(2, "enabled"),
+            "introducer_name",
+            json!("Galaxy S25+"),
+        );
+        let separate = with(link_of(2, "disabled"), "outcome", json!(setup::SEPARATE));
+        vec![
+            scene(
+                "72-readmission",
+                |w| {
+                    state(
+                        w,
+                        vec![device(1, "Galaxy S25+", true, "connected", 1)],
+                        vec![],
+                    );
+                    linking(w, vec![link_of(1, "enabled")], &[(1, "Galaxy S25+")]);
+                    w.setup.readmissions = vec![readmission_record()];
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "73-removed-self-offline-phone",
+                |w| {
+                    state(
+                        w,
+                        vec![
+                            device(1, "Galaxy S25+", true, "disconnected", 100),
+                            device(2, "MacBook Air", false, "unauthorized", 100),
+                        ],
+                        vec![],
+                    );
+                    w.snapshot.setup_refusal_since = Some(200);
+                    linking(
+                        w,
+                        vec![link_of(1, "enabled"), link_of(2, "enabled")],
+                        &[(1, "Galaxy S25+"), (2, "MacBook Air")],
+                    );
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "73-introduced-refused-row",
+                |w| {
+                    state(
+                        w,
+                        vec![device(2, "MacBook Air", false, "unauthorized", 0)],
+                        vec![],
+                    );
+                    linking(
+                        w,
+                        vec![with(
+                            with(link_of(2, "enabled"), "introduced_by", json!(id(1))),
+                            "ready",
+                            json!(false),
+                        )],
+                        &[(2, "MacBook Air")],
+                    );
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "73-introduced-refused",
+                |w| {
+                    state(
+                        w,
+                        vec![device(2, "MacBook Air", false, "unauthorized", 0)],
+                        vec![],
+                    );
+                    linking(
+                        w,
+                        vec![with(
+                            with(link_of(2, "enabled"), "introduced_by", json!(id(1))),
+                            "ready",
+                            json!(false),
+                        )],
+                        &[(2, "MacBook Air")],
+                    );
+                    device_page(w, 2);
+                },
+                go(Page::Device, 2, 0),
+            ),
+            scene(
+                "73-introduced-waiting-long-name",
+                |w| {
+                    state(
+                        w,
+                        vec![device(2, "sdk_gphone16k_x86_64", true, "disconnected", 0)],
+                        vec![],
+                    );
+                    linking(
+                        w,
+                        vec![with(
+                            with(link_of(2, "enabled"), "introduced_by", json!(id(1))),
+                            "ready",
+                            json!(false),
+                        )],
+                        &[(2, "sdk_gphone16k_x86_64")],
+                    );
+                    device_page(w, 2);
+                },
+                go(Page::Device, 2, 0),
+            ),
+            scene(
+                "73-introduced-waiting-max-name",
+                |w| {
+                    let name = "Very long device name ".repeat(6);
+                    assert_eq!(name.len(), 132);
+                    let name = &name[..128];
+                    state(w, vec![device(2, name, true, "disconnected", 0)], vec![]);
+                    linking(
+                        w,
+                        vec![with(
+                            with(link_of(2, "enabled"), "introduced_by", json!(id(1))),
+                            "ready",
+                            json!(false),
+                        )],
+                        &[(2, name)],
+                    );
+                    device_page(w, 2);
+                },
+                go(Page::Device, 2, 0),
+            ),
+            scene(
+                "73-connected-settings-pending",
+                |w| {
+                    state(
+                        w,
+                        vec![device(1, "Galaxy S25+", true, "connected", 1)],
+                        vec![],
+                    );
+                    device_page(w, 1);
+                    if let Some((_, reply, _)) = &mut w.peer_settings {
+                        for setting in reply["settings"].as_array_mut().unwrap() {
+                            setting["pending"] = json!(true);
+                        }
+                    }
+                },
+                go(Page::Device, 1, 0),
+            ),
+            scene(
+                "74-paired-before-ready",
+                |w| {
+                    state(
+                        w,
+                        vec![
+                            device(1, "Galaxy S25+", true, "connected", 1),
+                            device(2, "MacBook Air", false, "connecting", 0),
+                        ],
+                        vec![],
+                    );
+                    linking(
+                        w,
+                        vec![
+                            link_of(1, "enabled"),
+                            with(
+                                with(
+                                    with(link_of(2, "enabled"), "introduced_by", json!(id(1))),
+                                    "ready",
+                                    json!(false),
+                                ),
+                                "hello_seen",
+                                json!(false),
+                            ),
+                        ],
+                        &[(1, "Galaxy S25+"), (2, "MacBook Air")],
+                    );
+                    paired_with(w, 1, "Galaxy S25+");
+                },
+                go(Page::Add, 0, 0),
+            ),
+            scene(
+                "61-main-link-refresh",
+                |w| {
+                    state(
+                        w,
+                        vec![
+                            device(1, "Galaxy S25+", true, "disconnected", 123),
+                            device(2, "MacBook Air", false, "disconnected", 123),
+                        ],
+                        vec![],
+                    );
+                    w.snapshot.refreshing_devices = vec![id(1), id(2)];
+                    linking(
+                        w,
+                        vec![
+                            with(
+                                with(link_of(1, "ask"), "prompt", json!(true)),
+                                "outcome",
+                                json!("allow_pending_refresh"),
+                            ),
+                            link_of(2, "ask"),
+                        ],
+                        &[],
+                    );
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "65-device-not-connected-yet",
+                |w| {
+                    state(
+                        w,
+                        vec![device(2, "MacBook Air", false, "disconnected", 0)],
+                        vec![],
+                    );
+                    linking(
+                        w,
+                        vec![with(
+                            link_of(2, "enabled"),
+                            "introducer_name",
+                            json!("Phone"),
+                        )],
+                        &[(2, "MacBook Air")],
+                    );
+                    device_page(w, 2);
+                    w.peer_settings = Some((
+                        id(2).to_string(),
+                        json!({"can_sync": false}),
+                        Instant::now(),
+                    ));
+                },
+                go(Page::Device, 2, 0),
+            ),
+            scene(
+                "60-main-link-offer",
+                move |w| {
+                    state(w, trio(), Vec::new());
+                    linking(w, both(), &[]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "60-main-link-offer-mac",
+                |w| {
+                    state(w, mac_trio(), Vec::new());
+                    linking(w, vec![link_of(1, "ask"), link_of(3, "ask")], &[]);
+                },
+                mac(go(Page::Main, 0, 0)),
+            ),
+            scene(
+                "61-main-link-waiting",
+                |w| {
+                    state(w, trio(), Vec::new());
+                    linking(w, vec![link_of(1, "enabled"), link_of(2, "enabled")], &[]);
+                    for link in &mut w.setup.links {
+                        link.participating = false;
+                    }
+                    w.remembered.offer = Some(setup::LINKED.into());
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "62-main-link-request",
+                |w| {
+                    state(w, trio(), Vec::new());
+                    linking(
+                        w,
+                        vec![
+                            with(link_of(1, "ask"), "prompt", json!(true)),
+                            link_of(2, "ask"),
+                        ],
+                        &[],
+                    );
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "62-main-link-request-mac",
+                |w| {
+                    state(w, mac_trio(), Vec::new());
+                    let asked = |n| with(link_of(n, "ask"), "prompt", json!(true));
+                    linking(w, vec![asked(1), asked(3)], &[]);
+                },
+                mac(go(Page::Main, 0, 0)),
+            ),
+            scene(
+                "62-main-link-request-many",
+                |w| {
+                    let mut devices = trio();
+                    devices.push(device(4, "Office-PC", false, "connected", 0));
+                    state(w, devices, Vec::new());
+                    let asked = |n| with(link_of(n, "ask"), "prompt", json!(true));
+                    linking(w, vec![asked(1), asked(2), asked(4)], &[]);
+                },
+                go(Page::Main, 0, 0),
+            ),
+            scene(
+                "60-main-new-device-connecting",
+                |w| {
+                    let mut desktop = device(3, "MJStanton-Desktop", false, "connecting", 0);
+                    desktop.route = None;
+                    state(
+                        w,
+                        vec![device(1, "Galaxy S25+", true, "connected", 0), desktop],
+                        Vec::new(),
+                    );
+                    let introduced = with(
+                        link_of(3, "enabled"),
+                        "introducer_name",
+                        json!("Galaxy S25+"),
+                    );
+                    linking(
+                        w,
+                        vec![link_of(1, "enabled"), introduced],
+                        &[(1, "Galaxy S25+"), (3, "MJStanton-Desktop")],
+                    );
+                },
+                mac(go(Page::Main, 0, 0)),
+            ),
+            scene(
+                "60-main-new-device-not-yet",
+                |w| {
+                    let desktop = device(3, "MJStanton-Desktop", false, "disconnected", 0);
+                    state(
+                        w,
+                        vec![device(1, "Galaxy S25+", true, "connected", 0), desktop],
+                        Vec::new(),
+                    );
+                    let introduced = with(
+                        link_of(3, "enabled"),
+                        "introducer_name",
+                        json!("Galaxy S25+"),
+                    );
+                    linking(
+                        w,
+                        vec![link_of(1, "enabled"), introduced],
+                        &[(1, "Galaxy S25+"), (3, "MJStanton-Desktop")],
+                    );
+                },
+                mac(go(Page::Main, 0, 0)),
+            ),
+            scene(
+                "63-device-linked",
+                member(link_of(2, "enabled")),
+                go(Page::Device, 2, 0),
+            ),
+            scene(
+                "63-device-linked-via",
+                member(via.clone()),
+                go(Page::Device, 2, 0),
+            ),
+            scene(
+                "64-device-member-link-mac",
+                |w| {
+                    state(w, mac_trio(), Vec::new());
+                    linking(
+                        w,
+                        vec![link_of(1, "enabled"), link_of(3, "disabled")],
+                        &[(1, "Galaxy S25+"), (3, "MJStanton-Desktop")],
+                    );
+                    device_page(w, 3);
+                },
+                mac(go(Page::Device, 3, 0)),
+            ),
+            scene(
+                "64-device-asked-mac",
+                |w| {
+                    state(w, mac_trio(), Vec::new());
+                    linking(
+                        w,
+                        vec![
+                            link_of(1, "ask"),
+                            with(link_of(3, "ask"), "prompt", json!(true)),
+                        ],
+                        &[],
+                    );
+                    device_page(w, 3);
+                },
+                mac(go(Page::Device, 3, 0)),
+            ),
+            scene(
+                "65-device-link",
+                plain(link_of(2, "ask")),
+                go(Page::Device, 2, 0),
+            ),
+            scene(
+                "65-device-waiting",
+                plain(with(link_of(2, "enabled"), "participating", json!(false))),
+                go(Page::Device, 2, 0),
+            ),
+            scene(
+                "65-device-theirs",
+                plain(with(
+                    with(link_of(2, "enabled"), "participating", json!(false)),
+                    "remote_scope",
+                    json!("disabled"),
+                )),
+                go(Page::Device, 2, 0),
+            ),
+            scene(
+                "65-device-update",
+                plain(with(link_of(2, "ask"), "negotiated", json!(false))),
+                go(Page::Device, 2, 0),
+            ),
+            scene(
+                "65-device-separate",
+                plain(separate.clone()),
+                go(Page::Device, 2, 0),
+            ),
+            scene(
+                "65-device-separate-mac",
+                |w| {
+                    let mut devices = mac_trio();
+                    devices.push(device(4, "Office-PC", false, "connected", 0));
+                    state(w, devices, Vec::new());
+                    let separate = with(link_of(4, "disabled"), "outcome", json!(setup::SEPARATE));
+                    linking(
+                        w,
+                        vec![link_of(1, "enabled"), link_of(3, "enabled"), separate],
+                        &[(1, "Galaxy S25+"), (3, "MJStanton-Desktop")],
+                    );
+                    device_page(w, 4);
+                },
+                mac(go(Page::Device, 4, 0)),
+            ),
+            scene("66-remove-confirm", member(via.clone()), |w| {
+                go(Page::Device, 2, 0)(w);
+                w.invoke_prepare_remove();
+            }),
+            scene(
+                "66-remove-confirm-waiting",
+                {
+                    let via = via.clone();
+                    move |w: &mut Worker| {
+                        member(via.clone())(w);
+                        w.transfers = vec![
+                            transfer("w1", 2, "notes.md", "waiting_for_device", 0, 9),
+                            transfer("w2", 2, "report.pdf", "waiting_for_device", 0, 9),
+                            transfer("w3", 2, "Screenshot.png", "waiting_for_device", 0, 9),
+                        ];
+                    }
+                },
+                |w| {
+                    go(Page::Device, 2, 0)(w);
+                    w.invoke_prepare_remove();
+                },
+            ),
+            scene(
+                "66-remove-confirm-mac",
+                |w| {
+                    state(w, mac_trio(), Vec::new());
+                    let via = with(
+                        link_of(3, "enabled"),
+                        "introducer_name",
+                        json!("Galaxy S25+"),
+                    );
+                    linking(
+                        w,
+                        vec![link_of(1, "enabled"), via],
+                        &[(1, "Galaxy S25+"), (3, "MJStanton-Desktop")],
+                    );
+                    device_page(w, 3);
+                },
+                mac(|w| {
+                    go(Page::Device, 3, 0)(w);
+                    w.invoke_prepare_remove();
+                }),
+            ),
+            scene("66-remove-failed", member(via.clone()), |w| {
+                go(Page::Device, 2, 0)(w);
+                let ui = w.global::<Ui>();
+                ui.set_message(Message {
+                    title: "Couldn't remove MacBook Air".into(),
+                    text: "Nothing was changed. Try again.".into(),
+                    tile: 0,
+                    primary: "OK".into(),
+                    secondary: "".into(),
+                    action: "ok".into(),
+                });
+                ui.set_dialog(Dialog::Message);
+            }),
+            scene("67-removed", |w| state(w, Vec::new(), Vec::new()), removed),
+            scene(
+                "67-removed-mac",
+                |w| state(w, Vec::new(), Vec::new()),
+                |w| {
+                    w.global::<Ui>().set_is_mac(true);
+                    removed(w);
+                },
+            ),
+            scene(
+                "68-join-confirm-link",
+                |w| state(w, two(), Vec::new()),
+                join_confirm(true),
+            ),
+            scene(
+                "68-join-confirm-plain",
+                |w| state(w, two(), Vec::new()),
+                join_confirm(false),
+            ),
+            scene(
+                "68-join-confirm-limit",
+                |w| {
+                    state(w, two(), Vec::new());
+                    full(w);
+                },
+                join_confirm(true),
+            ),
+            scene(
+                "69-add-computer-offer-mac",
+                |w| {
+                    state(w, two(), Vec::new());
+                    offer_card(w);
+                },
+                mac(|w| {
+                    go(Page::Add, 0, 1)(w);
+                    w.global::<Ui>().set_camera_available(true);
+                }),
+            ),
+            scene(
+                "69-add-computer-offer-limit",
+                |w| {
+                    state(w, two(), Vec::new());
+                    full(w);
+                    offer_card(w);
+                },
+                go(Page::Add, 0, 1),
+            ),
+            scene(
+                "70-paired-also-one-more",
+                |w| {
+                    let names = [
+                        (1, "MacBook Air"),
+                        (2, "MJStanton-Desktop"),
+                        (3, "sdk_gphone16k_x86_64"),
+                        (4, "Den-PC"),
+                    ];
+                    state(
+                        w,
+                        names
+                            .iter()
+                            .map(|(n, name)| device(*n, name, false, "connected", 0))
+                            .collect(),
+                        vec![],
+                    );
+                    linking(w, (1..=4).map(|n| link_of(n, "enabled")).collect(), &names);
+                    paired_with(w, 1, "MacBook Air");
+                },
+                go(Page::Add, 0, 1),
+            ),
+            scene(
+                "70-paired-also",
+                |w| {
+                    let mut desktop = device(3, "MJStanton-Desktop", false, "connecting", 0);
+                    desktop.route = None;
+                    state(
+                        w,
+                        vec![device(1, "Galaxy S25+", true, "connected", 0), desktop],
+                        Vec::new(),
+                    );
+                    linking(
+                        w,
+                        vec![link_of(1, "enabled"), link_of(3, "enabled")],
+                        &[(1, "Galaxy S25+"), (3, "MJStanton-Desktop")],
+                    );
+                    paired_with(w, 1, "Galaxy S25+");
+                },
+                mac(go(Page::Add, 0, 0)),
+            ),
+            scene(
+                "70-paired-also-many",
+                |w| {
+                    state(w, trio(), Vec::new());
+                    linking(
+                        w,
+                        [1, 2, 4, 5, 6]
+                            .into_iter()
+                            .map(|n| link_of(n, "enabled"))
+                            .collect(),
+                        &[
+                            (1, "Galaxy S25+"),
+                            (2, "MacBook Air"),
+                            (4, "Office-PC"),
+                            (5, "Living-Room-HTPC"),
+                            (6, "Studio Mac mini"),
+                        ],
+                    );
+                    paired_with(w, 2, "MacBook Air");
+                },
+                go(Page::Add, 0, 1),
+            ),
+            scene(
+                "71-paired-only",
+                |w| {
+                    state(
+                        w,
+                        vec![device(1, "Galaxy S25+", true, "connected", 0)],
+                        Vec::new(),
+                    );
+                    let separate = with(link_of(1, "disabled"), "outcome", json!(setup::SEPARATE));
+                    linking(w, vec![separate], &[]);
+                    paired_with(w, 1, "Galaxy S25+");
+                },
+                go(Page::Add, 0, 0),
             ),
         ]
     }
@@ -7029,7 +13265,9 @@ mod tests {
             #[zbus(header)] header: zbus::message::Header<'_>,
         ) -> zbus::fdo::Result<zbus::zvariant::OwnedObjectPath> {
             assert!(parent.is_empty());
-            assert_eq!(options.len(), 4);
+            assert!((3..=4).contains(&options.len()));
+            assert!(bool::try_from(options["directory"].try_clone().unwrap()).unwrap());
+            assert!(!bool::try_from(options["multiple"].try_clone().unwrap()).unwrap());
             for key in options.keys() {
                 assert!(
                     matches!(
@@ -7174,7 +13412,14 @@ mod tests {
         // Exercise the actual Action::Open path for both Recent directions.
         // No original receive handle survives these edits/replacements.
         for direction in ["incoming", "outgoing"] {
-            for scenario in ["edited", "replaced", "large", "deleted", "symlink"] {
+            for scenario in [
+                "edited",
+                "replaced",
+                "large",
+                "deleted",
+                "symlink",
+                "final-symlink",
+            ] {
                 let folder = dir.path().join(format!("{direction}-{scenario}"));
                 std::fs::create_dir(&folder)?;
                 let path = folder.join("report.pdf");
@@ -7207,12 +13452,21 @@ mod tests {
                         std::fs::rename(&folder, &moved)?;
                         std::os::unix::fs::symlink(moved, &folder)?;
                     }
+                    "final-symlink" => {
+                        std::fs::rename(&path, folder.join("original.pdf"))?;
+                        std::os::unix::fs::symlink("original.pdf", &path)?;
+                    }
                     _ => unreachable!(),
                 }
                 let before = calls.load(Ordering::SeqCst);
                 worker.act(Action::Open(artifact_key(&row))).await;
-                if matches!(scenario, "deleted" | "symlink") {
-                    let error = job_result(&mut worker.open_job).await.unwrap_err();
+                if matches!(scenario, "deleted" | "final-symlink") {
+                    let error = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        job_result(&mut worker.open_job),
+                    )
+                    .await?
+                    .unwrap_err();
                     assert!(
                         error.is::<crate::actions::FileUnavailable>(),
                         "{direction} {scenario}: {error}"
@@ -7232,6 +13486,7 @@ mod tests {
                         "edited" => assert_eq!(bytes, b"legitimate edit"),
                         "replaced" => assert_eq!(bytes, b"replacement"),
                         "large" => assert_eq!(size, crate::outbox::PEER_BYTES + 1),
+                        "symlink" => assert_eq!(bytes, b"original"),
                         _ => unreachable!(),
                     }
                     assert_eq!(calls.load(Ordering::SeqCst), before + 1);
@@ -7331,7 +13586,7 @@ mod tests {
             .await?;
         let mut job: Option<futures_util::future::BoxFuture<'_, Result<()>>> =
             Some(Box::pin(async {
-                choose_folder_on(client.clone(), dir.path()).await?;
+                choose_folder_on(client.clone(), Path::new("")).await?;
                 Ok(())
             }));
         tokio::select! {result=job_result(&mut job)=>{result?;anyhow::bail!("missing response completed");}, _=entered.notified()=>{}}

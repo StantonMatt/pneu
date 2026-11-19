@@ -464,14 +464,14 @@ impl ActorReads {
 fn read_actor_jobs(reads: &ActorReads, core: &std::sync::Weak<Core>) {
     while let Some((mut job, cancel)) = reads.take() {
         let deadline = job.selection.arrived + Duration::from_secs(5);
-        let (content, fingerprints) = (|| -> Result<(Option<Content>, Vec<[u8; 32]>)> {
+        let (content, fingerprints, oversized) = (|| -> Result<_> {
             if let Some(marker) = job.marker.as_mut() {
                 let bytes = read_pipe_raw(marker, 1024, &cancel, || true, deadline)?;
                 if String::from_utf8_lossy(&bytes)
                     .trim_matches(|c: char| c.is_whitespace() || c == '\0')
                     .eq_ignore_ascii_case("secret")
                 {
-                    return Ok((None, Vec::new()));
+                    return Ok((None, Vec::new(), None));
                 }
             }
             Ok(read_payloads_bounded(
@@ -482,8 +482,14 @@ fn read_actor_jobs(reads: &ActorReads, core: &std::sync::Weak<Core>) {
                 true,
             ))
         })()
-        .unwrap_or((None, Vec::new()));
+        .unwrap_or((None, Vec::new(), None));
         if let Some(core) = core.upgrade() {
+            if let Some(fingerprint) = oversized {
+                core.clipboard_image_too_large(
+                    job.selection.observation.expect("watcher token"),
+                    fingerprint,
+                );
+            }
             core.clipboard_observed_hashes(
                 job.selection.observation.expect("watcher token"),
                 content,
@@ -538,10 +544,11 @@ fn read_payloads_bounded(
     current: impl Fn() -> bool,
     deadline: Instant,
     observe: bool,
-) -> (Option<Content>, Vec<[u8; 32]>) {
+) -> (Option<Content>, Vec<[u8; 32]>, Option<[u8; 32]>) {
+    let mut oversized = None;
     let mut pending: Vec<_> = readers
         .drain(..)
-        .map(|reader| (reader, Vec::new()))
+        .map(|reader| (reader, Vec::new(), Sha256::new(), 0usize))
         .collect();
     let (mut text, mut image) = (None, None);
     let mut fingerprints = Vec::new();
@@ -553,7 +560,7 @@ fn read_payloads_bounded(
     {
         let mut fds: Vec<_> = pending
             .iter()
-            .map(|(reader, _)| {
+            .map(|(reader, _, _, _)| {
                 rustix::event::PollFd::new(&reader.reader, rustix::event::PollFlags::IN)
             })
             .collect();
@@ -573,28 +580,74 @@ fn read_payloads_bounded(
         // Each pass reads at most one chunk per pipe. Failed/oversized formats
         // are discarded individually; the secret marker above gates the whole offer.
         for index in (0..pending.len()).rev().filter(|index| ready[*index]) {
-            let (reader, bytes) = &mut pending[index];
+            let (reader, bytes, hasher, length) = &mut pending[index];
             let mut buffer = [0; 32768];
             let limit = if observe && reader.mime == "image/png" {
                 32 * 1024 * 1024
             } else if observe && IMAGE_MIMES.contains(&reader.mime) {
-                16 * 1024 * 1024
+                crate::store::history::MAX_IMAGE
             } else if reader.mime == "image/png" {
                 MAX_IMAGE
+            } else if observe {
+                crate::store::history::MAX_TEXT
             } else {
                 pneu_proto::MAX_CLIPBOARD_BYTES
             };
             match reader.reader.read(&mut buffer) {
                 Ok(0) => {
-                    let (reader, bytes) = pending.remove(index);
-                    let is_image = image_header(reader.mime, &bytes);
-                    let content = if reader.mime == "image/png" || TEXT_MIMES.contains(&reader.mime)
+                    let (reader, bytes, hasher, length) = pending.remove(index);
+                    let mut large_fingerprint = None;
+                    if observe
+                        && IMAGE_MIMES.contains(&reader.mime)
+                        && length > MAX_IMAGE
+                        && image_header(reader.mime, &bytes)
                     {
-                        decode_payload(reader.mime, bytes.clone(), true)
+                        large_fingerprint = Some(hasher.finalize().into());
+                    }
+                    let is_image = image_header(reader.mime, &bytes);
+                    let content = if length != bytes.len() {
+                        None
+                    } else if reader.mime == "image/png" || TEXT_MIMES.contains(&reader.mime) {
+                        if observe && TEXT_MIMES.contains(&reader.mime) {
+                            String::from_utf8(bytes.clone())
+                                .ok()
+                                .filter(|s| !s.contains('\0'))
+                                .map(Content::Text)
+                        } else {
+                            decode_payload(reader.mime, bytes.clone(), true)
+                        }
+                    } else if observe && is_image && bytes.len() <= crate::store::history::MAX_IMAGE
+                    {
+                        (|| -> Result<Content> {
+                            let image = crate::actions::decode_image(&bytes)?;
+                            let mut png = std::io::Cursor::new(Vec::new());
+                            image.write_to(&mut png, image::ImageFormat::Png)?;
+                            if png.get_ref().len() > MAX_IMAGE {
+                                large_fingerprint = Some(Sha256::digest(&bytes).into());
+                            }
+                            ensure!(
+                                png.get_ref().len() <= crate::store::history::MAX_IMAGE,
+                                "history image limit"
+                            );
+                            Ok(Content::Image(png.into_inner()))
+                        })()
+                        .ok()
                     } else {
                         None
                     };
-                    if observe && (is_image || content.is_some()) {
+                    if let Some(fingerprint) = large_fingerprint {
+                        let rank = IMAGE_MIMES
+                            .iter()
+                            .position(|mime| *mime == reader.mime)
+                            .unwrap_or(IMAGE_MIMES.len());
+                        if oversized
+                            .as_ref()
+                            .is_none_or(|(current, _)| rank < *current)
+                        {
+                            oversized = Some((rank, fingerprint));
+                        }
+                    }
+                    if observe && length == bytes.len() && (is_image || content.is_some()) {
                         let hash: [u8; 32] = Sha256::digest(&bytes).into();
                         if !fingerprints.contains(&hash) {
                             fingerprints.push(hash);
@@ -614,7 +667,18 @@ fn read_payloads_bounded(
                         _ => {}
                     }
                 }
+                Ok(n) if observe && IMAGE_MIMES.contains(&reader.mime) => {
+                    hasher.update(&buffer[..n]);
+                    *length += n;
+                    // Keep the header for classification; finish hashing even
+                    // after the staging cap, under the same cancellation/deadline.
+                    if bytes.len() + n <= limit && total + n <= 64 * 1024 * 1024 {
+                        total += n;
+                        bytes.extend_from_slice(&buffer[..n]);
+                    }
+                }
                 Ok(n) if bytes.len() + n <= limit && total + n <= 64 * 1024 * 1024 => {
+                    *length += n;
                     total += n;
                     bytes.extend_from_slice(&buffer[..n]);
                 }
@@ -624,13 +688,21 @@ fn read_payloads_bounded(
             }
         }
     }
+    // A usable alternate representation means the image can still be sent.
+    if image.is_some() {
+        oversized = None;
+    }
     let content = match (text, image) {
         (Some((_, text)), Some(image)) => Some(Content::Formats(text, image)),
         (Some((_, text)), None) => Some(Content::Text(text)),
         (None, Some(image)) => Some(Content::Image(image)),
         (None, None) => None,
     };
-    (content, fingerprints)
+    (
+        content,
+        fingerprints,
+        oversized.map(|(_, fingerprint)| fingerprint),
+    )
 }
 pub struct Watch {
     cancel: wl_clipboard_rs::watch::CancelHandle,
@@ -689,10 +761,11 @@ impl Watch {
                     if marker.is_none() && mimes.iter().any(|mime| mime == ORIGIN_MIME) {
                         continue;
                     }
-                    let (_target, token) = core.observe_watched_clipboard_kind(
+                    let (_target, token) = core.observe_watched_clipboard_metadata(
                         false,
                         !matches!(&event, ClipboardEvent::Changed { .. }),
                         initial,
+                        marker.is_some(),
                     );
                     let selection = Selection {
                         observation: Some(token),
@@ -1753,6 +1826,138 @@ pub(crate) mod tests {
                 ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"]
             );
         }
+        Ok(())
+    }
+    #[test]
+    fn oversized_observation_hashes_full_image_without_staging_or_history_payload() -> Result<()> {
+        for size in [MAX_IMAGE, MAX_IMAGE + 1, 33 * 1024 * 1024] {
+            let (reader, mut writer) = UnixStream::pair()?;
+            let mut expected = Sha256::new();
+            expected.update(b"\x89PNG\r\n\x1a\n");
+            let remaining = size - 8;
+            for n in (0..remaining).step_by(32768) {
+                expected.update(vec![1; (remaining - n).min(32768)]);
+            }
+            let result = std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    writer.write_all(b"\x89PNG\r\n\x1a\n").unwrap();
+                    for n in (0..remaining).step_by(32768) {
+                        writer
+                            .write_all(&vec![1; (remaining - n).min(32768)])
+                            .unwrap();
+                    }
+                });
+                read_payloads_bounded(
+                    &mut vec![PayloadReader {
+                        mime: "image/png",
+                        reader: std::fs::File::from(OwnedFd::from(reader)),
+                    }],
+                    &AtomicBool::new(false),
+                    || true,
+                    Instant::now() + Duration::from_secs(5),
+                    true,
+                )
+            });
+            if size > MAX_IMAGE {
+                assert!(result.0.is_none());
+                assert_eq!(result.2, Some(expected.finalize().into()));
+            } else {
+                assert!(matches!(result.0, Some(Content::Image(ref bytes)) if bytes.len() == size));
+                assert!(result.2.is_none());
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn oversized_fingerprint_is_stable_across_reversed_format_completion() -> Result<()> {
+        let mut expected = Sha256::new();
+        expected.update(b"\x89PNG\r\n\x1a\n");
+        for _ in 0..MAX_IMAGE / 32768 {
+            expected.update([1; 32768]);
+        }
+        let expected: [u8; 32] = expected.finalize().into();
+        for png_first in [true, false] {
+            let (png_reader, png_writer) = UnixStream::pair()?;
+            let (bmp_reader, bmp_writer) = UnixStream::pair()?;
+            let result = std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    let png = (png_writer, &b"\x89PNG\r\n\x1a\n"[..]);
+                    let bmp = (bmp_writer, &b"BM123456"[..]);
+                    let writers = if png_first { [png, bmp] } else { [bmp, png] };
+                    for (mut writer, header) in writers {
+                        writer
+                            .set_read_timeout(Some(Duration::from_secs(10)))
+                            .unwrap();
+                        writer
+                            .set_write_timeout(Some(Duration::from_secs(10)))
+                            .unwrap();
+                        writer.write_all(header).unwrap();
+                        for _ in 0..MAX_IMAGE / 32768 {
+                            writer.write_all(&[1; 32768]).unwrap();
+                        }
+                        writer.shutdown(std::net::Shutdown::Write).unwrap();
+                        // Start the other format only after this reader was
+                        // consumed and closed, so completion order is forced.
+                        assert_eq!(writer.read(&mut [0]).unwrap(), 0);
+                    }
+                });
+                read_payloads_bounded(
+                    &mut vec![
+                        PayloadReader {
+                            mime: "image/png",
+                            reader: std::fs::File::from(OwnedFd::from(png_reader)),
+                        },
+                        PayloadReader {
+                            mime: "image/bmp",
+                            reader: std::fs::File::from(OwnedFd::from(bmp_reader)),
+                        },
+                    ],
+                    &AtomicBool::new(false),
+                    || true,
+                    Instant::now() + Duration::from_secs(10),
+                    true,
+                )
+            });
+            assert!(result.0.is_none());
+            assert_eq!(result.2, Some(expected), "PNG completes first: {png_first}");
+        }
+        Ok(())
+    }
+    #[test]
+    fn usable_image_alternate_suppresses_the_size_notice() -> Result<()> {
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(2, 2).write_to(&mut jpeg, image::ImageFormat::Jpeg)?;
+        let (jpeg_reader, jpeg_source) = pipe(jpeg.get_ref())?;
+        drop(jpeg_source);
+        let (png_reader, mut png_writer) = UnixStream::pair()?;
+        let (content, _, oversized) = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                png_writer.write_all(b"\x89PNG\r\n\x1a\n").unwrap();
+                for _ in 0..MAX_IMAGE / 32768 {
+                    png_writer.write_all(&[1; 32768]).unwrap();
+                }
+            });
+            read_payloads_bounded(
+                &mut vec![
+                    PayloadReader {
+                        mime: "image/png",
+                        reader: std::fs::File::from(OwnedFd::from(png_reader)),
+                    },
+                    PayloadReader {
+                        mime: "image/jpeg",
+                        reader: jpeg_reader,
+                    },
+                ],
+                &AtomicBool::new(false),
+                || true,
+                Instant::now() + Duration::from_secs(5),
+                true,
+            )
+        });
+        assert!(
+            matches!(content, Some(Content::Image(ref bytes)) if bytes.starts_with(b"\x89PNG\r\n\x1a\n") && bytes.len() < MAX_IMAGE)
+        );
+        assert!(oversized.is_none());
         Ok(())
     }
     #[test]

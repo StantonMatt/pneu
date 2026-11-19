@@ -9,7 +9,7 @@ pub(super) const IGNORE: &str = "Clipboard Viewer Ignore";
 pub(super) const HISTORY: &str = "CanIncludeInClipboardHistory";
 pub(super) const CLOUD: &str = "CanUploadToCloudClipboard";
 pub(super) const MAX_DIB: usize = 64 * 1024 * 1024 + 2048;
-pub(super) const OUTPUT_CAP: usize = MAX_IMAGE * 5 + pneu_proto::MAX_CLIPBOARD_BYTES * 6 + 4096;
+pub(super) const OUTPUT_CAP: usize = MAX_IMAGE * 5 + crate::store::history::MAX_TEXT * 6 + 4096;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Classification {
@@ -41,6 +41,8 @@ pub(super) struct Snapshot {
     pub status: SnapshotStatus,
     pub marker: Option<String>,
     pub content: Option<Content>,
+    #[serde(default)]
+    pub oversized: Option<[u8; 32]>,
 }
 impl Snapshot {
     pub fn empty() -> Self {
@@ -48,6 +50,7 @@ impl Snapshot {
             status: SnapshotStatus::Ready,
             marker: None,
             content: None,
+            oversized: None,
         }
     }
 }
@@ -63,7 +66,7 @@ pub(super) fn parse_output(bytes: Vec<u8>) -> Result<Snapshot> {
     let result: Snapshot = serde_json::from_slice(&bytes)?;
     ensure!(
         result.status == SnapshotStatus::Ready
-            || (result.marker.is_none() && result.content.is_none()),
+            || (result.marker.is_none() && result.content.is_none() && result.oversized.is_none()),
         "unavailable clipboard snapshot contains data"
     );
     ensure!(
@@ -87,7 +90,7 @@ pub(super) fn parse_output(bytes: Vec<u8>) -> Result<Snapshot> {
     Ok(result)
 }
 pub(super) fn valid_text(text: &str) -> bool {
-    text.len() <= pneu_proto::MAX_CLIPBOARD_BYTES && !text.contains('\0')
+    text.len() <= crate::store::history::MAX_TEXT && !text.contains('\0')
 }
 pub(super) fn combine(text: Option<String>, png: Option<Vec<u8>>) -> Option<Content> {
     match (text, png) {
@@ -100,7 +103,10 @@ pub(super) fn combine(text: Option<String>, png: Option<Vec<u8>>) -> Option<Cont
 pub(super) fn png(image: &image::DynamicImage) -> Result<Vec<u8>> {
     let mut output = std::io::Cursor::new(Vec::new());
     image.write_to(&mut output, image::ImageFormat::Png)?;
-    ensure!(output.get_ref().len() <= MAX_IMAGE, "clipboard PNG limit");
+    ensure!(
+        output.get_ref().len() <= MAX_IMAGE,
+        crate::actions::ImageTooLarge
+    );
     Ok(output.into_inner())
 }
 pub(super) fn dib_to_png(dib: &[u8]) -> Result<Vec<u8>> {
@@ -241,6 +247,7 @@ mod tests {
     #[test]
     fn clipboard_helper_output_limits() -> Result<()> {
         let output = Snapshot {
+            oversized: None,
             status: SnapshotStatus::Ready,
             marker: Some(format!("{:032x}", 42)),
             content: Some(Content::Text("🦀".into())),
@@ -248,11 +255,12 @@ mod tests {
         assert!(parse_output(serde_json::to_vec(&output)?).is_ok());
         for content in [
             Content::Text("a\0b".into()),
-            Content::Text("a".repeat(pneu_proto::MAX_CLIPBOARD_BYTES + 1)),
+            Content::Text("a".repeat(crate::store::history::MAX_TEXT + 1)),
             Content::Image(vec![0; MAX_IMAGE + 1]),
         ] {
             assert!(
                 parse_output(serde_json::to_vec(&Snapshot {
+                    oversized: None,
                     status: SnapshotStatus::Ready,
                     marker: None,
                     content: Some(content)
@@ -263,6 +271,7 @@ mod tests {
         assert!(parse_output(b"{} trailing".to_vec()).is_err());
         assert!(
             parse_output(serde_json::to_vec(&Snapshot {
+                oversized: None,
                 status: SnapshotStatus::Ready,
                 marker: Some("bad".into()),
                 content: None

@@ -144,6 +144,9 @@ impl Sender {
             receive.await.context("toast submission ended")?
         }))
     }
+    pub fn remove_tag(&self, tag: String, group: String) {
+        let _ = self.0.send(Command::Remove { tag, group });
+    }
     pub fn remove(&self, id: u32, group: &str) {
         let _ = self.0.send(Command::Remove {
             tag: id.to_string(),
@@ -196,6 +199,19 @@ impl Host {
                     } else {
                         ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(AUMID))?
                     };
+                    let group = HSTRING::from(crate::ui::windows_toast_model::PHONE_GROUP);
+                    if ToastNotificationManager::History()
+                        .and_then(|history| {
+                            if packaged {
+                                history.RemoveGroup(&group)
+                            } else {
+                                history.RemoveGroupWithId(&group, &HSTRING::from(AUMID))
+                            }
+                        })
+                        .is_err()
+                    {
+                        eprintln!("pneud: mirrored notification cleanup unavailable");
+                    }
                     let _ = ready.take().unwrap().send(Ok(()));
                     eprintln!("pneud: toast activator ready packaged={packaged}");
                     loop {
@@ -396,6 +412,56 @@ mod tests {
     use super::super::{DesktopActions, Target};
     use super::*;
     use crate::ui::notifications::Notice;
+
+    #[tokio::test]
+    async fn phone_notification_submission_guard_lives_until_ack_or_cancellation() -> Result<()> {
+        use crate::actions::PcActions;
+        let notice = crate::ui::notifications::PhoneNotice {
+            app: "Chat".into(),
+            title: Some("Message".into()),
+            text: None,
+            icon: None,
+        };
+        for mode in ["ack", "drop", "error"] {
+            let actions = DesktopActions::new(PathBuf::new());
+            let (send, receive) = mpsc::channel();
+            assert!(actions.sender.set(Sender(send)).is_ok());
+            let wait = actions
+                .begin_phone_notification("phone-key", &notice, 0)
+                .await?;
+            let Command::Show {
+                life, reply, tag, ..
+            } = receive.try_recv()?
+            else {
+                panic!("missing phone notification submission");
+            };
+            assert!(
+                life.active(),
+                "guard cancelled before acknowledgement: {mode}"
+            );
+            assert!(receive.try_recv().is_err());
+            if mode == "ack" {
+                reply.send(Ok(())).unwrap();
+                assert_eq!(wait.await?, 0);
+                assert!(life.active());
+                assert!(receive.try_recv().is_err());
+            } else {
+                if mode == "drop" {
+                    drop(wait);
+                } else {
+                    reply
+                        .send(Err(anyhow::anyhow!("submission failed")))
+                        .unwrap();
+                    assert!(wait.await.is_err());
+                }
+                assert!(!life.active());
+                assert!(
+                    matches!(receive.try_recv()?, Command::Remove { tag: removed, .. } if removed == tag)
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[tokio::test(start_paused = true)]
     async fn withdrawal_precedes_reused_tag_for_activation_cancellation_and_expiry() -> Result<()> {

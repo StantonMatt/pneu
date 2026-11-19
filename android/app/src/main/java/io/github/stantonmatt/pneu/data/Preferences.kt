@@ -7,6 +7,7 @@ import io.github.stantonmatt.pneu.protocol.*
 import io.github.stantonmatt.pneu.connection.TlsIdentity
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 private val Context.pneuDataStore by preferencesDataStore("pneu")
 data class Peer(val name: String, val pin: String, val deviceId: String, val addresses: List<Endpoint>,
@@ -15,7 +16,14 @@ data class Peer(val name: String, val pin: String, val deviceId: String, val add
     val settings:Map<String,PairField> = emptyMap(),val pendingSettings:String="",val confirmedSettings:String="",
     private val settingsReceipts:Map<String,String>? = null,
     @com.google.gson.annotations.SerializedName("localSettingsEdits") private val localEdits:Set<String>? = null,val settingsSupported:Boolean?=null,
-    private val acknowledgedSettings:String?=null) {
+    private val acknowledgedSettings:String?=null,
+    @com.google.gson.annotations.SerializedName("setupScope") private val setupDecision:SetupScope?=null,
+    val addedViaId:String?=null,val addedViaName:String?=null,val established:Boolean=false,val setupSupported:Boolean=false,
+    /** Last authenticated HELLO observation for this binding; never local consent. */
+    val remoteSetupScope:SetupScope?=null,val helloObserved:Boolean=false,val setupRefused:Boolean=false,val readyObserved:Boolean=false) {
+    val helloSeen get()=helloObserved || remoteSetupScope!=null || lastConnected>0
+    val setupScope get()=setupDecision ?: SetupScope.ASK
+    val setupScoped get()=addedViaId!=null || setupScope==SetupScope.ENABLED && setupSupported
     internal val acknowledgedSnapshot get()=acknowledgedSettings.orEmpty()
     val localSettingsEdits get()=localEdits.orEmpty()
     internal val legacySettingsReceipts get()=settingsReceipts.orEmpty()
@@ -38,12 +46,16 @@ data class Prefs(
     val peers:List<Peer> = emptyList(), val resetPeers:Set<String> = emptySet(),
     val recentClipboardHashes:List<String> = emptyList(),val legacyQueuePeer:String="",val legacyQueueGeneration:Long=0,val selfName:String="",val chooseDevicesEachTime:Boolean=false,val lastReceivedSource:String="",
     val recentClipboardSources:Map<String,String> = emptyMap(),
-    val automaticRevocations:Map<String,Long> = emptyMap()
+    val automaticRevocations:Map<String,Long> = emptyMap(),
+    val membership:SetupState=SetupState(),
+    val showBatteryLevel:Boolean=true,val allowRinging:Boolean=true,
+    val notificationConsent:io.github.stantonmatt.pneu.features.NotificationConsent=io.github.stantonmatt.pneu.features.NotificationConsent(),
+    val replacements:ReplacementState=ReplacementState(),
 ) {
     fun automaticRevocation(kind:String)=automaticRevocations[when(kind) {"photo"->"photos";"recording"->"recordings";else->"screenshots"}] ?: 0
     // Compatibility projection for the existing single-computer screens/fixtures.
     val devices get()=peers.ifEmpty {listOfNotNull(peer)}
-    fun installedAfter(revision:Long):DeliveryBinding? = devices.filter {it.generation>revision}.maxByOrNull {it.generation}?.let {DeliveryBinding.from(this,it.deviceId)}
+    fun installedAfter(revision:Long,pin:String?=null):DeliveryBinding? = devices.filter {it.generation>revision && (pin==null || it.pin==pin)}.maxByOrNull {it.generation}?.let {DeliveryBinding.from(this,it.deviceId)}
     fun forPeer(id:String):Prefs {
         val selected=devices.find {it.deviceId==id}
         return copy(peer=selected,lastLan=selected?.lastLan.orEmpty(),lastConnected=selected?.lastConnected ?: 0,
@@ -56,6 +68,12 @@ class Preferences(private val context:Context,internal val store:androidx.datast
     @Volatile internal var beforeReadStart:suspend ()->Unit={}
     @Volatile internal var readBoundary:suspend (Boolean)->Long={MediaCatalog.latest(context,it)}
     internal val policy=AdmissionPolicy()
+    /** Serializes computer-feature effects with local permission/pause commits. */
+    internal val computerPolicy=Mutex()
+    // Process-local notification admissions must stay revoked even across off/on.
+    // Read and advanced only under policy, like the persisted Pause epoch.
+    internal var notificationGeneration=0L
+        private set
     @Volatile internal var readCatalogVersion:suspend ()->String={MediaCatalog.version(context)}
     @Volatile internal var pairingBoundary:suspend ()->CatalogBoundary={MediaCatalog.boundary(context)}
     @Volatile internal var readSnapshot:suspend ()->CatalogSnapshot={MediaCatalog.snapshot(context)}
@@ -87,7 +105,7 @@ class Preferences(private val context:Context,internal val store:androidx.datast
     }
     /** Any successful settings write also persists abandoned clipboard effects.
      * Remove the in-memory fence only after the DataStore commit has succeeded. */
-    private suspend fun edit(body:suspend (MutablePreferences)->Unit) {
+    internal suspend fun edit(body:suspend (MutablePreferences)->Unit) {
         var effects=emptyList<ClipboardEffect>()
         store.edit {p->
             effects=unfinishedEffects.values.toList()
@@ -114,7 +132,8 @@ class Preferences(private val context:Context,internal val store:androidx.datast
             pairingRevision=l(p,"pairingRevision"),lastReceivedSource=s(p,"lastReceivedSource"),resetPeers=PeerRegistry.resets(p),
             legacyQueuePeer=s(p,"legacyQueuePeer"),legacyQueueGeneration=l(p,"legacyQueueGeneration"),
             recentClipboardHashes=s(p,"recentClipboardHashes").split('|').filter {it.isNotEmpty()},recentClipboardSources=ClipboardHistory.read(p),selfName=s(p,"selfName"),chooseDevicesEachTime=b(p,"chooseDevicesEachTime"),
-            automaticRevocations=listOf("screenshots","photos","recordings").associateWith {l(p,it+"AdmissionEpoch")}.filterValues {it!=0L})
+            showBatteryLevel=b(p,"showBatteryLevel",true),allowRinging=b(p,"allowRinging",true),
+            notificationConsent=readNotificationConsent(p),membership=SetupStorage.read(p),replacements=ReinstallReplacement.read(p),automaticRevocations=listOf("screenshots","photos","recordings").associateWith {l(p,it+"AdmissionEpoch")}.filterValues {it!=0L})
     }
     val flow=raw.recoverReads()
     suspend fun read():Prefs=kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {storageDeadline {beforeReadStart();raw.first()}}
@@ -183,7 +202,8 @@ class Preferences(private val context:Context,internal val store:androidx.datast
                 it[booleanPreferencesKey(key)]=value
             }
         }
-        if(key in policyKeys)policy.locked {apply()} else apply()
+        suspend fun mutate() {if(key in policyKeys)policy.locked {apply()} else apply()}
+        if(key in setOf("showBatteryLevel","allowRinging","paused"))computerPolicy.withLock {mutate()} else mutate()
     }
     /** Automatic bytes/skips are published only under the same policy boundary.
      * Reading the live namespace here rejects URI reuse after a catalog rebuild. */
@@ -196,7 +216,17 @@ class Preferences(private val context:Context,internal val store:androidx.datast
     suspend fun setLong(key: String, value: Long) { edit { it[longPreferencesKey(key)] = value } }
     suspend fun setString(key: String, value: String) {
         if(key in setOf("deviceId","tlsAlias"))policy.locked {edit {if(s(it,key)!=value)advanceEpoch(it);it[stringPreferencesKey(key)]=value}}
-        else edit {it[stringPreferencesKey(key)]=value}
+        else edit {p->
+            if(key=="selfName") {
+                val state=SetupStorage.read(p);val own=state.member(s(p,"deviceId"))
+                if(own!=null && own.name!=value) {
+                    val stamp=MeshClock.next(p,s(p,"deviceId"),false)
+                    val next=state.copy(roster=state.roster.map {if(it.key==own.key)it.copy(name=value,hlc=stamp.hlc.toString(),writer=stamp.source) else it})
+                    SetupReconcile.capacity(next,PeerRegistry.read(p));SetupStorage.write(p,next)
+                }
+            }
+            p[stringPreferencesKey(key)]=value
+        }
     }
     /** Old sessions cannot repopulate a replacement PC's connection cache. */
     internal suspend fun connected(binding:DeliveryBinding,endpoint:Endpoint,at:Long=System.currentTimeMillis()):Boolean {
@@ -204,13 +234,13 @@ class Preferences(private val context:Context,internal val store:androidx.datast
         edit {
             val peers=PeerRegistry.read(it);val peer=peers.find {peer->peer.deviceId==binding.pcId} ?: return@edit
             if(s(it,"deviceId")!=binding.phoneId || peer.pin!=binding.pin || peer.generation!=binding.generation || peer.deviceId in PeerRegistry.resets(it) || peer.pairingLost)return@edit
-            PeerRegistry.write(it,peers.map {if(it==peer)it.copy(lastLan=if(endpoint.tailscale)it.lastLan else endpoint.toString(),lastConnected=at) else it})
+            PeerRegistry.write(it,peers.map {if(it==peer)it.copy(established=true,readyObserved=true,setupRefused=false,lastLan=if(endpoint.tailscale)it.lastLan else endpoint.toString(),lastConnected=at) else it})
             recorded=true
         }
         return recorded
     }
     suspend fun paired(invitation: Invitation, pcId: String,
-                       replacement:ConfirmedBinding?=null,onInstalled:(DeliveryBinding)->Unit={}): Boolean=policy.locked {
+                       replacement:ConfirmedBinding?=null,setupChoice:Boolean=true,setupFence:SetupState?=null,beforeInstall:(MutablePreferences,DeliveryBinding)->Unit={_,_->},onInstalled:(DeliveryBinding)->Unit={}): Boolean=policy.locked {
         val boundary=if(read().devices.isEmpty())pairingBoundary() else null;var installed:DeliveryBinding?=null
         edit {
             val peers=PeerRegistry.read(it)
@@ -221,15 +251,21 @@ class Preferences(private val context:Context,internal val store:androidx.datast
             if(replacement!=null && (prior==null || !replacement.matches(current)))return@edit
             require(pcId!=s(it,"deviceId")) {"Remote device ID is the phone's own ID"}
             if(prior!=null && prior.pin!=invitation.fingerprint && !prior.pairingLost)return@edit
+            val setup=SetupStorage.read(it)
+            if(setupFence!=null && (setup.withdrawalRevision!=setupFence.withdrawalRevision || setup.barriers["$pcId/${invitation.fingerprint}"]?.pairingFence()!=setupFence.barriers["$pcId/${invitation.fingerprint}"]?.pairingFence()))return@edit
             val first=peers.isEmpty()
             val unchanged=prior!=null && !PairingIdentity.changes(prior,invitation,pcId)
             val generation=if(unchanged)requireNotNull(prior).generation else Math.addExact(l(it,"pairingRevision"),1)
             if(!unchanged)it[longPreferencesKey("pairingRevision")]=generation
-            val peer=if(unchanged)requireNotNull(prior).copy(name=invitation.name,addresses=invitation.addresses,pairingLost=false) else Peer(invitation.name,invitation.fingerprint,pcId,invitation.addresses,generation=generation,
+            var peer=if(unchanged)requireNotNull(prior).copy(name=invitation.name,addresses=invitation.addresses,pairingLost=false) else Peer(invitation.name,invitation.fingerprint,pcId,invitation.addresses,generation=generation,
                 lastLan=prior?.takeIf {it.deviceId==pcId && it.pin==invitation.fingerprint}?.lastLan.orEmpty(),
                 lastConnected=prior?.takeIf {it.deviceId==pcId && it.pin==invitation.fingerprint}?.lastConnected ?: 0,
                 clipboardSend=prior?.clipboardSend ?: true,clipboardReceive=prior?.clipboardReceive ?: true,automaticMedia=prior?.automaticMedia ?: true,
                 settings=prior?.takeIf {it.deviceId==pcId}?.settings.orEmpty(),localEdits=prior?.takeIf {it.deviceId==pcId}?.localSettingsEdits.orEmpty(),settingsSupported=prior?.settingsSupported)
+            peer=peer.copy(setupDecision=prior?.setupScope ?: if(setupChoice)SetupScope.ENABLED else SetupScope.DISABLED,
+                addedViaId=null,addedViaName=null)
+            SetupTransactions.paired(it,setup,peer,prior,setupChoice,setupFence!=null,
+                selfPin=if(setup.withdrawn)sha256(TlsIdentity(s(it,"tlsAlias")).certificate.encoded) else null)
             PeerRegistry.write(it,if(prior==null)peers+peer else peers.map {p->if(p==prior)peer else p})
             if(prior!=null && !unchanged)PeerRegistry.reset(it,prior.deviceId)
             it[booleanPreferencesKey("pairingLost")]=false;it.remove(stringPreferencesKey("lostPcName"))
@@ -248,6 +284,7 @@ class Preferences(private val context:Context,internal val store:androidx.datast
             }
             it[longPreferencesKey("mediaSince")]=System.currentTimeMillis()/1000
             installed=DeliveryBinding(s(it,"deviceId"),peer.pin,peer.deviceId,peer.generation)
+            beforeInstall(it,requireNotNull(installed))
             onInstalled(requireNotNull(installed))
         }
         installed!=null
@@ -406,10 +443,51 @@ class Preferences(private val context:Context,internal val store:androidx.datast
         }
     }
     internal class SettingsConflict:Exception()
-    internal suspend fun hello(binding:DeliveryBinding,name:String,addresses:List<Endpoint>,mesh:Boolean=true) {edit {p->
+    internal suspend fun hello(binding:DeliveryBinding,name:String,addresses:List<Endpoint>,mesh:Boolean=true,setup:Boolean=false,remoteSetupScope:SetupScope?=null) {edit {p->
         PeerRegistry.write(p,PeerRegistry.read(p).map {if(it.deviceId==binding.pcId && it.generation==binding.generation && it.pin==binding.pin)
-            it.copy(name=name,settingsSupported=mesh,addresses=if(addresses.isEmpty())it.addresses else (addresses+it.addresses).distinct().take(8)) else it})
+            it.copy(name=name,helloObserved=true,settingsSupported=mesh,setupSupported=setup,remoteSetupScope=remoteSetupScope.takeIf {setup},
+                addresses=if(addresses.isEmpty())it.addresses else (addresses+it.addresses).distinct().take(16)) else it})
     }}
+    internal suspend fun introducedRefusal(binding:DeliveryBinding,authenticated:Boolean) {edit {p->
+        PeerRegistry.write(p,PeerRegistry.read(p).map {peer->refusedPeer(peer,binding,authenticated)})
+    }}
+    private fun readNotificationConsent(p:androidx.datastore.preferences.core.Preferences)=io.github.stantonmatt.pneu.features.NotificationConsent(
+        b(p,"mirrorEnabled"),b(p,"mirrorInitialized"),b(p,"mirrorNamesOnly"),p[stringSetPreferencesKey("mirrorComputers")].orEmpty(),p[stringSetPreferencesKey("mirrorApps")].orEmpty())
+    suspend fun notificationMaster(enabled:Boolean)=policy.locked {
+        notificationGeneration=Math.addExact(notificationGeneration,1)
+        edit {p->
+            if(enabled && !b(p,"mirrorInitialized")) {
+                p[stringSetPreferencesKey("mirrorComputers")]=PeerRegistry.read(p).filter {it.role=="computer" && !it.pairingLost}.map {io.github.stantonmatt.pneu.features.NotificationConsent.computer(it)}.toSet()
+                p[booleanPreferencesKey("mirrorInitialized")]=true
+            }
+            p[booleanPreferencesKey("mirrorEnabled")]=enabled
+        }
+    }
+    suspend fun notificationNamesOnly(enabled:Boolean)=policy.locked {
+        notificationGeneration=Math.addExact(notificationGeneration,1)
+        edit {it[booleanPreferencesKey("mirrorNamesOnly")]=enabled}
+    }
+    suspend fun notificationSelection(computer:Boolean,key:String,enabled:Boolean)=policy.locked {
+        notificationGeneration=Math.addExact(notificationGeneration,1)
+        edit {p->
+            val field=stringSetPreferencesKey(if(computer)"mirrorComputers" else "mirrorApps")
+            val current=p[field].orEmpty()
+            // A stale UI cannot grant a removed or replaced binding.
+            if(!computer || !enabled || PeerRegistry.read(p).any {io.github.stantonmatt.pneu.features.NotificationConsent.computer(it)==key})p[field]=if(enabled)current+key else current-key
+        }
+    }
+    /** The snackbar tap grants only this exact new binding. It never touches the
+     * master switch: turning that on would resume sending to every remembered computer. */
+    internal suspend fun notificationReplacement(binding:DeliveryBinding)=policy.locked {
+        notificationGeneration=Math.addExact(notificationGeneration,1)
+        edit {p->
+            val peer=PeerRegistry.read(p).singleOrNull {it.deviceId==binding.pcId && it.pin==binding.pin &&
+                it.generation==binding.generation && !it.pairingLost && it.role=="computer"}
+            check(peer!=null && s(p,"deviceId")==binding.phoneId && !b(p,"deliveryReset") && binding.pcId !in PeerRegistry.resets(p)) {"Pairing changed"}
+            val field=stringSetPreferencesKey("mirrorComputers")
+            p[field]=p[field].orEmpty()+io.github.stantonmatt.pneu.features.NotificationConsent.computer(peer)
+        }
+    }
     suspend fun finishPeerReset(peerId:String) {edit {PeerRegistry.finishReset(it,peerId)}}
     suspend fun forget(lostPcName:String?=null,peerId:String?=null):Unit=policy.locked {
         beforeMutation("forget")
@@ -418,8 +496,13 @@ class Preferences(private val context:Context,internal val store:androidx.datast
             val peers=PeerRegistry.read(it)
             val target=peers.find {peer->peer.deviceId==(peerId ?: peers.firstOrNull()?.deviceId)}
             if(target!=null) {
+                val grants=stringSetPreferencesKey("mirrorComputers")
+                it[grants]=it[grants].orEmpty().filterNot {grant->grant.startsWith(target.deviceId+"/")}.toSet()
                 if(lostPcName!=null)PeerRegistry.write(it,peers.map {peer->if(peer==target)peer.copy(pairingLost=true) else peer})
-                else PeerRegistry.remove(it,target.deviceId)
+                else {
+                    PeerRegistry.remove(it,target.deviceId)
+                    SetupStorage.write(it,SetupStorage.read(it))
+                }
                 PeerRegistry.reset(it,target.deviceId)
                 it.remove(longPreferencesKey("legacyImageTime:${target.deviceId}"))
                 it.remove(longPreferencesKey("legacyImageGeneration:${target.deviceId}"))
@@ -431,3 +514,7 @@ class Preferences(private val context:Context,internal val store:androidx.datast
         }
     }
 }
+
+internal fun refusedPeer(peer:Peer,binding:DeliveryBinding,authenticated:Boolean)=
+    if(authenticated && peer.addedViaId!=null && peer.deviceId==binding.pcId && peer.pin==binding.pin && peer.generation==binding.generation)
+        peer.copy(setupRefused=true) else peer

@@ -103,7 +103,7 @@ class Sweep4RegressionDeviceTest {
             assertNull(app.connection.attempt.value)
             assertTrue(app.preferences.read().devices.isEmpty())
             compose.onNodeWithText(UiPresentation.status(c,status)).assertIsDisplayed()
-            compose.onNodeWithText(c.getString(R.string.pair_unreachable_title)).assertDoesNotExist()
+            compose.onNodeWithText(c.getString(R.string.pair_unreachable_title,"Incompatible PC")).assertDoesNotExist()
             delay(2500)
             assertEquals(status,app.connection.state.value.connectionStatus)
             assertEquals(status,app.connection.state.value.pairingFeedback!!.status)

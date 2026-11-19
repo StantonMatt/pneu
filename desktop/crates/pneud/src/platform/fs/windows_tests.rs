@@ -356,7 +356,6 @@ fn configured_win32_alias_names_stay_strict_while_receive_names_are_mapped() -> 
     let (temp, folder) = fixture()?;
     let source = create_private_at(&folder.file, "source", Access::ReadWrite)?;
     source.sync_all()?;
-    let staging = crate::storage::staging_directory(&folder)?;
     for name in [
         "data.",
         "data ",
@@ -376,11 +375,13 @@ fn configured_win32_alias_names_stay_strict_while_receive_names_are_mapped() -> 
     ] {
         let path = temp.path().join(name);
         assert!(validate_path(&path).is_err(), "{name}");
+        let staging = crate::storage::staging_directory(&folder)?;
         let stage = crate::storage::Stage::create(folder.clone(), staging.clone(), name.into(), 0)?;
         assert_ne!(stage.0.destination, name);
         validate_name(OsStr::new(&stage.0.destination))?;
         drop(stage);
-        assert_eq!(entries(&staging.file)?.count(), 0);
+        drop(staging);
+        assert!(!temp.path().join(crate::storage::STAGING_DIR).exists());
         assert!(Folder::open_private(&path).is_err(), "{name}");
         assert!(Folder::open(&path.join("child"), true).is_err(), "{name}");
         assert!(open_read(&path).is_err(), "{name}");
@@ -417,7 +418,8 @@ fn configured_win32_alias_names_stay_strict_while_receive_names_are_mapped() -> 
     assert!(validate_name(&OsString::from_wide(&[0xd800])).is_err());
     assert!(Folder::open_private(&temp.path().join("new/bad./child")).is_err());
     assert!(!temp.path().join("new").exists());
-    assert_eq!(entries(&folder.file)?.count(), 2);
+    // Only "source" remains: the empty staging root was retired after each stage.
+    assert_eq!(entries(&folder.file)?.count(), 1);
     for path in [
         r"\\?\C:\pneu",
         r"\\.\C:\pneu",
@@ -459,6 +461,8 @@ fn short_renames_support_fresh_collision_replace_and_read_only() -> Result<()> {
             // the source frozen, and use a writable destination for replacement.
             if readonly {
                 let mut p = source.metadata()?.permissions();
+                // Windows clears a DOS attribute here, not Unix access bits.
+                #[allow(clippy::permissions_set_readonly_false)]
                 p.set_readonly(false);
                 source.set_permissions(p)?;
             }
@@ -1169,7 +1173,7 @@ fn database_and_sidecar_hardlinks_are_rejected_before_writes() -> Result<()> {
 }
 #[test]
 fn database_lock_byte_coexists_with_sqlite_operations_and_reader() -> Result<()> {
-    assert!(STORE_LOCK_OFFSET >= (1u64 << 63));
+    const { assert!(STORE_LOCK_OFFSET >= (1u64 << 63)) };
     let (temp, _) = fixture()?;
     let (conn, lock, _parent) = open_database(&temp.path().join("state.sqlite3"))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE proof(x); INSERT INTO proof VALUES(42); PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE; INSERT INTO proof VALUES(99); PRAGMA journal_mode=WAL; VACUUM;")?;

@@ -61,7 +61,7 @@ internal class ReceivedFileEffects(private val app:AppGraph) {
             // getType() query while holding the global OS-effect boundary.
             val clip=ClipData(app.context.getString(R.string.app_name),arrayOf(row.mime),ClipData.Item(Uri.parse(row.uri))).apply {
                 description.extras=PersistableBundle().apply {
-                    putBoolean(ClipboardDelivery.OWN_CLIP,true);putBoolean(IMAGE_MARKER,true);putBoolean(LEGACY,!mesh)
+                    putBoolean(ClipboardDelivery.OWN_CLIP,true);if(metadata.sensitive)putBoolean(android.content.ClipDescription.EXTRA_IS_SENSITIVE,true);putBoolean(IMAGE_MARKER,true);putBoolean(LEGACY,!mesh)
                     putString(ClipboardDelivery.OWN_SOURCE,row.peerId);putString(ClipboardDelivery.OWN_HASH,metadata.hash)
                     putString(TRANSFER,row.transferId);putString(ORDER,stamp.hlc.toString());putLong(GENERATION,row.generation)
                 }
@@ -74,8 +74,9 @@ internal class ReceivedFileEffects(private val app:AppGraph) {
                     !ReceivedFileActions.published(ReceivedMediaStore(app.context),row) || !app.preferences.clipboardWins(stamp))return@withContext
                 if(apply!=null)apply(clip) else withContext(Dispatchers.Main) {
                     val clipboard=app.context.getSystemService(ClipboardManager::class.java)
-                    if(!ClipboardContent.imageMatches(runCatching {clipboard.primaryClip}.getOrNull(),metadata.hash,currentImage))clipboard.setPrimaryClip(clip)
+                    if(!ClipboardContent.imageMatches(runCatching {clipboard.primaryClip}.getOrNull(),metadata.hash,currentImage) || metadata.sensitive && clipboard.primaryClipDescription?.extras?.getBoolean(android.content.ClipDescription.EXTRA_IS_SENSITIVE)!=true)clipboard.setPrimaryClip(clip)
                 }
+                PostCommit.maintainSuspending {app.savedClips.recordImage(row.mime,peer.name,metadata.sensitive,source=row.peerId) {app.context.contentResolver.openInputStream(Uri.parse(row.uri))}}
                 app.preferences.recordClipboardEffect(stamp,metadata.hash,row.peerId,row.generation,row.transferId,if(mesh)null else metadata.createdAt)
                 app.preferences.appliedClipboard(stamp,metadata.hash,row.peerId,row.generation,row.transferId)
                 if(!mesh) {

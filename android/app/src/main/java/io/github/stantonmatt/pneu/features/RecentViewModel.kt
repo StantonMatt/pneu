@@ -10,7 +10,7 @@ import io.github.stantonmatt.pneu.data.*
 import kotlinx.coroutines.flow.*
 
 /** [item] identifies this one delivery, so a details sheet can stop or retry it alone. */
-data class RecipientOutcome(val peerId:String,val name:String,val state:String,val error:String,val sent:Long,val total:Long,val active:Boolean=false,val item:ConfirmedItem?=null) {
+data class RecipientOutcome(val peerId:String,val name:String,val state:String,val error:String,val sent:Long,val total:Long,val active:Boolean=false,val item:ConfirmedItem?=null,val resumable:Boolean=false,val preparing:Boolean=false) {
     val pending get()=state in setOf("waiting","sending")
     val retryable get()=state=="failed"
     val actionable get()=pending || retryable
@@ -26,6 +26,10 @@ data class RecentItem(val row:Outgoing,val recipients:List<RecipientOutcome>,val
     val waiting get()=recipients.filter {it.state=="waiting" || it.state=="sending" && !it.active}
 }
 internal object RecentProjection {
+    fun waitingCount(rows:List<Outgoing>,links:Map<String,LinkState>)=rows.filter {
+        it.state=="waiting" && links[it.peerId]?.connectionStatus!=ConnectionStatus.CONNECTED
+    }.distinctBy {it.mediaId}.size
+
     fun merged(rows:List<Outgoing>,received:List<ReceivedFile>,p:Prefs,links:Map<String,LinkState>):List<RecentItem> {
         val arrivals=received.map {file->RecentItem(Outgoing().apply {
             mediaId="received:${file.peerId}:${file.transferId}";peerId=file.peerId;transferId=file.transferId
@@ -39,10 +43,11 @@ internal object RecentProjection {
     fun items(rows:List<Outgoing>,p:Prefs,links:Map<String,LinkState>):List<RecentItem> =rows.groupBy {it.mediaId}.values.map {deliveries->
         val row=deliveries.minWith(compareBy<Outgoing> {when(it.state) {"sending"->0;"failed"->1;"waiting"->2;"sent"->3;else->4}}.thenBy {it.peerId})
         RecentItem(row,deliveries.map {delivery->
-            val link=links[delivery.peerId]?.takeIf {it.connectionStatus==ConnectionStatus.CONNECTED && it.transferMediaId==delivery.mediaId && delivery.state=="sending"}
+            val connection=links[delivery.peerId]
+            val link=connection?.takeIf {it.connectionStatus==ConnectionStatus.CONNECTED && it.transferMediaId==delivery.mediaId && delivery.state=="sending"}
             val total=maxOf(delivery.size,link?.total ?: 0).coerceAtLeast(0)
-            val sent=if(delivery.state=="sent")total else (link?.sent ?: 0).coerceIn(0,total)
-            RecipientOutcome(delivery.peerId,p.devices.find {it.deviceId==delivery.peerId}?.name.orEmpty(),delivery.state,delivery.error,sent,total,link!=null,ConfirmedItem.from(delivery))
+            val sent=if(delivery.state=="sent")total else (link?.sent ?: delivery.sentBytes).coerceIn(0,total)
+            RecipientOutcome(delivery.peerId,(p.devices.find {it.deviceId==delivery.peerId}?.name ?: p.replacements.replacement(delivery.peerId,delivery.bindingGeneration)?.old?.pcName).orEmpty(),delivery.state,delivery.error,sent,total,link!=null,ConfirmedItem.from(delivery),delivery.resumable,delivery.state=="waiting" && connection?.connectionStatus==ConnectionStatus.CONNECTED && !DeliveryPolicy.hold(delivery.kind,delivery.automatic,p.paused,connection.cellular,p.originals,delivery.attempted,delivery.optimized))
         })
     }.sortedWith(compareBy<RecentItem> {if(it.row.state=="sent")1 else 0}
         .thenBy {if(it.row.state=="sent")-it.row.orderId else it.row.orderId}.thenBy {it.row.mediaId})

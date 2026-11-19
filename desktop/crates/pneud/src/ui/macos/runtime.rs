@@ -73,11 +73,22 @@ pub async fn run(
     let mut interactions = crate::ui::portal::Interactions::new();
     let mut last_blocked: Option<Instant> = None;
     let mut notices = tokio::task::JoinSet::new();
+    let mut requests = Some(crate::ui::window_setup::Requests::default());
+    let mut request_job: Option<
+        futures_util::future::BoxFuture<'static, crate::ui::window_setup::Requests>,
+    > = None;
     loop {
         if *stop.borrow() {
             break;
         }
+        let mut sync_requests = true;
         tokio::select! {
+            state = async { request_job.as_mut().expect("link request job").await }, if request_job.is_some() => {
+                request_job = None;
+                requests = Some(state);
+                sync_requests = false;
+            },
+
             _=stop.changed()=>break,
             Some(_)=notices.join_next(),if !notices.is_empty()=>{},
             _=timer.tick()=>{
@@ -90,6 +101,8 @@ pub async fn run(
                         if !ui.swept && let Ok(wait) = actions.clear_stale_native_notifications() {
                             ui.swept = true;
                             notices.spawn(async move { let _ = wait.await; });
+                            // Joined notices left from before the menu bar was ready.
+                            queue_joined(&mut notices, core.clone(), actions.clone());
                         }
                     }
                     match ui.child.try_wait() {
@@ -102,6 +115,8 @@ pub async fn run(
                     ui.channel.close();
                     crate::ui::child_supervision::stop(&mut ui.child, Duration::from_secs(3)).await;
                     actions.clear_notifications().await;
+                    request_job = None;
+                    requests = Some(crate::ui::window_setup::Requests::default());
                     restart.failed(Instant::now(),ui.started.elapsed());
                     eprintln!("pneud: menu bar child stopped; restarting with backoff");
                 }
@@ -124,17 +139,31 @@ pub async fn run(
             },
             event=events.recv()=>match event {
                 Ok(Event::Error {message,..})=>eprintln!("pneud: {message}"),
-                Ok(Event::Blocked {address})=>{
+                Ok(Event::Blocked {address,..})=>{
                     if last_blocked.is_none_or(|time|time.elapsed()>=Duration::from_secs(3600)) {
                         last_blocked=Some(Instant::now());queue_notice(&mut notices,actions.clone(),Notice::blocked(&address));
                     }
                 }
                 Ok(Event::ComputerPaired {name,..})=>if !core.window_focused(){queue_notice(&mut notices,actions.clone(),Notice::paired(&name));},
                 Ok(Event::RemoteUnpaired {name})=>queue_notice(&mut notices,actions.clone(),Notice::unpaired(&name)),
+                Ok(event @ Event::Paired {..})=>{queue_joined(&mut notices,core.clone(),actions.clone());clipboard_policy_event(&core,&event);},
                 Ok(event)=>clipboard_policy_event(&core,&event),
                 Err(tokio::sync::broadcast::error::RecvError::Closed)=>break,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_))=>for device in core.paired_devices() {core.cancel_automatic_clipboard(&device);},
             }
+        }
+
+        if sync_requests
+            && require_ui(&core).is_ok()
+            && request_job.is_none()
+            && let Some(mut state) = requests.take()
+        {
+            let core = core.clone();
+            let actions = actions.clone();
+            request_job = Some(Box::pin(async move {
+                state.sync(&core, &actions).await;
+                state
+            }));
         }
     }
     notices.abort_all();
@@ -147,6 +176,30 @@ pub async fn run(
     actions.clear_notifications().await;
     watcher.shutdown().await;
     Ok(())
+}
+/// "{device} joined" for each device another of your devices added.
+fn queue_joined(
+    jobs: &mut tokio::task::JoinSet<()>,
+    core: Arc<Core>,
+    actions: Arc<DesktopActions>,
+) {
+    // The existing child-ready pass queues these again after startup.
+    if require_ui(&core).is_err() {
+        return;
+    }
+    while jobs.try_join_next().is_some() {}
+    if jobs.len() >= crate::ui::portal::Interactions::LIMIT {
+        eprintln!("pneud: notification submission capacity exhausted");
+        return;
+    }
+    jobs.spawn(async move {
+        for joined in crate::ui::window_setup::joined(&core).await {
+            let result = actions
+                .notice(joined.notice.clone(), Vec::new(), None, 0, None)
+                .await;
+            joined.posted(&core, result).await;
+        }
+    });
 }
 fn queue_notice(jobs: &mut tokio::task::JoinSet<()>, actions: Arc<DesktopActions>, notice: Notice) {
     while jobs.try_join_next().is_some() {}

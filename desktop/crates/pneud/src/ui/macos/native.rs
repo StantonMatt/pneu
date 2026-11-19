@@ -45,6 +45,7 @@ struct State {
     child: Option<Child>,
     panels: HashMap<u64, Retained<AnyObject>>,
     notifications: HashMap<u64, Arc<NativeNotice>>,
+    mirrors: HashMap<u64, (String, Arc<Lifecycle>)>,
     next_panel: u64,
     materials: crate::ui::viewer_cache::Materials,
     requests: HashMap<u64, Arc<std::sync::atomic::AtomicBool>>,
@@ -133,12 +134,20 @@ define_class!(
         fn present(
             &self,
             _center: &UNUserNotificationCenter,
-            _notification: &UNNotification,
+            notification: &UNNotification,
             completion: &DynBlock<dyn Fn(UNNotificationPresentationOptions)>,
         ) {
-            completion
-                .call((UNNotificationPresentationOptions::Banner
-                    | UNNotificationPresentationOptions::List,));
+            let mut options =
+                UNNotificationPresentationOptions::Banner | UNNotificationPresentationOptions::List;
+            if notification
+                .request()
+                .identifier()
+                .to_string()
+                .starts_with("pneu-mirror-")
+            {
+                options |= UNNotificationPresentationOptions::Sound;
+            }
+            completion.call((options,));
         }
         #[unsafe(method(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:))]
         fn response(
@@ -149,6 +158,14 @@ define_class!(
         ) {
             autoreleasepool(|_| {
                 let identifier = response.notification().request().identifier().to_string();
+                if identifier.starts_with("pneu-mirror-") {
+                    let _ = slint::invoke_from_event_loop(move || {
+                        forget_phone(&identifier);
+                        remove_native(&identifier);
+                    });
+                    completion.call(());
+                    return;
+                }
                 let action = response.actionIdentifier().to_string();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some((namespace, id)) = identifier
@@ -204,6 +221,12 @@ fn retire_stale_notices(identifiers: Vec<String>) {
                     .values()
                     .filter(|n| n.life.active())
                     .map(|n| n.notification.identifier())
+                    .chain(
+                        s.mirrors
+                            .values()
+                            .filter(|(_, life)| life.active())
+                            .map(|(id, _)| id.clone()),
+                    )
                     .collect::<std::collections::HashSet<_>>()
             })
             .unwrap_or_default()
@@ -366,6 +389,58 @@ impl State {
             let _: () = msg_send![menu, addItem: &*separator];
         }
     }
+    fn add_history(&mut self, menu: &AnyObject) {
+        if !self.config.clipboard_history {
+            return;
+        }
+        unsafe {
+            let submenu = new_menu("Clipboard History");
+            let entries: Vec<_> =
+                crate::ui::tray_model::history_entries(&self.snapshot.clipboard_history)
+                    .into_iter()
+                    .map(|i| i.cloned())
+                    .collect();
+            if entries.is_empty() {
+                self.add(&submenu, "Nothing copied yet", None, None, false);
+            } else {
+                for entry in entries {
+                    let Some(entry) = entry else {
+                        Self::separator(&submenu);
+                        continue;
+                    };
+                    let item = self.add(
+                        &submenu,
+                        &crate::ui::tray_model::history_label(&entry, false),
+                        Some(command(
+                            serde_json::json!({"command":"copy_clipboard_history","id":entry.id}),
+                        )),
+                        None,
+                        true,
+                    );
+                    if let Some(path) = entry.thumbnail {
+                        let allocated: Allocated<AnyObject> = msg_send![class!(NSImage), alloc];
+                        let image: Option<Retained<AnyObject>> = msg_send![allocated,initWithContentsOfFile:&*NSString::from_str(&path.to_string_lossy())];
+                        if let Some(image) = image {
+                            let _: () = msg_send![&*image,setSize:objc2_foundation::NSSize {width:16.0,height:16.0}];
+                            let _: () = msg_send![&*item,setImage:&*image];
+                        }
+                    }
+                }
+                Self::separator(&submenu);
+                self.add(
+                    &submenu,
+                    "Show All",
+                    Some(command(
+                        serde_json::json!({"command":"show_clipboard_history"}),
+                    )),
+                    None,
+                    true,
+                );
+            }
+            let parent = self.add(menu, "Clipboard History", None, None, true);
+            let _: () = msg_send![&*parent,setSubmenu:&*submenu];
+        }
+    }
     fn rebuild(&mut self) {
         main_thread();
         unsafe {
@@ -382,7 +457,13 @@ impl State {
             let peers = crate::ui::window::peers(&self.snapshot, &transfers);
             let status = crate::ui::tray_model::status(&self.snapshot, &peers, &transfers);
             self.add(&menu, &status, None, None, false);
+            for line in crate::ui::tray_model::battery_lines(&peers) {
+                self.add(&menu, &line, None, None, false);
+            }
             Self::separator(&menu);
+            if peers.is_empty() {
+                self.add_history(&menu);
+            }
             if !peers.is_empty() {
                 let submenu = new_menu("Send Files To");
                 let all = crate::file_recipients::resolve(
@@ -427,8 +508,30 @@ impl State {
                         true,
                     );
                 }
-                let parent = self.add(&menu, "Send Files To", None, None, true);
-                let _: () = msg_send![&*parent, setSubmenu: &*submenu];
+                if let [one] = peers.as_slice() {
+                    if let Ok(id) = pneu_proto::Id::new(&one.id) {
+                        let captured = crate::file_recipients::resolve(
+                            &self.snapshot.send_targets,
+                            crate::file_recipients::Selection::Explicit(&[id]),
+                        )
+                        .map(|r| r.recipients)
+                        .unwrap_or_default();
+                        self.add(
+                            &menu,
+                            "Send Files…",
+                            Some(MenuAction::Send {
+                                recipients: captured,
+                                targeted: true,
+                                clipboard: false,
+                            }),
+                            None,
+                            true,
+                        );
+                    }
+                } else {
+                    let parent = self.add(&menu, "Send Files To", None, None, true);
+                    let _: () = msg_send![&*parent, setSubmenu: &*submenu];
+                }
                 if self.config.clipboard_mode == crate::config::ClipboardMode::Manual {
                     self.add(
                         &menu,
@@ -441,6 +544,31 @@ impl State {
                         None,
                         true,
                     );
+                }
+                self.add_history(&menu);
+                let rings = crate::ui::tray_model::ring_items(&peers);
+                if rings.len() == 1 {
+                    let ring = &rings[0];
+                    self.add(
+                        &menu,
+                        &ring.label,
+                        Some(command(ring.request())),
+                        None,
+                        ring.connection.is_some(),
+                    );
+                } else if !rings.is_empty() {
+                    let submenu = new_menu("Ring Phone");
+                    for ring in rings {
+                        self.add(
+                            &submenu,
+                            &ring.label,
+                            Some(command(ring.request())),
+                            None,
+                            ring.connection.is_some(),
+                        );
+                    }
+                    let parent = self.add(&menu, "Ring Phone", None, None, true);
+                    let _: () = msg_send![&*parent, setSubmenu: &*submenu];
                 }
                 self.add(&menu, "Open Folder", Some(MenuAction::Folder), None, true);
                 Self::separator(&menu);
@@ -550,17 +678,7 @@ impl State {
                 let _: () = msg_send![&*image, setTemplate: Bool::YES];
                 let _: () = msg_send![&*button, setImage: &*image];
             }
-            let mut lines = peers
-                .iter()
-                .map(crate::ui::window::Peer::short)
-                .collect::<Vec<_>>();
-            if lines.is_empty()
-                || self.snapshot.error.is_some()
-                || self.snapshot.pairing.is_some()
-                || peers.iter().any(|p| p.sending() || p.receiving())
-            {
-                lines.insert(0, status);
-            }
+            let lines = crate::ui::tray_model::tooltip_lines(&self.snapshot, &peers, &transfers);
             let _: () = msg_send![&*button, setToolTip: &*NSString::from_str(&lines.join("\n"))];
         }
     }
@@ -631,6 +749,7 @@ pub(crate) fn install(
                 child: None,
                 panels: HashMap::new(),
                 notifications: HashMap::new(),
+                mirrors: HashMap::new(),
                 next_panel: 1,
                 materials: crate::ui::viewer_cache::Materials::default(),
                 requests: HashMap::new(),
@@ -814,6 +933,43 @@ pub(crate) fn request(id: u64, request: Request, descriptor: Option<OwnedFd>, gu
         return;
     }
     match request {
+        Request::PhoneNotification {
+            id: mirror_id,
+            notice,
+        } if descriptor.is_none() => {
+            let identifier = crate::ui::notifications::phone_identifier(&mirror_id);
+            if let Some(notice) = notice {
+                post_phone(id, identifier, notice, guard);
+            } else {
+                let result = guard.run(|| {
+                    forget_phone(&identifier);
+                    remove_native(&identifier);
+                    Ok(())
+                });
+                guard.finish(result);
+            }
+        }
+        Request::WithdrawPhoneNotifications { ids } if descriptor.is_none() => {
+            let result = guard.run(|| {
+                let identifiers: Vec<_> = ids
+                    .iter()
+                    .map(|id| crate::ui::notifications::phone_identifier(id))
+                    .collect();
+                for identifier in &identifiers {
+                    forget_phone(identifier);
+                }
+                let identifiers: Vec<_> = identifiers
+                    .iter()
+                    .map(|id| NSString::from_str(id))
+                    .collect();
+                let identifiers = NSArray::from_retained_slice(&identifiers);
+                let center = UNUserNotificationCenter::currentNotificationCenter();
+                center.removePendingNotificationRequestsWithIdentifiers(&identifiers);
+                center.removeDeliveredNotificationsWithIdentifiers(&identifiers);
+                Ok(())
+            });
+            guard.finish(result);
+        }
         Request::Notify(notification) if descriptor.is_none() => post(id, notification, guard),
         Request::ClearStale { .. } if descriptor.is_none() => clear_stale_notices(guard),
         Request::Withdraw {
@@ -852,6 +1008,13 @@ pub(crate) fn request(id: u64, request: Request, descriptor: Option<OwnedFd>, gu
                 return;
             };
             let descriptor = std::fs::File::from(descriptor);
+            if descriptor.metadata().is_ok_and(|m| m.is_dir()) {
+                guard.finish(
+                    crate::platform::fs::directory_path(&descriptor)
+                        .and_then(|path| open_viewer_path(&path, false, &guard)),
+                );
+                return;
+            }
             let reused = STATE.with(|s| {
                 s.borrow_mut()
                     .as_mut()
@@ -1161,6 +1324,17 @@ pub(crate) async fn choose(
     directory: bool,
     current: Option<&Path>,
 ) -> Result<Option<Vec<PathBuf>>> {
+    choose_options(title, directory, !directory, current).await
+}
+pub(crate) async fn choose_send(folders: bool) -> Result<Option<Vec<PathBuf>>> {
+    choose_options("Send Files", false, folders, None).await
+}
+async fn choose_options(
+    title: &str,
+    directory: bool,
+    folders: bool,
+    current: Option<&Path>,
+) -> Result<Option<Vec<PathBuf>>> {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let title = title.to_owned();
     let current = current.map(Path::to_owned);
@@ -1188,9 +1362,12 @@ pub(crate) async fn choose(
         }
         let panel: Retained<AnyObject> = msg_send![class!(NSOpenPanel), openPanel];
         let _: () = msg_send![&*panel, setTitle: &*NSString::from_str(&title)];
-        let _: () = msg_send![&*panel, setCanChooseDirectories: Bool::new(directory)];
+        let _: () = msg_send![&*panel, setCanChooseDirectories: Bool::new(directory || folders)];
         let _: () = msg_send![&*panel, setCanChooseFiles: Bool::new(!directory)];
         let _: () = msg_send![&*panel, setAllowsMultipleSelection: Bool::new(!directory)];
+        if !directory {
+            let _: () = msg_send![&*panel,setPrompt: &*NSString::from_str("Send")];
+        }
         if let Some(current) = current {
             let url = NSURL::fileURLWithPath(&NSString::from_str(&current.to_string_lossy()));
             let _: () = msg_send![&*panel, setDirectoryURL: &*url];
@@ -1261,6 +1438,12 @@ pub(crate) async fn choose(
     receiver.await.context("picker cancelled")?
 }
 pub(crate) fn cancel_request(id: u64) {
+    let mirror = STATE.with(|s| s.borrow_mut().as_mut().and_then(|s| s.mirrors.remove(&id)));
+    if let Some((identifier, life)) = mirror {
+        life.cancel();
+        remove_native(&identifier);
+    }
+
     STATE.with(|s| {
         if let Some(flag) = s.borrow().as_ref().and_then(|s| s.requests.get(&id)) {
             flag.store(true, std::sync::atomic::Ordering::Release);
@@ -1283,6 +1466,10 @@ pub(crate) fn cleanup() {
     let state = STATE.with(|s| s.borrow_mut().take());
     if let Some(mut state) = state {
         main_thread();
+        for (_, (identifier, life)) in state.mirrors.drain() {
+            life.cancel();
+            remove_native(&identifier);
+        }
         let identifiers = state
             .notifications
             .values()
@@ -1630,7 +1817,7 @@ fn test_control(action: &str) -> Result<()> {
                     let directories: Bool = msg_send![&*panel, canChooseDirectories];
                     let files: Bool = msg_send![&*panel, canChooseFiles];
                     ensure!(
-                        directories.as_bool() == (action == "assert-folder-picker")
+                        (action != "assert-folder-picker" || directories.as_bool())
                             && files.as_bool() == (action == "assert-file-picker"),
                         "picker kind mismatch"
                     );
@@ -1711,6 +1898,144 @@ fn test_control(action: &str) -> Result<()> {
     }
 }
 
+fn forget_phone(identifier: &str) {
+    STATE.with(|s| {
+        if let Some(s) = s.borrow_mut().as_mut() {
+            s.mirrors.retain(|_, (name, life)| {
+                if name == identifier {
+                    life.cancel();
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+    });
+}
+// The cached app icon is connection-owned. Its per-submission copy lasts only
+// until UserNotifications has finished importing the attachment.
+struct PhoneAttachmentFile(PathBuf);
+impl Drop for PhoneAttachmentFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+fn post_phone(
+    request_id: u64,
+    identifier: String,
+    notice: crate::ui::notifications::PhoneNotice,
+    guard: RequestGuard,
+) {
+    forget_phone(&identifier);
+    STATE.with(|s| {
+        if let Some(s) = s.borrow_mut().as_mut() {
+            s.mirrors
+                .insert(request_id, (identifier.clone(), guard.life().clone()));
+        }
+    });
+    let center = UNUserNotificationCenter::currentNotificationCenter();
+    center.getNotificationSettingsWithCompletionHandler(&RcBlock::new(
+        move |settings: NonNull<UNNotificationSettings>| {
+            autoreleasepool(|_| {
+                let status = unsafe { settings.as_ref() }.authorizationStatus();
+                if !matches!(
+                    status,
+                    UNAuthorizationStatus::Authorized
+                        | UNAuthorizationStatus::Provisional
+                        | UNAuthorizationStatus::Ephemeral
+                ) {
+                    let _ = slint::invoke_from_event_loop(move || cancel_request(request_id));
+                    guard.finish(Err(anyhow::anyhow!("phone notifications unavailable")));
+                    return;
+                }
+                let content = UNMutableNotificationContent::new();
+                let (title, subtitle, body) = notice.macos();
+                content.setTitle(&NSString::from_str(&title));
+                content.setSubtitle(&NSString::from_str(&subtitle));
+                content.setBody(&NSString::from_str(&body));
+                content.setSound(Some(&UNNotificationSound::defaultSound()));
+                let mut attachment_file = None;
+                if let Some(path) = notice.icon.as_ref().and_then(|icon| icon.file_path()) {
+                    // UserNotifications may move an attachment into its store.
+                    // Keep the connection's cached source available for updates.
+                    let attachment_path =
+                        path.with_file_name(format!("attachment-{}.png", crate::random_hex(16)));
+                    let copied = std::fs::read(path)
+                        .and_then(|bytes| {
+                            crate::config::atomic_private(&attachment_path, &bytes)
+                                .map_err(std::io::Error::other)
+                        })
+                        .is_ok();
+                    if copied {
+                        attachment_file = Some(PhoneAttachmentFile(attachment_path.clone()));
+                    }
+                    let url = NSURL::fileURLWithPath(&NSString::from_str(
+                        &attachment_path.to_string_lossy(),
+                    ));
+                    if copied
+                        && let Ok(attachment) = unsafe {
+                            UNNotificationAttachment::attachmentWithIdentifier_URL_options_error(
+                                &NSString::from_str("icon"),
+                                &url,
+                                None,
+                            )
+                        }
+                    {
+                        content.setAttachments(&NSArray::from_slice(&[&*attachment]));
+                    }
+                }
+                let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
+                    &NSString::from_str(&identifier),
+                    &content,
+                    None,
+                );
+                let completion = guard.clone();
+                let cancelled_id = identifier.clone();
+                if !guard.submit(|| {
+                    UNUserNotificationCenter::currentNotificationCenter()
+                        .addNotificationRequest_withCompletionHandler(
+                            &request,
+                            Some(&RcBlock::new(move |error: *mut NSError| {
+                                if let Some(file) = &attachment_file {
+                                    let _ = std::fs::remove_file(&file.0);
+                                }
+                                let succeeded = error.is_null();
+                                let id = cancelled_id.clone();
+                                let completion = completion.clone();
+                                // A native completion may be synchronous. Leave
+                                // the submit lifecycle lock before acknowledging.
+                                let _ = slint::invoke_from_event_loop(move || {
+                                    let ok = succeeded && completion.life().acknowledge();
+                                    if !ok {
+                                        let newer = STATE.with(|s| {
+                                            s.borrow().as_ref().is_some_and(|s| {
+                                                s.mirrors.iter().any(|(request, (name, _))| {
+                                                    *request != request_id && name == &id
+                                                })
+                                            })
+                                        });
+                                        if !newer {
+                                            forget_phone(&id);
+                                            remove_native(&id);
+                                        }
+                                    }
+                                    completion.finish(if ok {
+                                        Ok(())
+                                    } else {
+                                        Err(anyhow::anyhow!("phone notification submission failed"))
+                                    });
+                                });
+                            })),
+                        );
+                }) {
+                    let _ = slint::invoke_from_event_loop(move || cancel_request(request_id));
+                    guard.finish(Err(anyhow::anyhow!("phone notification cancelled")));
+                }
+            });
+        },
+    ));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1786,6 +2111,9 @@ mod tests {
             Request::OpenUrl("https://example.com".into()),
             Request::ClearStale {
                 namespace: "Pneu test".into(),
+            },
+            Request::WithdrawPhoneNotifications {
+                ids: (0..128).map(|key| format!("session-{key}")).collect(),
             },
             Request::Withdraw {
                 id: 1,

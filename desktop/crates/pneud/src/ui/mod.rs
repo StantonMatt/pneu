@@ -16,13 +16,19 @@ pub mod clipboard;
 #[cfg(windows)]
 #[path = "windows_clipboard.rs"]
 pub mod clipboard;
-#[cfg(target_os = "linux")]
-mod clipboard_content;
-#[cfg(any(windows, all(unix, any(target_os = "macos", test))))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) mod clipboard_content;
+#[cfg(any(
+    all(target_os = "linux", pneu_qt_drag),
+    windows,
+    all(unix, any(target_os = "macos", test))
+))]
 #[path = "macos/drop_target.rs"]
 mod drop_target;
 #[cfg(unix)]
 mod interactions;
+#[cfg(all(target_os = "linux", pneu_qt_drag))]
+mod linux_drag;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
 #[cfg(any(windows, all(unix, any(target_os = "macos", test))))]
@@ -57,6 +63,7 @@ mod viewer_cache;
 pub mod window;
 #[cfg(any(target_os = "linux", windows))]
 mod window_process;
+pub(crate) mod window_setup;
 #[cfg(any(windows, test))]
 mod windows_clipboard_content;
 #[cfg(windows)]
@@ -88,8 +95,39 @@ pub struct Phone {
     #[serde(default)]
     pub route: String,
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PairingCompletion {
+    pub token: pneu_proto::Hash,
+    pub device: pneu_proto::Id,
+}
+/// Ephemeral phone presentation; never persisted to the phone metadata file.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PhoneControl {
+    pub battery: Option<u8>,
+    pub charging: bool,
+    pub ring_supported: bool,
+    pub ringing: bool,
+    pub connection: Option<u64>,
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub ring_failure: Option<RingFailure>,
+    #[serde(default)]
+    pub phone_controls: std::collections::HashMap<pneu_proto::Id, PhoneControl>,
+    #[serde(default)]
+    pub replacements: Vec<crate::store::replacement::Offer>,
+    #[serde(default)]
+    pub clipboard_history: Vec<crate::store::history::Item>,
+    /// Last locally consumed invitation, published with Event::Paired.
+    #[serde(default)]
+    pub pairing_completion: Option<PairingCompletion>,
+    /// Presentation only: never used for recipient or session authority.
+    #[serde(default)]
+    pub refreshing_devices: Vec<pneu_proto::Id>,
+    /// First current authenticated refusal, preserved while the window is closed.
+    #[serde(default)]
+    pub setup_refusal_since: Option<u64>,
     /// Local UI hint only. Never a separate clipboard publication or log event.
     #[serde(default)]
     pub pairing_clipboard: Option<String>,
@@ -119,6 +157,12 @@ pub struct Snapshot {
     pub receiving: bool,
     pub pairing: Option<String>,
     pub error: Option<ReceiveError>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RingFailure {
+    pub request: u64,
+    pub revision: u64,
+    pub message: String,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ReceiveDestination {
@@ -201,6 +245,7 @@ impl Snapshot {
 }
 #[derive(Default)]
 pub(crate) struct State {
+    pub scope_refresh: std::collections::HashMap<pneu_proto::Id, tokio::time::Instant>,
     pub snapshot: Snapshot,
     pub receiving_until: std::collections::HashMap<(pneu_proto::Id, pneu_proto::Id), Instant>,
     pub phone_generation: Option<u64>,
@@ -210,7 +255,53 @@ pub(crate) struct State {
     pub incoming: std::collections::VecDeque<crate::outbox::Transfer>,
     pub active_transfers: std::collections::HashSet<(pneu_proto::Id, pneu_proto::Id)>,
 }
+/// Captured at the start of an authenticated reconnect attempt. An old socket
+/// ending cannot clear the grace for a newer planned refresh.
+pub(crate) struct ScopeReconnect {
+    ui: std::sync::Arc<std::sync::Mutex<State>>,
+    device: pneu_proto::Id,
+    refresh: Option<tokio::time::Instant>,
+}
+impl ScopeReconnect {
+    pub(crate) fn new(ui: std::sync::Arc<std::sync::Mutex<State>>, device: pneu_proto::Id) -> Self {
+        let refresh = ui
+            .lock()
+            .expect("UI state")
+            .scope_refresh
+            .get(&device)
+            .copied();
+        Self {
+            ui,
+            device,
+            refresh,
+        }
+    }
+}
+impl Drop for ScopeReconnect {
+    fn drop(&mut self) {
+        let mut ui = self.ui.lock().expect("UI state");
+        if self.refresh.is_some() && ui.scope_refresh.get(&self.device).copied() == self.refresh {
+            ui.scope_reconnect_finished(&self.device);
+        }
+    }
+}
 impl State {
+    pub(crate) fn refreshing_scope(&mut self, device: &pneu_proto::Id) {
+        let now = tokio::time::Instant::now();
+        self.scope_refresh
+            .entry(device.clone())
+            .and_modify(|until| {
+                if *until <= now {
+                    *until = now + std::time::Duration::from_secs(10);
+                }
+            })
+            .or_insert(now + std::time::Duration::from_secs(10));
+    }
+    /// End the planned-refresh presentation after the first failed attempt.
+    /// Successful registrations clear it through ConnectionChanged.
+    pub(crate) fn scope_reconnect_finished(&mut self, device: &pneu_proto::Id) {
+        self.scope_refresh.remove(device);
+    }
     pub fn prune_incoming(&mut self) {
         while self
             .incoming
@@ -258,7 +349,10 @@ impl Snapshot {
         } else if self.receiving && self.connected {
             format!("Receiving from {phone}…")
         } else if self.connected {
-            format!("{phone} connected over {}", self.phone.route)
+            format!(
+                "{phone} connected over {}",
+                route_in_sentence(&self.phone.route)
+            )
         } else {
             format!("{phone} isn't connected")
         }
@@ -364,6 +458,14 @@ fn twelve_hour_clock() -> bool {
         twelve
     }
 }
+/// Route name within a sentence; Tailscale keeps its proper name.
+pub(crate) fn route_in_sentence(route: &str) -> &str {
+    if route == "Local network" {
+        "local network"
+    } else {
+        route
+    }
+}
 pub fn route(address: IpAddr) -> &'static str {
     match address {
         IpAddr::V4(ip) if u32::from(ip) & 0xffc00000 == 0x64400000 => "Tailscale",
@@ -371,7 +473,7 @@ pub fn route(address: IpAddr) -> &'static str {
         IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some() => {
             route(IpAddr::V4(ip.to_ipv4_mapped().unwrap()))
         }
-        _ => "Wi-Fi",
+        _ => "Local network",
     }
 }
 pub fn display_path(path: &Path) -> String {
@@ -460,6 +562,17 @@ pub(crate) fn captured_authorities(snapshot: &Snapshot) -> Vec<crate::outbox::Au
 }
 #[derive(Clone, Debug)]
 pub enum Command {
+    Ring {
+        device: pneu_proto::Id,
+        connection: u64,
+        action: pneu_proto::RingAction,
+    },
+    ShowClipboardHistory,
+    CopyClipboardHistory(String),
+    SetupDecision {
+        requests: Vec<window_setup::Decision>,
+        allow: bool,
+    },
     RetryTransfer {
         operation: pneu_proto::Id,
         artifact: pneu_proto::Id,
@@ -482,10 +595,58 @@ pub enum Command {
     AddDevice {
         activation_token: Option<String>,
     },
+    /// A joined notification's Remove…: that device's page and confirmation.
+    RemoveDevice {
+        device: pneu_proto::Id,
+        activation_token: Option<String>,
+    },
 }
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn scope_refresh_waits_for_first_attempt_but_is_capped_at_ten_seconds() {
+        let mut state = State::default();
+        let device = pneu_proto::Id::from_bytes([1; 16]);
+        state.refreshing_scope(&device);
+        let deadline = state.scope_refresh[&device];
+        assert_eq!(
+            deadline - tokio::time::Instant::now(),
+            std::time::Duration::from_secs(10)
+        );
+        tokio::time::advance(std::time::Duration::from_secs(4)).await;
+        state.refreshing_scope(&device);
+        assert_eq!(
+            state.scope_refresh[&device], deadline,
+            "repeated refresh does not extend a disconnect"
+        );
+        tokio::time::advance(std::time::Duration::from_secs(3)).await;
+        assert!(
+            state.scope_refresh[&device] > tokio::time::Instant::now(),
+            "phone reconnect at 6.6 seconds stays connected"
+        );
+        state.scope_reconnect_finished(&device);
+        assert!(!state.scope_refresh.contains_key(&device));
+        state.refreshing_scope(&device);
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        assert!(state.scope_refresh[&device] <= tokio::time::Instant::now());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scope_refresh_only_the_new_reconnect_attempt_can_end_grace() {
+        let ui = std::sync::Arc::new(std::sync::Mutex::new(State::default()));
+        let device = pneu_proto::Id::from_bytes([1; 16]);
+        let old = ScopeReconnect::new(ui.clone(), device.clone());
+        ui.lock().unwrap().refreshing_scope(&device);
+        drop(old);
+        assert!(ui.lock().unwrap().scope_refresh.contains_key(&device));
+        let attempt = ScopeReconnect::new(ui.clone(), device.clone());
+        tokio::time::advance(std::time::Duration::from_millis(6600)).await;
+        assert!(ui.lock().unwrap().scope_refresh[&device] > tokio::time::Instant::now());
+        drop(attempt);
+        assert!(!ui.lock().unwrap().scope_refresh.contains_key(&device));
+    }
+
     #[test]
     fn icons_and_status_precedence() {
         let mut s = Snapshot::default();
@@ -494,8 +655,8 @@ mod tests {
         s.paired = true;
         s.phone.name = "Phone".into();
         s.connected = true;
-        s.phone.route = "Wi-Fi".into();
-        assert_eq!(s.status(), "Phone connected over Wi-Fi");
+        s.phone.route = "Local network".into();
+        assert_eq!(s.status(), "Phone connected over local network");
         assert_eq!(s.icon(), "pneu-tray-connected");
         s.receiving = true;
         assert_eq!(s.icon(), "pneu-tray-receiving");
@@ -528,7 +689,7 @@ mod tests {
             assert_eq!(route(address.parse().unwrap()), "Tailscale");
         }
         for address in ["100.63.255.255", "100.128.0.1", "192.168.1.1", "::1"] {
-            assert_eq!(route(address.parse().unwrap()), "Wi-Fi");
+            assert_eq!(route(address.parse().unwrap()), "Local network");
         }
     }
 }

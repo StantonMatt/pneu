@@ -14,7 +14,7 @@ import io.github.stantonmatt.pneu.protocol.sha256
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
-internal data class ShareRequest(val binding:Deferred<DeliveryBinding?>,val items:List<Uri>,val texts:List<String>,val admission:Deferred<FrozenAdmission>?=null,val explicitTargets:List<CapturedAuthority>?=null)
+internal data class ShareRequest(val binding:Deferred<DeliveryBinding?>,val items:List<Uri>,val texts:List<String>,val admission:Deferred<FrozenAdmission>?=null,val explicitTargets:List<CapturedAuthority>?=null,val sensitive:Boolean=false)
 internal data class EntryResult(val message:String?=null,val pair:Boolean=false,val id:String=java.util.UUID.randomUUID().toString()) {
     fun show(context:Context) {
         if(pair)context.startActivity(Intent(context,MainActivity::class.java).putExtra("pair",true).apply {
@@ -118,8 +118,8 @@ internal class ManualEntryViewModel(application:Application):AndroidViewModel(ap
                     if(reason=="no_recipient")excluded=true else failed=true
                 }
             }
-            if(request.items.isNotEmpty())for((index,uri) in request.items.withIndex())admit {ManualEntries.file(app,uri,"file",binding,targets=surviving,order=orders[index],provenance=provenance[index])}
-            else for((index,text) in request.texts.withIndex())admit {ManualEntries.text(app,text,"share",binding,surviving,orders[index],provenance[index])}
+            if(request.items.isNotEmpty())for((index,uri) in request.items.withIndex())admit {ManualEntries.file(app,uri,"file",binding,targets=surviving,order=orders[index],provenance=provenance[index],sensitive=request.sensitive)}
+            else for((index,text) in request.texts.withIndex())admit {ManualEntries.text(app,text,"share",binding,surviving,orders[index],provenance[index],sensitive=request.sensitive)}
         }
         return@launch EntryResult(when {
             failed->app.context.getString(R.string.toast_cant_read)
@@ -145,7 +145,7 @@ internal class ManualEntryViewModel(application:Application):AndroidViewModel(ap
     }
     suspend fun awaitClipboardAdmission() {clipboardAdmission?.await();clipboardBinding?.await()}
     fun clipboard(clip:ClipData?)=launch {
-        val order=if(clip!=null && clip.itemCount>0 && clip.description.extras?.getBoolean(ClipDescription.EXTRA_IS_SENSITIVE)!=true)
+        val order=if(clip!=null && clip.itemCount>0)
             shareStep("settings") {app.newTextOrder()} else null
         val binding=try {requireNotNull(clipboardBinding).await()}catch(e:Exception) {
             if(e is CancellationException)throw e
@@ -172,7 +172,6 @@ internal class ManualEntryViewModel(application:Application):AndroidViewModel(ap
                 Log.w("Pneu","manual_entry_rejected: unavailable_binding");EntryResult(app.context.getString(R.string.toast_not_sent))
             }
             clip==null || clip.itemCount==0-> {Log.w("Pneu","manual_entry_rejected: empty");EntryResult(app.context.getString(R.string.toast_clipboard_empty))}
-            clip.description.extras?.getBoolean(ClipDescription.EXTRA_IS_SENSITIVE)==true-> {Log.w("Pneu","manual_entry_rejected: sensitive");EntryResult(app.context.getString(R.string.toast_sensitive))}
             textTargets.isEmpty() && imageTargets.isEmpty()-> {
                 Log.w("Pneu","manual_entry_rejected: no_recipient");EntryResult(app.context.getString(R.string.toast_no_recipient))
             }
@@ -185,12 +184,12 @@ internal class ManualEntryViewModel(application:Application):AndroidViewModel(ap
                     val targets=ClipboardSendPolicy.targets(current,if(image)imageTargets else textTargets,provenance)
                     if(image) {
                         if(targets.isEmpty())throw ShareFailure("no_recipient")
-                        ManualEntries.file(app,item.uri,"clipboard_image",binding,type,targets,requireNotNull(order),provenance)
+                        ManualEntries.file(app,item.uri,"clipboard_image",binding,type,targets,requireNotNull(order),provenance,sensitive=clip.description.extras?.getBoolean(ClipDescription.EXTRA_IS_SENSITIVE)==true)
                     }else {
                         val text=item.text?.toString().orEmpty()
                         if(text.isEmpty()) {Log.w("Pneu","manual_entry_rejected: empty");return@withContext null}
                         if(targets.isEmpty())throw ShareFailure("no_recipient")
-                        ManualEntries.text(app,text,"clipboard",binding,targets,requireNotNull(order),provenance)
+                        ManualEntries.text(app,text,"clipboard",binding,targets,requireNotNull(order),provenance,sensitive=clip.description.extras?.getBoolean(ClipDescription.EXTRA_IS_SENSITIVE)==true)
                     }
                 }
                 if(row==null)EntryResult(app.context.getString(R.string.toast_clipboard_empty))else {
@@ -202,7 +201,7 @@ internal class ManualEntryViewModel(application:Application):AndroidViewModel(ap
                     }}
                     EntryResult()
                 }
-            }catch(e:CancellationException) {throw e}catch(e:Exception) {Log.w("Pneu","manual_entry_rejected: ${(e as? ShareFailure)?.reason ?: "read_failed"}");EntryResult(app.context.getString(if((e as? ShareFailure)?.reason=="no_recipient")R.string.toast_no_recipient else R.string.toast_not_sent))}
+            }catch(e:CancellationException) {throw e}catch(e:Exception) {Log.w("Pneu","manual_entry_rejected: ${(e as? ShareFailure)?.reason ?: "read_failed"}");EntryResult(app.context.getString(when((e as? ShareFailure)?.reason) {"no_recipient"->R.string.toast_no_recipient;"image_too_large"->R.string.toast_image_too_large;else->R.string.toast_not_sent}))}
         }
     }
 }

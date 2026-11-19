@@ -61,7 +61,7 @@ pub fn startup_activation() -> Result<bool> {
     Ok(AppInstance::GetActivatedEventArgs()?.Kind()? == ActivationKind::StartupTask)
 }
 
-/// Native share/drop inputs obey the regular-file policy of CLI sends.
+/// Native share/drop inputs use the same folder and regular-file admission as CLI sends.
 pub(crate) fn validate_send_paths(paths: &[std::path::PathBuf]) -> Result<()> {
     ensure!(
         !paths.is_empty() && paths.len() <= 128,
@@ -69,6 +69,9 @@ pub(crate) fn validate_send_paths(paths: &[std::path::PathBuf]) -> Result<()> {
     );
     for path in paths {
         ensure!(path.is_absolute(), "file paths must be absolute");
+        if crate::storage::Folder::read(path).is_ok() {
+            continue;
+        }
         let file = crate::storage::open_regular_file(path)?;
         ensure!(
             file.metadata()?.len() <= crate::outbox::PEER_BYTES.min(pneu_proto::MAX_FILE_SIZE),
@@ -116,8 +119,9 @@ pub async fn share_activation(paths: &crate::Paths) -> Result<bool> {
         let mut files = Vec::new();
         for item in items {
             ensure!(
-                item.IsOfType(StorageItemTypes::File)?,
-                "folders cannot be sent; choose regular files"
+                item.IsOfType(StorageItemTypes::File)?
+                    || item.IsOfType(StorageItemTypes::Folder)?,
+                "choose files or folders"
             );
             files.push(std::path::PathBuf::from(std::ffi::OsString::from_wide(
                 item.Path()?.as_ref(),
@@ -328,7 +332,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn share_and_drop_paths_require_bounded_absolute_regular_files() -> Result<()> {
+    fn share_and_drop_paths_accept_folders_and_bounded_absolute_files() -> Result<()> {
         let dir = crate::test_support::scratch()?;
         let file = dir.path().join("file with spaces.txt");
         std::fs::write(&file, b"native shell input")?;
@@ -340,16 +344,14 @@ mod tests {
             std::path::PathBuf::from("relative.txt"),
             std::path::PathBuf::from(r"C:drive-relative.txt"),
             std::path::PathBuf::from(r"\root-relative.txt"),
-            dir.path().to_path_buf(),
             dir.path().join("missing.txt"),
         ] {
             assert!(validate_send_paths(&[file.clone(), invalid]).is_err());
         }
-        // A file replaced by a directory between native selection and admission
-        // cannot pass this boundary either.
+        // All native entry points dispatch directories to the common capture path.
         std::fs::remove_file(&file)?;
         std::fs::create_dir(&file)?;
-        assert!(validate_send_paths(&[file]).is_err());
+        validate_send_paths(&[file, dir.path().to_path_buf()])?;
         Ok(())
     }
 

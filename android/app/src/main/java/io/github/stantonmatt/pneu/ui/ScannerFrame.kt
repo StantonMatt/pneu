@@ -34,13 +34,14 @@ internal fun scannerPlacement(width:Int,height:Int,instructionHeight:Int,density
     return ScannerPlacement(frame,top,gap)
 }
 
-@Composable fun ScannerFrame(busy:Boolean,success:Boolean,instruction:String) {
+/** extra sits under the instruction; the frame shrinks before either leaves the window. */
+@Composable fun ScannerFrame(busy:Boolean,success:Boolean,instruction:String,extra:(@Composable ()->Unit)?=null) {
     val animate=LocalPneuMotion.current
     val density=LocalDensity.current;val direction=LocalLayoutDirection.current
     val insets=WindowInsets.safeDrawing
     val left=insets.getLeft(density,direction);val right=insets.getRight(density,direction)
     val topInset=insets.getTop(density);val bottom=insets.getBottom(density)
-    val textGutter=with(density){20.dp.roundToPx()}
+    val textGutter=with(density){20.dp.roundToPx()};val extraGap=with(density){20.dp.roundToPx()}
     val scale by animateFloatAsState(if(busy).96f else 1f,tween(if(animate)PneuMotion.short else 0),label="Scanner frame")
     val fill by animateFloatAsState(if(success)1f else 0f,tween(if(animate)PneuMotion.long else 0,easing=PneuMotion.easeOut),label="Pair success")
     var frame by remember {mutableStateOf(Rect.Zero)}
@@ -73,13 +74,15 @@ internal fun scannerPlacement(width:Int,height:Int,instructionHeight:Int,density
             if(success)Symbol(R.drawable.ic_check,modifier=Modifier.size(56.dp),tint=Color.White)
         }
         Text(instruction,color=Color.White,style=PneuType.headline,textAlign=androidx.compose.ui.text.style.TextAlign.Center)
+        if(extra!=null)Box {extra()}
     }) {children,constraints->
         val width=constraints.maxWidth;val height=constraints.maxHeight
         val availableWidth=(width-left-right).coerceAtLeast(0)
         val availableHeight=(height-topInset-bottom).coerceAtLeast(0)
         // Measure wrapping/font scale before choosing the frame's size or offset.
         val instructionText=children[1].measure(Constraints(maxWidth=(availableWidth-2*textGutter).coerceAtLeast(0),maxHeight=availableHeight))
-        val placement=scannerPlacement(availableWidth,availableHeight,instructionText.height,density.density)
+        val below=children.getOrNull(2)?.measure(Constraints(maxWidth=(availableWidth-2*textGutter).coerceAtLeast(0),maxHeight=availableHeight))
+        val placement=scannerPlacement(availableWidth,availableHeight,instructionText.height+(below?.let {extraGap+it.height} ?: 0),density.density)
         val cut=placement.frameSize
         val x=left+(availableWidth-cut)/2;val y=topInset+placement.top
         frame=Rect(x.toFloat(),y.toFloat(),(x+cut).toFloat(),(y+cut).toFloat())
@@ -87,6 +90,7 @@ internal fun scannerPlacement(width:Int,height:Int,instructionHeight:Int,density
         layout(width,height) {
             indicator.place(x,y)
             instructionText.place(left+(availableWidth-instructionText.width)/2,y+cut+placement.gap)
+            below?.place(left+(availableWidth-below.width)/2,y+cut+placement.gap+instructionText.height+extraGap)
         }
     }
 }

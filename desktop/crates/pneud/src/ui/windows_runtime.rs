@@ -42,10 +42,25 @@ pub async fn run(
     let mut last_request = 0;
     let mut last_blocked = None;
     let mut jobs = tokio::task::JoinSet::new();
+    if interactive {
+        let (core, actions) = (core.clone(), actions.clone());
+        jobs.spawn(async move { post_joined(&core, &actions).await });
+    }
+    let mut requests = Some(super::window_setup::Requests::default());
+    let mut request_job: Option<
+        futures_util::future::BoxFuture<'static, super::window_setup::Requests>,
+    > = None;
     let mut timer = tokio::time::interval(Duration::from_secs(1));
     while !*stop.borrow() {
         let mut update_tray = true;
+        let mut sync_requests = true;
         tokio::select! {
+            state = async { request_job.as_mut().expect("link request job").await }, if request_job.is_some() => {
+                request_job = None;
+                requests = Some(state);
+                sync_requests = false;
+            },
+
             _ = stop.changed() => break,
             _ = timer.tick() => {
                 if watcher.as_ref().is_some_and(|w| w.is_finished()) {
@@ -65,9 +80,13 @@ pub async fn run(
             },
             Some(_) = jobs.join_next(), if !jobs.is_empty() => {},
             Some(command) = rx.recv() => match command {
+                Command::SetupDecision { requests, allow } => super::window_setup::decide(&core, &requests, allow).await,
                 Command::Window { .. } => core.request_window(false),
+                Command::ShowClipboardHistory => core.request_history_window(),
+                Command::CopyClipboardHistory(id) => {let core=core.clone();jobs.spawn(async move {if let Err(error)=core.copy_clipboard_history(id).await {eprintln!("pneud: clipboard copy failed: {error}");}});},
                 Command::ChooseFolder => core.request_window(true),
                 Command::AddDevice { .. } => core.request_add_device_with_activation(None),
+                Command::RemoveDevice { device, .. } => core.request_remove_window(device, None),
                 Command::Quit => core.request_shutdown(),
                 Command::OpenFolder => {
                     let folder = core.config().save_path;
@@ -80,6 +99,7 @@ pub async fn run(
                 Command::SendFiles { recipients, targeted } => {
                     if let Err(error) = core.present_send(SendRequest { id: crate::random_hex(16), paths: None, targets: recipients, clipboard: false, targeted, error: None }) { eprintln!("pneud: send unavailable: {error:#}"); }
                 }
+                Command::Ring {device,connection,action} => { if let Err(error)=core.ring_phone(device,connection,action) { eprintln!("pneud: ring unavailable: {error}"); } }
                 Command::SendClipboard(recipients) => {
                     if let Err(error) = core.present_send(SendRequest { id: crate::random_hex(16), paths: None, targets: recipients, clipboard: true, targeted: false, error: None }) { eprintln!("pneud: send unavailable: {error:#}"); }
                 }
@@ -106,9 +126,14 @@ pub async fn run(
                 Ok(event) => {
                     use super::notifications::Notice;
                     let notice = match &event {
-                        Event::Blocked { address } if last_blocked.is_none_or(|time: std::time::Instant| time.elapsed() >= Duration::from_secs(3600)) => { last_blocked = Some(std::time::Instant::now()); Some(Notice::blocked(address)) },
+                        Event::Blocked { address, .. } if last_blocked.is_none_or(|time: std::time::Instant| time.elapsed() >= Duration::from_secs(3600)) => { last_blocked = Some(std::time::Instant::now()); Some(Notice::blocked(address)) },
                         Event::ComputerPaired { name, .. } if !core.window_focused() => Some(Notice::paired(name)),
                         Event::RemoteUnpaired { name } => Some(Notice::unpaired(name)),
+                        Event::Paired { .. } => {
+                            let (core, actions) = (core.clone(), actions.clone());
+                            jobs.spawn(async move { post_joined(&core, &actions).await; });
+                            None
+                        }
                         _ => None,
                     };
                     if let Some(notice) = notice {
@@ -122,6 +147,18 @@ pub async fn run(
                     for device in core.paired_devices() { core.cancel_automatic_clipboard(&device); }
                 }
             }
+        }
+        if sync_requests
+            && interactive
+            && request_job.is_none()
+            && let Some(mut state) = requests.take()
+        {
+            let core = core.clone();
+            let actions = actions.clone();
+            request_job = Some(Box::pin(async move {
+                state.sync(&core, &actions).await;
+                state
+            }));
         }
         if let Some(child) = window.as_mut() {
             match child.try_wait() {
@@ -166,6 +203,15 @@ pub async fn run(
     }
     core.close_pairing().await;
     Ok(())
+}
+/// "{device} joined" for each device another of your devices added.
+async fn post_joined(core: &Core, actions: &DesktopActions) {
+    for joined in super::window_setup::joined(core).await {
+        let result = actions
+            .notice(joined.notice.clone(), Vec::new(), None, 0, None)
+            .await;
+        joined.posted(core, result).await;
+    }
 }
 pub(crate) fn clipboard_policy_event(core: &Core, event: &Event) {
     match event {

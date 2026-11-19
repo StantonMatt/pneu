@@ -8,6 +8,7 @@ public class Receipt {
     @NonNull public String hash="";
     @NonNull public String origin="clipboard";
     @NonNull public String state="pending";
+    @ColumnInfo(defaultValue="0") public boolean sensitive;
     public long createdAt;
     @NonNull @ColumnInfo(defaultValue="''") public String hlc="";
     @NonNull @ColumnInfo(defaultValue="''") public String sourceDevice="";

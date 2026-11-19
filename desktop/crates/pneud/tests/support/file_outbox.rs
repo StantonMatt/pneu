@@ -234,6 +234,9 @@ async fn outbox_offline_policy_and_capabilityless_legacy_phone() -> Result<()> {
 #[tokio::test]
 async fn outbox_pc_to_pc_lost_ack_replays_to_receiver_dedupe() -> Result<()> {
     let a = Harness::new().await?;
+    a.core
+        .set_setting("queue_offline".into(), true.into())
+        .await?;
     let b = Harness::new().await?;
     let uri = a
         .core
@@ -299,7 +302,7 @@ async fn outbox_pc_to_pc_lost_ack_replays_to_receiver_dedupe() -> Result<()> {
             .ui_snapshot()
             .transfers
             .iter()
-            .any(|t| t.error.as_ref().is_some_and(|e| e.contains("interrupted")))
+            .any(|t| t.error.as_ref().is_some_and(|e| e == "Connection lost"))
     })
     .await?;
     db.execute_batch("DROP TRIGGER lose_ack;")?;
@@ -347,7 +350,7 @@ async fn outbox_pc_to_pc_lost_ack_replays_to_receiver_dedupe() -> Result<()> {
             .ui_snapshot()
             .devices
             .iter()
-            .all(|d| d.state != "connected" || d.route.as_deref() == Some("Wi-Fi"))
+            .all(|d| d.state != "connected" || d.route.as_deref() == Some("Local network"))
     );
     assert_eq!(b.saved()?.len(), 1);
     assert_eq!(std::fs::read(&b.saved()?[0])?, b"PC file bytes");
@@ -439,7 +442,10 @@ async fn outbox_cli_and_ipc_validate_paths_and_persist_settings() -> Result<()> 
             targets: all(),
             request_id: None,
         },
-        pneud::ipc::Command::SendClipboard { targets: all() },
+        pneud::ipc::Command::SendClipboard {
+            targets: all(),
+            notify_too_large: false,
+        },
         #[cfg(target_os = "macos")]
         pneud::ipc::desktop_send_command(&[path.to_str().unwrap().into()]),
         #[cfg(target_os = "macos")]
@@ -542,7 +548,7 @@ async fn desktop_send_parser_errors_reach_the_cli_or_window() -> Result<()> {
     let (stop, rx) = tokio::sync::watch::channel(false);
     let ipc = tokio::spawn(pneud::ipc::serve(h.core.clone(), listener, rx));
     for (args, expected) in [
-        (vec!["send"], "send needs 1 to 128 regular files"),
+        (vec!["send"], "send needs 1 to 128 files or folders"),
         (vec!["send", "--to"], "--to needs a device ID"),
         (vec!["send", "--unknown"], "unknown send option"),
     ] {
@@ -649,7 +655,7 @@ async fn incoming_phone_progress_and_recent_are_scoped_to_each_device() -> Resul
         snapshot
             .devices
             .iter()
-            .all(|d| d.route.as_deref() == Some("Wi-Fi"))
+            .all(|d| d.route.as_deref() == Some("Local network"))
     );
     write_frame(
         &mut b,
@@ -682,13 +688,18 @@ async fn incoming_phone_progress_and_recent_are_scoped_to_each_device() -> Resul
     assert_eq!(std::fs::read(received.path.unwrap())?, bytes);
     drop(a);
     drop(b);
-    until(|| h.core.connected_devices().is_empty()).await?;
+    // A closing socket disappears from connected_devices before its file
+    // worker finishes and ConnectionChanged clears unfinished UI transfers.
+    until(|| h.core.connected_devices().is_empty() && h.core.ui_snapshot().transfers.len() == 1)
+        .await?;
     let recent = h.core.ui_snapshot().transfers;
     assert_eq!(
         recent.len(),
         1,
         "disconnect removes partial progress, preserving completed Recent"
     );
+    assert_eq!(recent[0].device, q.identity.device_id);
+    assert_eq!(recent[0].state, "sent");
     h.stop().await
 }
 
@@ -733,6 +744,9 @@ async fn outbox_text_lane_and_receipts_do_not_wait_for_file_ack() -> Result<()> 
 #[tokio::test]
 async fn outbox_transient_disconnect_recovery_retries_and_reconnect_replays() -> Result<()> {
     let h = Harness::new().await?;
+    h.core
+        .set_setting("queue_offline".into(), true.into())
+        .await?;
     let phone = h.phone("phone")?;
     let mut link = receiver(&h, &phone).await?;
     let reply = h.core.send_files(vec![source(&h)?], target(&phone)).await?;

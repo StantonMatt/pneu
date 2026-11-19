@@ -1,0 +1,3709 @@
+{
+  "format": "pneu-readmission-sequence-snippet-v1",
+  "note": "Shared declarative test inputs, not a new wire format or an executable test runner. Only payload objects are MEMBERS JSON. Import identical fixtures and scenario assertions into Rust and Kotlin suites. Revision 2: causal readmits register, authored-only questions, inherited follow, local barrier origin and neutral silent-peer status. New local actions are declarative acceptance arrangements, not existing runner APIs.",
+  "clock_ms": 1800000000100,
+  "initial_state": {
+    "receiver": "22222222222222222222222222222222",
+    "receiver_pin": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "setup_id": "00000000000000000000000000000000",
+    "setup_generation": 7,
+    "direct_enabled_authenticated_ready_senders": [
+      "11111111111111111111111111111111",
+      "44444444444444444444444444444444"
+    ],
+    "self_member": true,
+    "subject": {
+      "device_id": "33333333333333333333333333333333",
+      "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    "subject_binding": false,
+    "receipt_history": []
+  },
+  "conventions": {
+    "each_scenario": "Reset to initial_state; steps are sequential. Extra local actions arrange state under the normal lifecycle rules. Assertions name deltas or postconditions, not wire fields.",
+    "removal_tuple": "Compare (hlc, writer_device) unsigned lexicographically. An equal tuple with a different status is malformed, not eligible stale gossip.",
+    "retire-and-rejoin": "Arrange authorized own withdrawal, then fresh mutually enabled token join through A, preserving C barrier decisions; S may be joined again but setup generation changes.",
+    "prompt_count": "One durable pending question per authored barrier and setup generation; dismiss/restart may redisplay that same coalesced question. Inherited barriers never ask.",
+    "replay_noop": "No binding generation/reset/notice/provenance changes; normal receipt or clock bookkeeping may advance on a non-retained replay.",
+    "barrier_origin": "remove-C-from-all-devices is a real committed local user action with an explicit deterministic stamp (same pin unless stamp=RP after replacement). It records authored=true; receive remove does not. Never derive origin from writer_device. Origin survives a newer removal while denied, resets on clear; missing old origin means authored.",
+    "local_clock": "For a trial containing local Remove@R, run its preceding join/setup with an injected clock below R.hlc and last_seen strictly below R.hlc; Remove uses R.hlc and allocates exactly R, then restores clock_ms. reset-to-initial-state resets clock authority too. Never rewind an observed clock. All fixture HLCs are within the future bound under these clocks; later fresh pairs use restored clock_ms.",
+    "holder_trials": "For actions that deliver an exported snapshot to independent holders, each named holder starts with S, authenticated enabled trust for the exporter and the specified exact-key R origin; keep the payload unchanged. These are separate receiver trials, not a wire attestation.",
+    "claim": "Assertions readmits/retained_claim are the exact-key register, or null if absent. Superseded removal metadata is retained as high-water. Removing a key drops its claim, including before later stale claims arrive.",
+    "invalid_readmits_entries": "Embed each raw_entry in an otherwise valid snapshot with the authenticated sender self member and a fresh transfer ID. Also test as the matching authenticated sender row where flagged: ignored claims still require full validation."
+  },
+  "fixtures": {
+    "join": {
+      "authenticated_sender": "11111111111111111111111111111111",
+      "payload": {
+        "transfer_id": "00000000000000000000000000000101",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "member",
+            "hlc": 1800000000003,
+            "writer_device": "11111111111111111111111111111111",
+            "reach": {
+              "addresses": [
+                "192.168.1.12:47821"
+              ],
+              "relay": [],
+              "hlc": 1800000000004,
+              "writer_device": "33333333333333333333333333333333"
+            }
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "remove": {
+      "authenticated_sender": "11111111111111111111111111111111",
+      "payload": {
+        "transfer_id": "00000000000000000000000000000102",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "removed",
+            "hlc": 1800000000010,
+            "writer_device": "22222222222222222222222222222222"
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "readmission-from-D": {
+      "authenticated_sender": "44444444444444444444444444444444",
+      "payload": {
+        "transfer_id": "00000000000000000000000000000104",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop renamed",
+            "status": "member",
+            "hlc": 1800000000021,
+            "writer_device": "44444444444444444444444444444444",
+            "reach": {
+              "addresses": [
+                "192.168.1.12:47821"
+              ],
+              "relay": [],
+              "hlc": 1800000000004,
+              "writer_device": "33333333333333333333333333333333"
+            },
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            }
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "later-from-A": {
+      "authenticated_sender": "11111111111111111111111111111111",
+      "payload": {
+        "transfer_id": "00000000000000000000000000000105",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "member",
+            "hlc": 1800000000022,
+            "writer_device": "11111111111111111111111111111111",
+            "reach": {
+              "addresses": [
+                "192.168.1.12:47821"
+              ],
+              "relay": [],
+              "hlc": 1800000000004,
+              "writer_device": "33333333333333333333333333333333"
+            },
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            }
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "remove-newer": {
+      "authenticated_sender": "11111111111111111111111111111111",
+      "payload": {
+        "transfer_id": "00000000000000000000000000000106",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "removed",
+            "hlc": 1800000000030,
+            "writer_device": "22222222222222222222222222222222"
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "member-after-newer-removal": {
+      "authenticated_sender": "44444444444444444444444444444444",
+      "payload": {
+        "transfer_id": "00000000000000000000000000000107",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "member",
+            "hlc": 1800000000040,
+            "writer_device": "44444444444444444444444444444444",
+            "reach": {
+              "addresses": [
+                "192.168.1.12:47821"
+              ],
+              "relay": [],
+              "hlc": 1800000000004,
+              "writer_device": "33333333333333333333333333333333"
+            },
+            "readmits": {
+              "hlc": 1800000000030,
+              "writer_device": "22222222222222222222222222222222"
+            }
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "stale-member": {
+      "authenticated_sender": "11111111111111111111111111111111",
+      "payload": {
+        "transfer_id": "00000000000000000000000000000108",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "member",
+            "hlc": 1800000000003,
+            "writer_device": "11111111111111111111111111111111",
+            "reach": {
+              "addresses": [
+                "192.168.1.12:47821"
+              ],
+              "relay": [],
+              "hlc": 1800000000004,
+              "writer_device": "33333333333333333333333333333333"
+            }
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "equal-hlc-lower-writer": {
+      "authenticated_sender": "11111111111111111111111111111111",
+      "payload": {
+        "transfer_id": "00000000000000000000000000000109",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "member",
+            "hlc": 1800000000010,
+            "writer_device": "11111111111111111111111111111111",
+            "reach": {
+              "addresses": [
+                "192.168.1.12:47821"
+              ],
+              "relay": [],
+              "hlc": 1800000000004,
+              "writer_device": "33333333333333333333333333333333"
+            }
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "equal-removal-tuple-conflict": {
+      "authenticated_sender": "11111111111111111111111111111111",
+      "payload": {
+        "transfer_id": "0000000000000000000000000000010a",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "member",
+            "hlc": 1800000000010,
+            "writer_device": "22222222222222222222222222222222",
+            "reach": {
+              "addresses": [
+                "192.168.1.12:47821"
+              ],
+              "relay": [],
+              "hlc": 1800000000004,
+              "writer_device": "33333333333333333333333333333333"
+            }
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "new-pin-member": {
+      "authenticated_sender": "11111111111111111111111111111111",
+      "payload": {
+        "transfer_id": "0000000000000000000000000000010b",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "member",
+            "hlc": 1800000000020,
+            "writer_device": "11111111111111111111111111111111",
+            "reach": {
+              "addresses": [
+                "192.168.1.12:47821"
+              ],
+              "relay": [],
+              "hlc": 1800000000004,
+              "writer_device": "33333333333333333333333333333333"
+            },
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            }
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "own-key-removal": {
+      "authenticated_sender": "11111111111111111111111111111111",
+      "payload": {
+        "transfer_id": "0000000000000000000000000000010c",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "removed",
+            "hlc": 1800000000010,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "member",
+            "hlc": 1800000000003,
+            "writer_device": "11111111111111111111111111111111",
+            "reach": {
+              "addresses": [
+                "192.168.1.12:47821"
+              ],
+              "relay": [],
+              "hlc": 1800000000004,
+              "writer_device": "33333333333333333333333333333333"
+            }
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "own-key-newer-member": {
+      "authenticated_sender": "11111111111111111111111111111111",
+      "payload": {
+        "transfer_id": "0000000000000000000000000000010d",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000020,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "member",
+            "hlc": 1800000000003,
+            "writer_device": "11111111111111111111111111111111",
+            "reach": {
+              "addresses": [
+                "192.168.1.12:47821"
+              ],
+              "relay": [],
+              "hlc": 1800000000004,
+              "writer_device": "33333333333333333333333333333333"
+            }
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "newer-member-from-D": {
+      "authenticated_sender": "44444444444444444444444444444444",
+      "payload": {
+        "transfer_id": "0000000000000000000000000000010e",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "member",
+            "hlc": 1800000000023,
+            "writer_device": "44444444444444444444444444444444",
+            "reach": {
+              "addresses": [
+                "192.168.1.12:47821"
+              ],
+              "relay": [],
+              "hlc": 1800000000004,
+              "writer_device": "33333333333333333333333333333333"
+            },
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            }
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "remove-new-pin": {
+      "authenticated_sender": "11111111111111111111111111111111",
+      "payload": {
+        "transfer_id": "0000000000000000000000000000010f",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "removed",
+            "hlc": 1800000000200,
+            "writer_device": "22222222222222222222222222222222"
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "readmit-new-pin": {
+      "authenticated_sender": "11111111111111111111111111111111",
+      "payload": {
+        "transfer_id": "00000000000000000000000000000110",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "member",
+            "hlc": 1800000000210,
+            "writer_device": "11111111111111111111111111111111",
+            "reach": {
+              "addresses": [
+                "192.168.1.12:47821"
+              ],
+              "relay": [],
+              "hlc": 1800000000004,
+              "writer_device": "33333333333333333333333333333333"
+            },
+            "readmits": {
+              "hlc": 1800000000200,
+              "writer_device": "22222222222222222222222222222222"
+            }
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "later-introduction-unclaimed": {
+      "authenticated_sender": "11111111111111111111111111111111",
+      "payload": {
+        "transfer_id": "00000000000000000000000000000103",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "member",
+            "hlc": 1800000000020,
+            "writer_device": "11111111111111111111111111111111",
+            "reach": {
+              "addresses": [
+                "192.168.1.12:47821"
+              ],
+              "relay": [],
+              "hlc": 1800000000004,
+              "writer_device": "33333333333333333333333333333333"
+            }
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "later-introduction-claimed": {
+      "authenticated_sender": "11111111111111111111111111111111",
+      "payload": {
+        "transfer_id": "00000000000000000000000000000111",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "member",
+            "hlc": 1800000000020,
+            "writer_device": "11111111111111111111111111111111",
+            "reach": {
+              "addresses": [
+                "192.168.1.12:47821"
+              ],
+              "relay": [],
+              "hlc": 1800000000004,
+              "writer_device": "33333333333333333333333333333333"
+            },
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            }
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "stale-member-rename-unclaimed": {
+      "authenticated_sender": "11111111111111111111111111111111",
+      "payload": {
+        "transfer_id": "00000000000000000000000000000112",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Renamed stolen Laptop",
+            "status": "member",
+            "hlc": 1800000000022,
+            "writer_device": "33333333333333333333333333333333",
+            "reach": {
+              "addresses": [
+                "192.168.1.12:47821"
+              ],
+              "relay": [],
+              "hlc": 1800000000004,
+              "writer_device": "33333333333333333333333333333333"
+            }
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "insufficient-claim-member": {
+      "authenticated_sender": "11111111111111111111111111111111",
+      "payload": {
+        "transfer_id": "00000000000000000000000000000113",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "member",
+            "hlc": 1800000000020,
+            "writer_device": "11111111111111111111111111111111",
+            "reach": {
+              "addresses": [
+                "192.168.1.12:47821"
+              ],
+              "relay": [],
+              "hlc": 1800000000004,
+              "writer_device": "33333333333333333333333333333333"
+            },
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "11111111111111111111111111111111"
+            }
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "greater-claim-same-member": {
+      "authenticated_sender": "11111111111111111111111111111111",
+      "payload": {
+        "transfer_id": "00000000000000000000000000000114",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "member",
+            "hlc": 1800000000020,
+            "writer_device": "11111111111111111111111111111111",
+            "reach": {
+              "addresses": [
+                "192.168.1.12:47821"
+              ],
+              "relay": [],
+              "hlc": 1800000000004,
+              "writer_device": "33333333333333333333333333333333"
+            },
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "44444444444444444444444444444444"
+            }
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "equal-tuple-with-claim": {
+      "authenticated_sender": "11111111111111111111111111111111",
+      "payload": {
+        "transfer_id": "00000000000000000000000000000115",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "member",
+            "hlc": 1800000000010,
+            "writer_device": "22222222222222222222222222222222",
+            "reach": {
+              "addresses": [
+                "192.168.1.12:47821"
+              ],
+              "relay": [],
+              "hlc": 1800000000004,
+              "writer_device": "33333333333333333333333333333333"
+            },
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            }
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "claim-only-same-transfer-id": {
+      "authenticated_sender": "11111111111111111111111111111111",
+      "payload": {
+        "transfer_id": "00000000000000000000000000000103",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "member",
+            "hlc": 1800000000020,
+            "writer_device": "11111111111111111111111111111111",
+            "reach": {
+              "addresses": [
+                "192.168.1.12:47821"
+              ],
+              "relay": [],
+              "hlc": 1800000000004,
+              "writer_device": "33333333333333333333333333333333"
+            },
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            }
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "lower-claim-same-member": {
+      "authenticated_sender": "11111111111111111111111111111111",
+      "payload": {
+        "transfer_id": "00000000000000000000000000000117",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "member",
+            "hlc": 1800000000020,
+            "writer_device": "11111111111111111111111111111111",
+            "reach": {
+              "addresses": [
+                "192.168.1.12:47821"
+              ],
+              "relay": [],
+              "hlc": 1800000000004,
+              "writer_device": "33333333333333333333333333333333"
+            },
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "11111111111111111111111111111111"
+            }
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "same-member-claim-absent": {
+      "authenticated_sender": "11111111111111111111111111111111",
+      "payload": {
+        "transfer_id": "00000000000000000000000000000118",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "member",
+            "hlc": 1800000000020,
+            "writer_device": "11111111111111111111111111111111",
+            "reach": {
+              "addresses": [
+                "192.168.1.12:47821"
+              ],
+              "relay": [],
+              "hlc": 1800000000004,
+              "writer_device": "33333333333333333333333333333333"
+            }
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "remove-newest": {
+      "authenticated_sender": "11111111111111111111111111111111",
+      "payload": {
+        "transfer_id": "00000000000000000000000000000119",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "removed",
+            "hlc": 1800000000050,
+            "writer_device": "22222222222222222222222222222222"
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "renamed-self-unclaimed": {
+      "authenticated_sender": "33333333333333333333333333333333",
+      "payload": {
+        "transfer_id": "0000000000000000000000000000011a",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop renamed by itself",
+            "status": "member",
+            "hlc": 1800000000024,
+            "writer_device": "33333333333333333333333333333333",
+            "reach": {
+              "addresses": [
+                "192.168.1.12:47821"
+              ],
+              "relay": [],
+              "hlc": 1800000000004,
+              "writer_device": "33333333333333333333333333333333"
+            }
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "self-claim": {
+      "authenticated_sender": "33333333333333333333333333333333",
+      "payload": {
+        "transfer_id": "0000000000000000000000000000011b",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "member",
+            "hlc": 1800000000020,
+            "writer_device": "33333333333333333333333333333333",
+            "reach": {
+              "addresses": [
+                "192.168.1.12:47821"
+              ],
+              "relay": [],
+              "hlc": 1800000000004,
+              "writer_device": "33333333333333333333333333333333"
+            },
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            }
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "departed-keeper-removal": {
+      "authenticated_sender": "11111111111111111111111111111111",
+      "payload": {
+        "transfer_id": "0000000000000000000000000000011c",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "removed",
+            "hlc": 1800000000010,
+            "writer_device": "55555555555555555555555555555555"
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    "departed-keeper-claimed-member": {
+      "authenticated_sender": "11111111111111111111111111111111",
+      "payload": {
+        "transfer_id": "0000000000000000000000000000011d",
+        "setup_id": "00000000000000000000000000000000",
+        "members": [
+          {
+            "device_id": "11111111111111111111111111111111",
+            "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "role": "phone",
+            "name": "Phone",
+            "status": "member",
+            "hlc": 1800000000001,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "22222222222222222222222222222222",
+            "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "role": "computer",
+            "name": "Office PC",
+            "status": "member",
+            "hlc": 1800000000002,
+            "writer_device": "11111111111111111111111111111111"
+          },
+          {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "member",
+            "hlc": 1800000000020,
+            "writer_device": "11111111111111111111111111111111",
+            "reach": {
+              "addresses": [
+                "192.168.1.12:47821"
+              ],
+              "relay": [],
+              "hlc": 1800000000004,
+              "writer_device": "33333333333333333333333333333333"
+            },
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "55555555555555555555555555555555"
+            }
+          },
+          {
+            "device_id": "44444444444444444444444444444444",
+            "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "role": "computer",
+            "name": "Other PC",
+            "status": "member",
+            "hlc": 1800000000005,
+            "writer_device": "22222222222222222222222222222222"
+          }
+        ]
+      }
+    }
+  },
+  "scenarios": [
+    {
+      "name": "prompt-once-duplicate-gossip-restart",
+      "steps": [
+        {
+          "receive": "join"
+        },
+        {
+          "local_action": "remove-C-from-all-devices",
+          "stamp": {
+            "hlc": 1800000000010,
+            "writer_device": "22222222222222222222222222222222"
+          },
+          "expect": {
+            "origin": {
+              "authored": true,
+              "revoked_binding": true
+            }
+          }
+        },
+        {
+          "receive": "remove",
+          "expect": {
+            "denied": true,
+            "exported_C": "removed",
+            "binding_C": false,
+            "removal": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            }
+          }
+        },
+        {
+          "receive": "later-introduction-claimed",
+          "expect": {
+            "denied": true,
+            "exported_C": "removed",
+            "binding_C": false,
+            "removal": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "record": {
+              "decision": "pending",
+              "introducer": "11111111111111111111111111111111",
+              "value_hlc": 1800000000020
+            },
+            "joined_notices_delta": 0,
+            "ack_deduplicated": false
+          }
+        },
+        {
+          "receive": "later-introduction-claimed",
+          "expect": {
+            "ack_deduplicated": true,
+            "state_unchanged": true
+          }
+        },
+        {
+          "receive": "readmission-from-D",
+          "expect": {
+            "record": {
+              "decision": "pending",
+              "introducer": "11111111111111111111111111111111",
+              "value_hlc": 1800000000021,
+              "value_writer": "44444444444444444444444444444444",
+              "value_name": "Laptop renamed"
+            },
+            "binding_C": false,
+            "exported_C": "removed",
+            "new_question": false
+          }
+        },
+        {
+          "local_action": "dismiss"
+        },
+        {
+          "local_action": "restart",
+          "expect": {
+            "pending_questions_for_C": 1,
+            "introducer": "11111111111111111111111111111111",
+            "value_hlc": 1800000000021
+          }
+        },
+        {
+          "receive": "later-from-A",
+          "expect": {
+            "pending_questions_for_C": 1,
+            "introducer": "11111111111111111111111111111111",
+            "value_hlc": 1800000000022,
+            "roster_resend": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "member-before-previously-unseen-removal",
+      "steps": [
+        {
+          "receive": "later-introduction-unclaimed",
+          "expect": {
+            "binding_C": true,
+            "pending_questions_for_C": 0
+          }
+        },
+        {
+          "receive": "remove",
+          "expect": {
+            "denied": true,
+            "exported_C": "removed",
+            "binding_C": false,
+            "removal": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "pending_questions_for_C": 0
+          }
+        },
+        {
+          "local_action": "restart"
+        },
+        {
+          "receive": "later-introduction-unclaimed",
+          "expect": {
+            "ack_deduplicated": true,
+            "state_unchanged": true,
+            "pending_questions_for_C": 0
+          }
+        },
+        {
+          "receive": "readmission-from-D",
+          "expect": {
+            "pending_questions_for_C": 0,
+            "record": null,
+            "binding_C": true,
+            "denied": false,
+            "exported_C": "member",
+            "introducer": "44444444444444444444444444444444",
+            "value_hlc": 1800000000021,
+            "joined_notices_delta": 1,
+            "removal_high_water": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "removal-before-member",
+      "steps": [
+        {
+          "receive": "remove",
+          "expect": {
+            "denied": true,
+            "exported_C": "removed",
+            "binding_C": false,
+            "removal": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "origin": {
+              "authored": false,
+              "revoked_binding": false
+            }
+          }
+        },
+        {
+          "local_action": "restart"
+        },
+        {
+          "receive": "later-introduction-claimed",
+          "expect": {
+            "denied": false,
+            "exported_C": "member",
+            "binding_C": true,
+            "removal_high_water": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "record": null,
+            "pending_questions_for_C": 0,
+            "joined_notices_delta": 1,
+            "introducer": "11111111111111111111111111111111"
+          }
+        }
+      ]
+    },
+    {
+      "name": "stale-members-never-prompt",
+      "steps": [
+        {
+          "receive": "remove"
+        },
+        {
+          "receive": "stale-member",
+          "expect": {
+            "pending_questions_for_C": 0,
+            "binding_C": false
+          }
+        },
+        {
+          "receive": "equal-hlc-lower-writer",
+          "expect": {
+            "pending_questions_for_C": 0,
+            "binding_C": false
+          }
+        },
+        {
+          "receive": "stale-member-rename-unclaimed",
+          "expect": {
+            "pending_questions_for_C": 0,
+            "record": null,
+            "binding_C": false,
+            "exported_C": "removed"
+          }
+        },
+        {
+          "receive": "equal-removal-tuple-conflict",
+          "expect": {
+            "error": "malformed_message",
+            "state_unchanged": true,
+            "pending_questions_for_C": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "allow-installs-once-replays-noop",
+      "steps": [
+        {
+          "receive": "join"
+        },
+        {
+          "local_action": "remove-C-from-all-devices",
+          "stamp": {
+            "hlc": 1800000000010,
+            "writer_device": "22222222222222222222222222222222"
+          },
+          "expect": {
+            "origin": {
+              "authored": true,
+              "revoked_binding": true
+            }
+          }
+        },
+        {
+          "receive": "remove"
+        },
+        {
+          "receive": "later-introduction-claimed"
+        },
+        {
+          "receive": "readmission-from-D"
+        },
+        {
+          "local_action": "allow-C",
+          "expect": {
+            "denied": false,
+            "removal_high_water": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "exported_C": "member",
+            "binding_C": true,
+            "record_decision": "allowed",
+            "value_hlc": 1800000000021,
+            "value_writer": "44444444444444444444444444444444",
+            "introducer": "11111111111111111111111111111111",
+            "binding_generation_delta": 1,
+            "scope": "enabled",
+            "readiness": 0,
+            "hello_seen": false,
+            "settings_bootstrap": "defaults",
+            "joined_notices_delta": 0,
+            "roster_resend": true,
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            }
+          }
+        },
+        {
+          "local_action": "allow-C-again",
+          "expect": {
+            "state_unchanged": true
+          }
+        },
+        {
+          "receive": "remove",
+          "expect": {
+            "ack_deduplicated": true,
+            "state_unchanged": true
+          }
+        },
+        {
+          "local_action": "evict-membership-receipts"
+        },
+        {
+          "receive": "remove",
+          "expect": {
+            "ack_deduplicated": false,
+            "denied": false,
+            "binding_generation_delta": 0
+          }
+        },
+        {
+          "receive": "readmission-from-D",
+          "expect": {
+            "binding_generation_delta": 0,
+            "settings_reset": false,
+            "joined_notices_delta": 0
+          }
+        },
+        {
+          "local_action": "restart",
+          "expect": {
+            "record_decision": "allowed",
+            "binding_C": true
+          }
+        },
+        {
+          "receive": "remove-newer",
+          "expect": {
+            "denied": true,
+            "removal": {
+              "hlc": 1800000000030,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "binding_C": false,
+            "record": null,
+            "readmits": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "keep-removed-no-reask-until-new-barrier",
+      "steps": [
+        {
+          "receive": "join"
+        },
+        {
+          "local_action": "remove-C-from-all-devices",
+          "stamp": {
+            "hlc": 1800000000010,
+            "writer_device": "22222222222222222222222222222222"
+          },
+          "expect": {
+            "origin": {
+              "authored": true,
+              "revoked_binding": true
+            }
+          }
+        },
+        {
+          "receive": "remove"
+        },
+        {
+          "receive": "later-introduction-claimed"
+        },
+        {
+          "local_action": "keep-removed-C",
+          "expect": {
+            "denied": true,
+            "exported_C": "removed",
+            "binding_C": false,
+            "removal": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "record_decision": "kept",
+            "authored_values_delta": 0,
+            "roster_resend": false
+          }
+        },
+        {
+          "local_action": "restart"
+        },
+        {
+          "receive": "readmission-from-D",
+          "expect": {
+            "pending_questions_for_C": 0,
+            "record_decision": "kept"
+          }
+        },
+        {
+          "receive": "later-from-A",
+          "expect": {
+            "pending_questions_for_C": 0
+          }
+        },
+        {
+          "receive": "newer-member-from-D",
+          "expect": {
+            "pending_questions_for_C": 0
+          }
+        },
+        {
+          "receive": "remove-newer",
+          "expect": {
+            "record": null,
+            "removal": {
+              "hlc": 1800000000030,
+              "writer_device": "22222222222222222222222222222222"
+            }
+          }
+        },
+        {
+          "receive": "member-after-newer-removal",
+          "expect": {
+            "pending_questions_for_C": 1,
+            "introducer": "44444444444444444444444444444444",
+            "record_barrier": {
+              "hlc": 1800000000030,
+              "writer_device": "22222222222222222222222222222222"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "decisions-survive-retirement",
+      "steps": [
+        {
+          "receive": "join"
+        },
+        {
+          "local_action": "remove-C-from-all-devices",
+          "stamp": {
+            "hlc": 1800000000010,
+            "writer_device": "22222222222222222222222222222222"
+          },
+          "expect": {
+            "origin": {
+              "authored": true,
+              "revoked_binding": true
+            }
+          }
+        },
+        {
+          "receive": "remove"
+        },
+        {
+          "receive": "later-introduction-claimed"
+        },
+        {
+          "local_action": "keep-removed-C"
+        },
+        {
+          "local_action": "retire-and-rejoin-S-via-A",
+          "expect": {
+            "record_decision": "kept",
+            "denied": true,
+            "setup_generation_advanced": true,
+            "retired_roster_exported": false
+          }
+        },
+        {
+          "receive": "newer-member-from-D",
+          "expect": {
+            "pending_questions_for_C": 0,
+            "record_decision": "kept"
+          }
+        }
+      ]
+    },
+    {
+      "name": "pending-generation-fenced",
+      "steps": [
+        {
+          "receive": "join"
+        },
+        {
+          "local_action": "remove-C-from-all-devices",
+          "stamp": {
+            "hlc": 1800000000010,
+            "writer_device": "22222222222222222222222222222222"
+          },
+          "expect": {
+            "origin": {
+              "authored": true,
+              "revoked_binding": true
+            }
+          }
+        },
+        {
+          "receive": "remove"
+        },
+        {
+          "receive": "later-introduction-claimed"
+        },
+        {
+          "local_action": "capture-allow-notification"
+        },
+        {
+          "local_action": "retire-and-rejoin-S-via-A",
+          "expect": {
+            "pending_record_discarded": true,
+            "setup_generation_advanced": true
+          }
+        },
+        {
+          "local_action": "invoke-captured-allow",
+          "expect": {
+            "state_unchanged": true,
+            "binding_C": false
+          }
+        },
+        {
+          "receive": "readmission-from-D",
+          "expect": {
+            "pending_questions_for_C": 1,
+            "introducer": "44444444444444444444444444444444"
+          }
+        }
+      ]
+    },
+    {
+      "name": "fresh-local-pair-drops-record",
+      "steps": [
+        {
+          "receive": "join"
+        },
+        {
+          "local_action": "remove-C-from-all-devices",
+          "stamp": {
+            "hlc": 1800000000010,
+            "writer_device": "22222222222222222222222222222222"
+          },
+          "expect": {
+            "origin": {
+              "authored": true,
+              "revoked_binding": true
+            }
+          }
+        },
+        {
+          "receive": "remove"
+        },
+        {
+          "receive": "later-introduction-claimed"
+        },
+        {
+          "local_action": "keep-removed-C"
+        },
+        {
+          "local_action": "fresh-token-pair-C-with-enabled-scope",
+          "expect": {
+            "record": null,
+            "denied": false,
+            "removal_high_water": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "new_member_tuple_greater_than": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            }
+          }
+        },
+        {
+          "local_action": "evict-membership-receipts"
+        },
+        {
+          "receive": "remove",
+          "expect": {
+            "denied": false,
+            "binding_C": true
+          }
+        }
+      ]
+    },
+    {
+      "name": "fresh-pair-cannot-suppress-unseen-removal",
+      "steps": [
+        {
+          "local_action": "fresh-token-pair-C-with-enabled-scope",
+          "expect": {
+            "member_hlc": 1800000000100,
+            "removal_high_water": null,
+            "readmits": null
+          }
+        },
+        {
+          "receive": "remove",
+          "expect": {
+            "denied": true,
+            "exported_C": "removed",
+            "binding_C": false,
+            "removal": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "pending_questions_for_C": 0
+          }
+        },
+        {
+          "receive": "readmission-from-D",
+          "expect": {
+            "pending_questions_for_C": 0,
+            "binding_C": true,
+            "denied": false,
+            "removal_high_water": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "joined_notices_delta": 1
+          }
+        }
+      ]
+    },
+    {
+      "name": "new-pin-guard",
+      "steps": [
+        {
+          "receive": "remove"
+        },
+        {
+          "receive": "new-pin-member",
+          "expect": {
+            "binding_C": false,
+            "pending_questions_for_C": 0,
+            "old_pin_denied": true,
+            "diagnostic": "Laptop has a different certificate · Pair with it directly",
+            "dial_C": false
+          }
+        },
+        {
+          "local_action": "restart"
+        },
+        {
+          "local_action": "evict-membership-receipts"
+        },
+        {
+          "receive": "new-pin-member",
+          "expect": {
+            "binding_C": false,
+            "pending_questions_for_C": 0,
+            "old_pin_denied": true
+          }
+        },
+        {
+          "local_action": "fresh-token-pair-C-new-pin-with-enabled-scope",
+          "expect": {
+            "binding_C_pin": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "old_pin_barrier_retained": true
+          }
+        }
+      ]
+    },
+    {
+      "name": "exact-key-allow-after-certificate-replacement",
+      "steps": [
+        {
+          "receive": "join"
+        },
+        {
+          "local_action": "fresh-token-pair-C-new-pin-with-enabled-scope",
+          "expect": {
+            "binding_C_pin": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "old_pin_denied": true,
+            "old_pin_barrier_retained": true
+          }
+        },
+        {
+          "local_action": "remove-C-from-all-devices",
+          "stamp": {
+            "hlc": 1800000000200,
+            "writer_device": "22222222222222222222222222222222"
+          },
+          "expect": {
+            "origin": {
+              "authored": true,
+              "revoked_binding": true
+            }
+          }
+        },
+        {
+          "receive": "remove-new-pin",
+          "expect": {
+            "binding_C": false,
+            "old_pin_denied": true,
+            "new_pin_denied": true,
+            "pending_questions_for_C": 0
+          }
+        },
+        {
+          "receive": "readmit-new-pin",
+          "expect": {
+            "binding_C": false,
+            "old_pin_denied": true,
+            "new_pin_denied": true,
+            "pending_questions_for_C": 1,
+            "introducer": "11111111111111111111111111111111",
+            "record_barrier": {
+              "hlc": 1800000000200,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "value_hlc": 1800000000210
+          }
+        },
+        {
+          "local_action": "restart",
+          "expect": {
+            "pending_questions_for_C": 1,
+            "old_pin_denied": true,
+            "new_pin_denied": true
+          }
+        },
+        {
+          "local_action": "allow-C",
+          "expect": {
+            "binding_C_pin": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "old_pin_denied": true,
+            "old_pin_barrier_retained": true,
+            "new_pin_denied": false,
+            "removal_high_water": {
+              "hlc": 1800000000200,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "record_decision": "allowed",
+            "value_hlc": 1800000000210,
+            "value_writer": "11111111111111111111111111111111",
+            "binding_generation_delta": 1,
+            "scope": "enabled",
+            "joined_notices_delta": 0
+          }
+        },
+        {
+          "local_action": "evict-membership-receipts"
+        },
+        {
+          "receive": "remove-new-pin",
+          "expect": {
+            "binding_C_pin": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "old_pin_denied": true,
+            "new_pin_denied": false,
+            "binding_generation_delta": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "own-key-never-prompts",
+      "steps": [
+        {
+          "receive": "own-key-removal",
+          "expect": {
+            "withdrawn": true,
+            "setup_id": null,
+            "own_readmission_record": null
+          }
+        },
+        {
+          "receive": "own-key-newer-member",
+          "expect": {
+            "nack_code": "unsupported_kind",
+            "own_readmission_record": null
+          }
+        },
+        {
+          "local_action": "fresh-token-rejoin-via-A",
+          "expect": {
+            "own_deny_cleared": true,
+            "own_removal_high_water": {
+              "hlc": 1800000000010,
+              "writer_device": "11111111111111111111111111111111"
+            }
+          }
+        },
+        {
+          "receive": "own-key-newer-member",
+          "expect": {
+            "own_readmission_record": null,
+            "local_identity_unchanged": true,
+            "pending_questions_for_own_key": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "newer-removal-fences-old-allow",
+      "steps": [
+        {
+          "receive": "join"
+        },
+        {
+          "local_action": "remove-C-from-all-devices",
+          "stamp": {
+            "hlc": 1800000000010,
+            "writer_device": "22222222222222222222222222222222"
+          },
+          "expect": {
+            "origin": {
+              "authored": true,
+              "revoked_binding": true
+            }
+          }
+        },
+        {
+          "receive": "remove"
+        },
+        {
+          "receive": "later-introduction-claimed"
+        },
+        {
+          "local_action": "capture-allow-notification"
+        },
+        {
+          "receive": "remove-newer",
+          "expect": {
+            "record": null
+          }
+        },
+        {
+          "local_action": "invoke-captured-allow",
+          "expect": {
+            "denied": true,
+            "binding_C": false,
+            "removal": {
+              "hlc": 1800000000030,
+              "writer_device": "22222222222222222222222222222222"
+            }
+          }
+        },
+        {
+          "receive": "member-after-newer-removal",
+          "expect": {
+            "pending_questions_for_C": 1
+          }
+        }
+      ]
+    },
+    {
+      "name": "capacity-and-attempt-commit-guards",
+      "steps": [
+        {
+          "receive": "join"
+        },
+        {
+          "local_action": "remove-C-from-all-devices",
+          "stamp": {
+            "hlc": 1800000000010,
+            "writer_device": "22222222222222222222222222222222"
+          },
+          "expect": {
+            "origin": {
+              "authored": true,
+              "revoked_binding": true
+            }
+          }
+        },
+        {
+          "receive": "remove"
+        },
+        {
+          "receive": "later-introduction-claimed"
+        },
+        {
+          "local_action": "fill-active-roster-to-17"
+        },
+        {
+          "local_action": "allow-C",
+          "expect": {
+            "visible_error": "setup_capacity",
+            "denied": true,
+            "record_decision": "pending",
+            "binding_C": false
+          }
+        },
+        {
+          "local_action": "free-active-slot-and-start-direct-attempt-targeting-C-pin"
+        },
+        {
+          "local_action": "allow-C",
+          "expect": {
+            "deferred": true,
+            "denied": true,
+            "record_decision": "pending",
+            "binding_C": false
+          }
+        },
+        {
+          "local_action": "cancel-attempt-and-retry-allow-C",
+          "expect": {
+            "denied": false,
+            "binding_C": true,
+            "binding_generation_delta": 1,
+            "joined_notices_delta": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "claimed-member-at-own-barrier",
+      "steps": [
+        {
+          "receive": "join"
+        },
+        {
+          "local_action": "remove-C-from-all-devices",
+          "stamp": {
+            "hlc": 1800000000010,
+            "writer_device": "22222222222222222222222222222222"
+          },
+          "expect": {
+            "origin": {
+              "authored": true,
+              "revoked_binding": true
+            }
+          }
+        },
+        {
+          "receive": "later-introduction-claimed",
+          "expect": {
+            "denied": true,
+            "binding_C": false,
+            "pending_questions_for_C": 1,
+            "introducer": "11111111111111111111111111111111",
+            "record_barrier": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "joined_notices_delta": 0
+          }
+        },
+        {
+          "local_action": "keep-removed-C",
+          "expect": {
+            "record_decision": "kept",
+            "authored_values_delta": 0,
+            "roster_resend": false
+          }
+        },
+        {
+          "receive": "readmission-from-D",
+          "expect": {
+            "pending_questions_for_C": 0,
+            "record_decision": "kept",
+            "binding_C": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "claimed-member-at-inherited-barrier",
+      "steps": [
+        {
+          "receive": "remove",
+          "expect": {
+            "denied": true,
+            "binding_C": false,
+            "exported_C": "removed",
+            "pending_questions_for_C": 0,
+            "record": null,
+            "origin": {
+              "authored": false,
+              "revoked_binding": false
+            }
+          }
+        },
+        {
+          "local_action": "restart"
+        },
+        {
+          "receive": "readmission-from-D",
+          "expect": {
+            "denied": false,
+            "binding_C": true,
+            "exported_C": "member",
+            "pending_questions_for_C": 0,
+            "record": null,
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "removal_high_water": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "binding_generation_delta": 1,
+            "scope": "enabled",
+            "readiness": 0,
+            "hello_seen": false,
+            "settings_bootstrap": "defaults",
+            "joined_notices_delta": 1,
+            "introducer": "44444444444444444444444444444444"
+          }
+        },
+        {
+          "receive": "readmission-from-D",
+          "expect": {
+            "ack_deduplicated": true,
+            "state_unchanged": true
+          }
+        },
+        {
+          "local_action": "evict-membership-receipts"
+        },
+        {
+          "receive": "readmission-from-D",
+          "expect": {
+            "binding_generation_delta": 0,
+            "settings_reset": false,
+            "joined_notices_delta": 0
+          }
+        },
+        {
+          "local_action": "restart",
+          "expect": {
+            "binding_C": true,
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "pending_questions_for_C": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "unclaimed-newer-member-never-prompts",
+      "steps": [
+        {
+          "receive": "join"
+        },
+        {
+          "local_action": "remove-C-from-all-devices",
+          "stamp": {
+            "hlc": 1800000000010,
+            "writer_device": "22222222222222222222222222222222"
+          },
+          "expect": {
+            "origin": {
+              "authored": true,
+              "revoked_binding": true
+            }
+          }
+        },
+        {
+          "receive": "remove"
+        },
+        {
+          "receive": "later-introduction-unclaimed",
+          "expect": {
+            "denied": true,
+            "binding_C": false,
+            "exported_C": "removed",
+            "pending_questions_for_C": 0,
+            "record": null,
+            "roster_resend": false
+          }
+        },
+        {
+          "receive": "stale-member-rename-unclaimed",
+          "expect": {
+            "denied": true,
+            "binding_C": false,
+            "exported_C": "removed",
+            "pending_questions_for_C": 0,
+            "record": null,
+            "roster_resend": false
+          }
+        },
+        {
+          "local_action": "restart",
+          "expect": {
+            "denied": true,
+            "binding_C": false,
+            "exported_C": "removed",
+            "pending_questions_for_C": 0,
+            "record": null
+          }
+        },
+        {
+          "receive": "later-introduction-claimed",
+          "expect": {
+            "pending_questions_for_C": 1,
+            "binding_C": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "removal-after-claimed-member",
+      "steps": [
+        {
+          "receive": "join"
+        },
+        {
+          "receive": "later-introduction-claimed",
+          "expect": {
+            "binding_C": true,
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "binding_generation_delta": 0
+          }
+        },
+        {
+          "local_action": "authenticate-C-ready",
+          "expect": {
+            "readiness": 1,
+            "hello_seen": true
+          }
+        },
+        {
+          "receive": "remove",
+          "expect": {
+            "binding_C": true,
+            "denied": false,
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "removal_high_water": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "binding_generation_delta": 0,
+            "readiness": 1,
+            "joined_notices_delta": 0,
+            "pending_questions_for_C": 0
+          }
+        },
+        {
+          "local_action": "restart",
+          "expect": {
+            "binding_C": true,
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            }
+          }
+        },
+        {
+          "receive": "remove-newer",
+          "expect": {
+            "denied": true,
+            "binding_C": false,
+            "exported_C": "removed",
+            "pending_questions_for_C": 0,
+            "record": null,
+            "readmits": null,
+            "removal": {
+              "hlc": 1800000000030,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "origin": {
+              "authored": false,
+              "revoked_binding": true
+            }
+          }
+        },
+        {
+          "local_action": "evict-membership-receipts"
+        },
+        {
+          "receive": "later-introduction-claimed",
+          "expect": {
+            "denied": true,
+            "binding_C": false,
+            "exported_C": "removed",
+            "pending_questions_for_C": 0,
+            "record": null,
+            "removal": {
+              "hlc": 1800000000030,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "retained_claim": null
+          }
+        },
+        {
+          "receive": "member-after-newer-removal",
+          "expect": {
+            "denied": false,
+            "binding_C": true,
+            "exported_C": "member",
+            "pending_questions_for_C": 0,
+            "record": null,
+            "readmits": {
+              "hlc": 1800000000030,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "removal_high_water": {
+              "hlc": 1800000000030,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "binding_generation_delta": 1,
+            "scope": "enabled",
+            "readiness": 0,
+            "hello_seen": false,
+            "settings_bootstrap": "defaults",
+            "joined_notices_delta": 1,
+            "introducer": "44444444444444444444444444444444"
+          }
+        }
+      ]
+    },
+    {
+      "name": "self-claim-stripped",
+      "steps": [
+        {
+          "receive": "join"
+        },
+        {
+          "local_action": "authenticate-C-ready"
+        },
+        {
+          "receive": "self-claim",
+          "expect": {
+            "binding_C": true,
+            "readmits": null,
+            "pending_questions_for_C": 0
+          }
+        },
+        {
+          "receive": "remove",
+          "expect": {
+            "denied": true,
+            "binding_C": false,
+            "exported_C": "removed",
+            "pending_questions_for_C": 0,
+            "record": null,
+            "readmits": null,
+            "origin": {
+              "authored": false,
+              "revoked_binding": true
+            }
+          }
+        },
+        {
+          "receive": "readmission-from-D",
+          "expect": {
+            "denied": false,
+            "binding_C": true,
+            "exported_C": "member",
+            "pending_questions_for_C": 0,
+            "record": null,
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "removal_high_water": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "binding_generation_delta": 1,
+            "scope": "enabled",
+            "readiness": 0,
+            "hello_seen": false,
+            "settings_bootstrap": "defaults",
+            "joined_notices_delta": 1,
+            "introducer": "44444444444444444444444444444444"
+          }
+        }
+      ]
+    },
+    {
+      "name": "fresh-pair-mints-claim",
+      "steps": [
+        {
+          "receive": "join"
+        },
+        {
+          "local_action": "remove-C-from-all-devices",
+          "stamp": {
+            "hlc": 1800000000010,
+            "writer_device": "22222222222222222222222222222222"
+          },
+          "expect": {
+            "origin": {
+              "authored": true,
+              "revoked_binding": true
+            }
+          }
+        },
+        {
+          "local_action": "fresh-token-pair-C-with-enabled-scope",
+          "expect": {
+            "denied": false,
+            "record": null,
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "removal_high_water": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "new_member_tuple_greater_than": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            }
+          }
+        },
+        {
+          "local_action": "deliver-exported-snapshot-to-independent-holders",
+          "holders": [
+            {
+              "origin": {
+                "authored": false,
+                "revoked_binding": false
+              },
+              "removal": {
+                "hlc": 1800000000010,
+                "writer_device": "22222222222222222222222222222222"
+              },
+              "device_id": "44444444444444444444444444444444"
+            },
+            {
+              "origin": {
+                "authored": true,
+                "revoked_binding": true
+              },
+              "removal": {
+                "hlc": 1800000000010,
+                "writer_device": "22222222222222222222222222222222"
+              },
+              "device_id": "11111111111111111111111111111111",
+              "previous_local_removal": {
+                "hlc": 1800000000006,
+                "writer_device": "11111111111111111111111111111111"
+              },
+              "origin_reason": "Locally removed at the earlier tuple, then learned R while still denied; authored remains true."
+            }
+          ],
+          "expect": {
+            "inherited_holder": {
+              "binding_C": true,
+              "pending_questions_for_C": 0,
+              "joined_notices_delta": 1
+            },
+            "authored_holder": {
+              "binding_C": false,
+              "pending_questions_for_C": 1
+            }
+          }
+        },
+        {
+          "local_action": "evict-membership-receipts"
+        },
+        {
+          "receive": "remove",
+          "expect": {
+            "binding_C": true,
+            "denied": false,
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            }
+          }
+        },
+        {
+          "local_action": "fresh-token-pair-C-with-enabled-scope",
+          "expect": {
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "removal_high_water": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "record": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "authored-vs-revoked-binding",
+      "steps": [
+        {
+          "receive": "join"
+        },
+        {
+          "local_action": "remove-C-from-all-devices",
+          "stamp": {
+            "hlc": 1800000000010,
+            "writer_device": "22222222222222222222222222222222"
+          },
+          "expect": {
+            "origin": {
+              "authored": true,
+              "revoked_binding": true
+            }
+          }
+        },
+        {
+          "receive": "later-introduction-claimed",
+          "expect": {
+            "pending_questions_for_C": 1,
+            "binding_C": false
+          }
+        },
+        {
+          "local_action": "reset-to-initial-state"
+        },
+        {
+          "receive": "join"
+        },
+        {
+          "receive": "remove",
+          "expect": {
+            "origin": {
+              "authored": false,
+              "revoked_binding": true
+            }
+          }
+        },
+        {
+          "receive": "later-introduction-claimed",
+          "expect": {
+            "denied": false,
+            "binding_C": true,
+            "exported_C": "member",
+            "pending_questions_for_C": 0,
+            "record": null,
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "removal_high_water": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "binding_generation_delta": 1,
+            "scope": "enabled",
+            "readiness": 0,
+            "hello_seen": false,
+            "settings_bootstrap": "defaults",
+            "joined_notices_delta": 1
+          }
+        },
+        {
+          "local_action": "reset-to-initial-state"
+        },
+        {
+          "receive": "remove",
+          "expect": {
+            "origin": {
+              "authored": false,
+              "revoked_binding": false
+            }
+          }
+        },
+        {
+          "receive": "later-introduction-claimed",
+          "expect": {
+            "denied": false,
+            "binding_C": true,
+            "exported_C": "member",
+            "pending_questions_for_C": 0,
+            "record": null,
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "removal_high_water": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "binding_generation_delta": 1,
+            "scope": "enabled",
+            "readiness": 0,
+            "hello_seen": false,
+            "settings_bootstrap": "defaults",
+            "joined_notices_delta": 1
+          }
+        }
+      ]
+    },
+    {
+      "name": "claim-across-renames",
+      "steps": [
+        {
+          "receive": "later-introduction-claimed",
+          "expect": {
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "binding_C": true
+          }
+        },
+        {
+          "local_action": "authenticate-C-ready"
+        },
+        {
+          "receive": "renamed-self-unclaimed",
+          "expect": {
+            "value_name": "Laptop renamed by itself",
+            "value_writer": "33333333333333333333333333333333",
+            "value_hlc": 1800000000024,
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "binding_generation_delta": 0,
+            "settings_reset": false
+          }
+        },
+        {
+          "receive": "remove",
+          "expect": {
+            "binding_C": true,
+            "denied": false,
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "removal_high_water": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "readiness": 1,
+            "pending_questions_for_C": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "departed-keeper-removal-first",
+      "steps": [
+        {
+          "local_action": "arrange-departed-keeper-and-fresh-repairer",
+          "keeper": {
+            "origin": {
+              "authored": true,
+              "revoked_binding": true
+            },
+            "decision": "kept",
+            "removal": {
+              "hlc": 1800000000010,
+              "writer_device": "55555555555555555555555555555555"
+            },
+            "online": false,
+            "device_id": "55555555555555555555555555555555"
+          },
+          "repairer": {
+            "device_id": "11111111111111111111111111111111",
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "55555555555555555555555555555555"
+            }
+          }
+        },
+        {
+          "receive": "departed-keeper-removal",
+          "expect": {
+            "denied": true,
+            "binding_C": false,
+            "exported_C": "removed",
+            "pending_questions_for_C": 0,
+            "record": null
+          }
+        },
+        {
+          "receive": "departed-keeper-claimed-member",
+          "expect": {
+            "denied": false,
+            "binding_C": true,
+            "exported_C": "member",
+            "pending_questions_for_C": 0,
+            "record": null,
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "55555555555555555555555555555555"
+            },
+            "removal_high_water": {
+              "hlc": 1800000000010,
+              "writer_device": "55555555555555555555555555555555"
+            },
+            "binding_generation_delta": 1,
+            "scope": "enabled",
+            "readiness": 0,
+            "hello_seen": false,
+            "settings_bootstrap": "defaults",
+            "joined_notices_delta": 1
+          }
+        },
+        {
+          "local_action": "restart",
+          "expect": {
+            "binding_C": true,
+            "pending_questions_for_C": 0,
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "55555555555555555555555555555555"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "departed-keeper-member-first",
+      "steps": [
+        {
+          "local_action": "arrange-departed-keeper-and-fresh-repairer",
+          "keeper": {
+            "origin": {
+              "authored": true,
+              "revoked_binding": true
+            },
+            "decision": "kept",
+            "removal": {
+              "hlc": 1800000000010,
+              "writer_device": "55555555555555555555555555555555"
+            },
+            "online": false,
+            "device_id": "55555555555555555555555555555555"
+          },
+          "repairer": {
+            "device_id": "11111111111111111111111111111111",
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "55555555555555555555555555555555"
+            }
+          }
+        },
+        {
+          "receive": "departed-keeper-claimed-member",
+          "expect": {
+            "binding_C": true,
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "55555555555555555555555555555555"
+            },
+            "pending_questions_for_C": 0
+          }
+        },
+        {
+          "local_action": "authenticate-C-ready"
+        },
+        {
+          "receive": "departed-keeper-removal",
+          "expect": {
+            "binding_C": true,
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "55555555555555555555555555555555"
+            },
+            "removal_high_water": {
+              "hlc": 1800000000010,
+              "writer_device": "55555555555555555555555555555555"
+            },
+            "readiness": 1,
+            "pending_questions_for_C": 0
+          }
+        },
+        {
+          "local_action": "restart",
+          "expect": {
+            "binding_C": true,
+            "pending_questions_for_C": 0,
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "55555555555555555555555555555555"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "migration-origin-and-unclaimed-values",
+      "steps": [
+        {
+          "local_action": "load-legacy-barrier-without-origin",
+          "removal": {
+            "hlc": 1800000000010,
+            "writer_device": "22222222222222222222222222222222"
+          },
+          "expect": {
+            "denied": true,
+            "origin_effective_authored": true
+          }
+        },
+        {
+          "receive": "later-introduction-unclaimed",
+          "expect": {
+            "denied": true,
+            "binding_C": false,
+            "exported_C": "removed",
+            "pending_questions_for_C": 0,
+            "record": null,
+            "readmits": null
+          }
+        },
+        {
+          "local_action": "restart",
+          "expect": {
+            "origin_effective_authored": true,
+            "pending_questions_for_C": 0
+          }
+        },
+        {
+          "receive": "later-introduction-claimed",
+          "expect": {
+            "pending_questions_for_C": 1,
+            "binding_C": false
+          }
+        },
+        {
+          "local_action": "reset-to-initial-state"
+        },
+        {
+          "local_action": "load-legacy-member-without-claim",
+          "member": {
+            "device_id": "33333333333333333333333333333333",
+            "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "role": "computer",
+            "name": "Laptop",
+            "status": "member",
+            "hlc": 1800000000020,
+            "writer_device": "11111111111111111111111111111111",
+            "reach": {
+              "addresses": [
+                "192.168.1.12:47821"
+              ],
+              "relay": [],
+              "hlc": 1800000000004,
+              "writer_device": "33333333333333333333333333333333"
+            }
+          },
+          "expect": {
+            "readmits": null,
+            "binding_C": true
+          }
+        },
+        {
+          "receive": "remove",
+          "expect": {
+            "denied": true,
+            "binding_C": false,
+            "exported_C": "removed",
+            "pending_questions_for_C": 0,
+            "record": null,
+            "origin": {
+              "authored": false,
+              "revoked_binding": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "insufficient-claim-never-prompts",
+      "steps": [
+        {
+          "receive": "join"
+        },
+        {
+          "local_action": "remove-C-from-all-devices",
+          "stamp": {
+            "hlc": 1800000000010,
+            "writer_device": "22222222222222222222222222222222"
+          },
+          "expect": {
+            "origin": {
+              "authored": true,
+              "revoked_binding": true
+            }
+          }
+        },
+        {
+          "receive": "insufficient-claim-member",
+          "expect": {
+            "denied": true,
+            "binding_C": false,
+            "exported_C": "removed",
+            "pending_questions_for_C": 0,
+            "record": null
+          }
+        },
+        {
+          "receive": "equal-tuple-with-claim",
+          "expect": {
+            "error": "malformed_message",
+            "state_unchanged": true
+          }
+        },
+        {
+          "receive": "later-introduction-claimed",
+          "expect": {
+            "pending_questions_for_C": 1,
+            "binding_C": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "claim-register-and-receipt-equality",
+      "steps": [
+        {
+          "receive": "later-introduction-unclaimed",
+          "expect": {
+            "binding_C": true,
+            "readmits": null
+          }
+        },
+        {
+          "receive": "claim-only-same-transfer-id",
+          "expect": {
+            "nack_code": "id_conflict",
+            "retryable": false,
+            "state_unchanged": true
+          }
+        },
+        {
+          "receive": "later-introduction-claimed",
+          "expect": {
+            "binding_C": true,
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "binding_generation_delta": 0,
+            "membership_stamp_unchanged": true
+          }
+        },
+        {
+          "receive": "greater-claim-same-member",
+          "expect": {
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "44444444444444444444444444444444"
+            },
+            "binding_generation_delta": 0,
+            "membership_stamp_unchanged": true
+          }
+        },
+        {
+          "receive": "lower-claim-same-member",
+          "expect": {
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "44444444444444444444444444444444"
+            },
+            "binding_generation_delta": 0
+          }
+        },
+        {
+          "receive": "same-member-claim-absent",
+          "expect": {
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "44444444444444444444444444444444"
+            },
+            "binding_generation_delta": 0
+          }
+        },
+        {
+          "receive": "remove",
+          "expect": {
+            "binding_C": true,
+            "readmits": {
+              "hlc": 1800000000010,
+              "writer_device": "44444444444444444444444444444444"
+            },
+            "removal_high_water": {
+              "hlc": 1800000000010,
+              "writer_device": "22222222222222222222222222222222"
+            },
+            "pending_questions_for_C": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "origin-replays-do-not-reclassify",
+      "steps": [
+        {
+          "receive": "remove",
+          "expect": {
+            "origin": {
+              "authored": false,
+              "revoked_binding": false
+            }
+          }
+        },
+        {
+          "local_action": "restart"
+        },
+        {
+          "local_action": "evict-membership-receipts"
+        },
+        {
+          "receive": "remove",
+          "expect": {
+            "origin": {
+              "authored": false,
+              "revoked_binding": false
+            }
+          }
+        },
+        {
+          "receive": "remove-newer",
+          "expect": {
+            "origin": {
+              "authored": false,
+              "revoked_binding": false
+            }
+          }
+        },
+        {
+          "receive": "member-after-newer-removal",
+          "expect": {
+            "binding_C": true,
+            "pending_questions_for_C": 0,
+            "removal_high_water": {
+              "hlc": 1800000000030,
+              "writer_device": "22222222222222222222222222222222"
+            }
+          }
+        },
+        {
+          "local_action": "reset-to-initial-state"
+        },
+        {
+          "receive": "join"
+        },
+        {
+          "local_action": "remove-C-from-all-devices",
+          "stamp": {
+            "hlc": 1800000000010,
+            "writer_device": "22222222222222222222222222222222"
+          },
+          "expect": {
+            "origin": {
+              "authored": true,
+              "revoked_binding": true
+            }
+          }
+        },
+        {
+          "receive": "remove-newer",
+          "expect": {
+            "origin": {
+              "authored": true,
+              "revoked_binding": true
+            }
+          }
+        },
+        {
+          "receive": "member-after-newer-removal",
+          "expect": {
+            "binding_C": false,
+            "pending_questions_for_C": 1
+          }
+        },
+        {
+          "local_action": "allow-C",
+          "expect": {
+            "binding_C": true,
+            "readmits": {
+              "hlc": 1800000000030,
+              "writer_device": "22222222222222222222222222222222"
+            }
+          }
+        },
+        {
+          "receive": "remove-newest",
+          "expect": {
+            "binding_C": false,
+            "readmits": null,
+            "origin": {
+              "authored": false,
+              "revoked_binding": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "silent-keeper-neutral-status",
+      "steps": [
+        {
+          "receive": "later-introduction-claimed"
+        },
+        {
+          "local_action": "arrange-introduced-phone-keeps-B-removed-and-stays-silent"
+        },
+        {
+          "local_action": "observe-without-authenticated-refusal",
+          "expect": {
+            "remote_refusal_claimed": false,
+            "remote_keep_removed_claimed": false,
+            "status": "neutral",
+            "status_example": "Hasn't connected · Open Pneu on Phone, or pair with it directly",
+            "also_linked": false
+          }
+        },
+        {
+          "local_action": "receive-authenticated-unauthorized-from-A",
+          "expect": {
+            "diagnostic": "Phone doesn't recognize this computer · Pair with it directly",
+            "trust_A_retained": true
+          }
+        },
+        {
+          "local_action": "authenticate-A-ready",
+          "expect": {
+            "refusal_status_cleared": true
+          }
+        }
+      ]
+    }
+  ],
+  "invalid_readmits_entries": [
+    {
+      "name": "claim-null",
+      "raw_entry": "{\"device_id\":\"33333333333333333333333333333333\",\"fingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"role\":\"computer\",\"name\":\"Laptop\",\"status\":\"member\",\"hlc\":1800000000020,\"writer_device\":\"11111111111111111111111111111111\",\"reach\":{\"addresses\":[\"192.168.1.12:47821\"],\"relay\":[],\"hlc\":1800000000004,\"writer_device\":\"33333333333333333333333333333333\"},\"readmits\":null}",
+      "expect": {
+        "error": "malformed_message",
+        "state_unchanged": true
+      },
+      "also_validate_on_sender_self_row": true
+    },
+    {
+      "name": "claim-missing-hlc",
+      "raw_entry": "{\"device_id\":\"33333333333333333333333333333333\",\"fingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"role\":\"computer\",\"name\":\"Laptop\",\"status\":\"member\",\"hlc\":1800000000020,\"writer_device\":\"11111111111111111111111111111111\",\"reach\":{\"addresses\":[\"192.168.1.12:47821\"],\"relay\":[],\"hlc\":1800000000004,\"writer_device\":\"33333333333333333333333333333333\"},\"readmits\":{\"writer_device\":\"22222222222222222222222222222222\"}}",
+      "expect": {
+        "error": "malformed_message",
+        "state_unchanged": true
+      },
+      "also_validate_on_sender_self_row": true
+    },
+    {
+      "name": "claim-missing-writer",
+      "raw_entry": "{\"device_id\":\"33333333333333333333333333333333\",\"fingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"role\":\"computer\",\"name\":\"Laptop\",\"status\":\"member\",\"hlc\":1800000000020,\"writer_device\":\"11111111111111111111111111111111\",\"reach\":{\"addresses\":[\"192.168.1.12:47821\"],\"relay\":[],\"hlc\":1800000000004,\"writer_device\":\"33333333333333333333333333333333\"},\"readmits\":{\"hlc\":1800000000010}}",
+      "expect": {
+        "error": "malformed_message",
+        "state_unchanged": true
+      },
+      "also_validate_on_sender_self_row": true
+    },
+    {
+      "name": "claim-invalid-writer",
+      "raw_entry": "{\"device_id\":\"33333333333333333333333333333333\",\"fingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"role\":\"computer\",\"name\":\"Laptop\",\"status\":\"member\",\"hlc\":1800000000020,\"writer_device\":\"11111111111111111111111111111111\",\"reach\":{\"addresses\":[\"192.168.1.12:47821\"],\"relay\":[],\"hlc\":1800000000004,\"writer_device\":\"33333333333333333333333333333333\"},\"readmits\":{\"hlc\":1800000000010,\"writer_device\":\"ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ\"}}",
+      "expect": {
+        "error": "malformed_message",
+        "state_unchanged": true
+      },
+      "also_validate_on_sender_self_row": true
+    },
+    {
+      "name": "claim-negative-hlc",
+      "raw_entry": "{\"device_id\":\"33333333333333333333333333333333\",\"fingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"role\":\"computer\",\"name\":\"Laptop\",\"status\":\"member\",\"hlc\":1800000000020,\"writer_device\":\"11111111111111111111111111111111\",\"reach\":{\"addresses\":[\"192.168.1.12:47821\"],\"relay\":[],\"hlc\":1800000000004,\"writer_device\":\"33333333333333333333333333333333\"},\"readmits\":{\"hlc\":-1,\"writer_device\":\"22222222222222222222222222222222\"}}",
+      "expect": {
+        "error": "malformed_message",
+        "state_unchanged": true
+      },
+      "also_validate_on_sender_self_row": true
+    },
+    {
+      "name": "claim-fractional-hlc",
+      "raw_entry": "{\"device_id\":\"33333333333333333333333333333333\",\"fingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"role\":\"computer\",\"name\":\"Laptop\",\"status\":\"member\",\"hlc\":1800000000020,\"writer_device\":\"11111111111111111111111111111111\",\"reach\":{\"addresses\":[\"192.168.1.12:47821\"],\"relay\":[],\"hlc\":1800000000004,\"writer_device\":\"33333333333333333333333333333333\"},\"readmits\":{\"hlc\":1.5,\"writer_device\":\"22222222222222222222222222222222\"}}",
+      "expect": {
+        "error": "malformed_message",
+        "state_unchanged": true
+      },
+      "also_validate_on_sender_self_row": true
+    },
+    {
+      "name": "claim-exponent-hlc",
+      "raw_entry": "{\"device_id\":\"33333333333333333333333333333333\",\"fingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"role\":\"computer\",\"name\":\"Laptop\",\"status\":\"member\",\"hlc\":1800000000020,\"writer_device\":\"11111111111111111111111111111111\",\"reach\":{\"addresses\":[\"192.168.1.12:47821\"],\"relay\":[],\"hlc\":1800000000004,\"writer_device\":\"33333333333333333333333333333333\"},\"readmits\":{\"hlc\":1e0,\"writer_device\":\"22222222222222222222222222222222\"}}",
+      "expect": {
+        "error": "malformed_message",
+        "state_unchanged": true
+      },
+      "also_validate_on_sender_self_row": true
+    },
+    {
+      "name": "claim-duplicate-hlc",
+      "raw_entry": "{\"device_id\":\"33333333333333333333333333333333\",\"fingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"role\":\"computer\",\"name\":\"Laptop\",\"status\":\"member\",\"hlc\":1800000000020,\"writer_device\":\"11111111111111111111111111111111\",\"reach\":{\"addresses\":[\"192.168.1.12:47821\"],\"relay\":[],\"hlc\":1800000000004,\"writer_device\":\"33333333333333333333333333333333\"},\"readmits\":{\"hlc\":1,\"hlc\":2,\"writer_device\":\"22222222222222222222222222222222\"}}",
+      "expect": {
+        "error": "malformed_message",
+        "state_unchanged": true
+      },
+      "also_validate_on_sender_self_row": true
+    },
+    {
+      "name": "claim-overflow",
+      "raw_entry": "{\"device_id\":\"33333333333333333333333333333333\",\"fingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"role\":\"computer\",\"name\":\"Laptop\",\"status\":\"member\",\"hlc\":1800000000020,\"writer_device\":\"11111111111111111111111111111111\",\"reach\":{\"addresses\":[\"192.168.1.12:47821\"],\"relay\":[],\"hlc\":1800000000004,\"writer_device\":\"33333333333333333333333333333333\"},\"readmits\":{\"hlc\":18446744073709551616,\"writer_device\":\"22222222222222222222222222222222\"}}",
+      "expect": {
+        "error": "malformed_message",
+        "state_unchanged": true
+      },
+      "also_validate_on_sender_self_row": true
+    },
+    {
+      "name": "claim-future-hlc",
+      "raw_entry": "{\"device_id\":\"33333333333333333333333333333333\",\"fingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"role\":\"computer\",\"name\":\"Laptop\",\"status\":\"member\",\"hlc\":1800000000020,\"writer_device\":\"11111111111111111111111111111111\",\"reach\":{\"addresses\":[\"192.168.1.12:47821\"],\"relay\":[],\"hlc\":1800000000004,\"writer_device\":\"33333333333333333333333333333333\"},\"readmits\":{\"hlc\":1800000060101,\"writer_device\":\"22222222222222222222222222222222\"}}",
+      "expect": {
+        "error": "malformed_message",
+        "state_unchanged": true
+      },
+      "also_validate_on_sender_self_row": true
+    },
+    {
+      "name": "claim-on-removed",
+      "raw_entry": "{\"device_id\":\"33333333333333333333333333333333\",\"fingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"role\":\"computer\",\"name\":\"Laptop\",\"status\":\"removed\",\"hlc\":1800000000020,\"writer_device\":\"11111111111111111111111111111111\",\"readmits\":{\"hlc\":1800000000010,\"writer_device\":\"22222222222222222222222222222222\"}}",
+      "expect": {
+        "error": "malformed_message",
+        "state_unchanged": true
+      },
+      "also_validate_on_sender_self_row": false
+    }
+  ],
+  "source": {
+    "path": "/home/mjstanton/.worktrees/pneu/setup-ui-desktop/desktop/protocol-vectors/readmission.json",
+    "sha256": "3013b01cb753451f4c340b9ce47d498bb6dc1d8aa7972eac0bca397d133e7fd4",
+    "purpose": "Scratch revision only; original shared files are unchanged."
+  }
+}

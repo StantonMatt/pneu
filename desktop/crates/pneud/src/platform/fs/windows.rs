@@ -247,9 +247,11 @@ pub(crate) mod private {
         }
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn check_path(path: &Path) -> Result<()> {
         check(&open_read(path)?)
     }
+    #[cfg(test)]
     pub(crate) fn open(path: &Path) -> Result<File> {
         open_lock(path)
     }
@@ -277,7 +279,7 @@ fn drive_root(path: &Path) -> Result<PathBuf> {
         matches!(prefix.kind(), Prefix::Disk(_)) && parts.next() == Some(Component::RootDir),
         "Windows path must be an absolute local drive path; UNC, verbatim and device namespaces are forbidden"
     );
-    Ok(PathBuf::from(prefix.as_os_str()).join(r"\"))
+    Ok(path.components().take(2).collect())
 }
 pub(crate) fn validate_path(path: &Path) -> Result<()> {
     drive_root(path)?;
@@ -640,6 +642,11 @@ pub(crate) struct Folder {
     pub file: Arc<File>,
 }
 impl Folder {
+    pub fn read(path: &Path) -> Result<Self> {
+        Ok(Self {
+            file: Arc::new(walk(path, false, false, READ)?),
+        })
+    }
     pub fn open(path: &Path, create: bool) -> Result<Self> {
         Ok(Self {
             file: Arc::new(walk(path, create, false, WRITE)?),
@@ -763,7 +770,7 @@ fn database_lock(file: &File) -> Result<()> {
     }
     .context("data store is already owned by another daemon")
 }
-fn single_link(file: &File) -> Result<()> {
+pub(crate) fn single_link(file: &File) -> Result<()> {
     let info: FILE_STANDARD_INFO = query(file, FileStandardInfo)?;
     ensure!(
         info.NumberOfLinks == 1 && !info.DeletePending,
@@ -958,18 +965,18 @@ pub(crate) fn open_regular_file(path: &Path) -> Result<File> {
 pub(crate) fn open_read(path: &Path) -> Result<File> {
     path_open(path, READ)
 }
+#[cfg(test)]
 pub(crate) fn open_secret(path: &Path) -> std::io::Result<File> {
     open_read(path).map_err(io_error)
 }
 pub(crate) fn open_read_at(parent: &File, name: impl AsRef<OsStr>) -> Result<File> {
     open_at(parent, name.as_ref(), READ, false, None)
 }
+pub(crate) fn open_read_write_at(parent: &File, name: impl AsRef<OsStr>) -> Result<File> {
+    open_at(parent, name.as_ref(), WRITE, false, Some(false))
+}
 pub(crate) fn open_journal_at(parent: &File, name: impl AsRef<OsStr>) -> Result<File> {
     open_read_at(parent, name)
-}
-#[cfg(test)]
-pub(crate) fn open_read_write_at(parent: &File, name: impl AsRef<OsStr>) -> Result<File> {
-    open_at(parent, name.as_ref(), WRITE, false, None)
 }
 pub(crate) fn metadata_file(parent: &File, name: impl AsRef<OsStr>) -> Result<File> {
     open_read_at(parent, name)
@@ -1059,7 +1066,7 @@ pub(crate) fn rename(
     parent.sync_all()?;
     Ok(())
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Identity(u64, [u8; 16]);
 pub(crate) fn identity(file: &File) -> Result<Identity> {
     let info: FILE_ID_INFO = query(file, FileIdInfo)?;
@@ -1068,9 +1075,14 @@ pub(crate) fn identity(file: &File) -> Result<Identity> {
 pub(crate) fn identity_at(parent: &File, name: impl AsRef<OsStr>) -> Result<Identity> {
     identity(&metadata_file(parent, name)?)
 }
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Version(Identity, i64, i64, i64, i64);
 impl Version {
+    /// Folder capture uses identity, size and mtime; metadata-only changes are harmless.
+    pub fn same_content_metadata(&self, other: &Self) -> bool {
+        self.0 == other.0 && self.1 == other.1 && self.3 == other.3
+    }
+
     /// Finish a Pneu writer after its last write, before retaining ownership.
     pub fn record_written(file: &File) -> Result<Self> {
         file.sync_all()?;
@@ -1175,6 +1187,7 @@ pub(crate) fn is_private_file(file: &File) -> Result<bool> {
     Ok(file.metadata()?.is_file() && private::check(file).is_ok())
 }
 // Existing objects are checked, never repaired after possible exposure.
+#[cfg(test)]
 pub(crate) fn set_private_file(path: &Path) -> std::io::Result<()> {
     private::check_path(path).map_err(io_error)
 }
@@ -1209,6 +1222,21 @@ fn reopen(file: &File, access: u32) -> std::io::Result<File> {
 pub(crate) fn read_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
     reopen(file, READ)?.seek_read(bytes, offset)
 }
+/// Positional write on a writable handle. Callers never rely on its cursor.
+pub(crate) fn write_all_at(file: &File, mut bytes: &[u8], mut offset: u64) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        match file.seek_write(bytes, offset) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                bytes = &bytes[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
 pub(crate) fn copy_prefix(source: &File, destination: &File, prefix: u64) -> Result<()> {
     let mut source = reopen(source, READ)?;
     (&*destination).seek(SeekFrom::Start(0))?;
@@ -1232,6 +1260,12 @@ pub(crate) fn sync_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 pub(crate) fn entries(parent: &File) -> Result<impl Iterator<Item = Result<OsString>>> {
+    entries_limited(parent, usize::MAX)
+}
+pub(crate) fn entries_limited(
+    parent: &File,
+    limit: usize,
+) -> Result<impl Iterator<Item = Result<OsString>>> {
     // Serialize this backend's shared directory cursors. Collect before
     // returning so recursive cleanup never holds the enumeration lock.
     static ENUMERATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1284,6 +1318,9 @@ pub(crate) fn entries(parent: &File) -> Result<impl Iterator<Item = Result<OsStr
             });
             if name != "." && name != ".." {
                 names.push(Ok(name));
+                if names.len() > limit {
+                    return Ok(names.into_iter());
+                }
             }
             if info.NextEntryOffset == 0 {
                 break;
@@ -1382,3 +1419,34 @@ pub(crate) fn known_folder(id: &windows_sys::core::GUID) -> Result<PathBuf> {
 mod tests;
 #[cfg(test)]
 pub(crate) use tests::TestDrive;
+
+pub(crate) fn capture_entry(
+    parent: &File,
+    name: impl AsRef<OsStr>,
+) -> Result<(super::CaptureType, Identity)> {
+    let file = metadata_file(parent, name)?;
+    let meta = file.metadata()?;
+    Ok((
+        if meta.is_dir() {
+            super::CaptureType::Directory
+        } else if meta.is_file() {
+            super::CaptureType::File
+        } else {
+            super::CaptureType::Special
+        },
+        identity(&file)?,
+    ))
+}
+
+/// Flush file or directory metadata without a per-file device barrier.
+pub(crate) fn sync_plain(file: &File) -> Result<()> {
+    file.sync_all()?;
+    Ok(())
+}
+
+pub(crate) fn is_unsupported_name(error: &anyhow::Error) -> bool {
+    error.chain().any(|e| {
+        e.downcast_ref::<std::io::Error>()
+            .is_some_and(|e| matches!(e.raw_os_error(), Some(123 | 206 | 1113)))
+    })
+}

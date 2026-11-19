@@ -21,11 +21,13 @@ enum class ConnectionStatus(val key:String) {
 data class IncomingTransfer(val peerId:String,val transferId:String,val fileName:String,val received:Long,val total:Long)
 
 /** Legacy feedback is classified once at the connection boundary; UI uses the type. */
-enum class PairingIssue { NONE, UNREACHABLE, CLOCK, FEEDBACK;
+enum class PairingIssue { NONE, UNREACHABLE, CLOCK, EXPIRED, FEEDBACK;
     companion object {
+        const val EXPIRED_MESSAGE="This code expired. Scan the new one."
         fun fromMessage(message:String)=when {
             message=="Can't reach your PC" -> UNREACHABLE
             message.startsWith("Your PC's clock") -> CLOCK
+            message==EXPIRED_MESSAGE -> EXPIRED
             message.isEmpty() || message=="Pairing…" || message.startsWith("Paired with ") -> NONE
             else -> FEEDBACK
         }

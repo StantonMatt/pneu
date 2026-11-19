@@ -9,7 +9,7 @@ object RecipientSelection {
         val clipboard=kind in setOf("text","clipboard_image")
         val onlineOnly=clipboard || automatic && !p.queue
         val candidates=p.devices.filter {peer->
-            (!clipboard || peer.clipboardSend) && (!automatic || peer.automaticMedia) &&
+            peer.role=="computer" && (!clipboard || peer.clipboardSend) && (!automatic || peer.automaticMedia) &&
                 (selected==null || peer.deviceId in selected) &&
                 (peer.deviceId in connected || !onlineOnly && (automatic && p.queue || selected!=null || connected.isEmpty() && p.queue))
         }

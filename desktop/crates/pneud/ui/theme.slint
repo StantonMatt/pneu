@@ -10,7 +10,10 @@ export global Pneu {
     out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
     out property <color> card: dark ? #2A2E32 : #FFFFFF;
     out property <color> card-border: dark ? #373B41 : #DCDEE1;
-    out property <color> text: Palette.foreground;
+    // Defaults follow the native palette; offscreen render fixtures can supply
+    // the foreground/background without changing the desktop session.
+    in-out property <color> text: Palette.foreground;
+    in-out property <color> background: Palette.background;
     out property <color> text2: dark ? #A4A9B0 : #5E6369;
     out property <color> accent: #4F5BFF;
     out property <color> accent-text: dark ? #9AA3FF : #3D47E0;
@@ -38,6 +41,15 @@ export global Pneu {
 export enum Tone { neutral, accent, warn, danger }
 
 export global Icons {
+    out property <image> pin: @image-url("icons/pin.svg");
+    out property <image> pin-filled: @image-url("icons/pin-filled.svg");
+    out property <image> search: @image-url("icons/search.svg");
+    out property <image> bolt: @image-url("../../../assets/bolt.svg");
+    out property <image> ring: @image-url("../../../assets/ring.svg");
+    out property <image> stop: @image-url("../../../assets/stop.svg");
+    out property <image> expand-more: @image-url("../../../assets/expand-more.svg");
+    out property <image> folder: @image-url("../../../assets/folder.svg");
+    out property <image> folder-open: @image-url("../../../assets/folder-open.svg");
     out property <image> smartphone: @image-url("../../../assets/smartphone.svg");
     out property <image> computer: @image-url("../../../assets/desktop.svg");
     out property <image> chevron-right: @image-url("../../../assets/chevron-right.svg");
@@ -65,4 +77,8 @@ export global Icons {
     out property <image> error: @image-url("../../../assets/error.svg");
     out property <image> no-network: @image-url("../../../assets/monitor-off.svg");
     out property <image> ghost: @image-url("../../../assets/ghost-tile.svg");
+    out property <image> wifi: @image-url("../../../assets/wifi.svg");
+    out property <image> globe: @image-url("../../../assets/language.svg");
+    out property <image> link: @image-url("../../../assets/link.svg");
+    out property <image> pneu: @image-url("../../../assets/pneu.svg");
 }

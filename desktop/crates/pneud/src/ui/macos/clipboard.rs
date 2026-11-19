@@ -15,7 +15,7 @@ use std::{
 };
 
 pub const ORIGIN_MIME: &str = "io.github.stantonmatt.pneu.origin";
-pub const MAX_IMAGE: usize = 10 * 1024 * 1024;
+pub use crate::ui::clipboard_content::MAX_IMAGE;
 const TEXT: &str = "public.utf8-plain-text";
 const IMAGE_TYPES: [(&str, &str); 5] = [
     ("public.png", "image/png"),
@@ -66,7 +66,7 @@ pub fn sensitive_mime(mime: &str) -> bool {
 }
 use super::pasteboard_reader::{Baseline, Change, Completion, Phase, ReadResult, ticket};
 fn text(bytes: Vec<u8>) -> Option<String> {
-    if bytes.len() > pneu_proto::MAX_CLIPBOARD_BYTES {
+    if bytes.len() > crate::store::history::MAX_TEXT {
         return None;
     }
     String::from_utf8(bytes).ok().filter(|s| !s.contains('\0'))
@@ -86,7 +86,15 @@ pub(crate) struct Offer {
     ticket: u128,
 }
 impl Offer {
+    #[cfg(test)]
     pub(crate) fn prepare(input: &crate::actions::ClipboardInput, ticket: u128) -> Result<Self> {
+        Self::prepare_sensitive(input, ticket, false)
+    }
+    pub(crate) fn prepare_sensitive(
+        input: &crate::actions::ClipboardInput,
+        ticket: u128,
+        sensitive: bool,
+    ) -> Result<Self> {
         use crate::actions::ClipboardInput;
         let mut representations = Vec::new();
         match input {
@@ -108,11 +116,14 @@ impl Offer {
             ClipboardInput::Image(file, mime) => add_image(
                 &mut representations,
                 mime,
-                file.read_bounded(16 * 1024 * 1024)?,
+                file.read_bounded(crate::store::history::MAX_IMAGE)?,
             )?,
             ClipboardInput::Bytes { bytes, mime, .. } => {
                 add_image(&mut representations, mime, bytes.clone())?
             }
+        }
+        if sensitive {
+            representations.push(("org.nspasteboard.ConcealedType".into(), Vec::new()));
         }
         Ok(Self {
             representations,
@@ -168,7 +179,10 @@ fn add_image(types: &mut Vec<(String, Vec<u8>)>, mime: &str, bytes: Vec<u8>) -> 
         .find(|(_, m)| *m == mime)
         .map(|(u, _)| *u)
         .ok_or_else(|| anyhow::anyhow!("unsupported clipboard image"))?;
-    ensure!(bytes.len() <= 16 * 1024 * 1024, "clipboard image too large");
+    ensure!(
+        bytes.len() <= crate::store::history::MAX_IMAGE,
+        "clipboard image too large"
+    );
     let decoded = crate::actions::decode_image(&bytes)?;
     if mime != "image/png" {
         let mut png = std::io::Cursor::new(Vec::new());
@@ -261,7 +275,7 @@ fn observe_change(
 ) -> Change<Content> {
     // Observe exactly once, before the marker subprocess as well as the payload
     // subprocess. The actor retains the frozen recipients under this token.
-    let (_, token) = core.observe_watched_clipboard_kind(false, false, initial);
+    let (_, token) = core.observe_watched_clipboard_metadata(false, false, initial, marker);
     let canceled = Arc::new(AtomicBool::new(false));
     core.register_clipboard_read(token, canceled.clone());
     let weak = Arc::downgrade(core);
@@ -281,6 +295,9 @@ fn observe_change(
             let Some(core) = weak.upgrade() else { return };
             match completion {
                 Completion::Read(result) => {
+                    if let Some(fingerprint) = result.oversized {
+                        core.clipboard_image_too_large(token, fingerprint);
+                    }
                     core.clipboard_observed_hashes(token, result.content, result.fingerprints, true)
                 }
                 Completion::Unavailable => core.clipboard_observed(token, None, false),
@@ -323,12 +340,13 @@ fn poll(
     }
     if let Some(initial) = snapshot {
         let class = classify(access, &types);
-        if class == Classification::Sensitive {
+        let marker = types.iter().any(|t| t == ORIGIN_MIME);
+        if class == Classification::Sensitive && !marker {
             pending.take();
             invalidate(core);
             return;
         }
-        if initial && class != Classification::Origin {
+        if initial && !marker {
             // Establish the baseline without reading or publishing the
             // pre-existing selection. Only an origin marker can witness a
             // write that raced startup/restart/access recovery.
@@ -337,7 +355,7 @@ fn poll(
         }
         // Capture the new policy before reaping the previous provider, but never
         // start a second subprocess until the old one has been reaped.
-        let change = observe_change(core, count, class == Classification::Origin, initial);
+        let change = observe_change(core, count, marker, initial);
         pending.take();
         match change.start(read_command) {
             Ok(read) => *pending = Some(read),
@@ -372,6 +390,7 @@ pub fn read_helper(count: isize, marker: bool) -> Result<()> {
 }
 fn read_snapshot(count: isize, marker: bool) -> ReadResult<Content> {
     let empty = || ReadResult {
+        oversized: None,
         marker: None,
         content: None,
         fingerprints: Vec::new(),
@@ -385,7 +404,8 @@ fn read_snapshot(count: isize, marker: bool) -> ReadResult<Content> {
         .map(|a| a.iter().map(|s| s.to_string()).collect())
         .unwrap_or_default();
     let class = classify(pb.accessBehavior().0, &types);
-    if matches!(class, Classification::Denied | Classification::Sensitive) {
+    // A marker-only read can confirm our sensitive write without reading its payload.
+    if class == Classification::Denied || (!marker && class == Classification::Sensitive) {
         return empty();
     }
     if marker {
@@ -406,13 +426,14 @@ fn read_snapshot(count: isize, marker: bool) -> ReadResult<Content> {
     let mut fingerprints = Vec::new();
     let mut value = None;
     let mut png = None;
+    let mut oversized = None;
     // Default/Ask are allowed one read per new changeCount. Nil reads are a
     // stable denied/unavailable state until another human copy; never a retry
     // or prompt loop. Do not override the user's system policy.
     if types.iter().any(|t| t == TEXT)
         && let Some(data) = pb
             .dataForType(&NSString::from_str(TEXT))
-            .filter(|d| d.len() <= pneu_proto::MAX_CLIPBOARD_BYTES)
+            .filter(|d| d.len() <= crate::store::history::MAX_TEXT)
     {
         let bytes = data.to_vec();
         value = text(bytes.clone());
@@ -427,12 +448,18 @@ fn read_snapshot(count: isize, marker: bool) -> ReadResult<Content> {
         let cap = if mime == "image/png" {
             32 * 1024 * 1024
         } else {
-            16 * 1024 * 1024
+            crate::store::history::MAX_IMAGE
         };
-        if let Some(data) = pb
-            .dataForType(&NSString::from_str(uti))
-            .filter(|d| d.len() <= cap)
-        {
+        if let Some(data) = pb.dataForType(&NSString::from_str(uti)) {
+            if data.len() > MAX_IMAGE {
+                // NSData remains retained and immutable throughout this helper
+                // read. Hash in place without making another oversized copy.
+                oversized = Some(Sha256::digest(unsafe { data.as_bytes_unchecked() }).into());
+                continue;
+            }
+            if data.len() > cap {
+                continue;
+            }
             let bytes = data.to_vec();
             if let Ok(decoded) = crate::actions::decode_image(&bytes) {
                 fingerprints.push(Sha256::digest(&bytes).into());
@@ -444,9 +471,12 @@ fn read_snapshot(count: isize, marker: bool) -> ReadResult<Content> {
                         if decoded
                             .write_to(&mut converted, image::ImageFormat::Png)
                             .is_ok()
-                            && converted.get_ref().len() <= MAX_IMAGE
                         {
-                            png = Some(converted.into_inner());
+                            if converted.get_ref().len() > MAX_IMAGE {
+                                oversized = Some(Sha256::digest(&bytes).into());
+                            } else {
+                                png = Some(converted.into_inner());
+                            }
                         }
                     }
                 }
@@ -458,6 +488,7 @@ fn read_snapshot(count: isize, marker: bool) -> ReadResult<Content> {
         return empty();
     }
     ReadResult {
+        oversized: if png.is_some() { None } else { oversized },
         marker: None,
         content: combine(value, png),
         fingerprints,
@@ -468,6 +499,47 @@ fn read_snapshot(count: isize, marker: bool) -> ReadResult<Content> {
 mod tests {
     use super::*;
     use crate::ui::pasteboard_reader::{MarkerAction, marker_action};
+    #[tokio::test]
+    async fn sensitive_received_offer_keeps_payload_and_requires_marker_confirmation() -> Result<()>
+    {
+        use crate::actions::PcActions;
+        let actions = crate::actions::DesktopActions::new("/unused".into());
+        let prepared = actions
+            .prepare_clipboard_sensitive(
+                crate::actions::ClipboardInput::Text("received secret".into()),
+                1,
+                true,
+            )
+            .await?;
+        assert!(
+            prepared.marker_confirmation,
+            "sensitive install must await its marker"
+        );
+        let offer = Offer::prepare_sensitive(
+            &crate::actions::ClipboardInput::Text("received secret".into()),
+            1,
+            true,
+        )?;
+        assert!(
+            offer
+                .representations
+                .iter()
+                .any(|(name, data)| name == TEXT && data == b"received secret")
+        );
+        assert!(
+            offer
+                .representations
+                .iter()
+                .any(|(name, _)| name == "org.nspasteboard.ConcealedType")
+        );
+        let names = offer
+            .representations
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(classify(0, &names), Classification::Sensitive);
+        Ok(())
+    }
     #[test]
     fn classification_respects_privacy_origin_and_unknown_types() {
         for policy in [0, 1, 2] {
@@ -492,7 +564,7 @@ mod tests {
         assert_eq!(ticket(b"42"), None);
         assert!(text(vec![255]).is_none());
         assert!(text(b"a\0b".to_vec()).is_none());
-        assert!(text(vec![b'a'; pneu_proto::MAX_CLIPBOARD_BYTES + 1]).is_none());
+        assert!(text(vec![b'a'; crate::store::history::MAX_TEXT + 1]).is_none());
     }
     #[test]
     fn preparation_preserves_all_representations_without_accessing_pasteboard() -> Result<()> {

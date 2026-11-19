@@ -19,7 +19,12 @@ internal object MeshClock {
         if(value.signum()<0 || value>maximum || value>BigInteger.valueOf(now.coerceAtLeast(0))+BigInteger.valueOf(60000))throw MeshViolation()
     }
     fun observe(p:MutablePreferences,value:BigInteger,now:Long=System.currentTimeMillis()) {
-        validate(value,now);p[seen]=maxOf(p[seen]?.toBigInteger() ?: BigInteger.ZERO,value).toString()
+        validate(value,now);retain(p,value)
+    }
+    /** Already validated durable history still orders local edits after a wall-clock change. */
+    fun retain(p:MutablePreferences,value:BigInteger) {
+        check(value.signum()>=0 && value<=maximum)
+        p[seen]=maxOf(p[seen]?.toBigInteger() ?: BigInteger.ZERO,value).toString()
     }
     fun next(p:MutablePreferences,id:String,apply:Boolean,now:Long=System.currentTimeMillis()):ClipboardStamp {
         val value=maxOf(BigInteger.valueOf(now.coerceAtLeast(0)),maxOf(p[seen]?.toBigInteger() ?: BigInteger.ZERO,register(p)?.hlc ?: BigInteger.ZERO)+BigInteger.ONE)

@@ -15,6 +15,12 @@ public class ReceivedFile {
     @NonNull public String kind="";
     @NonNull public String senderName="";
     @NonNull public String state="writing";
+    @NonNull @ColumnInfo(defaultValue="''") public String stagePath="";
+    @NonNull @ColumnInfo(defaultValue="''") public String stageIdentity="";
+    @NonNull @ColumnInfo(defaultValue="''") public String checkpointHash="";
+    @ColumnInfo(defaultValue="0") public long checkpoint;
+    @ColumnInfo(defaultValue="0") public long progressWall;
+    @ColumnInfo(defaultValue="0") public long wallHighWater;
     public long generation;
     public long size;
     public long receivedAt;

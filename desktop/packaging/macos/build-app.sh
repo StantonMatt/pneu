@@ -83,7 +83,25 @@ for image in assets/macos/menubar-*.png; do
     cp "$image" "$app/Contents/Resources/menubar/pneu-tray-${name#menubar-}"
 done
 plutil -lint "$app/Contents/Info.plist" "$agent" packaging/macos/Pneu.entitlements
-codesign --force --sign - --options runtime --entitlements packaging/macos/Pneu.entitlements "$app"
+identity=${PNEU_CODESIGN_IDENTITY:-}
+keychain="$HOME/Library/Keychains/pneu-signing.keychain-db"
+signing_options=(--force)
+if [[ -f "$keychain" && "$identity" != - ]]; then
+    # Never silently switch an existing local identity back to ad-hoc signing.
+    local_identity=$(security find-identity -p codesigning "$keychain" | awk '/"Pneu Local Signing"/ { print $2; exit }')
+    if [[ -z "$identity" || "$identity" == "$local_identity" || "$identity" == 'Pneu Local Signing' ]]; then
+        [[ -n "$local_identity" ]] || { echo 'Local signing identity unavailable; run packaging/macos/setup-local-signing.sh' >&2; exit 1; }
+        set +x
+        password=$(cat "$HOME/Library/Application Support/Pneu-signing/keychain-password")
+        security unlock-keychain -p "$password" "$keychain"
+        unset password
+        identity=$local_identity
+        signing_options+=(--keychain "$keychain")
+    fi
+fi
+identity=${identity:--}
+printf 'Signing with: %s\n' "$identity"
+codesign "${signing_options[@]}" --sign "$identity" --options runtime --entitlements packaging/macos/Pneu.entitlements "$app"
 codesign --verify --strict --verbose=2 "$app"
 # Publish only after validation; never recursively remove a caller-selected path.
 if [[ -e "$out/Pneu.app" || -L "$out/Pneu.app" ]]; then

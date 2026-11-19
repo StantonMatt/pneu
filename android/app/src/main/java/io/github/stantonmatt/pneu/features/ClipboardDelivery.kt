@@ -19,8 +19,8 @@ class ClipboardDelivery(private val app: AppGraph, private val applyText:(suspen
         private const val OWN_TRANSFER="io.github.stantonmatt.pneu.clipboard.transfer"
         private const val OWN_GENERATION="io.github.stantonmatt.pneu.clipboard.generation"
         private const val OWN_ORDER="io.github.stantonmatt.pneu.clipboard.order"
-        internal fun receivedClip(label:String,text:String,hash:String,source:String,id:String="",order:String="",generation:Long=0)=ClipData.newPlainText(label,text).apply {
-            description.extras=android.os.PersistableBundle().apply {putBoolean(OWN_CLIP,true);putString(OWN_HASH,hash);putString(OWN_SOURCE,source);putString(OWN_TRANSFER,id);putString(OWN_ORDER,order);putLong(OWN_GENERATION,generation)}
+        internal fun receivedClip(label:String,text:String,hash:String,source:String,id:String="",order:String="",generation:Long=0,sensitive:Boolean=false)=ClipData.newPlainText(label,text).apply {
+            description.extras=android.os.PersistableBundle().apply {putBoolean(OWN_CLIP,true);if(sensitive)putBoolean(android.content.ClipDescription.EXTRA_IS_SENSITIVE,true);putString(OWN_HASH,hash);putString(OWN_SOURCE,source);putString(OWN_TRANSFER,id);putString(OWN_ORDER,order);putLong(OWN_GENERATION,generation)}
         }
         internal fun disabledDirection(id:String,mesh:Boolean)=if(mesh)
             Frame.Control(Type.NACK,json("transfer_id" to id,"code" to "unsupported_kind","retryable" to false))
@@ -76,13 +76,14 @@ class ClipboardDelivery(private val app: AppGraph, private val applyText:(suspen
         result ?: throw java.io.IOException("Binding changed")
     }
     private suspend fun receiveCurrent(peerId:String,generation:Long,body:com.google.gson.JsonObject,stamp:ClipboardStamp?):Frame.Control {
+        val sensitive=body["sensitive"]?.asBoolean==true
         val id=body["transfer_id"].asString;val text=body["text"].asString
         val hash=sha256(text.toByteArray());val timestamp=body["created_at"].asLong;val origin=body["origin"]?.asString ?: "clipboard"
         fun nack(code: String)=Frame.Control(Type.NACK,json("transfer_id" to id,"code" to code,"retryable" to (code !in setOf("id_conflict","unsupported_kind"))))
         if(stamp!=null)app.preferences.observeClipboard(stamp)
         // Retained-ID conflicts are decided before fallible journal recovery.
         val reserved=app.queue.receipt(peerId,id)
-        fun conflicts(record:Receipt)=record.hash!=hash || record.createdAt!=timestamp || record.origin!=origin || record.hlc!=stamp?.hlc?.toString().orEmpty() || record.sourceDevice!=stamp?.source.orEmpty()
+        fun conflicts(record:Receipt)=record.sensitive!=sensitive || record.hash!=hash || record.createdAt!=timestamp || record.origin!=origin || record.hlc!=stamp?.hlc?.toString().orEmpty() || record.sourceDevice!=stamp?.source.orEmpty()
         if(reserved!=null && conflicts(reserved))return nack("id_conflict")
         // Conflicts remain authoritative even when recovery storage is failing.
         reconcileCurrent()
@@ -96,7 +97,7 @@ class ClipboardDelivery(private val app: AppGraph, private val applyText:(suspen
         // Old pending reservations predate this journal and never proved an
         // effect. New reserved rows retain metadata through completion failures.
         if(existing?.state=="pending")app.queue.deleteReceipt(peerId,id)
-        val record=Receipt().apply {this.peerId=peerId;transferId=id;this.hash=hash;createdAt=timestamp;this.origin=origin;hlc=stamp?.hlc?.toString().orEmpty();sourceDevice=stamp?.source.orEmpty();state="reserved"}
+        val record=Receipt().apply {this.sensitive=sensitive;this.peerId=peerId;transferId=id;this.hash=hash;createdAt=timestamp;this.origin=origin;hlc=stamp?.hlc?.toString().orEmpty();sourceDevice=stamp?.source.orEmpty();state="reserved"}
         suspend fun finish(applied:Boolean) {
             record.state="applied"
             if(applied)app.queue.completeReceipt(record) else app.queue.retainClipboardReceipt(record)
@@ -117,8 +118,8 @@ class ClipboardDelivery(private val app: AppGraph, private val applyText:(suspen
                 try {
                     if(applyText!=null)applyText.invoke(text,hash) else withContext(Dispatchers.Main) {
                         val clipboard=app.context.getSystemService(ClipboardManager::class.java)
-                        deduplicated=ClipboardContent.textMatches(runCatching {clipboard.primaryClip}.getOrNull(),text)
-                        if(!deduplicated)clipboard.setPrimaryClip(receivedClip(app.context.getString(R.string.app_name),text,hash,peerId,id,appliedStamp.hlc.toString(),generation))
+                        deduplicated=ClipboardContent.textMatches(runCatching {clipboard.primaryClip}.getOrNull(),text) && (!sensitive || clipboard.primaryClipDescription?.extras?.getBoolean(android.content.ClipDescription.EXTRA_IS_SENSITIVE)==true)
+                        if(!deduplicated)clipboard.setPrimaryClip(receivedClip(app.context.getString(R.string.app_name),text,hash,peerId,id,appliedStamp.hlc.toString(),generation,sensitive))
                     }
                 }catch(e:CancellationException) {app.queue.deleteReceipt(peerId,id);throw e}
                 catch(_:Exception) {app.queue.deleteReceipt(peerId,id);return@withContext}
@@ -127,6 +128,7 @@ class ClipboardDelivery(private val app: AppGraph, private val applyText:(suspen
                 app.preferences.appliedClipboard(appliedStamp,hash,peerId,generation,id)
             }
             if(!effected)return nack("clipboard_unavailable")
+            PostCommit.maintainSuspending {app.savedClips.recordText(text,peer.name,sensitive,source=peerId)}
             finish(true)
         } else if(existing?.state=="reserved")finish(false)
         return Frame.Control(Type.ACK,json("transfer_id" to id,"deduplicated" to deduplicated))

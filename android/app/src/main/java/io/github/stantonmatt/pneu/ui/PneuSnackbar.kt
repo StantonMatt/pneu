@@ -14,7 +14,7 @@ internal val UiFeedbackSaver=Saver<UiFeedback?,List<String>>(
     save={it?.let {event->listOf(event.message,event.id)} ?: emptyList()},
     restore={if(it.size==2)UiFeedback(it[0],it[1]) else null})
 
-@Composable fun PneuSnackbarHost(state:SnackbarHostState,modifier:Modifier=Modifier) {
+@Composable fun PneuSnackbarHost(state:SnackbarHostState,modifier:Modifier=Modifier,onPresented:suspend (SnackbarData)->Unit={}) {
     val c=LocalPneuColors.current
-    SnackbarHost(state,modifier.padding(horizontal=12.dp,vertical=16.dp)) {Snackbar(it,shape=RoundedCornerShape(14.dp),containerColor=c.inverse,contentColor=c.onInverse,actionColor=c.onInverse)}
+    SnackbarHost(state,modifier.padding(horizontal=12.dp,vertical=16.dp)) {androidx.compose.runtime.LaunchedEffect(it) {onPresented(it)};Snackbar(it,shape=RoundedCornerShape(14.dp),containerColor=c.inverse,contentColor=c.onInverse,actionColor=c.onInverse)}
 }

@@ -39,7 +39,7 @@ pub(super) fn fields(c: &Connection, peer: &Id) -> Result<Vec<PeerSetting>> {
     })
     .collect()
 }
-fn initialize(tx: &Transaction<'_>, local: &Id, peer: &Id, phone: bool) -> Result<()> {
+pub(super) fn initialize(tx: &Transaction<'_>, local: &Id, peer: &Id, phone: bool) -> Result<()> {
     ensure!(local != peer, SettingsUnexpected);
     for key in pair_keys(local, peer, phone) {
         tx.execute(
@@ -49,7 +49,7 @@ fn initialize(tx: &Transaction<'_>, local: &Id, peer: &Id, phone: bool) -> Resul
     }
     Ok(())
 }
-fn write_field(tx: &Transaction<'_>, peer: &Id, field: &PeerSetting) -> Result<()> {
+pub(super) fn write_field(tx: &Transaction<'_>, peer: &Id, field: &PeerSetting) -> Result<()> {
     tx.execute("INSERT INTO peer_settings VALUES(?,?,?,?,?) ON CONFLICT(device,key) DO UPDATE SET enabled=excluded.enabled,hlc=excluded.hlc,writer_device=excluded.writer_device",params![peer.as_str(),field.key,field.enabled,field.hlc.to_string(),field.writer_device.as_str()])?;
     Ok(())
 }
@@ -305,6 +305,7 @@ impl Store {
                     f.validate().map_err(|_| SettingsMalformed)?;
                     validate_stamp(f.hlc, crate::now_ms()).map_err(|_| SettingsMalformed)?;
                 }
+                reject_partial_id(tx,&peer,&snapshot.transfer_id)?;
                 let meta = Metadata::Settings(snapshot.clone());
                 if let Some((old, _)) =
                     receipt_row(tx, peer.as_str(), snapshot.transfer_id.as_str())?

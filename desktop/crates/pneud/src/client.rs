@@ -186,6 +186,7 @@ impl Phone {
                 let sent = crate::transport::send(
                     &mut tls,
                     &Message::Hello(Hello {
+                        setup: None,
                         role: None,
                         addresses: None,
                         version: 1,
@@ -279,6 +280,9 @@ impl Phone {
             hash.update(&buf[..n]);
         }
         let begin = FileBegin {
+            resume: None,
+            folder: None,
+            sensitive: false,
             hlc: None,
             source_device: None,
             transfer_id: Id::new(crate::random_hex(16))?,
@@ -300,6 +304,7 @@ impl Phone {
     }
     pub fn text(&self, text: String, origin: ClipboardOrigin) -> Result<Clipboard> {
         let mut text = Clipboard {
+            sensitive: false,
             hlc: None,
             source_device: None,
             transfer_id: Id::new(crate::random_hex(16))?,
@@ -651,6 +656,7 @@ mod tests {
                 write_frame(
                     &mut tls,
                     &Message::Hello(Hello {
+                        setup: None,
                         version: 1,
                         device_id: local,
                         name: "forged PC".into(),
@@ -693,6 +699,7 @@ mod tests {
         let clock = phone.directory.join("clipboard-clock.json");
         atomic_private(&clock, &serde_json::to_vec(&(MAX_TIMESTAMP - 1))?)?;
         let mut text = Clipboard {
+            sensitive: false,
             hlc: None,
             source_device: None,
             transfer_id: Id::from_bytes([1; 16]),
@@ -731,6 +738,10 @@ mod tests {
         scenario: Scenario,
         id: Id,
     ) -> Result<(PhoneConnection, JoinHandle<Result<()>>)> {
+        // macOS temporary roots may arrive through /var's symlink. Production
+        // private writes deliberately reject such an unanchored parent.
+        #[cfg(not(windows))]
+        let directory = directory.canonicalize()?;
         let phone = Phone::new(directory.join("phone"))?;
         let pc = Identity::load_or_create(&directory.join("pc"))?;
         let admission = Arc::new(Mutex::new(Admission::default()));
@@ -758,6 +769,7 @@ mod tests {
             crate::transport::send(
                 &mut tls,
                 &Message::Hello(Hello {
+                    setup: None,
                     role: None,
                     addresses: None,
                     version: 1,
@@ -823,6 +835,7 @@ mod tests {
             if matches!(scenario, Scenario::ClipboardOrder) {
                 for (timestamp, deduplicated) in [(2, false), (1, true), (3, false), (3, true)] {
                     let text = Clipboard {
+                        sensitive: false,
                         hlc: None,
                         source_device: None,
                         transfer_id: Id::new(crate::random_hex(16))?,
@@ -846,6 +859,7 @@ mod tests {
             }
             if matches!(scenario, Scenario::PausedClipboard) {
                 let text = Clipboard {
+                    sensitive: false,
                     hlc: None,
                     source_device: None,
                     transfer_id: id,
@@ -942,6 +956,7 @@ mod tests {
             let (mut connection, pc) =
                 mock_pc(directory.path(), scenario.clone(), id.clone()).await?;
             let text = Clipboard {
+                sensitive: false,
                 hlc: None,
                 source_device: None,
                 transfer_id: id.clone(),

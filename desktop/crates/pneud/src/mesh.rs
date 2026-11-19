@@ -28,13 +28,24 @@ struct Join {
     installed_generation: Arc<AtomicU64>,
     retry_at: Option<Instant>,
     ready: Arc<AtomicBool>,
+    setup_scope: bool,
 }
+#[cfg(test)]
+type ConfirmHook = (
+    tokio::sync::oneshot::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+#[cfg(test)]
+type RequestHook = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
 #[derive(Default)]
 pub(super) struct Mesh {
     peers: Mutex<Vec<PeerInfo>>,
     join: Mutex<Option<Join>>,
     gate: tokio::sync::Mutex<()>,
-    pub(super) changed: Notify,
+    pub(super) changed: Arc<Notify>,
     links: Mutex<HashMap<Id, LinkState>>,
     connecting: Mutex<HashSet<Id>>,
     #[cfg(test)]
@@ -43,6 +54,12 @@ pub(super) struct Mesh {
     panic_dial: AtomicBool,
     #[cfg(test)]
     panic_supervisor: AtomicBool,
+    #[cfg(test)]
+    confirm_hook: Mutex<Option<ConfirmHook>>,
+    #[cfg(test)]
+    retry_hook: Mutex<Option<ConfirmHook>>,
+    #[cfg(test)]
+    request_hook: Mutex<Option<RequestHook>>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LinkProblem {
@@ -74,6 +91,7 @@ struct LinkState {
 struct LinkIssue {
     generation: u64,
     problem: LinkProblem,
+    since: u64,
     retry_at: Instant,
 }
 fn link_problem(error: &anyhow::Error) -> Option<LinkProblem> {
@@ -102,6 +120,35 @@ pub struct DeviceSnapshot {
     pub route: Option<String>,
 }
 impl Mesh {
+    pub(super) fn cancel_withdrawn_join(&self) {
+        if let Some(join) = self.join.lock().expect("join").as_mut()
+            && join.phase != JoinPhase::Finished
+        {
+            join.phase = JoinPhase::Finished;
+            join.state = "cancelled".into();
+        }
+    }
+    pub(super) fn cancel_removed(&self, keys: &[(Id, Hash)]) {
+        if let Some(join) = self.join.lock().expect("join").as_mut()
+            && join.phase != JoinPhase::Finished
+            && keys.iter().any(|(id, pin)| {
+                join.uri.fingerprint == *pin
+                    && join.authority.as_ref().is_none_or(|a| a.peer == *id)
+            })
+        {
+            join.phase = JoinPhase::Finished;
+            join.state = "cancelled".into();
+            self.changed.notify_waiters();
+        }
+    }
+    pub(super) fn join_scope(&self, pin: &Hash) -> bool {
+        self.join
+            .lock()
+            .expect("join")
+            .as_ref()
+            .filter(|j| j.uri.fingerprint == *pin && j.phase != JoinPhase::Finished)
+            .is_none_or(|j| j.setup_scope)
+    }
     pub(super) fn new(peers: Vec<PeerInfo>) -> Self {
         Self {
             peers: Mutex::new(peers),
@@ -133,13 +180,66 @@ impl DialCandidate {
     }
 }
 impl Core {
+    pub(super) fn setup_attempts(&self) -> Vec<(Option<Id>, Hash)> {
+        let mut targets = self
+            .setup_incoming
+            .lock()
+            .expect("setup incoming")
+            .values()
+            .map(|v| (v.peer.clone(), v.pin.clone()))
+            .collect::<Vec<_>>();
+        if let Some(join) = self
+            .mesh
+            .join
+            .lock()
+            .expect("join")
+            .as_ref()
+            .filter(|j| j.phase != JoinPhase::Finished)
+        {
+            targets.push((
+                join.authority.as_ref().map(|a| a.peer.clone()),
+                join.uri.fingerprint.clone(),
+            ));
+        }
+        targets
+    }
+    pub(super) fn computer_hello_for(
+        &self,
+        pin: &Hash,
+        expected: Option<&Id>,
+        outbound: bool,
+    ) -> Hello {
+        let mut hello = self.computer_hello();
+        let peer = expected.cloned().or_else(|| {
+            self.admission
+                .lock()
+                .expect("admission")
+                .peers
+                .get(pin)
+                .cloned()
+        });
+        let default = if if outbound {
+            self.mesh.join_scope(pin)
+        } else {
+            self.setup_invitation_scope.load(Ordering::SeqCst)
+        } {
+            SetupScope::Enabled
+        } else {
+            SetupScope::Disabled
+        };
+        if hello.capabilities.iter().any(|c| c == "setup") {
+            hello.setup = Some(self.store.setup_hello(peer.as_ref(), default));
+        }
+        hello
+    }
     pub(super) fn computer_hello(&self) -> Hello {
         let addresses = crate::discovery::pairing_candidates()
             .unwrap_or_default()
             .into_iter()
             .map(|i| SocketAddr::new(i.ip, self.bound_port()).to_string())
             .collect();
-        Hello {
+        let hello = Hello {
+            setup: Some(self.store.setup_hello(None, SetupScope::Enabled)),
             version: 1,
             device_id: self.identity.device_id.clone(),
             name: self.config().name,
@@ -148,11 +248,27 @@ impl Core {
             paused: None,
             capabilities: vec![
                 "files".into(),
+                "file_resume_v1".into(),
+                "folder_v1".into(),
                 "clipboard_text".into(),
                 "clipboard_image".into(),
                 "mesh".into(),
+                "setup".into(),
+                CAP_BATTERY.into(),
+                CAP_RING.into(),
+                pneu_proto::CAP_NOTIFICATIONS.into(),
             ],
-        }
+        };
+        #[cfg(test)]
+        let hello = if self.setup_test_capability.load(Ordering::SeqCst) {
+            hello
+        } else {
+            let mut h = hello;
+            h.capabilities.retain(|c| c != "setup");
+            h.setup = None;
+            h
+        };
+        hello
     }
     pub(super) fn device_snapshots(
         &self,
@@ -160,6 +276,7 @@ impl Core {
         admission: &Admission,
         ui: &crate::ui::State,
     ) -> Vec<DeviceSnapshot> {
+        let setup = self.store.setup_state();
         let peers = self.mesh.peers.lock().expect("mesh peers");
         let mut devices: Vec<_> = admission
             .peers
@@ -172,8 +289,16 @@ impl Core {
                 let phone = ui.phones.get(id);
                 DeviceSnapshot {
                     device: id.clone(),
-                    name: phone
-                        .map(|p| p.name.clone())
+                    name: setup
+                        .roster
+                        .iter()
+                        .find(|m| {
+                            &m.device_id == id
+                                && m.status == MemberStatus::Member
+                                && admission.peers.get(&m.fingerprint) == Some(id)
+                        })
+                        .map(|m| m.name.clone())
+                        .or_else(|| phone.map(|p| p.name.clone()))
                         .or_else(|| peer.map(|p| p.name.clone()))
                         .unwrap_or_default(),
                     role: session
@@ -223,7 +348,7 @@ impl Core {
         });
         devices
     }
-    fn link_problem(&self, device: &Id) -> Option<LinkProblem> {
+    pub(super) fn link_problem(&self, device: &Id) -> Option<LinkProblem> {
         self.mesh
             .links
             .lock()
@@ -279,6 +404,20 @@ impl Core {
         let _sessions = self.sessions.lock().expect("sessions");
         self.set_link_problem_checked(device, generation, Some(epoch), problem);
     }
+    pub(super) fn setup_refusal_since(&self) -> Option<u64> {
+        self.mesh
+            .links
+            .lock()
+            .expect("link state")
+            .iter()
+            .filter_map(|(id, link)| {
+                let issue = link.issue.as_ref()?;
+                (issue.problem == LinkProblem::Unauthorized
+                    && self.store.pairing_generation(id) == Some(issue.generation))
+                .then_some(issue.since)
+            })
+            .min()
+    }
     pub(super) fn set_link_problem(
         &self,
         device: &Id,
@@ -304,9 +443,16 @@ impl Core {
         }
         link.epoch.issue += 1;
         if let Some(problem) = problem {
+            let since = link
+                .issue
+                .as_ref()
+                .filter(|i| i.generation == generation && i.problem == problem)
+                .map(|i| i.since)
+                .unwrap_or_else(crate::now_ms);
             link.issue = Some(LinkIssue {
                 generation,
                 problem,
+                since,
                 retry_at: Instant::now() + Duration::from_secs(300),
             });
         } else if link
@@ -340,6 +486,7 @@ impl Core {
             Ok(_) => return Ok(json!({"state":"update_required"})),
             Err(_) => return Ok(json!({"state":"garbled"})),
         };
+        let _pairing = self.pairing_gate.lock().await;
         let paired = self
             .admission
             .lock()
@@ -371,6 +518,7 @@ impl Core {
             installed_generation: Arc::new(AtomicU64::new(0)),
             retry_at: None,
             ready: Default::default(),
+            setup_scope: true,
         };
         let value = join_value(&join);
         *self.mesh.join.lock().expect("join") = Some(join);
@@ -399,20 +547,31 @@ impl Core {
         Ok(value)
     }
     pub async fn confirm_join(&self, attempt: &str) -> Result<Value> {
+        self.confirm_join_scoped(attempt, true).await
+    }
+    pub async fn confirm_join_scoped(&self, attempt: &str, enabled: bool) -> Result<Value> {
         let _guard = self.mesh.gate.lock().await;
-        let mut join = self
-            .mesh
-            .join
-            .lock()
-            .expect("join")
-            .as_ref()
+        let mut state = self.mesh.join.lock().expect("join");
+        let join = state
+            .as_mut()
             .filter(|j| j.attempt == attempt)
-            .cloned()
             .context("unknown join attempt")?;
+        #[cfg(test)]
+        if let Some((entered, release)) =
+            self.mesh.confirm_hook.lock().expect("confirm hook").take()
+        {
+            let _ = entered.send(());
+            let _ = release.recv();
+        }
         ensure!(
             join.phase != JoinPhase::Finished,
             "join cannot be confirmed"
         );
+        if join.phase == JoinPhase::Preview {
+            join.setup_scope = enabled;
+        } else {
+            ensure!(join.setup_scope == enabled, "pairing scope is frozen");
+        }
         if join.phase == JoinPhase::Preview && join.uri.expires_at <= crate::now_ms() {
             join.state = "expired".into();
             join.phase = JoinPhase::Finished;
@@ -421,8 +580,7 @@ impl Core {
             join.state = "pairing".into();
             join.retry_at = None;
         }
-        let value = join_value(&join);
-        *self.mesh.join.lock().expect("join") = Some(join);
+        let value = join_value(join);
         self.mesh.changed.notify_waiters();
         Ok(value)
     }
@@ -474,8 +632,10 @@ impl Core {
         pin: Hash,
         expected: Option<&Id>,
     ) -> Result<ComputerLink> {
-        let connector =
-            TlsConnector::from(Arc::new(crate::tls::client_config(&self.identity, pin)?));
+        let connector = TlsConnector::from(Arc::new(crate::tls::client_config(
+            &self.identity,
+            pin.clone(),
+        )?));
         let deadline = Instant::now() + DIAL_SWEEP_TIMEOUT;
         let mut mismatch = false;
         for candidate in candidates {
@@ -499,7 +659,9 @@ impl Core {
                         return Err(error.into());
                     }
                 };
-                let sent = send(&mut tls, &Message::Hello(self.computer_hello())).await;
+                let (local_hello,setup_revision)={let _gate=self.pairing_gate.lock().await;(self.computer_hello_for(&pin,expected,true),self.store.setup_state().generation)};
+                let setup_sent=local_hello.setup.clone().map(|h|(h,setup_revision));
+                let sent = send(&mut tls, &Message::Hello(local_hello)).await;
                 let mut hello = match read_handshake(&mut tls).await? {
                     Message::Hello(h) => h,
                     Message::Error(error) => return Err(crate::client::PcRejection(error).into()),
@@ -520,7 +682,7 @@ impl Core {
                     return Err(crate::client::PcRejection(ErrorMessage { code: ErrorCode::MalformedMessage, message: Some("invalid computer role".into()), supported_version: None }).into());
                 }
                 normalize_legacy_hello(&mut hello, true);
-                Ok(ComputerLink { tls, hello, remote, address: address.clone(), permit, transport })
+                Ok(ComputerLink { tls, hello, remote, address: address.clone(), permit, transport, setup_sent })
             }).await {
                 Ok(result) => result,
                 Err(_) => break,
@@ -555,6 +717,7 @@ impl Core {
             address,
             permit,
             transport: _transport,
+            setup_sent,
         } = self
             .connect_computer(
                 &join.uri.addresses,
@@ -570,9 +733,20 @@ impl Core {
             if !join.requested && join.uri.expires_at <= crate::now_ms() {
                 return Err(PairRejected("expired").into());
             }
+            #[cfg(test)]
+            {
+                let hook = self.mesh.request_hook.lock().expect("request hook").take();
+                if let Some((entered, release)) = hook {
+                    let _ = entered.send(());
+                    let _ = release.await;
+                }
+            }
             let _pairing = self.pairing_gate.lock().await;
             let mut state = self.mesh.join.lock().expect("join");
-            let current = state.as_mut().context("join disappeared")?;
+            let current = state
+                .as_mut()
+                .filter(|j| j.attempt == join.attempt && j.phase == JoinPhase::Pending)
+                .context("cancelled")?;
             if current.authority.is_none() {
                 current.authority = Some(JoinAuthority {
                     peer: hello.device_id.clone(),
@@ -620,7 +794,14 @@ impl Core {
                     | Message::FileBegin(_)
                     | Message::FileChunk(_)
                     | Message::FileEnd(_)
-                    | Message::PeerSettings(_)) => {
+                    | Message::PeerSettings(_)
+                    | Message::Members(_)) => {
+                        if matches!(m, Message::Members(_)) {
+                            ensure!(
+                                !buffered.iter().any(|m| matches!(m, Message::Members(_))),
+                                "too many buffered MEMBERS"
+                            );
+                        }
                         ensure!(buffered.len() < 8, "too much data before pairing result");
                         buffered.push(m);
                     }
@@ -634,6 +815,7 @@ impl Core {
         let gate = self.mesh.gate.lock().await;
         ensure!(self.joining(&join.attempt), "cancelled");
         let guard = self.pairing_gate.clone().lock_owned().await;
+        ensure!(self.joining(&join.attempt), "cancelled");
         let (authority, installed_generation) = self
             .mesh
             .join
@@ -676,7 +858,13 @@ impl Core {
         }
         let captured = if admission.as_ref() == Some(&hello.device_id) {
             let captured = self.store.with_current_pairing();
-            drop(guard);
+            captured
+                .setup_fresh_local_recovery(
+                    hello.device_id.clone(),
+                    self.self_member(),
+                    self.setup_publish(guard, None, None),
+                )
+                .await?;
             captured
         } else {
             let mut initial = hello.clone();
@@ -710,7 +898,7 @@ impl Core {
         join.ready.store(true, Ordering::SeqCst);
         drop(gate);
         let _route = self.persist_working_route(captured.clone(), hello.device_id.clone(), address);
-        self.register_buffered(
+        self.register_buffered_setup(
             tls,
             hello,
             join.uri.fingerprint,
@@ -721,6 +909,7 @@ impl Core {
             false,
             buffered,
             Some(candidate),
+            setup_sent,
         )
         .await
     }
@@ -783,7 +972,14 @@ impl Core {
                     | Message::FileBegin(_)
                     | Message::FileChunk(_)
                     | Message::FileEnd(_)
-                    | Message::PeerSettings(_)) => {
+                    | Message::PeerSettings(_)
+                    | Message::Members(_)) => {
+                        if matches!(m, Message::Members(_)) {
+                            ensure!(
+                                !buffered.iter().any(|m| matches!(m, Message::Members(_))),
+                                "too many buffered MEMBERS"
+                            );
+                        }
                         ensure!(buffered.len() < 8, "too much data before READY");
                         buffered.push(m);
                     }
@@ -859,6 +1055,7 @@ impl Core {
                         false
                     }
                 };
+                let reconnect = crate::ui::ScopeReconnect::new(self.ui.clone(), peer.id.clone());
                 let dial = async {
                     let addresses = self.dial_candidates(&peer);
                     let ComputerLink {
@@ -868,6 +1065,7 @@ impl Core {
                         address,
                         permit,
                         transport: _transport,
+                        setup_sent,
                     } = self
                         .connect_computer_candidates(
                             &addresses,
@@ -883,7 +1081,7 @@ impl Core {
                     let _route =
                         self.persist_working_route(captured.clone(), peer.id.clone(), address);
                     self.clone()
-                        .register_buffered(
+                        .register_buffered_setup(
                             tls,
                             hello,
                             peer.fingerprint.clone(),
@@ -894,6 +1092,7 @@ impl Core {
                             false,
                             buffered,
                             Some(candidate),
+                            setup_sent,
                         )
                         .await
                 };
@@ -902,12 +1101,30 @@ impl Core {
                 if self.mesh.panic_dial.swap(false, Ordering::SeqCst) {
                     panic!("injected dial failure");
                 }
-                let result = tokio::select! { biased; _ = cancelled.changed() => break, _ = revoked.changed() => break, _ = shutdown.changed() => break, result = dial => result };
+                tokio::pin!(dial);
+                let result = tokio::select! { biased;
+                    _ = cancelled.changed() => {
+                        // A lifecycle commit has already fenced this binding
+                        // and published its close reason. Let an owned READY
+                        // transport flush its final control notification before
+                        // dropping it; connecting candidates remain bounded.
+                        let _ = tokio::time::timeout(Duration::from_secs(3), &mut dial).await;
+                        break;
+                    },
+                    _ = revoked.changed() => {
+                        let _ = tokio::time::timeout(Duration::from_secs(3), &mut dial).await;
+                        break;
+                    },
+                    _ = shutdown.changed() => break,
+                    result = &mut dial => result
+                };
+                drop(reconnect);
                 if let Err(error) = &result
                     && error
                         .downcast_ref::<crate::client::PcRejection>()
                         .is_some_and(|e| e.0.code == ErrorCode::Unauthorized)
                     && may_revoke
+                    && !self.store.setup_protected(&peer.id)
                 {
                     // Revoke only this captured generation, serialized by lifecycle admission.
                     self.forget_pairing_generation_checked(
@@ -957,7 +1174,7 @@ impl Core {
         latest
             .addresses
             .first()
-            .filter(|a| !tailscale_endpoint(a))
+            .filter(|a| latest.route_proven && !tailscale_endpoint(a))
             .cloned()
             .map(DialCandidate::current)
             .into_iter()
@@ -965,7 +1182,7 @@ impl Core {
                 latest
                     .addresses
                     .iter()
-                    .skip(1)
+                    .skip(usize::from(latest.route_proven))
                     .filter(|a| !tailscale_endpoint(a))
                     .cloned()
                     .map(DialCandidate::cached),
@@ -992,6 +1209,7 @@ impl Core {
         let mut links: Vec<Task> = Vec::new();
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         let mut stop = self.shutdown.subscribe();
+        let mut reach_refresh = Instant::now();
         loop {
             tokio::select! { biased; _ = stop.changed() => break, _ = tick.tick() => {} }
             if *stop.borrow() {
@@ -1000,6 +1218,29 @@ impl Core {
             #[cfg(test)]
             if self.mesh.panic_supervisor.swap(false, Ordering::SeqCst) {
                 panic!("injected supervisor failure");
+            }
+            if self.store.setup_state().pending_link {
+                let guard = self.pairing_gate.clone().lock_owned().await;
+                if let Err(error) = self
+                    .store
+                    .setup_discovery_tick(
+                        self.self_member(),
+                        crate::now_ms(),
+                        self.setup_publish(guard, None, None),
+                    )
+                    .await
+                {
+                    self.error(None, format!("setup discovery deferred: {error}"));
+                }
+            }
+            if self.store.setup_state().setup_id.is_some() && Instant::now() >= reach_refresh {
+                reach_refresh = Instant::now() + Duration::from_secs(30);
+                if let Err(error) = self.store.setup_refresh_self(self.self_member()).await {
+                    self.error(None, format!("setup routes unavailable: {error}"));
+                }
+            }
+            if let Err(error) = self.reconcile_setup_candidates().await {
+                self.error(None, format!("membership reconciliation deferred: {error}"));
             }
             let peers = match self.store.peer_info().await {
                 Ok(peers) => peers,
@@ -1078,17 +1319,20 @@ impl Core {
                             _ => "unreachable",
                         };
                         let _guard = self.mesh.gate.lock().await;
-                        if !self.joining(&attempt) {
+                        let mut join = self.mesh.join.lock().expect("join");
+                        let Some(pending) = join
+                            .as_mut()
+                            .filter(|j| j.attempt == attempt && j.phase == JoinPhase::Pending)
+                        else {
                             continue;
+                        };
+                        #[cfg(test)]
+                        if let Some((entered, release)) =
+                            self.mesh.retry_hook.lock().expect("retry hook").take()
+                        {
+                            let _ = entered.send(());
+                            let _ = release.recv();
                         }
-                        let mut pending = self
-                            .mesh
-                            .join
-                            .lock()
-                            .expect("join")
-                            .as_ref()
-                            .expect("join")
-                            .clone();
                         if rejected {
                             pending.phase = JoinPhase::Finished;
                             pending.state = state.into();
@@ -1110,7 +1354,6 @@ impl Core {
                                     ),
                             );
                         }
-                        *self.mesh.join.lock().expect("join") = Some(pending);
                     }
                 } else if !self.joining(&attempt.attempt) {
                     // Successful joins continue as ordinary READY workers; unpair closes them.
@@ -1162,7 +1405,7 @@ impl Core {
     }
 }
 fn join_value(join: &Join) -> Value {
-    json!({"attempt":join.attempt,"state":join.state,"name":join.uri.name,"fingerprint":join.uri.fingerprint,"role":"computer"})
+    json!({"attempt":join.attempt,"state":join.state,"name":join.uri.name,"fingerprint":join.uri.fingerprint,"role":"computer","setup_enabled":join.setup_scope})
 }
 fn join_error(error: &anyhow::Error) -> &'static str {
     if let Some(rejected) = error.downcast_ref::<PairRejected>() {
@@ -1237,6 +1480,7 @@ struct ComputerLink {
     address: String,
     permit: tokio::sync::OwnedSemaphorePermit,
     transport: tokio::sync::OwnedSemaphorePermit,
+    setup_sent: Option<(SetupHello, u64)>,
 }
 struct Connecting {
     core: Arc<Core>,
@@ -1282,6 +1526,7 @@ impl Drop for Registration {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::store::members::SetupFence;
     use async_trait::async_trait;
     struct Mock;
     #[async_trait]
@@ -1299,9 +1544,31 @@ mod tests {
             Ok(())
         }
     }
-    async fn core() -> Result<(tempfile::TempDir, Arc<Core>, TcpListener)> {
-        let dir = crate::test_support::scratch()?;
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+    struct Fixture {
+        directory: tempfile::TempDir,
+        // Core advertises its configured port even when no server is running.
+        // Keep the socket bound after a test drops/moves its serving handle, so
+        // another parallel fixture cannot inherit a still-advertised address.
+        listeners: Vec<std::net::TcpListener>,
+    }
+    impl Fixture {
+        fn path(&self) -> &std::path::Path {
+            self.directory.path()
+        }
+        fn listen(&mut self) -> Result<TcpListener> {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            listener.set_nonblocking(true)?;
+            let serving = TcpListener::from_std(listener.try_clone()?)?;
+            self.listeners.push(listener);
+            Ok(serving)
+        }
+    }
+    async fn core() -> Result<(Fixture, Arc<Core>, TcpListener)> {
+        let mut dir = Fixture {
+            directory: crate::test_support::scratch()?,
+            listeners: Vec::new(),
+        };
+        let listener = dir.listen()?;
         let paths = Paths {
             data: dir.path().join("data"),
             cache: dir.path().join("cache"),
@@ -1314,6 +1581,8 @@ mod tests {
             ..Config::default()
         };
         let core = Core::new(paths, config, Arc::new(Mock)).await?;
+        // These protocol mocks implement mesh/PEER_SETTINGS, not membership.
+        core.setup_test_capability.store(false, Ordering::SeqCst);
         eprintln!(
             "mock Core PID={} port={} directory={} (no mDNS)",
             std::process::id(),
@@ -1321,6 +1590,28 @@ mod tests {
             dir.path().display()
         );
         Ok((dir, core, listener))
+    }
+    #[tokio::test]
+    async fn fixture_reserves_advertised_port_after_listener_drop_and_server_shutdown() -> Result<()>
+    {
+        for serve in [false, true] {
+            let (_dir, core, listener) = core().await?;
+            let address = listener.local_addr()?;
+            assert_eq!(address.port(), core.bound_port());
+            if serve {
+                let server = Task::spawn(core.clone().serve(listener, false));
+                core.request_shutdown();
+                server.await??;
+            } else {
+                drop(listener);
+                core.shutdown_actions().await?;
+            }
+            // Model a competing fixture claiming this port at precisely the
+            // old drop-then-dial gap, without depending on kernel allocation.
+            let error = TcpListener::bind(address).await.unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        }
+        Ok(())
     }
     // Real mesh peers now also exchange settings. These mocks acknowledge
     // those independent frames while tests inspect pairing/heartbeat controls.
@@ -1348,6 +1639,36 @@ mod tests {
         a.persist_pairing(&b.identity.device_id, &b.identity.fingerprint, guard, false)
             .await
     }
+    #[tokio::test]
+    async fn setup_refusal_timestamp_survives_retry_and_clears_on_ready_or_repair() -> Result<()> {
+        let (_da, a, _la) = core().await?;
+        let (_db, b, _lb) = core().await?;
+        bind(&a, &b).await?;
+        let device = &b.identity.device_id;
+        let generation = a.store.pairing_generation(device).unwrap();
+        a.set_link_problem(device, generation, Some(LinkProblem::Unauthorized));
+        // Model an earlier authenticated refusal without a wall-clock sleep.
+        a.mesh
+            .links
+            .lock()
+            .unwrap()
+            .get_mut(device)
+            .unwrap()
+            .issue
+            .as_mut()
+            .unwrap()
+            .since = 42;
+        a.set_link_problem(device, generation, Some(LinkProblem::Unauthorized));
+        assert_eq!(a.ui_snapshot().setup_refusal_since, Some(42));
+        a.set_link_problem(device, generation, None);
+        assert_eq!(a.ui_snapshot().setup_refusal_since, None);
+        a.set_link_problem(device, generation, Some(LinkProblem::Unauthorized));
+        bind(&a, &b).await?;
+        assert_eq!(a.ui_snapshot().setup_refusal_since, None);
+        a.shutdown_actions().await?;
+        b.shutdown_actions().await
+    }
+
     #[tokio::test]
     async fn own_device_id_inbound_hello_rejected_before_pair_request() -> Result<()> {
         for known in [false, true] {
@@ -1443,6 +1764,7 @@ mod tests {
         for join in [false, true] {
             let (_da, a, la) = core().await?;
             let (_db, b, lb) = core().await?;
+            let lb = MockListener::new(lb);
             drop(la);
             let address = lb.local_addr()?.to_string();
             let uri = b
@@ -1473,16 +1795,20 @@ mod tests {
                     .await
                     .map(|_| ())
             };
+            let mock = mock_result(mock).await;
+            let outcome = format!("dial: {result:?}; mock: {mock:?}");
             assert!(
                 result
-                    .unwrap_err()
+                    .err()
+                    .context(outcome.clone())?
                     .downcast_ref::<crate::client::PcRejection>()
-                    .is_some_and(|e| e.0.code == ErrorCode::Unauthorized)
+                    .is_some_and(|e| e.0.code == ErrorCode::Unauthorized),
+                "{outcome}"
             );
             assert!(a.paired_devices().is_empty());
             assert!(a.store.peer_info().await?.is_empty());
             assert_eq!(a.store.pairing_generation(&a.identity.device_id), None);
-            mock.await??;
+            mock?;
             a.shutdown_actions().await?;
         }
         Ok(())
@@ -1511,6 +1837,7 @@ mod tests {
     async fn own_device_id_registration_rejected_before_session_state_changes() -> Result<()> {
         let (_da, a, la) = core().await?;
         let (_db, b, lb) = core().await?;
+        let lb = MockListener::new(lb);
         drop(la);
         let address = lb.local_addr()?.to_string();
         let pin = b.identity.fingerprint.clone();
@@ -1552,7 +1879,7 @@ mod tests {
     #[tokio::test]
     async fn settings_reconnect_wire_replay_is_deduplicated_and_unblocks_content_after_restart()
     -> Result<()> {
-        let (_da, mut a, mut la) = core().await?;
+        let (mut da, mut a, mut la) = core().await?;
         let (_db, b, lb) = core().await?;
         drop(lb);
         bind(&a, &b).await?;
@@ -1639,9 +1966,10 @@ mod tests {
             a.request_shutdown();
             server.await??;
             drop((tls, a));
-            la = TcpListener::bind("127.0.0.1:0").await?;
+            la = da.listen()?;
             config.port = la.local_addr()?.port();
             a = Core::new(paths, config, Arc::new(Mock)).await?;
+            a.setup_test_capability.store(false, Ordering::SeqCst);
         }
         a.shutdown_actions().await?;
         b.shutdown_actions().await
@@ -1674,7 +2002,7 @@ mod tests {
     async fn accept_join_request(
         a: &Core,
         b: &Core,
-        la: &TcpListener,
+        la: &MockListener,
     ) -> Result<TlsStream<TcpStream>> {
         let mut tls = accept_hello(a, la, None).await?;
         let token = match read_frame(&mut tls).await? {
@@ -1708,6 +2036,7 @@ mod tests {
     #[tokio::test]
     async fn pairing_connection_pong_is_not_established_evidence() -> Result<()> {
         let (_da, a, la) = core().await?;
+        let la = MockListener::new(la);
         let (_db, b, lb) = core().await?;
         drop(lb);
         let uri = a
@@ -1860,6 +2189,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_before_request_preserves_both_endpoints_other_bindings() -> Result<()> {
         let (_da, a, la) = core().await?;
+        let la = MockListener::new(la);
         let (_db, b, lb) = core().await?;
         let (_dc, c, lc) = core().await?;
         drop(lb);
@@ -1877,7 +2207,7 @@ mod tests {
         let supervisor = Task::spawn(b.clone().mesh_supervise());
         // Stall before TLS/HELLO, so cancellation races a live connection but
         // no PAIR_REQUEST can have been sent.
-        let (mut tcp, _) = la.accept().await?;
+        let (mut tcp, _) = accept_tls_tcp(&la).await?;
         b.cancel_join(attempt).await?;
         assert_eq!(b.join_status(attempt)?["state"], "cancelled");
         until(|| b.transports.available_permits() == TRANSPORT_LIMIT).await?;
@@ -1900,6 +2230,7 @@ mod tests {
     #[tokio::test]
     async fn incoming_replacement_survives_old_attempt_retry_on_both_endpoints() -> Result<()> {
         let (_da, a, la) = core().await?;
+        let la = MockListener::new(la);
         let (_db, b, lb) = core().await?;
         drop(lb);
         let uri = a
@@ -1951,6 +2282,7 @@ mod tests {
     #[tokio::test]
     async fn unrelated_pairing_does_not_void_install_fence() -> Result<()> {
         let (_da, a, la) = core().await?;
+        let la = MockListener::new(la);
         let (_db, b, lb) = core().await?;
         let (_dc, c, lc) = core().await?;
         drop(lb);
@@ -1988,6 +2320,7 @@ mod tests {
     async fn restart_abandons_attempt_and_fresh_invitation_reuses_unestablished_binding()
     -> Result<()> {
         let (_da, a, la) = core().await?;
+        let la = MockListener::new(la);
         let (_db, mut b, lb) = core().await?;
         drop(lb);
         let address = la.local_addr()?.to_string();
@@ -2015,17 +2348,22 @@ mod tests {
         b.store.drain().await;
         drop(b);
         b = Core::new(paths, config, Arc::new(Mock)).await?;
+        b.setup_test_capability.store(false, Ordering::SeqCst);
         assert!(b.join_status(attempt).is_err());
         assert!(!b.paths.data.join("join-pending.json").exists());
         let fresh = a.start_pairing_with_addresses(vec![address]).await?;
         assert_ne!(uri.token, fresh.token);
-        let server = Task::spawn(a.clone().serve(la, false));
+        let server = Task::spawn(a.clone().serve(la.into_inner(), false));
         let preview = b.join(&fresh.build()?).await?;
         let next = preview["attempt"].as_str().unwrap();
         b.confirm_join(next).await?;
         let pending = b.mesh.join.lock().unwrap().as_ref().unwrap().clone();
         let worker = Task::spawn(b.clone().join_worker(pending));
-        until(|| b.join_status(next).unwrap()["state"] == "paired").await?;
+        until(|| b.join_status(next).unwrap()["state"] == "paired" || worker.is_finished()).await?;
+        if b.join_status(next)?["state"] != "paired" {
+            worker.await??;
+            bail!("join worker ended before installation");
+        }
         assert_eq!(
             a.paired_devices(),
             std::slice::from_ref(&b.identity.device_id)
@@ -2047,6 +2385,7 @@ mod tests {
     #[tokio::test]
     async fn local_join_storage_error_preserves_supervisor_and_other_link() -> Result<()> {
         let (_da, a, la) = core().await?;
+        let la = MockListener::new(la);
         let (_db, b, lb) = core().await?;
         let (_dc, c, lc) = core().await?;
         drop(lb);
@@ -2100,7 +2439,7 @@ mod tests {
             })
             .await?;
         b.confirm_join(attempt).await?;
-        let a_server = Task::spawn(a.clone().serve(la, false));
+        let a_server = Task::spawn(a.clone().serve(la.into_inner(), false));
         until(|| b.join_status(attempt).unwrap()["state"] == "paired").await?;
         assert!(b.connected_devices().contains(&c.identity.device_id));
         assert!(b.paired_devices().contains(&a.identity.device_id));
@@ -2115,6 +2454,7 @@ mod tests {
     #[tokio::test]
     async fn cancellation_after_request_finishes_locally_without_unpair() -> Result<()> {
         let (_da, a, la) = core().await?;
+        let la = MockListener::new(la);
         let (_db, b, lb) = core().await?;
         drop(lb);
         let (_dc, c, lc) = core().await?;
@@ -2173,6 +2513,7 @@ mod tests {
     #[tokio::test]
     async fn lifecycle_change_while_pair_result_is_in_flight_cannot_install_trust() -> Result<()> {
         let (_da, a, la) = core().await?;
+        let la = MockListener::new(la);
         let (_db, b, lb) = core().await?;
         drop(lb);
         bind(&b, &a).await?;
@@ -2218,6 +2559,7 @@ mod tests {
     async fn storage_denial_and_missing_rejection_code_keep_same_attempt_retryable() -> Result<()> {
         for code in [Some(PairCode::StorageFailed), None] {
             let (_da, a, la) = core().await?;
+            let la = MockListener::new(la);
             let (_db, b, lb) = core().await?;
             drop(lb);
             let uri = a
@@ -2407,8 +2749,8 @@ mod tests {
             })
             .await?;
         let peer = a.store.peer_info().await?.remove(0);
-        // Only B listens: its HELLO-advertised physical addresses cannot reach
-        // A's absent listener. This deliberately exercises a lone higher dial.
+        // Only B serves: A keeps its advertised port reserved but never accepts
+        // reverse dials. This deliberately exercises a lone higher dial.
         let sb = tokio::spawn(b.clone().serve(listener_b, false));
         drop(listener_a);
         let (cancel, rx) = watch::channel(false);
@@ -2442,6 +2784,7 @@ mod tests {
         ] {
             let (_da, a, la) = core().await?;
             let (_db, b, lb) = core().await?;
+            let lb = MockListener::new(lb);
             let (_dc, c, lc) = core().await?;
             drop(la);
             drop(lc);
@@ -2517,12 +2860,9 @@ mod tests {
             tokio::time::advance(Duration::from_secs(120)).await;
             tokio::time::resume();
             a.mesh.changed.notify_waiters();
-            assert!(
-                tokio::time::timeout(Duration::from_millis(50), lb.accept())
-                    .await
-                    .is_err(),
-                "{failure} retried too soon"
-            );
+            no_tls_dial(&lb, Duration::from_millis(50))
+                .await
+                .with_context(|| format!("{failure} retried too soon"))?;
             cancel.send_replace(true);
             worker.await??;
             a.request_shutdown();
@@ -2606,6 +2946,7 @@ mod tests {
     async fn established_remote_revocation_is_detected_after_restart() -> Result<()> {
         let (_da, mut a, la) = core().await?;
         let (_db, b, lb) = core().await?;
+        let lb = MockListener::new(lb);
         drop(la);
         computer_route(&a, &b, lb.local_addr()?.to_string()).await?;
         bind(&b, &a).await?;
@@ -2631,7 +2972,8 @@ mod tests {
         // Remote revocation occurs while A is stopped.
         b.unpair_device(id).await?;
         a = Core::new(paths, config, Arc::new(Mock)).await?;
-        let server = Task::spawn(b.clone().serve(lb, false));
+        a.setup_test_capability.store(false, Ordering::SeqCst);
+        let server = Task::spawn(b.clone().serve(lb.into_inner(), false));
         let supervisor = Task::spawn(a.clone().mesh_supervise());
         until(|| a.paired_devices().is_empty()).await?;
         assert!(b.paired_devices().is_empty());
@@ -2646,6 +2988,7 @@ mod tests {
     async fn unconfirmed_reverse_dial_denial_after_restart_keeps_binding() -> Result<()> {
         let (_da, a, la) = core().await?;
         let (_db, b, lb) = core().await?;
+        let lb = MockListener::new(lb);
         drop(la);
         computer_route(&a, &b, lb.local_addr()?.to_string()).await?;
         let paths = a.paths.clone();
@@ -2655,6 +2998,7 @@ mod tests {
         a.store.drain().await;
         drop(a);
         let a = Core::new(paths, config, Arc::new(Mock)).await?;
+        a.setup_test_capability.store(false, Ordering::SeqCst);
         let peer = a.store.peer_info().await?.remove(0);
         let (cancel, rx) = watch::channel(false);
         let worker = Task::spawn(a.clone().dial_worker(peer, rx));
@@ -2682,14 +3026,14 @@ mod tests {
     }
     async fn accept_hello(
         core: &Core,
-        listener: &TcpListener,
+        listener: &MockListener,
         addresses: Option<Vec<String>>,
     ) -> Result<TlsStream<TcpStream>> {
         accept_hello_version(core, listener, addresses, 1).await
     }
     async fn accept_hello_version(
         core: &Core,
-        listener: &TcpListener,
+        listener: &MockListener,
         addresses: Option<Vec<String>>,
         version: u32,
     ) -> Result<TlsStream<TcpStream>> {
@@ -2700,20 +3044,118 @@ mod tests {
         send(&mut tls, &Message::Hello(hello)).await?;
         Ok(tls)
     }
+    type Candidate = futures_util::future::BoxFuture<
+        'static,
+        (TcpStream, SocketAddr, Vec<u8>, std::io::Result<()>),
+    >;
+    struct MockListener {
+        tcp: TcpListener,
+        candidates: tokio::sync::Mutex<futures_util::stream::FuturesUnordered<Candidate>>,
+    }
+    impl MockListener {
+        fn new(tcp: TcpListener) -> Self {
+            Self {
+                tcp,
+                candidates: tokio::sync::Mutex::new(futures_util::stream::FuturesUnordered::new()),
+            }
+        }
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            self.tcp.local_addr()
+        }
+        fn into_inner(self) -> TcpListener {
+            self.tcp
+        }
+    }
+    // Other host processes can reach these shared loopback listeners. Select
+    // the first handshake record carrying the dialers' encoded pneu.local SNI
+    // extension; rustls and the protocol assertions still validate that socket
+    // strictly, with no retry after selection. Concurrent reads let silent or
+    // partial candidates wait without polling or delaying another dialer.
+    // The listener owns candidate futures, preserving their sockets and read
+    // progress across selection or cancellation until the listener is dropped.
+    async fn accept_tls_tcp(listener: &MockListener) -> Result<(TcpStream, Vec<u8>)> {
+        use futures_util::{FutureExt, StreamExt};
+        use tokio::io::AsyncReadExt;
+        // server_name extension: type, extension length, list length, name type,
+        // name length, name. Match its encoding, not an arbitrary name substring.
+        const SNI: &[u8] = b"\x00\x00\x00\x0f\x00\x0d\x00\x00\x0apneu.local";
+        let local = listener.local_addr()?;
+        let mut candidates = listener.candidates.lock().await;
+        loop {
+            tokio::select! {
+                accepted = listener.tcp.accept() => {
+                    let (mut tcp, peer) = accepted?;
+                    candidates.push(async move {
+                        let mut prefix = vec![0; 1];
+                        let read = async {
+                            tcp.read_exact(&mut prefix).await?;
+                            if prefix[0] == 0x16 {
+                                prefix.resize(5, 0);
+                                tcp.read_exact(&mut prefix[1..]).await?;
+                                let len = usize::from(u16::from_be_bytes([prefix[3], prefix[4]]));
+                                prefix.resize(5 + len, 0);
+                                tcp.read_exact(&mut prefix[5..]).await?;
+                            }
+                            Ok::<_, std::io::Error>(())
+                        }.await;
+                        (tcp, peer, prefix, read)
+                    }.boxed());
+                }
+                Some((tcp, peer, prefix, read)) = candidates.next(), if !candidates.is_empty() => {
+                    match read {
+                        Ok(()) if prefix.windows(SNI.len()).any(|w| w == SNI) => {
+                            return Ok((tcp, prefix));
+                        }
+                        Ok(()) => eprintln!(
+                            "mock listener {local} dropped foreign connection from {peer}: \"{}\"",
+                            prefix[..prefix.len().min(32)].escape_ascii()
+                        ),
+                        Err(e) => eprintln!("mock listener {local} skipped connection from {peer}: {e}"),
+                    }
+                }
+            }
+        }
+    }
+    // A must-not-dial window: strays are filtered as above, but a TLS dialer
+    // that connects within it fails the caller's assertion.
+    async fn no_tls_dial(listener: &MockListener, window: Duration) -> Result<()> {
+        match tokio::time::timeout(window, accept_tls_tcp(listener)).await {
+            Err(_) => Ok(()),
+            Ok(Ok((tcp, _))) => bail!("unexpected TLS dial from {:?}", tcp.peer_addr()),
+            Ok(Err(e)) => Err(e),
+        }
+    }
+    // Await a mock peer with its own failure, so an unexpected dial outcome
+    // reports the cause rather than only a derived classification mismatch.
+    async fn mock_result(mock: Task) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(5), mock)
+            .await
+            .context("mock peer did not finish")??
+    }
     async fn accept_client_hello(
         core: &Core,
-        listener: &TcpListener,
+        listener: &MockListener,
     ) -> Result<TlsStream<TcpStream>> {
         let verifier = Arc::new(ClientVerifier::new(
             core.admission.clone(),
             core.provisional.clone(),
         ));
         let config = crate::tls::server_config(&core.identity, verifier.clone())?;
-        let (tcp, _) = listener.accept().await?;
-        let mut tls: TlsStream<TcpStream> = TlsAcceptor::from(Arc::new(config))
-            .accept(tcp)
-            .await?
-            .into();
+        let (tcp, prefix) = accept_tls_tcp(listener).await?;
+        // Feed exactly the inspected bytes to rustls, then continue its same
+        // handshake on the selected socket. Any TLS failure is returned.
+        let mut acceptor = rustls::server::Acceptor::default();
+        let mut prefix = std::io::Cursor::new(prefix);
+        let handshake = loop {
+            if prefix.position() == prefix.get_ref().len() as u64 {
+                break tokio_rustls::LazyConfigAcceptor::new(acceptor, tcp).await?;
+            }
+            acceptor.read_tls(&mut prefix)?;
+            if let Some(accepted) = acceptor.accept().map_err(|(error, _alert)| error)? {
+                break tokio_rustls::StartHandshake::from_parts(accepted, tcp);
+            }
+        };
+        let mut tls: TlsStream<TcpStream> = handshake.into_stream(Arc::new(config)).await?.into();
         assert!(matches!(
             read_frame(&mut tls).await?,
             Some(Message::Hello(_))
@@ -2723,7 +3165,7 @@ mod tests {
     }
     async fn accept_ready(
         core: &Core,
-        listener: &TcpListener,
+        listener: &MockListener,
         addresses: Option<Vec<String>>,
     ) -> Result<TlsStream<TcpStream>> {
         let mut tls = accept_hello(core, listener, addresses).await?;
@@ -2732,6 +3174,229 @@ mod tests {
         };
         send(&mut tls, &Message::Pong(ping)).await?;
         Ok(tls)
+    }
+    #[tokio::test]
+    async fn mock_accept_skips_foreign_loopback_connections_queued_before_the_dialer() -> Result<()>
+    {
+        let (_da, a, _la) = core().await?;
+        let (_db, b, lb) = core().await?;
+        let lb = MockListener::new(lb);
+        bind(&a, &b).await?;
+        let address = lb.local_addr()?.to_string();
+        // Queue foreign connections first, including partial records that must
+        // neither spin nor delay selection, and a real ClientHello for localhost.
+        let mut plaintext = TcpStream::connect(&address).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut plaintext, b"GET / HTTP/1.1\r\n").await?;
+        let mut probe = TcpStream::connect(&address).await?;
+        let config = crate::tls::client_config(&a.identity, b.identity.fingerprint.clone())?;
+        let mut client = rustls::ClientConnection::new(
+            Arc::new(config),
+            rustls::pki_types::ServerName::try_from("localhost")?,
+        )?;
+        let mut hello = Vec::new();
+        client.write_tls(&mut hello)?;
+        tokio::io::AsyncWriteExt::write_all(&mut probe, &hello).await?;
+        let mut partial_header = TcpStream::connect(&address).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut partial_header, &[0x16, 0x03]).await?;
+        let mut partial_body = TcpStream::connect(&address).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut partial_body, &[0x16, 0x03, 0x01, 0x00, 0x20])
+            .await?;
+        let mut closed_header = TcpStream::connect(&address).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut closed_header, &[0x16]).await?;
+        tokio::io::AsyncWriteExt::shutdown(&mut closed_header).await?;
+        // The name outside an encoded SNI extension is not a dialer marker.
+        let mut name_only = TcpStream::connect(&address).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut name_only, b"\x16\x03\x01\x00\x0apneu.local")
+            .await?;
+        let mut silent = TcpStream::connect(&address).await?;
+        drop(TcpStream::connect(&address).await?);
+        let mock_core = b.clone();
+        let mock = Task::spawn(async move { accept_hello(&mock_core, &lb, None).await.map(drop) });
+        let link = tokio::time::timeout(
+            Duration::from_secs(5),
+            a.connect_computer(
+                &[address],
+                b.identity.fingerprint.clone(),
+                Some(&b.identity.device_id),
+            ),
+        )
+        .await??;
+        assert_eq!(link.hello.device_id, b.identity.device_id);
+        mock_result(mock).await?;
+        for stray in [
+            &mut plaintext,
+            &mut probe,
+            &mut partial_header,
+            &mut partial_body,
+            &mut closed_header,
+            &mut name_only,
+            &mut silent,
+        ] {
+            let mut bytes = Vec::new();
+            // A reset (unread data) or EOF both mean the mock closed it.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::io::AsyncReadExt::read_to_end(stray, &mut bytes),
+            )
+            .await
+            .context("stray connection left open")?;
+            assert!(bytes.is_empty());
+        }
+        drop(link);
+        // The must-not-dial helper retains pending candidates on timeout;
+        // dropping the listener closes them without background tasks.
+        let listener = MockListener::new(TcpListener::bind("127.0.0.1:0").await?);
+        let mut stalled = TcpStream::connect(listener.local_addr()?).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut stalled, &[0x16, 0x03]).await?;
+        no_tls_dial(&listener, Duration::from_millis(50)).await?;
+        let mut byte = [0];
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                tokio::io::AsyncReadExt::read(&mut stalled, &mut byte),
+            )
+            .await
+            .is_err(),
+            "must-not-dial timeout dropped a pending candidate"
+        );
+        drop(listener);
+        let mut bytes = Vec::new();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read_to_end(&mut stalled, &mut bytes),
+        )
+        .await
+        .context("dropped listener left a candidate open")?;
+        assert!(bytes.is_empty());
+        let listener = MockListener::new(TcpListener::bind("127.0.0.1:0").await?);
+        let config = crate::tls::client_config(&a.identity, b.identity.fingerprint.clone())?;
+        let mut client = rustls::ClientConnection::new(
+            Arc::new(config),
+            rustls::pki_types::ServerName::try_from("pneu.local")?,
+        )?;
+        let mut hello = Vec::new();
+        client.write_tls(&mut hello)?;
+        let mut dialer = TcpStream::connect(listener.local_addr()?).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut dialer, &hello).await?;
+        let error = no_tls_dial(&listener, Duration::from_millis(50))
+            .await
+            .expect_err("must-not-dial window accepted a dialer");
+        assert!(error.to_string().contains("unexpected TLS dial"));
+        a.shutdown_actions().await?;
+        b.shutdown_actions().await
+    }
+    #[tokio::test]
+    async fn mock_accept_preserves_queued_legitimate_dialers_across_accepts() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (_da, a, _la) = core().await?;
+        let (_db, b, listener) = core().await?;
+        let listener = MockListener::new(listener);
+        let config = crate::tls::client_config(&a.identity, b.identity.fingerprint.clone())?;
+        let mut client = rustls::ClientConnection::new(
+            Arc::new(config),
+            rustls::pki_types::ServerName::try_from("pneu.local")?,
+        )?;
+        let mut hello = Vec::new();
+        client.write_tls(&mut hello)?;
+        let address = listener.local_addr()?;
+        let mut stray = TcpStream::connect(address).await?;
+        stray.write_all(b"GET / HTTP/1.1\r\n").await?;
+        let mut partial = TcpStream::connect(address).await?;
+        partial.write_all(&hello[..2]).await?;
+        let mut accepting = Box::pin(accept_tls_tcp(&listener));
+        // Keep an already-accepted legitimate candidate pending while other
+        // complete ClientHellos queue up behind it.
+        assert!(futures_util::poll!(accepting.as_mut()).is_pending());
+        let mut dialers = vec![partial];
+        for _ in 0..3 {
+            let mut dialer = TcpStream::connect(address).await?;
+            dialer.write_all(&hello).await?;
+            dialers.push(dialer);
+        }
+        let first = tokio::time::timeout(Duration::from_secs(2), accepting).await??;
+        dialers[0].write_all(&hello[2..]).await?;
+        for (index, dialer) in dialers.iter_mut().enumerate() {
+            dialer.write_all(&[index as u8]).await?;
+        }
+        let mut accepted = vec![first];
+        for _ in 1..dialers.len() {
+            accepted.push(
+                tokio::time::timeout(Duration::from_secs(2), accept_tls_tcp(&listener))
+                    .await
+                    .context("queued legitimate dialer was dropped")??,
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (mut tcp, prefix) in accepted {
+            assert_eq!(prefix, hello);
+            let mut marker = [0];
+            tokio::time::timeout(Duration::from_secs(2), tcp.read_exact(&mut marker)).await??;
+            let index = usize::from(marker[0]);
+            assert_eq!(tcp.peer_addr()?, dialers[index].local_addr()?);
+            assert!(seen.insert(index), "dialer accepted twice");
+        }
+        assert_eq!(seen.len(), dialers.len());
+        let mut bytes = Vec::new();
+        // A foreign connection may close with either EOF or a reset.
+        let _ = tokio::time::timeout(Duration::from_secs(2), stray.read_to_end(&mut bytes))
+            .await
+            .context("foreign stray left open")?;
+        assert!(bytes.is_empty());
+        a.shutdown_actions().await?;
+        b.shutdown_actions().await
+    }
+    #[tokio::test]
+    async fn mock_accept_fails_on_the_selected_tls_connection_without_skipping() -> Result<()> {
+        let (_da, a, _la) = core().await?;
+        let (_db, b, lb) = core().await?;
+        let lb = MockListener::new(lb);
+        let address = lb.local_addr()?.to_string();
+        // Skip plaintext first, then select a record with the encoded SNI but
+        // a truncated ClientHello body. Its TLS error must surface, not retry.
+        let mut plaintext = TcpStream::connect(&address).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut plaintext, b"GET / HTTP/1.1\r\n").await?;
+        let body = [
+            &[0x01, 0x00, 0x00, 0x15, 0x03, 0x03][..],
+            b"\x00\x00\x00\x0f\x00\x0d\x00\x00\x0apneu.local",
+        ]
+        .concat();
+        let record = [&[0x16, 0x03, 0x01, 0x00, body.len() as u8][..], &body].concat();
+        let mut corrupt = TcpStream::connect(&address).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut corrupt, &record[..2]).await?;
+        let mut accepted = Box::pin(accept_client_hello(&b, &lb));
+        assert!(futures_util::poll!(accepted.as_mut()).is_pending());
+        tokio::io::AsyncWriteExt::write_all(&mut corrupt, &record[2..]).await?;
+        let error = tokio::time::timeout(Duration::from_secs(2), accepted)
+            .await
+            .context("corrupt TLS connection was skipped")?
+            .err()
+            .context("corrupt TLS connection was accepted")?;
+        assert!(
+            matches!(
+                error.downcast_ref::<rustls::Error>(),
+                Some(rustls::Error::InvalidMessage(
+                    rustls::InvalidMessage::MissingData("Random")
+                ))
+            ),
+            "unexpected selected TLS error: {error:?}"
+        );
+        // A real dialer pinning the wrong fingerprint fails the handshake.
+        let pin = Hash::new("a".repeat(64))?;
+        let addresses = [address];
+        let (accepted, dialed) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(2), accept_client_hello(&b, &lb)),
+            a.connect_computer(&addresses, pin, None)
+        );
+        assert!(
+            accepted
+                .context("wrong-pin TLS connection was skipped")?
+                .is_err()
+        );
+        assert!(dialed.is_err());
+        drop(corrupt);
+        a.shutdown_actions().await?;
+        b.shutdown_actions().await
     }
     async fn computer_route(a: &Core, b: &Core, address: String) -> Result<()> {
         bind(a, b).await?;
@@ -2744,6 +3409,366 @@ mod tests {
                 Ok(())
             })
             .await
+    }
+    async fn resume_test_link(core: Arc<Core>, address: String, pin: Hash) -> Result<()> {
+        let captured = core.store.with_current_pairing();
+        let ComputerLink {
+            mut tls,
+            hello,
+            remote,
+            permit,
+            transport: _transport,
+            setup_sent,
+            ..
+        } = core.connect_computer(&[address], pin.clone(), None).await?;
+        let buffered = core.confirm_peer_ready(&mut tls).await?;
+        core.register_buffered_setup(
+            tls, hello, pin, remote, permit, captured, true, false, buffered, None, setup_sent,
+        )
+        .await
+    }
+    #[tokio::test]
+    async fn resume_bulk_pending_cancels_reconnect_without_blocking_reports() -> Result<()> {
+        let (dir, a, la) = core().await?;
+        let (_db, b, lb) = core().await?;
+        drop(la);
+        let address = lb.local_addr()?.to_string();
+        computer_route(&a, &b, address.clone()).await?;
+        bind(&b, &a).await?;
+        let device = b.identity.device_id.clone();
+        let generation = a.store.pairing_generation(&device).unwrap();
+        let peer = device.clone();
+        a.store
+            .call(move |c| {
+                let tx = c.transaction()?;
+                for n in 0..64u8 {
+                    tx.execute(
+                        "INSERT INTO file_pending_cancels(device,id,generation) VALUES(?,?,?)",
+                        rusqlite::params![
+                            peer.as_str(),
+                            Id::from_bytes([n; 16]).as_str(),
+                            generation as i64
+                        ],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .await?;
+        let source = dir.path().join("after-cancels.txt");
+        std::fs::write(&source, b"connection is usable")?;
+        let server = Task::spawn(b.clone().serve(lb, false));
+        let link = Task::spawn(resume_test_link(
+            a.clone(),
+            address,
+            b.identity.fingerprint.clone(),
+        ));
+        let completed: Result<()> = async {
+            let drained = tokio::time::timeout(Duration::from_secs(10), async {
+                while !a
+                    .outbox
+                    .pending_cancels(device.clone(), generation)
+                    .await?
+                    .is_empty()
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            ensure!(
+                drained.is_ok(),
+                "64 pending cancels must drain reports: {} intents remain",
+                a.outbox
+                    .pending_cancels(device.clone(), generation)
+                    .await?
+                    .len()
+            );
+            drained??;
+            // HELLO has now established file support. The connection must
+            // remain usable after draining all 64 cancellation reports.
+            let reply = a
+                .send_files(vec![source], crate::outbox::Targets::Devices(vec![device]))
+                .await?;
+            let operation = Id::new(reply["operation"].as_str().unwrap().to_owned())?;
+            until(|| {
+                a.ui_snapshot()
+                    .transfers
+                    .iter()
+                    .any(|t| t.operation == operation && t.state == "sent")
+            })
+            .await?;
+            Ok(())
+        }
+        .await;
+        a.request_shutdown();
+        b.request_shutdown();
+        server.await??;
+        let _ = tokio::time::timeout(Duration::from_secs(5), link).await?;
+        a.shutdown_actions().await?;
+        b.shutdown_actions().await?;
+        completed?;
+        assert_eq!(
+            std::fs::read(b.config().save_path.join("after-cancels.txt"))?,
+            b"connection is usable"
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn desktop_resume_after_connection_drop_preserves_exact_file() -> Result<()> {
+        let (da, a, la) = core().await?;
+        let (_db, b, lb) = core().await?;
+        drop(la);
+        let address = lb.local_addr()?.to_string();
+        computer_route(&a, &b, address.clone()).await?;
+        bind(&b, &a).await?;
+        a.set_setting("queue_offline".into(), false.into()).await?;
+        *b.file_write_delay.lock().unwrap() = Duration::from_millis(15);
+        let server = Task::spawn(b.clone().serve(lb, false));
+        let dialing = a.clone();
+        let route = address.clone();
+        let pin = b.identity.fingerprint.clone();
+        let first = Task::spawn(resume_test_link(dialing, route, pin));
+        until(|| a.connected_devices().contains(&b.identity.device_id)).await?;
+        let bytes: Vec<u8> = (0..12 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let source = da.path().join("resume.bin");
+        std::fs::write(&source, &bytes)?;
+        let mut events = b.subscribe();
+        let reply = a
+            .send_files(
+                vec![source],
+                crate::outbox::Targets::Devices(vec![b.identity.device_id.clone()]),
+            )
+            .await?;
+        let operation = Id::new(reply["operation"].as_str().unwrap().to_owned())?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Event::TransferProgress { received, .. } = events.recv().await?
+                    && received >= 5 * 1024 * 1024
+                {
+                    break;
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        b.sessions.lock().unwrap().sessions[&a.identity.device_id]
+            .close
+            .send_replace(Some(CloseReason::Error(ErrorCode::Closing)));
+        let _ = first.await?;
+        until(|| {
+            a.ui_snapshot()
+                .transfers
+                .iter()
+                .any(|t| t.operation == operation && t.state == "failed")
+        })
+        .await?;
+        until(|| b.connected_devices().is_empty()).await?;
+        tokio::time::timeout(Duration::from_secs(10), b.store.drain()).await?;
+        let sender = a.identity.device_id.clone();
+        let durable = b
+            .store
+            .call(move |c| {
+                let record: String = c.query_row(
+                    "SELECT record FROM file_partials WHERE device=?",
+                    [sender.as_str()],
+                    |r| r.get(0),
+                )?;
+                Ok(serde_json::from_str::<Value>(&record)?["offset"]
+                    .as_u64()
+                    .unwrap())
+            })
+            .await?;
+        assert!(
+            durable > 0 && durable < bytes.len() as u64,
+            "durable prefix {durable}"
+        );
+        // A sender can be ahead of the receiver's fsynced prefix. Deliberately
+        // persist a misleading UI offset; READY must still select the suffix.
+        let advisory_offset = bytes.len() as i64;
+        a.store
+            .call(move |c| {
+                c.execute(
+                    "UPDATE outbox_deliveries SET sent=? WHERE state='failed'",
+                    [advisory_offset],
+                )?;
+                Ok(())
+            })
+            .await?;
+        let mut events = b.subscribe();
+        a.retry_transfer(operation.clone(), b.identity.device_id.clone())
+            .await?;
+        let dialing = a.clone();
+        let pin = b.identity.fingerprint.clone();
+        let second = Task::spawn(resume_test_link(dialing, address, pin));
+        let resumed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Event::TransferProgress { received, .. } = events.recv().await? {
+                    return Ok::<_, anyhow::Error>(received);
+                }
+            }
+        })
+        .await??;
+        assert_eq!(
+            resumed, durable,
+            "first receiver progress is the READY offset"
+        );
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !a
+                .ui_snapshot()
+                .transfers
+                .iter()
+                .any(|t| t.operation == operation && t.state == "sent")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(
+            std::fs::read(b.config().save_path.join("resume.bin"))?,
+            bytes
+        );
+        a.request_shutdown();
+        b.request_shutdown();
+        server.await??;
+        let _ = tokio::time::timeout(Duration::from_secs(5), second).await?;
+        a.shutdown_actions().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn folder_resume_after_connection_drop_preserves_exact_tree() -> Result<()> {
+        let (da, a, la) = core().await?;
+        let (_db, b, lb) = core().await?;
+        drop(la);
+        let address = lb.local_addr()?.to_string();
+        computer_route(&a, &b, address.clone()).await?;
+        bind(&b, &a).await?;
+        a.set_setting("queue_offline".into(), false.into()).await?;
+        *b.file_write_delay.lock().unwrap() = Duration::from_millis(15);
+        let server = Task::spawn(b.clone().serve(lb, false));
+        let dialing = a.clone();
+        let route = address.clone();
+        let pin = b.identity.fingerprint.clone();
+        let first = Task::spawn(resume_test_link(dialing, route, pin));
+        until(|| a.connected_devices().contains(&b.identity.device_id)).await?;
+        let bytes: Vec<u8> = (0..12 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let source = da.path().join("Trip");
+        std::fs::create_dir_all(source.join("empty/nested"))?;
+        std::fs::create_dir_all(source.join("docs"))?;
+        std::fs::write(source.join("first.txt"), b"first")?;
+        std::fs::write(source.join("docs/resume.bin"), &bytes)?;
+        std::fs::write(source.join("zero"), b"")?;
+        let mut events = b.subscribe();
+        let reply = a
+            .send_files(
+                vec![source],
+                crate::outbox::Targets::Devices(vec![b.identity.device_id.clone()]),
+            )
+            .await?;
+        let operation = Id::new(reply["operation"].as_str().unwrap().to_owned())?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Event::TransferProgress { received, .. } = events.recv().await?
+                    && received >= 5 * 1024 * 1024
+                {
+                    break;
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        b.sessions.lock().unwrap().sessions[&a.identity.device_id]
+            .close
+            .send_replace(Some(CloseReason::Error(ErrorCode::Closing)));
+        let _ = first.await?;
+        until(|| {
+            a.ui_snapshot()
+                .transfers
+                .iter()
+                .any(|t| t.operation == operation && t.state == "failed")
+        })
+        .await?;
+        until(|| b.connected_devices().is_empty()).await?;
+        tokio::time::timeout(Duration::from_secs(10), b.store.drain()).await?;
+        let sender = a.identity.device_id.clone();
+        let durable = b
+            .store
+            .call(move |c| {
+                let record: String = c.query_row(
+                    "SELECT record FROM file_partials WHERE device=?",
+                    [sender.as_str()],
+                    |r| r.get(0),
+                )?;
+                Ok(serde_json::from_str::<Value>(&record)?["offset"]
+                    .as_u64()
+                    .unwrap())
+            })
+            .await?;
+        assert!(
+            durable > 0 && durable < bytes.len() as u64,
+            "durable prefix {durable}"
+        );
+        // A sender can be ahead of the receiver's fsynced prefix. Deliberately
+        // persist a misleading UI offset; READY must still select the suffix.
+        let advisory_offset = bytes.len() as i64;
+        a.store
+            .call(move |c| {
+                c.execute(
+                    "UPDATE outbox_deliveries SET sent=? WHERE state='failed'",
+                    [advisory_offset],
+                )?;
+                Ok(())
+            })
+            .await?;
+        let mut events = b.subscribe();
+        a.retry_transfer(operation.clone(), b.identity.device_id.clone())
+            .await?;
+        let dialing = a.clone();
+        let pin = b.identity.fingerprint.clone();
+        let second = Task::spawn(resume_test_link(dialing, address, pin));
+        let resumed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Event::TransferProgress { received, .. } = events.recv().await? {
+                    return Ok::<_, anyhow::Error>(received);
+                }
+            }
+        })
+        .await??;
+        assert_eq!(
+            resumed, durable,
+            "first receiver progress is the READY offset"
+        );
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !a
+                .ui_snapshot()
+                .transfers
+                .iter()
+                .any(|t| t.operation == operation && t.state == "sent")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(
+            std::fs::read(b.config().save_path.join("Trip/docs/resume.bin"))?,
+            bytes
+        );
+        assert_eq!(
+            std::fs::read(b.config().save_path.join("Trip/first.txt"))?,
+            b"first"
+        );
+        assert!(b.config().save_path.join("Trip/empty/nested").is_dir());
+        assert_eq!(
+            std::fs::metadata(b.config().save_path.join("Trip/zero"))?.len(),
+            0
+        );
+        a.request_shutdown();
+        b.request_shutdown();
+        server.await??;
+        let _ = tokio::time::timeout(Duration::from_secs(5), second).await?;
+        a.shutdown_actions().await?;
+        b.shutdown_actions().await?;
+        Ok(())
     }
     #[tokio::test]
     async fn sixteen_stalled_computers_leave_inbound_phone_admission_available() -> Result<()> {
@@ -2764,7 +3789,7 @@ mod tests {
         drop(initial);
         until(|| a.connected_devices().is_empty()).await?;
 
-        let stalled = TcpListener::bind("127.0.0.1:0").await?;
+        let stalled = MockListener::new(TcpListener::bind("127.0.0.1:0").await?);
         let mut peers = Vec::new();
         for _ in 0..16 {
             let device = Id::new(crate::random_hex(16))?;
@@ -2798,7 +3823,7 @@ mod tests {
         let mut stalled_sockets = Vec::new();
         for _ in 0..OUTBOUND_ADMISSION_LIMIT {
             stalled_sockets.push(
-                tokio::time::timeout(Duration::from_secs(2), stalled.accept())
+                tokio::time::timeout(Duration::from_secs(2), accept_tls_tcp(&stalled))
                     .await??
                     .0,
             );
@@ -2845,6 +3870,7 @@ mod tests {
     async fn outbound_legacy_hello_ignores_role_and_address_hints_before_pairing() -> Result<()> {
         let (_da, a, la) = core().await?;
         let (_db, b, lb) = core().await?;
+        let lb = MockListener::new(lb);
         drop(la);
         let address = lb.local_addr()?.to_string();
         let responder = b.clone();
@@ -2903,9 +3929,9 @@ mod tests {
         let (_da, a, la) = core().await?;
         let (_db, b, lb) = core().await?;
         drop((la, lb));
-        let first = TcpListener::bind("127.0.0.1:0").await?;
-        let second = TcpListener::bind("127.0.0.1:0").await?;
-        let other = TcpListener::bind("127.0.0.1:0").await?;
+        let first = MockListener::new(TcpListener::bind("127.0.0.1:0").await?);
+        let second = MockListener::new(TcpListener::bind("127.0.0.1:0").await?);
+        let other = MockListener::new(TcpListener::bind("127.0.0.1:0").await?);
         let reserved = a
             .outbound_ingress
             .clone()
@@ -2924,7 +3950,7 @@ mod tests {
                 .map(|_| ())
         });
         let (first_socket, _) =
-            tokio::time::timeout(Duration::from_secs(2), first.accept()).await??;
+            tokio::time::timeout(Duration::from_secs(2), accept_tls_tcp(&first)).await??;
         let addresses = [other.local_addr()?.to_string()];
         let mut queued =
             Box::pin(a.connect_computer(&addresses, b.identity.fingerprint.clone(), None));
@@ -2934,19 +3960,15 @@ mod tests {
         let (other_socket, _) = tokio::time::timeout(Duration::from_secs(2), async {
             tokio::select! {
                 result = &mut queued => bail!("queued handshake unexpectedly finished: {}", result.is_ok()),
-                accepted = other.accept() => Ok(accepted?),
+                accepted = accept_tls_tcp(&other) => accepted,
             }
         }).await??;
         // The sweep must yield to the earlier waiter, rather than retain a
         // permit while opening its second route.
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), second.accept())
-                .await
-                .is_err()
-        );
+        no_tls_dial(&second, Duration::from_millis(50)).await?;
         drop((queued, other_socket));
         let (second_socket, _) =
-            tokio::time::timeout(Duration::from_secs(2), second.accept()).await??;
+            tokio::time::timeout(Duration::from_secs(2), accept_tls_tcp(&second)).await??;
         sweep.abort();
         let _ = sweep.await;
         drop((reserved, second_socket));
@@ -2963,6 +3985,7 @@ mod tests {
     async fn authenticated_inbound_recovery_cancels_error_backoff_and_drop_redials() -> Result<()> {
         let (_da, a, la) = core().await?;
         let (_db, b, lb) = core().await?;
+        let lb = MockListener::new(lb);
         computer_route(&a, &b, lb.local_addr()?.to_string()).await?;
         bind(&b, &a).await?;
         let generation = a.store.pairing_generation(&b.identity.device_id).unwrap();
@@ -2977,11 +4000,7 @@ mod tests {
         tokio::task::yield_now().await;
         for _ in 0..3 {
             a.mesh.changed.notify_waiters();
-            assert!(
-                tokio::time::timeout(Duration::from_millis(50), lb.accept())
-                    .await
-                    .is_err()
-            );
+            no_tls_dial(&lb, Duration::from_millis(50)).await?;
         }
         let ComputerLink {
             mut tls,
@@ -3031,6 +4050,7 @@ mod tests {
     async fn dialer_keepalive_answers_then_times_out_without_pong() -> Result<()> {
         let (_da, a, la) = core().await?;
         let (_db, b, lb) = core().await?;
+        let lb = MockListener::new(lb);
         drop(la);
         computer_route(&a, &b, lb.local_addr()?.to_string()).await?;
         bind(&b, &a).await?;
@@ -3101,9 +4121,10 @@ mod tests {
     #[tokio::test]
     async fn network_loss_redials_using_changed_hello_address() -> Result<()> {
         let (_da, a, la) = core().await?;
-        let (_db, b, old) = core().await?;
+        let (mut db, b, old) = core().await?;
+        let old = MockListener::new(old);
         drop(la);
-        let moved = TcpListener::bind("127.0.0.1:0").await?;
+        let moved = db.listen()?;
         let address = moved.local_addr()?.to_string();
         computer_route(&a, &b, old.local_addr()?.to_string()).await?;
         bind(&b, &a).await?;
@@ -3125,7 +4146,14 @@ mod tests {
         })
         .await?;
         drop(tls);
-        drop(old);
+        // Keep the stale route owned, but reject its dials immediately so the
+        // cached last-good address cannot stall recovery to the moved server.
+        let _old_server = Task::spawn(async move {
+            loop {
+                let (socket, _) = accept_tls_tcp(&old).await?;
+                drop(socket);
+            }
+        });
         let server = Task::spawn(b.clone().serve(moved, false));
         until(|| {
             a.sessions
@@ -3152,12 +4180,13 @@ mod tests {
     -> Result<()> {
         let (_da, a, la) = core().await?;
         let (_db, b, lb) = core().await?;
+        let lb = MockListener::new(lb);
         drop(la);
         computer_route(&a, &b, lb.local_addr()?.to_string()).await?;
         bind(&b, &a).await?;
         let supervisor = Task::spawn(a.clone().mesh_supervise());
         // Stall TLS after TCP admission. The snapshot exposes an active dial.
-        let (tcp, _) = lb.accept().await?;
+        let (tcp, _) = accept_tls_tcp(&lb).await?;
         until(|| {
             a.ui_snapshot()
                 .devices
@@ -3199,6 +4228,7 @@ mod tests {
     #[tokio::test]
     async fn pending_join_recovers_lost_result_and_buffers_ready_before_binding() -> Result<()> {
         let (_da, a, la) = core().await?;
+        let la = MockListener::new(la);
         let (_db, b, lb) = core().await?;
         drop(lb);
         let uri = a
@@ -3232,6 +4262,7 @@ mod tests {
             Some(Message::PairRequest(p)) if p.token == uri.token
         ));
         let clip = Clipboard {
+            sensitive: false,
             transfer_id: Id::new(crate::random_hex(16))?,
             text: "buffer me".into(),
             created_at: crate::now_ms(),
@@ -3283,6 +4314,7 @@ mod tests {
     #[tokio::test]
     async fn supervisor_recovers_join_and_dial_panics_without_leaking_children() -> Result<()> {
         let (_da, a, la) = core().await?;
+        let la = MockListener::new(la);
         let (_db, b, lb) = core().await?;
         drop(lb);
         let uri = a
@@ -3302,7 +4334,7 @@ mod tests {
             .await
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         drop(tls);
-        let server = Task::spawn(a.clone().serve(la, false));
+        let server = Task::spawn(a.clone().serve(la.into_inner(), false));
         until(|| a.connected_devices().len() == 1 && b.connected_devices().len() == 1).await?;
         assert_eq!(b.join_status(attempt)?["state"], "paired");
         // An actual worker panic is collected, then the supervisor replaces it.
@@ -3448,6 +4480,7 @@ mod tests {
     async fn invitation_versions_are_distinct_from_malformed_links_without_dialing() -> Result<()> {
         let (_da, a, _la) = core().await?;
         let (_db, b, lb) = core().await?;
+        let lb = MockListener::new(lb);
         let uri = b
             .start_pairing_with_addresses(vec![lb.local_addr()?.to_string()])
             .await?
@@ -3467,11 +4500,7 @@ mod tests {
             assert!(a.mesh.join.lock().unwrap().is_none());
         }
         assert_eq!(a.join("unrelated clipboard").await?["state"], "no_link");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), lb.accept())
-                .await
-                .is_err()
-        );
+        no_tls_dial(&lb, Duration::from_millis(50)).await?;
         assert!(a.paired_devices().is_empty());
         a.shutdown_actions().await?;
         b.shutdown_actions().await
@@ -3482,6 +4511,7 @@ mod tests {
         let (_db, b, _lb) = core().await?;
         bind(&a, &b).await?;
         let mut peer = a.store.peer_info().await?.remove(0);
+        peer.route_proven = true;
         peer.addresses = vec![
             "192.0.2.1:47821".into(), // last-good
             "192.0.2.2:47821".into(), // HELLO hint
@@ -3516,6 +4546,13 @@ mod tests {
             routes[1..]
                 .iter()
                 .all(|route| route.connect_timeout == Duration::from_secs(1))
+        );
+        peer.route_proven = false;
+        assert!(
+            a.dial_candidates(&peer)
+                .iter()
+                .all(|route| route.connect_timeout == Duration::from_secs(1)),
+            "forwarded hints have no proven last-good route"
         );
         a.shutdown_actions().await?;
         b.shutdown_actions().await
@@ -3592,7 +4629,7 @@ mod tests {
     #[tokio::test]
     async fn dial_sweep_deadline_cancels_an_active_handshake_after_admission_wait() -> Result<()> {
         let (_da, a, _la) = core().await?;
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let listener = MockListener::new(TcpListener::bind("127.0.0.1:0").await?);
         let reserved = a
             .outbound_ingress
             .clone()
@@ -3609,7 +4646,7 @@ mod tests {
         let (socket, _) = tokio::time::timeout(Duration::from_secs(2), async {
             tokio::select! {
                 _ = &mut dial => bail!("dial ended before TCP accept"),
-                accepted = listener.accept() => Ok(accepted?),
+                accepted = accept_tls_tcp(&listener) => accepted,
             }
         })
         .await??;
@@ -3703,9 +4740,10 @@ mod tests {
         ] {
             let (_da, a, _la) = core().await?;
             let (_db, b, lb) = core().await?;
+            let lb = MockListener::new(lb);
             bind(&a, &b).await?;
             let generation = a.store.pairing_generation(&b.identity.device_id);
-            let fallback = TcpListener::bind("127.0.0.1:0").await?;
+            let fallback = MockListener::new(TcpListener::bind("127.0.0.1:0").await?);
             let addresses = [
                 lb.local_addr()?.to_string(),
                 fallback.local_addr()?.to_string(),
@@ -3752,35 +4790,38 @@ mod tests {
                     Some(&b.identity.device_id),
                 )
                 .await;
+            let mock = mock_result(mock).await;
+            let outcome = format!(
+                "{variant}: dial: {:?}; mock: {mock:?}",
+                result.as_ref().err()
+            );
             if variant == "invalid_capability" {
                 assert!(
                     result
                         .err()
-                        .unwrap()
+                        .context(outcome.clone())?
                         .downcast_ref::<ProtocolError>()
-                        .is_some()
+                        .is_some(),
+                    "{outcome}"
                 );
             } else if matches!(variant, "missing_role" | "phone_role") {
                 assert!(
                     result
                         .err()
-                        .unwrap()
+                        .context(outcome.clone())?
                         .downcast_ref::<crate::client::PcRejection>()
-                        .is_some_and(|e| e.0.code == ErrorCode::MalformedMessage)
+                        .is_some_and(|e| e.0.code == ErrorCode::MalformedMessage),
+                    "{outcome}"
                 );
             } else {
-                let link = result?;
-                assert_eq!(link.hello.role, Some(DeviceRole::Computer));
+                let link = result.context(outcome.clone())?;
+                assert_eq!(link.hello.role, Some(DeviceRole::Computer), "{outcome}");
                 if variant == "legacy" {
                     assert!(link.hello.addresses.is_none());
                 }
             }
-            mock.await??;
-            assert!(
-                tokio::time::timeout(Duration::from_millis(30), fallback.accept())
-                    .await
-                    .is_err()
-            );
+            mock.context(outcome)?;
+            no_tls_dial(&fallback, Duration::from_millis(30)).await?;
             assert_eq!(
                 a.store.pairing_generation(&b.identity.device_id),
                 generation
@@ -3875,6 +4916,7 @@ mod tests {
     #[tokio::test]
     async fn attempt_own_committed_install_is_reused_without_replacing_generation() -> Result<()> {
         let (_da, a, la) = core().await?;
+        let la = MockListener::new(la);
         let (_db, b, _lb) = core().await?;
         let address = la.local_addr()?.to_string();
         let uri = a
@@ -3972,4 +5014,470 @@ mod tests {
         Ok(())
     }
     include!("storage_failure_tests.rs");
+    async fn scoped_binding(a: &Core, b: &Core, remote_enabled: bool) -> Result<()> {
+        a.setup_test_capability.store(true, Ordering::SeqCst);
+        b.setup_test_capability.store(true, Ordering::SeqCst);
+        let mut hello = b.computer_hello();
+        hello.setup = Some(SetupHello {
+            scope: if remote_enabled {
+                SetupScope::Enabled
+            } else {
+                SetupScope::Disabled
+            },
+            setup_id: None,
+        });
+        let guard = a.pairing_gate.clone().lock_owned().await;
+        a.persist_pairing_hello_scoped(
+            &b.identity.device_id,
+            &b.identity.fingerprint,
+            guard,
+            false,
+            Some(hello),
+            None,
+            Some(true),
+        )
+        .await?;
+        Ok(())
+    }
+    async fn assign_from(a: &Core, b: &Core) -> Result<SetupFence> {
+        let mut fence = SetupFence {
+            generation: a.store.setup_state().generation,
+            binding_generation: a.store.pairing_generation(&b.identity.device_id).unwrap(),
+            device: b.identity.device_id.clone(),
+            fingerprint: b.identity.fingerprint.clone(),
+            connection: 100,
+            current: Arc::new(AtomicU64::new(100)),
+        };
+        a.store
+            .setup_activate(
+                fence.clone(),
+                a.self_member(),
+                b.self_member(),
+                SetupHello {
+                    scope: SetupScope::Enabled,
+                    setup_id: Some(
+                        a.store
+                            .setup_state()
+                            .setup_id
+                            .unwrap_or_else(|| Id::from_bytes([42; 16])),
+                    ),
+                },
+                |_| {},
+            )
+            .await?;
+        fence.generation = a.store.setup_state().generation;
+        Ok(fence)
+    }
+    #[tokio::test]
+    async fn setup_advisory_one_sided_scope_keeps_ready_and_prehello_loss_handling() -> Result<()> {
+        let mut outcomes = Vec::new();
+        for ready in [true, false] {
+            let (_da, a, la) = core().await?;
+            let (_db, b, lb) = core().await?;
+            let lb = MockListener::new(lb);
+            drop(la);
+            scoped_binding(&a, &b, false).await?;
+            bind(&b, &a).await?;
+            b.store
+                .setup_link(a.identity.device_id.clone(), SetupScope::Disabled)
+                .await?;
+            a.store
+                .remember_route(b.identity.device_id.clone(), lb.local_addr()?.to_string())
+                .await?;
+            a.store
+                .mark_peer_established(b.identity.device_id.clone())
+                .await?;
+            let peer = a.store.peer_info().await?.remove(0);
+            let (cancel, rx) = watch::channel(false);
+            let worker = Task::spawn(a.clone().dial_worker(peer, rx));
+            let mut tls = accept_client_hello(&b, &lb).await?;
+            if ready {
+                let mut hello = b.computer_hello();
+                hello.setup = Some(SetupHello {
+                    scope: SetupScope::Disabled,
+                    setup_id: None,
+                });
+                send(&mut tls, &Message::Hello(hello)).await?;
+                let Some(Message::Ping(p)) = read_frame(&mut tls).await? else {
+                    bail!("expected READY ping");
+                };
+                send(&mut tls, &Message::Pong(p)).await?;
+                until(|| a.connected_devices().contains(&b.identity.device_id)).await?;
+            }
+            send_error(&mut tls, ErrorCode::Unauthorized).await?;
+            outcomes.push((ready, until(|| a.paired_devices().is_empty()).await.is_ok()));
+            cancel.send_replace(true);
+            worker.await??;
+            a.shutdown_actions().await?;
+            b.shutdown_actions().await?;
+        }
+        assert_eq!(
+            outcomes,
+            vec![(true, true), (false, true)],
+            "READY and pre-HELLO refusal must both forget this direct link"
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn setup_advisory_disabled_remote_unpair_keeps_unrelated_setup_and_rechecks_gate()
+    -> Result<()> {
+        let (_da, a, la) = core().await?;
+        let (_db, b, lb) = core().await?;
+        let lb = MockListener::new(lb);
+        let (_dc, c, _lc) = core().await?;
+        drop(la);
+        scoped_binding(&a, &c, true).await?;
+        let fence = assign_from(&a, &c).await?;
+        scoped_binding(&a, &b, false).await?;
+        bind(&b, &a).await?;
+        let mut member = b.self_member();
+        member.hlc = crate::now_ms();
+        let mut roster = a.store.setup_state().roster;
+        roster.push(member);
+        let setup_id = a.store.setup_state().setup_id.unwrap();
+        a.store
+            .members_merge(
+                fence,
+                a.self_member(),
+                Members {
+                    transfer_id: Id::from_bytes(rand::random()),
+                    setup_id: setup_id.clone(),
+                    members: roster,
+                },
+                Vec::new(),
+                |_| {},
+            )
+            .await?;
+        a.store
+            .remember_route(b.identity.device_id.clone(), lb.local_addr()?.to_string())
+            .await?;
+        let peer = a
+            .store
+            .peer_info()
+            .await?
+            .into_iter()
+            .find(|p| p.id == b.identity.device_id)
+            .unwrap();
+        let (cancel, rx) = watch::channel(false);
+        let worker = Task::spawn(a.clone().dial_worker(peer, rx));
+        let mut tls = accept_client_hello(&b, &lb).await?;
+        let mut hello = b.computer_hello();
+        hello.setup = Some(SetupHello {
+            scope: SetupScope::Disabled,
+            setup_id: None,
+        });
+        send(&mut tls, &Message::Hello(hello.clone())).await?;
+        let Some(Message::Ping(p)) = read_frame(&mut tls).await? else {
+            bail!("READY ping");
+        };
+        send(&mut tls, &Message::Pong(p)).await?;
+        until(|| a.connected_devices().contains(&b.identity.device_id)).await?;
+        // Recheck under the gate even if a caller observed participation before
+        // waiting: a newer authenticated disabled HELLO has won the lifecycle.
+        let mut captured = a.store.with_current_pairing();
+        captured.connection_id =
+            Some(a.sessions.lock().unwrap().sessions[&b.identity.device_id].id);
+        captured.setup_generation = Some(a.store.setup_state().generation);
+        let guard = a.pairing_gate.clone().lock_owned().await;
+        let mut withdraw = Box::pin(a.withdraw_setup(&captured, &hello));
+        assert!(futures_util::poll!(withdraw.as_mut()).is_pending());
+        drop(guard);
+        assert!(!withdraw.await?);
+        send(&mut tls, &Message::Unpair(Unpair {})).await?;
+        until(|| !a.paired_devices().contains(&b.identity.device_id)).await?;
+        assert_eq!(a.store.setup_state().setup_id, Some(setup_id));
+        assert!(!a.store.setup_state().withdrawn);
+        assert!(a.paired_devices().contains(&c.identity.device_id));
+        cancel.send_replace(true);
+        worker.await??;
+        a.shutdown_actions().await?;
+        b.shutdown_actions().await?;
+        c.shutdown_actions().await
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn setup_review_retry_cannot_resurrect_withdrawn_join() -> Result<()> {
+        let (_da, a, _la) = core().await?;
+        let (_db, b, lb) = core().await?;
+        let lb = MockListener::new(lb);
+        let uri = b
+            .start_pairing_with_addresses(vec![lb.local_addr()?.to_string()])
+            .await?;
+        let preview = a.join(&uri.build()?).await?;
+        let attempt = preview["attempt"].as_str().unwrap();
+        a.confirm_join(attempt).await?;
+        let (entered, wait) = tokio::sync::oneshot::channel();
+        let (release, blocking) = std::sync::mpsc::channel();
+        *a.mesh.retry_hook.lock().unwrap() = Some((entered, blocking));
+        a.mesh.panic_join.store(true, Ordering::SeqCst);
+        let supervisor = Task::spawn(a.clone().mesh_supervise());
+        let mut tls = accept_hello(&b, &lb, None).await?;
+        assert!(matches!(
+            read_frame(&mut tls).await?,
+            Some(Message::PairRequest(_))
+        ));
+        drop(tls);
+        tokio::time::timeout(Duration::from_secs(5), wait).await??;
+        let held = a.mesh.join.try_lock().is_err();
+        let cancellation = if held {
+            let cancel = a.clone();
+            Some(tokio::task::spawn_blocking(move || {
+                cancel.mesh.cancel_withdrawn_join();
+            }))
+        } else {
+            // Complete withdrawal in the old clone-and-replace gap.
+            a.mesh.cancel_withdrawn_join();
+            None
+        };
+        release.send(())?;
+        if let Some(cancellation) = cancellation {
+            cancellation.await?;
+        }
+        a.request_shutdown();
+        supervisor.await??;
+        assert_eq!(a.join_status(attempt)?["state"], "cancelled");
+        assert!(a.mesh.join.lock().unwrap().as_ref().unwrap().phase == JoinPhase::Finished);
+        assert!(held, "retry exposed a stale clone to withdrawal");
+        assert!(a.paired_devices().is_empty());
+        a.shutdown_actions().await?;
+        b.shutdown_actions().await
+    }
+    #[tokio::test]
+    async fn setup_review_stale_periodic_refresh_preserves_rename_on_restart() -> Result<()> {
+        let (_da, a, la) = core().await?;
+        let (_db, b, _lb) = core().await?;
+        scoped_binding(&a, &b, true).await?;
+        assign_from(&a, &b).await?;
+        let (captured, wait) = tokio::sync::oneshot::channel();
+        let (release, blocked) = tokio::sync::oneshot::channel();
+        let refresher = a.clone();
+        let refresh = tokio::spawn(async move {
+            let mut stale = refresher.self_member();
+            stale.reach.as_mut().unwrap().addresses = vec!["127.0.0.1:45678".into()];
+            let _ = captured.send(());
+            blocked.await?;
+            refresher.store.setup_refresh_self(stale).await
+        });
+        wait.await?;
+        a.rename("Renamed computer".into()).await?;
+        let own = || {
+            a.store
+                .setup_state()
+                .roster
+                .into_iter()
+                .find(|m| m.device_id == a.identity.device_id)
+                .unwrap()
+        };
+        let renamed = own();
+        release.send(()).unwrap();
+        refresh.await??;
+        let refreshed = own();
+        assert_eq!(refreshed.name, "Renamed computer");
+        assert_eq!(refreshed.hlc, renamed.hlc);
+        assert_eq!(refreshed.writer_device, renamed.writer_device);
+        let reach = refreshed.reach.unwrap();
+        assert_eq!(reach.addresses, vec!["127.0.0.1:45678"]);
+        assert!(reach.hlc > renamed.hlc);
+        let paths = a.paths.clone();
+        let config = Config::load(&paths.config)?;
+        a.shutdown_actions().await?;
+        a.store.drain().await;
+        drop(la);
+        drop(a);
+        let restarted = Core::new(paths, config, Arc::new(Mock)).await?;
+        assert_eq!(restarted.config().name, "Renamed computer");
+        assert_eq!(
+            Config::load(&restarted.paths.config)?.name,
+            "Renamed computer"
+        );
+        restarted.shutdown_actions().await?;
+        b.shutdown_actions().await
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn setup_advisory_confirmation_holds_join_mutex_through_mutation() -> Result<()> {
+        for withdrawal in [false, true] {
+            let (_da, a, _la) = core().await?;
+            let (_db, b, lb) = core().await?;
+            let uri = b
+                .start_pairing_with_addresses(vec![lb.local_addr()?.to_string()])
+                .await?;
+            let preview = a.join(&uri.build()?).await?;
+            let attempt = preview["attempt"].as_str().unwrap().to_string();
+            let (entered, wait) = tokio::sync::oneshot::channel();
+            let (release, blocking) = std::sync::mpsc::channel();
+            *a.mesh.confirm_hook.lock().unwrap() = Some((entered, blocking));
+            let confirmer = a.clone();
+            let id = attempt.clone();
+            let confirm =
+                tokio::spawn(async move { confirmer.confirm_join_scoped(&id, true).await });
+            wait.await?;
+            let held = a.mesh.join.try_lock().is_err();
+            let cancel = a.clone();
+            let key = (b.identity.device_id.clone(), b.identity.fingerprint.clone());
+            let cancellation = if held {
+                Some(tokio::task::spawn_blocking(move || {
+                    if withdrawal {
+                        cancel.mesh.cancel_withdrawn_join();
+                    } else {
+                        cancel.mesh.cancel_removed(&[key]);
+                    }
+                }))
+            } else {
+                // With the old clone-and-replace path, complete cancellation
+                // inside that gap before confirmation can publish its clone.
+                if withdrawal {
+                    cancel.mesh.cancel_withdrawn_join();
+                } else {
+                    cancel.mesh.cancel_removed(&[key]);
+                }
+                None
+            };
+            release.send(())?;
+            confirm.await??;
+            if let Some(cancellation) = cancellation {
+                cancellation.await?;
+            }
+            assert_eq!(a.join_status(&attempt)?["state"], "cancelled");
+            assert!(held, "confirmation exposed a stale clone to cancellation");
+            a.shutdown_actions().await?;
+            b.shutdown_actions().await?;
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn setup_advisory_cancelled_worker_rechecks_after_pairing_gate_before_request()
+    -> Result<()> {
+        let (_da, a, la) = core().await?;
+        let la = MockListener::new(la);
+        let (_db, b, _lb) = core().await?;
+        let uri = a
+            .start_pairing_with_addresses(vec![la.local_addr()?.to_string()])
+            .await?;
+        let preview = b.join(&uri.build()?).await?;
+        let attempt = preview["attempt"].as_str().unwrap();
+        b.confirm_join(attempt).await?;
+        let pending = b.mesh.join.lock().unwrap().as_ref().unwrap().clone();
+        let (entered, wait) = tokio::sync::oneshot::channel();
+        let (release, blocked) = tokio::sync::oneshot::channel();
+        *b.mesh.request_hook.lock().unwrap() = Some((entered, blocked));
+        let worker = Task::spawn(b.clone().join_worker(pending));
+        let mut tls = accept_hello(&a, &la, None).await?;
+        wait.await?;
+        let guard = b.pairing_gate.clone().lock_owned().await;
+        b.mesh
+            .cancel_removed(&[(a.identity.device_id.clone(), a.identity.fingerprint.clone())]);
+        release.send(()).unwrap();
+        drop(guard);
+        closed_without_unpair(&mut tls).await?;
+        assert_eq!(worker.await?.unwrap_err().to_string(), "cancelled");
+        let join = b.mesh.join.lock().unwrap().as_ref().unwrap().clone();
+        assert!(!join.requested);
+        assert!(join.authority.is_none());
+        assert_eq!(b.join_status(attempt)?["state"], "cancelled");
+        a.shutdown_actions().await?;
+        b.shutdown_actions().await
+    }
+    #[tokio::test]
+    async fn setup_advisory_plain_unpair_rechecks_member_after_waiting_for_gate() -> Result<()> {
+        let (_da, a, _la) = core().await?;
+        let (_db, b, _lb) = core().await?;
+        scoped_binding(&a, &b, true).await?;
+        let guard = a.pairing_gate.clone().lock_owned().await;
+        let mut unpair = Box::pin(a.unpair_device(b.identity.device_id.clone()));
+        assert!(futures_util::poll!(unpair.as_mut()).is_pending());
+        assign_from(&a, &b).await?;
+        let before = a.store.setup_state();
+        drop(guard);
+        assert!(
+            unpair
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("confirm Remove from all devices")
+        );
+        assert!(a.paired_devices().contains(&b.identity.device_id));
+        assert_eq!(a.store.setup_state(), before);
+        a.shutdown_actions().await?;
+        b.shutdown_actions().await
+    }
+    #[tokio::test]
+    async fn setup_introduced_authenticated_refusal_keeps_trust_before_and_after_ready()
+    -> Result<()> {
+        for ready in [false, true] {
+            let (_da, a, _la) = core().await?;
+            let (_db, b, lb) = core().await?;
+            let lb = MockListener::new(lb);
+            computer_route(&a, &b, lb.local_addr()?.to_string()).await?;
+            bind(&b, &a).await?;
+            let device = b.identity.device_id.clone();
+            let d = device.clone();
+            a.store.call(move |c| { c.execute("UPDATE setup_links SET introduced_by=?,introducer_name='Introducer',negotiated=1,participating=1 WHERE device=?",rusqlite::params![Id::from_bytes([9;16]).as_str(),d.as_str()])?;Ok(()) }).await?;
+            a.store
+                .setup_link(device.clone(), SetupScope::Enabled)
+                .await?;
+            let generation = a.store.pairing_generation(&device).unwrap();
+            assert!(a.store.setup_protected(&device));
+            assert_eq!(a.setup_status().await?["links"][0]["hello_seen"], false);
+            assert_eq!(a.setup_status().await?["links"][0]["ready"], false);
+            let peer = a.store.peer_info().await?.remove(0);
+            let (cancel, rx) = watch::channel(false);
+            let worker = Task::spawn(a.clone().dial_worker(peer, rx));
+            let mut tls = if ready {
+                accept_ready(&b, &lb, None).await?
+            } else {
+                accept_client_hello(&b, &lb).await?
+            };
+            if ready {
+                until(|| a.connected_devices().contains(&device)).await?;
+                wait_established(&a, &device).await?;
+            }
+            send_error(&mut tls, ErrorCode::Unauthorized).await?;
+            until(|| a.ui_snapshot().devices[0].state == "unauthorized").await?;
+            assert_eq!(a.paired_devices(), vec![device.clone()]);
+            assert_eq!(a.store.pairing_generation(&device), Some(generation));
+            assert!(a.store.setup_protected(&device));
+            assert!(
+                a.store
+                    .setup_state()
+                    .roster
+                    .iter()
+                    .all(|m| m.status != MemberStatus::Removed)
+            );
+            cancel.send_replace(true);
+            worker.await??;
+            drop(tls);
+            // A direct successful READY in this generation clears the hint.
+            let peer = a.store.peer_info().await?.remove(0);
+            a.mesh
+                .links
+                .lock()
+                .unwrap()
+                .get_mut(&device)
+                .unwrap()
+                .issue
+                .as_mut()
+                .unwrap()
+                .retry_at = Instant::now();
+            let (cancel, rx) = watch::channel(false);
+            let worker = Task::spawn(a.clone().dial_worker(peer, rx));
+            let tls = accept_ready(&b, &lb, None).await?;
+            until(|| a.connected_devices().contains(&device)).await?;
+            assert!(a.link_problem(&device).is_none());
+            cancel.send_replace(true);
+            worker.await??;
+            drop(tls);
+            a.store
+                .pair(device.clone(), b.identity.fingerprint.clone())
+                .await?;
+            a.set_link_problem(&device, generation, Some(LinkProblem::Unauthorized));
+            assert!(
+                a.link_problem(&device).is_none(),
+                "old generation refusal reached replacement"
+            );
+            assert!(link_problem(&anyhow::anyhow!("peer idle timeout")).is_none());
+            assert!(link_problem(&anyhow::anyhow!("TLS handshake failed")).is_none());
+            a.shutdown_actions().await?;
+            b.shutdown_actions().await?;
+        }
+        Ok(())
+    }
 }

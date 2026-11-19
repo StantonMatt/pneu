@@ -43,6 +43,7 @@ class ProtocolTest {
                 }
             }
             val output=ByteArrayOutputStream();Protocol.write(output,frame)
+            if(v["name"].asString in setOf("resume_legacy_begin","resume_false_begin"))assertArrayEquals(v["frame_hex"].asString.unhex(),output.toByteArray())
             val copy=Protocol.read(ByteArrayInputStream(output.toByteArray()))
             if(frame is Frame.Control) assertEquals(frame,copy) else {
                 copy as Frame.Chunk;frame as Frame.Chunk
@@ -59,12 +60,46 @@ class ProtocolTest {
     @Test fun transferVectorsReconstructAndHash() {
         val frames=vectors["frames"].asJsonArray.associate { it.asJsonObject["name"].asString to it.asJsonObject["frame_hex"].asString }
         for(entry in vectors["transfers"].asJsonArray) {
-            val v=entry.asJsonObject;val bytes=ByteArrayOutputStream()
+            val v=entry.asJsonObject;val bytes=ByteArrayOutputStream().apply {v["prefix_hex"]?.let {write(it.asString.unhex())}}
+            var begin:com.google.gson.JsonObject?=null
+            var ready=false;var sentChunk=false;var ended=false;var acked=false
             for(name in v["frames"].asJsonArray) {
-                if(name.asString in setOf("file_begin","empty_begin")) continue
-                val frame=decode(frames.getValue(name.asString))
-                if(frame is Frame.Chunk) {assertEquals(bytes.size().toLong(),frame.offset);bytes.write(frame.data)}
+                // These legacy fixtures use the obsolete kind=shared spelling.
+                val frame=if(name.asString in setOf("file_begin","empty_begin")) {
+                    val original=vectors["frames"].asJsonArray.single {it.asJsonObject["name"].asString==name.asString}.asJsonObject
+                    Frame.Control(Type.FILE_BEGIN,original["decoded"].asJsonObject["payload"].asJsonObject)
+                } else decode(frames.getValue(name.asString))
+                when(frame) {
+                    is Frame.Chunk -> {
+                        val b=requireNotNull(begin)
+                        assertFalse(ended);assertEquals(b["resume"]?.asBoolean==true,ready)
+                        assertEquals(b["transfer_id"].asString,frame.id)
+                        assertEquals(bytes.size().toLong(),frame.offset);bytes.write(frame.data);sentChunk=true
+                    }
+                    is Frame.Control -> when(frame.type) {
+                        Type.FILE_BEGIN -> {assertNull(begin);begin=frame.body}
+                        Type.FILE_READY -> {
+                            val b=requireNotNull(begin)
+                            assertTrue(b["resume"]?.asBoolean==true);assertFalse(ready || sentChunk || ended)
+                            assertEquals(b["transfer_id"].asString,frame.body["transfer_id"].asString)
+                            FileReady(frame.body["transfer_id"].asString,frame.body["offset"].asLong).validateOffset(b["size"].asLong)
+                            assertEquals(bytes.size().toLong(),frame.body["offset"].asLong);ready=true
+                        }
+                        Type.FILE_END -> {
+                            val b=requireNotNull(begin)
+                            assertFalse(ended);assertEquals(b["resume"]?.asBoolean==true,ready)
+                            assertEquals(b["transfer_id"].asString,frame.body["transfer_id"].asString);ended=true
+                        }
+                        Type.ACK -> {
+                            assertTrue(ended && !acked)
+                            assertEquals(requireNotNull(begin)["transfer_id"].asString,frame.body["transfer_id"].asString)
+                            assertEquals(v["deduplicated"]?.asBoolean ?: false,frame.body["deduplicated"].asBoolean);acked=true
+                        }
+                        else -> error("Unexpected transfer frame")
+                    }
+                }
             }
+            assertTrue(ended && acked)
             assertEquals(v["data_hex"].asString,bytes.toByteArray().hex());assertEquals(v["size"].asLong,bytes.size().toLong());assertEquals(v["sha256"].asString,sha256(bytes.toByteArray()))
         }
     }

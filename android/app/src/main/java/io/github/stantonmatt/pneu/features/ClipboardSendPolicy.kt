@@ -18,7 +18,7 @@ import io.github.stantonmatt.pneu.protocol.sha256
  * while automatic received-content echoes are suppressed for every computer. */
 internal object ClipboardSendPolicy {
     suspend fun available(context:Context,clip:ClipData?,p:Prefs,links:Map<String,io.github.stantonmatt.pneu.connection.LinkState>):Boolean {
-        if(clip==null || clip.itemCount==0 || !p.loaded || clip.description.extras?.getBoolean(ClipDescription.EXTRA_IS_SENSITIVE)==true)return false
+        if(clip==null || clip.itemCount==0 || !p.loaded)return false
         val uri=clip.getItemAt(0).uri
         val mime=try {uri?.let {source->ProviderReads.call {context.contentResolver.getType(source)}}}
         catch(e:CancellationException) {throw e}
@@ -43,7 +43,6 @@ internal object ClipboardSendPolicy {
     }
     fun clipboardProvenance(clip:ClipData,p:Prefs,image:Boolean=clip.itemCount>0 && clip.getItemAt(0).uri!=null):SendProvenance {
         val extras=clip.description.extras
-        if(extras?.getBoolean(ClipDescription.EXTRA_IS_SENSITIVE)==true)return SendProvenance(sensitive=true)
         val owned=extras?.getBoolean(ClipboardDelivery.OWN_CLIP)==true
         val item=if(clip.itemCount>0)clip.getItemAt(0) else null
         val hash=if(image)(if(owned)extras?.getString(ClipboardDelivery.OWN_HASH) else null).orEmpty()
@@ -53,9 +52,9 @@ internal object ClipboardSendPolicy {
         // name a different sender. Otherwise staging must identify its bytes.
         val competingSource=p.recentClipboardSources.values.any {it.isNotEmpty() && it!=markedSource} ||
             p.lastReceivedHash.isNotEmpty() && p.lastReceivedSource.isNotEmpty() && p.lastReceivedSource!=markedSource
-        return if(hash.isEmpty() && image && (markedSource.isEmpty() || competingSource))
+        return (if(hash.isEmpty() && image && (markedSource.isEmpty() || competingSource))
             SendProvenance(received=owned,source=markedSource,needsHash=true)
-            else provenance(p,hash,owned,markedSource)
+            else provenance(p,hash,owned,markedSource)).copy(sensitive=extras?.getBoolean(ClipDescription.EXTRA_IS_SENSITIVE)==true)
     }
     /** Ordinary files never enter clipboard history. Resolve their publication
      * journal before staging drops the source URI, including document-provider
@@ -97,7 +96,7 @@ internal object ClipboardSendPolicy {
         return SendProvenance(received=received,source=source)
     }
     fun targets(p:Prefs,captured:List<DeliveryBinding>,provenance:SendProvenance,automatic:Boolean=false):List<DeliveryBinding> {
-        if(provenance.sensitive || automatic && provenance.received)return emptyList()
+        if(automatic && (provenance.sensitive || provenance.received))return emptyList()
         // An old image marker may know a sender but lack its hash. Wait for
         // staged bytes before excluding anyone: history may name a newer sender.
         return RecipientSelection.surviving(p,captured).filter {provenance.needsHash || it.pcId!=provenance.source}

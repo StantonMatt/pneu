@@ -9,11 +9,12 @@ when AVFoundation discovers a camera.
 
 ## Install
 
-M2 packages the native daemon and its supervised UI child as an ad-hoc-signed
+M2 packages the native daemon and its supervised UI child as a signed
 `Pneu.app` (macOS 15.4 or later). Run from the `desktop` directory on the Mac:
 
 ```sh
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$HOME/.local/bin:$PATH"
+./packaging/macos/setup-local-signing.sh # Once per Mac, before the first install.
 ./install-macos.sh
 ```
 
@@ -78,11 +79,24 @@ codesign --verify --strict "$HOME/Developer/pneu-build/bundles/Pneu.app"
 Use `--profile release` for an optimized build. Packaging creates `AppIcon.icns`
 with `iconutil` from `assets/macos/AppIcon.iconset`, copies `assets/macos/menubar-*.png`
 images (including Retina variants) into `Resources/menubar/pneu-tray-*.png`, lints
-the Info.plist and daemon template (`Resources/daemon.plist.in`), signs ad-hoc
+the Info.plist and daemon template (`Resources/daemon.plist.in`), signs
 with the hardened runtime and camera entitlement, and verifies the signature. The executable renders
 the session plist with its current absolute bundle path and explicit Pneu paths.
 If designer icons are absent the builder reports a temporary SVG-derived icon.
-Ad-hoc signing provides no Developer ID or notarization.
+The one-time signing setup creates a self-signed `Pneu Local Signing` identity
+in `~/Library/Keychains/pneu-signing.keychain-db`, with a random password in
+`~/Library/Application Support/Pneu-signing/keychain-password` (mode 0600).
+It adds that keychain to the user search list for certificate-chain lookup.
+It does not need `sudo`, the login password or changes to the login keychain's contents.
+After allowing camera, notifications and Downloads access once with this
+identity, grants persist across rebuilds and reinstalls with the same bundle ID
+and certificate. Keep the keychain and signing support directory; rerunning
+setup reuses the identity. Deleting or replacing it requires granting access again.
+The builder unlocks that keychain and signs by certificate SHA-1. Set
+`PNEU_CODESIGN_IDENTITY` to select another signing identity (name or SHA-1), or
+`-` for ad-hoc signing. Without a local keychain or override it signs ad-hoc,
+so other machines and CI still build. Local signing provides no Developer ID
+or notarization.
 
 For isolated login acceptance, use `--bundle-id io.github.stantonmatt.pneu.test.pkg`
 (or `.test.pkg2`), keep the bundle in a private build directory, and override all

@@ -25,9 +25,10 @@ use windows::{
 };
 
 type Point = (f64, f64);
+type Begin = Rc<dyn Fn(&[PathBuf]) -> bool>;
 #[derive(Clone)]
 pub(crate) struct Callbacks {
-    pub begin: Rc<dyn Fn() -> bool>,
+    pub begin: Begin,
     pub hover: Rc<dyn Fn(Point) -> bool>,
     pub drop: Rc<dyn Fn(Point, Vec<PathBuf>) -> bool>,
     pub cancel: Rc<dyn Fn()>,
@@ -89,7 +90,7 @@ impl IDropTarget_Impl for Target_Impl {
         self.cancel();
         if let Some(data) = data.as_ref()
             && let Ok(paths) = selected_paths(data)
-            && (self.callbacks.begin)()
+            && (self.callbacks.begin)(&paths)
         {
             *self.paths.borrow_mut() = Some(paths);
         }

@@ -1,13 +1,11 @@
 //! Win32 clipboard adapter. The watcher owns actor observations; provider reads
 //! run in a killable child and publication is one OpenClipboard transaction.
-#[path = "clipboard_content.rs"]
-mod content;
+pub use super::clipboard_content::{Content, MAX_IMAGE};
 use super::{
     pasteboard_reader::{Reader, ticket},
     windows_clipboard_content::*,
 };
 use anyhow::{Context, Result, ensure};
-pub use content::{Content, MAX_IMAGE};
 use sha2::{Digest, Sha256};
 use std::{
     ptr::{null, null_mut},
@@ -270,9 +268,11 @@ impl std::fmt::Display for ReadAbort {
     }
 }
 impl std::error::Error for ReadAbort {}
+type PngRead = (Option<Vec<u8>>, Option<[u8; 32]>);
 struct ReadGuard {
     sequence: u32,
     history: Option<u32>,
+    marker: bool,
 }
 impl ReadGuard {
     fn check(&self) -> Result<()> {
@@ -280,10 +280,34 @@ impl ReadGuard {
             return Err(ReadAbort(SnapshotStatus::Changed).into());
         }
         let meta = metadata()?;
-        if meta.class == Classification::Sensitive || meta.history != self.history {
+        // Marker helpers read only the installation ticket, never payload or privacy data.
+        if (meta.class == Classification::Sensitive && !self.marker) || meta.history != self.history
+        {
             return Err(ReadAbort(SnapshotStatus::Sensitive).into());
         }
         Ok(())
+    }
+    fn png(&self, id: u32) -> Result<PngRead> {
+        let memory = unsafe { GetClipboardData(id) };
+        self.check()?;
+        ensure!(!memory.is_null(), "clipboard format unavailable");
+        let size = unsafe { GlobalSize(memory) };
+        if size <= MAX_IMAGE {
+            return Ok((Some(copy_memory(memory, MAX_IMAGE)?), None));
+        }
+        let pointer = unsafe { GlobalLock(memory) };
+        ensure!(!pointer.is_null(), "lock clipboard format");
+        // The helper is killable and the HGLOBAL remains locked until hashing
+        // finishes. Never copy an oversized provider buffer into the IPC result.
+        let bytes = unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), size) };
+        let fingerprint = bytes
+            .starts_with(b"\x89PNG\r\n\x1a\n")
+            .then(|| Sha256::digest(bytes).into());
+        unsafe {
+            GlobalUnlock(memory);
+        }
+        self.check()?;
+        Ok((None, fingerprint))
     }
     fn optional(&self, id: u32, cap: usize) -> Result<Option<Vec<u8>>> {
         match get_checked(id, cap, self) {
@@ -310,7 +334,15 @@ pub(crate) struct Offer {
     thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 impl Offer {
+    #[cfg(test)]
     pub(crate) fn prepare(input: &crate::actions::ClipboardInput, ticket: u128) -> Result<Self> {
+        Self::prepare_sensitive(input, ticket, false)
+    }
+    pub(crate) fn prepare_sensitive(
+        input: &crate::actions::ClipboardInput,
+        ticket: u128,
+        sensitive: bool,
+    ) -> Result<Self> {
         use crate::actions::ClipboardInput;
         let mut offer = Self {
             payload: Arc::new(Vec::new()),
@@ -329,8 +361,23 @@ impl Offer {
                 offer.text(text)?;
                 offer.image(png)?;
             }
-            ClipboardInput::Image(file, _) => offer.image(&file.read_bounded(16 * 1024 * 1024)?)?,
+            ClipboardInput::Image(file, _) => {
+                offer.image(&file.read_bounded(crate::store::history::MAX_IMAGE)?)?
+            }
             ClipboardInput::Bytes { bytes, .. } => offer.image(bytes)?,
+        }
+        if sensitive {
+            for (name, bytes) in [
+                (
+                    "ExcludeClipboardContentFromMonitorProcessing",
+                    vec![1, 0, 0, 0],
+                ),
+                ("CanIncludeInClipboardHistory", vec![0, 0, 0, 0]),
+            ] {
+                Arc::get_mut(&mut offer.payload)
+                    .unwrap()
+                    .push((format(name)?, bytes));
+            }
         }
         Ok(offer)
     }
@@ -342,7 +389,10 @@ impl Offer {
         Ok(())
     }
     fn image(&mut self, bytes: &[u8]) -> Result<()> {
-        ensure!(bytes.len() <= 16 * 1024 * 1024, "clipboard image limit");
+        ensure!(
+            bytes.len() <= crate::store::history::MAX_IMAGE,
+            "clipboard image limit"
+        );
         let decoded = crate::actions::decode_image(bytes)?;
         let png = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
             ensure!(bytes.len() <= MAX_IMAGE, "clipboard PNG limit");
@@ -557,9 +607,10 @@ fn read_snapshot(sequence: u32, marker: bool, images: bool) -> Result<Snapshot> 
         let guard = ReadGuard {
             sequence,
             history: meta.history,
+            marker,
         };
         guard.check()?;
-        if let Some(id) = meta.history {
+        if !marker && let Some(id) = meta.history {
             let value = guard.optional(id, 4)?;
             if value.as_deref() != Some(&1u32.to_le_bytes()) {
                 return Err(ReadAbort(SnapshotStatus::Sensitive).into());
@@ -574,7 +625,7 @@ fn read_snapshot(sequence: u32, marker: bool, images: bool) -> Result<Snapshot> 
         } else {
             let text = if meta.formats.contains(&TEXT) {
                 guard
-                    .optional(TEXT, 2 * (pneu_proto::MAX_CLIPBOARD_BYTES + 1))?
+                    .optional(TEXT, 2 * (crate::store::history::MAX_TEXT + 1))?
                     .and_then(|bytes| {
                         if bytes.len() % 2 != 0 {
                             return None;
@@ -595,7 +646,16 @@ fn read_snapshot(sequence: u32, marker: bool, images: bool) -> Result<Snapshot> 
             if images {
                 let png_format = format("PNG")?;
                 if meta.formats.contains(&png_format) {
-                    image = guard.optional(png_format, MAX_IMAGE)?.filter(|b| {
+                    let (png, oversized) = match guard.png(png_format) {
+                        Ok(value) => value,
+                        Err(error) if error.is::<ReadAbort>() => return Err(error),
+                        Err(_) => {
+                            guard.check()?;
+                            (None, None)
+                        }
+                    };
+                    result.oversized = oversized;
+                    image = png.filter(|b| {
                         b.starts_with(b"\x89PNG\r\n\x1a\n")
                             && crate::actions::decode_image(b).is_ok()
                     });
@@ -603,15 +663,24 @@ fn read_snapshot(sequence: u32, marker: bool, images: bool) -> Result<Snapshot> 
                 if image.is_none() {
                     for id in [DIBV5, DIB] {
                         if meta.formats.contains(&id) {
-                            image = guard
-                                .optional(id, MAX_DIB)?
-                                .and_then(|b| dib_to_png(&b).ok());
+                            if let Some(bytes) = guard.optional(id, MAX_DIB)? {
+                                match dib_to_png(&bytes) {
+                                    Ok(png) => image = Some(png),
+                                    Err(error) if error.is::<crate::actions::ImageTooLarge>() => {
+                                        result.oversized = Some(Sha256::digest(&bytes).into());
+                                    }
+                                    Err(_) => {}
+                                }
+                            }
                             if image.is_some() {
                                 break;
                             }
                         }
                     }
                 }
+            }
+            if image.is_some() {
+                result.oversized = None;
             }
             result.content = combine(text, image);
         }
@@ -723,19 +792,23 @@ fn poll(
             }
         };
         let initial = baseline.replace(sequence).is_none();
-        if meta.class == Classification::Sensitive {
+        let marker = owned && meta.formats.contains(&format(INSTALL)?);
+        if meta.class == Classification::Sensitive && !marker {
             unavailable(core, pending);
             return Ok(());
         }
-        let marker = meta.class == Classification::Origin && owned;
         if initial && !marker {
             pending.take();
             return Ok(());
         }
         // Freeze recipients and register cancellation before reaping the old
         // provider, and reap it before spawning the replacement provider.
-        let (_, token) =
-            core.observe_watched_clipboard_kind(false, meta.formats.is_empty(), initial);
+        let (_, token) = core.observe_watched_clipboard_metadata(
+            false,
+            meta.formats.is_empty(),
+            initial,
+            marker,
+        );
         let canceled = Arc::new(AtomicBool::new(false));
         core.register_clipboard_read(token, canceled.clone());
         let mut next = Pending {
@@ -750,7 +823,11 @@ fn poll(
             completed: false,
         };
         pending.take();
-        if let Err(error) = next.start(core.config().clipboard_include_images) {
+        if let Err(error) = next.start(
+            core.config().clipboard_include_images
+                || core.config().clipboard_history
+                || core.config().clipboard_mode == crate::config::ClipboardMode::Manual,
+        ) {
             next.finish(core, None, false);
             return Err(error);
         }
@@ -806,7 +883,11 @@ fn service_pending(
             // An unknown/retired or foreign marker does not hide local content.
             // Keep the original token, frozen policy, cancellation and deadline.
             read.marker = false;
-            if let Err(error) = read.start(core.config().clipboard_include_images) {
+            if let Err(error) = read.start(
+                core.config().clipboard_include_images
+                    || core.config().clipboard_history
+                    || core.config().clipboard_mode == crate::config::ClipboardMode::Manual,
+            ) {
                 read.finish(core, None, false);
                 return Err(error);
             }
@@ -815,6 +896,9 @@ fn service_pending(
     } else {
         if result.content.is_some() {
             eprintln!("pneud: clipboard observed sequence={sequence}");
+        }
+        if let Some(fingerprint) = result.oversized {
+            core.clipboard_image_too_large(read.token, fingerprint);
         }
         read.finish(core, result.content, true);
     }

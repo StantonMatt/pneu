@@ -3,6 +3,7 @@
 use super::{ClipboardOffer, ClipboardRecipient};
 use crate::clipboard_fingerprint::FingerprintKey;
 use crate::config::ClipboardMode;
+use crate::store::history::Capture as HistoryCapture;
 use crate::ui::clipboard::Content;
 use pneu_proto::Id;
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,9 @@ pub(super) enum Payload {
 #[derive(Clone, Debug)]
 pub(super) struct Operation {
     pub token: Token,
+    pub sensitive: bool,
+    pub history: Option<Arc<HistoryCapture>>,
+    pub history_id: Option<String>,
     pub id: Id,
     pub source: Id,
     pub key: Option<Key>,
@@ -84,6 +88,7 @@ pub(super) fn hashes(content: &Content) -> Vec<[u8; 32]> {
 pub(super) enum Failure {
     Storage,
     Clipboard,
+    TooLarge,
     Cancelled,
 }
 #[derive(Clone, Debug)]
@@ -97,7 +102,11 @@ pub(super) enum Event {
     },
     ShareReady {
         token: Token,
-        content: Option<Content>,
+        content: Result<Content, Failure>,
+    },
+    ImageTooLarge {
+        token: Token,
+        fingerprint: [u8; 32],
     },
     Observe {
         token: Token,
@@ -105,6 +114,7 @@ pub(super) enum Event {
         offer: Option<ClipboardOffer>,
         origin: bool,
         clear: bool,
+        history: Option<Arc<HistoryCapture>>,
     },
     Read {
         token: Token,
@@ -156,6 +166,14 @@ pub(super) enum Event {
 }
 #[derive(Clone, Debug)]
 pub(super) enum Effect {
+    ImageTooLarge {
+        fingerprint: [u8; 32],
+        offer: ClipboardOffer,
+    },
+    RecordHistory {
+        content: Content,
+        capture: Arc<HistoryCapture>,
+    },
     /// Local UI hint, independent from the ordinary sharing classification.
     PairingLink(Option<String>),
     LoadShare {
@@ -198,6 +216,8 @@ pub(super) enum Effect {
 }
 #[derive(Clone, Debug)]
 struct Observation {
+    history: Option<Arc<HistoryCapture>>,
+    oversized: Option<[u8; 32]>,
     token: Token,
     id: Id,
     offer: Option<ClipboardOffer>,
@@ -267,6 +287,8 @@ pub(super) struct State {
     observation: Option<Observation>,
     held_observations: VecDeque<Observation>,
     os_token: Token,
+    os_image_too_large: bool,
+    last_large_notice: Option<[u8; 32]>,
     last_marker: Option<Ticket>,
     stopping_markers: VecDeque<Ticket>,
     queue: VecDeque<Operation>,
@@ -284,6 +306,10 @@ pub(super) struct State {
     shutdown: bool,
 }
 impl State {
+    /// Consume the deduplication key only after the driver's live policy check.
+    pub fn image_notice_posted(&mut self, fingerprint: [u8; 32]) {
+        self.last_large_notice = Some(fingerprint);
+    }
     pub fn seed_tickets(&mut self, seed: Ticket) {
         self.next_ticket = seed;
     }
@@ -358,10 +384,15 @@ impl State {
             self.known_hash(&self.fingerprint_key.digest(&Sha256::digest(bytes).into()))
         };
         match content {
-            Some(Content::Text(text)) => (!known(text.as_bytes())).then_some(Content::Text(text)),
+            Some(Content::Text(text)) => (!known(text.as_bytes())
+                && text.len() <= pneu_proto::MAX_CLIPBOARD_BYTES)
+                .then_some(Content::Text(text)),
             Some(Content::Image(image)) => (!known(&image)).then_some(Content::Image(image)),
             Some(Content::Formats(text, image)) => {
-                match (!known(text.as_bytes()), !known(&image)) {
+                match (
+                    !known(text.as_bytes()) && text.len() <= pneu_proto::MAX_CLIPBOARD_BYTES,
+                    !known(&image),
+                ) {
                     (true, true) => Some(Content::Formats(text, image)),
                     (true, false) => Some(Content::Text(text)),
                     (false, true) => Some(Content::Image(image)),
@@ -496,6 +527,7 @@ impl State {
                 self.observe_physical(&self.current_hashes.clone());
             }
             self.os_current = true;
+            self.os_image_too_large = false;
             self.pinned = install.operation.received.then(|| {
                 (
                     install.operation.source.clone(),
@@ -696,6 +728,22 @@ impl State {
                 .unwrap();
             self.held_observations.remove(index).unwrap()
         };
+        if let Some(fingerprint) = observation.oversized {
+            if token == self.os_token {
+                self.os_image_too_large = true;
+            }
+            if token == self.os_token
+                && self.mode == ClipboardMode::Automatic
+                && self.last_large_notice != Some(fingerprint)
+                && let Some(offer) = observation.offer.as_ref()
+                && offer.recipients.iter().any(|r| r.image)
+            {
+                effects.push(Effect::ImageTooLarge {
+                    fingerprint,
+                    offer: offer.clone(),
+                });
+            }
+        }
         let (original, fingerprints) = observation.read.unwrap();
         let mut fingerprints = self.fingerprint_key.hashes(&fingerprints);
         if fingerprints.is_empty()
@@ -727,6 +775,9 @@ impl State {
                 // publication. Its historical key must stay intact: an older
                 // echo is not a repair payload for the register winner.
                 self.current = Some(Operation {
+                    sensitive: false,
+                    history: None,
+                    history_id: None,
                     token,
                     id: fingerprint.id,
                     source: fingerprint.key.source.clone(),
@@ -782,6 +833,9 @@ impl State {
         self.invalidate_publications(effects);
         let hashes = content.as_ref().map(|c| self.hashes(c)).unwrap_or_default();
         let operation = Operation {
+            sensitive: false,
+            history: None,
+            history_id: None,
             token,
             id: observation.id,
             source: self
@@ -941,7 +995,11 @@ impl State {
                 self.clocking = Some(operation);
                 return;
             }
-            if (equal || !operation.received) && !operation.repair {
+            if (equal || !operation.received)
+                && !operation.sensitive
+                && !operation.repair
+                && operation.history_id.is_none()
+            {
                 // No OS write means the previous offer still serves every one
                 // of its representations. Carry them into the new provenance,
                 // including formats absent from the incoming operation.
@@ -1062,6 +1120,7 @@ impl State {
                 event,
                 Event::Observe { .. }
                     | Event::Read { .. }
+                    | Event::ImageTooLarge { .. }
                     | Event::Debounce(_)
                     | Event::AbandonRead(_)
                     | Event::ReadTimeout(_)
@@ -1115,6 +1174,22 @@ impl State {
                 offer,
             } => {
                 let payload = self.current.as_ref().and_then(|o| o.payload.clone());
+                if self.os_image_too_large
+                    && payload.is_none()
+                    && self.mode == ClipboardMode::Manual
+                    && self.observation.is_none()
+                    && self.held_observations.is_empty()
+                    && !self.shutdown
+                    && offer.recipients.iter().any(|r| r.image)
+                {
+                    effects.push(Effect::Reply {
+                        token,
+                        applied: false,
+                        deduplicated: false,
+                        failure: Some(Failure::TooLarge),
+                    });
+                    return effects;
+                }
                 if self.shutdown
                     || self.mode != ClipboardMode::Manual
                     || !self.os_current
@@ -1122,6 +1197,7 @@ impl State {
                     || !self.held_observations.is_empty()
                     || offer.recipients.is_empty()
                     || payload.is_none()
+                    || self.current.as_ref().is_some_and(|o| o.sensitive)
                     || self.pending_count() >= 61
                 {
                     effects.push(Effect::Reply {
@@ -1132,6 +1208,9 @@ impl State {
                     });
                 } else if let Some(payload) = payload {
                     let operation = Operation {
+                        sensitive: false,
+                        history: None,
+                        history_id: None,
                         token,
                         id,
                         source,
@@ -1157,6 +1236,11 @@ impl State {
                 }
             }
             Event::ShareReady { token, content } => {
+                let failure = content
+                    .as_ref()
+                    .err()
+                    .copied()
+                    .unwrap_or(Failure::Clipboard);
                 if let Some((physical, key, mut operation)) = self.sharing.remove(&token) {
                     if self.mode == ClipboardMode::Manual
                         && physical == self.os_token
@@ -1164,7 +1248,7 @@ impl State {
                         && self.observation.is_none()
                         && self.held_observations.is_empty()
                         && self.os_current
-                        && let Some(content) = content
+                        && let Ok(content) = content
                     {
                         let fingerprints = self.hashes(&content);
                         // File-backed payloads may have been edited since the
@@ -1181,6 +1265,11 @@ impl State {
                                 failure: Some(Failure::Clipboard),
                             });
                         } else {
+                            let image_too_large = self.os_image_too_large
+                                && operation
+                                    .offer
+                                    .as_ref()
+                                    .is_some_and(|o| o.recipients.iter().any(|r| r.image));
                             if let Some(offer) = &mut operation.offer {
                                 self.exclude_received_representations(&content, offer);
                             }
@@ -1193,7 +1282,11 @@ impl State {
                                     token,
                                     applied: false,
                                     deduplicated: false,
-                                    failure: Some(Failure::Cancelled),
+                                    failure: Some(if image_too_large {
+                                        Failure::TooLarge
+                                    } else {
+                                        Failure::Cancelled
+                                    }),
                                 });
                             } else {
                                 operation.hashes = hashes(&content);
@@ -1206,7 +1299,7 @@ impl State {
                             token,
                             applied: false,
                             deduplicated: false,
-                            failure: Some(Failure::Clipboard),
+                            failure: Some(failure),
                         });
                     }
                 }
@@ -1217,6 +1310,7 @@ impl State {
                 offer,
                 origin,
                 clear,
+                history,
             } => {
                 effects.push(Effect::PairingLink(None));
                 if clear
@@ -1252,6 +1346,7 @@ impl State {
                         }
                     }
                     self.os_current = false;
+                    self.os_image_too_large = false;
                     self.os_token = token;
                     let restore = self
                         .installing
@@ -1259,6 +1354,8 @@ impl State {
                         .is_some_and(|i| i.phase == Phase::Authorized)
                         || !self.stopping_markers.is_empty();
                     self.observation = Some(Observation {
+                        history,
+                        oversized: None,
                         token,
                         id,
                         offer: if self.mode == ClipboardMode::Automatic {
@@ -1272,6 +1369,11 @@ impl State {
                     });
                     effects.push(Effect::Debounce(token));
                     effects.push(Effect::ReadTimeout(token));
+                }
+            }
+            Event::ImageTooLarge { token, fingerprint } => {
+                if let Some(observation) = self.read_slot(token) {
+                    observation.oversized = Some(fingerprint);
                 }
             }
             Event::Read {
@@ -1291,6 +1393,23 @@ impl State {
                         text.filter(|text| text.starts_with("pneu://pair") && text.len() <= 16384)
                             .map(str::to_owned),
                     ));
+                }
+                // Apply the same received-fingerprint exclusion as resolve_read,
+                // while keeping local history capture independent of debounce.
+                let echo = if fingerprints.is_empty() {
+                    content.as_ref().is_some_and(|content| self.echo(content))
+                } else {
+                    self.fingerprint_key
+                        .hashes(&fingerprints)
+                        .iter()
+                        .all(|hash| self.known_hash(hash))
+                };
+                let history = self.read_slot(token).and_then(|o| o.history.take());
+                if !echo && let (Some(capture), Some(content)) = (history, content.as_ref()) {
+                    effects.push(Effect::RecordHistory {
+                        capture,
+                        content: content.clone(),
+                    });
                 }
                 if let Some(observation) = self.read_slot(token) {
                     observation.read = Some((content, fingerprints));
@@ -1333,7 +1452,7 @@ impl State {
                 }
             }
             Event::Submit(mut operation) => {
-                if !operation.received && !operation.repair {
+                if !operation.received && !operation.repair && operation.history_id.is_none() {
                     if self.mode != ClipboardMode::Automatic
                         && (self.mode == ClipboardMode::Off || operation.observation.is_some())
                     {
@@ -1675,6 +1794,7 @@ impl State {
             Event::Persisted { token, success } => {
                 if let Some(pending) = self.persistence.remove(&token) {
                     let explicit = !pending.operation.received
+                        && pending.operation.history_id.is_none()
                         && !pending.operation.repair
                         && pending.operation.observation.is_none();
                     let publish = success

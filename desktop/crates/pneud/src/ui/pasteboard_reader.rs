@@ -12,6 +12,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+// JSON encodes each image byte as up to three digits and a comma, and
+// each text byte as up to six bytes (\u0000), plus result metadata.
+const OUTPUT_CAP: usize =
+    super::clipboard::MAX_IMAGE * 4 + crate::store::history::MAX_TEXT * 6 + 4096;
+
 // Held only for metadata snapshots and publication, never provider reads.
 pub(super) static PUBLICATION: Mutex<()> = Mutex::new(());
 
@@ -67,6 +72,8 @@ pub(super) struct ReadResult<C> {
     pub marker: Option<String>,
     pub content: Option<C>,
     pub fingerprints: Vec<[u8; 32]>,
+    #[serde(default)]
+    pub oversized: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,7 +161,7 @@ impl<C: serde::de::DeserializeOwned + Send + 'static> Change<C> {
         self.reader = Some(Reader::spawn(
             command(self.count, self.phase)?,
             timeout,
-            64 * 1024 * 1024,
+            OUTPUT_CAP,
             |bytes| Ok(serde_json::from_slice(&bytes)?),
         )?);
         Ok(())
@@ -447,6 +454,36 @@ mod tests {
         Unavailable,
         Retired,
     }
+    #[test]
+    fn output_cap_accepts_maximum_image_and_escaped_accompanying_text() -> Result<()> {
+        struct Count(usize);
+        impl std::io::Write for Count {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 += bytes.len();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let result = ReadResult {
+            oversized: None,
+            marker: None,
+            content: Some(super::super::clipboard::Content::Formats(
+                "\u{1}".repeat(crate::store::history::MAX_TEXT),
+                vec![255; super::super::clipboard::MAX_IMAGE],
+            )),
+            fingerprints: vec![[255; 32]; 6],
+        };
+        let mut count = Count(0);
+        serde_json::to_writer(&mut count, &result)?;
+        assert!(count.0 > 64 * 1024 * 1024);
+        assert!(
+            count.0 <= OUTPUT_CAP,
+            "valid clipboard JSON exceeds helper cap"
+        );
+        Ok(())
+    }
     #[derive(Default)]
     struct Observations(Arc<Mutex<Vec<(u64, Outcome)>>>);
     impl Observations {
@@ -479,6 +516,7 @@ mod tests {
     }
     fn result_command(_: isize, phase: Phase) -> Result<Command> {
         let result = ReadResult {
+            oversized: None,
             marker: (phase != Phase::Payload).then(|| format!("{:032x}", 42)),
             content: (phase == Phase::Payload).then(|| "human copy".to_owned()),
             fingerprints: Vec::new(),
@@ -623,6 +661,7 @@ mod tests {
                 .change(17, Phase::InitialMarker)
                 .start(|_, _| {
                     Ok(output(&serde_json::to_string(&ReadResult::<String> {
+                        oversized: None,
                         marker: marker.map(str::to_owned),
                         content: None,
                         fingerprints: Vec::new(),

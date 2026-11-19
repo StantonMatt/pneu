@@ -20,6 +20,7 @@ pub struct Tray {
     pub named_icons: bool,
     pub commands: mpsc::Sender<Command>,
     device_slots: Mutex<Vec<String>>,
+    history_menu: Option<Vec<crate::store::history::Item>>,
 }
 impl Tray {
     fn send(&self, command: Command) {
@@ -27,6 +28,52 @@ impl Tray {
     }
     fn transfers(&self) -> Vec<Transfer> {
         self.snapshot.transfers.iter().map(Transfer::from).collect()
+    }
+    fn history_menu(&self) -> ksni::MenuItem<Self> {
+        let history = self
+            .history_menu
+            .as_ref()
+            .unwrap_or(&self.snapshot.clipboard_history);
+        let mut submenu: Vec<_> = super::tray_model::history_entries(history)
+            .into_iter()
+            .map(|entry| {
+                let Some(entry) = entry else {
+                    return ksni::MenuItem::Separator;
+                };
+                let id = entry.id.clone();
+                StandardItem {
+                    label: super::tray_model::history_label(entry, true),
+                    icon_data: super::tray_model::history_icon(entry),
+                    activate: Box::new(move |s: &mut Self| {
+                        s.send(Command::CopyClipboardHistory(id.clone()))
+                    }),
+                    ..Default::default()
+                }
+                .into()
+            })
+            .collect();
+        if submenu.is_empty() {
+            submenu.push(
+                StandardItem {
+                    label: "Nothing copied yet".into(),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            );
+        } else {
+            submenu.push(ksni::MenuItem::Separator);
+            submenu.push(item("Show All", "", |s: &mut Self| {
+                s.send(Command::ShowClipboardHistory)
+            }));
+        }
+        SubMenu {
+            label: "Clipboard History".into(),
+            icon_name: "edit-paste".into(),
+            submenu,
+            ..Default::default()
+        }
+        .into()
     }
     fn clipboard_mode(&self) -> ClipboardMode {
         let config = serde_json::to_value(&self.config).unwrap_or_default();
@@ -94,15 +141,7 @@ impl ksni::Tray for Tray {
     fn tool_tip(&self) -> ksni::ToolTip {
         let transfers = self.transfers();
         let peers = peers(&self.snapshot, &transfers);
-        // One line per device; the status line leads only when it adds something.
-        let mut lines: Vec<String> = peers.iter().map(Peer::short).collect();
-        if self.snapshot.error.is_some()
-            || self.snapshot.pairing.is_some()
-            || lines.is_empty()
-            || peers.iter().any(|p| p.sending() || p.receiving())
-        {
-            lines.insert(0, status(&self.snapshot, &peers, &transfers));
-        }
+        let lines = super::tray_model::tooltip_lines(&self.snapshot, &peers, &transfers);
         ksni::ToolTip {
             icon_name: "pneu".into(),
             title: "Pneu".into(),
@@ -114,6 +153,9 @@ impl ksni::Tray for Tray {
         self.send(Command::Window {
             activation_token: None,
         });
+    }
+    fn menu_about_to_show(&mut self) {
+        self.history_menu = Some(self.snapshot.clipboard_history.clone());
     }
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         let transfers = self.transfers();
@@ -127,6 +169,20 @@ impl ksni::Tray for Tray {
             .into(),
             ksni::MenuItem::Separator,
         ];
+        for (index, label) in super::tray_model::battery_lines(&peers)
+            .into_iter()
+            .enumerate()
+        {
+            items.insert(
+                1 + index,
+                StandardItem {
+                    label: label.replace('_', "__"),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
         if !peers.is_empty() {
             let connected =
                 super::runtime::file_recipients(self.snapshot.send_targets.clone(), None);
@@ -151,11 +207,11 @@ impl ksni::Tray for Tray {
                 &mut self.device_slots.lock().expect("tray device slots"),
                 &identities,
             );
-            for identity in slots {
+            for identity in &slots {
                 let peer = peers.iter().find(|p| {
                     identities
                         .iter()
-                        .any(|(key, id)| key == &identity && id == &p.id)
+                        .any(|(key, id)| key == identity && id == &p.id)
                 });
                 let Some(peer) = peer else {
                     targets.push(
@@ -175,6 +231,7 @@ impl ksni::Tray for Tray {
                     self.snapshot.send_targets.clone(),
                     Some(&device),
                 );
+                let identity = identity.clone();
                 targets.push(item(
                     format!("{}…", menu_label(&peer.name)),
                     if peer.phone { "smartphone" } else { "computer" },
@@ -189,21 +246,100 @@ impl ksni::Tray for Tray {
                     },
                 ));
             }
-            items.push(
-                SubMenu {
-                    label: "Send Files To".into(),
-                    icon_name: "document-send".into(),
-                    submenu: targets,
-                    ..Default::default()
+            if peers.len() == 1 {
+                // Keep the same captured-identity tombstones as the submenu.
+                // An old positional menu ID must never select a newly paired device.
+                for identity in slots {
+                    let peer = peers.iter().find(|p| {
+                        identities
+                            .iter()
+                            .any(|(key, id)| key == &identity && id == &p.id)
+                    });
+                    let Some(peer) = peer else {
+                        items.push(
+                            StandardItem {
+                                visible: false,
+                                enabled: false,
+                                ..Default::default()
+                            }
+                            .into(),
+                        );
+                        continue;
+                    };
+                    if let Ok(device) = pneu_proto::Id::new(&peer.id) {
+                        let captured = super::runtime::file_recipients(
+                            self.snapshot.send_targets.clone(),
+                            Some(&device),
+                        );
+                        items.push(item(
+                            "Send Files…",
+                            "document-send",
+                            move |s: &mut Self| {
+                                if tray_identities(&s.snapshot, &peers_for_menu(s))
+                                    .iter()
+                                    .any(|(key, _)| key == &identity)
+                                {
+                                    s.send(Command::SendFiles {
+                                        recipients: captured.clone(),
+                                        targeted: true,
+                                    });
+                                }
+                            },
+                        ));
+                    }
                 }
-                .into(),
-            );
+            } else {
+                items.push(
+                    SubMenu {
+                        label: "Send Files To".into(),
+                        icon_name: "document-send".into(),
+                        submenu: targets,
+                        ..Default::default()
+                    }
+                    .into(),
+                );
+            }
             let mode = self.clipboard_mode();
             if mode == ClipboardMode::Manual {
                 let captured = super::captured_authorities(&self.snapshot);
                 items.push(item("Send Clipboard", "edit-paste", move |s: &mut Self| {
                     s.send(Command::SendClipboard(captured.clone()))
                 }));
+            }
+            if self.config.clipboard_history {
+                items.push(self.history_menu());
+            }
+            let rings = super::tray_model::ring_items(&peers)
+                .into_iter()
+                .map(|ring| {
+                    StandardItem {
+                        label: ring.label.replace('_', "__"),
+                        enabled: ring.connection.is_some(),
+                        activate: Box::new(move |s: &mut Self| {
+                            if let Some(connection) = ring.connection {
+                                s.send(Command::Ring {
+                                    device: ring.device.clone(),
+                                    connection,
+                                    action: ring.action,
+                                });
+                            }
+                        }),
+                        ..Default::default()
+                    }
+                    .into()
+                })
+                .collect::<Vec<ksni::MenuItem<Self>>>();
+            if rings.len() == 1 {
+                items.extend(rings);
+            } else if !rings.is_empty() {
+                items.push(
+                    SubMenu {
+                        label: "Ring Phone".into(),
+                        submenu: rings,
+                        ..Default::default()
+                    }
+                    .into(),
+                );
             }
             items.push(item("Open Folder", "folder-open", |s: &mut Self| {
                 s.send(Command::OpenFolder)
@@ -275,6 +411,14 @@ impl ksni::Tray for Tray {
                 .into(),
             );
             items.push(ksni::MenuItem::Separator);
+        }
+        if peers.is_empty() && self.config.clipboard_history {
+            items.push(item("Open Pneu", "", |s: &mut Self| {
+                s.send(Command::Window {
+                    activation_token: None,
+                })
+            }));
+            items.push(self.history_menu());
         }
         items.push(item("Add Device…", "list-add", |s: &mut Self| {
             s.send(Command::AddDevice {
@@ -349,6 +493,7 @@ pub async fn start(
         pixmaps: pixmaps()?,
         named_icons,
         commands,
+        history_menu: None,
         device_slots: Mutex::new(Vec::new()),
     }
     .assume_sni_available(true)
@@ -417,12 +562,79 @@ mod tests {
                         state: (*state).into(),
                         last_seen: 0,
                         dialer: None,
-                        route: (*state == "connected").then(|| "Wi-Fi".into()),
+                        route: (*state == "connected").then(|| "Local network".into()),
                     },
                 )
                 .collect(),
             ..Default::default()
         }
+    }
+    #[test]
+    fn phone_controls_kde_menu_tooltip_and_captured_ring_command() {
+        use ksni::Tray as _;
+        let (commands, mut rx) = mpsc::channel(4);
+        let mut snapshot = devices(&[("Phone_A", true, "connected")]);
+        let device = snapshot.devices[0].device.clone();
+        snapshot.connected_devices.push(device.clone());
+        snapshot.phone_controls.insert(
+            device.clone(),
+            super::super::PhoneControl {
+                battery: Some(15),
+                charging: false,
+                ring_supported: true,
+                ringing: true,
+                connection: Some(7),
+            },
+        );
+        let mut tray = Tray {
+            snapshot,
+            config: Config::default(),
+            icons: PathBuf::new(),
+            pixmaps: Vec::new(),
+            named_icons: false,
+            commands,
+            history_menu: None,
+            device_slots: Mutex::default(),
+        };
+        let menu = tray.menu();
+        assert!(
+            matches!(&menu[1], ksni::MenuItem::Standard(item) if !item.enabled && item.label == "Phone__A · Battery 15%")
+        );
+        assert!(
+            tray.tool_tip()
+                .description
+                .contains("Phone_A · Local network · Battery 15%")
+        );
+        let ring = menu
+            .iter()
+            .find_map(|entry| match entry {
+                ksni::MenuItem::Standard(item) if item.label == "Stop Ringing" => Some(item),
+                _ => None,
+            })
+            .expect("ring menu item");
+        assert!(ring.enabled);
+        tray.snapshot
+            .phone_controls
+            .get_mut(&device)
+            .unwrap()
+            .connection = Some(8);
+        (ring.activate)(&mut tray);
+        assert!(
+            matches!(rx.try_recv().unwrap(), Command::Ring {connection:7, action:pneu_proto::RingAction::Stop, device:captured} if captured == device)
+        );
+        tray.snapshot.connected_devices.clear();
+        tray.snapshot.devices[0].state = "disconnected".into();
+        let menu = tray.menu();
+        assert!(!menu.iter().any(|entry| matches!(entry, ksni::MenuItem::Standard(item) if item.label.contains("Battery"))));
+        assert!(menu.iter().any(|entry| matches!(entry, ksni::MenuItem::Standard(item) if item.label == "Ring Phone" && !item.enabled)));
+        tray.snapshot
+            .phone_controls
+            .get_mut(&device)
+            .unwrap()
+            .ring_supported = false;
+        assert!(!tray.menu().iter().any(
+            |entry| matches!(entry, ksni::MenuItem::Standard(item) if item.label == "Ring Phone")
+        ));
     }
     #[test]
     fn device_menu_slots_never_reassign_stale_ids() {
@@ -458,6 +670,7 @@ mod tests {
             pixmaps: Vec::new(),
             named_icons: false,
             commands,
+            history_menu: None,
             device_slots: Mutex::new(Vec::new()),
         };
         tray.snapshot.send_targets = tray
@@ -465,6 +678,7 @@ mod tests {
             .devices
             .iter()
             .map(|d| crate::outbox::SendTarget {
+                folder_reason: None,
                 device: d.device.clone(),
                 name: d.name.clone(),
                 generation: 1,
@@ -525,6 +739,7 @@ mod tests {
             pixmaps: Vec::new(),
             named_icons: false,
             commands,
+            history_menu: None,
             device_slots: Mutex::new(Vec::new()),
         };
         let authority = crate::outbox::Authority {
@@ -533,6 +748,7 @@ mod tests {
             fingerprint: pneu_proto::Hash::new("ab".repeat(32)).unwrap(),
         };
         tray.snapshot.send_targets = vec![crate::outbox::SendTarget {
+            folder_reason: None,
             device: authority.device.clone(),
             name: "A".into(),
             generation: authority.generation,
@@ -541,6 +757,22 @@ mod tests {
             would_queue: false,
             reason: None,
         }];
+        let single_menu = tray.menu();
+        let ksni::MenuItem::Standard(single) = &single_menu[2] else {
+            panic!("single-device send item");
+        };
+        assert_eq!(single.label, "Send Files…");
+        (single.activate)(&mut tray);
+        assert!(
+            matches!(rx.try_recv().unwrap(), Command::SendFiles { recipients: targets, targeted: true } if targets == vec![authority.clone()])
+        );
+        // With a second paired (offline) device the broadcast submenu remains;
+        // its connected-only recipient set still contains just A.
+        let mut second = tray.snapshot.devices[0].clone();
+        second.device = pneu_proto::Id::from_bytes([2; 16]);
+        second.name = "B".into();
+        second.state = "disconnected".into();
+        tray.snapshot.devices.push(second);
         let menu = tray.menu();
         let ksni::MenuItem::SubMenu(files) = &menu[2] else {
             panic!("files submenu")
@@ -555,6 +787,11 @@ mod tests {
             Some(pneu_proto::Hash::new("cd".repeat(32)).unwrap());
         assert!(
             matches!(rx.try_recv().unwrap(), Command::SendFiles { recipients: targets, .. } if targets == vec![authority.clone()])
+        );
+        (single.activate)(&mut tray);
+        assert!(
+            rx.try_recv().is_err(),
+            "old direct callback must retain its pairing identity"
         );
         // Old named menu callbacks become inert once the snapshot is current.
         (one.activate)(&mut tray);
@@ -590,8 +827,8 @@ mod tests {
         assert_eq!(icon_of(&none), "pneu-tray-disconnected");
         let mut one = devices(&[("Galaxy S25+", true, "connected")]);
         one.device = Some(pneu_proto::Id::from_bytes([1; 16]));
-        one.phone.route = "Wi-Fi".into();
-        assert_eq!(line(&one), "Galaxy S25+ connected over Wi-Fi");
+        one.phone.route = "Local network".into();
+        assert_eq!(line(&one), "Galaxy S25+ connected over local network");
         assert_eq!(icon_of(&one), "pneu-tray-connected");
         one.paused_devices = vec![pneu_proto::Id::from_bytes([1; 16])];
         assert_eq!(line(&one), "Galaxy S25+ paused sending");

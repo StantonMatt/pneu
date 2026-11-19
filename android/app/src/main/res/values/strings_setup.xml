@@ -1,0 +1,53 @@
+<resources>
+<string name="channel_setup_requests">Link requests</string>
+<!-- Pair once, join your devices. The screens never say "setup": they say "your devices" and "linked". -->
+<string name="setup_link_switch">Also link with your other devices</string>
+<string name="setup_link_limit">Your devices are at the limit of %1$d</string>
+<string name="setup_also_linked">Also linked: %1$s</string>
+<plurals name="setup_names_more"><item quantity="one">%1$s, %2$s and %3$d more</item><item quantity="other">%1$s, %2$s and %3$d more</item></plurals>
+<string name="setup_joined">%1$s joined</string>
+<string name="setup_added_via">Added via %1$s</string>
+<string name="setup_action_remove">Remove</string>
+<string name="setup_banner_link">Link your devices, so new ones pair just once</string>
+<string name="setup_banner_allow">Allow linking on %1$s</string>
+<plurals name="setup_banner_allow_many"><item quantity="one">Allow linking on %1$d device</item><item quantity="other">Allow linking on %1$d devices</item></plurals>
+<string name="action_link">Link</string>
+<string name="setup_linked">Your devices are linked</string>
+<string name="setup_request_one">%1$s wants to link your devices</string>
+<string name="setup_request_two">%1$s and %2$s want to link your devices</string>
+<plurals name="setup_request_many"><item quantity="one">%1$s and %2$d other device want to link your devices</item><item quantity="other">%1$s and %2$d other devices want to link your devices</item></plurals>
+<string name="setup_request_text">New devices then pair just once.</string>
+<string name="action_dont_allow">Don\'t allow</string>
+<string name="setup_row_link">Link with your other devices</string>
+<string name="setup_row_pending">Allow linking on %1$s</string>
+<string name="setup_row_theirs">Link on %1$s too</string>
+<string name="setup_row_asked">Wants to link your devices</string>
+<string name="setup_row_update">Update Pneu on %1$s to link it</string>
+<string name="setup_row_separate">Not linked with your other devices</string>
+<string name="setup_row_separate_detail">It already has its own linked devices</string>
+<string name="setup_remove_all">Remove from all devices</string>
+<string name="setup_remove_title">Remove %1$s from all devices?</string>
+<string name="setup_remove_text">It\'s removed from this phone now, and from your other devices when they next connect.</string>
+<string name="setup_removed">%1$s removed. Your other devices update when they connect.</string>
+<string name="setup_remove_failed_title">Couldn\'t remove %1$s</string>
+<string name="setup_remove_failed_text">Nothing was changed. Try again.</string>
+<string name="setup_removed_self">This phone was removed from your devices</string>
+<string name="setup_phones_dont_connect">Phones don\'t connect to each other</string>
+<string name="setup_phones_dont_connect_page">Phones don\'t connect to each other.</string>
+<string name="setup_paired_only">Paired with %1$s only. It already has its own linked devices.</string>
+<string name="setup_not_linked">%1$s wasn\'t linked. It already has its own linked devices.</string>
+<string name="device_not_connected_yet">Hasn\'t connected</string>
+<string name="ui_error_link">Couldn\'t link your devices</string>
+    <string name="setup_readmission">%1$s was removed from this phone. %2$s added it again</string>
+    <string name="setup_readmission_title">%1$s was removed from this phone</string>
+    <string name="setup_readmission_text">%1$s added it again</string>
+    <string name="setup_keep_removed">Keep removed</string>
+    <string name="setup_readmission_error">Couldn’t allow this device</string>
+    <string name="setup_refused">Not allowed on %1$s yet</string>
+    <string name="setup_readmission_capacity">Your devices are at the limit. Remove a device and try again.</string>
+    <string name="setup_readmission_conflict">Device identity already bound · Pair with it directly</string>
+    <string name="setup_readmission_attempt">Finish pairing before allowing this device</string>
+    <string name="setup_different_certificate">%1$s has a different certificate · Pair with it directly</string>
+    <string name="setup_refused_hint">Allow it on %1$s, or pair with it directly</string>
+    <string name="setup_silent_hint">Open Pneu on %1$s, or pair with it directly</string>
+</resources>

@@ -19,6 +19,8 @@ struct Target {
     url: Option<String>,
     retry: Option<(pneu_proto::Id, pneu_proto::Id, pneu_proto::Id)>,
     actions: Vec<String>,
+    device: Option<pneu_proto::Id>,
+    setup_requests: Vec<crate::ui::window_setup::Decision>,
 }
 struct NotificationRecord {
     target: Target,
@@ -95,6 +97,17 @@ impl DesktopActions {
             burst: Mutex::new(None),
         }
     }
+    pub(crate) async fn withdraw_notice(&self, id: u32) -> Result<()> {
+        if let Some(record) = self
+            .targets
+            .lock()
+            .expect("notification targets")
+            .remove(&id)
+        {
+            record.withdraw();
+        }
+        Ok(())
+    }
     pub async fn notice(
         &self,
         notice: Notice,
@@ -123,6 +136,8 @@ impl DesktopActions {
                 url,
                 retry: None,
                 actions: Vec::new(),
+                device: None,
+                setup_requests: Vec::new(),
             },
             replaces,
         )
@@ -144,6 +159,8 @@ impl DesktopActions {
         };
         anyhow::ensure!(id != 0, "notification identifier exhausted");
         target.actions = notice.actions.iter().map(|(id, _)| (*id).into()).collect();
+        target.device = notice.device.clone();
+        target.setup_requests = notice.setup_requests.clone();
         let notification = Notification {
             id,
             namespace: self.namespace.clone(),
@@ -288,6 +305,10 @@ impl DesktopActions {
         // paths, pairing links, or notification bodies.
         eprintln!("pneud: notification action notification={id} action={action}");
         match action {
+            "allow" | "deny" => {
+                crate::ui::window_setup::decide(core, &target.setup_requests, action == "allow")
+                    .await
+            }
             "default" | "open" => {
                 if let Some(file) = target.files.last() {
                     self.begin_viewer(file, false)?.await?;
@@ -309,6 +330,11 @@ impl DesktopActions {
             }
             "folder" => core.request_window(true),
             "pair" => core.request_add_device(),
+            "remove" => {
+                if let Some(device) = target.device {
+                    core.request_remove_window(device, None);
+                }
+            }
             "retry" => {
                 if let Some((operation, artifact, device)) = target.retry {
                     core.retry_transfer_artifact(operation, Some(artifact), device)
@@ -322,6 +348,47 @@ impl DesktopActions {
 }
 #[async_trait]
 impl PcActions for DesktopActions {
+    async fn show_phone_notification(
+        &self,
+        id: &str,
+        notice: &crate::ui::notifications::PhoneNotice,
+        replaces: u32,
+    ) -> Result<u32> {
+        self.begin_phone_notification(id, notice, replaces)
+            .await?
+            .await
+    }
+    async fn begin_phone_notification<'a>(
+        &'a self,
+        id: &'a str,
+        notice: &'a crate::ui::notifications::PhoneNotice,
+        _replaces: u32,
+    ) -> Result<super::PhoneAcknowledgement<'a>> {
+        let wait = bridge::begin(
+            Request::PhoneNotification {
+                id: id.into(),
+                notice: Some(notice.clone()),
+            },
+            None,
+        )?;
+        Ok(Box::pin(async move {
+            wait.await?;
+            Ok(0)
+        }))
+    }
+    async fn remove_phone_notification(&self, id: &str, _handle: u32) -> Result<()> {
+        self.remove_phone_notifications(&[(id.into(), 0)]).await
+    }
+    async fn remove_phone_notifications(&self, handles: &[(String, u32)]) -> Result<()> {
+        bridge::begin(
+            Request::WithdrawPhoneNotifications {
+                ids: handles.iter().map(|(id, _)| id.clone()).collect(),
+            },
+            None,
+        )?
+        .await
+    }
+
     async fn ui_test_notification(&self, transient: bool) -> Result<u32> {
         if transient {
             let mut notice = Notice::text("https://example.com/Pneu-test");
@@ -361,8 +428,16 @@ impl PcActions for DesktopActions {
         input: ClipboardInput,
         ticket: u128,
     ) -> Result<PreparedClipboard> {
+        self.prepare_clipboard_sensitive(input, ticket, false).await
+    }
+    async fn prepare_clipboard_sensitive(
+        &self,
+        input: ClipboardInput,
+        ticket: u128,
+        sensitive: bool,
+    ) -> Result<PreparedClipboard> {
         crate::work::blocking(self.jobs.clone(), move || {
-            let native = Offer::prepare(&input, ticket)?;
+            let native = Offer::prepare_sensitive(&input, ticket, sensitive)?;
             Ok(PreparedClipboard {
                 hashes: native.hashes(),
                 marker_confirmation: true,
@@ -550,10 +625,34 @@ impl PcActions for DesktopActions {
             .await
             .map(|(_, wait)| wait)
     }
+    async fn notify_clipboard_too_large(&self) -> Result<()> {
+        self.notice(
+            crate::ui::notifications::Notice::image_too_large(),
+            Vec::new(),
+            None,
+            0,
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+    async fn notify_ring_failure(&self, phone: &str) -> Result<()> {
+        let mut notice = crate::ui::notifications::Notice::new(format!("Couldn't ring {phone}"));
+        notice.body = crate::ui::notifications::escape(&format!("{phone} didn't respond"));
+        self.notice(notice, Vec::new(), None, 0, None)
+            .await
+            .map(|_| ())
+    }
     async fn notify_send_admission_failure(&self, reason: &str) -> Result<()> {
-        let mut n = Notice::new("Couldn't send files");
-        n.body = crate::ui::notifications::escape(reason);
-        self.notice(n, Vec::new(), None, 0, None).await.map(|_| ())
+        self.notice(
+            crate::ui::notifications::Notice::admission_failure(reason),
+            Vec::new(),
+            None,
+            0,
+            None,
+        )
+        .await
+        .map(|_| ())
     }
     async fn notify_delivery(
         &self,
@@ -561,10 +660,7 @@ impl PcActions for DesktopActions {
         device_name: &str,
     ) -> Result<()> {
         let (notice, retry) = if transfer.state == "sent" {
-            (
-                Notice::sent(&transfer.file_name, &[device_name.into()]),
-                None,
-            )
+            (Notice::sent_transfer(transfer, device_name), None)
         } else {
             (
                 Notice::send_failed(
@@ -588,6 +684,8 @@ impl PcActions for DesktopActions {
                     url: None,
                     retry,
                     actions: Vec::new(),
+                    device: None,
+                    setup_requests: Vec::new(),
                 },
                 0,
             )
@@ -685,6 +783,7 @@ impl PcActions for DesktopActions {
         let mut all_saved = saved;
         let mut started = arrived;
         if save_error.is_none()
+            && metadata.folder.is_none()
             && copied != Some(false)
             && let Some(previous) = burst.as_ref()
             && previous.source == file.source
@@ -720,11 +819,13 @@ impl PcActions for DesktopActions {
                     url: None,
                     retry: None,
                     actions: Vec::new(),
+                    device: None,
+                    setup_requests: Vec::new(),
                 },
                 replaces,
             )
             .await?;
-        *burst = if save_error.is_none() && copied != Some(false) {
+        *burst = if !file.is_folder() && save_error.is_none() && copied != Some(false) {
             Some(Burst {
                 id,
                 paths,

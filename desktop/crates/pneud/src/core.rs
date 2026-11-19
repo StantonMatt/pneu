@@ -1,5 +1,7 @@
 #[path = "clipboard_actor.rs"]
 pub(crate) mod clipboard_actor;
+#[path = "phone_notifications.rs"]
+mod phone_notifications;
 use crate::{
     Config, Paths,
     actions::{PcActions, ReceivedFile},
@@ -44,6 +46,12 @@ mod file_sender;
 pub mod mesh;
 #[path = "peer_settings.rs"]
 mod peer_settings;
+#[path = "phone_controls.rs"]
+mod phone_controls;
+#[path = "replacement.rs"]
+mod replacement;
+#[path = "setup.rs"]
+mod setup;
 use file_sender::{FileWrite, transmit_file};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -106,6 +114,7 @@ pub enum Event {
     },
     Blocked {
         address: String,
+        fingerprint: Hash,
     },
     RemoteUnpaired {
         name: String,
@@ -115,12 +124,17 @@ pub enum Event {
 pub(crate) enum CloseReason {
     Error(ErrorCode),
     Unpair,
+    MembershipAck([u8; 16]),
 }
 impl CloseReason {
     fn message(self) -> Message {
         match self {
             Self::Error(code) => error_message(code),
             Self::Unpair => Message::Unpair(Unpair {}),
+            Self::MembershipAck(id) => Message::Ack(Ack {
+                transfer_id: Id::from_bytes(id),
+                deduplicated: false,
+            }),
         }
     }
 }
@@ -186,10 +200,15 @@ impl ActionScope {
         }
     }
     /// Native notification submission is gated; its acknowledgement is not.
-    async fn notification<F, Fut>(&self, origin: &ActionOrigin, issue: F) -> Option<Result<()>>
+    async fn notification<F, Fut, Ack, T>(
+        &self,
+        origin: &ActionOrigin,
+        issue: F,
+    ) -> Option<Result<T>>
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<crate::ui::portal::Interaction>>,
+        Fut: std::future::Future<Output = Result<Ack>>,
+        Ack: std::future::Future<Output = Result<T>>,
     {
         let mut cancelled = self.cancelled.subscribe();
         let mut generation = self.generation_changed.subscribe();
@@ -246,7 +265,7 @@ enum ReceiptNotice {
     Text(String),
     TextFailed,
     SaveFailed {
-        metadata: FileBegin,
+        metadata: Box<FileBegin>,
         code: NackCode,
         destination: crate::ui::ReceiveDestination,
         folder: PathBuf,
@@ -258,9 +277,9 @@ struct ReceiptJob {
     notice: ReceiptNotice,
 }
 enum NotificationJob {
-    File(ActionJob, DesktopAction),
+    File(Box<ActionJob>, DesktopAction),
     Receipt(ReceiptJob),
-    Delivery(crate::outbox::Transfer, String),
+    Delivery(Box<crate::outbox::Transfer>, String),
 }
 impl NotificationJob {
     fn allows(&self) -> bool {
@@ -323,7 +342,7 @@ impl ActionQueue {
         accepted
     }
     fn notice(pending: &mut PendingActions, job: ActionJob, action: DesktopAction) {
-        Self::push_notice(pending, NotificationJob::File(job, action));
+        Self::push_notice(pending, NotificationJob::File(Box::new(job), action));
     }
     fn push_notice(pending: &mut PendingActions, job: NotificationJob) {
         if pending.notifications.len() == NOTIFICATION_LIMIT {
@@ -349,7 +368,10 @@ impl ActionQueue {
     }
     fn delivery(&self, transfer: crate::outbox::Transfer, name: String) {
         let mut pending = self.pending.lock().expect("pending actions");
-        Self::push_notice(&mut pending, NotificationJob::Delivery(transfer, name));
+        Self::push_notice(
+            &mut pending,
+            NotificationJob::Delivery(Box::new(transfer), name),
+        );
         drop(pending);
         self.changed.notify_one();
     }
@@ -486,6 +508,9 @@ fn update_ui_state(ui: &Mutex<crate::ui::State>, event: &Event) {
     let mut ui = ui.lock().expect("UI state");
     match event {
         Event::ConnectionChanged { device, connected } => {
+            if *connected {
+                ui.scope_reconnect_finished(device);
+            }
             let now = crate::now_ms();
             if let Some(phone) = ui.phones.get_mut(device) {
                 phone.last_seen = now;
@@ -557,6 +582,7 @@ fn update_ui_state(ui: &Mutex<crate::ui::State>, event: &Event) {
             ui.prune_incoming();
         }
         Event::Unpaired { device } | Event::Paired { device } => {
+            ui.scope_refresh.remove(device);
             ui.phones.remove(device);
             ui.phone_generations.remove(device);
             ui.clear_transfers(device);
@@ -680,9 +706,10 @@ impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for DeliveryWriter<
     }
 }
 async fn send_pending_messages<W: tokio::io::AsyncWrite + Unpin>(
+    core: &Core,
     writer: &mut W,
     priority: &mut mpsc::Receiver<Message>,
-    normal: &mut mpsc::Receiver<Message>,
+    normal: &mut phone_controls::FrameQueue,
     reports: Option<&mpsc::Sender<WriteReport>>,
 ) -> Result<()> {
     // Bound each drain so incoming traffic cannot indefinitely stall an image.
@@ -696,7 +723,7 @@ async fn send_pending_messages<W: tokio::io::AsyncWrite + Unpin>(
         }
     }
     if let Ok(message) = normal.try_recv() {
-        send(writer, &message).await?;
+        normal.send(core, writer, &message).await?;
         if let Some(reports) = reports {
             report_frame(reports, &message).await;
         }
@@ -708,7 +735,7 @@ async fn transmit_automatic<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     work: AutomaticWrite,
     priority: &mut mpsc::Receiver<Message>,
-    normal: &mut mpsc::Receiver<Message>,
+    normal: &mut phone_controls::FrameQueue,
     mut text: Option<&mut mpsc::Receiver<AutomaticWrite>>,
     reports: Option<&mpsc::Sender<WriteReport>>,
 ) -> Result<bool> {
@@ -732,7 +759,8 @@ async fn transmit_automatic<W: tokio::io::AsyncWrite + Unpin>(
                 send(&mut writer, &frame).await?;
                 for (index, chunk) in bytes.chunks(CHUNK_SIZE).enumerate() {
                     // Receipts and heartbeats stay prompt between image frames.
-                    send_pending_messages(&mut *writer.writer, priority, normal, reports).await?;
+                    send_pending_messages(core, &mut *writer.writer, priority, normal, reports)
+                        .await?;
                     if let Some(text) = &mut text {
                         send_pending_clipboard_text(
                             core,
@@ -754,7 +782,7 @@ async fn transmit_automatic<W: tokio::io::AsyncWrite + Unpin>(
                     )
                     .await?;
                 }
-                send_pending_messages(&mut *writer.writer, priority, normal, reports).await?;
+                send_pending_messages(core, &mut *writer.writer, priority, normal, reports).await?;
                 send(&mut writer, &Message::FileEnd(FileEnd { transfer_id: id })).await?;
             }
         }
@@ -771,7 +799,7 @@ async fn send_pending_clipboard_text<W: tokio::io::AsyncWrite + Unpin>(
     core: &Core,
     writer: &mut W,
     priority: &mut mpsc::Receiver<Message>,
-    normal: &mut mpsc::Receiver<Message>,
+    normal: &mut phone_controls::FrameQueue,
     text: &mut mpsc::Receiver<AutomaticWrite>,
     reports: Option<&mpsc::Sender<WriteReport>>,
 ) -> Result<()> {
@@ -913,16 +941,19 @@ impl ClipboardDelivery {
 struct ApplicationMessage {
     message: Message,
     refusal: Option<NackCode>,
+    resume_cancel: Option<Arc<watch::Sender<bool>>>,
 }
 impl From<Message> for ApplicationMessage {
     fn from(message: Message) -> Self {
         Self {
             message,
             refusal: None,
+            resume_cancel: None,
         }
     }
 }
 struct ReadyState {
+    setup_sent: Option<(SetupHello, u64)>,
     store: Store,
     allow_recovery: bool,
     action_scope: Option<ActionScope>,
@@ -954,9 +985,10 @@ struct PhoneWrites {
 /// Clone the Arc<Core> into a tray/window. Commands below are async; subscribe()
 /// returns a bounded broadcast stream (lagging UI consumers must resnapshot).
 pub struct Core {
+    phone_controls: Mutex<phone_controls::Controls>,
     #[cfg(target_os = "macos")]
     pub(crate) ui_ready: Mutex<Arc<std::sync::atomic::AtomicBool>>,
-    mesh: mesh::Mesh,
+    mesh: Arc<mesh::Mesh>,
     transports: Arc<Semaphore>,
     ingress: Arc<Semaphore>,
     outbound_ingress: Arc<Semaphore>,
@@ -973,8 +1005,14 @@ pub struct Core {
     store: Store,
     admission: Arc<Mutex<Admission>>,
     invitation_changes: watch::Sender<u64>,
+    setup_invitation_scope: AtomicBool,
+    #[cfg(test)]
+    setup_test_capability: AtomicBool,
+    setup_incoming: Arc<Mutex<HashMap<u64, setup::IncomingTarget>>>,
+    readmission_errors: Mutex<Vec<(crate::store::members::ReadmissionKey, String)>>,
     provisional: Arc<AtomicBool>,
     pairing_gate: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) setup_decisions: tokio::sync::Mutex<()>,
     config_gate: Arc<tokio::sync::Mutex<()>>,
     clipboard: clipboard_driver::Handle,
     clipboard_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -991,8 +1029,12 @@ pub struct Core {
     shutdown: watch::Sender<bool>,
     port: AtomicU16,
     window_request: Mutex<(u64, Option<String>, bool)>,
+    window_history: AtomicU64,
+    // The window request whose device page opens with Remove from all devices.
+    window_remove: Mutex<Option<(u64, Id)>>,
     pending_sends: Mutex<std::collections::VecDeque<crate::ui::window::SendRequest>>,
     window_focus: Mutex<Option<(u64, Instant)>>,
+    window_visible: Mutex<Option<(u64, Instant)>>,
     #[cfg(test)]
     file_write_delay: Mutex<Duration>,
 }
@@ -1020,9 +1062,22 @@ impl Core {
         config.clipboard_sync_to_phone = config.clipboard_mode != crate::config::ClipboardMode::Off;
         config.validate_with_cache(&paths.cache)?;
         paths.prepare()?;
+        if let Err(error) = phone_notifications::prepare_icons(&paths.cache) {
+            eprintln!("pneud: phone notification icon cleanup deferred: {error}");
+        }
         let store = Store::open(&paths.data.join("state.sqlite3"))?;
         let identity = Identity::load_or_create(&paths.data)?;
+        if let Some(own) = store.setup_state().roster.iter().find(|m| {
+            m.device_id == identity.device_id
+                && m.fingerprint == identity.fingerprint
+                && m.status == MemberStatus::Member
+        }) && config.name != own.name
+        {
+            config.name = own.name.clone();
+            config.save(&paths.config)?;
+        }
         let outbox = crate::outbox::Outbox::open(store.clone(), &paths.data.join("outbox"))?;
+        outbox.recover_startup(config.queue_offline).await?;
         let admission = Arc::new(Mutex::new(Admission {
             peers: store.peers().await?,
             ..Default::default()
@@ -1098,6 +1153,8 @@ impl Core {
         }
         let mesh = mesh::Mesh::new(store.peer_info().await?);
         let (clipboard, clipboard_rx) = clipboard_driver::Handle::channel();
+        let history_enabled = config.borrow().clipboard_history;
+        store.history_configure(history_enabled, true).await?;
         let (register, legacy, history) = store.clipboard_snapshot().await?;
         let mut clipboard_state = clipboard_actor::State::load(
             register,
@@ -1107,7 +1164,13 @@ impl Core {
         );
         clipboard_state.seed_tickets(rand::random());
         let core = Arc::new(Self {
-            mesh,
+            phone_controls: Mutex::default(),
+            setup_invitation_scope: AtomicBool::new(true),
+            #[cfg(test)]
+            setup_test_capability: AtomicBool::new(true),
+            setup_incoming: Default::default(),
+            readmission_errors: Default::default(),
+            mesh: Arc::new(mesh),
             outbox,
             transports: Arc::new(Semaphore::new(TRANSPORT_LIMIT)),
             ingress: Arc::new(Semaphore::new(ADMISSION_LIMIT)),
@@ -1135,6 +1198,7 @@ impl Core {
             invitation_changes,
             provisional: Arc::new(AtomicBool::new(false)),
             pairing_gate: Arc::new(tokio::sync::Mutex::new(())),
+            setup_decisions: tokio::sync::Mutex::new(()),
             config_gate: Arc::new(tokio::sync::Mutex::new(())),
             sessions: Arc::new(Mutex::new(Connections::default())),
             clipboard,
@@ -1151,12 +1215,18 @@ impl Core {
             shutdown,
             port: AtomicU16::new(port),
             window_request: Mutex::new((0, None, false)),
+            window_history: AtomicU64::new(0),
+            window_remove: Mutex::new(None),
             pending_sends: Mutex::default(),
             window_focus: Mutex::new(None),
+            window_visible: Mutex::new(None),
             #[cfg(test)]
             file_write_delay: Mutex::new(Duration::ZERO),
         });
         encode_frame(&Message::Hello(core.computer_hello()))?;
+        if let Err(error) = core.reconcile_setup_candidates().await {
+            core.error(None, format!("membership reconciliation deferred: {error}"));
+        }
         let weak = Arc::downgrade(&core);
         let stop = core.action_stop.subscribe();
         *core.action_worker.lock().expect("actions") = Some(tokio::spawn(Box::pin(action_loop(
@@ -1225,6 +1295,9 @@ impl Core {
         {
             let changed = s.paused != paused;
             s.paused = paused;
+            if paused {
+                self.clear_phone_control(device, id);
+            }
             if changed {
                 self.clipboard.event(ClipboardEvent::Narrow(device.clone()));
                 self.automatic
@@ -1257,6 +1330,7 @@ impl Core {
             .is_some_and(|s| s.id == id && &s.device == device)
         {
             state.sessions.remove(device);
+            self.end_phone_control(device, id);
             self.clipboard.event(ClipboardEvent::Narrow(device.clone()));
             self.mesh.changed.notify_waiters();
             self.automatic
@@ -1290,6 +1364,118 @@ impl Core {
     pub fn bound_port(&self) -> u16 {
         self.port.load(Ordering::SeqCst)
     }
+    pub(crate) fn request_history_window(&self) {
+        if !self.config().clipboard_history {
+            return;
+        }
+        let mut request = self.window_request.lock().expect("window request");
+        request.0 = ((request.0 >> 1) + 1) * 2;
+        request.1 = None;
+        request.2 = false;
+        self.window_history.store(request.0, Ordering::SeqCst);
+    }
+    pub(crate) fn window_history(&self, request: u64) -> bool {
+        request != 0
+            && self.window_history.load(Ordering::SeqCst) == request
+            && self.config().clipboard_history
+    }
+    pub(crate) async fn disable_empty_clipboard_history(&self) -> Result<usize> {
+        let guard = self.config_gate.clone().lock_owned().await;
+        let mut config = self.config();
+        if !config.clipboard_history {
+            return Ok(0);
+        }
+        let count = self.store.history_disable_if_empty().await;
+        if count == 0 {
+            config.clipboard_history = false;
+            if let Err(error) = self.persist_config(config, guard).await {
+                self.store.history_configure(true, true).await?;
+                return Err(error);
+            }
+        }
+        Ok(count)
+    }
+    pub(crate) async fn pin_clipboard_history(&self, id: String, pinned: bool) -> Result<()> {
+        self.store.history_pin(id, pinned).await
+    }
+    pub(crate) async fn delete_clipboard_history(&self, id: Option<String>) -> Result<()> {
+        self.store.history_delete(id).await
+    }
+    pub(crate) async fn copy_clipboard_history(&self, id: String) -> Result<()> {
+        ensure!(self.config().clipboard_history, "clipboard history is off");
+        let (input, capture) = self.store.history_input(id.clone()).await?;
+        let content = self
+            .outbox
+            .file_io({
+                let input = input.clone();
+                move || {
+                    Ok(match input {
+                        crate::actions::ClipboardInput::Text(text) => {
+                            crate::ui::clipboard::Content::Text(text)
+                        }
+                        crate::actions::ClipboardInput::Image(file, _) => {
+                            crate::ui::clipboard::Content::Image(
+                                file.read_bounded(crate::store::history::MAX_IMAGE)?,
+                            )
+                        }
+                        _ => anyhow::bail!("invalid history input"),
+                    })
+                }
+            })
+            .await?;
+        let token = self.clipboard.token();
+        let offer = if self.config().clipboard_mode == crate::config::ClipboardMode::Automatic {
+            self.automatic_target()
+        } else {
+            None
+        };
+        let mut operation = ClipboardOperation {
+            token,
+            id: Id::new(crate::random_hex(16))?,
+            source: self.identity.device_id.clone(),
+            key: None,
+            created_at: 0,
+            hashes: clipboard_actor::hashes(&content),
+            content: Some(content),
+            payload: None,
+            offer,
+            received: false,
+            legacy: false,
+            restore: true,
+            repair: false,
+            observation: None,
+            sensitive: false,
+            history: Some(capture),
+            history_id: Some(id),
+        };
+        // Restoring is local even when peers cannot accept this representation.
+        // The largest clock also accounts for JSON framing overhead.
+        if operation.offer.is_some()
+            && self
+                .clipboard_frames(&operation, pneu_proto::MAX_TIMESTAMP)
+                .is_err()
+        {
+            operation.offer = None;
+        }
+        let (reply, _) = tokio::sync::oneshot::channel();
+        let outcome = self
+            .clipboard
+            .submit(
+                operation,
+                clipboard_driver::Request {
+                    input,
+                    claim: None,
+                    store: self.store.clone(),
+                    authority: None,
+                    kind: None,
+                    policy: Vec::new(),
+                    reply,
+                },
+            )
+            .await?;
+        ensure!(outcome.applied, "clipboard copy was superseded");
+        Ok(())
+    }
     pub fn request_window(&self, choose_folder: bool) {
         self.request_window_with_activation(choose_folder, None);
     }
@@ -1311,6 +1497,22 @@ impl Core {
         request.0 = ((request.0 >> 1) + 1) * 2;
         request.1 = token;
         request.2 = true;
+    }
+    /// A joined notification's Remove…: that device's page and its confirmation.
+    pub(crate) fn request_remove_window(&self, device: Id, token: Option<String>) {
+        let mut request = self.window_request.lock().expect("window request");
+        request.0 = ((request.0 >> 1) + 1) * 2;
+        request.1 = token;
+        request.2 = false;
+        *self.window_remove.lock().expect("window remove") = Some((request.0, device));
+    }
+    pub fn window_remove_device(&self, id: u64) -> Option<Id> {
+        self.window_remove
+            .lock()
+            .expect("window remove")
+            .as_ref()
+            .filter(|(request, _)| *request == id)
+            .map(|(_, device)| device.clone())
     }
     pub fn window_add_device(&self, id: u64) -> bool {
         let request = self.window_request.lock().expect("window request");
@@ -1363,10 +1565,30 @@ impl Core {
         let mut ui = self.ui.lock().expect("UI state");
         select_display(&sessions, &admission, &mut ui);
         let mut snapshot = ui.snapshot.clone();
+        snapshot.phone_controls = self.phone_control_snapshot(&sessions, &admission);
+        snapshot.clipboard_history = self.store.history_items();
+        snapshot.replacements = self
+            .store
+            .replacements
+            .lock()
+            .expect("replacement offers")
+            .clone();
+        snapshot.setup_refusal_since = self.setup_refusal_since();
         snapshot.devices = self.device_snapshots(&sessions, &admission, &ui);
         snapshot.send_targets = self.file_targets(&snapshot.devices, &sessions, &admission);
+        ui.scope_refresh.retain(|id, until| {
+            *until > Instant::now() && admission.peers.values().any(|p| p == id)
+        });
+        snapshot.refreshing_devices = ui.scope_refresh.keys().cloned().collect();
+        for device in &mut snapshot.devices {
+            if snapshot.refreshing_devices.contains(&device.device) && device.route.is_none() {
+                device.route = ui.phones.get(&device.device).map(|p| p.route.clone());
+            }
+        }
         snapshot.transfers = self.outbox.snapshot(&snapshot.connected_devices);
-        snapshot.transfers.extend(ui.incoming.iter().cloned());
+        let mut incoming: Vec<_> = ui.incoming.iter().cloned().collect();
+        self.store.attribute_finished_transfers(&mut incoming);
+        snapshot.transfers.extend(incoming);
         snapshot
     }
     fn arrival_source(&self, device: &Id) -> crate::actions::ArrivalSource {
@@ -1493,6 +1715,7 @@ impl Core {
         self.create_pairing(addresses)
     }
     fn create_pairing(&self, addresses: Vec<String>) -> Result<PairingUri> {
+        self.setup_invitation_scope.store(true, Ordering::SeqCst);
         ensure!(!addresses.is_empty(), "no reachable interface for pairing");
         let uri = PairingUri {
             version: 1,
@@ -1566,6 +1789,17 @@ impl Core {
         registration: Option<mesh::LinkEpoch>,
     ) -> Result<bool> {
         let guard = self.pairing_gate.clone().lock_owned().await;
+        if matches!(reason, CloseReason::Unpair) {
+            ensure!(
+                !self
+                    .store
+                    .setup_state()
+                    .roster
+                    .iter()
+                    .any(|m| m.device_id == device && m.status == MemberStatus::Member),
+                "setup membership changed; confirm Remove from all devices"
+            );
+        }
         if generation.is_some() && self.store.pairing_generation(&device) != generation {
             return Ok(false);
         }
@@ -1750,43 +1984,85 @@ impl Core {
         let clipboard = self.clipboard.clone();
         let ui = self.ui.clone();
         let settings = self.config.clone();
+        let retry_disconnected = self.outbox.retry_disconnected.clone();
         let events = self.events.clone();
+        let mut member = self.self_member();
+        member.name = config.name.clone();
+        let saved = config.clone();
+        #[cfg(test)]
+        let save_store = self.store.clone();
+        let history_change = previous.clipboard_history != config.clipboard_history;
+        let history_enabled = config.clipboard_history;
+        let history_store = self.store.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let (complete, completed) = tokio::sync::oneshot::channel();
+        let publish = move || {
+            let _guard = guard;
+            let mut automatic = automatic.lock().expect("automatic clipboard");
+            if cancel_automatic {
+                // Fence effects computed before this change, even if their
+                // publication runs after the existing queue is invalidated.
+                config_epoch.fetch_add(1, Ordering::SeqCst);
+                automatic.invalidate();
+                clipboard.event(ClipboardEvent::Policy {
+                    allowed: Vec::new(),
+                });
+            }
+            retry_disconnected.store(config.queue_offline, Ordering::SeqCst);
+            settings.send_replace(config);
+            clipboard.event(ClipboardEvent::Mode(
+                if settings.borrow().clipboard_sync_to_phone {
+                    settings.borrow().clipboard_mode
+                } else {
+                    crate::config::ClipboardMode::Off
+                },
+            ));
+            drop(automatic);
+            if clear_error {
+                let mut ui = ui.lock().expect("UI state");
+                ui.snapshot
+                    .clear_destination(crate::ui::ReceiveDestination::SaveFolder, None);
+            }
+            let _ = events.send(Event::ConfigChanged);
+        };
         self.store
-            .blocking(move |_| {
-                let _guard = guard;
-                config.save(&path)?;
-                let mut automatic = automatic.lock().expect("automatic clipboard");
-                if cancel_automatic {
-                    // Fence effects computed before this change, even if their
-                    // publication runs after the existing queue is invalidated.
-                    config_epoch.fetch_add(1, Ordering::SeqCst);
-                    automatic.invalidate();
-                    clipboard.event(ClipboardEvent::Policy {
-                        allowed: Vec::new(),
-                    });
-                }
-                settings.send_replace(config);
-                clipboard.event(ClipboardEvent::Mode(
-                    if settings.borrow().clipboard_sync_to_phone {
-                        settings.borrow().clipboard_mode
+            .setup_refresh_self_then(
+                member,
+                move || {
+                    #[cfg(test)]
+                    save_store.fault("setup_config_after_commit")?;
+                    saved.save(&path)
+                },
+                move || {
+                    if history_change {
+                        runtime.spawn(async move {
+                            let result = history_store
+                                .history_configure(history_enabled, false)
+                                .await;
+                            if result.is_ok() {
+                                publish();
+                            }
+                            let _ = complete.send(result);
+                        });
                     } else {
-                        crate::config::ClipboardMode::Off
-                    },
-                ));
-                drop(automatic);
-                if clear_error {
-                    let mut ui = ui.lock().expect("UI state");
-                    ui.snapshot
-                        .clear_destination(crate::ui::ReceiveDestination::SaveFolder, None);
-                }
-                let _ = events.send(Event::ConfigChanged);
-                Ok(())
-            })
+                        publish();
+                        let _ = complete.send(Ok(()));
+                    }
+                },
+            )
+            .await?;
+        completed
             .await
+            .context("configuration publication stopped")??;
+        Ok(())
     }
+
     pub async fn send_clipboard(&self, device: Id, text: String) -> Result<Id> {
         self.send_observed_formats(self.explicit_clipboard_offer_for(device)?, Some(text), None)
             .await
+    }
+    pub(crate) async fn notify_clipboard_too_large(&self) -> Result<()> {
+        self.actions.notify_clipboard_too_large().await
     }
     pub async fn share_clipboard(&self, targets: crate::outbox::Targets) -> Result<Id> {
         let mut offer = {
@@ -1834,6 +2110,7 @@ impl Core {
         let guard = self.config_gate.clone().lock_owned().await;
         let mut config = self.config();
         match key.as_str() {
+            "clipboard_history" => config.clipboard_history = serde_json::from_value(value)?,
             "clipboard_mode" => config.clipboard_mode = serde_json::from_value(value)?,
             "choose_devices_each_time" => {
                 config.choose_devices_each_time = serde_json::from_value(value)?
@@ -1902,6 +2179,7 @@ impl Core {
         target.config_epoch == self.clipboard_config_epoch.load(Ordering::SeqCst)
             && self.config().clipboard_sync_to_phone
             && self.config().clipboard_mode != crate::config::ClipboardMode::Off
+            && !self.store.replacement_pending(&target.device)
             && !sessions.unpairing.contains(&target.device)
             && target.binding == self.store.pairing_generation(&target.device).unwrap_or(0)
             && sessions.sessions.get(&target.device).is_some_and(|s| {
@@ -1980,6 +2258,15 @@ impl Core {
         clear: bool,
         initial: bool,
     ) -> (Option<ClipboardOffer>, u64) {
+        self.observe_watched_clipboard_metadata(origin, clear, initial, false)
+    }
+    pub(crate) fn observe_watched_clipboard_metadata(
+        &self,
+        origin: bool,
+        clear: bool,
+        initial: bool,
+        owned: bool,
+    ) -> (Option<ClipboardOffer>, u64) {
         let token = self.clipboard.token();
         // A watcher's first event describes existing content, not a new copy.
         // Classify it for explicit sharing, but never freeze automatic recipients.
@@ -1992,6 +2279,9 @@ impl Core {
                 offer
             });
         self.clipboard.event(ClipboardEvent::Observe {
+            history: (!initial && !owned)
+                .then(|| self.store.history_capture())
+                .flatten(),
             token,
             id: Id::new(crate::random_hex(16)).expect("random id"),
             offer: offer.clone(),
@@ -2009,6 +2299,10 @@ impl Core {
     #[cfg(any(target_os = "macos", windows))]
     pub(crate) fn retire_clipboard_observation(&self, token: u64) {
         self.clipboard.event(ClipboardEvent::AbandonRead(token));
+    }
+    pub(crate) fn clipboard_image_too_large(&self, token: u64, fingerprint: [u8; 32]) {
+        self.clipboard
+            .event(ClipboardEvent::ImageTooLarge { token, fingerprint });
     }
     pub(crate) fn clipboard_observed(
         &self,
@@ -2059,7 +2353,7 @@ impl Core {
     pub(crate) async fn clipboard_test_idle(&self) {
         self.clipboard.barrier().await;
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn clipboard_test_read(
         &self,
         token: u64,
@@ -2073,7 +2367,7 @@ impl Core {
     async fn wait_clipboard_observation(&self) {
         self.clipboard.barrier().await;
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn observe_local_clipboard_offer(&self) -> Result<Option<ClipboardOffer>> {
         let (offer, token) = self.observe_watched_clipboard(false);
         let reply = self.clipboard.waiter(token);
@@ -2094,6 +2388,19 @@ impl Core {
             *self.window_focus.lock().expect("window focus") =
                 focused.then_some((request, Instant::now()));
         }
+    }
+    pub(crate) fn set_window_visible(&self, request: u64, visible: bool) {
+        if self.window_request() == request {
+            *self.window_visible.lock().expect("window visibility") =
+                visible.then_some((request, Instant::now()));
+        }
+    }
+    pub(crate) fn window_visible(&self) -> bool {
+        let request = self.window_request();
+        self.window_visible
+            .lock()
+            .expect("window visibility")
+            .is_some_and(|(r, at)| r == request && at.elapsed() < Duration::from_secs(2))
     }
     pub(crate) fn window_focused(&self) -> bool {
         let request = self.window_request.lock().expect("window request").0;
@@ -2143,7 +2450,7 @@ impl Core {
             .expect("automatic clipboard")
             .invalidate_peer(device);
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn take_automatic(&self, device: &Id, connection: u64) -> Option<AutomaticWrite> {
         self.take_automatic_lanes(device, connection, true, true)
     }
@@ -2337,6 +2644,9 @@ impl Core {
         let id = Id::new(crate::random_hex(16))?;
         let input = self.clipboard_input(Some(content.clone()))?;
         let operation = ClipboardOperation {
+            sensitive: false,
+            history: None,
+            history_id: None,
             token,
             id: id.clone(),
             source: self.identity.device_id.clone(),
@@ -2408,8 +2718,9 @@ impl Core {
             Some(Content::Formats(text, bytes)) => (Some(text.clone()), Some(bytes.clone())),
             None => (None, None),
         };
-        let text = text.map(|text| {
+        let text = text.filter(|t| t.len() <= MAX_CLIPBOARD_BYTES).map(|text| {
             OutgoingSelection::Text(Clipboard {
+                sensitive: false,
                 transfer_id: operation.id.clone(),
                 text,
                 created_at: hlc,
@@ -2421,6 +2732,9 @@ impl Core {
         let image = image.map(|bytes| {
             OutgoingSelection::Image(
                 FileBegin {
+                    resume: None,
+                    folder: None,
+                    sensitive: false,
                     transfer_id: operation.id.clone(),
                     file_name: "clipboard.png".into(),
                     mime: "image/png".into(),
@@ -2479,6 +2793,7 @@ impl Core {
         }
     }
     pub fn request_shutdown(&self) {
+        self.outbox.stopping.store(true, Ordering::SeqCst);
         self.shutdown.send_replace(true);
         self.action_stop.send_replace(true);
     }
@@ -2533,12 +2848,14 @@ impl Core {
         let mut prune = tokio::time::interval(Duration::from_secs(3600));
         let mut discovery = tokio::time::interval(Duration::from_secs(60));
         let mut recovery_tick = tokio::time::interval(Duration::from_secs(1));
+        let mut partial_tick = tokio::time::interval(Duration::from_secs(60));
         loop {
             if *shutdown.borrow() {
                 break;
             }
             tokio::select! {
                 _ = shutdown.changed() => break,
+                _ = partial_tick.tick()=>{if let Err(error)=self.store.maintain_partials().await {self.error(None,format!("resume maintenance deferred: {error}"));}},
                 _ = recovery_tick.tick() => {if let Err(error)=self.outbox.retry_recovery().await {self.error(None,format!("outbox recovery deferred: {error}"));}},
                 _ = discovery.tick(), if advertise => {
                     match crate::discovery::candidates() {
@@ -2646,10 +2963,46 @@ impl Core {
                     .context("missing client cert")?[0]
                     .as_ref(),
             );
-            if !verifier.admit(&fp) {
-                self.event(Event::Blocked {
-                    address: peer_address.ip().to_canonical().to_string(),
-                });
+            let _refresh = self
+                .admission
+                .lock()
+                .expect("admission")
+                .peers
+                .get(&fp)
+                .cloned()
+                .map(|device| crate::ui::ScopeReconnect::new(self.ui.clone(), device));
+            let already_known = self
+                .admission
+                .lock()
+                .expect("admission")
+                .peers
+                .contains_key(&fp);
+            let (admitted, _setup_incoming) = if already_known {
+                (true, None)
+            } else {
+                let _gate = self.pairing_gate.lock().await;
+                let admitted = verifier.admit(&fp);
+                let target = if admitted
+                    && !self
+                        .admission
+                        .lock()
+                        .expect("admission")
+                        .peers
+                        .contains_key(&fp)
+                {
+                    Some(self.track_setup_incoming(candidate, fp.clone()))
+                } else {
+                    None
+                };
+                (admitted, target)
+            };
+            if !admitted {
+                if !self.store.setup_quiet_reconnect(fp.clone()).await? {
+                    self.event(Event::Blocked {
+                        address: peer_address.ip().to_canonical().to_string(),
+                        fingerprint: fp.clone(),
+                    });
+                }
                 crate::transport::close(
                     &mut tls,
                     &[Message::Error(ErrorMessage {
@@ -2719,9 +3072,42 @@ impl Core {
                 return Ok(());
             }
             normalize_legacy_hello(&mut hello, false);
+            if _setup_incoming.is_some() {
+                let _gate = self.pairing_gate.lock().await;
+                if let Some(target) = self
+                    .setup_incoming
+                    .lock()
+                    .expect("setup incoming")
+                    .get_mut(&candidate)
+                {
+                    target.peer = Some(hello.device_id.clone());
+                }
+            }
+            let (mut local_hello, setup_revision) = {
+                (
+                    self.computer_hello_for(&fp, Some(&hello.device_id), false),
+                    self.store.setup_state().generation,
+                )
+            };
+            if let Some(target) = self
+                .setup_incoming
+                .lock()
+                .expect("setup incoming")
+                .get(&candidate)
+            {
+                local_hello.setup = Some(self.store.setup_hello(
+                    None,
+                    if target.scope {
+                        SetupScope::Enabled
+                    } else {
+                        SetupScope::Disabled
+                    },
+                ));
+            }
+            let setup_sent = local_hello.setup.clone().map(|h| (h, setup_revision));
             crate::transport::send(
                 &mut tls,
-                &Message::Hello(self.computer_hello()),
+                &Message::Hello(local_hello),
                 Duration::from_secs(10),
             )
             .await?;
@@ -2741,6 +3127,10 @@ impl Core {
             } else {
                 let token = match read_handshake(&mut tls).await? {
                     Message::PairRequest(p) => p.token,
+                    Message::Members(_) => {
+                        send_error(&mut tls, ErrorCode::UnexpectedMessage).await?;
+                        return Ok(());
+                    }
                     Message::Error(_) => return Ok(()),
                     _ => {
                         send_error(&mut tls, ErrorCode::Unauthorized).await?;
@@ -2750,8 +3140,20 @@ impl Core {
                 self.event(Event::PairingProgress {
                     name: Some(hello.name.clone()),
                 });
+                let incoming_target = self
+                    .setup_incoming
+                    .lock()
+                    .expect("setup incoming")
+                    .get(&candidate)
+                    .cloned();
                 let result = self
-                    .finish_pairing_hello(&hello.device_id, &fp, &token, Some(hello.clone()))
+                    .finish_pairing_hello_target(
+                        &hello.device_id,
+                        &fp,
+                        &token,
+                        Some(hello.clone()),
+                        incoming_target,
+                    )
                     .await;
                 if let Ok(store) = &result {
                     captured = store.clone();
@@ -2779,7 +3181,7 @@ impl Core {
             }
             verifier.release_provisional();
             self.clone()
-                .register_buffered(
+                .register_buffered_setup(
                     tls,
                     hello,
                     fp,
@@ -2790,12 +3192,13 @@ impl Core {
                     allow_recovery,
                     Vec::new(),
                     Some(candidate),
+                    setup_sent,
                 )
                 .await
         })
         .await
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     #[allow(clippy::too_many_arguments)]
     async fn register(
         self: Arc<Self>,
@@ -2822,8 +3225,43 @@ impl Core {
         )
         .await
     }
+    #[cfg(all(test, unix))]
     #[allow(clippy::too_many_arguments)]
     async fn register_buffered(
+        self: Arc<Self>,
+        tls: TlsStream<TcpStream>,
+        hello: Hello,
+        fp: Hash,
+        peer_address: SocketAddr,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        captured: Store,
+        outbound: bool,
+        allow_recovery: bool,
+        buffered: Vec<Message>,
+        started: Option<u64>,
+    ) -> Result<()> {
+        let sent = Some((
+            self.store
+                .setup_hello(Some(&hello.device_id), SetupScope::Enabled),
+            self.store.setup_state().generation,
+        ));
+        self.register_buffered_setup(
+            tls,
+            hello,
+            fp,
+            peer_address,
+            permit,
+            captured,
+            outbound,
+            allow_recovery,
+            buffered,
+            started,
+            sent,
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn register_buffered_setup(
         self: Arc<Self>,
         mut tls: TlsStream<TcpStream>,
         mut hello: Hello,
@@ -2835,6 +3273,7 @@ impl Core {
         allow_recovery: bool,
         buffered: Vec<Message>,
         started: Option<u64>,
+        setup_sent: Option<(SetupHello, u64)>,
     ) -> Result<()> {
         if hello.device_id == self.identity.device_id {
             send_error(&mut tls, ErrorCode::Unauthorized).await?;
@@ -2987,6 +3426,14 @@ impl Core {
                         .expect("paired generation"),
                     hello.capabilities.iter().any(|c| c == "files"),
                 );
+                self.outbox.note_folders(
+                    hello.device_id.clone(),
+                    self.store
+                        .pairing_generation(&hello.device_id)
+                        .expect("paired generation"),
+                    hello.capabilities.iter().any(|c| c == "folder_v1")
+                        && hello.capabilities.iter().any(|c| c == "file_resume_v1"),
+                );
                 self.publish_phone(&state, connection_id, &hello, peer_address.ip());
                 self.event(Event::PhonePaused {
                     device: hello.device_id.clone(),
@@ -3050,7 +3497,10 @@ impl Core {
             .as_ref()
             .map(|scope| scope.connection_generation.load(Ordering::SeqCst));
         store.mesh = hello.capabilities.iter().any(|c| c == "mesh");
+        store.file_resume = hello.capabilities.iter().any(|c| c == "file_resume_v1")
+            && hello.capabilities.iter().any(|c| c == "files");
         store.local_device = Some(self.identity.device_id.clone());
+        store.setup_generation = Some(self.store.setup_state().generation);
         let result = if persisted {
             // The task's total transport permit remains held through READY
             // and teardown. Only the bounded ingress reserve is released.
@@ -3061,6 +3511,7 @@ impl Core {
                     &hello,
                     wake,
                     ReadyState {
+                        setup_sent,
                         store,
                         allow_recovery,
                         action_scope,
@@ -3184,7 +3635,7 @@ impl Core {
             Ok(())
         }
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     async fn finish_pairing(
         &self,
         device: &Id,
@@ -3195,7 +3646,7 @@ impl Core {
             .await
             .map(|_| ())
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     async fn finish_pairing_captured(
         &self,
         device: &Id,
@@ -3204,6 +3655,7 @@ impl Core {
     ) -> std::result::Result<Store, PairCode> {
         self.finish_pairing_hello(device, fp, token, None).await
     }
+    #[cfg(test)]
     async fn finish_pairing_hello(
         &self,
         device: &Id,
@@ -3211,12 +3663,29 @@ impl Core {
         token: &Hash,
         hello: Option<Hello>,
     ) -> std::result::Result<Store, PairCode> {
+        self.finish_pairing_hello_target(device, fp, token, hello, None)
+            .await
+    }
+    async fn finish_pairing_hello_target(
+        &self,
+        device: &Id,
+        fp: &Hash,
+        token: &Hash,
+        hello: Option<Hello>,
+        target: Option<setup::IncomingTarget>,
+    ) -> std::result::Result<Store, PairCode> {
         // PAIR_REQUEST carries only a token; its remote ID comes from HELLO.
         // Refuse it before consuming the invitation or allocating a binding.
         if device == &self.identity.device_id {
             return Err(PairCode::InvalidToken);
         }
         let guard = self.pairing_gate.clone().lock_owned().await;
+        if target
+            .as_ref()
+            .is_some_and(|v| v.cancelled.load(Ordering::SeqCst))
+        {
+            return Err(PairCode::InvalidToken);
+        }
         {
             let state = self.admission.lock().expect("admission");
             let invitation = state.invitation.as_ref().ok_or(PairCode::PairingClosed)?;
@@ -3237,11 +3706,19 @@ impl Core {
             normalize_legacy_hello(&mut hello, false);
             hello
         });
-        self.persist_pairing_hello(device, fp, guard, true, hello, None)
-            .await
-            .map_err(|_| PairCode::StorageFailed)
+        self.persist_pairing_hello_scoped(
+            device,
+            fp,
+            guard,
+            true,
+            hello,
+            None,
+            target.map(|t| t.scope),
+        )
+        .await
+        .map_err(|_| PairCode::StorageFailed)
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     async fn persist_pairing(
         &self,
         device: &Id,
@@ -3252,6 +3729,7 @@ impl Core {
         self.persist_pairing_hello(device, fp, guard, consume_invitation, None, None)
             .await
     }
+    #[allow(clippy::too_many_arguments)]
     async fn persist_pairing_hello(
         &self,
         device: &Id,
@@ -3260,6 +3738,28 @@ impl Core {
         consume_invitation: bool,
         hello: Option<Hello>,
         installed: Option<Arc<AtomicU64>>,
+    ) -> Result<Store> {
+        self.persist_pairing_hello_scoped(
+            device,
+            fp,
+            guard,
+            consume_invitation,
+            hello,
+            installed,
+            None,
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_pairing_hello_scoped(
+        &self,
+        device: &Id,
+        fp: &Hash,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+        consume_invitation: bool,
+        hello: Option<Hello>,
+        installed: Option<Arc<AtomicU64>>,
+        scope: Option<bool>,
     ) -> Result<Store> {
         ensure!(
             device != &self.identity.device_id,
@@ -3280,46 +3780,120 @@ impl Core {
         let device = device.clone();
         let fp = fp.clone();
         let invitation_changes = self.invitation_changes.clone();
+        let local_scope = scope.unwrap_or_else(|| {
+            if consume_invitation {
+                self.setup_invitation_scope.load(Ordering::SeqCst)
+            } else {
+                self.mesh.join_scope(&fp)
+            }
+        });
+        let route_proven = !consume_invitation
+            && hello
+                .as_ref()
+                .is_some_and(|h| h.addresses.as_ref().is_some_and(|v| !v.is_empty()));
+        let old_pin = self
+            .admission
+            .lock()
+            .expect("admission")
+            .peers
+            .iter()
+            .find(|(pin, id)| **id == device && **pin != fp)
+            .map(|(pin, _)| pin.clone());
+        let mesh = self.mesh.clone();
+        let incoming = self.setup_incoming.clone();
+        let lifecycle_store = self.store.clone();
+        let setup_generation = self.store.setup_state().generation;
+        let offline = self
+            .ui_snapshot()
+            .devices
+            .into_iter()
+            .filter(|d| !self.connected_devices().contains(&d.device))
+            .map(|d| (d.device, d.last_seen))
+            .collect();
         self.store
-            .pair_then_hello(device.clone(), fp.clone(), hello, move || {
-                let _guard = guard;
-                let mut connections = sessions.lock().expect("sessions");
-                connections.unpairing.remove(&device);
-                automatic
-                    .lock()
-                    .expect("automatic clipboard")
-                    .invalidate_peer(&device);
-                if let Some(old) = connections.sessions.remove(&device) {
-                    old.close
-                        .send_replace(Some(CloseReason::Error(ErrorCode::Unauthorized)));
-                }
-                clipboard.event(ClipboardEvent::BindingReset(device.clone()));
-                let mut scopes = actions.lock().expect("actions");
-                if let Some(old) = scopes.insert(device.clone(), ActionScope::new()) {
-                    old.cancelled.send_replace(true);
-                }
-                pending.discard_invalid();
-                let mut state = admission.lock().expect("admission");
-                state.peers.retain(|_, id| *id != device);
-                state.peers.insert(fp, device.clone());
-                // The attempt owns this marker. Publish in the uncancelable
-                // commit callback so retry cannot mistake its own install for
-                // a newer local decision, even if its waiter disappears.
-                if let Some(installed) = installed {
-                    installed.store(installed_generation, Ordering::SeqCst);
-                }
-                if consume_invitation {
-                    state.invitation = None;
-                }
-                invitation_changes.send_modify(|r| *r = r.wrapping_add(1));
-                drop(state);
-                emit_event(&ui, &events, Event::Paired { device });
-                select_display(
-                    &connections,
-                    &admission.lock().expect("admission"),
-                    &mut ui.lock().expect("UI state"),
-                );
-            })
+            .pair_then_hello_replacement(
+                device.clone(),
+                fp.clone(),
+                hello,
+                Some(self.self_member()),
+                if local_scope {
+                    SetupScope::Enabled
+                } else {
+                    SetupScope::Disabled
+                },
+                route_proven,
+                offline,
+                move || {
+                    let _guard = guard;
+                    if let Some(pin) = old_pin {
+                        mesh.cancel_removed(&[(device.clone(), pin.clone())]);
+                        for target in incoming.lock().expect("setup incoming").values() {
+                            if target.pin == pin
+                                && target.peer.as_ref().is_none_or(|p| *p == device)
+                            {
+                                target.cancelled.store(true, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                    let mut connections = sessions.lock().expect("sessions");
+                    connections.unpairing.remove(&device);
+                    automatic
+                        .lock()
+                        .expect("automatic clipboard")
+                        .invalidate_peer(&device);
+                    if let Some(old) = connections.sessions.remove(&device) {
+                        old.close
+                            .send_replace(Some(CloseReason::Error(ErrorCode::Unauthorized)));
+                    }
+                    clipboard.event(ClipboardEvent::BindingReset(device.clone()));
+                    let mut scopes = actions.lock().expect("actions");
+                    if let Some(old) = scopes.insert(device.clone(), ActionScope::new()) {
+                        old.cancelled.send_replace(true);
+                    }
+                    pending.discard_invalid();
+                    let mut state = admission.lock().expect("admission");
+                    state.peers.retain(|_, id| *id != device);
+                    state.peers.insert(fp, device.clone());
+                    // The attempt owns this marker. Publish in the uncancelable
+                    // commit callback so retry cannot mistake its own install for
+                    // a newer local decision, even if its waiter disappears.
+                    if let Some(installed) = installed {
+                        installed.store(installed_generation, Ordering::SeqCst);
+                    }
+                    if consume_invitation && let Some(invitation) = state.invitation.take() {
+                        ui.lock().expect("UI state").snapshot.pairing_completion =
+                            Some(crate::ui::PairingCompletion {
+                                token: invitation.token,
+                                device: device.clone(),
+                            });
+                    }
+                    invitation_changes.send_modify(|r| *r = r.wrapping_add(1));
+                    drop(state);
+                    let setup = lifecycle_store.setup_state();
+                    if setup.generation != setup_generation {
+                        for session in connections.sessions.values() {
+                            if session.capabilities.iter().any(|c| c == "setup")
+                                && setup.links.iter().any(|l| {
+                                    l.device == session.device && l.scope != SetupScope::Disabled
+                                })
+                            {
+                                ui.lock()
+                                    .expect("UI state")
+                                    .refreshing_scope(&session.device);
+                                session
+                                    .close
+                                    .send_replace(Some(CloseReason::Error(ErrorCode::Closing)));
+                            }
+                        }
+                    }
+                    emit_event(&ui, &events, Event::Paired { device });
+                    select_display(
+                        &connections,
+                        &admission.lock().expect("admission"),
+                        &mut ui.lock().expect("UI state"),
+                    );
+                },
+            )
             .await?;
         Ok(captured)
     }
@@ -3337,6 +3911,7 @@ impl Core {
         Box::pin(async move {
 
         let ReadyState {
+            setup_sent,
             store,
             allow_recovery,
             action_scope,
@@ -3344,10 +3919,15 @@ impl Core {
         } = state;
         let mut config = self.config.subscribe();
         let mut settings_changes=store.settings_changed.subscribe();
+        let mut setup_changes=store.setup_changed.subscribe();
         let (mut reader, writer) = tokio::io::split(tls);
         let activity = Arc::new(Mutex::new(Instant::now()));
         let mut writer = crate::transport::ActivityWriter { writer, sent: activity.clone() };
         let (write_tx, write_rx) = mpsc::channel::<Message>(32);
+        self.attach_phone_control(hello, &store, write_tx.clone());
+        let write_rx = phone_controls::FrameQueue::new(write_rx, hello, &store);
+        let mut phone_tick = tokio::time::interval(Duration::from_secs(1));
+        phone_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let (priority_tx, priority_rx) = mpsc::channel::<Message>(8);
         let (automatic_tx, automatic_rx) = mpsc::channel::<AutomaticWrite>(1);
         let (automatic_text_tx, automatic_text_rx) = mpsc::channel::<AutomaticWrite>(1);
@@ -3373,7 +3953,7 @@ impl Core {
         let readiness = Arc::new(Notify::new());
         let needs_evidence = !outbound && hello.role == Some(DeviceRole::Computer);
         let _readiness = needs_evidence.then(|| self.persist_readiness(
-            store.clone(), hello.device_id.clone(), Some(readiness.clone()),
+            store.clone(), hello.device_id.clone(), if allow_recovery {None}else{Some(readiness.clone())},
         ));
         let reader_task = tokio::spawn(Box::pin(async move {
             for message in buffered {
@@ -3445,6 +4025,7 @@ impl Core {
         let text_writer = write_tx.clone();
         let text_close = close_tx.clone();
         let text_store = store.clone();
+        let mirror_scope = action_scope.clone();
         let text_task = tokio::spawn(Box::pin(async move {
             let mut incoming = None;
             while let Some(message) = text_rx.recv().await {
@@ -3484,6 +4065,10 @@ impl Core {
         };
         let mut writer_finished = false;
         let mut file_pending: Option<crate::outbox::Delivery> = None;
+        let mut file_ready: Option<(Id,u64,tokio::sync::oneshot::Sender<Option<u64>>)> = None;
+        let mut cancelled_files=HashMap::<Id,(bool,bool)>::new();
+        let mut file_receipt_ready:Option<Arc<AtomicBool>>=None;
+        let mut queued_cancels=HashSet::new();
         let mut file_preparations = JoinSet::new();
         let mut file_poll = Instant::now();
         let generation = store.pairing_generation(&hello.device_id).context("pairing changed")?;
@@ -3496,6 +4081,33 @@ impl Core {
         let mut settings_confirmed: Option<Vec<PeerSetting>> = None;
         let mut settings_received = !store.mesh;
         let mut settings_retry: Option<Instant> = None;
+        let mut members_pending: Option<PendingOutgoing> = None;
+        let mut members_snapshot: Option<Members> = None;
+        let mut members_confirmed: Option<Vec<Member>> = None;
+        let mut members_retry: Option<Instant> = None;
+        let mut members_blocked=false;
+        let mut members_init_retry: Option<Instant> = None;
+        let mut phone_notices = phone_notifications::Worker::start(self.clone(), store.clone(), hello.device_id.clone(), mirror_scope, close.clone());
+        let mut notice_stream = phone_notifications::Stream::default();
+        let setup_negotiated=hello.capabilities.iter().any(|c|c=="setup");
+        // Legacy READY evidence is bookkeeping, not a prerequisite for control
+        // traffic. Poll one bounded store job alongside the control loop; drop
+        // cancels its admission wait and admitted work remains store-tracked.
+        let legacy_ready=async {
+            loop {
+                match self.setup_ready(&store,hello,setup_sent.clone()).await {
+                    Ok(_)=>break,
+                    Err(error)=>self.error(Some(hello.device_id.clone()),format!("membership initialization deferred: {error}")),
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        };
+        tokio::pin!(legacy_ready);
+        let mut legacy_ready_pending=!setup_negotiated;
+        let mut members_fence=if setup_negotiated {match self.setup_ready(&store,hello,setup_sent.clone()).await {
+            Ok(fence)=>fence,
+            Err(error)=>{self.error(Some(hello.device_id.clone()),format!("membership initialization deferred: {error}"));members_init_retry=Some(Instant::now()+Duration::from_secs(60));None},
+        }} else {None};
         let result:Result<()>=async {
             if let Err(error)=self.initialize_settings(&store,hello).await {
                 self.error(Some(hello.device_id.clone()),format!("settings initialization deferred: {error}"));
@@ -3503,7 +4115,26 @@ impl Core {
             }
             loop {
                 if close.borrow().is_some() || !self.connection_current(&store, &hello.device_id) {break;}
-                if store.mesh {
+                if members_init_retry.is_some_and(|at|at<=Instant::now()) {
+                    match self.setup_ready(&store,hello,setup_sent.clone()).await {
+                        Ok(fence)=>{members_fence=fence;members_init_retry=None;},
+                        Err(error)=>{self.error(Some(hello.device_id.clone()),format!("membership initialization deferred: {error}"));members_init_retry=Some(Instant::now()+Duration::from_secs(60));},
+                    }
+                }
+                if let Some(fence)=&members_fence {
+                    let state=store.setup_state();
+                    if state.generation!=fence.generation {break;}
+                    if !members_blocked && members_pending.is_none() && members_retry.is_none_or(|at|at<=Instant::now()) && members_confirmed.as_ref()!=Some(&state.roster) {
+                        match store.members_outgoing(fence.clone()).await {
+                            Ok(snapshot)=>{
+                                if !enqueue(&write_tx,Message::Members(snapshot.clone()),&mut close,Some(Instant::now()+Duration::from_secs(60))).await? {break;}
+                                members_pending=Some(PendingOutgoing::queued(snapshot.transfer_id.clone()));members_snapshot=Some(snapshot);members_retry=None;
+                            },
+                            Err(error)=>{self.error(Some(hello.device_id.clone()),format!("membership persistence failed: {error}"));members_retry=Some(Instant::now()+Duration::from_secs(60));},
+                        }
+                    }
+                }
+                if store.mesh && !self.store.replacement_pending(&hello.device_id) {
                     let fields=self.store.pair_settings.lock().expect("pair settings").get(&hello.device_id).cloned().unwrap_or_default();
                     if settings_pending.is_none() && settings_retry.is_none_or(|at|at<=Instant::now()) && settings_confirmed.as_ref()!=Some(&fields) {
                         match store.settings_outgoing(self.identity.device_id.clone(),hello.device_id.clone(),hello.role==Some(DeviceRole::Phone)).await {
@@ -3519,7 +4150,20 @@ impl Core {
                     let synchronized=settings_received && settings_pending.is_none() && settings_confirmed.as_ref()==Some(&fields);
                     self.publish_settings_ready(&store, &hello.device_id, synchronized);
                 }
-                if file_pending.is_some() && !self.outbox.current(file_pending.as_ref().expect("pending file")) {break;}
+                if file_pending.as_ref().is_some_and(|d|!self.outbox.current(d)) {
+                    let delivery=file_pending.take().expect("pending file");
+                    if !store.file_resume {break;}
+                    cancelled_files.insert(delivery.begin.transfer_id.clone(),(file_ready.is_some(),file_receipt_ready.as_ref().is_some_and(|p|p.load(Ordering::SeqCst))));
+                    if let Some((_,_,ready))=file_ready.take(){let _=ready.send(None);}
+                    pending=None;
+                }
+                // Reserve one writer slot in select! below, alongside reports.
+                // Filling the queue here can deadlock against the writer's
+                // bounded report queue during a bulk reconnect cancellation.
+                let next_cancel=if store.file_resume {
+                    self.outbox.pending_cancels(hello.device_id.clone(),generation).await?
+                        .into_iter().find(|id|!queued_cancels.contains(id))
+                } else {None};
                 if pending.is_none() && self.outbox.has_work(&hello.device_id) && Instant::now()>=file_poll && self.content_ready(&store,&hello.device_id)
                     && hello.capabilities.iter().any(|c|c=="files") {
                     file_poll=Instant::now()+Duration::from_secs(1);
@@ -3527,19 +4171,22 @@ impl Core {
                     let claim_core=self.clone();let claim_store=store.clone();let claim_device=hello.device_id.clone();
                     match self.outbox.claim_while(hello.device_id.clone(),generation,store.connection_id.expect("connection id"),move ||claim_core.connection_current(&claim_store,&claim_device)).await {
                         Ok(Some(delivery))=>{
+                            if delivery.begin.folder.is_some() && (!store.file_resume || !hello.capabilities.iter().any(|c|c=="folder_v1")) {
+                                let reason = if hello.role == Some(pneu_proto::DeviceRole::Phone) { "Can't receive folders yet" } else { "Needs a Pneu update" };
+                                self.outbox.fail(delivery.clone(),reason.into()).await?;
+                                self.delivery_finished(&delivery);
+                                continue;
+                            }
                             let id=delivery.begin.transfer_id.clone();
                             // Hashing belongs to a preparation job. The transport
                             // writer continues servicing heartbeat and text.
                             let core=self.clone();let preparing=delivery.clone();let connection=store.connection_id.expect("connection id");let mesh=store.mesh;
                             file_preparations.spawn(async move {
-                                match core.outbox.reader(preparing.clone()).await {
-                                    Ok(file)=>Ok(FileWrite {delivery:preparing,connection,mesh,file:Some(file)}),
-                                    Err(error)=>{
-                                        if let Err(storage)=core.outbox.fail(preparing.clone(),error.to_string()).await {core.error(None,format!("outbox failure persistence deferred: {storage}"));}
-                                        core.delivery_finished(&preparing);Err(error)
-                                    }
-                                }
+                                let payload=if preparing.begin.folder.is_some() {core.outbox.folder_reader(preparing.clone()).await.map(file_sender::Payload::from)} else {core.outbox.reader(preparing.clone()).await.map(file_sender::Payload::from)};
+                                let result=payload.map(|file|FileWrite {delivery:preparing.clone(),connection,mesh,file:Some(file),ready:None,receipt_ready:Arc::new(AtomicBool::new(false))});
+                                (preparing,result)
                             });
+                            file_receipt_ready=None;
                             file_pending=Some(delivery);pending=Some(PendingOutgoing::queued(id));
                         },
                         Ok(None)=>{},
@@ -3567,12 +4214,15 @@ impl Core {
                 }
                 let content_deadline=pending.as_ref().and_then(|p|p.deadline).into_iter().chain(text_pending.as_ref().and_then(|p|p.deadline)).min();
                 let settings_deadline=settings_pending.as_ref().and_then(|p|p.deadline);
-                let receipt_deadline=content_deadline.into_iter().chain(settings_deadline).min().unwrap_or_else(||Instant::now()+Duration::from_secs(86400));
+                let members_deadline=members_pending.as_ref().and_then(|p|p.deadline);
+                let receipt_deadline=content_deadline.into_iter().chain(settings_deadline).chain(members_deadline).min().unwrap_or_else(||Instant::now()+Duration::from_secs(86400));
                 tokio::select! {
                     biased;
                     _=close.changed()=>break,
+                    _=&mut legacy_ready,if legacy_ready_pending=>{legacy_ready_pending=false;},
                     Some(report)=reports_rx.recv()=>{
                         match report {
+                            WriteReport::CancelSent(id) => {self.outbox.cancel_sent(hello.device_id.clone(),id,generation).await?;}
                             WriteReport::Canceled(id) => {
                                 if pending.as_ref().is_some_and(|p| p.id == id) { pending=None; }
                                 if text_pending.as_ref().is_some_and(|p| p.id == id) { text_pending=None; }
@@ -3580,21 +4230,63 @@ impl Core {
                             WriteReport::Sent { id, at } => {
                                 if let Some(pending) = pending.as_mut() { pending.sent(&id, at); }
                                 if let Some(pending) = settings_pending.as_mut() { pending.sent(&id, at); }
+                                if let Some(pending) = members_pending.as_mut() { pending.sent(&id, at); }
                                 if let Some(pending) = text_pending.as_mut() { pending.sent(&id, at); }
                             }
                         }
                     },
+                    permit=write_tx.reserve(),if next_cancel.is_some()=>{
+                        let id=next_cancel.expect("pending cancel");
+                        queued_cancels.insert(id.clone());
+                        cancelled_files.entry(id.clone()).or_insert((false,false));
+                        permit?.send(Message::Cancel(Cancel{transfer_id:id}));
+                    },
                     prepared=file_preparations.join_next(),if !file_preparations.is_empty()=>{
-                        let work=prepared.context("file preparation missing")???;
+                        let (delivery,prepared)=prepared.context("file preparation missing")??;
+                        let id=delivery.begin.transfer_id.clone();
+                        let mut work=match self.outbox.preparation_result(&delivery,prepared) {
+                            Ok(Some(work))=>work,
+                            Ok(None)=>{
+                                self.delivery_finished(&delivery);
+                                if pending.as_ref().is_some_and(|p|p.id==id) {pending=None;}
+                                if file_pending.as_ref().is_some_and(|p|p.begin.transfer_id==id) {file_pending=None;}
+                                continue;
+                            }
+                            Err(error) if error.downcast_ref::<crate::folders::SourceChanged>().is_some()=>{
+                                // A changed folder fails only this delivery; the
+                                // session and other work continue.
+                                self.outbox.fail_changed(delivery.clone()).await?;
+                                self.delivery_finished(&delivery);
+                                if pending.as_ref().is_some_and(|p|p.id==id) {pending=None;}
+                                if file_pending.as_ref().is_some_and(|p|p.begin.transfer_id==id) {file_pending=None;}
+                                continue;
+                            }
+                            Err(error)=>{
+                                if let Err(storage)=self.outbox.fail(delivery.clone(),error.to_string()).await {self.error(None,format!("outbox failure persistence deferred: {storage}"));}
+                                self.delivery_finished(&delivery);
+                                return Err(error);
+                            }
+                        };
+                        if !self.outbox.current(&work.delivery) {continue;}
+                        self.outbox.negotiate_resume(work.delivery.clone(),store.file_resume).await?;
+                        file_receipt_ready=Some(work.receipt_ready.clone());
+                        if store.file_resume {
+                            let (tx,rx)=tokio::sync::oneshot::channel();
+                            file_ready=Some((work.delivery.begin.transfer_id.clone(),work.delivery.begin.size,tx));work.ready=Some(rx);
+                        }
                         if !enqueue(&outbox_tx,work,&mut close,Some(Instant::now()+Duration::from_secs(60))).await? {break;}
                     },
                     writer=&mut workers.writer=>{writer_finished=true;if close.borrow().is_none() {writer??;}break;},
-                    _=tokio::time::sleep_until(receipt_deadline),if content_deadline.is_some() || settings_deadline.is_some()=>{let _=close_tx.send(Some(CloseReason::Error(ErrorCode::Timeout)));bail!("outgoing receipt timeout");},
+                    _=tokio::time::sleep_until(receipt_deadline),if content_deadline.is_some() || settings_deadline.is_some() || members_deadline.is_some()=>{let _=close_tx.send(Some(CloseReason::Error(ErrorCode::Timeout)));bail!("outgoing receipt timeout");},
+                    _=retry_timer(members_init_retry),if members_init_retry.is_some()=>{},
+                    _=retry_timer(members_retry),if members_retry.is_some()=>{members_retry=None;},
                     _=retry_timer(settings_retry),if settings_retry.is_some()=>{settings_retry=None;},
                     _=tokio::time::sleep_until(file_poll),if pending.is_none()=>{},
                     _=wake.notified()=>{file_poll=Instant::now();},
+                    _=phone_tick.tick()=>{self.expire_phone_control(hello, &store).await;},
                     _=config.changed()=>{},
                     _=settings_changes.changed()=>{},
+                    _=setup_changes.changed()=>{},
                     message=read_rx.recv()=>{
                         let Some(message)=message else {break;};
                         if !self.connection_current(&store, &hello.device_id) {break;}
@@ -3621,7 +4313,20 @@ impl Core {
                             refusal = Some(NackCode::StorageFailed);
                         }
                         match message {
+                            Message::FileReady(ready)=>{
+                                ensure!(store.file_resume,"unnegotiated FILE_READY");
+                                if let Some((allowed,_))=cancelled_files.get_mut(&ready.transfer_id) {ensure!(*allowed,"duplicate or unsolicited cancelled FILE_READY");*allowed=false;continue;}
+                                let (id,size,reply)=file_ready.take().context("unsolicited FILE_READY")?;
+                                ensure!(id==ready.transfer_id,"wrong FILE_READY ID");
+                                if ready.offset>size {close_tx.send_replace(Some(CloseReason::Error(ErrorCode::MalformedMessage)));bail!("FILE_READY offset exceeds size");}
+                                let _=reply.send(Some(ready.offset));
+                            },
+                            Message::BatteryState(sample) if phone_controls::eligible(hello, CAP_BATTERY) => { self.receive_phone_battery(&store, hello, sample); },
+                            Message::RingState(state) if phone_controls::eligible(hello, CAP_RING) => { self.receive_phone_ring(&store, hello, state); },
                             Message::Error(error)=>{
+                                if error.code == ErrorCode::Closing && hello.capabilities.iter().any(|c| c == "setup") && self.connection_current(&store, &hello.device_id) {
+                                    self.ui.lock().expect("UI state").refreshing_scope(&hello.device_id);
+                                }
                                 if let Some(problem) = match error.code {
                                     ErrorCode::VersionMismatch => Some(mesh::LinkProblem::UpdateRequired),
                                     ErrorCode::Unauthorized => Some(mesh::LinkProblem::Unauthorized),
@@ -3632,12 +4337,21 @@ impl Core {
                                         self.set_link_problem(&hello.device_id, generation, Some(problem));
                                     }
                                 }
-                                if outbound && error.code == ErrorCode::Unauthorized {
+                                if outbound && error.code == ErrorCode::Unauthorized && !self.store.setup_protected(&hello.device_id) {
                                     self.forget_pairing(hello.device_id.clone(), CloseReason::Error(ErrorCode::Closing), store.connection_id, Some(hello.name.clone())).await?;
                                 }
                                 break;
                             },
+                            Message::NotificationEvent(event)=>{
+                                if !store.mesh || hello.role != Some(DeviceRole::Phone)
+                                    || notice_stream.accept(&event).is_err()
+                                    || phone_notices.send(event).is_err() {
+                                    close_tx.send_replace(Some(CloseReason::Error(ErrorCode::UnexpectedMessage)));
+                                    break;
+                                }
+                            },
                             Message::Status(status)=>{self.set_phone_paused(&hello.device_id,store.connection_id.expect("connection id"),status.paused);},
+                            Message::Unpair(_) if hello.capabilities.iter().any(|c|c=="setup") && self.withdraw_setup(&store,hello).await?=>{break;},
                             Message::Unpair(_)=>{
                                 // Admission precedes worker teardown too. The
                                 // pairing epoch fences any in-flight commit;
@@ -3645,11 +4359,22 @@ impl Core {
                                 self.forget_pairing(hello.device_id.clone(), CloseReason::Error(ErrorCode::Closing), store.connection_id, Some(hello.name.clone())).await?;
                                 break;
                             },
-                            Message::PairRequest(_) if !recovered_pairing=>{
+                            Message::PairRequest(request) if !recovered_pairing=>{
                                 // TLS + HELLO binding were checked before READY.
                                 // A consumed/expired token is irrelevant to this recovery.
+                                self.consume_repair_invitation(&store,hello,&request.token).await?;
                                 recovered_pairing=true;
                                 if !enqueue(&write_tx,Message::PairResult(PairResult {accepted:true,code:None,message:None}),&mut close,Some(receipt_deadline.min(Instant::now()+Duration::from_secs(60)))).await? {break;}
+                            },
+                            Message::Members(snapshot) if hello.capabilities.iter().any(|c|c=="setup")=>{
+                                if members_init_retry.is_some()&&self.store.setup_hello(Some(&hello.device_id),SetupScope::Disabled).scope==SetupScope::Enabled&&self.store.setup_state().setup_id.as_ref()==Some(&snapshot.setup_id)&&hello.setup.as_ref().is_some_and(|h|h.scope==SetupScope::Enabled&&h.setup_id==self.store.setup_state().setup_id) {
+                                    if !enqueue(&write_tx,nack(snapshot.transfer_id,NackCode::StorageFailed),&mut close,Some(Instant::now()+Duration::from_secs(60))).await? {break;}
+                                    continue;
+                                }
+                                match self.receive_members(&store,hello,members_fence.as_ref(),snapshot).await {
+                                    Ok(response)=>{if !enqueue(&write_tx,response,&mut close,Some(Instant::now()+Duration::from_secs(60))).await? {break;}},
+                                    Err(error)=>{close_tx.send_replace(Some(CloseReason::Error(if error.is::<crate::store::SettingsMalformed>() {ErrorCode::MalformedMessage}else{ErrorCode::UnexpectedMessage})));break;},
+                                }
                             },
                             Message::PeerSettings(snapshot) if store.mesh=>{
                                 let result={
@@ -3671,6 +4396,18 @@ impl Core {
                                 if !enqueue(&write_tx,response,&mut close,Some(receipt_deadline.min(Instant::now()+Duration::from_secs(60)))).await? {break;}
                             },
                             Message::Ack(ack)=>{
+                                if let Some((_,allowed))=cancelled_files.get_mut(&ack.transfer_id){ensure!(*allowed,"unsolicited cancelled ACK");*allowed=false;continue;}
+                                if file_pending.as_ref().is_some_and(|d|d.begin.transfer_id==ack.transfer_id){ensure!(file_receipt_ready.as_ref().is_some_and(|p|p.load(Ordering::SeqCst)),"ACK before END");}
+                                ensure!(!file_ready.as_ref().is_some_and(|(id,_,_)|id==&ack.transfer_id),"ACK before FILE_READY");
+                                if members_pending.as_ref().is_some_and(|p|p.id==ack.transfer_id) {
+                                    members_pending=None;
+                                    let fence=members_fence.as_ref().context("missing membership fence")?;
+                                    match store.members_ack(fence.clone(),ack.transfer_id).await {
+                                        Ok(())=>members_confirmed=Some(members_snapshot.take().context("missing membership snapshot")?.members),
+                                        Err(error)=>{members_snapshot=None;members_retry=Some(Instant::now()+Duration::from_secs(60));self.error(Some(hello.device_id.clone()),format!("membership ACK persistence deferred: {error}"));},
+                                    }
+                                    continue;
+                                }
                                 if settings_pending.as_ref().is_some_and(|p|p.id==ack.transfer_id) {
                                     let deadline=settings_pending.take().and_then(|p|p.deadline).unwrap_or_else(||Instant::now()+Duration::from_secs(120));
                                     match tokio::time::timeout_at(deadline,store.settings_ack(hello.device_id.clone(),ack.transfer_id)).await.map_err(anyhow::Error::from).and_then(|result|result) {
@@ -3699,6 +4436,16 @@ impl Core {
                                 self.connection_event(&store,&hello.device_id,Event::ClipboardSent {device:hello.device_id.clone(),transfer_id:id});
                             },
                             Message::Nack(nack)=>{
+                                let early_file_nack=file_ready.as_ref().is_some_and(|(id,_,_)|id==&nack.transfer_id);
+                                if let Some((ready,receipt))=cancelled_files.get_mut(&nack.transfer_id){ensure!(*ready||*receipt,"unsolicited cancelled NACK");*ready=false;*receipt=false;continue;}
+                                if file_pending.as_ref().is_some_and(|d|d.begin.transfer_id==nack.transfer_id) && file_ready.is_none(){ensure!(file_receipt_ready.as_ref().is_some_and(|p|p.load(Ordering::SeqCst)),"NACK before END");}
+                                if file_ready.as_ref().is_some_and(|(id,_,_)|id==&nack.transfer_id) && let Some((_,_,reply))=file_ready.take(){let _=reply.send(None);}
+                                if members_pending.as_ref().is_some_and(|p|p.id==nack.transfer_id) {
+                                    members_pending=None;members_snapshot=None;members_confirmed=None;
+                                    members_blocked = !nack.retryable;
+                                    members_retry=nack.retryable.then(||Instant::now()+Duration::from_secs(60));
+                                    self.error(Some(hello.device_id.clone()),format!("membership synchronization rejected: {:?}",nack.code));continue;
+                                }
                                 if settings_pending.as_ref().is_some_and(|p|p.id==nack.transfer_id) {
                                     settings_pending=None;
                                     settings_snapshot=None;
@@ -3715,7 +4462,7 @@ impl Core {
                                 ensure!(pending.as_ref().is_some_and(|p|p.id==nack.transfer_id),"wrong or unsolicited NACK ID");
                                 let id=pending.take().unwrap().id;
                                 if let Some(delivery)=file_pending.take() {
-                                    if let Err(error)=self.outbox.receipt(delivery.clone(),Some(nack.code)).await {self.error(Some(hello.device_id.clone()),format!("file NACK persistence deferred: {error}"));break;}
+                                    if let Err(error)=self.outbox.receipt_phase(delivery.clone(),Some(nack.code),early_file_nack).await {self.error(Some(hello.device_id.clone()),format!("file NACK persistence deferred: {error}"));break;}
                                     self.delivery_finished(&delivery);
                                     let _=self.events.send(Event::ConfigChanged);continue;
                                 }
@@ -3723,7 +4470,15 @@ impl Core {
 
                                 self.error(Some(hello.device_id.clone()),format!("clipboard delivery rejected: {:?}",nack.code));
                             },
-                            m @ (Message::FileBegin(_)|Message::FileChunk(_)|Message::FileEnd(_))=>{if !enqueue(&file_tx,ApplicationMessage { message: m, refusal },&mut close,pending.as_ref().and_then(|p|p.deadline)).await? {break;}},
+                            Message::Cancel(cancel)=>{
+                                ensure!(store.file_resume,"unnegotiated CANCEL");
+                                store.signal_cancel(&hello.device_id,&cancel.transfer_id);
+                                if !enqueue(&file_tx,ApplicationMessage {message:Message::Cancel(cancel),refusal:None,resume_cancel:None},&mut close,None).await?{break;}
+                            },
+                            m @ (Message::FileBegin(_)|Message::FileChunk(_)|Message::FileEnd(_))=>{
+                                let resume_cancel=match &m {Message::FileBegin(b) if b.resume==Some(true)=>Some(store.register_resume_begin(&hello.device_id,&b.transfer_id)),_=>None};
+                                if !enqueue(&file_tx,ApplicationMessage { message: m, refusal, resume_cancel },&mut close,pending.as_ref().and_then(|p|p.deadline)).await? {break;}
+                            },
                             m @ Message::Clipboard(_)=>{if !enqueue(&text_tx,m,&mut close,pending.as_ref().and_then(|p|p.deadline)).await? {break;}},
                             _=>bail!("unexpected READY frame"),
                         }
@@ -3731,20 +4486,23 @@ impl Core {
                 }
             }Ok(())
         }.await;
+        self.end_phone_control(&hello.device_id, store.connection_id.expect("connection id"));
         if let Err(error) = &result
             && close.borrow().is_none()
         {
             let _ = close_tx.send(Some(CloseReason::Error(processing_error_code(error))));
         }
+        phone_notices.stop().await;
         workers.reader.abort();
         workers.heartbeat.abort();
         let _=(&mut workers.heartbeat).await;
-        workers.file.abort();
+        drop(file_tx);
+        let file_finished=tokio::time::timeout(Duration::from_secs(2),&mut workers.file).await.is_ok();
+        if !file_finished {workers.file.abort();}
         workers.text.abort();
         let _ = (&mut workers.reader).await;
-        let _ = (&mut workers.file).await;
+        if !file_finished {let _ = (&mut workers.file).await;}
         let _ = (&mut workers.text).await;
-        drop(file_tx);
         drop(text_tx);
         drop(write_tx);
         drop(automatic_tx);
@@ -3757,6 +4515,11 @@ impl Core {
         {
             workers.writer.abort();
             let _ = (&mut workers.writer).await;
+        }
+        // The writer may have been cancelled mid-frame. Its UI offset is
+        // useful on disconnect, but never authorizes a future resume offset.
+        if store.file_resume && let Some(delivery)=file_pending.as_ref() {
+            self.optional(self.outbox.checkpoint_progress(delivery.clone()).await,"outbox progress checkpoint");
         }
         file_preparations.abort_all();
         while file_preparations.join_next().await.is_some() {}
@@ -3817,7 +4580,7 @@ impl Core {
             let mut progress = Instant::now();
             let result: Result<()> = async {
                 loop {
-                    let deadline = progress + Duration::from_secs(60);
+                    let deadline = progress + Duration::from_secs(if incoming.as_ref().is_some_and(|s:&Incoming|s.first_chunk&&s.begin.resume==Some(true)){120}else{60});
                     let message = if incoming.is_some() {
                         tokio::time::timeout_at(deadline, messages.recv()).await?
                     } else {
@@ -3827,7 +4590,9 @@ impl Core {
                         break;
                     };
                     let message: ApplicationMessage = message.into();
-                    let deadline = if matches!(message.message, Message::FileEnd(_)) {
+                    let deadline = if matches!(message.message, Message::FileBegin(ref b) if b.resume==Some(true)) {
+                        Instant::now()+Duration::from_secs(90)
+                    } else if matches!(message.message, Message::FileEnd(_)) {
                         Instant::now() + Duration::from_secs(120)
                     } else if incoming.is_some() {
                         deadline
@@ -3857,7 +4622,33 @@ impl Core {
             if let Some(mut state) = incoming {
                 state.file.take();
                 if let Some(stage) = state.stage.take() {
-                    self.optional(store.discard_stage(stage).await, "staging cleanup");
+                    if state.begin.resume == Some(true)
+                        && !state.begin.sensitive
+                        && state.save_error.is_none()
+                        && state.receipt.is_none()
+                    {
+                        self.optional(
+                            store
+                                .checkpoint(
+                                    device.clone(),
+                                    state.begin,
+                                    stage,
+                                    state.received,
+                                    state.hash,
+                                    true,
+                                )
+                                .await,
+                            "resume checkpoint",
+                        );
+                    } else {
+                        self.optional(
+                            store
+                                .purge_partial(device.clone(), state.begin.transfer_id.clone())
+                                .await,
+                            "resume cleanup",
+                        );
+                        self.optional(store.discard_stage(stage).await, "staging cleanup");
+                    }
                 }
             }
             result
@@ -3873,15 +4664,32 @@ impl Core {
         incoming: &mut Option<Incoming>,
         tx: &mpsc::Sender<Message>,
     ) -> Result<()> {
-        let ApplicationMessage { message, refusal } = message.into();
-        Box::pin(async move {
+        let ApplicationMessage {
+            message,
+            refusal,
+            resume_cancel,
+        } = message.into();
+        let resume_cancel = resume_cancel.or_else(|| match &message {
+            Message::FileBegin(b) if b.resume == Some(true) => {
+                Some(store.register_resume_begin(device, &b.transfer_id))
+            }
+            _ => None,
+        });
+        let mut cancelled = resume_cancel.as_ref().map(|c| c.subscribe());
+        let receive = Box::pin(async move {
             match message {
                 Message::FileBegin(begin) => {
+                    ensure!(
+                        (begin.resume != Some(true) || (store.file_resume && !begin.sensitive))
+                            && (begin.folder.is_none() || store.file_resume),
+                        "unnegotiated file extension"
+                    );
                     ensure!(incoming.is_none(), "second FILE_BEGIN");
                     let config = self.config();
                     let mut state = Incoming {
                         begin: begin.clone(),
                         received: 0,
+                        first_chunk: true,
                         hash: Sha256::new(),
                         file: None,
                         stage: None,
@@ -3904,7 +4712,9 @@ impl Core {
                         .await
                     {
                         Ok(Some((meta, complete))) => {
-                            if meta == Metadata::File(begin.clone()) && complete {
+                            if matches!(&meta, Metadata::File(retained) if retained.content_eq(&begin))
+                                && complete
+                            {
                                 state.admission = FileAdmission::RetainedReplay;
                                 state.deduplicated = true;
                             } else {
@@ -3927,11 +4737,137 @@ impl Core {
                             } else if !self.incoming_kind_allowed(store, device, begin.kind) {
                                 state.receipt = Some(NackCode::UnsupportedKind);
                             } else if begin.size <= state.config.max_file_bytes {
-                                self.prepare_incoming(store, &mut state).await;
+                                if begin.resume == Some(true) && !begin.sensitive {
+                                    match store
+                                        .resume_stage_cancellable(
+                                            device.clone(),
+                                            begin.clone(),
+                                            resume_cancel
+                                                .as_ref()
+                                                .expect("resume cancellation")
+                                                .clone(),
+                                        )
+                                        .await
+                                    {
+                                        Ok(Some((stage, offset, hash))) => {
+                                            let root = stage.0.folder.path()?;
+                                            if root != self.paths.cache {
+                                                if crate::config::save_folder_overlaps_cache(
+                                                    &root,
+                                                    &self.paths.cache,
+                                                ) {
+                                                    store
+                                                        .purge_partial(
+                                                            device.clone(),
+                                                            begin.transfer_id.clone(),
+                                                        )
+                                                        .await?;
+                                                    self.prepare_incoming(store, &mut state).await;
+                                                } else {
+                                                    state.config.save_to_folder = true;
+                                                    state.config.save_path = root;
+                                                    state.storage_kind =
+                                                        crate::ui::ReceiveDestination::SaveFolder;
+                                                    state.file = Some(tokio::fs::File::from_std(
+                                                        stage.0.file.try_clone()?,
+                                                    ));
+                                                    state.destination =
+                                                        Some(stage.destination_path()?);
+                                                    state.stage = Some(stage);
+                                                    state.received = offset;
+                                                    state.hash = hash;
+                                                }
+                                            } else {
+                                                state.config.save_to_folder = false;
+                                                state.storage_kind =
+                                                    crate::ui::ReceiveDestination::Cache;
+                                                state.file = Some(tokio::fs::File::from_std(
+                                                    stage.0.file.try_clone()?,
+                                                ));
+                                                state.destination = Some(stage.destination_path()?);
+                                                state.stage = Some(stage);
+                                                state.received = offset;
+                                                state.hash = hash;
+                                            }
+                                        }
+                                        Ok(None) => self.prepare_incoming(store, &mut state).await,
+                                        Err(error) => {
+                                            state.receipt = Some(
+                                                if error
+                                                    .downcast_ref::<crate::store::ReceiptConflict>()
+                                                    .is_some()
+                                                {
+                                                    NackCode::IdConflict
+                                                } else {
+                                                    crate::store::save_failure_code(&error)
+                                                },
+                                            )
+                                        }
+                                    }
+                                } else {
+                                    match store
+                                        .discard_legacy_partial(device.clone(), begin.clone())
+                                        .await
+                                    {
+                                        Ok(()) => self.prepare_incoming(store, &mut state).await,
+                                        Err(error) => {
+                                            state.receipt = Some(
+                                                if error
+                                                    .downcast_ref::<crate::store::ReceiptConflict>()
+                                                    .is_some()
+                                                {
+                                                    NackCode::IdConflict
+                                                } else {
+                                                    crate::store::save_failure_code(&error)
+                                                },
+                                            )
+                                        }
+                                    }
+                                }
                             } else {
                                 state.receipt = Some(NackCode::StorageFailed);
                             }
                         }
+                    }
+                    if begin.resume == Some(true) {
+                        // A failed requested save must never become a successful
+                        // cache-only completion when this BEGIN is retried.
+                        if let Some(code) = state.save_error {
+                            state.file.take();
+                            if let Some(stage) = state.stage.take() {
+                                store.discard_stage(stage).await?;
+                            }
+                            state.receipt = Some(code);
+                        }
+                        if state.receipt.is_none()
+                            && !state.deduplicated
+                            && !begin.sensitive
+                            && let Some(stage) = &state.stage
+                            && let Err(error) = store
+                                .checkpoint(
+                                    device.clone(),
+                                    begin.clone(),
+                                    stage.clone(),
+                                    state.received,
+                                    state.hash.clone(),
+                                    true,
+                                )
+                                .await
+                        {
+                            state.receipt = Some(crate::store::save_failure_code(&error));
+                        }
+                        if let Some(code) = state.receipt {
+                            tx.send(nack(begin.transfer_id.clone(), code)).await?;
+                            return Ok(());
+                        }
+                        if state.deduplicated {
+                            state.received = begin.size;
+                        }
+                        tx.send(Message::FileReady(pneu_proto::FileReady {
+                            transfer_id: begin.transfer_id.clone(),
+                            offset: state.received,
+                        }))
+                        .await?;
                     }
                     self.connection_event(
                         store,
@@ -3941,10 +4877,23 @@ impl Core {
                             metadata: begin,
                         },
                     );
+                    if state.begin.resume == Some(true) {
+                        self.connection_event(
+                            store,
+                            device,
+                            Event::TransferProgress {
+                                device: device.clone(),
+                                transfer_id: state.begin.transfer_id.clone(),
+                                received: state.received,
+                                total: state.begin.size,
+                            },
+                        );
+                    }
                     *incoming = Some(state);
                 }
                 Message::FileChunk(chunk) => {
                     let state = incoming.as_mut().context("chunk without BEGIN")?;
+                    state.first_chunk = false;
                     ensure!(
                         chunk.transfer_id == state.begin.transfer_id
                             && chunk.offset == state.received
@@ -3952,7 +4901,6 @@ impl Core {
                         "noncontiguous chunk or size overflow"
                     );
                     if state.receipt.is_none() && !state.deduplicated {
-                        state.hash.update(&chunk.data);
                         #[cfg(test)]
                         {
                             let delay = *self.file_write_delay.lock().expect("file write delay");
@@ -3960,24 +4908,35 @@ impl Core {
                                 tokio::time::sleep(delay).await;
                             }
                         }
-                        let written = async {
-                            if let Some(file) = state.file.as_mut() {
+                        let written: Result<()> = async {
+                            if state.begin.folder.is_some() {
+                                // Manifest bytes go to the stage file and content
+                                // directly into the private tree: no stream spool.
+                                let stage = state.stage.clone().context("missing folder stage")?;
+                                let begin = state.begin.clone();
+                                let from = state.received;
+                                let data = chunk.data.clone();
+                                store
+                                    .blocking(move |_| stage.folder_write(&begin, from, &data))
+                                    .await?;
+                            } else if let Some(file) = state.file.as_mut() {
                                 file.write_all(&chunk.data).await?;
                                 // Tokio File may report a kernel write failure only
                                 // on flush. Keep this chunk until that write resolves.
                                 file.flush().await?;
                             }
-                            Ok::<_, std::io::Error>(())
+                            Ok(())
                         }
                         .await;
                         if let Err(error) = written {
-                            let code = crate::store::save_failure_code(&error.into());
+                            let code = crate::store::save_failure_code(&error);
                             if state.config.save_to_folder
+                                && state.begin.folder.is_none()
                                 && state.save_error.is_none()
                                 && state.begin.kind != FileKind::ClipboardImage
                                 && matches!(code, NackCode::NotWritable | NackCode::DiskFull)
                                 && self
-                                    .fallback_cache(store, state, code, state.received)
+                                    .fallback_cache(store, device, state, code, state.received)
                                     .await
                                     .map_err(|error| {
                                         state.receipt =
@@ -4000,8 +4959,29 @@ impl Core {
                                 state.receipt = state.receipt.or(Some(code));
                             }
                         }
+                        if state.receipt.is_none() {
+                            state.hash.update(&chunk.data);
+                        }
                     }
                     state.received += chunk.data.len() as u64;
+                    if state.begin.resume == Some(true)
+                        && state.save_error.is_none()
+                        && state.receipt.is_none()
+                        && !state.begin.sensitive
+                        && let Some(stage) = &state.stage
+                        && let Err(error) = store
+                            .checkpoint(
+                                device.clone(),
+                                state.begin.clone(),
+                                stage.clone(),
+                                state.received,
+                                state.hash.clone(),
+                                false,
+                            )
+                            .await
+                    {
+                        state.receipt = Some(crate::store::save_failure_code(&error));
+                    }
                     self.connection_event(
                         store,
                         device,
@@ -4012,6 +4992,23 @@ impl Core {
                             total: state.begin.size,
                         },
                     );
+                }
+                Message::Cancel(cancel) => {
+                    ensure!(store.file_resume, "unnegotiated CANCEL");
+                    if incoming
+                        .as_ref()
+                        .is_some_and(|s| s.begin.transfer_id == cancel.transfer_id)
+                    {
+                        let mut state = incoming.take().expect("matching transfer");
+                        state.file.take();
+                        if let Some(stage) = state.stage.take() {
+                            store.discard_stage(stage).await?;
+                        }
+                        self.finish_transfer_activity(store, device, &cancel.transfer_id);
+                    }
+                    store
+                        .purge_partial(device.clone(), cancel.transfer_id)
+                        .await?;
                 }
                 Message::FileEnd(end) => {
                     ensure!(
@@ -4088,10 +5085,23 @@ impl Core {
                             && let Some(stage) = &state.stage
                             && let Ok(path) = stage.destination_path()
                         {
-                            received_file = Some(ReceivedFile::from_file(
+                            received_file = Some(ReceivedFile::from_transfer(
                                 path.clone(),
-                                stage.0.file.try_clone()?,
+                                stage.published_file()?,
+                                stage.folder_details(),
+                                state.begin.size,
                             )?);
+                            if let Some(details) = stage.folder_details()
+                                && let Some(row) =
+                                    self.ui.lock().expect("UI state").incoming.iter_mut().find(
+                                        |r| {
+                                            r.device == *device
+                                                && r.transfer_id == state.begin.transfer_id
+                                        },
+                                    )
+                            {
+                                row.folder = Some(details);
+                            }
                             state.destination = Some(path);
                         }
                         if stored.is_ok() {
@@ -4102,11 +5112,12 @@ impl Core {
                         if let Err(error) = stored {
                             let code = crate::store::save_failure_code(&error);
                             if state.config.save_to_folder
+                                && state.begin.folder.is_none()
                                 && state.save_error.is_none()
                                 && state.begin.kind != FileKind::ClipboardImage
                                 && matches!(code, NackCode::NotWritable | NackCode::DiskFull)
                                 && self
-                                    .fallback_cache(store, state, code, state.received)
+                                    .fallback_cache(store, device, state, code, state.received)
                                     .await
                                     .map_err(|error| {
                                         state.receipt =
@@ -4150,6 +5161,17 @@ impl Core {
                         }
                     }
                     state.file.take();
+                    if state.begin.resume == Some(true) {
+                        if state.receipt.is_some() || state.save_error.is_some() {
+                            store
+                                .purge_partial(device.clone(), state.begin.transfer_id.clone())
+                                .await?;
+                        } else {
+                            store
+                                .forget_partial(device.clone(), state.begin.transfer_id.clone())
+                                .await?;
+                        }
+                    }
                     if let Some(stage) = state.stage.take() {
                         self.optional(store.discard_stage(stage).await, "staging cleanup");
                     }
@@ -4188,7 +5210,7 @@ impl Core {
                                     scope,
                                     origin,
                                     ReceiptNotice::SaveFailed {
-                                        metadata: state.begin.clone(),
+                                        metadata: Box::new(state.begin.clone()),
                                         code,
                                         destination: state.storage_kind,
                                         folder: state.storage_folder(&self.paths).to_owned(),
@@ -4260,6 +5282,11 @@ impl Core {
                     incoming.take();
                 }
                 Message::Clipboard(text) => {
+                    if self.store.replacement_pending(device) {
+                        tx.send(nack(text.transfer_id, NackCode::UnsupportedKind))
+                            .await?;
+                        return Ok(());
+                    }
                     let receipt = if store.mesh {
                         match store
                             .receipt(device.clone(), text.transfer_id.clone())
@@ -4346,6 +5373,9 @@ impl Core {
                     let token = self.clipboard.token();
                     let content = crate::ui::clipboard::Content::Text(text.text.clone());
                     let operation = ClipboardOperation {
+                        sensitive: text.sensitive,
+                        history: self.store.history_capture(),
+                        history_id: None,
                         token,
                         id: text.transfer_id.clone(),
                         source: device.clone(),
@@ -4440,14 +5470,19 @@ impl Core {
                 _ => bail!("unexpected application message"),
             }
             Ok(())
-        })
-        .await
+        });
+        tokio::select! {
+            biased;
+            _=async {if let Some(cancel)=&mut cancelled {let _=cancel.wait_for(|b|*b).await;}else{std::future::pending::<()>().await;} }=>Ok(()),
+            result=receive=>result,
+        }
     }
     /// Recover the already received prefix through its retained descriptor,
     /// then keep streaming in cache. Never resolve the selected folder again.
     async fn fallback_cache(
         &self,
         store: &Store,
+        device: &Id,
         state: &mut Incoming,
         code: NackCode,
         prefix: u64,
@@ -4479,6 +5514,11 @@ impl Core {
         state.destination = Some(stage.destination_path()?);
         state.file = Some(tokio::fs::File::from_std(stage.0.file.try_clone()?));
         state.stage = Some(stage);
+        if state.begin.resume == Some(true) {
+            store
+                .purge_partial(device.clone(), state.begin.transfer_id.clone())
+                .await?;
+        }
         let _ = store.discard_stage(source).await;
         Ok(())
     }
@@ -4506,9 +5546,13 @@ impl Core {
             let destination =
                 if state.begin.kind == FileKind::ClipboardImage || !state.config.save_to_folder {
                     cache_basename(&state.begin.file_name)
+                } else if state.begin.folder.is_some() {
+                    crate::folders::root_name(&state.begin.file_name)
                 } else {
                     local_name(&state.begin.file_name, 255)
                 };
+            // Folders write content straight into their private tree, so the
+            // stream size is also the temporary space a folder needs.
             let size = state.begin.size;
             let stage = match async {
                 if state.config.save_to_folder && state.begin.kind != FileKind::ClipboardImage {
@@ -4655,6 +5699,9 @@ impl Core {
             store.mesh = job.origin.mesh;
             let token = self.clipboard.token();
             let operation = ClipboardOperation {
+                sensitive: job.metadata.kind == FileKind::ClipboardImage && job.metadata.sensitive,
+                history: self.store.history_capture(),
+                history_id: None,
                 token,
                 id: job.metadata.transfer_id.clone(),
                 source: job.origin.device.clone(),
@@ -5005,17 +6052,24 @@ impl PendingOutgoing {
 #[derive(Debug, PartialEq, Eq)]
 enum WriteReport {
     Canceled(Id),
+    CancelSent(Id),
     Sent { id: Id, at: Instant },
 }
 fn frame_receipt_id(message: &Message) -> Option<Id> {
     match message {
         Message::Clipboard(text) => Some(text.transfer_id.clone()),
         Message::PeerSettings(snapshot) => Some(snapshot.transfer_id.clone()),
+        Message::Members(snapshot) => Some(snapshot.transfer_id.clone()),
         Message::FileEnd(end) => Some(end.transfer_id.clone()),
         _ => None,
     }
 }
 async fn report_frame(reports: &mpsc::Sender<WriteReport>, message: &Message) {
+    if let Message::Cancel(cancel) = message {
+        let _ = reports
+            .send(WriteReport::CancelSent(cancel.transfer_id.clone()))
+            .await;
+    }
     if let Some(id) = frame_receipt_id(message) {
         let _ = reports
             .send(WriteReport::Sent {
@@ -5026,7 +6080,7 @@ async fn report_frame(reports: &mpsc::Sender<WriteReport>, message: &Message) {
     }
 }
 struct WriterQueues {
-    normal: mpsc::Receiver<Message>,
+    normal: phone_controls::FrameQueue,
     priority: mpsc::Receiver<Message>,
     automatic: mpsc::Receiver<AutomaticWrite>,
     text: mpsc::Receiver<AutomaticWrite>,
@@ -5079,7 +6133,8 @@ async fn writer_loop<W: tokio::io::AsyncWrite + Unpin>(
                         let id=work.delivery.begin.transfer_id.clone();
                         let result=tokio::select! {biased;_=writer_close.changed()=>None,result=transmit_file(&core,writer,work,&mut priority_rx,&mut write_rx,&mut text_rx,&reports_tx)=>Some(result)};
                         match result {
-                            Some(Ok(()))=>{let _=reports_tx.send(WriteReport::Sent{id,at:Instant::now()}).await;},
+                            Some(Ok(true))=>{let _=reports_tx.send(WriteReport::Sent{id,at:Instant::now()}).await;},
+                            Some(Ok(false))=>{let _=reports_tx.send(WriteReport::Canceled(id)).await;},
                             Some(Err(error))=>{core.error(None,format!("file send interrupted: {error}"));return crate::transport::close(writer,&[]).await;},
                             None=>return crate::transport::close(writer,&[]).await,
                         }
@@ -5104,7 +6159,7 @@ async fn writer_loop<W: tokio::io::AsyncWrite + Unpin>(
                 }
                 let sent = tokio::select! { biased;
                     _ = writer_close.changed() => None,
-                    sent = send(writer, &message) => Some(sent),
+                    sent = write_rx.send(&core, writer, &message) => Some(sent),
                 };
                 match sent {
                     Some(result) => {
@@ -5133,6 +6188,7 @@ enum FileAdmission {
 struct Incoming {
     begin: FileBegin,
     received: u64,
+    first_chunk: bool,
     hash: Sha256,
     file: Option<tokio::fs::File>,
     stage: Option<Stage>,
@@ -5157,7 +6213,9 @@ async fn close_transport<W: tokio::io::AsyncWrite + Unpin>(
     reason: CloseReason,
 ) -> Result<()> {
     let messages = match reason {
-        CloseReason::Unpair => vec![reason.message(), error_message(ErrorCode::Closing)],
+        CloseReason::Unpair | CloseReason::MembershipAck(_) => {
+            vec![reason.message(), error_message(ErrorCode::Closing)]
+        }
         _ => vec![reason.message()],
     };
     crate::transport::close(writer, &messages).await
@@ -5427,6 +6485,7 @@ mod tests {
             let mut events = core.subscribe();
             let (tx, mut rx) = mpsc::channel(8);
             let winner = Clipboard {
+                sensitive: false,
                 transfer_id: Id::from_bytes([10; 16]),
                 text: "winner".into(),
                 created_at: 200,
@@ -5535,6 +6594,7 @@ mod tests {
                 .await?;
             for conflict in [false, true] {
                 let mut replay = begin.clone();
+                replay.resume = Some(false); // Transport-only field must not conflict with retained metadata.
                 if conflict {
                     replay.file_name = "conflict.png".into();
                 }
@@ -5601,6 +6661,7 @@ mod tests {
         actions.delay.store(true, Ordering::SeqCst);
         let (_dir, core, device) = fixture(actions.clone()).await?;
         let text = Clipboard {
+            sensitive: false,
             transfer_id: Id::from_bytes(rand::random()),
             text: "older remote".into(),
             hlc: Some(crate::now_ms()),
@@ -5640,6 +6701,7 @@ mod tests {
             &core.store,
             &device,
             Message::Clipboard(Clipboard {
+                sensitive: false,
                 transfer_id: Id::from_bytes(rand::random()),
                 text: "next winner".into(),
                 hlc: Some(seen.parse::<u64>()? + 1),
@@ -5676,6 +6738,7 @@ mod tests {
                 &c.store,
                 &d,
                 Message::Clipboard(Clipboard {
+                    sensitive: false,
                     transfer_id: Id::from_bytes(rand::random()),
                     text: "legacy now".into(),
                     hlc: None,
@@ -5883,6 +6946,7 @@ mod tests {
             &state,
             id,
             &Hello {
+                setup: None,
                 role: None,
                 addresses: None,
                 version: 1,
@@ -6212,7 +7276,7 @@ mod tests {
                 core.clone(),
                 &mut bytes,
                 WriterQueues {
-                    normal,
+                    normal: normal.into(),
                     priority,
                     automatic,
                     text,
@@ -6277,7 +7341,7 @@ mod tests {
                 core.clone(),
                 &mut stream,
                 WriterQueues {
-                    normal,
+                    normal: normal.into(),
                     priority,
                     automatic,
                     text,
@@ -6370,7 +7434,7 @@ mod tests {
                     writer_core,
                     &mut stream,
                     WriterQueues {
-                        normal,
+                        normal: normal.into(),
                         priority,
                         automatic,
                         text,
@@ -6463,7 +7527,7 @@ mod tests {
                         writer_core,
                         &mut writer,
                         WriterQueues {
-                            normal,
+                            normal: normal.into(),
                             priority,
                             automatic,
                             text,
@@ -6559,7 +7623,8 @@ mod tests {
             };
             let writer_core = core.clone();
             let (_tx, mut priority) = mpsc::channel(1);
-            let (_normal_tx, mut normal) = mpsc::channel(1);
+            let (_normal_tx, normal) = mpsc::channel(1);
+            let mut normal = phone_controls::FrameQueue::from(normal);
             let task = tokio::spawn(Box::pin(async move {
                 transmit_automatic(
                     &writer_core,
@@ -7329,6 +8394,7 @@ mod tests {
             },
         );
         let current = Hello {
+            setup: None,
             role: None,
             addresses: None,
             version: pneu_proto::PROTOCOL_VERSION,
@@ -7367,7 +8433,8 @@ mod tests {
     }
     async fn automatic_wire(core: &Core, work: AutomaticWrite) -> Result<Vec<Message>> {
         let (_priority_tx, mut priority) = mpsc::channel(1);
-        let (_normal_tx, mut normal) = mpsc::channel(1);
+        let (_normal_tx, normal) = mpsc::channel(1);
+        let mut normal = phone_controls::FrameQueue::from(normal);
         let mut bytes = Vec::new();
         assert!(
             transmit_automatic(
@@ -7459,6 +8526,7 @@ mod tests {
             .unwrap()
             .mesh = true;
         let mut wire = Clipboard {
+            sensitive: false,
             transfer_id: Id::from_bytes([0; 16]),
             text: "\u{1}".repeat(10_800),
             created_at: crate::now_ms(),
@@ -7478,6 +8546,46 @@ mod tests {
             matches!(&messages[0],Message::Clipboard(text) if text.text==wire.text && text.hlc.is_none())
         );
         assert_eq!(core.connected_devices().len(), 2);
+        core.shutdown_actions().await
+    }
+    #[tokio::test]
+    async fn only_implemented_protocol_extensions_are_advertised() -> Result<()> {
+        let (_dir, core, peer) = fixture(Arc::new(NoActions)).await?;
+        let hello = core.computer_hello();
+        assert_eq!(
+            hello.capabilities,
+            [
+                "files",
+                "file_resume_v1",
+                "folder_v1",
+                "clipboard_text",
+                "clipboard_image",
+                "mesh",
+                "setup",
+                "battery_v1",
+                "ring_v1",
+                "notifications_v1"
+            ]
+        );
+        let mut incoming = None;
+        let (tx, mut rx) = mpsc::channel(8);
+        {
+            let mut begin = test_begin(b"abc");
+            begin.resume = Some(true);
+            let error = core
+                .receive_test(
+                    &core.store,
+                    &peer,
+                    Message::FileBegin(begin),
+                    &mut incoming,
+                    &tx,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(processing_error_code(&error), ErrorCode::UnexpectedMessage);
+            assert!(incoming.is_none());
+            assert!(rx.try_recv().is_err());
+        }
         core.shutdown_actions().await
     }
     #[tokio::test]
@@ -8223,7 +9331,8 @@ mod tests {
                             .await?
                     };
                     let (_priority, mut priority_rx) = mpsc::channel(1);
-                    let (_normal, mut normal_rx) = mpsc::channel(1);
+                    let (_normal, normal_rx) = mpsc::channel(1);
+                    let mut normal_rx = phone_controls::FrameQueue::from(normal_rx);
                     let mut bytes = Vec::new();
                     assert!(
                         !transmit_automatic(
@@ -8258,6 +9367,7 @@ mod tests {
             .start_pairing_with_addresses(vec!["127.0.0.1:47821".into()])
             .await?;
         let hello = Hello {
+            setup: None,
             version: 1,
             device_id: device.clone(),
             name: "Legacy phone".into(),
@@ -8574,6 +9684,7 @@ mod tests {
             });
             original.write(&ping).await?;
             original.read(Duration::from_secs(2)).await?;
+            settle_legacy_ready(&core, &mut original).await?;
             let device = phone.identity.device_id.clone();
             let scope = core.action_scope.lock().unwrap()[&device].clone();
             let connection = core.sessions.lock().unwrap().sessions[&device].id;
@@ -9062,6 +10173,8 @@ mod tests {
             .store
             .create_stage(history.clone(), "unfinished".into(), 1)
             .await?;
+        // Plant crash orphans while the stage is live: empty staging roots are retired.
+        std::fs::write(history.join(".pneu-staging/orphan"), b"crashed")?;
         drop(stage);
         core.store.drain().await;
         let healthy = core.config().save_path;
@@ -9069,9 +10182,9 @@ mod tests {
             .store
             .create_stage(healthy.clone(), "temporary".into(), 1)
             .await?;
+        std::fs::write(healthy.join(".pneu-staging/orphan"), b"crashed")?;
         drop(stage);
         core.store.drain().await;
-        std::fs::write(healthy.join(".pneu-staging/orphan"), b"crashed")?;
         let paths = core.paths.clone();
         let config = core.config();
         core.shutdown_actions().await?;
@@ -9122,6 +10235,7 @@ mod tests {
         let mut state = Incoming {
             begin,
             received: 0,
+            first_chunk: true,
             hash: Sha256::new(),
             file: None,
             stage: None,
@@ -9192,6 +10306,9 @@ mod tests {
             .await?;
         let bytes = b"original bytes";
         let begin = FileBegin {
+            resume: None,
+            folder: None,
+            sensitive: false,
             hlc: None,
             source_device: None,
             transfer_id: Id::new(crate::random_hex(16))?,
@@ -9214,7 +10331,8 @@ mod tests {
         )
         .await?;
         let state = incoming.as_mut().unwrap();
-        let stage = state.stage.clone().unwrap();
+        // Resolve while linked: cleanup also retires the empty staging root.
+        let stage_path = state.stage.as_ref().unwrap().path()?;
         // /dev/full gives a real ENOSPC without exhausting a shared filesystem.
         // Keep the real staging file so cleanup proves it removes the copy.
         state.file = Some(
@@ -9253,7 +10371,14 @@ mod tests {
                 ..
             }))
         ));
-        assert!(!stage.path()?.exists());
+        assert!(!stage_path.exists());
+        assert!(
+            !core
+                .config()
+                .save_path
+                .join(crate::storage::STAGING_DIR)
+                .exists()
+        );
         let cached: Vec<_> = std::fs::read_dir(&core.paths.cache)?
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
@@ -9310,6 +10435,7 @@ mod tests {
         ));
         Ok(())
     }
+    include!("phone_control_tests.rs");
     async fn fixture(actions: Arc<dyn PcActions>) -> Result<(tempfile::TempDir, Arc<Core>, Id)> {
         let dir = crate::test_support::scratch()?;
         let core = Core::new(
@@ -9335,6 +10461,26 @@ mod tests {
             .unwrap()
             .insert(device.clone(), ActionScope::new());
         Ok((dir, core, device))
+    }
+    // PONG is handled by the reader before READY initialization finishes.
+    // STATUS reaches the control loop; draining afterwards includes its evidence
+    // write rather than racing that job's admission after ConnectionChanged.
+    async fn settle_legacy_ready(
+        core: &Core,
+        connection: &mut crate::client::PhoneConnection,
+    ) -> Result<()> {
+        let mut events = core.subscribe();
+        for paused in [true, false] {
+            connection
+                .write(&Message::Status(Status { paused }))
+                .await?;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !matches!(events.recv().await?, Event::PhonePaused { paused: value, .. } if value == paused) {}
+                Ok::<_, anyhow::Error>(())
+            }).await??;
+        }
+        core.store.drain().await;
+        Ok(())
     }
     #[tokio::test]
     async fn blocked_notice_uses_canonical_peer_addresses() -> Result<()> {
@@ -9381,7 +10527,7 @@ mod tests {
                 Ok::<_, anyhow::Error>(())
             })
             .await??;
-            let Event::Blocked { address } =
+            let Event::Blocked { address, .. } =
                 tokio::time::timeout(Duration::from_secs(2), events.recv()).await??
             else {
                 panic!("expected blocked event");
@@ -9398,6 +10544,9 @@ mod tests {
 
     fn test_begin(bytes: &[u8]) -> FileBegin {
         FileBegin {
+            resume: None,
+            folder: None,
+            sensitive: false,
             hlc: None,
             source_device: None,
             transfer_id: Id::new(crate::random_hex(16)).unwrap(),
@@ -9503,16 +10652,17 @@ mod tests {
     async fn file_progress_deadline_runs_while_clipboard_is_blocked() -> Result<()> {
         let actions = Arc::new(BlockingText(tokio::sync::Notify::new()));
         let (_dir, core, device) = fixture(actions.clone()).await?;
-        let (writer, _rx) = mpsc::channel(4);
+        let (writer, mut receipts) = mpsc::channel(4);
         let text_core = core.clone();
         let text_device = device.clone();
         let text_writer = writer.clone();
-        let text = tokio::spawn(async move {
+        let mut text = tokio::spawn(async move {
             text_core
                 .receive_test(
                     &text_core.store,
                     &text_device,
                     Message::Clipboard(Clipboard {
+                        sensitive: false,
                         hlc: None,
                         source_device: None,
                         transfer_id: Id::new(crate::random_hex(16))?,
@@ -9542,20 +10692,39 @@ mod tests {
         while !matches!(events.recv().await?, Event::TransferStarted { .. }) {}
         tokio::task::yield_now().await;
         tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(11)).await;
+        // Advancing time only wakes timers. Join the independent actor reply
+        // and its Store cleanup before checking completion, while the file's
+        // 60-second progress deadline is still pending.
+        let text_result = tokio::time::timeout(Duration::from_secs(48), &mut text).await;
+        let file_still_waiting = !worker.is_finished() && closed.borrow().is_none();
+        if text_result.is_err() {
+            text.abort();
+            let _ = text.await;
+        }
         tokio::time::advance(Duration::from_secs(61)).await;
         let result = worker.await?;
         let code = *closed.borrow();
-        let text_still_blocked = !text.is_finished();
-        text.abort();
-        let _ = text.await;
         tokio::time::resume();
         core.shutdown_actions().await?;
         assert!(result.is_err());
         assert!(matches!(code, Some(CloseReason::Error(ErrorCode::Timeout))));
         assert!(
-            !text_still_blocked,
+            text_result.is_ok(),
             "actor must time out the blocked helper independently"
         );
+        text_result???;
+        assert!(
+            file_still_waiting,
+            "file expired before its progress deadline"
+        );
+        assert!(matches!(
+            receipts.recv().await,
+            Some(Message::Nack(Nack {
+                code: NackCode::ClipboardUnavailable,
+                ..
+            }))
+        ));
         assert!(
             std::fs::read_dir(core.config().save_path)?.all(|e| e.is_ok_and(|e| e.path().is_dir()))
         );
@@ -9570,6 +10739,7 @@ mod tests {
         core.update_config(config).await?;
         let begin = test_begin(b"file");
         let text = Clipboard {
+            sensitive: false,
             hlc: None,
             source_device: None,
             transfer_id: begin.transfer_id.clone(),
@@ -9655,6 +10825,7 @@ mod tests {
         let mut store = core.store.with_current_pairing();
         store.connection_id = Some(1);
         let text = Clipboard {
+            sensitive: false,
             hlc: None,
             source_device: None,
             transfer_id: Id::new(crate::random_hex(16))?,
@@ -9735,6 +10906,7 @@ mod tests {
                 ..
             }
         ) {}
+        settle_legacy_ready(&core, &mut original).await?;
         let device = phone.identity.device_id.clone();
         let scope = core
             .action_scope
@@ -9792,13 +10964,34 @@ mod tests {
         })
         .await?;
         let mut replacement = phone.reconnect().await?;
-        while !matches!(
-            events.recv().await?,
-            Event::ConnectionChanged {
-                connected: true,
-                ..
-            }
-        ) {}
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !matches!(
+                events.recv().await?,
+                Event::ConnectionChanged {
+                    connected: true,
+                    ..
+                }
+            ) {}
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("replacement registration blocked by READY evidence persistence")??;
+        replacement
+            .write(&Message::Status(Status { paused: true }))
+            .await?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !matches!(
+                events.recv().await?,
+                Event::PhonePaused { paused: true, .. }
+            ) {}
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("replacement STATUS blocked by READY evidence persistence")??;
+        let gate = tokio::time::timeout(Duration::from_secs(2), core.pairing_gate.lock())
+            .await
+            .context("READY evidence persistence held the pairing gate")?;
+        drop(gate);
         assert!(
             !*scope.cancelled.borrow(),
             "reconnect unexpectedly revoked the pairing scope"
@@ -9967,6 +11160,7 @@ mod tests {
                     Some(&worker_scope),
                     &device,
                     Message::Clipboard(Clipboard {
+                        sensitive: false,
                         hlc: None,
                         source_device: None,
                         transfer_id: Id::new(crate::random_hex(16))?,
@@ -10269,6 +11463,7 @@ mod tests {
                     ..
                 }
             ) {}
+            settle_legacy_ready(&core, &mut original).await?;
             core.event(Event::TransferStarted {
                 device: phone.identity.device_id.clone(),
                 metadata: test_begin(b"partial"),
@@ -10760,7 +11955,7 @@ mod tests {
             let ping = Ping { nonce: Nonce::new("d".repeat(16))? };
             initial.write(&Message::Ping(ping.clone())).await?;
             assert_eq!(initial.read(Duration::from_secs(2)).await?, Message::Pong(ping));
-            core.store.drain().await;
+            settle_legacy_ready(&core, &mut initial).await?;
             let connector = tokio_rustls::TlsConnector::from(Arc::new(crate::tls::client_config(
                 &phone.identity, core.identity.fingerprint.clone(),
             )?));
@@ -10806,6 +12001,7 @@ mod tests {
                         rustls::pki_types::ServerName::try_from("pneu.local")?, stream,
                     ).await?;
                     write_frame(&mut tls, &Message::Hello(Hello {
+                        setup: None,
                         role: Some(DeviceRole::Computer),
                         addresses: Some(vec![format!("127.0.0.1:{}", 10000 + index)]),
                         version: 1,
@@ -10897,6 +12093,20 @@ mod tests {
                 ..
             }
         ) {}
+        // ConnectionChanged precedes READY initialization and its legacy
+        // setup evidence write. Synchronize with the actual control loop before
+        // blocking the store; drain alone can run before that job is admitted.
+        connection
+            .write(&Message::Status(Status { paused: true }))
+            .await?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !matches!(
+                events.recv().await?,
+                Event::PhonePaused { paused: true, .. }
+            ) {}
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
         core.store.drain().await;
         let (entered, wait) = tokio::sync::oneshot::channel();
         let (release, blocking) = std::sync::mpsc::channel();
@@ -10950,6 +12160,7 @@ mod tests {
         let phone = crate::client::Phone::new(dir.path().join("phone"))?;
         let invitation = core.start_pairing_with_addresses(vec![address]).await?;
         let mut original = phone.pair(&invitation).await?;
+        settle_legacy_ready(&core, &mut original).await?;
         let mut listening = tokio::spawn(async move { original.listen(60).await });
         let (entered, wait) = tokio::sync::oneshot::channel();
         let (release, blocking) = std::sync::mpsc::channel();
@@ -11310,6 +12521,7 @@ mod tests {
                 &core.store,
                 device,
                 Message::Clipboard(Clipboard {
+                    sensitive: false,
                     hlc: None,
                     source_device: None,
                     transfer_id: shared.clone(),
@@ -11334,6 +12546,7 @@ mod tests {
             &core.store,
             &a,
             Message::Clipboard(Clipboard {
+                sensitive: false,
                 hlc: None,
                 source_device: None,
                 transfer_id: Id::from_bytes([4; 16]),
@@ -11391,6 +12604,196 @@ mod tests {
             fingerprint: peer.fingerprint,
         })
     }
+
+    #[tokio::test]
+    async fn replacement_retry_image_sends_and_applies_after_newer_clipboard_activity() -> Result<()>
+    {
+        let (dir, sender, _) = fixture(Arc::new(NoActions)).await?;
+        let actions = Arc::new(CountingActions(AtomicU64::new(0)));
+        let (_received_dir, receiver, _) = fixture(actions.clone()).await?;
+        let old = Id::from_bytes([81; 16]);
+        let pin = Hash::new("81".repeat(32))?;
+        let pair = |device: Id, fingerprint: Hash, offline| {
+            sender.store.pair_then_hello_replacement(
+                device.clone(),
+                fingerprint,
+                Some(Hello {
+                    version: 1,
+                    device_id: device,
+                    name: "Replacement PC".into(),
+                    capabilities: vec!["mesh".into()],
+                    role: Some(DeviceRole::Computer),
+                    addresses: None,
+                    setup: None,
+                    paused: None,
+                }),
+                None,
+                SetupScope::Disabled,
+                false,
+                offline,
+                || {},
+            )
+        };
+        pair(old.clone(), pin.clone(), vec![]).await?;
+        let operation = Id::from_bytes([82; 16]);
+        let source = dir.path().join("retained.png");
+        let immutable = b"\x89PNG\r\n\x1a\noriginal image";
+        std::fs::write(&source, immutable)?;
+        let (artifact, _) = sender
+            .outbox
+            .admit_selected(
+                operation.clone(),
+                source.clone(),
+                vec![file_test_peer(&sender, &old).await?],
+                crate::outbox::PEER_BYTES,
+                sender.identity.device_id.clone(),
+            )
+            .await?;
+        pair(
+            receiver.identity.device_id.clone(),
+            receiver.identity.fingerprint.clone(),
+            vec![(old.clone(), 42)],
+        )
+        .await?;
+        let incoming = test_begin(b"previous receive");
+        sender.event(Event::TransferStarted {
+            device: old.clone(),
+            metadata: incoming.clone(),
+        });
+        sender.event(Event::TransferFinished {
+            device: old.clone(),
+            transfer_id: incoming.transfer_id.clone(),
+            path: Some(dir.path().join("received.jpg")),
+            deduplicated: false,
+        });
+        let offer = sender.store.replacements.lock().unwrap()[0].clone();
+        sender
+            .store
+            .replacement_decide(sender.identity.device_id.clone(), offer, true, |_| {})
+            .await?;
+        assert!(
+            sender
+                .ui_snapshot()
+                .transfers
+                .iter()
+                .any(|r| r.direction == "incoming"
+                    && r.device == receiver.identity.device_id
+                    && r.transfer_id == incoming.transfer_id
+                    && r.state == "sent")
+        );
+        sender.outbox.reconcile().await?;
+        // The mutable source is no longer the content being sent.
+        std::fs::write(&source, b"changed original source")?;
+        let peer = sender.identity.device_id.clone();
+        receiver
+            .store
+            .pair(peer.clone(), sender.identity.fingerprint.clone())
+            .await?;
+        receiver
+            .action_scope
+            .lock()
+            .unwrap()
+            .insert(peer.clone(), ActionScope::new());
+        let mut config = receiver.config();
+        config.notification_preview = false;
+        config.open_in_viewer = false;
+        config.copy_image_to_clipboard = true;
+        receiver.update_config(config).await?;
+        let (created_at, hlc) = sender.store.local_clipboard(peer.clone()).await?;
+        let (tx, mut rx) = mpsc::channel(2);
+        receiver
+            .receive_test(
+                &receiver.store,
+                &peer,
+                Message::Clipboard(Clipboard {
+                    sensitive: false,
+                    hlc: Some(hlc),
+                    source_device: Some(peer.clone()),
+                    transfer_id: Id::from_bytes([83; 16]),
+                    text: "newer clipboard".into(),
+                    created_at,
+                    origin: ClipboardOrigin::Clipboard,
+                }),
+                &mut None,
+                &tx,
+            )
+            .await?;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(3), rx.recv()).await?,
+            Some(Message::Ack(_))
+        ));
+        assert_eq!(actions.0.load(Ordering::SeqCst), 1);
+        let target = file_test_peer(&sender, &receiver.identity.device_id).await?;
+        sender
+            .outbox
+            .retry_replaced(
+                operation.clone(),
+                Some(artifact.clone()),
+                old,
+                vec![target.clone()],
+                peer.clone(),
+            )
+            .await?;
+        let delivery = sender
+            .outbox
+            .claim(target.device, target.generation, 1)
+            .await?
+            .context("retry send")?;
+        assert_ne!(delivery.begin.transfer_id, artifact);
+        assert!(delivery.begin.hlc.context("retry HLC")? > hlc);
+        assert!(
+            sender
+                .outbox
+                .snapshot(&[])
+                .iter()
+                .any(|r| r.transfer_id == delivery.begin.transfer_id && r.operation != operation)
+        );
+        let mut file = sender.outbox.reader(delivery.clone()).await?;
+        let mut bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut file, &mut bytes).await?;
+        assert_eq!(bytes, immutable);
+        let mut incoming = None;
+        for message in [
+            Message::FileBegin(delivery.begin.clone()),
+            Message::FileChunk(FileChunk {
+                transfer_id: delivery.begin.transfer_id.clone(),
+                offset: 0,
+                data: bytes,
+            }),
+            Message::FileEnd(FileEnd {
+                transfer_id: delivery.begin.transfer_id.clone(),
+            }),
+        ] {
+            receiver
+                .receive_test(&receiver.store, &peer, message, &mut incoming, &tx)
+                .await?;
+        }
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(3), rx.recv()).await?,
+            Some(Message::Ack(Ack {
+                deduplicated: false,
+                ..
+            }))
+        ));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let (register, _, _) = receiver.store.clipboard_snapshot().await?;
+                if actions.0.load(Ordering::SeqCst) == 2
+                    && register.is_some_and(|key| Some(key.hlc) == delivery.begin.hlc)
+                {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("retried image must apply after the newer clipboard")??;
+        sender.outbox.receipt(delivery, None).await?;
+        sender.shutdown_actions().await?;
+        receiver.shutdown_actions().await?;
+        Ok(())
+    }
+
     async fn file_recipient_fixture() -> Result<(
         tempfile::TempDir,
         Arc<Core>,
@@ -11481,6 +12884,7 @@ mod tests {
                 request_id: None,
             },
             crate::ipc::Command::SendClipboard {
+                notify_too_large: false,
                 targets: crate::outbox::Targets::All("all".into()),
             },
         ] {
@@ -12019,6 +13423,8 @@ mod tests {
     async fn file_replacement_during_claim_handoff_recovers_after_waiter_is_cancelled() -> Result<()>
     {
         let (dir, core, device) = fixture(Arc::new(NoActions)).await?;
+        core.set_setting("queue_offline".into(), true.into())
+            .await?;
         let _old = admit_ui_test_phone(&core, &device, 1)?;
         let authority = file_test_peer(&core, &device).await?;
         let source = dir.path().join("source");
@@ -12107,7 +13513,7 @@ mod tests {
                 sender,
                 &mut stream,
                 WriterQueues {
-                    normal,
+                    normal: normal.into(),
                     priority,
                     automatic,
                     text,
@@ -12135,7 +13541,9 @@ mod tests {
                 delivery,
                 connection: 1,
                 mesh: false,
-                file: Some(preparing.await??),
+                file: Some(preparing.await??.into()),
+                ready: None,
+                receipt_ready: Arc::new(AtomicBool::new(false)),
             })
             .await
             .map_err(|_| anyhow::anyhow!("writer stopped"))?;
@@ -12238,6 +13646,7 @@ mod tests {
     }
     fn held_clipboard_publication(core: &Core) -> OutgoingSelection {
         OutgoingSelection::Text(Clipboard {
+            sensitive: false,
             transfer_id: Id::from_bytes([70; 16]),
             text: "already computed publication".into(),
             origin: ClipboardOrigin::Clipboard,
@@ -12281,7 +13690,8 @@ mod tests {
             );
             // A first-byte writer already holding work also rejects it.
             let (_priority, mut priority) = mpsc::channel(1);
-            let (_normal, mut normal) = mpsc::channel(1);
+            let (_normal, normal) = mpsc::channel(1);
+            let mut normal = phone_controls::FrameQueue::from(normal);
             let mut bytes = Vec::new();
             assert!(
                 !transmit_automatic(
@@ -12556,6 +13966,8 @@ mod tests {
         core.shutdown_actions().await?;
         Ok(())
     }
+    include!("resume_tests.rs");
+    include!("folder_tests.rs");
 }
 
 #[cfg(all(test, windows))]

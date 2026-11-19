@@ -4,7 +4,10 @@ use anyhow::{Context, Result, ensure};
 use std::{
     fs::File,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crate::platform::fs;
@@ -12,6 +15,10 @@ pub(crate) use fs::{Folder, open_regular_file, remove_directory, remove_file};
 
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) mod windows_names;
+
+// Hold from opening/creating the root through creating a stage entry, or while
+// removing its last entry and retiring the empty root. Never hold during stream reads/writes.
+pub(crate) static STAGING_LIFECYCLE: Mutex<()> = Mutex::new(());
 
 pub(crate) const STAGING_DIR: &str = ".pneu-staging";
 pub(crate) const CACHE_PREFIX: &str = ".pneu-cache-";
@@ -60,8 +67,12 @@ pub(crate) fn cache_basename(name: &str) -> String {
     )
 }
 
-fn numbered_name(name: &str, number: usize) -> String {
-    let (stem, extension) = name_parts(name);
+pub(crate) fn numbered_name(name: &str, number: usize, directory: bool) -> String {
+    let (stem, extension) = if directory {
+        (name, "")
+    } else {
+        name_parts(name)
+    };
     let suffix = format!(" ({number})");
     format!(
         "{}{suffix}{extension}",
@@ -69,6 +80,7 @@ fn numbered_name(name: &str, number: usize) -> String {
     )
 }
 /// Startup-only sweep. Never called while a transfer owns a live stage.
+#[cfg(test)]
 pub(crate) fn clean_staging(folder: &Folder) -> Result<()> {
     clean_legacy_staging(folder)?;
     match fs::open_directory_at(&folder.file, STAGING_DIR) {
@@ -76,6 +88,7 @@ pub(crate) fn clean_staging(folder: &Folder) -> Result<()> {
             let directory = owned_staging(fd)?;
             wipe(&directory.file)?;
             directory.file.sync_all()?;
+            remove_empty_staging(folder, &directory)?;
         }
         Err(error) if fs::is_missing(&error) => {}
         Err(e) => return Err(e),
@@ -132,6 +145,19 @@ pub(crate) fn staging_directory(folder: &Folder) -> Result<Folder> {
         crate::platform::private::created(&file)?;
     }
     owned_staging(file)
+}
+/// Caller serializes with stage admission. Nonempty roots include live receives
+/// and retained resume prefixes, and must stay linked.
+pub(crate) fn remove_empty_staging(folder: &Folder, directory: &Folder) -> Result<()> {
+    for entry in fs::entries(&directory.file)? {
+        let name = entry?;
+        if name != std::ffi::OsStr::new(".") && name != std::ffi::OsStr::new("..") {
+            return Ok(());
+        }
+    }
+    remove_directory(&folder.file, STAGING_DIR, &directory.file)?;
+    folder.file.sync_all()?;
+    Ok(())
 }
 fn owned_staging(file: File) -> Result<Folder> {
     crate::platform::private::check(&file)?;
@@ -190,6 +216,9 @@ pub(crate) struct StageInner {
     pub name: String,
     pub destination: String,
     placed_name: Mutex<Option<String>>,
+    pub tree: Mutex<Option<crate::folders::Tree>>,
+    pub retained: AtomicBool,
+    pub cancelled: AtomicBool,
     pub cleanup: Mutex<Option<Cleanup>>,
 }
 impl Stage {
@@ -217,8 +246,31 @@ impl Stage {
             name,
             destination,
             placed_name: Mutex::new(None),
+            tree: Mutex::new(None),
+            retained: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
             cleanup: Mutex::new(None),
         })))
+    }
+    pub(crate) fn reopen(
+        folder: Folder,
+        directory: Folder,
+        file: File,
+        name: String,
+        destination: String,
+    ) -> Self {
+        Self(Arc::new(StageInner {
+            folder,
+            directory,
+            file,
+            name,
+            destination,
+            placed_name: Mutex::new(None),
+            tree: Mutex::new(None),
+            retained: AtomicBool::new(true),
+            cancelled: AtomicBool::new(false),
+            cleanup: Mutex::new(None),
+        }))
     }
     pub fn record_placed(&self) -> Result<OwnedFile> {
         Ok(OwnedFile {
@@ -249,20 +301,45 @@ impl Stage {
         Ok(self.0.directory.path()?.join(&self.0.name))
     }
     pub fn cleanup(&self) -> Result<()> {
+        let _lifecycle = STAGING_LIFECYCLE.lock().expect("staging lifecycle");
+        self.cleanup_folder()?;
         remove_file(&self.0.directory.file, &self.0.name, &self.0.file)?;
         self.0.directory.file.sync_all()?;
+        remove_empty_staging(&self.0.folder, &self.0.directory)?;
         self.0.cleanup.lock().expect("stage cleanup").take();
         Ok(())
     }
+    fn cleanup_folder(&self) -> Result<()> {
+        if let Some(tree) = self.0.tree.lock().expect("folder tree").as_ref() {
+            tree.release();
+            tree.record.cleanup(&self.0.directory, &self.0.name)?;
+        }
+        Ok(())
+    }
     pub fn place(&self) -> Result<()> {
+        ensure!(!self.0.cancelled.load(Ordering::SeqCst), "stage cancelled");
         // Windows rename needs only DELETE access so frozen read-only files
         // remain publishable. Flush data on the retained writer beforehand.
         #[cfg(windows)]
         self.0.file.sync_all()?;
         let mut placed_name = self.0.placed_name.lock().expect("placed name");
         ensure!(placed_name.is_none(), "file has already been placed");
-        let before = fs::identity(&self.0.file)?;
-        let named = fs::identity_at(&self.0.directory.file, &self.0.name)?;
+        let tree = self.0.tree.lock().expect("folder tree");
+        let source_name = if tree.is_some() {
+            format!("{}-tree", self.0.name)
+        } else {
+            self.0.name.clone()
+        };
+        let source = tree
+            .as_ref()
+            .map(|tree| &*tree.root)
+            .unwrap_or(&self.0.file);
+        let before = fs::identity(source)?;
+        if tree.is_some() {
+            source.set_modified(std::time::SystemTime::now())?;
+            fs::sync_plain(source)?;
+        }
+        let named = fs::identity_at(&self.0.directory.file, &source_name)?;
         ensure!(before == named, "staging file was replaced");
         // Only the no-replace rename decides whether a name is free. Every
         // contender is relative to the retained folder FD, including fallback.
@@ -270,7 +347,7 @@ impl Stage {
             let candidate = if attempt == 1 {
                 safe_basename(&self.0.destination, NAME_MAX)
             } else if attempt <= NAME_ATTEMPTS {
-                numbered_name(&self.0.destination, attempt)
+                numbered_name(&self.0.destination, attempt, tree.is_some())
             } else {
                 // Cache fallback names must remain in the disposable namespace.
                 let (namespace, basename) = self
@@ -286,13 +363,36 @@ impl Stage {
                 )
             };
             let candidate = local_name(&candidate, NAME_MAX);
-            match fs::rename(
-                &self.0.directory.file,
-                &self.0.name,
-                &self.0.folder.file,
-                &candidate,
-                false,
-            ) {
+            let rename = || {
+                fs::rename(
+                    &self.0.directory.file,
+                    &source_name,
+                    &self.0.folder.file,
+                    &candidate,
+                    false,
+                )
+            };
+            #[cfg(windows)]
+            let result = {
+                let mut result = rename();
+                for _ in 0..10 {
+                    if !result.as_ref().is_err_and(|error| {
+                        error.chain().any(|e| {
+                            e.downcast_ref::<std::io::Error>()
+                                .is_some_and(|e| matches!(e.raw_os_error(), Some(5 | 32 | 33)))
+                        })
+                    }) {
+                        break;
+                    }
+                    ensure!(!self.0.cancelled.load(Ordering::SeqCst), "stage cancelled");
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    result = rename();
+                }
+                result
+            };
+            #[cfg(not(windows))]
+            let result = rename();
+            match result {
                 Ok(()) => {
                     *placed_name = Some(candidate);
                     break;
@@ -312,6 +412,10 @@ impl Stage {
 }
 impl Drop for StageInner {
     fn drop(&mut self) {
+        if self.retained.load(Ordering::SeqCst) {
+            return;
+        }
+        let folder = self.folder.clone();
         let directory = self.directory.clone();
         let name = self.name.clone();
         // If FD duplication fails, startup can sweep the disposable stage;
@@ -319,9 +423,16 @@ impl Drop for StageInner {
         let Ok(file) = self.file.try_clone() else {
             return;
         };
+        let tree = self.tree.get_mut().ok().and_then(Option::take);
         let clean = move || {
+            let _lifecycle = STAGING_LIFECYCLE.lock().expect("staging lifecycle");
+            if let Some(tree) = tree {
+                tree.release();
+                tree.record.cleanup(&directory, &name)?;
+            }
             remove_file(&directory.file, &name, &file)?;
             directory.file.sync_all()?;
+            remove_empty_staging(&folder, &directory)?;
             Ok(())
         };
         if let Some(cleanup) = self.cleanup.get_mut().ok().and_then(Option::take) {
@@ -396,7 +507,14 @@ pub(crate) fn prune_cache(folder: &Folder, cutoff: std::time::SystemTime) -> Res
             Err(e) => return Err(e),
         };
         let meta = file.metadata()?;
-        if meta.is_file() && meta.modified()? < cutoff {
+        if meta.is_dir() && meta.modified()? < cutoff {
+            if !fs::is_owned_private(&file)? {
+                continue;
+            }
+            crate::platform::private::check(&file)?;
+            wipe(&file)?;
+            remove_directory(&folder.file, name, &file)?;
+        } else if meta.is_file() && meta.modified()? < cutoff {
             crate::platform::private::check(&file)?;
             remove_file(&folder.file, name, &file)?;
         }
@@ -465,6 +583,32 @@ mod tests {
         )?;
         (&stage.0.file).write_all(bytes)?;
         Ok(stage)
+    }
+    #[cfg(unix)]
+    #[test]
+    fn folder_cache_pruning_skips_non_private_entries() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::scratch()?;
+        let folder = Folder::open_private(&dir.path().join("cache"))?;
+        let private = cache_basename("private");
+        let foreign = cache_basename("foreign");
+        fs::create_private_directory_at(&folder.file, &private)?;
+        fs::create_private_directory_at(&folder.file, &foreign)?;
+        for name in [&private, &foreign] {
+            fs::open_directory_at(&folder.file, name)?
+                .set_modified(std::time::SystemTime::UNIX_EPOCH)?;
+        }
+        std::fs::set_permissions(
+            folder.path()?.join(&foreign),
+            std::fs::Permissions::from_mode(0o755),
+        )?;
+        prune_cache(
+            &folder,
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
+        )?;
+        assert!(folder.path()?.join(foreign).is_dir());
+        assert!(!folder.path()?.join(private).exists());
+        Ok(())
     }
     #[test]
     fn placement_keeps_names_and_numbers_collisions_without_overwriting() -> Result<()> {
@@ -563,7 +707,7 @@ mod tests {
                 (stage, expected.to_owned()),
                 (
                     named_stage(&folder, wire, b"received")?,
-                    numbered_name(expected, 2),
+                    numbered_name(expected, 2, false),
                 ),
             ] {
                 stage.place()?;
@@ -572,7 +716,8 @@ mod tests {
                 assert_eq!(std::fs::read(&path)?, b"received");
                 only_default_stream(&path)?;
             }
-            assert_eq!(fs::entries(&staging.file)?.count(), 0);
+            drop(staging);
+            assert!(!dir.path().join(STAGING_DIR).exists());
         }
         assert!(!dir.path().join("a").exists(), "ADS base file was created");
         assert!(!dir.path().join("a:b.jpg").exists());
@@ -707,7 +852,7 @@ mod tests {
             }
         }
         // Larger counters reserve their entire suffix before UTF-8 truncation.
-        let numbered = numbered_name(&format!("{}.png", "界".repeat(83)), NAME_ATTEMPTS);
+        let numbered = numbered_name(&format!("{}.png", "界".repeat(83)), NAME_ATTEMPTS, false);
         assert!(numbered.len() <= NAME_MAX);
         assert!(numbered.ends_with(" (10000).png"));
         Ok(())
@@ -785,7 +930,7 @@ mod tests {
                 let candidate = if number == 1 {
                     name.clone()
                 } else {
-                    numbered_name(&name, number)
+                    numbered_name(&name, number, false)
                 };
                 #[cfg(unix)]
                 std::fs::hard_link(&occupied, dir.path().join(candidate))?;
@@ -805,10 +950,11 @@ mod tests {
             assert_eq!(std::fs::read(path)?, b"received");
             assert_eq!(std::fs::read(dir.path().join(name))?, b"keep");
             assert_eq!(
-                std::fs::read(
-                    dir.path()
-                        .join(numbered_name(&stage.0.destination, NAME_ATTEMPTS))
-                )?,
+                std::fs::read(dir.path().join(numbered_name(
+                    &stage.0.destination,
+                    NAME_ATTEMPTS,
+                    false
+                )))?,
                 b"keep"
             );
         }
@@ -866,9 +1012,12 @@ mod tests {
             dir.path().join(STAGING_DIR),
             std::fs::Permissions::from_mode(0o500),
         )?;
-        clean_staging(&folder)?;
         staging_directory(&folder)?;
         assert_eq!(staging.file.metadata()?.permissions().mode() & 0o777, 0o500);
+        clean_staging(&folder)?;
+        assert!(!dir.path().join(STAGING_DIR).exists());
+        assert_eq!(staging.file.metadata()?.permissions().mode() & 0o777, 0o500);
+        let staging = staging_directory(&folder)?;
         // A publicly writable root is refused without silently changing it.
         std::fs::set_permissions(
             dir.path().join(STAGING_DIR),
@@ -887,6 +1036,9 @@ mod tests {
     fn streamed_verification_checks_both_count_and_digest() {
         use sha2::{Digest, Sha256};
         let begin = pneu_proto::FileBegin {
+            resume: None,
+            folder: None,
+            sensitive: false,
             hlc: None,
             source_device: None,
             transfer_id: pneu_proto::Id::new(crate::random_hex(16)).unwrap(),

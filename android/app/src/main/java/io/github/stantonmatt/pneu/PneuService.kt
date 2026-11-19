@@ -21,6 +21,12 @@ class PneuService : Service() {
     private var initialization: ServiceInitialization?=null
     @Volatile private var latestStart=0
     @Volatile private var lastNotification:Notification?=null
+    private val notificationUpdates by lazy {StatusNotificationUpdates(scope,{
+        if(StatusNotificationChannel.ensure(this)==null)null else notification()
+    }) {ready->
+        lastNotification=ready
+        getSystemService(NotificationManager::class.java).notify(1,ready)
+    }}
     private var workStarted=false
     override fun onCreate() {
         super.onCreate()
@@ -44,12 +50,7 @@ class PneuService : Service() {
         startForeground(1,ready,ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
         return true
     }
-    private fun updateNotification(nm:NotificationManager) {
-        if(StatusNotificationChannel.ensure(this)==null)return
-        val ready=notification()
-        lastNotification=ready
-        nm.notify(1,ready)
-    }
+    private fun updateNotification()=notificationUpdates.request()
     private suspend fun stopForCommand(startId:Int)=withContext(Dispatchers.Main.immediate) {
         // An older idle snapshot must not cancel a newer, possibly queued,
         // foreground start. AMS checks its latest start ID, not just our copy.
@@ -57,6 +58,7 @@ class PneuService : Service() {
     }
     private fun startWork() {
         workStarted=true
+        graph.ringing.attach(scope)
         val nm=getSystemService(NotificationManager::class.java)
         observer=ScreenshotObserver(graph)
         initialization=ServiceInitialization(scope,attempt={
@@ -72,12 +74,12 @@ class PneuService : Service() {
             }
         },failure={
             graph.connection.state.value=io.github.stantonmatt.pneu.connection.LinkState("Storage unavailable")
-            updateNotification(nm)
+            updateNotification()
         })
         scope.launch {
             combine(graph.prefs,graph.connection.state,graph.waitingCount,graph.connection.devices,graph.connection.attempt) { p,s,_,_,a -> Triple(p,s,a) }.collect { (p,s,attempt) ->
                 val command=latestStart
-                if(!p.loaded) {updateNotification(nm);return@collect}
+                if(!p.loaded) {updateNotification();return@collect}
                 if(p.pairingLost && attempt==null) {
                     val times=getSharedPreferences("health_alerts",MODE_PRIVATE)
                     if(alertThrottle.eligible("pairing",times.getLong("pairing",0),MainActivity.visible)) {
@@ -90,9 +92,10 @@ class PneuService : Service() {
                     if(p==graph.prefs.value && graph.connection.attempt.value==null && runCatching { !io.github.stantonmatt.pneu.connection.BindingTransitions.hasWork(graph.preferences.read(),graph.connection.attempt.value) }.getOrDefault(false))stopForCommand(command)
                 } else if(p.peer == null && attempt == null && p.deviceId.isNotEmpty()) {
                     if(p==graph.prefs.value && graph.connection.attempt.value==null && runCatching { !io.github.stantonmatt.pneu.connection.BindingTransitions.hasWork(graph.preferences.read(),graph.connection.attempt.value) }.getOrDefault(false))stopForCommand(command)
-                } else updateNotification(nm)
+                } else updateNotification()
             }
         }
+        scope.launch {graph.initialized.await();SetupNotifications.run(graph)}
         scope.launch {graph.initialized.await();graph.prefs.first {it.deviceId.isNotEmpty()};PostCommit.maintain {health();ServiceEvidence.start(this@PneuService)}; while(isActive) { PostCommit.maintainSuspending {checkHealthAlerts()}; delay(86_400_000) } }
     }
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -158,9 +161,10 @@ class PneuService : Service() {
             Triple(!h.localNetwork,getString(R.string.banner_local_network),getString(R.string.alert_local_network_text))
         )
         val times=getSharedPreferences("health_alerts",MODE_PRIVATE)
+        val activeIds=nm.activeNotifications.filter {it.tag==null}.map {it.id}.toSet()
         alerts.forEachIndexed { i,(active,title,text) ->
             val key="alert_$i"
-            if(!active) nm.cancel(10+i)
+            if(!active) {if(10+i in activeIds)nm.cancel(10+i)}
             else if(alertThrottle.eligible(key,times.getLong(key,0),MainActivity.visible)) {
                 nm.notify(10+i,NotificationCompat.Builder(this,"alerts").setSmallIcon(R.drawable.ic_stat_pneu).setColor(0xFF4F5BFF.toInt()).setContentTitle(UiPresentation.status(this,title)).setContentText(text)
                     .setContentIntent(activityIntent(10+i,MainActivity::class.java)).addAction(0,getString(R.string.action_fix),activityIntent(10+i,MainActivity::class.java)).build())
@@ -168,7 +172,7 @@ class PneuService : Service() {
             }
         }
     }
-    override fun onDestroy() {scope.cancel();if(workStarted) {ServiceEvidence.stop(this);observer?.stop();graph.connection.stop()};super.onDestroy() }
+    override fun onDestroy() {if(workStarted)graph.ringing.detach();scope.cancel();if(workStarted) {ServiceEvidence.stop(this);observer?.stop();graph.connection.stop()};super.onDestroy() }
     override fun onBind(intent: Intent?): IBinder? = null
     companion object {
         const val ACTION_PAUSE="io.github.stantonmatt.pneu.PAUSE"

@@ -54,7 +54,11 @@ async fn sta<T: Send + 'static>(
 
 fn checked_path(file: &ReceivedFile) -> Result<&Path> {
     let check = || -> Result<()> {
-        let named = platform_fs::open_regular_file(file.path())?;
+        let named = if file.is_folder() {
+            platform_fs::Folder::read(file.path())?.file.try_clone()?
+        } else {
+            platform_fs::open_regular_file(file.path())?
+        };
         anyhow::ensure!(
             platform_fs::identity(&named)? == platform_fs::identity(&file.file)?,
             "received file identity changed"
@@ -82,11 +86,11 @@ pub(super) async fn open_url(url: String) -> Result<Interaction> {
 }
 
 pub(super) async fn open_folder(path: PathBuf) -> Result<Interaction> {
-    sta(
-        move || platform_fs::Folder::open(&path, false)?.path(),
-        |path| execute(&path),
-    )
-    .await
+    sta(move || prepare_folder(&path), |path| execute(&path)).await
+}
+
+fn prepare_folder(path: &Path) -> Result<PathBuf> {
+    platform_fs::Folder::open(path, true)?.path()
 }
 
 fn wide(path: &Path) -> Result<Vec<u16>> {
@@ -273,14 +277,20 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn folder_open_rejects_missing_and_regular_file() -> Result<()> {
+    #[test]
+    fn open_folder_creates_missing_and_rejects_regular_file() -> Result<()> {
         let dir = crate::test_support::scratch()?;
         let path = dir.path().join("missing");
-        assert!(open_folder(path.clone()).await.is_err());
-        assert!(!path.exists());
-        std::fs::write(&path, b"file")?;
-        assert!(open_folder(path).await.is_err());
+        let prepared = prepare_folder(&path)?;
+        assert!(path.is_dir());
+        assert_eq!(
+            std::fs::canonicalize(&prepared)?,
+            std::fs::canonicalize(&path)?
+        );
+        assert_eq!(prepare_folder(&path)?, prepared);
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"file")?;
+        assert!(prepare_folder(&file).is_err());
         Ok(())
     }
 

@@ -80,6 +80,54 @@ class MultiComputerReviewDeviceTest {
             if(files)listOf(reviewProvider.buildUpon().appendPath("slow-type").build()) else emptyList(),
             if(files)emptyList() else listOf("No recipient"),CompletableDeferred(captured)),picker)
     }
+    @Test(timeout=30000) fun setupRefreshKeepsDisplayConnectedWhileTheSocketIsNotReady()=runBlocking<Unit> {
+        val blocked=CountDownLatch(1);val release=CountDownLatch(1);val hold=AtomicBoolean(false)
+        val fixture=LocalPeerFixture(app,beforeHello={if(hold.get()) {blocked.countDown();check(release.await(10,TimeUnit.SECONDS))}}).also {local+=it}
+        fixture.connect(a)
+        try {
+            val peer=app.preferences.read().devices.single()
+            // Exercise the exact socket-refresh entry point used by Link, Allow and Don't allow.
+            hold.set(true);app.connection.refreshSetupPeer(peer.pin)
+            assertTrue("Refreshed HELLO is held",blocked.await(5,TimeUnit.SECONDS))
+            assertFalse("No live READY authority during refresh",app.connection.connected(a))
+            assertEquals("Connected",app.connection.devices.value.getValue(a).status)
+            assertNull(app.connection.freezeSession(requireNotNull(DeliveryBinding.from(app.preferences.read(),a))))
+            hold.set(false);release.countDown()
+            withTimeout(5000) {while(!app.connection.connected(a))delay(20)}
+            assertTrue(fixture.hellos.get()>=2)
+        }finally {hold.set(false);release.countDown()}
+    }
+    @Test(timeout=30000) fun remoteSetupRefreshRedialsWithoutBackoffAndKeepsOnlyDisplayAuthority()=runBlocking<Unit> {
+        val blocked=CountDownLatch(1);val release=CountDownLatch(1);val hold=AtomicBoolean(false)
+        val fixture=LocalPeerFixture(app,capabilities=setOf("files","mesh","setup"),setupHello=SetupHello(SetupScope.ASK,null),
+            beforeHello={if(hold.get()) {blocked.countDown();check(release.await(10,TimeUnit.SECONDS))}}).also {local+=it}
+        fixture.connect(a,holdFirstFrame=false)
+        try {
+            hold.set(true)
+            fixture.sendControl(Frame.Control(Type.ERROR,json("code" to "closing")))
+            assertTrue("Explicit peer refresh redials before the minimum 1.6 s backoff",blocked.await(1400,TimeUnit.MILLISECONDS))
+            assertFalse(app.connection.connected(a))
+            assertEquals("Connected",app.connection.devices.value.getValue(a).status)
+            assertNull(app.connection.freezeSession(requireNotNull(DeliveryBinding.from(app.preferences.read(),a))))
+            hold.set(false);release.countDown()
+            withTimeout(5000) {while(!app.connection.connected(a))delay(20)}
+        }finally {hold.set(false);release.countDown()}
+    }
+    @Test(timeout=30000) fun ordinarySetupPeerEofNeverStartsDisplayGrace()=runBlocking<Unit> {
+        val blocked=CountDownLatch(1);val release=CountDownLatch(1);val hold=AtomicBoolean(false)
+        val fixture=LocalPeerFixture(app,capabilities=setOf("files","mesh","setup"),setupHello=SetupHello(SetupScope.ASK,null),
+            beforeHello={if(hold.get()) {blocked.countDown();check(release.await(10,TimeUnit.SECONDS))}}).also {local+=it}
+        fixture.connect(a,holdFirstFrame=false)
+        try {
+            hold.set(true);fixture.disconnect()
+            withTimeout(5000) {app.connection.devices.first {it[a]?.status=="PC unreachable"}}
+            assertFalse(app.connection.connected(a))
+            // Network/discovery wakes may legitimately shorten ordinary backoff.
+            // Hold HELLO so neither the disconnect nor the dial can borrow grace.
+            assertTrue(blocked.await(5000,TimeUnit.MILLISECONDS))
+            assertEquals("Connecting…",app.connection.devices.value.getValue(a).status)
+        }finally {hold.set(false);release.countDown()}
+    }
     @Test(timeout=30000) fun offlineTextSharesFailImmediatelyWithAndWithoutPicker()=runBlocking<Unit> {
         bind(b,"B",'b');app.preferences.toggle("chooseDevicesEachTime",true)
         for(picker in listOf(true,false))unavailableCapturedShare(picker=picker)
@@ -411,11 +459,11 @@ class MultiComputerReviewDeviceTest {
             compose.onNodeWithText("Field Phone").assertExists()
         }
     }
-    @Test(timeout=45000) fun addingAnotherComputerSaysAddAndScannerCompletesForItsBinding()=runBlocking<Unit> {
+    @Test(timeout=45000) fun addingAnotherComputerSaysPairAndScannerCompletesForItsBinding()=runBlocking<Unit> {
         val baseline=app.preferences.read().pairingRevision
         ActivityScenario.launch<MainActivity>(Intent(Intent.ACTION_VIEW,Uri.parse(raw("B",'b')),c,MainActivity::class.java)).use {
-            compose.waitUntil(10000) {compose.onAllNodesWithText("Add B?").fetchSemanticsNodes().isNotEmpty()}
-            compose.onNodeWithText("Add").performClick()
+            compose.waitUntil(10000) {compose.onAllNodesWithText("Pair with B?").fetchSemanticsNodes().isNotEmpty()}
+            compose.onNodeWithText("Pair").performClick()
             withTimeout(5000) {DeviceFixture.awaitPrefs(app) {app.connection.attempt.value?.invitation?.name=="B"}}
             val pending=requireNotNull(app.connection.attempt.value?.invitation)
             assertTrue(app.installBinding(pending,b))
@@ -432,8 +480,8 @@ class MultiComputerReviewDeviceTest {
         val row=Outgoing().apply {mediaId="manual:${randomId()}";transferId=randomId();kind="file";automatic=false;fileName="Keep.bin";recipients=listOf(binding)}
         assertTrue(app.enqueueFixture(row))
         ActivityScenario.launch<MainActivity>(Intent(Intent.ACTION_VIEW,Uri.parse(uri),c,MainActivity::class.java)).use {
-            compose.waitUntil(10000) {compose.onAllNodesWithText("Add New identity?").fetchSemanticsNodes().isNotEmpty()}
-            compose.onNodeWithText("Add").performClick()
+            compose.waitUntil(10000) {compose.onAllNodesWithText("Pair with New identity?").fetchSemanticsNodes().isNotEmpty()}
+            compose.onNodeWithText("Pair").performClick()
             compose.waitUntil(10000) {compose.onAllNodesWithText("Already paired as A. Unpair it first.").fetchSemanticsNodes().isNotEmpty()}
             assertEquals(0,fixture.pairRequests.get())
             assertTrue(binding.matches(app.preferences.read()))
@@ -452,8 +500,8 @@ class MultiComputerReviewDeviceTest {
         val before=app.preferences.read();val old=before.devices.first {it.deviceId==a}
         val fixture=LocalPeerFixture(app).also {local+=it};val uri=fixture.invitation(a,"Repaired")
         ActivityScenario.launch<MainActivity>(Intent(Intent.ACTION_VIEW,Uri.parse(uri),c,MainActivity::class.java)).use {
-            compose.waitUntil(10000) {compose.onAllNodesWithText("Add Repaired?").fetchSemanticsNodes().isNotEmpty()}
-            compose.onNodeWithText("Add").performClick()
+            compose.waitUntil(10000) {compose.onAllNodesWithText("Pair with Repaired?").fetchSemanticsNodes().isNotEmpty()}
+            compose.onNodeWithText("Pair").performClick()
             withTimeout(10000) {DeviceFixture.awaitPrefs(app) {app.connection.attempt.value?.invitation==null && it.devices.any {peer->peer.deviceId==a && peer.pin==Invitation.parse(uri).fingerprint}}}
             val after=app.preferences.read();assertEquals(16,after.devices.size);assertNotEquals(old.generation,after.devices.first {it.deviceId==a}.generation)
             assertEquals(before.devices.filter {it.deviceId!=a},after.devices.filter {it.deviceId!=a})
@@ -599,7 +647,7 @@ class MultiComputerReviewDeviceTest {
             assertEquals(listOf(a),app.preferences.read().devices.map {peer->peer.deviceId})
             assertTrue(app.connection.connected(a))
             compose.onNodeWithText("Add device").performScrollTo().performClick()
-            compose.waitUntil(5000) {compose.onAllNodesWithText("Scan the QR code on your computer").fetchSemanticsNodes().isNotEmpty()}
+            compose.waitUntil(5000) {compose.onAllNodesWithText("Scan the QR code in Pneu on your computer").fetchSemanticsNodes().isNotEmpty()}
         }
     }
 

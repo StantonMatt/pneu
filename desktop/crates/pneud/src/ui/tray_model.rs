@@ -3,6 +3,85 @@ use super::{
     Snapshot,
     window::{Peer, contract::Transfer, display_peer_text},
 };
+/// Pins have their own order; Recent retains the store's copy-sequence order.
+pub(crate) fn history_entries(
+    items: &[crate::store::history::Item],
+) -> Vec<Option<&crate::store::history::Item>> {
+    let mut pins: Vec<_> = items.iter().filter(|i| i.pinned.is_some()).collect();
+    pins.sort_by_key(|i| std::cmp::Reverse(i.pinned));
+    let recent: Vec<_> = items.iter().filter(|i| i.pinned.is_none()).collect();
+    let mut entries: Vec<_> = pins.into_iter().take(5).map(Some).collect();
+    if !entries.is_empty() && !recent.is_empty() {
+        entries.push(None);
+    }
+    entries.extend(recent.into_iter().take(10).map(Some));
+    entries
+}
+pub(crate) fn phone_name(name: &str) -> String {
+    if name.chars().count() > 40 {
+        format!("{}…", name.chars().take(39).collect::<String>().trim_end())
+    } else {
+        name.to_owned()
+    }
+}
+pub(crate) fn battery_lines(peers: &[Peer]) -> Vec<String> {
+    peers
+        .iter()
+        .filter_map(|p| {
+            p.battery.map(|level| {
+                format!(
+                    "{} · Battery {level}%{}",
+                    phone_name(&p.name),
+                    if p.charging { ", charging" } else { "" }
+                )
+            })
+        })
+        .collect()
+}
+pub(crate) struct RingItem {
+    pub label: String,
+    pub device: pneu_proto::Id,
+    pub connection: Option<u64>,
+    pub action: pneu_proto::RingAction,
+}
+#[cfg(target_os = "macos")]
+impl RingItem {
+    pub fn request(&self) -> serde_json::Value {
+        serde_json::json!({"command":"ring", "device":self.device, "connection":self.connection, "action":self.action})
+    }
+}
+pub(crate) fn ring_items(peers: &[Peer]) -> Vec<RingItem> {
+    let phones: Vec<_> = peers
+        .iter()
+        .filter(|p| p.phone && p.ring_supported)
+        .collect();
+    phones
+        .iter()
+        .filter_map(|p| {
+            Some(RingItem {
+                device: pneu_proto::Id::new(&p.id).ok()?,
+                connection: p.ring_connection,
+                action: if p.ringing {
+                    pneu_proto::RingAction::Stop
+                } else {
+                    pneu_proto::RingAction::Start
+                },
+                label: if phones.len() == 1 {
+                    if p.ringing {
+                        "Stop Ringing"
+                    } else {
+                        "Ring Phone"
+                    }
+                    .into()
+                } else if p.ringing {
+                    format!("Stop Ringing {}", phone_name(&p.name))
+                } else {
+                    phone_name(&p.name)
+                },
+            })
+        })
+        .collect()
+}
 /// The tray's first line, which also starts its tooltip.
 pub(crate) fn status(snapshot: &Snapshot, peers: &[Peer], transfers: &[Transfer]) -> String {
     let sending: Vec<&str> = peers
@@ -36,7 +115,11 @@ pub(crate) fn status(snapshot: &Snapshot, peers: &[Peer], transfers: &[Transfer]
         if one.paused() {
             format!("{} paused sending", one.name)
         } else if let (true, Some(route)) = (one.connected(), &one.route) {
-            format!("{} connected over {route}", one.name)
+            format!(
+                "{} connected over {}",
+                one.name,
+                super::route_in_sentence(route)
+            )
         } else if one.connected() {
             format!("{} connected", one.name)
         } else if one.lost() {
@@ -56,6 +139,26 @@ pub(crate) fn status(snapshot: &Snapshot, peers: &[Peer], transfers: &[Transfer]
     } else {
         format!("{} of {} devices connected", connected.len(), peers.len())
     }
+}
+/// A single device has one tooltip line, with active status taking precedence.
+pub(crate) fn tooltip_lines(
+    snapshot: &Snapshot,
+    peers: &[Peer],
+    transfers: &[Transfer],
+) -> Vec<String> {
+    let leads = snapshot.error.is_some()
+        || snapshot.pairing.is_some()
+        || peers.is_empty()
+        || peers.iter().any(|p| p.sending() || p.receiving())
+        || (snapshot.receiving && snapshot.connected);
+    if leads && peers.len() <= 1 {
+        return vec![status(snapshot, peers, transfers)];
+    }
+    let mut lines: Vec<_> = peers.iter().map(Peer::short).collect();
+    if leads {
+        lines.insert(0, status(snapshot, peers, transfers));
+    }
+    lines
 }
 pub(crate) fn icon(snapshot: &Snapshot, peers: &[Peer]) -> &'static str {
     if snapshot.error.is_some() {
@@ -141,7 +244,7 @@ pub fn render_svg(svg: &[u8], size: u32) -> Result<Vec<u8>> {
         &mut pixmap.as_mut(),
     );
     // tiny-skia pixels are premultiplied. SNI and Slint take straight-alpha bytes.
-    for pixel in pixmap.data_mut().chunks_exact_mut(4) {
+    for pixel in pixmap.data_mut().as_chunks_mut::<4>().0 {
         if pixel[3] > 0 {
             for i in 0..3 {
                 pixel[i] = (u32::from(pixel[i]) * 255 / u32::from(pixel[3])).min(255) as u8;
@@ -149,6 +252,38 @@ pub fn render_svg(svg: &[u8], size: u32) -> Result<Vec<u8>> {
         }
     }
     Ok(pixmap.take())
+}
+
+pub(crate) fn history_label(item: &crate::store::history::Item, kde: bool) -> String {
+    let label = if item.image {
+        format!("Image · {}", super::last_seen(item.at))
+    } else {
+        item.title.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    let label = if label.chars().count() > 40 {
+        format!("{}…", label.chars().take(39).collect::<String>())
+    } else {
+        label
+    };
+    if kde { label.replace('_', "__") } else { label }
+}
+#[cfg(target_os = "linux")]
+pub(crate) fn history_icon(item: &crate::store::history::Item) -> Vec<u8> {
+    let Some(path) = item.thumbnail.as_ref() else {
+        return Vec::new();
+    };
+    (|| -> Result<Vec<u8>> {
+        let bytes = crate::storage::read_bounded(path, 128 * 1024)?;
+        let image = image::load_from_memory(&bytes)?.resize_exact(
+            16,
+            16,
+            image::imageops::FilterType::Triangle,
+        );
+        let mut png = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut png, image::ImageFormat::Png)?;
+        Ok(png.into_inner())
+    })()
+    .unwrap_or_default()
 }
 
 // The native Windows menu uses the same presentation projection and captured
@@ -191,6 +326,35 @@ pub(super) fn menu(snapshot: &Snapshot, config: &crate::Config) -> Vec<MenuEntry
             command: Some(Command::Toggle(toggle)),
         }
     }
+    fn history(snapshot: &Snapshot) -> MenuEntry {
+        let mut items: Vec<_> = history_entries(&snapshot.clipboard_history)
+            .into_iter()
+            .map(|i| {
+                let Some(i) = i else {
+                    return Separator;
+                };
+                item(
+                    history_label(i, false),
+                    Command::CopyClipboardHistory(i.id.clone()),
+                )
+            })
+            .collect();
+        if items.is_empty() {
+            items.push(Item {
+                label: "Nothing copied yet".into(),
+                enabled: false,
+                checked: None,
+                command: None,
+            });
+        } else {
+            items.push(Separator);
+            items.push(item("Show All", Command::ShowClipboardHistory));
+        }
+        Submenu {
+            label: "Clipboard History".into(),
+            items,
+        }
+    }
     let transfers = snapshot
         .transfers
         .iter()
@@ -212,6 +376,17 @@ pub(super) fn menu(snapshot: &Snapshot, config: &crate::Config) -> Vec<MenuEntry
             },
         ),
     ];
+    for (index, label) in battery_lines(&peers).into_iter().enumerate() {
+        items.insert(
+            1 + index,
+            Item {
+                label,
+                enabled: false,
+                checked: None,
+                command: None,
+            },
+        );
+    }
     if !peers.is_empty() {
         let recipients = |device: Option<&pneu_proto::Id>| {
             let ids = device.map(|id| [id.clone()]);
@@ -254,10 +429,22 @@ pub(super) fn menu(snapshot: &Snapshot, config: &crate::Config) -> Vec<MenuEntry
                 ));
             }
         }
-        items.push(Submenu {
-            label: "Send Files To".into(),
-            items: targets,
-        });
+        if let [one] = peers.as_slice() {
+            if let Ok(device) = pneu_proto::Id::new(&one.id) {
+                items.push(item(
+                    "Send Files…",
+                    Command::SendFiles {
+                        recipients: recipients(Some(&device)),
+                        targeted: true,
+                    },
+                ));
+            }
+        } else {
+            items.push(Submenu {
+                label: "Send Files To".into(),
+                items: targets,
+            });
+        }
         let value = serde_json::to_value(config).unwrap_or_default();
         let mode = ClipboardMode::from_config(
             Some(&value["clipboard_mode"]).filter(|v| !v.is_null()),
@@ -268,6 +455,30 @@ pub(super) fn menu(snapshot: &Snapshot, config: &crate::Config) -> Vec<MenuEntry
                 "Send Clipboard",
                 Command::SendClipboard(super::captured_authorities(snapshot)),
             ));
+        }
+        if config.clipboard_history {
+            items.push(history(snapshot));
+        }
+        let rings = ring_items(&peers)
+            .into_iter()
+            .map(|ring| Item {
+                label: ring.label,
+                enabled: ring.connection.is_some(),
+                checked: None,
+                command: ring.connection.map(|connection| Command::Ring {
+                    device: ring.device,
+                    connection,
+                    action: ring.action,
+                }),
+            })
+            .collect::<Vec<_>>();
+        if rings.len() == 1 {
+            items.extend(rings);
+        } else if !rings.is_empty() {
+            items.push(Submenu {
+                label: "Ring Phone".into(),
+                items: rings,
+            });
         }
         items.extend([item("Open Received Files", Command::OpenFolder), Separator]);
         let mut modes = [
@@ -305,6 +516,9 @@ pub(super) fn menu(snapshot: &Snapshot, config: &crate::Config) -> Vec<MenuEntry
         });
         items.push(Separator);
     }
+    if peers.is_empty() && config.clipboard_history {
+        items.push(history(snapshot));
+    }
     items.extend([
         item(
             "Add Device…",
@@ -323,6 +537,34 @@ mod tests {
     use super::super::{Command, Toggle, window::peers};
     use super::*;
 
+    #[test]
+    fn one_device_tooltip_has_one_line_and_multiple_devices_keep_each_line() {
+        let mut snap = Snapshot {
+            devices: (1..=2)
+                .map(|n| crate::core::mesh::DeviceSnapshot {
+                    device: pneu_proto::Id::from_bytes([n; 16]),
+                    name: format!("Device {n}"),
+                    role: "computer".into(),
+                    state: "connected".into(),
+                    last_seen: 0,
+                    dialer: None,
+                    route: Some("Local network".into()),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(tooltip_lines(&snap, &peers(&snap, &[]), &[]).len(), 2);
+        snap.devices.pop();
+        assert_eq!(
+            tooltip_lines(&snap, &peers(&snap, &[]), &[]),
+            ["Device 1 · Local network"]
+        );
+        snap.error = Some(super::super::ReceiveError::Port(53317));
+        assert_eq!(
+            tooltip_lines(&snap, &peers(&snap, &[]), &[]),
+            [snap.error.as_ref().unwrap().tooltip()]
+        );
+    }
     #[test]
     fn menu_projects_unpaired_and_paired_settings_and_captures_authority() {
         let mut snapshot = Snapshot::default();
@@ -383,6 +625,7 @@ mod tests {
             route: None,
         });
         snapshot.send_targets.push(crate::outbox::SendTarget {
+            folder_reason: None,
             device: device.clone(),
             name: "Phone & tablet".into(),
             generation: 7,
@@ -398,7 +641,7 @@ mod tests {
             [
                 "---",
                 "Open Pneu",
-                "Send Files To",
+                "Send Files…",
                 "Open Received Files",
                 "---",
                 "Clipboard",
@@ -415,7 +658,7 @@ mod tests {
             [
                 "---",
                 "Open Pneu",
-                "Send Files To",
+                "Send Files…",
                 "Send Clipboard",
                 "Open Received Files",
                 "---",
@@ -429,16 +672,11 @@ mod tests {
         );
         let files = entries
             .iter()
-            .find_map(|item| match item {
-                MenuEntry::Submenu { label, items } if label == "Send Files To" => Some(items),
-                _ => None,
-            })
+            .find(|entry| matches!(entry, MenuEntry::Item {label,..} if label == "Send Files…"))
             .unwrap();
         assert!(
-            matches!(&files[0], MenuEntry::Item { command: Some(Command::SendFiles { recipients, targeted: false }), .. } if recipients.len() == 1 && recipients[0].generation == 7)
-        );
-        assert!(
-            matches!(&files[2], MenuEntry::Item { command: Some(Command::SendFiles { recipients, targeted: true }), .. } if recipients[0].device == device)
+            matches!(files, MenuEntry::Item { command: Some(Command::SendFiles { recipients, targeted: true }), .. }
+            if recipients.len() == 1 && recipients[0].device == device && recipients[0].generation == 7)
         );
         let clipboard = entries
             .iter()
@@ -462,8 +700,18 @@ mod tests {
         // it even after a peer is removed or paired again before activation.
         snapshot.send_targets[0].generation = 8;
         assert!(
-            matches!(&files[2], MenuEntry::Item { command: Some(Command::SendFiles { recipients, .. }), .. } if recipients[0].generation == 7)
+            matches!(files, MenuEntry::Item { command: Some(Command::SendFiles { recipients, .. }), .. } if recipients[0].generation == 7)
         );
+        snapshot.devices[0].state = "disconnected".into();
+        snapshot.send_targets[0].would_queue = true;
+        assert!(menu(&snapshot, &config).iter().any(|entry| matches!(entry, MenuEntry::Item { label, command: Some(Command::SendFiles {recipients,targeted:true}),.. } if label == "Send Files…" && recipients.len() == 1)));
+        let mut second = snapshot.devices[0].clone();
+        second.device = pneu_proto::Id::from_bytes([2; 16]);
+        second.name = "Second computer".into();
+        snapshot.devices.push(second);
+        assert!(menu(&snapshot, &config).iter().any(
+            |entry| matches!(entry, MenuEntry::Submenu {label,..} if label == "Send Files To")
+        ));
     }
 
     #[test]
@@ -481,12 +729,107 @@ mod tests {
                 for size in [16, 20, 24, 32] {
                     let rgba = render_svg(svg.as_bytes(), size)?;
                     assert_eq!(rgba.len(), (size * size * 4) as usize);
-                    assert!(rgba.chunks_exact(4).any(|p| p[3] != 0));
-                    assert!(rgba.chunks_exact(4).any(|p| p[3] == 0));
+                    assert!(rgba.as_chunks::<4>().0.iter().any(|p| p[3] != 0));
+                    assert!(rgba.as_chunks::<4>().0.iter().any(|p| p[3] == 0));
                 }
             }
         }
         assert!(render_svg(ICONS[0].1.as_bytes(), 0).is_err());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    fn entry(text: &str) -> crate::store::history::Item {
+        crate::store::history::Item {
+            id: "1".repeat(32),
+            title: crate::store::history::title(text),
+            search: crate::store::history::search_key(text),
+            pinned: None,
+            url: crate::store::history::is_url(text),
+            image: false,
+            origin: None,
+            at: 1,
+            thumbnail: None,
+        }
+    }
+    #[test]
+    fn history_menu_groups_five_newest_pins_then_ten_recent() {
+        let mut items: Vec<_> = (0..20)
+            .map(|n| {
+                let mut item = entry(&format!("item {n}"));
+                item.pinned = (n < 7).then_some(n);
+                item.at = (20 - n) as u64;
+                item
+            })
+            .collect();
+        // Wall-clock adjustments must not reorder the store's copy sequence.
+        items[7].at = 0;
+        let entries = history_entries(&items);
+        assert_eq!(entries.len(), 16);
+        assert_eq!(entries[0].unwrap().title, "item 6");
+        assert_eq!(entries[4].unwrap().title, "item 2");
+        assert!(entries[5].is_none());
+        assert_eq!(entries[6].unwrap().title, "item 7");
+        assert_eq!(entries[15].unwrap().title, "item 16");
+        items.retain(|i| i.pinned.is_some());
+        assert_eq!(history_entries(&items).len(), 5);
+        assert!(history_entries(&items).iter().all(Option::is_some));
+    }
+    #[test]
+    fn history_labels_collapse_whitespace_trim_urls_limit_unicode_and_escape_kde_mnemonics() {
+        assert_eq!(
+            history_label(&entry(" \n https://example.org/a_b \t"), false),
+            "example.org/a_b"
+        );
+        assert_eq!(
+            history_label(&entry("line_1\n\tline_2"), true),
+            "line__1 line__2"
+        );
+        assert_eq!(
+            history_label(&entry(&"é".repeat(40)), false),
+            "é".repeat(40)
+        );
+        assert_eq!(
+            history_label(&entry(&"é".repeat(41)), false),
+            format!("{}…", "é".repeat(39))
+        );
+        assert!(
+            history_label(
+                &crate::store::history::Item {
+                    image: true,
+                    ..entry("")
+                },
+                false
+            )
+            .starts_with("Image · ")
+        );
+    }
+    #[test]
+    fn history_menu_is_hidden_when_off_disabled_when_empty_and_has_ten_latest_plus_show_all() {
+        let mut snapshot = Snapshot::default();
+        let mut config = crate::Config::default();
+        fn history(items: Vec<MenuEntry>) -> Option<Vec<MenuEntry>> {
+            items.into_iter().find_map(|i| match i {
+                MenuEntry::Submenu { label, items } if label == "Clipboard History" => Some(items),
+                _ => None,
+            })
+        }
+        assert!(history(menu(&snapshot, &config)).is_none());
+        config.clipboard_history = true;
+        let empty = history(menu(&snapshot, &config)).unwrap();
+        assert_eq!(empty.len(), 1);
+        assert!(
+            matches!(&empty[0],MenuEntry::Item {label,enabled:false,command:None,..} if label=="Nothing copied yet")
+        );
+        snapshot.clipboard_history = (0..11).map(|i| entry(&format!("text {i}"))).collect();
+        let items = history(menu(&snapshot, &config)).unwrap();
+        assert_eq!(items.len(), 12);
+        assert!(matches!(&items[9],MenuEntry::Item {label,..} if label=="text 9"));
+        assert!(
+            matches!(&items[11],MenuEntry::Item {label,command:Some(super::super::Command::ShowClipboardHistory),..} if label=="Show All")
+        );
     }
 }

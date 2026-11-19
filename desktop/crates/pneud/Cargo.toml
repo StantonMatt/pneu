@@ -17,6 +17,7 @@ required-features = ["windows-package"]
 [dependencies]
 pneu-proto = { path = "../pneu-proto" }
 anyhow = "1"
+thiserror.workspace = true
 async-trait = "0.1"
 hex.workspace = true
 serde.workspace = true
@@ -37,20 +38,29 @@ if-addrs = "0.15"
 futures-util = "0.3"
 qrcode = { version = "0.14", default-features = false }
 url = "2"
+unicode-normalization = "0.1"
+caseless = "0.2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 
 resvg = "0.47"
 chrono = "0.4"
+unicode-casefold = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs", "process", "event", "system"] }
 libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+cpp = "=0.5.11"
+qttypes = { version = "=0.2.12", default-features = false }
+i-slint-backend-qt = { version = "=1.15.1", features = ["enable"] }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 wl-clipboard-rs = "=0.9.4"
 ksni = "0.3"
 slint = { version = "=1.15.1", default-features = false, features = ["std", "backend-qt", "backend-winit", "unstable-winit-030", "renderer-software", "compat-1-2"] }
+
+[target.'cfg(target_os = "linux")'.build-dependencies]
+cpp_build = "=0.5.11"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "=0.6.5"

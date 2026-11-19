@@ -20,9 +20,10 @@ use slint::{
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::OnceLock};
 
 type Point = (f64, f64);
+type Begin = Rc<dyn Fn(&[PathBuf]) -> bool>;
 #[derive(Clone)]
 pub(crate) struct Callbacks {
-    pub begin: Rc<dyn Fn() -> bool>,
+    pub begin: Begin,
     pub hover: Rc<dyn Fn(Point) -> bool>,
     pub drop: Rc<dyn Fn(Point, Vec<PathBuf>) -> bool>,
     pub cancel: Rc<dyn Fn()>,
@@ -119,7 +120,7 @@ unsafe extern "C-unwind" fn entered(
         };
         // This callback captures the currently rendered authorities immediately,
         // before a queued Slint status update can replace the displayed binding.
-        if !(callbacks.begin)() {
+        if !(callbacks.begin)(&paths) {
             return Bool::NO;
         }
         CAPTURE.with(|s| {
@@ -334,7 +335,7 @@ mod tests {
                 *s.borrow_mut() = Some(Capture {
                     _delegate: Retained::cast_unchecked(info.clone()),
                     callbacks: Callbacks {
-                        begin: Rc::new(move || {
+                        begin: Rc::new(move |_| {
                             count.set(count.get() + 1);
                             true
                         }),

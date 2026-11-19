@@ -10,7 +10,7 @@ use crate::{
     ui::{
         notifications::Notice,
         portal::Interaction,
-        windows_toast_model::{Record, Targets},
+        windows_toast_model::{Record, Targets, can_burst},
     },
 };
 use std::{
@@ -26,6 +26,7 @@ struct Target {
     url: Option<String>,
     retry: Option<(pneu_proto::Id, pneu_proto::Id, pneu_proto::Id)>,
     attribution: Option<String>,
+    device: Option<pneu_proto::Id>,
 }
 struct Burst {
     id: u32,
@@ -54,12 +55,34 @@ impl Drop for Submission {
     }
 }
 
+struct PhoneSubmission {
+    sender: toasts::Sender,
+    tag: String,
+    life: Arc<crate::ui::notice_lifecycle::Lifecycle>,
+    accepted: bool,
+}
+impl Drop for PhoneSubmission {
+    fn drop(&mut self) {
+        if !self.accepted {
+            self.life.cancel();
+            self.sender.remove_tag(
+                self.tag.clone(),
+                crate::ui::windows_toast_model::PHONE_GROUP.into(),
+            );
+        }
+    }
+}
+
 pub async fn open_folder(path: &Path) -> Result<()> {
     shell::open_folder(path.to_owned()).await?.await
 }
 
 pub async fn show_files(paths: &[PathBuf]) -> Result<()> {
     shell::show_files(paths.to_owned()).await?.await
+}
+
+pub async fn open_url(url: &str) -> Result<()> {
+    shell::open_url(url.to_owned()).await?.await
 }
 
 pub struct DesktopActions {
@@ -104,6 +127,16 @@ impl DesktopActions {
     ) -> Option<tokio::sync::mpsc::Receiver<toasts::Activation>> {
         self.activations.lock().expect("toast activations").take()
     }
+    pub(crate) async fn withdraw_notice(&self, id: u32) -> Result<()> {
+        let mut targets = self.targets.lock().expect("toast targets");
+        if let Some(record) = targets.records.get(&id).cloned() {
+            targets.remove(&record);
+            if let Some(sender) = self.sender.get() {
+                sender.remove(record.id, record.group());
+            }
+        }
+        Ok(())
+    }
     pub async fn notice(
         &self,
         notice: Notice,
@@ -132,6 +165,7 @@ impl DesktopActions {
                 url,
                 retry: None,
                 attribution: None,
+                device: None,
             },
             replaces,
         )
@@ -140,9 +174,10 @@ impl DesktopActions {
     async fn issue_notice_target(
         &self,
         notice: Notice,
-        target: Target,
+        mut target: Target,
         replaces: u32,
     ) -> Result<(u32, Interaction)> {
+        target.device = notice.device.clone();
         let sender = self
             .sender
             .get()
@@ -234,6 +269,14 @@ impl DesktopActions {
         );
         let target = &record.target;
         match action.as_str() {
+            "allow" | "deny" => {
+                crate::ui::window_setup::decide(
+                    core,
+                    &record.notice.setup_requests,
+                    action == "allow",
+                )
+                .await
+            }
             "window" => core.request_window(false),
             "default" | "open" => {
                 if let Some(file) = target.files.last() {
@@ -248,6 +291,11 @@ impl DesktopActions {
             }
             "folder" => core.request_window(true),
             "pair" => core.request_add_device(),
+            "remove" => {
+                if let Some(device) = &target.device {
+                    core.request_remove_window(device.clone(), None);
+                }
+            }
             "retry" => {
                 if let Some((operation, artifact, device)) = &target.retry {
                     core.retry_transfer_artifact(
@@ -274,6 +322,57 @@ fn file_attribution(metadata: &pneu_proto::FileBegin) -> Option<String> {
 
 #[async_trait]
 impl PcActions for DesktopActions {
+    async fn show_phone_notification(
+        &self,
+        id: &str,
+        notice: &crate::ui::notifications::PhoneNotice,
+        replaces: u32,
+    ) -> Result<u32> {
+        self.begin_phone_notification(id, notice, replaces)
+            .await?
+            .await
+    }
+    async fn begin_phone_notification<'a>(
+        &'a self,
+        id: &'a str,
+        notice: &'a crate::ui::notifications::PhoneNotice,
+        _replaces: u32,
+    ) -> Result<super::PhoneAcknowledgement<'a>> {
+        use crate::ui::{notice_lifecycle::Lifecycle, windows_toast_model::*};
+        let sender = self
+            .sender
+            .get()
+            .context("Windows notifications require an interactive daemon")?;
+        let submission = PhoneSubmission {
+            sender: sender.clone(),
+            tag: phone_tag(id),
+            life: Arc::new(Lifecycle::new(None)),
+            accepted: false,
+        };
+        let wait = sender.show(
+            phone_xml(notice),
+            submission.tag.clone(),
+            PHONE_GROUP.into(),
+            submission.life.clone(),
+        )?;
+        Ok(Box::pin(async move {
+            // Move the complete cancellation guard into the future. Capturing
+            // only its Copy bool drops the guard before submission is awaited.
+            let mut submission = submission;
+            wait.await?;
+            submission.accepted = true;
+            Ok(0)
+        }))
+    }
+    async fn remove_phone_notification(&self, id: &str, _handle: u32) -> Result<()> {
+        use crate::ui::windows_toast_model::*;
+        self.sender
+            .get()
+            .context("toast host unavailable")?
+            .remove_tag(phone_tag(id), PHONE_GROUP.into());
+        Ok(())
+    }
+
     async fn clipboard_text(&self, _text: &str) -> Result<()> {
         anyhow::bail!("Windows clipboard writes require the clipboard actor")
     }
@@ -285,8 +384,16 @@ impl PcActions for DesktopActions {
         input: ClipboardInput,
         ticket: u128,
     ) -> Result<PreparedClipboard> {
+        self.prepare_clipboard_sensitive(input, ticket, false).await
+    }
+    async fn prepare_clipboard_sensitive(
+        &self,
+        input: ClipboardInput,
+        ticket: u128,
+        sensitive: bool,
+    ) -> Result<PreparedClipboard> {
         crate::work::blocking(self.jobs.clone(), move || {
-            let native = crate::ui::clipboard::Offer::prepare(&input, ticket)?;
+            let native = crate::ui::clipboard::Offer::prepare_sensitive(&input, ticket, sensitive)?;
             Ok(PreparedClipboard {
                 hashes: native.hashes(),
                 marker_confirmation: true,
@@ -509,10 +616,34 @@ impl PcActions for DesktopActions {
         .await
         .map(|(_, wait)| wait)
     }
+    async fn notify_clipboard_too_large(&self) -> Result<()> {
+        self.notice(
+            crate::ui::notifications::Notice::image_too_large(),
+            Vec::new(),
+            None,
+            0,
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+    async fn notify_ring_failure(&self, phone: &str) -> Result<()> {
+        let mut notice = crate::ui::notifications::Notice::new(format!("Couldn't ring {phone}"));
+        notice.body = crate::ui::notifications::escape(&format!("{phone} didn't respond"));
+        self.notice(notice, Vec::new(), None, 0, None)
+            .await
+            .map(|_| ())
+    }
     async fn notify_send_admission_failure(&self, reason: &str) -> Result<()> {
-        let mut n = Notice::new("Couldn't send files");
-        n.body = crate::ui::notifications::escape(reason);
-        self.notice(n, Vec::new(), None, 0, None).await.map(|_| ())
+        self.notice(
+            crate::ui::notifications::Notice::admission_failure(reason),
+            Vec::new(),
+            None,
+            0,
+            None,
+        )
+        .await
+        .map(|_| ())
     }
     async fn notify_delivery(
         &self,
@@ -520,10 +651,7 @@ impl PcActions for DesktopActions {
         device_name: &str,
     ) -> Result<()> {
         let (notice, retry) = if transfer.state == "sent" {
-            (
-                Notice::sent(&transfer.file_name, &[device_name.into()]),
-                None,
-            )
+            (Notice::sent_transfer(transfer, device_name), None)
         } else {
             (
                 Notice::send_failed(
@@ -547,6 +675,7 @@ impl PcActions for DesktopActions {
                     url: None,
                     retry,
                     attribution: None,
+                    device: None,
                 },
                 0,
             )
@@ -652,7 +781,7 @@ impl PcActions for DesktopActions {
         let mut kind = Some(metadata.kind);
         let mut all_saved = saved;
         let mut started = arrived;
-        if save_error.is_none()
+        if can_burst(metadata, save_error)
             && let Some(previous) = burst.as_ref()
             && previous.source == file.source
             && arrived.saturating_duration_since(previous.arrived)
@@ -689,11 +818,12 @@ impl PcActions for DesktopActions {
                     url: None,
                     retry: None,
                     attribution: (count == 1).then(|| file_attribution(metadata)).flatten(),
+                    device: None,
                 },
                 replaces,
             )
             .await?;
-        *burst = if save_error.is_none() {
+        *burst = if can_burst(metadata, save_error) {
             Some(Burst {
                 id,
                 paths,

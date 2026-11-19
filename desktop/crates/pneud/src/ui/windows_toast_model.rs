@@ -3,6 +3,13 @@ use super::{notice_lifecycle::Lifecycle, notifications::Notice};
 use anyhow::{Context, Result};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
+pub(crate) fn can_burst(
+    metadata: &pneu_proto::FileBegin,
+    save_error: Option<pneu_proto::NackCode>,
+) -> bool {
+    metadata.folder.is_none() && save_error.is_none()
+}
+
 pub(crate) struct Record<T> {
     pub id: u32,
     pub session: String,
@@ -177,9 +184,102 @@ fn escape(value: &str) -> String {
         .collect()
 }
 
+/// Dedicated mirror group: no activation arguments, actions or transfer targets.
+pub(crate) const PHONE_GROUP: &str = "pneu-mirrors";
+pub(crate) fn phone_tag(id: &str) -> String {
+    use sha2::Digest;
+    hex::encode(&sha2::Sha256::digest(id.as_bytes())[..8])
+}
+pub(crate) fn phone_xml(notice: &super::notifications::PhoneNotice) -> String {
+    let (title, text, attribution) = if notice.app_only() {
+        (notice.app.as_str(), "New notification", None)
+    } else {
+        (
+            notice.title.as_deref().unwrap_or(""),
+            notice.text.as_deref().unwrap_or(""),
+            Some(notice.app.as_str()),
+        )
+    };
+    let mut xml = format!(
+        r#"<toast activationType="background"><visual><binding template="ToastGeneric"><text>{}</text><text>{}</text>"#,
+        escape(title),
+        escape(text)
+    );
+    if let Some(icon) = notice
+        .icon
+        .as_ref()
+        .and_then(|icon| icon.file_path())
+        .and_then(|p| url::Url::from_file_path(p).ok())
+    {
+        xml.push_str(&format!(
+            r#"<image placement="appLogoOverride" src="{}"/>"#,
+            escape(icon.as_str())
+        ));
+    }
+    if let Some(app) = attribution {
+        xml.push_str(&format!(
+            r#"<text placement="attribution">{}</text>"#,
+            escape(app)
+        ));
+    }
+    xml.push_str("</binding></visual></toast>");
+    xml
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn folders_neither_replace_nor_start_file_notification_bursts() -> Result<()> {
+        use pneu_proto::{FileBegin, FileKind, Hash, Id, NackCode};
+        let mut metadata = FileBegin {
+            transfer_id: Id::from_bytes([1; 16]),
+            file_name: "report.pdf".into(),
+            mime: "application/pdf".into(),
+            size: 3,
+            sha256: Hash::new("ab".repeat(32))?,
+            kind: FileKind::File,
+            created_at: 0,
+            source_media_id: None,
+            hlc: None,
+            source_device: None,
+            sensitive: false,
+            resume: None,
+            folder: None,
+        };
+        let mut targets = Targets::default();
+        let (first, _) = targets.issue(Notice::new("report.pdf"), (), 0)?;
+        assert!(can_burst(&metadata, None));
+        for error in [NackCode::DiskFull, NackCode::NotWritable] {
+            assert!(!can_burst(&metadata, Some(error)));
+        }
+
+        metadata.folder = Some(Box::new(pneu_proto::Folder { manifest_len: 100 }));
+        assert!(!can_burst(&metadata, None));
+        let replaces = if can_burst(&metadata, None) {
+            first.id
+        } else {
+            0
+        };
+        let mut notice = Notice::new("Trip");
+        notice.actions = vec![("default", "Open"), ("open", "Open")];
+        let (folder, retired) = targets.issue(notice, (), replaces)?;
+        assert!(retired.is_empty());
+        assert_ne!(folder.id, first.id);
+        assert!(first.life.active());
+
+        // A folder also cannot become the candidate replaced by the next file.
+        let candidate = can_burst(&metadata, None).then_some(folder.id);
+        metadata.folder = None;
+        assert!(can_burst(&metadata, None));
+        let (next, retired) = targets.issue(Notice::new("next.pdf"), (), candidate.unwrap_or(0))?;
+        assert!(retired.is_empty());
+        assert_ne!(next.id, folder.id);
+        assert!(targets.take(&folder.argument("open")).is_ok());
+        assert!(first.life.active());
+        Ok(())
+    }
+
     #[tokio::test(start_paused = true)]
     async fn rejects_wrong_session_unknown_expired_replaced_and_unoffered_actions() -> Result<()> {
         let mut targets = Targets::default();
@@ -286,6 +386,9 @@ mod tests {
             FileKind::ClipboardImage,
         ] {
             let m = FileBegin {
+                resume: None,
+                folder: None,
+                sensitive: false,
                 hlc: None,
                 source_device: None,
                 transfer_id: Id::from_bytes([0; 16]),
@@ -323,5 +426,32 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn phone_notifications_windows_content_tag_group_and_no_actions() {
+        let mut n = super::super::notifications::PhoneNotice {
+            app: "Chat<&>".into(),
+            title: None,
+            text: None,
+            icon: Some(super::super::notifications::PhoneIcon::File(
+                std::env::temp_dir().join("icon &.png"),
+            )),
+        };
+        let hidden = phone_xml(&n);
+        assert!(hidden.contains("<text>Chat&lt;&amp;&gt;</text><text>New notification</text>"));
+        assert!(!hidden.contains("attribution"));
+        assert!(!hidden.contains("launch="));
+        assert!(!hidden.contains("<actions>"));
+        assert!(hidden.contains("appLogoOverride"));
+        n.title = Some("Ana<&>".into());
+        n.text = Some("¿Llegaste?".into());
+        let xml = phone_xml(&n);
+        assert!(xml.contains("<text>Ana&lt;&amp;&gt;</text><text>¿Llegaste?</text>"));
+        assert!(xml.contains("placement=\"attribution\">Chat&lt;&amp;&gt;</text>"));
+        assert_eq!(phone_tag("one"), phone_tag("one"));
+        assert_eq!(phone_tag("one").len(), 16);
+        assert_ne!(phone_tag("one"), phone_tag("two"));
+        assert_eq!(PHONE_GROUP, "pneu-mirrors");
     }
 }

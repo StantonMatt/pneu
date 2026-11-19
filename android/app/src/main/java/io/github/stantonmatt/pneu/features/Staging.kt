@@ -69,6 +69,9 @@ class Staging(private val app: AppGraph, private val deleteCommittedSource:(File
                     catch(e:Exception) {if(!row.automatic)throw ShareFailure("open_failed",e) else throw e}
                     sources.add(asset)
                     try {asset.use {source->
+                    // Cancellation closes even a stalled descriptor off the caller's
+                    // thread. A late open observes the already-cancelled signal here.
+                    signal.setOnCancelListener {runCatching {source.close()}}
                     progress()
                     val digest=MessageDigest.getInstance("SHA-256");var count=0L
                     val fd=source.fileDescriptor
@@ -78,7 +81,8 @@ class Staging(private val app: AppGraph, private val deleteCommittedSource:(File
                         val buffer=ByteArray(CHUNK_SIZE)
                         while(range.remaining!=0L) {
                             if(signal.isCanceled)throw java.io.IOException("Copy abandoned")
-                            val n=try {android.system.Os.read(fd,buffer,0,range.limit(buffer.size))}
+                            val limit=range.limit(buffer.size).let {if(row.kind=="clipboard_image")ClipboardImageSize.readLimit(count,it) else it}
+                            val n=try {android.system.Os.read(fd,buffer,0,limit)}
                             catch(e:android.system.ErrnoException) {
                                 if(e.errno!=android.system.OsConstants.EAGAIN)throw e
                                 val poll=android.system.StructPollfd().apply {this.fd=fd;events=android.system.OsConstants.POLLIN.toShort()}
@@ -86,6 +90,7 @@ class Staging(private val app: AppGraph, private val deleteCommittedSource:(File
                             }
                             if(!range.consume(n))break
                             progress();count+=n;require(count<=MAX_FILE)
+                            if(row.kind=="clipboard_image")ClipboardImageSize.requireAllowed(count)
                             output.write(buffer,0,n);digest.update(buffer,0,n)
                         }
                         source.parcelFileDescriptor.checkError()
@@ -114,6 +119,47 @@ class Staging(private val app: AppGraph, private val deleteCommittedSource:(File
         } catch(e:LocalCapacityException) {app.preferences.toggle("localCapacity",true);throw e}
         finally {part?.let {activeParts.remove(it)}}
     }
+    /** Fresh operations own fresh payload files; the original artifact can still
+     * be completed or evicted independently by its other recipients. */
+    internal suspend fun withResendPayloads(rows:List<Outgoing>,publish:suspend ()->Boolean):Boolean=withContext(Dispatchers.IO) {
+        val copies=mutableListOf<File>();var committed=false
+        try {
+            for(row in rows.filter {it.kind!="text"}) {
+                val source=File(row.path)
+                capacity(source.length())
+                val target=File(dir,"${row.transferId}.bin")
+                // Register before creating the file, as cleanup runs concurrently.
+                activeParts.add(target);copies+=target
+                FileOutputStream(target).use {output->
+                    source.inputStream().use {it.copyTo(writer(output))}
+                    output.fd.sync()
+                }
+                row.path=target.absolutePath
+            }
+            if(copies.isNotEmpty())syncDir()
+            withContext(NonCancellable) {committed=publish()}
+            committed
+        } catch(e:LocalCapacityException) {app.preferences.toggle("localCapacity",true);throw e}
+        finally {
+            copies.forEach {if(!committed)it.delete();activeParts.remove(it)}
+        }
+    }
+    internal suspend fun admitFolder(row:Outgoing,capture:FolderCapture,binding:DeliveryBinding):Boolean=withContext(Dispatchers.IO) {mutex.withLock {
+        capacity(0)
+        val target=File(dir,"${row.transferId}.bin")
+        val part=File.createTempFile("folder-",".part",dir)
+        try {
+            val descriptor=capture.encode().toByteArray()
+            if(descriptor.size>32*1024*1024)throw FolderInvalid(FolderInvalid.Reason.METADATA)
+            FileOutputStream(part).use {out->writer(out).write(descriptor);out.fd.sync()}
+            check(part.renameTo(target));syncDir();row.path=target.path
+            Protocol.validate(Type.FILE_BEGIN,metadata(row))
+            val admitted=app.enqueue(row,binding)
+            if(!admitted)target.delete()
+            admitted
+        }catch(e:Exception) {if(app.queue.anyPath(target.path)==0)target.delete();throw e}
+        finally {part.delete()}
+    }}
     suspend fun optimize(row:Outgoing)=withContext(Dispatchers.IO) {ImageWorkBudget.run {
         // An interrupted pre-send preparation may already have published a JPEG.
         // Its ID, bytes and metadata are immutable on every subsequent selection.
@@ -166,7 +212,7 @@ class Staging(private val app: AppGraph, private val deleteCommittedSource:(File
         }}catch(_:Exception) {null}
         var retained=false
         try {
-            val thumbnail=target?.let {MediaPreview.makeThumbnail(app.context,row,it,beforeThumbnailWrite)}
+            val thumbnail=if(row.isFolder())null else target?.let {MediaPreview.makeThumbnail(app.context,row,it,beforeThumbnailWrite)}
             if(thumbnail==null)target?.delete()
             mutex.withLock {app.queueMutex.withLock commit@{
                 val current=app.queue.delivery(row.mediaId,row.peerId)
@@ -199,6 +245,9 @@ class Staging(private val app: AppGraph, private val deleteCommittedSource:(File
         try {android.system.Os.fsync(fd)} finally {android.system.Os.close(fd)}
     }
     companion object {
-        fun metadata(row: Outgoing)=json("transfer_id" to row.transferId,"file_name" to row.fileName,"mime" to row.mime,"size" to row.size,"sha256" to row.hash,"kind" to row.kind,"created_at" to row.createdAt,"source_media_id" to row.mediaId)
+        fun clipboardMetadata(row:Outgoing)=json("transfer_id" to row.transferId,"text" to row.text,"created_at" to row.createdAt,"origin" to row.origin).apply {if(row.sensitive)addProperty("sensitive",true)}
+        fun metadata(row: Outgoing)=json("transfer_id" to row.transferId,"file_name" to row.fileName,"mime" to row.mime,"size" to row.size,"sha256" to row.hash,"kind" to row.kind,"created_at" to row.createdAt,"source_media_id" to row.mediaId).apply {if(row.isFolder()) {
+            remove("source_media_id");addProperty("resume",true);add("folder",json("manifest_len" to requireNotNull(row.folderSummary()).manifestLen))
+        }else if(row.kind=="clipboard_image" && row.sensitive)addProperty("sensitive",true)}
     }
 }

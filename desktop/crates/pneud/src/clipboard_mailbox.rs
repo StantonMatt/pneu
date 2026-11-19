@@ -32,7 +32,11 @@ pub(super) fn channel() -> (Sender, Receiver) {
 }
 fn observation_token(message: &Message) -> Option<Token> {
     match message {
-        Message::Event(Event::Observe { token, .. } | Event::Read { token, .. })
+        Message::Event(
+            Event::Observe { token, .. }
+            | Event::Read { token, .. }
+            | Event::ImageTooLarge { token, .. },
+        )
         | Message::ReadHandle(token, _) => Some(*token),
         _ => None,
     }
@@ -71,7 +75,7 @@ impl Sender {
                 slot.cancel = Some(cancel.clone());
             }
             // At most one read result and one cancellation registration per slot.
-            q.messages.retain(|m| !matches!((m, &message),
+            q.messages.retain(|m| !matches!((m, &message), (Message::Event(Event::ImageTooLarge { token: old, .. }), Message::Event(Event::ImageTooLarge { token: new, .. })) if old == new) && !matches!((m, &message),
                 (Message::ReadHandle(old, _), Message::ReadHandle(new, _)) if old == new)
                 && !matches!((m, &message), (Message::Event(Event::Read {token:old,..}), Message::Event(Event::Read {token:new,..})) if old == new));
         }
@@ -82,7 +86,7 @@ impl Sender {
     }
 }
 impl Receiver {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn len(&self) -> usize {
         self.0.queue.lock().unwrap().messages.len()
     }

@@ -54,6 +54,27 @@ fn check_client(stream: &ServerStream) -> Result<()> {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Command {
+    Ring {
+        device: pneu_proto::Id,
+        connection: u64,
+        action: pneu_proto::RingAction,
+    },
+    ShowClipboardHistory,
+    CopyClipboardHistory {
+        id: String,
+    },
+    DeleteClipboardHistory {
+        id: String,
+    },
+    PinClipboardHistory {
+        id: String,
+        pinned: bool,
+    },
+    ClipboardHistorySearch {
+        ids: Vec<String>,
+    },
+    ClearClipboardHistory,
+    DisableEmptyClipboardHistory,
     SendFiles {
         paths: Vec<std::path::PathBuf>,
         targets: crate::outbox::Targets,
@@ -70,7 +91,7 @@ pub enum Command {
     UiTest {
         action: String,
     },
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     PresentPicker {
         #[serde(default)]
         paths: Option<Vec<std::path::PathBuf>>,
@@ -110,6 +131,8 @@ pub enum Command {
     },
     SendClipboard {
         targets: crate::outbox::Targets,
+        #[serde(default)]
+        notify_too_large: bool,
     },
     Rename {
         name: String,
@@ -120,6 +143,45 @@ pub enum Command {
     },
     JoinConfirm {
         attempt: String,
+    },
+    JoinConfirmScoped {
+        attempt: String,
+        enabled: bool,
+    },
+    PairingScope {
+        enabled: bool,
+    },
+    SetupStatus,
+    LinkExistingDevice {
+        device: Id,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binding_generation: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_scope: Option<pneu_proto::SetupScope>,
+    },
+    SetupDecision {
+        device: Id,
+        setup_generation: u64,
+        binding_generation: u64,
+        allow: bool,
+    },
+    SetupDecisions {
+        requests: Vec<crate::ui::window_setup::Decision>,
+        allow: bool,
+    },
+    ReadmissionDecision {
+        key: crate::store::members::ReadmissionKey,
+        allow: bool,
+    },
+    RemoveFromSetup {
+        device: Id,
+        setup_generation: u64,
+        binding_generation: Option<u64>,
+        fingerprint: Hash,
+    },
+    DismissSetupNotice {
+        device: Id,
+        binding_generation: u64,
     },
     JoinStatus {
         attempt: String,
@@ -138,9 +200,17 @@ pub enum Command {
     Unpair {
         device: Id,
     },
+    ReplacementDecision {
+        intent: Id,
+        replace: bool,
+        #[serde(default)]
+        implied_old: Option<crate::outbox::Authority>,
+    },
     Config {
         config: Config,
     },
+    #[cfg(any(target_os = "linux", windows))]
+    OpenFolder,
     SaveFolder {
         folder: std::path::PathBuf,
     },
@@ -168,6 +238,8 @@ pub enum Command {
     WindowFocus {
         request: u64,
         focused: bool,
+        #[serde(default)]
+        visible: bool,
     },
     AddDevice,
     ShowWindow {
@@ -198,17 +270,22 @@ impl Command {
     }
 
     fn requires_desktop(&self, choose_devices: bool) -> bool {
+        #[cfg(any(target_os = "linux", windows))]
+        if matches!(self, Self::OpenFolder) {
+            return true;
+        }
         #[cfg(target_os = "macos")]
         if matches!(self, Self::UiTest { .. }) {
             return true;
         }
-        #[cfg(any(target_os = "macos", windows))]
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         if matches!(self, Self::PresentPicker { .. }) {
             return true;
         }
         matches!(
             self,
-            Self::AddDevice
+            Self::ShowClipboardHistory
+                | Self::AddDevice
                 | Self::ShowWindow { .. }
                 | Self::PresentFiles { .. }
                 | Self::PresentSendError { .. }
@@ -219,7 +296,8 @@ impl Command {
                     targets: crate::outbox::Targets::All(_),
                     ..
                 } | Self::SendClipboard {
-                    targets: crate::outbox::Targets::All(_)
+                    targets: crate::outbox::Targets::All(_),
+                    ..
                 }
             ))
     }
@@ -408,10 +486,10 @@ async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
     )?;
     let ask = core.config().choose_devices_each_time;
     let desktop_send = match &request {
-        #[cfg(any(target_os = "macos", windows))]
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         Command::PresentPicker {..} => true,
         Command::PresentFiles {..} | Command::PresentSendError {..} => true,
-        Command::SendFiles {targets,..} | Command::SendClipboard {targets} => !matches!(targets, crate::outbox::Targets::Captured(_)),
+        Command::SendFiles {targets,..} | Command::SendClipboard {targets,..} => !matches!(targets, crate::outbox::Targets::Captured(_)),
         _ => false,
     };
     let result: Result<serde_json::Value> = async {
@@ -430,7 +508,7 @@ async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
             else if action=="open-test" {core.ui_test_open().await?;serde_json::Value::Null}
             else {crate::ui::child_bridge::begin(crate::ui::child_bridge::Request::Test(action),None)?.await?;serde_json::Value::Null}
         },
-        #[cfg(any(target_os = "macos", windows))]
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         Command::PresentPicker {paths,targets,clipboard,targeted} => {
             anyhow::ensure!(paths.as_ref().is_none_or(|paths|!clipboard && !paths.is_empty() && paths.len()<=128),"choose 1 to 128 files");
             core.present_send(crate::ui::window::SendRequest {id:crate::random_hex(16),paths,targets,clipboard,targeted,error:None})?
@@ -441,14 +519,45 @@ async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
         Command::DismissTransfer{operation,artifact}=>{core.dismiss_transfer_artifact(operation,artifact).await?;serde_json::Value::Null},
         Command::CancelTransfer{operation,artifact,device}=>{core.cancel_transfer_artifact(operation,artifact,device).await?;serde_json::Value::Null},
         Command::RetryTransfer{operation,artifact,device}=>{core.retry_transfer_artifact(operation,artifact,device).await?;serde_json::Value::Null},
+        Command::Ring {device,connection,action}=>{core.ring_phone(device,connection,action)?;serde_json::Value::Null},
+        Command::ShowClipboardHistory=>{core.request_history_window();serde_json::Value::Null},
+        Command::CopyClipboardHistory{id}=>{core.copy_clipboard_history(id).await?;serde_json::Value::Null},
+        Command::DeleteClipboardHistory{id}=>{core.delete_clipboard_history(Some(id)).await?;serde_json::Value::Null},
+        Command::DisableEmptyClipboardHistory=>serde_json::json!(core.disable_empty_clipboard_history().await?),
+        Command::ClipboardHistorySearch{ids}=>{ensure!(ids.len()<=75,"too many history items");serde_json::Value::Array(history_search(&core.ui_snapshot(), &ids))},
+        Command::PinClipboardHistory{id,pinned}=>{core.pin_clipboard_history(id,pinned).await?;serde_json::Value::Null},
+        Command::ClearClipboardHistory=>{core.delete_clipboard_history(None).await?;serde_json::Value::Null},
         Command::SetSetting{key,value}=>{core.set_setting(key,value).await?;serde_json::Value::Null},
         Command::Rename{name}=>{core.rename(name).await?;serde_json::Value::Null},
-        Command::SendClipboard{targets:crate::outbox::Targets::All(_)} if ask=>core.present_send(crate::ui::window::SendRequest {
+        Command::SendClipboard{targets:crate::outbox::Targets::All(_),..} if ask=>core.present_send(crate::ui::window::SendRequest {
             id:crate::random_hex(16),paths:None,targets:crate::ui::captured_authorities(&core.ui_snapshot()),clipboard:true,targeted:false,error:None,
         })?,
-        Command::SendClipboard{targets}=>serde_json::json!({"transfer_id":core.share_clipboard(targets).await?}),
+        Command::SendClipboard{targets,notify_too_large}=>{
+            let result = core.share_clipboard(targets).await;
+            if notify_too_large && result.as_ref().is_err_and(|error| error.is::<crate::actions::ImageTooLarge>()) {
+                let _ = core.notify_clipboard_too_large().await;
+            }
+            serde_json::json!({"transfer_id":result?})
+        },
         Command::Join { uri } => core.join(&uri).await?,
         Command::JoinConfirm { attempt } => core.confirm_join(&attempt).await?,
+        Command::JoinConfirmScoped { attempt, enabled } => core.confirm_join_scoped(&attempt,enabled).await?,
+        Command::PairingScope { enabled } => {core.set_pairing_scope(enabled).await?;serde_json::Value::Null},
+        Command::SetupStatus => core.setup_status().await?,
+        Command::LinkExistingDevice {device,binding_generation,expected_scope} => {
+            ensure!(binding_generation.is_some()==expected_scope.is_some(),"incomplete setup link expectation");
+            let linked=core.link_existing_device(device,binding_generation.zip(expected_scope)).await?;
+            if binding_generation.is_some() {serde_json::json!(linked)} else {serde_json::Value::Null}
+        },
+        Command::SetupDecisions { requests, allow } => {
+            ensure!(requests.len() <= 16, "too many setup decisions");
+            crate::ui::window_setup::decide_all(&core, &requests, allow).await?;
+            serde_json::Value::Null
+        },
+        Command::ReadmissionDecision { key, allow } => {core.decide_readmission(key,allow).await?;serde_json::Value::Null},
+        Command::SetupDecision {device,setup_generation,binding_generation,allow} => {core.decide_setup(device,setup_generation,binding_generation,allow).await?;serde_json::Value::Null},
+        Command::RemoveFromSetup {device,setup_generation,binding_generation,fingerprint} => {core.remove_setup_device_confirmed(device,setup_generation,binding_generation,fingerprint).await?;serde_json::Value::Null},
+        Command::DismissSetupNotice {device,binding_generation} => {core.dismiss_setup_notice(device,binding_generation).await?;serde_json::Value::Null},
         Command::JoinStatus { attempt } => core.join_status(&attempt)?,
         Command::JoinCancel { attempt } => { core.cancel_join(&attempt).await?; serde_json::Value::Null },
         Command::Pair => { let uri = core.start_pairing().await?; serde_json::json!({"uri":uri.build()?,"expires_at":uri.expires_at,"qr_data":uri.build()?}) },
@@ -457,6 +566,11 @@ async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
         Command::ClosePairingIf { token } => { core.close_pairing_if(token).await; serde_json::Value::Null },
         Command::ClosePairing => { core.close_pairing().await; serde_json::Value::Null },
         Command::Unpair {device} => { core.unpair_device(device).await?; serde_json::Value::Null },
+        Command::ReplacementDecision {intent,replace,implied_old} => { core.decide_replacement(intent,replace,implied_old).await?; serde_json::Value::Null },
+        #[cfg(target_os = "linux")]
+        Command::OpenFolder => { crate::ui::runtime::open_folder(&core.config().save_path).await?; serde_json::Value::Null },
+        #[cfg(windows)]
+        Command::OpenFolder => { crate::actions::open_folder(&core.config().save_path).await?; serde_json::Value::Null },
         Command::SaveFolder {folder} => { core.change_save_folder(folder).await?; serde_json::Value::Null },
         Command::Config {config} => { core.update_config(config).await?; serde_json::Value::Null },
         Command::Clipboard {device,text} => serde_json::to_value(core.send_clipboard(device,text).await?)?,
@@ -465,8 +579,8 @@ async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
         Command::DiscardClipboard {device} => { core.discard_clipboard(device).await?; serde_json::Value::Null },
         #[cfg(windows)]
         Command::WindowClosed { request } => { core.window_closed(request); serde_json::Value::Null },
-        Command::WindowFocus { request, focused } => { core.set_window_focus(request, focused); serde_json::Value::Null },
-        Command::UiStatus => { let (revision, invitation) = core.pairing_status(); let snapshot = core.ui_snapshot(); let (window_request, activation_token) = core.window_request_with_activation(); serde_json::json!({"device":snapshot.device, "snapshot":snapshot, "config": core.config(), "window_request":window_request,"add_device":core.window_add_device(window_request),"activation_token":activation_token,"invitation_revision":revision,"invitation":invitation,"pending_send":core.pending_send()}) },
+        Command::WindowFocus { request, focused, visible } => { core.set_window_visible(request, visible); core.set_window_focus(request, focused); serde_json::Value::Null },
+        Command::UiStatus => { let (revision, invitation) = core.pairing_status(); let snapshot = core.ui_snapshot(); let (window_request, activation_token) = core.window_request_with_activation(); serde_json::json!({"device":snapshot.device, "snapshot":snapshot, "config": core.config(), "window_request":window_request,"history_page":core.window_history(window_request),"add_device":core.window_add_device(window_request),"remove_device":core.window_remove_device(window_request),"self_id":core.identity.device_id,"activation_token":activation_token,"invitation_revision":revision,"invitation":invitation,"pending_send":core.pending_send(),"setup":core.setup_status().await?}) },
         Command::AddDevice => { core.request_add_device(); serde_json::Value::Null },
         Command::ShowWindow { choose_folder } => { core.request_window(choose_folder); serde_json::Value::Null },
         Command::Status => {
@@ -511,6 +625,23 @@ async fn handle(core: Arc<Core>, stream: ServerStream) -> Result<()> {
     Ok(())
 
         }).await
+}
+// Keep each history projection below the page limit even for a 1 MiB text
+// item whose JSON escaping expands it. The window joins these before filtering.
+fn history_search(snapshot: &crate::ui::Snapshot, ids: &[String]) -> Vec<serde_json::Value> {
+    let mut chunks = Vec::new();
+    for item in snapshot
+        .clipboard_history
+        .iter()
+        .filter(|i| ids.contains(&i.id))
+    {
+        let mut chars = item.search.chars().peekable();
+        while chars.peek().is_some() {
+            let text: String = chars.by_ref().take(16_384).collect();
+            chunks.push(serde_json::json!({"id":item.id,"text":text}));
+        }
+    }
+    chunks
 }
 /// Split array projections into <= 1 MiB JSON pages, leaving 1 MiB of
 /// headroom below the reader's hard limit. This covers both status forms and
@@ -633,6 +764,7 @@ async fn request_connected(
         if matches!(
             command,
             Command::ShowWindow { .. }
+                | Command::OpenFolder
                 | Command::PresentFiles { .. }
                 | Command::PresentPicker { .. }
                 | Command::PresentSendError { .. }
@@ -723,7 +855,7 @@ fn parse_send_command(args: &[String], validate_files: bool) -> Result<Command> 
             "unknown send option; use -- before a filename starting with -"
         );
         let path = std::path::absolute(arg)?;
-        if validate_files {
+        if validate_files && crate::storage::Folder::read(&path).is_err() {
             let file = crate::storage::open_regular_file(&path)?;
             ensure!(
                 file.metadata()?.len() <= crate::outbox::PEER_BYTES.min(pneu_proto::MAX_FILE_SIZE),
@@ -734,7 +866,7 @@ fn parse_send_command(args: &[String], validate_files: bool) -> Result<Command> 
     }
     ensure!(
         !paths.is_empty() && paths.len() <= 128,
-        "send needs 1 to 128 regular files"
+        "send needs 1 to 128 files or folders"
     );
     Ok(Command::SendFiles {
         paths,
@@ -749,6 +881,69 @@ fn parse_send_command(args: &[String], validate_files: bool) -> Result<Command> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_search_keys_are_lossless_across_bounded_ipc_pages() -> Result<()> {
+        let search = format!("{}é", "\u{1}".repeat(crate::store::history::MAX_TEXT));
+        let item = crate::store::history::Item {
+            id: "a".repeat(32),
+            title: "Long item".into(),
+            search: search.clone(),
+            pinned: Some(1),
+            url: false,
+            image: false,
+            origin: None,
+            at: 1,
+            thumbnail: None,
+        };
+        let snapshot = crate::ui::Snapshot {
+            clipboard_history: vec![item],
+            ..Default::default()
+        };
+        let expected = serde_json::json!({"snapshot":snapshot,"history_search":history_search(&snapshot, &["a".repeat(32)])});
+        let pages = response_pages(Reply {
+            ok: true,
+            more: false,
+            value: expected.clone(),
+        })?;
+        assert!(pages.len() > 1);
+        let mut joined = serde_json::Value::Null;
+        for (n, page) in pages.into_iter().enumerate() {
+            assert!(serde_json::to_vec(&page)?.len() < RESPONSE_PAGE_BYTES);
+            if n == 0 {
+                joined = page.value;
+            } else {
+                append_page(&mut joined, page.value)?;
+            }
+        }
+        assert_eq!(joined, expected);
+        let restored: String = joined["history_search"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(restored, search);
+        Ok(())
+    }
+
+    #[test]
+    fn link_existing_device_accepts_legacy_and_fenced_requests() -> Result<()> {
+        let device = Id::from_bytes([1; 16]);
+        for extra in [
+            serde_json::json!({}),
+            serde_json::json!({"binding_generation":3,"expected_scope":"ask"}),
+        ] {
+            let mut request = serde_json::json!({"command":"link_existing_device","device":device});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let command: Command = serde_json::from_value(request.clone())?;
+            assert_eq!(serde_json::to_value(command)?, request);
+        }
+        Ok(())
+    }
 
     #[cfg(unix)]
     struct NoActions;
@@ -767,6 +962,170 @@ mod tests {
         async fn open(&self, _: &Path) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pin_unpin_delete_and_clear_history_round_trip_over_ipc() -> Result<()> {
+        let dir = crate::test_support::scratch()?;
+        let paths = crate::Paths {
+            data: dir.path().join("data"),
+            cache: dir.path().join("cache"),
+            config: dir.path().join("config/config.toml"),
+            socket: dir.path().join("ipc.sock"),
+        };
+        crate::config::private_dir(&paths.data)?;
+        let id = {
+            let store = crate::store::Store::open(&paths.data.join("state.sqlite3"))?;
+            store.history_configure(true, true).await?;
+            for text in ["Keep café", "Clear me"] {
+                store
+                    .history_record(
+                        crate::actions::ClipboardInput::Text(text.into()),
+                        None,
+                        store.history_capture().unwrap(),
+                    )
+                    .await?;
+            }
+            store.history_items()[1].id.clone()
+        };
+        let core = Core::new(
+            paths.clone(),
+            Config {
+                clipboard_history: true,
+                save_path: dir.path().join("saved"),
+                ..Config::default()
+            },
+            Arc::new(NoActions),
+        )
+        .await?;
+        let (listener, _owner) = bind(&paths.socket)?;
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(serve(core.clone(), listener, rx));
+        request(
+            &paths.socket,
+            Command::PinClipboardHistory {
+                id: id.clone(),
+                pinned: true,
+            },
+        )
+        .await?;
+        assert!(core.ui_snapshot().clipboard_history[0].pinned.is_some());
+        let search = request(
+            &paths.socket,
+            Command::ClipboardHistorySearch {
+                ids: vec![id.clone()],
+            },
+        )
+        .await?;
+        assert!(
+            search
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["text"] == "keep cafe")
+        );
+        request(&paths.socket, Command::ClearClipboardHistory).await?;
+        assert_eq!(core.ui_snapshot().clipboard_history.len(), 1);
+        request(
+            &paths.socket,
+            Command::PinClipboardHistory {
+                id: id.clone(),
+                pinned: false,
+            },
+        )
+        .await?;
+        assert_eq!(core.ui_snapshot().clipboard_history[0].pinned, None);
+        request(
+            &paths.socket,
+            Command::PinClipboardHistory {
+                id: id.clone(),
+                pinned: true,
+            },
+        )
+        .await?;
+        request(&paths.socket, Command::DeleteClipboardHistory { id }).await?;
+        assert!(core.ui_snapshot().clipboard_history.is_empty());
+        let _ = stop.send(true);
+        tokio::time::timeout(Duration::from_secs(2), server).await???;
+        core.shutdown_actions().await?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn open_folder_ipc_creates_missing_folder_and_launches_private_xdg_open() -> Result<()> {
+        let Some(root) = std::env::var_os("PNEU_OPEN_FOLDER_TEST_ROOT") else {
+            let dir = crate::test_support::scratch()?;
+            let bin = dir.path().join("bin");
+            std::fs::create_dir(&bin)?;
+            let opener = bin.join("xdg-open");
+            std::fs::write(
+                &opener,
+                "#!/bin/sh\ntest -d \"$1\" || exit 3\nprintf '%s\\n' \"$1\" >> \"$PNEU_OPEN_FOLDER_TEST_ROOT/calls\"\nif [ -f \"$PNEU_OPEN_FOLDER_TEST_ROOT/fail\" ]; then exit 1; fi\n",
+            )?;
+            std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o700))?;
+            let status = tokio::time::timeout(Duration::from_secs(30),
+                tokio::process::Command::new(std::env::current_exe()?)
+                    .args(["--exact", "ipc::tests::open_folder_ipc_creates_missing_folder_and_launches_private_xdg_open", "--nocapture"])
+                    .env("PNEU_OPEN_FOLDER_TEST_ROOT", dir.path())
+                    .env("PATH", bin)
+                    .env("DBUS_SESSION_BUS_ADDRESS", format!("unix:path={}/unavailable-bus", dir.path().display()))
+                    .env_remove("DISPLAY").env_remove("WAYLAND_DISPLAY")
+                    .kill_on_drop(true).status()
+            ).await??;
+            anyhow::ensure!(status.success(), "private open-folder IPC test failed");
+            return Ok(());
+        };
+        let root = std::path::PathBuf::from(root);
+        let folder = root.join("Received files 日本語/missing");
+        let paths = crate::Paths {
+            data: root.join("data"),
+            cache: root.join("cache"),
+            config: root.join("config/config.toml"),
+            socket: root.join("ipc.sock"),
+        };
+        let core = Core::new(
+            paths.clone(),
+            Config {
+                save_path: folder.clone(),
+                ..Config::default()
+            },
+            Arc::new(NoActions),
+        )
+        .await?;
+        assert!(!folder.exists());
+        let (listener, _owner) = bind(&paths.socket)?;
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(serve(core.clone(), listener, rx));
+        request(&paths.socket, Command::OpenFolder).await?;
+        assert!(folder.is_dir());
+        let expected = format!("{}\n", folder.display());
+        assert_eq!(std::fs::read_to_string(root.join("calls"))?, expected);
+        std::fs::write(root.join("fail"), b"")?;
+        let error = request(&paths.socket, Command::OpenFolder)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("folder opener exited unsuccessfully")
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("calls"))?,
+            expected.repeat(2)
+        );
+        std::fs::remove_dir(&folder)?;
+        std::fs::write(&folder, b"not a directory")?;
+        assert!(request(&paths.socket, Command::OpenFolder).await.is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("calls"))?,
+            expected.repeat(2)
+        );
+        let _ = stop.send(true);
+        tokio::time::timeout(Duration::from_secs(2), server).await???;
+        core.shutdown_actions().await?;
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -840,6 +1199,8 @@ mod tests {
             let captured = || Targets::Captured(Vec::new());
             for (command, needs_ui) in [
                 (Command::AddDevice, true),
+                #[cfg(any(target_os = "linux", windows))]
+                (Command::OpenFolder, true),
                 (
                     Command::ShowWindow {
                         choose_folder: false,
@@ -860,6 +1221,16 @@ mod tests {
                     },
                     true,
                 ),
+                #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+                (
+                    Command::PresentPicker {
+                        paths: Some(vec!["/private/scratch-file".into()]),
+                        targets: Vec::new(),
+                        clipboard: false,
+                        targeted: true,
+                    },
+                    true,
+                ),
                 (
                     Command::SendFiles {
                         paths: vec![],
@@ -868,7 +1239,13 @@ mod tests {
                     },
                     choose_devices,
                 ),
-                (Command::SendClipboard { targets: all() }, choose_devices),
+                (
+                    Command::SendClipboard {
+                        targets: all(),
+                        notify_too_large: false,
+                    },
+                    choose_devices,
+                ),
                 (
                     Command::SendFiles {
                         paths: vec![],
@@ -877,7 +1254,13 @@ mod tests {
                     },
                     false,
                 ),
-                (Command::SendClipboard { targets: devices() }, false),
+                (
+                    Command::SendClipboard {
+                        targets: devices(),
+                        notify_too_large: false,
+                    },
+                    false,
+                ),
                 (
                     Command::SendFiles {
                         paths: vec![],
@@ -888,6 +1271,7 @@ mod tests {
                 ),
                 (
                     Command::SendClipboard {
+                        notify_too_large: false,
                         targets: captured(),
                     },
                     false,
@@ -902,6 +1286,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn readmission_decisions_roundtrip_exact_removal_authority() -> Result<()> {
+        let key = crate::store::members::ReadmissionKey {
+            device: Id::from_bytes([3; 16]),
+            fingerprint: Hash::new("c".repeat(64))?,
+            removal_hlc: u64::MAX,
+            removal_writer: Id::from_bytes([2; 16]),
+            setup_generation: 7,
+        };
+        for allow in [false, true] {
+            let value =
+                serde_json::json!({"command":"readmission_decision","key":key,"allow":allow});
+            let command: Command = serde_json::from_value(value.clone())?;
+            assert_eq!(serde_json::to_value(command)?, value);
+        }
+        Ok(())
     }
 
     #[test]

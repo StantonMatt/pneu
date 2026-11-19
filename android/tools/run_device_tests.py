@@ -221,6 +221,8 @@ def authenticated(rows, digest):
 
 
 LOCAL_TESTS = (
+    'ClipboardHistoryDeviceTest', 'ClipboardHistoryIntegrationDeviceTest', 'ClipboardHistoryMigrationDeviceTest',
+    'ClipboardHistoryScreensDeviceTest',
     'Sweep4RegressionDeviceTest',
     'ReceiveStorageDeviceTest', 'DeviceScreensDeviceTest', 'Sweep3RegressionDeviceTest', 'OperationFeedbackDeviceTest',
     'AdmissionFenceDeviceTest', 'MergeRegressionDeviceTest',
@@ -235,6 +237,8 @@ LOCAL_TESTS = (
     'FourteenthReviewDeviceTest', 'FifteenthReviewDeviceTest',
     'SixteenthReviewDeviceTest', 'SixteenthRecentDeviceTest', 'EighteenthReviewUiDeviceTest',
     'TwentiethReviewDeviceTest', 'TwentyFirstPolicyDeviceTest', 'TwentySecondReviewDeviceTest',
+    'OnboardingDeviceTest',
+    'SetupFlowDeviceTest', 'SetupScreensDeviceTest',
 )
 
 
@@ -246,6 +250,8 @@ def local_case(test):
         screenshots('files/fifth-review-screens', 'screens')
         if test == 'V2ScreensDeviceTest':
             screenshots('files/v2-screens', 'screens')
+        if test in ('SetupFlowDeviceTest', 'SetupScreensDeviceTest'):
+            screenshots('files/setup-screens', 'setup-screens')
         if test == 'DeviceScreensDeviceTest':
             screenshots('files/device-screens', 'device-screens')
         if test == 'SixteenthRecentDeviceTest':
@@ -826,6 +832,10 @@ def cleanup():
 
 
 SUITES = {
+    'nov2': [DeviceCase(test, test, local_case) for test in (
+        'ReinstallReplacementDeviceTest', 'FolderSendDeviceTest', 'ResumeTransferDeviceTest',
+        'PhoneComputerDeviceTest', 'NotificationMirrorDeviceTest',
+        'FolderScreensDeviceTest', 'NotificationScreensDeviceTest')],
     'local': [DeviceCase(test, test, local_case) for test in LOCAL_TESTS] +
              [DeviceCase('permission-denials', 'FourthReviewUiDeviceTest', permission_denials),
               DeviceCase('pairing-preview-restore', 'Sweep3PairingRestoreDeviceTest', permission_denials)],
@@ -986,6 +996,7 @@ def main():
     parser.add_argument('suites', nargs='*', help='Suite names (default: all): ' + ', '.join(SUITES))
     parser.add_argument('--scratch', type=Path, default=Path.home() / '.cache/agent-scratch/pneu' / ('device-' + time.strftime('%Y%m%d-%H%M%S')))
     parser.add_argument('--serial', default=os.environ.get('ANDROID_SERIAL', 'emulator-5554'))
+    parser.add_argument('--avd', default='pneu-test', help='Exact disposable AVD name')
     parser.add_argument('--cases', help='Comma-separated existing case names to rerun')
     parser.add_argument('--daemon', type=Path, default=Path.home() / '.cache/agent-scratch/pneu/android10-target/debug/pneud')
     args = parser.parse_args()
@@ -1012,8 +1023,8 @@ def main():
     adb = [str(Path(os.environ.get('ANDROID_HOME', str(Path.home() / 'Android/Sdk'))) / 'platform-tools/adb'), '-s', args.serial]
     with emulator_commands(args.serial):
         avd = run([*adb, 'emu', 'avd', 'name'], capture_output=True, text=True).stdout.splitlines()
-        if not avd or avd[0].strip() != 'pneu-test':
-            parser.error('Only the pneu-test AVD is permitted')
+        if not avd or avd[0].strip() != args.avd:
+            parser.error(f'Expected disposable AVD {args.avd}')
         base_scratch = args.scratch.resolve()
         base_scratch.mkdir(parents=True, exist_ok=True)
         try:

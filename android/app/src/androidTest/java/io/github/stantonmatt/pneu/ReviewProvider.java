@@ -32,6 +32,17 @@ public class ReviewProvider extends ContentProvider {
     @Override public AssetFileDescriptor openAssetFile(Uri uri,String mode) throws FileNotFoundException {
         opens.incrementAndGet();String kind=uri.getLastPathSegment();if("slow-open".equals(kind))block();
         try {
+            if("unknown-oversized-image".equals(kind)) {
+                ParcelFileDescriptor[] pipe=ParcelFileDescriptor.createReliablePipe();
+                new Thread(()->{
+                    try(OutputStream output=new ParcelFileDescriptor.AutoCloseOutputStream(pipe[1])) {
+                        byte[] bytes=new byte[65536];
+                        // Intentionally unknown and larger than the clipboard limit.
+                        for(int n=0;n<400;n++)output.write(bytes);
+                    } catch(IOException expected) { /* Reader aborts at its limit. */ }
+                },"Pneu-fixture-oversized").start();
+                return new AssetFileDescriptor(pipe[0],0,AssetFileDescriptor.UNKNOWN_LENGTH);
+            }
             if("proxy-stall".equals(kind)) {
                 HandlerThread worker=new HandlerThread("Pneu-fixture-proxy");worker.start();
                 ParcelFileDescriptor proxy=getContext().getSystemService(android.os.storage.StorageManager.class).openProxyFileDescriptor(

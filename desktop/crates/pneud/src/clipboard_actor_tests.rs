@@ -30,6 +30,9 @@ fn offer(token: u64, peers: &[u8]) -> ClipboardOffer {
 fn remote(token: u64, source: u8, hlc: u64, value: &str) -> Operation {
     let content = content(value);
     Operation {
+        sensitive: false,
+        history: None,
+        history_id: None,
         token,
         id: id(token as u8),
         source: id(source),
@@ -83,12 +86,16 @@ impl Compositor {
     fn effects(&mut self, effects: Vec<Effect>) {
         for effect in effects {
             match effect {
+                Effect::ImageTooLarge { fingerprint, .. } => {
+                    self.state.image_notice_posted(fingerprint)
+                }
+                Effect::RecordHistory { .. } => {}
                 Effect::PairingLink(_) => {}
                 Effect::LoadShare { token, payload } => self.pending.push_back(Event::ShareReady {
                     token,
                     content: match payload.as_ref() {
-                        Payload::Content(content) => Some(content.clone()),
-                        _ => None,
+                        Payload::Content(content) => Ok(content.clone()),
+                        _ => Err(Failure::Clipboard),
                     },
                 }),
                 Effect::Clock { token, floor } => {
@@ -237,6 +244,7 @@ impl Compositor {
     fn copy(&mut self, token: u64, value: Option<Content>, recipients: &[u8]) {
         self.os = value.clone();
         self.event(Event::Observe {
+            history: None,
             token,
             id: id(token as u8),
             offer: Some(offer(token, recipients)),
@@ -325,6 +333,7 @@ fn delayed_local_read_before_marker_is_restored_after_marker() {
     }
     model.os = Some(content("Y"));
     model.event(Event::Observe {
+        history: None,
         token: 20,
         id: id(20),
         offer: Some(offer(20, &[2, 3])),
@@ -407,6 +416,7 @@ fn explicit_mesh_share_stops_unresolved_install_before_accepting_new_origination
 fn recipient_sets_only_narrow_across_settings_unpair_and_late_connections() {
     let mut model = Compositor::default();
     model.event(Event::Observe {
+        history: None,
         token: 20,
         id: id(20),
         offer: Some(offer(20, &[2, 3])),
@@ -540,6 +550,7 @@ fn filtered_and_targetless_local_observations_cancel_slow_preparation_and_fence_
         model.event(Event::Submit(remote(10, 2, 100, "remote")));
         model.os = readable.then(|| content("local"));
         model.event(Event::Observe {
+            history: None,
             token: 20,
             id: id(20),
             offer: None,
@@ -613,6 +624,7 @@ fn identical_incoming_cannot_skip_an_unfinished_local_restoration() {
         model.tick();
     }
     model.event(Event::Observe {
+        history: None,
         token: 20,
         id: id(20),
         offer: Some(offer(20, &[2, 3])),
@@ -657,6 +669,7 @@ fn a_manager_echo_cannot_cancel_a_local_read_before_or_after_the_marker() {
         }
         model.os = Some(content("human"));
         model.event(Event::Observe {
+            history: None,
             token: 20,
             id: id(20),
             offer: Some(offer(20, &[2, 3])),
@@ -668,6 +681,7 @@ fn a_manager_echo_cannot_cancel_a_local_read_before_or_after_the_marker() {
         }
         model.os = Some(content("received"));
         model.event(Event::Observe {
+            history: None,
             token: 30,
             id: id(30),
             offer: Some(offer(30, &[2, 3])),
@@ -706,6 +720,7 @@ fn a_canceled_helper_marker_and_its_clear_do_not_steal_a_local_copy() {
     model.copy(20, Some(content("human")), &[2, 3]);
     model.event(Event::Installed(1)); // ordered watcher evidence queued before reaping
     model.event(Event::Observe {
+        history: None,
         token: 30,
         id: id(30),
         offer: Some(offer(30, &[2, 3])),
@@ -735,6 +750,7 @@ fn unshareable_representation_hashes_suppress_received_original_and_converted_ec
     let before = model.state.register.clone();
     for (token, hash) in [(20, original), (30, converted)] {
         model.event(Event::Observe {
+            history: None,
             token,
             id: id(token as u8),
             offer: None,
@@ -762,6 +778,7 @@ fn new_offer_revokes_unflushed_delivery_and_a_late_persist_cannot_republish_it()
     }
     let pending = model.state.persistence.keys().copied().collect::<Vec<_>>();
     model.event(Event::Observe {
+        history: None,
         token: 20,
         id: id(20),
         offer: Some(offer(20, &[2, 3])),
@@ -1069,6 +1086,7 @@ fn randomized_interleavings(mut seed: u64, seconds: u64, case_limit: u64) {
                     let value = format!("human-{token}");
                     model.os = Some(content(&value));
                     let observe = Event::Observe {
+                        history: None,
                         token,
                         id: id(token as u8),
                         offer: Some(offer(token, &[2, 3])),
@@ -1107,6 +1125,7 @@ fn randomized_interleavings(mut seed: u64, seconds: u64, case_limit: u64) {
                     token += 1;
                     model.os = Some(value.clone());
                     let observe = Event::Observe {
+                        history: None,
                         token,
                         id: id(token as u8),
                         offer: Some(offer(token, &[2, 3])),
@@ -1142,7 +1161,7 @@ fn randomized_interleavings(mut seed: u64, seconds: u64, case_limit: u64) {
                 }
                 21 => Event::ShareReady {
                     token: 1_000_000 + token,
-                    content: Some(content("stale share")),
+                    content: Ok(content("stale share")),
                 },
                 7 => Event::Narrow(id(if seed & 128 == 0 { 2 } else { 3 })),
                 8 => Event::Policy {
@@ -1168,6 +1187,7 @@ fn randomized_interleavings(mut seed: u64, seconds: u64, case_limit: u64) {
                     let local = token;
                     model.os = Some(content(&format!("saturated-{local}")));
                     let observe = Event::Observe {
+                        history: None,
                         token: local,
                         id: id(local as u8),
                         offer: Some(offer(local, &[2, 3])),
@@ -1221,6 +1241,7 @@ fn randomized_interleavings(mut seed: u64, seconds: u64, case_limit: u64) {
                     token += 1;
                     model.os = Some(content(&format!("unread-{token}")));
                     Event::Observe {
+                        history: None,
                         token,
                         id: id(token as u8),
                         offer: Some(offer(token, &[2, 3])),
@@ -1349,6 +1370,7 @@ fn review_human_read_may_be_delayed_across_arbitrary_other_completions() {
         }
         model.os = Some(content("human"));
         model.event(Event::Observe {
+            history: None,
             token: 20,
             id: id(20),
             offer: Some(offer(20, &[2, 3])),
@@ -1390,6 +1412,7 @@ fn review_copy_after_stop_requested_but_before_marker_must_be_restored() {
         // Reaping clears the helper's now-current selection.
         model.os = None;
         model.event(Event::Observe {
+            history: None,
             token: 30,
             id: id(30),
             offer: Some(offer(30, &[3])),
@@ -1535,6 +1558,7 @@ fn local_observations_coalesce_persistence_and_leave_receipt_capacity() {
     let mut state = State::default();
     for token in 1..=256 {
         state.step(Event::Observe {
+            history: None,
             token,
             id: id(token as u8),
             offer: Some(offer(token, &[2])),
@@ -1710,6 +1734,7 @@ fn saturated_admitted_receipts_and_local_burst_share_the_pending_cap() {
     assert_eq!(state.persistence.len(), 61);
     for token in 100..=355 {
         state.step(Event::Observe {
+            history: None,
             token,
             id: id(token as u8),
             offer: Some(offer(token, &[2])),
@@ -1941,6 +1966,7 @@ fn restart_repairs_only_when_winner_payload_was_captured() {
         model.stopped.clear();
         model.os = Some(content("winner"));
         model.event(Event::Observe {
+            history: None,
             token: 30,
             id: id(30),
             offer: None,
@@ -2011,6 +2037,7 @@ fn local_clock_completes_with_all_claims_retained_during_read_or_debounce() {
             ..Default::default()
         };
         model.event(Event::Observe {
+            history: None,
             token: 1,
             id: id(1),
             offer: Some(offer(1, &[2])),
@@ -2147,6 +2174,7 @@ fn failed_clock_retry_is_retired_by_newer_local_cancellation_and_shutdown() {
 fn lost_reader_completion_has_a_terminal_timer_and_cannot_block_reception() {
     let mut model = Compositor::default();
     model.event(Event::Observe {
+        history: None,
         token: 10,
         id: id(10),
         offer: Some(offer(10, &[2])),
@@ -2191,6 +2219,7 @@ fn initial_selection_is_manual_only_across_modes_and_watcher_restarts() {
                     m.os = Some(value.clone());
                     // Every watcher generation starts without an automatic offer.
                     m.event(Event::Observe {
+                        history: None,
                         token,
                         id: id(token as u8),
                         offer: None,
@@ -2277,6 +2306,7 @@ fn initial_received_echo_restores_payload_without_advancing_or_repairing_registe
             m.event(Event::Mode(ClipboardMode::Automatic));
             m.os = Some(value.clone());
             m.event(Event::Observe {
+                history: None,
                 token: 30,
                 id: id(30),
                 offer: None,
@@ -2353,6 +2383,7 @@ fn initial_older_echo_can_recover_the_current_winner_payload_on_next_observation
     };
     m.os = Some(content("older"));
     m.event(Event::Observe {
+        history: None,
         token: 10,
         id: id(10),
         offer: None,
@@ -2429,6 +2460,7 @@ fn initial_mixed_echo_keeps_each_representations_received_source() {
     };
     m.os = Some(value.clone());
     m.event(Event::Observe {
+        history: None,
         token: 10,
         id: id(10),
         offer: None,
@@ -2471,6 +2503,7 @@ fn initial_read_timeout_recovers_on_next_watcher_snapshot_without_publication() 
     let mut m = Compositor::default();
     m.event(Event::Mode(ClipboardMode::Off));
     m.event(Event::Observe {
+        history: None,
         token: 10,
         id: id(10),
         offer: None,
@@ -2484,6 +2517,7 @@ fn initial_read_timeout_recovers_on_next_watcher_snapshot_without_publication() 
     assert!(m.published.is_empty());
     m.os = Some(content("recovered"));
     m.event(Event::Observe {
+        history: None,
         token: 20,
         id: id(20),
         offer: None,
@@ -2521,6 +2555,7 @@ fn clipboard_mode_matrix_preserves_ordering_and_received_provenance() {
         m.event(Event::Mode(mode));
         m.os = Some(content("human"));
         m.event(Event::Observe {
+            history: None,
             token: 1,
             id: id(1),
             offer: Some(offer(1, &[2, 3])),
@@ -2595,6 +2630,7 @@ fn changing_clipboard_mode_cannot_republish_pending_or_late_manual_content() {
     m.event(Event::Mode(ClipboardMode::Manual));
     m.os = Some(content("human"));
     m.event(Event::Observe {
+        history: None,
         token: 1,
         id: id(1),
         offer: Some(offer(1, &[2])),
@@ -2630,6 +2666,7 @@ fn pairing_link_hint_is_local_current_and_does_not_change_sharing() {
         let mut state = State::default();
         state.step(Event::Mode(mode));
         state.step(Event::Observe {
+            history: None,
             token: 1,
             id: id(1),
             offer: Some(offer(1, &[2])),
@@ -2655,6 +2692,7 @@ fn pairing_link_hint_is_local_current_and_does_not_change_sharing() {
         assert_eq!(local.content, Some(link));
         assert_eq!(local.offer.is_some(), mode == ClipboardMode::Automatic);
         let effects = state.step(Event::Observe {
+            history: None,
             token: 2,
             id: id(2),
             offer: None,
@@ -2717,7 +2755,7 @@ fn manual_queued_share_keeps_captured_identity_through_clock_and_incoming() {
     for token in [20, 21] {
         model.event(Event::ShareReady {
             token,
-            content: Some(content("human")),
+            content: Ok(content("human")),
         });
     }
     model.event(Event::Submit(remote(30, 2, model.clock + 10, "remote")));
@@ -2742,7 +2780,7 @@ fn manual_clocking_share_is_cancelled_by_new_physical_selection() {
     });
     model.event(Event::ShareReady {
         token: 20,
-        content: Some(content("first")),
+        content: Ok(content("first")),
     });
     model.copy(30, Some(content("second")), &[2]);
     model.settle();
@@ -2849,7 +2887,7 @@ fn manual_changed_image_bytes_are_rejected_before_clocking() {
     });
     model.event(Event::ShareReady {
         token: 20,
-        content: Some(Content::Image(vec![4, 5, 6])),
+        content: Ok(Content::Image(vec![4, 5, 6])),
     });
     model.settle();
     assert_eq!(model.state.register, register);
@@ -2863,6 +2901,7 @@ fn marker_read_observation_keeps_recipients_frozen_across_policy_expansion() {
     // The macOS watcher must capture this before its marker subprocess, exactly
     // as Wayland captures policy before reading an offered secret-hint marker.
     model.event(Event::Observe {
+        history: None,
         token: 20,
         id: id(20),
         offer: Some(offer(20, &[2])),
@@ -2893,6 +2932,7 @@ fn discarded_reader_then_manager_echo_releases_incoming_install_without_read_tim
     model.settle();
     for token in [20, 30] {
         model.event(Event::Observe {
+            history: None,
             token,
             id: id(token as u8),
             offer: Some(offer(token, &[2, 3])),
@@ -2926,12 +2966,15 @@ fn confirmed_marker_retires_provisional_observation_without_a_local_clock() {
     // including on restart. Initial marker reads carry no recipients.
     for initial in [false, true] {
         let mut model = Compositor::default();
-        model.event(Event::Submit(remote(10, 2, 100, "received")));
+        let mut operation = remote(10, 2, 100, "received");
+        operation.sensitive = true;
+        model.event(Event::Submit(operation));
         while !matches!(model.pending.front(), Some(Event::Installed(_))) {
             assert!(model.tick());
         }
         let ticket = model.state.installing.as_ref().unwrap().ticket;
         model.event(Event::Observe {
+            history: None,
             token: 20,
             id: id(20),
             offer: (!initial).then(|| offer(20, &[2, 3])),
@@ -2948,4 +2991,335 @@ fn confirmed_marker_retires_provisional_observation_without_a_local_clock() {
         assert!(model.published.is_empty());
         model.consistent();
     }
+}
+
+#[tokio::test]
+async fn history_capture_follows_echo_classification_and_only_records_once() -> anyhow::Result<()> {
+    let dir = crate::test_support::scratch()?;
+    let store = crate::store::Store::open(&dir.path().join("state.sqlite3"))?;
+    store.history_configure(true, true).await?;
+    let mut model = Compositor::default();
+    model.event(Event::Submit(remote(10, 2, 100, "received")));
+    model.settle();
+    for (token, text, expected) in [(20, "received", false), (30, "new human copy", true)] {
+        model.state.step(Event::Observe {
+            token,
+            id: id(token as u8),
+            offer: None,
+            origin: false,
+            clear: false,
+            history: store.history_capture(),
+        });
+        let effects = model.state.step(Event::Read {
+            token,
+            content: Some(content(text)),
+            fingerprints: vec![],
+            debounce: true,
+        });
+        assert_eq!(
+            effects.iter().any(|e| matches!(e,
+            Effect::RecordHistory { content: Content::Text(t), .. } if t == text)),
+            expected
+        );
+        assert!(
+            !model
+                .state
+                .step(Event::Debounce(token))
+                .iter()
+                .any(|e| matches!(e, Effect::RecordHistory { .. }))
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn history_reversed_read_completions_keep_copy_order_after_restart() -> anyhow::Result<()> {
+    let dir = crate::test_support::scratch()?;
+    let path = dir.path().join("state.sqlite3");
+    let store = crate::store::Store::open(&path)?;
+    store.history_configure(true, true).await?;
+    let mut model = Compositor::default();
+    model.event(Event::Submit(remote(10, 2, 100, "received")));
+    model.settle();
+    for token in [20, 30] {
+        model.state.step(Event::Observe {
+            token,
+            id: id(token as u8),
+            offer: None,
+            origin: false,
+            clear: false,
+            history: store.history_capture(),
+        });
+    }
+    // B finishes first; A finishes while B is still in its debounce window.
+    for (token, text) in [(30, "B"), (20, "A")] {
+        let effects = model.state.step(Event::Read {
+            token,
+            content: Some(content(text)),
+            fingerprints: vec![],
+            debounce: true,
+        });
+        let (content, capture) = effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::RecordHistory {
+                    content: Content::Text(text),
+                    capture,
+                } => Some((text, capture)),
+                _ => None,
+            })
+            .expect("history effect for each human copy");
+        store
+            .history_record(crate::actions::ClipboardInput::Text(content), None, capture)
+            .await?;
+    }
+    assert_eq!(
+        store
+            .history_items()
+            .iter()
+            .map(|item| item.title.as_str())
+            .collect::<Vec<_>>(),
+        ["B", "A"]
+    );
+    store.drain().await;
+    drop(store);
+    let store = crate::store::Store::open(&path)?;
+    store.history_configure(true, true).await?;
+    assert_eq!(
+        store
+            .history_items()
+            .iter()
+            .map(|item| item.title.as_str())
+            .collect::<Vec<_>>(),
+        ["B", "A"]
+    );
+    // The first copy after restart must also sort above the persisted sequence.
+    store
+        .history_record(
+            crate::actions::ClipboardInput::Text("C".into()),
+            None,
+            store.history_capture().unwrap(),
+        )
+        .await?;
+    assert_eq!(store.history_items()[0].title, "C");
+    Ok(())
+}
+
+fn oversized_read(
+    state: &mut State,
+    token: u64,
+    fingerprint: u8,
+    offer: Option<ClipboardOffer>,
+    origin: bool,
+) -> Vec<Effect> {
+    state.step(Event::Observe {
+        token,
+        id: id(token as u8),
+        offer,
+        origin,
+        clear: false,
+        history: None,
+    });
+    state.step(Event::ImageTooLarge {
+        token,
+        fingerprint: [fingerprint; 32],
+    });
+    state.step(Event::Read {
+        token,
+        content: None,
+        fingerprints: Vec::new(),
+        debounce: false,
+    })
+}
+#[test]
+fn oversized_notice_requires_automatic_image_recipient_and_deduplicates_last_image() {
+    for mode in [
+        ClipboardMode::Off,
+        ClipboardMode::Manual,
+        ClipboardMode::Automatic,
+    ] {
+        for recipients in [false, true] {
+            for images in [false, true] {
+                for origin in [false, true] {
+                    let mut state = State::default();
+                    state.step(Event::Mode(mode));
+                    let mut target = offer(10, if recipients { &[2] } else { &[] });
+                    for r in &mut target.recipients {
+                        r.image = images;
+                    }
+                    let effects = oversized_read(&mut state, 10, 1, Some(target), origin);
+                    assert_eq!(
+                        effects
+                            .iter()
+                            .any(|e| matches!(e, Effect::ImageTooLarge { .. })),
+                        mode == ClipboardMode::Automatic && recipients && images && !origin
+                    );
+                }
+            }
+        }
+    }
+    let mut state = State::default();
+    state.step(Event::Mode(ClipboardMode::Automatic));
+    for (token, fingerprint, expected) in
+        [(10, 1, true), (20, 1, false), (30, 2, true), (40, 2, false)]
+    {
+        let effects = oversized_read(
+            &mut state,
+            token,
+            fingerprint,
+            Some(offer(token, &[2])),
+            false,
+        );
+        assert_eq!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::ImageTooLarge { .. })),
+            expected
+        );
+        if expected {
+            state.image_notice_posted([fingerprint; 32]);
+        }
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::RecordHistory { .. }))
+        );
+    }
+    // A recipient revoked at delivery does not consume the deduplication key.
+    let mut state = State::default();
+    state.step(Event::Mode(ClipboardMode::Automatic));
+    for token in [10, 20] {
+        assert!(
+            oversized_read(&mut state, token, 1, Some(offer(token, &[2])), false)
+                .iter()
+                .any(|e| matches!(e, Effect::ImageTooLarge { .. }))
+        );
+    }
+    // A history-only observation never emits or consumes the once-per-image notice.
+    let mut state = State::default();
+    state.step(Event::Mode(ClipboardMode::Automatic));
+    assert!(
+        !oversized_read(&mut state, 10, 1, None, false)
+            .iter()
+            .any(|e| matches!(e, Effect::ImageTooLarge { .. }))
+    );
+    assert!(
+        oversized_read(&mut state, 20, 1, Some(offer(20, &[2])), false)
+            .iter()
+            .any(|e| matches!(e, Effect::ImageTooLarge { .. }))
+    );
+}
+#[test]
+fn manual_oversized_share_reports_too_large_each_attempt_and_new_copy_clears_it() {
+    let mut state = State::default();
+    state.step(Event::Mode(ClipboardMode::Manual));
+    assert!(
+        !oversized_read(&mut state, 10, 1, Some(offer(10, &[2])), false)
+            .iter()
+            .any(|e| matches!(e, Effect::ImageTooLarge { .. }))
+    );
+    for token in [20, 30] {
+        assert!(
+            state
+                .step(Event::Share {
+                    token,
+                    id: id(token as u8),
+                    source: id(1),
+                    offer: offer(token, &[2])
+                })
+                .iter()
+                .any(|e| matches!(
+                    e,
+                    Effect::Reply {
+                        failure: Some(Failure::TooLarge),
+                        ..
+                    }
+                ))
+        );
+    }
+    state.step(Event::Observe {
+        token: 40,
+        id: id(40),
+        offer: None,
+        origin: false,
+        clear: true,
+        history: None,
+    });
+    assert!(!state.os_image_too_large);
+}
+
+#[test]
+fn manual_mixed_oversized_image_offer_shares_eligible_text() {
+    for (text, image) in [(true, false), (true, true), (false, true)] {
+        let mut model = Compositor::default();
+        model.event(Event::Mode(ClipboardMode::Manual));
+        model.event(Event::Observe {
+            token: 10,
+            id: id(10),
+            offer: None,
+            origin: false,
+            clear: false,
+            history: None,
+        });
+        model.event(Event::ImageTooLarge {
+            token: 10,
+            fingerprint: [1; 32],
+        });
+        // The adapter retains valid text while omitting the oversized image.
+        model.event(Event::Read {
+            token: 10,
+            content: Some(content("valid text")),
+            fingerprints: Vec::new(),
+            debounce: false,
+        });
+        model.settle();
+        let mut target = offer(20, &[2]);
+        target.recipients[0].text = text;
+        target.recipients[0].image = image;
+        model.event(Event::Share {
+            token: 20,
+            id: id(20),
+            source: id(1),
+            offer: target,
+        });
+        model.settle();
+        if text {
+            assert_eq!(model.replies[&20].1, None, "include images: {image}");
+            assert_eq!(model.published.len(), 1);
+            assert_eq!(model.published[0].content, Some(content("valid text")));
+            let recipients = &model.published[0].offer.as_ref().unwrap().recipients;
+            assert_eq!(recipients.len(), 1);
+            assert!(recipients[0].text);
+            assert!(!recipients[0].image);
+        } else {
+            assert_eq!(model.replies[&20].1, Some(Failure::TooLarge));
+            assert!(model.published.is_empty());
+        }
+    }
+}
+
+#[test]
+fn manual_share_load_failure_keeps_too_large_reason() {
+    let mut model = Compositor::default();
+    model.copy(10, Some(content("human")), &[2]);
+    model.settle();
+    model.event(Event::Mode(ClipboardMode::Manual));
+    model.state.step(Event::Share {
+        token: 20,
+        id: id(20),
+        source: id(1),
+        offer: offer(20, &[2]),
+    });
+    let effects = model.state.step(Event::ShareReady {
+        token: 20,
+        content: Err(Failure::TooLarge),
+    });
+    assert!(effects.iter().any(|e| matches!(
+        e,
+        Effect::Reply {
+            token: 20,
+            failure: Some(Failure::TooLarge),
+            ..
+        }
+    )));
 }

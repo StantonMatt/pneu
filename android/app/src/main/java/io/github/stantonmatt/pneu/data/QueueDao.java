@@ -3,8 +3,15 @@ import androidx.room.*;
 import java.util.List;
 import kotlinx.coroutines.flow.Flow;
 @Dao public interface QueueDao {
+    @Insert(onConflict=OnConflictStrategy.REPLACE) void insertPendingCancel(PendingCancel row);
+    @Query("SELECT * FROM pending_cancels WHERE peerId=:peer") List<PendingCancel> pendingCancels(String peer);
+    @Query("DELETE FROM pending_cancels WHERE peerId=:peer AND transferId=:id") void deletePendingCancel(String peer,String id);
+    @Query("DELETE FROM pending_cancels WHERE peerId=:peer") void deletePeerCancels(String peer);
+    @Query("DELETE FROM pending_cancels") void clearPendingCancels();
     @Insert(onConflict=OnConflictStrategy.ABORT) void insertReceivedFile(ReceivedFile row);
     @Update void updateReceivedFile(ReceivedFile row);
+    @Query("UPDATE received_files SET checkpoint=:offset,checkpointHash=:hash,progressWall=:progress,wallHighWater=:highWater WHERE peerId=:peer AND transferId=:id AND generation=:generation AND stagePath=:path AND stageIdentity=:identity AND state='writing' AND checkpoint<=:offset")
+    int checkpointReceivedFile(String peer,String id,long generation,String path,String identity,long offset,String hash,long progress,long highWater);
     @Query("SELECT * FROM received_files WHERE peerId=:peer AND transferId=:id") ReceivedFile receivedFile(String peer,String id);
     @Query("SELECT * FROM received_files WHERE catalogVersion=:version AND uri LIKE 'content://media/external_primary/%/' || :mediaId AND state='complete' LIMIT 1") ReceivedFile receivedFileByMediaId(String version,long mediaId);
     @Query("SELECT * FROM received_files WHERE state!='complete'") List<ReceivedFile> unfinishedReceivedFiles();
@@ -16,8 +23,8 @@ import kotlinx.coroutines.flow.Flow;
     @Query("SELECT * FROM received_files WHERE state='complete' ORDER BY receivedAt DESC,peerId,transferId LIMIT 50") Flow<List<ReceivedFile>> recentReceivedFiles();
     @Query("DELETE FROM received_files WHERE peerId=:peer") void deletePeerReceivedFiles(String peer);
     @Query("DELETE FROM received_files") void clearReceivedFiles();
-    @Query("DELETE FROM received_files WHERE peerId=:peer AND transferId=:id AND generation=:generation AND metadata=:metadata AND uri=:uri AND catalogVersion=:version AND state=:state AND state!='complete'")
-    int deleteReceivedFileIfCurrent(String peer,String id,long generation,String metadata,String uri,String version,String state);
+    @Query("DELETE FROM received_files WHERE peerId=:peer AND transferId=:id AND generation=:generation AND metadata=:metadata AND uri=:uri AND catalogVersion=:version AND stagePath=:stagePath AND state=:state AND state!='complete'")
+    int deleteReceivedFileIfCurrent(String peer,String id,long generation,String metadata,String uri,String version,String stagePath,String state);
     @Transaction default boolean reserveReceivedFile(ReceivedFile row,Receipt receipt,int peerLimit,int globalLimit) {
         // Counts include permanent receipts/history and unfinished reservations.
         // Room's write transaction makes concurrent peers share one durable cap.
@@ -32,12 +39,12 @@ import kotlinx.coroutines.flow.Flow;
         receipt.state="applied";updateReceipt(receipt);row.state="complete";updateReceivedFile(row);
     }
     static boolean sameReceivedFile(ReceivedFile retained,ReceivedFile row) {
-        return retained!=null && retained.generation==row.generation && retained.metadata.equals(row.metadata) && retained.uri.equals(row.uri) && retained.catalogVersion.equals(row.catalogVersion);
+        return retained!=null && retained.generation==row.generation && retained.metadata.equals(row.metadata) && retained.uri.equals(row.uri) && retained.catalogVersion.equals(row.catalogVersion) && retained.stagePath.equals(row.stagePath);
     }
     @Transaction default boolean abandonReceivedFile(ReceivedFile row) {
         Receipt receipt=receipt(row.peerId,row.transferId);
         if(receipt==null || !receipt.origin.equals("file") || !receipt.state.equals("reserved"))return false;
-        if(deleteReceivedFileIfCurrent(row.peerId,row.transferId,row.generation,row.metadata,row.uri,row.catalogVersion,row.state)!=1)return false;
+        if(deleteReceivedFileIfCurrent(row.peerId,row.transferId,row.generation,row.metadata,row.uri,row.catalogVersion,row.stagePath,row.state)!=1)return false;
         deleteReceipt(row.peerId,row.transferId);return true;
     }
 
@@ -71,9 +78,14 @@ import kotlinx.coroutines.flow.Flow;
     // State mutations never overwrite another recipient or the shared payload.
     default void update(Outgoing row) {updateRecipient(Delivery.from(row));}
     @Transaction default void replacePayload(Outgoing row) {updateArtifact(Artifact.from(row));update(row);}
+    // A disabled automatic retry can still be retried manually after restart.
+    // Release access for final failures, not merely an infinite retry deadline.
+    String FOLDER_GRANT_URIS="SELECT DISTINCT uri FROM outgoing WHERE origin='folder' AND (state IN ('waiting','sending') OR (state='failed' AND error NOT IN ('folder_changed','folder_access_lost','folder_update_required','unsupported_kind','invalid_payload','id_conflict','local_file_missing')))";
+    @Query(FOLDER_GRANT_URIS) List<String> activeFolderUris();
+    @Query(FOLDER_GRANT_URIS) Flow<List<String>> folderGrantChanges();
     @Query("SELECT * FROM outgoing WHERE mediaId=:id AND peerId=:peer") Outgoing delivery(String id,String peer);
     @Query("SELECT * FROM outgoing WHERE mediaId=:id") List<Outgoing> deliveries(String id);
-    @Query("SELECT * FROM outgoing WHERE peerId=:peer AND state IN ('waiting','sending','failed') ORDER BY orderId,mediaId") List<Outgoing> pendingPeer(String peer);
+    @Query("SELECT * FROM outgoing WHERE peerId=:peer AND state IN ('waiting','sending','failed') AND error!='old_device_replaced' ORDER BY orderId,mediaId") List<Outgoing> pendingPeer(String peer);
     @Query("UPDATE deliveries SET peerId=:peer,bindingGeneration=:generation WHERE peerId=''") void bindLegacy(String peer,long generation);
     @Transaction default void resolveLegacy(Prefs p) {
         if(p.getLegacyQueuePeer().isEmpty() || p.getResetPeers().contains(p.getLegacyQueuePeer()) || p.getDeliveryReset())deletePeerDeliveries("");
@@ -83,35 +95,45 @@ import kotlinx.coroutines.flow.Flow;
         }
         deletePeerOutboundClock("");
     }
-    @Query("DELETE FROM deliveries WHERE peerId=:peer") void deletePeerDeliveries(String peer);
+    @Query("DELETE FROM deliveries WHERE peerId=:peer AND error!='old_device_replaced'") void deletePeerDeliveries(String peer);
+    @Query("UPDATE deliveries SET state='failed',error='old_device_replaced',nextAttempt=9223372036854775807,revision=revision+1 WHERE peerId=:peer AND bindingGeneration=:generation AND state IN ('waiting','sending','failed') AND error!='old_device_replaced'") void cancelReplacedPeer(String peer,long generation);
+    // Sent history wins inactive delivery collisions; any existing fresh receive row (it may own a live journal/receipt) is kept.
+    @Query("UPDATE OR REPLACE deliveries SET peerId=:fresh,bindingGeneration=:revision WHERE peerId=:old AND bindingGeneration=:generation AND state='sent' AND mediaId NOT IN (SELECT mediaId FROM deliveries WHERE peerId=:fresh AND state IN ('waiting','sending'))") void reattributeSent(String old,long generation,String fresh,long revision);
+    @Query("UPDATE OR REPLACE received_files SET peerId=:fresh,generation=:revision,senderName=:name WHERE peerId=:old AND generation=:generation AND state='complete' AND transferId NOT IN (SELECT transferId FROM received_files WHERE peerId=:fresh)") void reattributeReceived(String old,long generation,String fresh,long revision,String name);
+    @Transaction default void reattributeFinished(String old,long generation,String fresh,long revision,String name) {
+        reattributeSent(old,generation,fresh,revision);reattributeReceived(old,generation,fresh,revision,name);
+    }
+    @Query("DELETE FROM deliveries WHERE mediaId=:id AND peerId=:peer") void deleteDelivery(String id,String peer);
     @Query("DELETE FROM receipts WHERE peerId=:peer") void deletePeerReceipts(String peer);
     @Query("DELETE FROM clipboard_clock WHERE peerId=:peer") void deletePeerClock(String peer);
-    @Transaction default void clearPeer(String peer) {deletePeerDeliveries(peer);deletePeerReceipts(peer);deletePeerClock(peer);deletePeerOutboundClock(peer);deletePeerReceivedFiles(peer);}
+    @Transaction default void clearPeer(String peer) {deletePeerDeliveries(peer);deletePeerReceipts(peer);deletePeerClock(peer);deletePeerOutboundClock(peer);deletePeerReceivedFiles(peer);deletePeerCancels(peer);}
     @Query("SELECT * FROM artifacts WHERE mediaId NOT IN (SELECT mediaId FROM deliveries)") List<Artifact> orphanArtifacts();
     @Query("DELETE FROM artifacts WHERE mediaId=:id") void deleteArtifact(String id);
     @Query("SELECT COUNT(*) FROM outgoing WHERE mediaId=:id AND attempted=1") int anyAttempted(String id);
     @Query("SELECT COUNT(*) FROM outgoing WHERE peerId=:peer AND state='sending' AND (kind='text')=:text") int sendingPeerLane(String peer,boolean text);
     @Query("UPDATE deliveries SET state='waiting' WHERE peerId=:peer AND state='sending' AND mediaId IN (SELECT mediaId FROM artifacts WHERE (kind='text')=:text)") void recoverPeerLane(String peer,boolean text);
-    @Query("UPDATE deliveries SET state='superseded',revision=revision+1 WHERE peerId=:peer AND state IN ('waiting','failed') AND mediaId IN (SELECT mediaId FROM outgoing WHERE peerId=:peer AND kind='text' AND orderId<(SELECT MAX(orderId) FROM outgoing WHERE peerId=:peer AND kind='text' AND state IN ('waiting','failed')))") void supersedeOlderPeerText(String peer);
+    @Query("UPDATE deliveries SET state='superseded',revision=revision+1 WHERE peerId=:peer AND state IN ('waiting','failed') AND mediaId IN (SELECT mediaId FROM outgoing WHERE peerId=:peer AND kind='text' AND orderId<(SELECT MAX(orderId) FROM outgoing WHERE peerId=:peer AND kind='text' AND state IN ('waiting','failed'))) AND error!='old_device_replaced'") void supersedeOlderPeerText(String peer);
     @Transaction default void recoverPeer(String peer,boolean text) {recoverPeerLane(peer,text);if(text)supersedeOlderPeerText(peer);}
     @Query("SELECT COUNT(*) FROM outgoing WHERE peerId=:peer AND bindingGeneration=:generation AND state='sending' AND (kind='text')=:text") int sendingBoundLane(String peer,long generation,boolean text);
     @Query("UPDATE deliveries SET state='waiting' WHERE peerId=:peer AND bindingGeneration=:generation AND state='sending' AND mediaId IN (SELECT mediaId FROM artifacts WHERE (kind='text')=:text)") void recoverBoundSending(String peer,long generation,boolean text);
-    @Query("UPDATE deliveries SET state='superseded',revision=revision+1 WHERE peerId=:peer AND bindingGeneration=:generation AND state IN ('waiting','failed') AND mediaId IN (SELECT mediaId FROM artifacts WHERE kind='text')") void supersedeBoundText(String peer,long generation);
-    @Query("UPDATE deliveries SET state='superseded',revision=revision+1 WHERE peerId=:peer AND bindingGeneration=:generation AND state IN ('waiting','failed') AND mediaId IN (SELECT mediaId FROM outgoing WHERE peerId=:peer AND bindingGeneration=:generation AND kind='text' AND orderId<(SELECT MAX(orderId) FROM outgoing WHERE peerId=:peer AND bindingGeneration=:generation AND kind='text' AND state IN ('waiting','failed')))") void supersedeOlderBoundText(String peer,long generation);
+    @Query("UPDATE deliveries SET state='superseded',revision=revision+1 WHERE peerId=:peer AND bindingGeneration=:generation AND state IN ('waiting','failed') AND mediaId IN (SELECT mediaId FROM artifacts WHERE kind='text') AND error!='old_device_replaced'") void supersedeBoundText(String peer,long generation);
+    @Query("UPDATE deliveries SET state='superseded',revision=revision+1 WHERE peerId=:peer AND bindingGeneration=:generation AND state IN ('waiting','failed') AND mediaId IN (SELECT mediaId FROM outgoing WHERE peerId=:peer AND bindingGeneration=:generation AND kind='text' AND orderId<(SELECT MAX(orderId) FROM outgoing WHERE peerId=:peer AND bindingGeneration=:generation AND kind='text' AND state IN ('waiting','failed'))) AND error!='old_device_replaced'") void supersedeOlderBoundText(String peer,long generation);
     @Transaction default void recoverBound(String peer,long generation,boolean text) {recoverBoundSending(peer,generation,text);if(text)supersedeOlderBoundText(peer,generation);}
-    @Query("UPDATE deliveries SET state='superseded',revision=revision+1 WHERE peerId=:peer AND mediaId IN (SELECT mediaId FROM artifacts WHERE kind='text') AND state IN ('waiting','failed')") void supersedePeerText(String peer);
-    @Query("UPDATE deliveries SET state='superseded',revision=revision+1 WHERE peerId=:peer AND bindingGeneration=:generation AND state IN ('waiting','sending','failed') AND mediaId IN (SELECT mediaId FROM artifacts WHERE kind IN ('text','clipboard_image'))") void dropPeerClipboard(String peer,long generation);
-    @Query("UPDATE deliveries SET state='superseded',revision=revision+1 WHERE peerId=:peer AND bindingGeneration=:generation AND sessionId!='' AND state IN ('waiting','sending','failed') AND mediaId IN (SELECT mediaId FROM artifacts WHERE kind IN ('text','clipboard_image'))") void dropPeerSessionClipboard(String peer,long generation);
-    @Query("UPDATE deliveries SET state='superseded',revision=revision+1 WHERE peerId=:peer AND state IN ('waiting','sending','failed') AND mediaId IN (SELECT mediaId FROM artifacts WHERE kind='text')") void dropPeerText(String peer);
+    @Query("UPDATE deliveries SET state='superseded',revision=revision+1 WHERE peerId=:peer AND mediaId IN (SELECT mediaId FROM artifacts WHERE kind='text') AND state IN ('waiting','failed') AND error!='old_device_replaced'") void supersedePeerText(String peer);
+    @Query("UPDATE deliveries SET state='superseded',revision=revision+1 WHERE peerId=:peer AND bindingGeneration=:generation AND state IN ('waiting','sending','failed') AND mediaId IN (SELECT mediaId FROM artifacts WHERE kind IN ('text','clipboard_image')) AND error!='old_device_replaced'") void dropPeerClipboard(String peer,long generation);
+    @Query("UPDATE deliveries SET state='superseded',revision=revision+1 WHERE peerId=:peer AND bindingGeneration=:generation AND sessionId!='' AND state IN ('waiting','sending','failed') AND mediaId IN (SELECT mediaId FROM artifacts WHERE kind IN ('text','clipboard_image')) AND error!='old_device_replaced'") void dropPeerSessionClipboard(String peer,long generation);
+    @Query("UPDATE deliveries SET state='superseded',revision=revision+1 WHERE peerId=:peer AND state IN ('waiting','sending','failed') AND mediaId IN (SELECT mediaId FROM artifacts WHERE kind='text') AND error!='old_device_replaced'") void dropPeerText(String peer);
     @Query("SELECT COUNT(*) FROM outgoing WHERE peerId=:peer AND kind='text' AND orderId>:order AND state IN ('waiting','sending','failed')") int newerPeerText(String peer,long order);
     @Query("SELECT * FROM outgoing WHERE mediaId = :id ORDER BY CASE WHEN state='sending' THEN 0 WHEN state='waiting' THEN 1 WHEN state='failed' THEN 2 WHEN state='sent' THEN 3 ELSE 4 END,peerId LIMIT 1") Outgoing find(String id);
-    @Query("SELECT * FROM outgoing WHERE state IN ('waiting', 'sending', 'failed') ORDER BY orderId ASC, mediaId ASC") List<Outgoing> pending();
+    @Query("SELECT * FROM outgoing WHERE state IN ('waiting', 'sending', 'failed') AND error!='old_device_replaced' ORDER BY orderId ASC, mediaId ASC") List<Outgoing> pending();
     // Choose active rows first, then fill the bounded projection; display in send order.
     @Query("SELECT * FROM (SELECT * FROM outgoing o WHERE peerId=(SELECT peerId FROM outgoing n WHERE n.mediaId=o.mediaId ORDER BY CASE WHEN state='sending' THEN 0 WHEN state='failed' THEN 1 WHEN state='waiting' THEN 2 WHEN state='sent' THEN 3 ELSE 4 END,peerId LIMIT 1) AND state IN ('waiting','sending','failed','sent') ORDER BY CASE WHEN state='sending' THEN 0 WHEN state='sent' THEN 2 ELSE 1 END, CASE WHEN state='sent' THEN -orderId ELSE orderId END, mediaId LIMIT 50) ORDER BY CASE WHEN state='sent' THEN 1 ELSE 0 END, CASE WHEN state='sent' THEN -orderId ELSE orderId END, mediaId") Flow<List<Outgoing>> recent();
     // Limit artifacts, not recipient rows: partial failures remain visible and
     // every selected artifact carries its complete frozen recipient set.
     @Query("SELECT * FROM outgoing WHERE mediaId IN (SELECT mediaId FROM outgoing GROUP BY mediaId HAVING SUM(CASE WHEN state IN ('waiting','sending','failed','sent') THEN 1 ELSE 0 END)>0 ORDER BY MIN(CASE WHEN state='sending' THEN 0 WHEN state IN ('waiting','failed') THEN 1 ELSE 2 END), CASE WHEN SUM(CASE WHEN state IN ('waiting','sending','failed') THEN 1 ELSE 0 END)>0 THEN MIN(orderId) ELSE -MAX(orderId) END,mediaId LIMIT 50) ORDER BY orderId,mediaId,peerId") Flow<List<Outgoing>> recentDeliveries();
-    @Query("SELECT COUNT(DISTINCT mediaId) FROM outgoing WHERE state IN ('waiting','sending','failed')") Flow<Integer> waitingCount();
+    @Query("SELECT COUNT(DISTINCT mediaId) FROM outgoing WHERE state='waiting'") Flow<Integer> waitingCount();
+    @Query("UPDATE deliveries SET state=CASE WHEN :offline THEN 'waiting' ELSE 'failed' END,error='connection_lost',nextAttempt=CASE WHEN :offline THEN 0 ELSE 9223372036854775807 END WHERE state='sending' AND resumable=1 AND (:peer='' OR (peerId=:peer AND bindingGeneration=:generation))")
+    void recoverResumable(String peer,long generation,boolean offline);
     @Query("UPDATE deliveries SET state='waiting' WHERE state='sending'") void recoverSending();
     @Query("SELECT COUNT(*) FROM outgoing WHERE state='sending' AND (kind='text')=:text") int sendingInLane(boolean text);
     @Query("UPDATE deliveries SET state='waiting' WHERE state='sending' AND mediaId IN (SELECT mediaId FROM artifacts WHERE (kind='text')=:text)") void recoverSendingLane(boolean text);
@@ -119,12 +141,12 @@ import kotlinx.coroutines.flow.Flow;
         recoverSendingLane(text);
         if(text) supersedeOlderText();
     }
-    @Query("UPDATE artifacts SET uri='' WHERE automatic=0 AND kind!='text' AND uri NOT LIKE :privateUris") void forgetManualSources(String privateUris);
-    @Query("UPDATE deliveries SET state='superseded',revision=revision+1 WHERE state IN ('waiting','failed') AND mediaId IN (SELECT o.mediaId FROM outgoing o WHERE o.peerId=deliveries.peerId AND o.kind='text' AND o.orderId<(SELECT MAX(n.orderId) FROM outgoing n WHERE n.peerId=o.peerId AND n.kind='text' AND n.state IN ('waiting','failed')))") void supersedeOlderText();
+    @Query("UPDATE artifacts SET uri='' WHERE automatic=0 AND kind!='text' AND origin!='folder' AND uri NOT LIKE :privateUris") void forgetManualSources(String privateUris);
+    @Query("UPDATE deliveries SET state='superseded',revision=revision+1 WHERE state IN ('waiting','failed') AND mediaId IN (SELECT o.mediaId FROM outgoing o WHERE o.peerId=deliveries.peerId AND o.kind='text' AND o.orderId<(SELECT MAX(n.orderId) FROM outgoing n WHERE n.peerId=o.peerId AND n.kind='text' AND n.state IN ('waiting','failed'))) AND error!='old_device_replaced'") void supersedeOlderText();
     @Transaction default void recover() { recoverSending();supersedeOlderText(); }
     @Query("SELECT COUNT(*) FROM outgoing WHERE path=:path") int anyPath(String path);
     @Query("SELECT COUNT(*) FROM outgoing WHERE path = :path AND state IN ('waiting','sending','failed')") int hasPath(String path);
-    @Query("SELECT COUNT(DISTINCT mediaId) FROM outgoing WHERE state IN ('waiting','sending','failed')") int pendingCount();
+    @Query("SELECT COUNT(DISTINCT mediaId) FROM outgoing WHERE state IN ('waiting','sending','failed') AND error!='old_device_replaced'") int pendingCount();
     @Query("SELECT COALESCE((SELECT textTime FROM peer_outbound_clock WHERE peerId=:peer),0)") long peerTextTime(String peer);
     @Insert(onConflict=OnConflictStrategy.IGNORE) long insertPeerOutboundClock(PeerOutboundClock clock);
     @Query("UPDATE peer_outbound_clock SET textTime=MAX(textTime,:timestamp) WHERE peerId=:peer") void advancePeerText(String peer,long timestamp);
@@ -144,7 +166,7 @@ import kotlinx.coroutines.flow.Flow;
     @Query("DELETE FROM artifacts WHERE mediaId=:id") void deleteOutgoing(String id);
     @Query("SELECT COUNT(*) FROM outgoing WHERE kind='text' AND orderId>:order AND state IN ('waiting','sending','failed')") int newerText(long order);
     @Query("SELECT COALESCE((SELECT lastOrder FROM outbound_clock WHERE id=0),0)+1") long nextOrder();
-    @Query("SELECT * FROM outgoing WHERE state IN ('waiting','sending','failed') ORDER BY orderId ASC, mediaId ASC") Flow<List<Outgoing>> work();
+    @Query("SELECT * FROM outgoing WHERE state IN ('waiting','sending','failed') AND error!='old_device_replaced' ORDER BY orderId ASC, mediaId ASC") Flow<List<Outgoing>> work();
     @Insert(onConflict=OnConflictStrategy.IGNORE) long insertReceipt(Receipt receipt);
     @Update void updateReceipt(Receipt receipt);
     @Query("SELECT * FROM receipts WHERE peerId=:peer AND transferId=:id") Receipt receipt(String peer,String id);
@@ -161,8 +183,9 @@ import kotlinx.coroutines.flow.Flow;
         insertClock(clock);advanceClock(receipt.peerId,receipt.createdAt);
         retainClipboardReceipt(receipt);
     }
-    @Query("UPDATE deliveries SET state='superseded', revision=revision+1 WHERE mediaId IN (SELECT mediaId FROM artifacts WHERE kind='text') AND state IN ('waiting','failed')") void supersedeText();
+    @Query("UPDATE deliveries SET state='superseded', revision=revision+1 WHERE mediaId IN (SELECT mediaId FROM artifacts WHERE kind='text') AND state IN ('waiting','failed') AND error!='old_device_replaced'") void supersedeText();
     @Query("SELECT * FROM outgoing") List<Outgoing> all();
+    @Query("DELETE FROM receipts WHERE peerId=:peer AND origin='members' AND rowid NOT IN (SELECT rowid FROM receipts WHERE peerId=:peer AND origin='members' ORDER BY rowid DESC LIMIT 4096)") void pruneMembersReceipts(String peer);
     @Query("SELECT COUNT(*) FROM receipts") int receiptCount();
     @Query("DELETE FROM receipts") void clearReceiptRows();
     @Query("DELETE FROM clipboard_clock") void clearClipboardClocks();
@@ -170,5 +193,5 @@ import kotlinx.coroutines.flow.Flow;
     @Query("DELETE FROM artifacts") void clearOutgoing();
     @Query("DELETE FROM media_seen") void clearSeen();
     @Query("DELETE FROM outbound_clock") void clearOutboundClock();
-    @Transaction default void clear() {clearOutgoing();clearSeen();clearOutboundClock();clearPendingAdmissions();}
+    @Transaction default void clear() {clearOutgoing();clearSeen();clearOutboundClock();clearPendingAdmissions();clearPendingCancels();}
 }

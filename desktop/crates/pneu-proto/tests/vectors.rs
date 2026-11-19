@@ -12,6 +12,8 @@ struct Vectors {
     invalid_frames: Vec<InvalidFrame>,
     invalid_pairing_uris: Vec<InvalidUri>,
     fingerprints: Vec<FingerprintVector>,
+    folder_manifests: Vec<ManifestVector>,
+    invalid_ready_offsets: Vec<InvalidReadyOffset>,
 }
 #[derive(Deserialize)]
 struct FrameVector {
@@ -26,6 +28,10 @@ struct TransferVector {
     data_hex: String,
     size: u64,
     sha256: String,
+    #[serde(default)]
+    prefix_hex: String,
+    #[serde(default)]
+    deduplicated: bool,
 }
 #[derive(Deserialize)]
 struct PairVector {
@@ -71,14 +77,21 @@ fn every_frame_decodes_and_roundtrips() {
             "{}",
             vector.name
         );
-        if matches!(decoded, Message::FileChunk(_)) {
+        if matches!(decoded, Message::FileChunk(_))
+            || matches!(
+                vector.name.as_str(),
+                "resume_legacy_begin" | "resume_false_begin"
+            )
+        {
             assert_eq!(encoded, raw);
         }
         ids.insert(decoded.type_id());
     }
     assert_eq!(
         ids.into_iter().collect::<Vec<_>>(),
-        [1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 32, 33, 127]
+        [
+            1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 32, 33, 48, 49, 50, 51, 127
+        ]
     );
 }
 
@@ -155,31 +168,45 @@ fn all_transfer_vectors_reassemble_and_verify() {
         .map(|f| (f.name.as_str(), &f.decoded))
         .collect();
     for transfer in vectors.transfers {
-        let mut bytes = Vec::new();
+        let mut bytes = hex::decode(&transfer.prefix_hex).unwrap();
         let mut begin = None;
         let mut ended = false;
         let mut acked = false;
+        let mut ready = false;
+        let mut sent_chunk = false;
         for name in &transfer.frames {
             match frames[name.as_str()] {
                 Message::FileBegin(m) => {
                     assert!(begin.is_none());
                     begin = Some(m);
                 }
+                Message::FileReady(m) => {
+                    let begin = begin.unwrap();
+                    assert_eq!(begin.resume, Some(true));
+                    assert!(!ready && !sent_chunk && !ended);
+                    assert_eq!(m.transfer_id, begin.transfer_id);
+                    m.validate_offset(begin.size).unwrap();
+                    assert_eq!(m.offset, bytes.len() as u64);
+                    ready = true;
+                }
                 Message::FileChunk(m) => {
                     assert!(!ended);
+                    assert_eq!(ready, begin.unwrap().resume == Some(true));
+                    sent_chunk = true;
                     assert_eq!(m.transfer_id, begin.unwrap().transfer_id);
                     assert_eq!(m.offset, bytes.len() as u64);
                     bytes.extend_from_slice(&m.data);
                 }
                 Message::FileEnd(m) => {
                     assert!(!ended);
+                    assert_eq!(ready, begin.unwrap().resume == Some(true));
                     assert_eq!(m.transfer_id, begin.unwrap().transfer_id);
                     ended = true;
                 }
                 Message::Ack(m) => {
                     assert!(ended && !acked);
                     assert_eq!(m.transfer_id, begin.unwrap().transfer_id);
-                    assert!(!m.deduplicated);
+                    assert_eq!(m.deduplicated, transfer.deduplicated);
                     acked = true;
                 }
                 _ => panic!("unexpected message in {}", transfer.name),
@@ -192,5 +219,70 @@ fn all_transfer_vectors_reassemble_and_verify() {
         assert_eq!(begin.size, transfer.size);
         assert_eq!(hex::encode(Sha256::digest(&bytes)), transfer.sha256);
         assert_eq!(begin.sha256.as_str(), transfer.sha256);
+    }
+}
+
+#[derive(Deserialize)]
+struct ManifestVector {
+    name: String,
+    #[serde(default)]
+    manifest: String,
+    manifest_hex: Option<String>,
+    manifest_len: u64,
+    stream_size: u64,
+    valid: bool,
+}
+#[test]
+fn shared_folder_manifest_vectors() {
+    for v in vectors().folder_manifests {
+        let begin = FileBegin {
+            transfer_id: Id::from_bytes([0; 16]),
+            file_name: "Folder".into(),
+            mime: FOLDER_MIME.into(),
+            size: v.stream_size,
+            sha256: Hash::new("0".repeat(64)).unwrap(),
+            kind: FileKind::File,
+            created_at: 0,
+            source_media_id: None,
+            hlc: None,
+            source_device: None,
+            sensitive: false,
+            resume: Some(true),
+            folder: Some(Box::new(Folder {
+                manifest_len: v.manifest_len,
+            })),
+        };
+        let bytes = v
+            .manifest_hex
+            .map_or_else(|| v.manifest.into_bytes(), |h| hex::decode(h).unwrap());
+        assert_eq!(
+            FolderManifest::parse(&bytes, &begin).is_ok(),
+            v.valid,
+            "{}",
+            v.name
+        );
+    }
+}
+
+#[derive(Deserialize)]
+struct InvalidReadyOffset {
+    begin: String,
+    payload: String,
+}
+#[test]
+fn shared_contextual_ready_rejections() {
+    let v = vectors();
+    for bad in v.invalid_ready_offsets {
+        let Message::FileBegin(begin) = &v
+            .frames
+            .iter()
+            .find(|f| f.name == bad.begin)
+            .unwrap()
+            .decoded
+        else {
+            panic!("BEGIN fixture")
+        };
+        let ready: FileReady = serde_json::from_str(&bad.payload).unwrap();
+        assert!(ready.validate_offset(begin.size).is_err());
     }
 }

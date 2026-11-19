@@ -83,7 +83,7 @@ class V2ScreensDeviceTest {
         }
         val pending=rows.filter {it.state!="sent"}
         withContext(Dispatchers.IO) {pending.forEach {it.peerId=prefs.peer!!.deviceId;it.bindingGeneration=prefs.peer.generation;DeviceFixture.insert(app,it)}}
-        withTimeout(5000) {app.waitingCount.first {it==pending.size}}
+        withTimeout(5000) {app.waitingCount.first {it==pending.count {row->row.state=="waiting"}}}
         // Infinite animation policy cancels loops under autoAdvance; explicitly
         // drive and sample the capsule/dashes instead of capturing their first frame.
         compose.mainClock.autoAdvance=scene!=Scene.SENDING && scene!=Scene.CONNECTING
@@ -158,7 +158,7 @@ class V2ScreensDeviceTest {
         compose.onNodeWithText("Failed · Computer storage is full").assertIsDisplayed();capture("v2-dark-failed-row")
     }
     @Test(timeout=20000) fun waitingMenu()=runBlocking<Unit> {
-        render(Scene.WAITING_MENU);compose.onNodeWithText("2 waiting").performClick()
+        render(Scene.WAITING_MENU);compose.onNodeWithText("1 waiting").performClick()
         compose.onNodeWithText("Send now").assertIsDisplayed();capture("v2-dark-waiting-menu")
     }
     @Test(timeout=20000) fun unpairConfirmation()=runBlocking<Unit> {

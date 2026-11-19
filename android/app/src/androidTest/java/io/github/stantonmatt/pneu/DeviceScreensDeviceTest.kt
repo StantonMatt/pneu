@@ -187,8 +187,9 @@ class DeviceScreensDeviceTest {
         compose.waitForIdle();compose.onNodeWithText("Send clipboard").assertIsNotEnabled()
         compose.runOnUiThread {context.getSystemService(ClipboardManager::class.java).setPrimaryClip(clipboard("Send this"))}
         compose.waitForIdle();compose.onNodeWithText("Send clipboard").assertIsEnabled()
+        // Unreachable: what helps reconnect takes Send clipboard's place.
         online=false
-        compose.waitForIdle();compose.onNodeWithText("Send clipboard").assertIsNotEnabled()
+        compose.waitForIdle();compose.onNodeWithText("Send clipboard").assertDoesNotExist();compose.onNodeWithText("Connect anywhere").assertIsDisplayed()
     }
     @Test(timeout=30000) fun uriMimeReadSurvivesProgressAndSettingsWhileEligibilityUpdatesIndependently()=runBlocking<Unit> {
         val entered=java.util.concurrent.CountDownLatch(1);val release=java.util.concurrent.CountDownLatch(1)
@@ -290,7 +291,8 @@ class DeviceScreensDeviceTest {
         show {Device(p,DeviceState(p.devices[1],LinkState(),setOf("receiveClipboard"),true))}
         compose.onNodeWithText("Applies when MacBook Air connects").assertIsDisplayed()
         compose.onNodeWithText("Off for all devices in Settings").assertIsDisplayed()
-        compose.onNodeWithText("Last connected",substring=true).assertIsDisplayed()
+        // What the phone can tell replaces Last connected.
+        compose.onNode(hasText("MacBook Air may be off or on another Wi-Fi") or hasText("Connects on the same Wi-Fi") or hasText("Tailscale is off")).assertIsDisplayed()
         bothThemes("device-offline-pending")
     }
     @Test(timeout=30000) fun devicePagePairingLostAndNeedsUpdate()=runBlocking<Unit> {
@@ -357,7 +359,7 @@ class DeviceScreensDeviceTest {
         val p=prefs(pc)
         show {PairScreen(p,wifi,{},{},{},validationFeedback=UiFeedback("Already paired with MJStanton-Desktop"),cameraPreview={modifier,_->androidx.compose.foundation.layout.Box(modifier.then(Modifier.fillMaxSize()))})}
         compose.waitUntil(5000) {compose.onAllNodesWithText("Already paired with MJStanton-Desktop").fetchSemanticsNodes().isNotEmpty()}
-        compose.onNodeWithText("Scan the QR code on your computer").assertIsDisplayed()
+        compose.onNodeWithText("Scan the QR code in Pneu on your computer").assertIsDisplayed()
         capture("add-device-already-paired")
     }
     @Test(timeout=30000) fun stoppedRecipientsShowTerminalOutcomesWithoutActionsWhileOtherRecipientsStayActionable()=runBlocking<Unit> {
@@ -384,12 +386,16 @@ class DeviceScreensDeviceTest {
         show {Device(snapshot,DeviceProjection.states(snapshot,if(online)mapOf(pc.deviceId to wifi) else emptyMap()).single())}
         compose.onNodeWithText("Applies when Pending PC connects").assertIsDisplayed()
         online=true;compose.waitForIdle()
-        compose.onNodeWithText("Applies when Pending PC connects").assertIsDisplayed()
+        compose.onNodeWithText("Connected",substring=true).assertIsDisplayed()
+        compose.onNodeWithText("Applies when Pending PC connects").assertDoesNotExist()
+        capture("connected-settings-pending")
         val binding=DeliveryBinding.from(app.preferences.read(),pc.deviceId)!!
         val old=app.preferences.prepareSettings(binding)
         app.preferences.setPairSwitch(pc.deviceId,"receiveClipboard",true)
         app.preferences.acknowledgeSettings(binding,old)
         snapshot=app.preferences.read();compose.waitForIdle()
+        compose.onNodeWithText("Applies when Pending PC connects").assertDoesNotExist()
+        online=false;compose.waitForIdle()
         compose.onNodeWithText("Applies when Pending PC connects").assertIsDisplayed()
         val latest=app.preferences.prepareSettings(binding);app.preferences.acknowledgeSettings(binding,latest)
         snapshot=app.preferences.read();compose.waitForIdle()

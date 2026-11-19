@@ -8,6 +8,10 @@ use std::{
     sync::Arc,
 };
 
+pub type PhoneAcknowledgement<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<u32>> + Send + 'a>>;
+pub(crate) const PHONE_WITHDRAW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArrivalSource {
     pub device: pneu_proto::Id,
@@ -22,13 +26,29 @@ impl ArrivalSource {
     ) -> crate::ui::notifications::Notice {
         if clipboard {
             notice.copied_from(&self.name)
-        } else if self.several {
-            notice.from_device(&self.name)
         } else {
-            notice
+            notice.from_device(&self.name)
         }
     }
 }
+#[derive(Debug)]
+pub(crate) struct BoundedReadLimit;
+impl std::fmt::Display for BoundedReadLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("input exceeds bounded read limit")
+    }
+}
+impl std::error::Error for BoundedReadLimit {}
+/// Kept distinct through daemon IPC so manual sends can explain the limit.
+#[derive(Debug)]
+pub(crate) struct ImageTooLarge;
+impl std::fmt::Display for ImageTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("clipboard image too large")
+    }
+}
+impl std::error::Error for ImageTooLarge {}
+
 #[derive(Debug)]
 pub(crate) struct FileUnavailable;
 impl std::fmt::Display for FileUnavailable {
@@ -45,6 +65,7 @@ pub struct ReceivedFile {
     path: PathBuf,
     file: Arc<std::fs::File>,
     source: Option<ArrivalSource>,
+    folder: Option<Box<(crate::folders::Details, u64)>>,
 }
 impl ReceivedFile {
     pub(crate) fn from_file(path: PathBuf, file: std::fs::File) -> Result<Self> {
@@ -55,7 +76,32 @@ impl ReceivedFile {
             path,
             file: Arc::new(file),
             source: None,
+            folder: None,
         })
+    }
+    pub(crate) fn from_transfer(
+        path: PathBuf,
+        file: std::fs::File,
+        folder: Option<crate::folders::Details>,
+        size: u64,
+    ) -> Result<Self> {
+        if let Some(details) = folder {
+            anyhow::ensure!(
+                file.metadata()?.is_dir(),
+                "received folder must be a directory"
+            );
+            Ok(Self {
+                path,
+                file: Arc::new(file),
+                source: None,
+                folder: Some(Box::new((details, size))),
+            })
+        } else {
+            Self::from_file(path, file)
+        }
+    }
+    pub(crate) fn is_folder(&self) -> bool {
+        self.folder.is_some() || self.file.metadata().is_ok_and(|m| m.is_dir())
     }
     pub(crate) fn with_source(mut self, source: ArrivalSource) -> Self {
         self.source = Some(source);
@@ -63,15 +109,31 @@ impl ReceivedFile {
     }
     fn notice(
         &self,
-        notice: crate::ui::notifications::Notice,
+        mut notice: crate::ui::notifications::Notice,
         clipboard: bool,
     ) -> crate::ui::notifications::Notice {
+        if let Some((details, size)) = self.folder.as_deref() {
+            notice.body = format!(
+                "{}, {}",
+                crate::folders::items(details.items),
+                crate::folders::size_label(details.content_size.unwrap_or(*size))
+            );
+            notice.actions.retain(|(action, _)| *action != "show");
+        }
         self.source.as_ref().map_or_else(
             || notice.clone(),
             |source| source.file_notice(notice.clone(), clipboard),
         )
     }
     pub fn open(path: &Path) -> Result<Self> {
+        if let Ok(folder) = platform_fs::Folder::read(path) {
+            return Ok(Self {
+                path: path.to_owned(),
+                file: folder.file,
+                source: None,
+                folder: None,
+            });
+        }
         let file = platform_fs::open_read(path)?;
         Self::from_file(path.to_owned(), file)
     }
@@ -80,6 +142,9 @@ impl ReceivedFile {
     }
     #[cfg(target_os = "linux")]
     fn viewer_descriptor(&self) -> Result<std::fs::File> {
+        if self.is_folder() {
+            return Ok(self.file.try_clone()?);
+        }
         platform_fs::viewer_descriptor(&self.file)
     }
     #[cfg(target_os = "macos")]
@@ -89,7 +154,7 @@ impl ReceivedFile {
     pub fn read_bounded(&self, limit: usize) -> Result<Vec<u8>> {
         anyhow::ensure!(
             self.file.metadata()?.len() <= limit as u64,
-            "input exceeds bounded read limit"
+            BoundedReadLimit
         );
         let mut bytes = Vec::new();
         let mut buffer = [0; 8192];
@@ -101,7 +166,7 @@ impl ReceivedFile {
             }
             bytes.extend_from_slice(&buffer[..n]);
         }
-        anyhow::ensure!(bytes.len() <= limit, "input grew beyond bounded read limit");
+        anyhow::ensure!(bytes.len() <= limit, BoundedReadLimit);
         Ok(bytes)
     }
     pub(crate) fn is_image(&self, mime: &str) -> Result<bool> {
@@ -171,7 +236,9 @@ impl PreparedClipboard {
                 (ClipboardInput::Text(text), hashes)
             }
             ClipboardInput::Image(file, mime) => {
-                let hashes = vec![Sha256::digest(file.read_bounded(16 * 1024 * 1024)?).into()];
+                let hashes = vec![
+                    Sha256::digest(file.read_bounded(crate::store::history::MAX_IMAGE)?).into(),
+                ];
                 (ClipboardInput::Image(file, mime), hashes)
             }
             ClipboardInput::Bytes { bytes, mime, cache } => {
@@ -247,6 +314,41 @@ impl PreparedClipboard {
 }
 #[async_trait]
 pub trait PcActions: Send + Sync {
+    /// Submit under the authority gate, then await native acknowledgement
+    /// outside it. Native backends retain cancellation ownership in this future.
+    async fn begin_phone_notification<'a>(
+        &'a self,
+        id: &'a str,
+        notice: &'a crate::ui::notifications::PhoneNotice,
+        replaces: u32,
+    ) -> Result<PhoneAcknowledgement<'a>> {
+        // Synchronous/lightweight backends retain their completion semantics.
+        let handle = self.show_phone_notification(id, notice, replaces).await?;
+        Ok(Box::pin(async move { Ok(handle) }))
+    }
+    /// Mirror handles belong only to the current phone connection. No actions.
+    async fn show_phone_notification(
+        &self,
+        _id: &str,
+        _notice: &crate::ui::notifications::PhoneNotice,
+        _replaces: u32,
+    ) -> Result<u32> {
+        anyhow::bail!("phone notifications unavailable")
+    }
+    async fn remove_phone_notification(&self, _id: &str, _handle: u32) -> Result<()> {
+        Ok(())
+    }
+    /// Native backends with a bulk API can withdraw a full connection in one request.
+    async fn remove_phone_notifications(&self, handles: &[(String, u32)]) -> Result<()> {
+        let results = futures_util::future::join_all(
+            handles
+                .iter()
+                .map(|(id, handle)| self.remove_phone_notification(id, *handle)),
+        )
+        .await;
+        results.into_iter().collect()
+    }
+
     #[cfg(target_os = "macos")]
     async fn ui_test_notification(&self, _transient: bool) -> Result<u32> {
         anyhow::bail!("UI test notifications unavailable")
@@ -272,6 +374,14 @@ pub trait PcActions: Send + Sync {
         _ticket: u128,
     ) -> Result<PreparedClipboard> {
         tokio::task::spawn_blocking(move || PreparedClipboard::immediate(input)).await?
+    }
+    async fn prepare_clipboard_sensitive(
+        &self,
+        input: ClipboardInput,
+        ticket: u128,
+        _sensitive: bool,
+    ) -> Result<PreparedClipboard> {
+        self.prepare_clipboard(input, ticket).await
     }
     async fn install_clipboard(&self, prepared: &mut PreparedClipboard) -> Result<()> {
         match &prepared.input {
@@ -427,6 +537,12 @@ pub trait PcActions: Send + Sync {
         self.notify_save_failure(metadata, code, destination, folder)
             .await
     }
+    async fn notify_clipboard_too_large(&self) -> Result<()> {
+        Ok(())
+    }
+    async fn notify_ring_failure(&self, _phone: &str) -> Result<()> {
+        Ok(())
+    }
     async fn notify_send_admission_failure(&self, _reason: &str) -> Result<()> {
         Ok(())
     }
@@ -486,6 +602,57 @@ mod acl_tests {
         crate::platform::private::check(&file)?;
         assert_eq!(std::fs::read_dir(&root)?.count(), 0);
         assert!(clipboard_file(&root).is_err());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod arrival_copy_tests {
+    use super::*;
+    #[test]
+    fn every_file_arrival_names_sender_even_with_one_pair() {
+        for several in [false, true] {
+            let source = ArrivalSource {
+                device: pneu_proto::Id::from_bytes([1; 16]),
+                name: "Galaxy S25+".into(),
+                several,
+            };
+            let mut notice = crate::ui::notifications::Notice::new("Screenshot");
+            notice.body = "Copied to clipboard".into();
+            assert_eq!(
+                source.file_notice(notice, false).body,
+                "From Galaxy S25+ · Copied to clipboard"
+            );
+            assert_eq!(
+                source
+                    .file_notice(crate::ui::notifications::Notice::new("report.pdf"), false)
+                    .body,
+                "From Galaxy S25+"
+            );
+            assert_eq!(
+                source
+                    .file_notice(crate::ui::notifications::Notice::text("hello"), true)
+                    .summary,
+                "Copied from Galaxy S25+"
+            );
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod folder_open_tests {
+    use super::*;
+    #[test]
+    fn ordinary_file_opens_through_a_symlinked_parent() -> Result<()> {
+        let dir = crate::test_support::scratch()?;
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real)?;
+        std::fs::write(real.join("file.txt"), b"abc")?;
+        std::os::unix::fs::symlink(&real, dir.path().join("alias"))?;
+        let file = ReceivedFile::open(&dir.path().join("alias/file.txt"))?;
+        assert_eq!(file.read_bounded(10)?, b"abc");
+        std::os::unix::fs::symlink(real.join("file.txt"), real.join("link"))?;
+        assert!(ReceivedFile::open(&real.join("link")).is_err());
         Ok(())
     }
 }

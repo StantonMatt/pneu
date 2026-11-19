@@ -9,6 +9,10 @@ pub struct Notice {
     pub transient: bool,
     pub expires: i32,
     pub urls: Vec<String>,
+    /// The device an action such as Remove… is about.
+    pub device: Option<pneu_proto::Id>,
+    pub blocked_pin: Option<pneu_proto::Hash>,
+    pub setup_requests: Vec<super::window_setup::Decision>,
 }
 impl Notice {
     pub fn new(summary: impl Into<String>) -> Self {
@@ -20,6 +24,9 @@ impl Notice {
             transient: false,
             expires: -1,
             urls: Vec::new(),
+            device: None,
+            blocked_pin: None,
+            setup_requests: Vec::new(),
         }
     }
     pub fn file(
@@ -116,9 +123,9 @@ impl Notice {
         n
     }
     pub fn blocked(address: &str) -> Self {
-        let mut n = Self::new("Blocked an unpaired phone");
+        let mut n = Self::new("Blocked an unpaired device");
         n.body = format!("{address} tried to connect");
-        n.actions.push(("pair", "Pair Phone…"));
+        n.actions.push(("pair", "Add Device…"));
         n
     }
     pub fn paired(name: &str) -> Self {
@@ -127,6 +134,40 @@ impl Notice {
         n.urgency = 0;
         n.expires = 4000;
         n
+    }
+    /// Once per device another of your devices added: "MacBook Air joined".
+    pub fn joined(device: pneu_proto::Id, name: &str, via: &str) -> Self {
+        let mut n = Self::new(format!("{} joined", label(name)));
+        n.body = format!("Added via {}", escape(&label(via)));
+        n.actions.push(("remove", "Remove…"));
+        n.device = Some(device);
+        n
+    }
+    pub(crate) fn readmission(record: &crate::store::members::Readmission) -> Self {
+        let mut notice = Self::new(super::window_setup::readmission_text(record));
+        notice.actions = vec![("deny", "Keep removed"), ("allow", "Allow")];
+        notice.setup_requests = vec![super::window_setup::Decision {
+            readmission: Some(record.key.clone()),
+            device: record.key.device.clone(),
+            setup_generation: record.key.setup_generation,
+            binding_generation: 0,
+        }];
+        notice
+    }
+    pub(crate) fn link_request(
+        names: &[String],
+        requests: Vec<super::window_setup::Decision>,
+    ) -> Self {
+        let names: Vec<_> = names.iter().map(|name| label(name)).collect();
+        let verb = if names.len() == 1 { "wants" } else { "want" };
+        let mut notice = Self::new(format!(
+            "{} {verb} to link your devices",
+            super::window_setup::askers(&names)
+        ));
+        notice.body = "New devices then pair just once.".into();
+        notice.actions = vec![("deny", "Don't Allow"), ("allow", "Allow")];
+        notice.setup_requests = requests;
+        notice
     }
     pub fn unpaired(device: &str) -> Self {
         let mut n = Self::new(format!(
@@ -137,7 +178,7 @@ impl Notice {
         n.actions.push(("pair", "Add Device…"));
         n
     }
-    /// With more than one paired device, arrivals say where they came from:
+    /// File arrivals always say where they came from:
     /// "From Galaxy S25+ · Copied to clipboard".
     pub fn from_device(mut self, device: &str) -> Self {
         let from = format!("From {}", escape(&label(device)));
@@ -152,6 +193,14 @@ impl Notice {
     pub fn copied_from(mut self, device: &str) -> Self {
         self.summary = format!("Copied from {}", label(device));
         self
+    }
+    pub fn image_too_large() -> Self {
+        let mut n = Self::new("Image too large to send");
+        n.body = "The limit for copied images is 20 MB.".into();
+        n.urgency = 0;
+        n.transient = true;
+        n.expires = 4000;
+        n
     }
     /// Short, transient: "report.pdf sent to 2 devices".
     pub fn sent(file: &str, devices: &[String]) -> Self {
@@ -168,7 +217,80 @@ impl Notice {
     pub fn send_failed(file: &str, device: &str, reason: &str) -> Self {
         let mut n = Self::new(format!("Couldn't send {file} to {}", label(device)));
         n.body = escape(&send_failure_reason(device, reason));
-        n.actions.push(("retry", "Retry"));
+        if retryable_reason(reason) {
+            n.actions.push(("retry", "Retry"));
+        }
+        n
+    }
+    pub(crate) fn admission_failure(reason: &str) -> Self {
+        if reason.ends_with(" is empty")
+            || reason.contains(" is over ")
+            || reason == "Folder contains more than 10,000 entries"
+            || reason.ends_with(" can't receive folders yet")
+        {
+            Self::new(reason)
+        } else {
+            let mut notice = Self::new("Couldn't send files");
+            notice.body = escape(reason);
+            notice
+        }
+    }
+    pub(crate) fn sent_transfer(transfer: &crate::outbox::Transfer, device: &str) -> Self {
+        let mut n = Self::sent(&transfer.file_name, &[device.into()]);
+        if let Some(details) = &transfer.folder {
+            let mut lines = Vec::new();
+            if details.failed > 0 {
+                let names = details
+                    .names
+                    .iter()
+                    .map(|n| escape(&label(n)))
+                    .collect::<Vec<_>>();
+                let list = if details.failed > 3 {
+                    names.join(", ")
+                } else {
+                    match names.as_slice() {
+                        [] => String::new(),
+                        [one] => one.clone(),
+                        [a, b] => format!("{a} and {b}"),
+                        [a, b, c, ..] => format!("{a}, {b} and {c}"),
+                    }
+                };
+                lines.push(format!(
+                    "{} {} couldn't be sent: {}{}",
+                    crate::folders::grouped(details.failed),
+                    if details.failed == 1 { "item" } else { "items" },
+                    list,
+                    if details.failed > 3 {
+                        format!(" and {} more", crate::folders::grouped(details.failed - 3))
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
+            let skipped = details.links + details.special;
+            if skipped > 0 {
+                lines.push(if details.special > 0 {
+                    if skipped == 1 {
+                        "1 special file skipped".into()
+                    } else {
+                        format!(
+                            "{} links and special files skipped",
+                            crate::folders::grouped(skipped)
+                        )
+                    }
+                } else if skipped == 1 {
+                    "1 link skipped".into()
+                } else {
+                    format!("{} links skipped", crate::folders::grouped(skipped))
+                });
+            }
+            if !lines.is_empty() {
+                n.body = lines.join("\n");
+                n.transient = false;
+                n.urgency = 1;
+                n.expires = -1;
+            }
+        }
         n
     }
     pub fn port(port: u16) -> Self {
@@ -183,9 +305,19 @@ fn label(name: &str) -> String {
         .map(|c| if c.is_whitespace() { ' ' } else { c })
         .collect()
 }
+pub(crate) fn retryable_reason(reason: &str) -> bool {
+    reason != "Can't receive folders yet" && reason != crate::folders::SourceChanged.to_string()
+}
 pub(crate) fn send_failure_reason(device: &str, reason: &str) -> String {
     let device = label(device);
     match reason {
+        reason if reason.starts_with("Needs ") && reason.ends_with(" free") => {
+            format!("{device} needs {}", &reason[6..])
+        }
+        "Folder changed after Preparing. Send the folder again." => reason.into(),
+        "Needs a Pneu update" => format!("{device} needs a Pneu update"),
+        "Can't receive folders yet" => format!("{device} can't receive folders yet"),
+        "Connection lost" | "Connection interrupted" => "Connection lost".into(),
         "UnsupportedKind" | "unsupported_kind" => {
             format!("Update Pneu on {device} to send this kind of file")
         }
@@ -213,11 +345,76 @@ pub fn single_url(text: &str) -> Option<String> {
         None
     }
 }
+/// Plain content shared by the native mirror projections. Never stored in SQL.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PhoneNotice {
+    pub app: String,
+    pub title: Option<String>,
+    pub text: Option<String>,
+    pub icon: Option<PhoneIcon>,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum PhoneIcon {
+    Pixels {
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
+    File(std::path::PathBuf),
+}
+impl PhoneIcon {
+    pub fn file_path(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::File(path) => Some(path),
+            Self::Pixels { .. } => None,
+        }
+    }
+}
+impl PhoneNotice {
+    pub fn app_only(&self) -> bool {
+        self.title.as_deref().is_none_or(|s| s.trim().is_empty())
+            && self.text.as_deref().is_none_or(|s| s.trim().is_empty())
+    }
+    pub fn linux(&self) -> Notice {
+        let mut n = Notice::new(if self.app_only() {
+            &self.app
+        } else {
+            self.title.as_deref().unwrap_or("")
+        });
+        n.summary = escape(&n.summary);
+        n.body = if self.app_only() {
+            "New notification".into()
+        } else {
+            escape(self.text.as_deref().unwrap_or(""))
+        };
+        n
+    }
+    pub fn macos(&self) -> (String, String, String) {
+        if self.app_only() {
+            (self.app.clone(), String::new(), "New notification".into())
+        } else {
+            (
+                self.title.clone().unwrap_or_default(),
+                self.app.clone(),
+                self.text.clone().unwrap_or_default(),
+            )
+        }
+    }
+}
+
+/// A stable native identifier in a group separate from transfer notices.
+pub fn phone_identifier(id: &str) -> String {
+    format!("pneu-mirror-{id}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     fn metadata(kind: FileKind) -> FileBegin {
         FileBegin {
+            resume: None,
+            folder: None,
+            sensitive: false,
             hlc: None,
             source_device: None,
             transfer_id: pneu_proto::Id::from_bytes([0; 16]),
@@ -230,6 +427,95 @@ mod tests {
             source_media_id: None,
         }
     }
+    #[test]
+    fn oversized_image_notice_is_quiet_transient_and_actionless() {
+        let n = Notice::image_too_large();
+        assert_eq!(
+            (n.summary.as_str(), n.body.as_str()),
+            (
+                "Image too large to send",
+                "The limit for copied images is 20 MB."
+            )
+        );
+        assert_eq!((n.urgency, n.transient, n.expires), (0, true, 4000));
+        assert!(n.actions.is_empty() && n.urls.is_empty());
+    }
+    #[test]
+    fn folder_skip_and_refusal_notification_contract() {
+        let mut row = crate::outbox::Transfer::received(
+            pneu_proto::Id::from_bytes([1; 16]),
+            &metadata(FileKind::File),
+        );
+        row.file_name = "Trip".into();
+        row.folder = Some(crate::folders::Details {
+            items: 3,
+            failed: 4,
+            links: 2,
+            names: vec!["a.txt".into(), "b.txt".into(), "c.txt".into()],
+            ..Default::default()
+        });
+        let notice = Notice::sent_transfer(&row, "MacBook Air");
+        assert_eq!(notice.summary, "Trip sent to MacBook Air");
+        assert_eq!(
+            notice.body,
+            "4 items couldn't be sent: a.txt, b.txt, c.txt and 1 more\n2 links skipped"
+        );
+        assert!(!notice.transient);
+        assert!(notice.actions.is_empty());
+        row.folder.as_mut().unwrap().diagnostic_count = 1;
+        row.folder
+            .as_mut()
+            .unwrap()
+            .diagnostics
+            .push("Docs: Couldn't enumerate subtree".into());
+        assert!(
+            !Notice::sent_transfer(&row, "MacBook Air")
+                .body
+                .contains("Couldn't enumerate subtree")
+        );
+        let refused = Notice::send_failed("Trip", "Galaxy S25+", "Can't receive folders yet");
+        assert_eq!(refused.body, "Galaxy S25+ can't receive folders yet");
+        assert!(refused.actions.is_empty());
+        let changed = Notice::send_failed(
+            "Trip",
+            "Desktop",
+            &crate::folders::SourceChanged.to_string(),
+        );
+        assert_eq!(changed.body, crate::folders::SourceChanged.to_string());
+        assert!(changed.actions.is_empty());
+        row.folder.as_mut().unwrap().links = 0;
+        row.folder.as_mut().unwrap().special = 1;
+        assert!(
+            Notice::sent_transfer(&row, "Desktop")
+                .body
+                .ends_with("1 special file skipped")
+        );
+        row.folder.as_mut().unwrap().failed = 1204;
+        assert!(
+            Notice::sent_transfer(&row, "Desktop")
+                .body
+                .starts_with("1,204 items couldn't be sent:")
+        );
+        let empty = Notice::admission_failure("Trip is empty");
+        assert_eq!(empty.summary, "Trip is empty");
+        assert!(empty.body.is_empty());
+        assert_eq!(
+            send_failure_reason("MacBook Air", "Needs 1.8 GB free"),
+            "MacBook Air needs 1.8 GB free"
+        );
+    }
+    #[test]
+    fn blocked_copy_is_device_neutral_and_decision_actions_are_negative_first() {
+        let blocked = Notice::blocked("127.0.0.1");
+        assert_eq!(blocked.summary, "Blocked an unpaired device");
+        assert_eq!(blocked.actions, vec![("pair", "Add Device…")]);
+        let request = Notice::link_request(&["Computer".into()], Vec::new());
+        assert_eq!(
+            request.actions,
+            vec![("deny", "Don't Allow"), ("allow", "Allow")]
+        );
+    }
+
     #[test]
     fn file_copy_and_save_failure_copy() {
         let n = Notice::file(
@@ -355,6 +641,18 @@ mod tests {
         assert_eq!(failed.body, "MacBook Air's disk is full");
         assert_eq!(failed.actions, vec![("retry", "Retry")]);
         assert!(!failed.transient);
+        let joined = Notice::joined(
+            pneu_proto::Id::from_bytes([7; 16]),
+            "MacBook\nAir",
+            "Galaxy <S25+>",
+        );
+        assert_eq!(
+            (joined.summary.as_str(), joined.body.as_str()),
+            ("MacBook Air joined", "Added via Galaxy &lt;S25+&gt;")
+        );
+        assert_eq!(joined.actions, vec![("remove", "Remove…")]);
+        assert_eq!(joined.device, Some(pneu_proto::Id::from_bytes([7; 16])));
+        assert!(!joined.transient);
         assert_eq!(
             Notice::unpaired("Office-PC").summary,
             if cfg!(target_os = "macos") {
@@ -422,5 +720,65 @@ mod tests {
         assert!(Notice::text("https://example.com more").actions.is_empty());
         assert_eq!(Notice::text("<a>\n2\n3\n4").body, "&lt;a&gt;\n2\n3");
         assert_eq!(Notice::text(&"é".repeat(220)).body.chars().count(), 200);
+    }
+
+    #[test]
+    fn phone_notifications_blank_content_has_app_and_generic_body() {
+        for blank in [None, Some(String::new()), Some("  \t".into())] {
+            let n = PhoneNotice {
+                app: "Chat<&>".into(),
+                title: blank.clone(),
+                text: blank,
+                icon: None,
+            };
+            assert!(n.app_only());
+            let linux = n.linux();
+            assert_eq!(linux.summary, escape("Chat<&>"));
+            assert_eq!(linux.body, "New notification");
+            assert_eq!(
+                n.macos(),
+                ("Chat<&>".into(), "".into(), "New notification".into())
+            );
+        }
+    }
+    #[test]
+    fn phone_notifications_linux_and_macos_projections() {
+        assert_eq!(phone_identifier("session-key"), "pneu-mirror-session-key");
+        assert_ne!(
+            phone_identifier("session-key"),
+            phone_identifier("next-session-key")
+        );
+        let mut n = PhoneNotice {
+            app: "Chat<&>".into(),
+            title: None,
+            text: None,
+            icon: None,
+        };
+        let linux = n.linux();
+        assert_eq!(linux.summary, escape("Chat<&>"));
+        assert_eq!(linux.body, "New notification");
+        assert!(linux.actions.is_empty());
+        assert_eq!(linux.urgency, 1);
+        assert_eq!(linux.expires, -1);
+        assert_eq!(
+            n.macos(),
+            ("Chat<&>".into(), "".into(), "New notification".into())
+        );
+        n.title = Some("Ana<&>".into());
+        n.text = Some("¿Llegaste? <b>".into());
+        let linux = n.linux();
+        assert_eq!(linux.summary, escape("Ana<&>"));
+        assert_eq!(linux.body, escape("¿Llegaste? <b>"));
+        assert!(linux.actions.is_empty());
+        // UserNotifications takes plain strings, so markup stays literal.
+        assert_eq!(
+            n.macos(),
+            ("Ana<&>".into(), "Chat<&>".into(), "¿Llegaste? <b>".into())
+        );
+        n.title = None;
+        assert_eq!(n.macos().0, "");
+        assert_eq!(n.linux().summary, "");
+        n.text = Some(String::new());
+        assert!(n.app_only());
     }
 }

@@ -194,8 +194,9 @@ impl Outbox {
                 this.validate_artifact(&tx, &id, artifact.as_ref())?;
                 let active:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox_deliveries d JOIN outbox_artifacts a ON a.id=d.artifact WHERE a.operation=? AND (? IS NULL OR a.id=?) AND d.state IN ('sending','queued')) OR (? IS NULL AND EXISTS(SELECT 1 FROM outbox_operations WHERE id=? AND state='staging'))",params![id.as_str(),artifact.as_ref().map(Id::as_str),artifact.as_ref().map(Id::as_str),artifact.as_ref().map(Id::as_str),id.as_str()],|r|r.get(0))?;
                 ensure!(!active,"operation is still active");
+                tx.execute("INSERT OR IGNORE INTO file_pending_cancels SELECT d.device,d.artifact,d.generation FROM outbox_deliveries d JOIN outbox_artifacts a ON a.id=d.artifact WHERE a.operation=? AND (? IS NULL OR a.id=?) AND d.state NOT IN ('sent','cancelled','skipped') AND d.resume=1",params![id.as_str(),artifact.as_ref().map(Id::as_str),artifact.as_ref().map(Id::as_str)])?;
                 // A hidden failed delivery must not retain queue capacity forever.
-                tx.execute("UPDATE outbox_deliveries SET state='cancelled',error=NULL WHERE artifact IN (SELECT id FROM outbox_artifacts WHERE operation=? AND (? IS NULL OR id=?)) AND state NOT IN ('sent','cancelled')", params![id.as_str(),artifact.as_ref().map(Id::as_str),artifact.as_ref().map(Id::as_str)])?;
+                tx.execute("UPDATE outbox_deliveries SET state='cancelled',error=NULL WHERE artifact IN (SELECT id FROM outbox_artifacts WHERE operation=? AND (? IS NULL OR id=?)) AND (state NOT IN ('sent','cancelled','skipped') OR error='Old device replaced')", params![id.as_str(),artifact.as_ref().map(Id::as_str),artifact.as_ref().map(Id::as_str)])?;
                 if let Some(artifact) = &artifact {
                     tx.execute("INSERT OR IGNORE INTO outbox_artifact_dismissed(artifact) VALUES(?)",[artifact.as_str()])?;
                 } else {
@@ -223,7 +224,7 @@ impl Outbox {
                 drop(q);
                 for (device,generation,session) in rows {
                     if !live.iter().any(|(d,g,s)|d.as_str()==device && *g==generation as u64 && *s==session as u64) {
-                        c.execute("UPDATE outbox_deliveries SET state='queued',error=NULL,retry_at=0 WHERE device=? AND generation=? AND session=? AND state='sending'",params![device,generation,session])?;
+                        c.execute("UPDATE outbox_deliveries SET state=?,error='Connection lost',retry_at=0 WHERE device=? AND generation=? AND session=? AND state='sending'",params![this.disconnected_state(),device,generation,session])?;
                     }
                 }
                 Ok(())

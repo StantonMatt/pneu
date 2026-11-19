@@ -2,6 +2,7 @@ package io.github.stantonmatt.pneu.connection
 
 import io.github.stantonmatt.pneu.data.*
 import io.github.stantonmatt.pneu.features.DeliveryPolicy
+import io.github.stantonmatt.pneu.features.isFolder
 import java.util.concurrent.atomic.AtomicInteger
 
 /** Cancellation before the first frame is local; an emitted text keeps its receipt. */
@@ -31,7 +32,8 @@ internal object EmissionPolicy {
         current.state in setOf("waiting","failed") && current.mediaId==selected.mediaId && current.transferId==selected.transferId &&
         current.revision==selected.revision && !newerText &&
         (if(current.kind=="text")"clipboard_text" in capabilities else
-            "files" in capabilities && (current.kind!="clipboard_image" || "clipboard_image" in capabilities)) &&
+            "files" in capabilities && (current.kind!="clipboard_image" || "clipboard_image" in capabilities) &&
+            (!current.isFolder() || capabilities.containsAll(setOf(io.github.stantonmatt.pneu.protocol.CAP_FOLDER,io.github.stantonmatt.pneu.protocol.CAP_FILE_RESUME)))) &&
         !DeliveryPolicy.hold(current.kind,current.automatic,p.paused,mobile,p.originals,(current.attempted || current.payloadAttempted),current.optimized) &&
         (current.kind=="text" || !DeliveryPolicy.optimize(current.kind,current.mime,mobile,p.originals,(current.attempted || current.payloadAttempted),current.optimized))
 }

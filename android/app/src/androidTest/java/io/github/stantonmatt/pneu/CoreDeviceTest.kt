@@ -109,7 +109,7 @@ class CoreDeviceTest {
         click("Unpair");click("Unpair")
         withTimeout(3000) { while(context.graph.prefs.value.peer != null) delay(50) }
         delay(1200)
-        assertTrue(device.findObject(androidx.test.uiautomator.UiSelector().text("Scan the QR code on your computer")).exists())
+        assertTrue(device.findObject(androidx.test.uiautomator.UiSelector().text("Scan the QR code in Pneu on your computer")).exists())
         assertTrue(context.graph.queue.pending().isEmpty())
         assertNull(context.graph.queue.find(id))
         assertFalse(File(row.path).exists())

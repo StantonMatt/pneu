@@ -61,6 +61,7 @@ pub struct Config {
     pub open_in_viewer: bool,
     pub clipboard_sync_to_phone: bool,
     pub clipboard_include_images: bool,
+    pub clipboard_history: bool,
     pub port: u16,
     /// Cache only: completed files can expire; dedupe records never expire.
     pub cache_retention_days: u32,
@@ -81,6 +82,7 @@ impl Default for Config {
             open_in_viewer: false,
             clipboard_sync_to_phone: true,
             clipboard_include_images: true,
+            clipboard_history: false,
             port: pneu_proto::DEFAULT_PORT,
             cache_retention_days: 1,
             max_file_bytes: pneu_proto::MAX_FILE_SIZE,
@@ -260,6 +262,7 @@ pub(crate) fn atomic_private_in(
 }
 /// First-writer-wins publication for durable secrets. A racing creator loads
 /// the winner instead of replacing a key another process may already use.
+#[cfg(any(unix, test))]
 pub(crate) fn atomic_private_new(path: &Path, bytes: &[u8]) -> Result<bool> {
     #[cfg(windows)]
     platform_fs::validate_path(path)?;
@@ -431,7 +434,7 @@ mod tests {
     }
     #[test]
     fn legacy_name_is_migrated_and_saved_without_changing_preferences() -> Result<()> {
-        let dir = tempfile::tempdir()?;
+        let dir = crate::test_support::scratch()?;
         let path = dir.path().join("config.toml");
         let legacy = Config {
             name: "Pneu PC".into(),

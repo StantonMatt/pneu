@@ -34,8 +34,11 @@ public class Outgoing {
     @NonNull @ColumnInfo(defaultValue = "''") public String sourceHash = "";
     @ColumnInfo(defaultValue = "0") public long revision;
     @NonNull @ColumnInfo(defaultValue = "''") public String rejectedCapabilities = "";
+    @androidx.room.ColumnInfo(defaultValue="0") public boolean sensitive;
     public long size;
     public long createdAt;
+    @ColumnInfo(defaultValue="0") public long sentBytes;
+    @ColumnInfo(defaultValue="0") public boolean resumable;
     public long nextAttempt;
     public int mismatches;
 }

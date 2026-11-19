@@ -81,13 +81,26 @@ pub async fn run(
     if core.paired_devices().is_empty() {
         core.request_window(false);
     }
+    if let Err(error) = actions.restore_setup_notices().await {
+        eprintln!("pneud: previous setup notifications: {error:#}");
+    }
+    post_joined(&core, &actions).await;
+    let mut requests = Some(super::window_setup::Requests::default());
+    let mut request_job: Option<futures_util::future::BoxFuture<'static, super::window_setup::Requests>> = None;
     loop {
         if *stop.borrow() {
             break;
         }
         let mut refresh_icons = false;
         let mut update_tray = true;
+        let mut sync_requests = true;
         tokio::select! {
+            state = async { request_job.as_mut().expect("link request job").await }, if request_job.is_some() => {
+                request_job = None;
+                requests = Some(state);
+                sync_requests = false;
+            },
+
             _=stop.changed()=>break,
             result=async {folder_open.as_mut().expect("folder open").await},if folder_open.is_some()=>{
                 folder_open=None;
@@ -107,22 +120,28 @@ pub async fn run(
             Some(())=theme_rx.recv()=>{themes.changed(Instant::now());refresh_icons=true;},
             event=events.recv()=>match event {
                 Ok(Event::Error {message,..})=>eprintln!("pneud: {message}"),
-                Ok(Event::Blocked {address})=>{
+                Ok(Event::Blocked {address,fingerprint})=>{
                     if last_blocked.is_none_or(|time:Instant|time.elapsed()>=Duration::from_secs(3600)) {
-                        last_blocked=Some(Instant::now());let _=actions.notice(Notice::blocked(&address),Vec::new(),None,0,None).await;
+                        last_blocked=Some(Instant::now());let mut notice=Notice::blocked(&address);notice.blocked_pin=Some(fingerprint);let _=actions.notice(notice,Vec::new(),None,0,None).await;
                     }
                 }
                 Ok(Event::ComputerPaired {name,..})=>{
                     if !core.window_focused() {let _=actions.notice(Notice::paired(&name),Vec::new(),None,0,None).await;}
                 },
                 Ok(Event::RemoteUnpaired {name})=>{let _=actions.notice(Notice::unpaired(&name),Vec::new(),None,0,None).await;},
+                Ok(Event::Unpaired {device})=>{let _=actions.withdraw_device_notices(&device).await;},
+                Ok(Event::Paired {..})=>post_joined(&core,&actions).await,
                 Ok(event @ (Event::ConnectionChanged {..}|Event::PhonePaused {..}|Event::ConfigChanged))=>clipboard_policy_event(&core,&event),
                 Err(tokio::sync::broadcast::error::RecvError::Closed)=>break,
                 Ok(event)=>update_tray=event_updates_tray(&event),
                 Err(_)=>update_tray=false,
             },
             command=rx.recv()=>match command {
+                Some(Command::SetupDecision {requests, allow})=>super::window_setup::decide(&core, &requests, allow).await,
                 Some(Command::Window { activation_token })=>core.request_window_with_activation(false, activation_token),
+                Some(Command::Ring {device,connection,action})=>{if let Err(error)=core.ring_phone(device,connection,action) { eprintln!("pneud: ring unavailable: {error}"); }},
+                Some(Command::ShowClipboardHistory)=>core.request_history_window(),
+                Some(Command::CopyClipboardHistory(id))=>{if let Err(error)=core.copy_clipboard_history(id).await {eprintln!("pneud: clipboard copy failed: {error}");}},
                 Some(Command::ChooseFolder)=>core.request_window(true),
                 Some(Command::Quit)=>core.request_shutdown(),
                 Some(Command::Toggle(toggle))=>{
@@ -150,8 +169,14 @@ pub async fn run(
                     sending.spawn(async move { if let Err(error)=core.retry_transfer_artifact(operation,Some(artifact),device).await {eprintln!("pneud: retry: {error:#}"); if core.present_send_error(error.to_string()).is_err() {core.notify_send_admission_failure(&error.to_string()).await;}} });
                 },
                 Some(Command::AddDevice {activation_token})=>core.request_add_device_with_activation(activation_token),
+                Some(Command::RemoveDevice {device,activation_token})=>core.request_remove_window(device,activation_token),
                 None=>break,
             },
+        }
+            if sync_requests && request_job.is_none() && let Some(mut state) = requests.take() {
+            let core = core.clone();
+            let actions = actions.clone();
+            request_job = Some(spawn_request_job(async move { let _=actions.withdraw_known_blocked(&core).await; state.sync(&core, &actions).await; state }));
         }
         if !update_tray { continue; }
         if let Some(child) = window.as_mut()
@@ -214,6 +239,23 @@ pub async fn run(
         }).await
 }
 
+pub(crate) fn spawn_request_job(
+    job: impl std::future::Future<Output = super::window_setup::Requests> + Send + 'static,
+) -> futures_util::future::BoxFuture<'static, super::window_setup::Requests> {
+    // A selected UI event can itself await the notification mutex. Keep the
+    // sync running independently so it can finish its D-Bus call and release
+    // that mutex even while the UI loop is handling the event. The JoinSet
+    // aborts the task if the owning future is dropped on shutdown.
+    let mut jobs = tokio::task::JoinSet::new();
+    jobs.spawn(job);
+    Box::pin(async move {
+        jobs.join_next()
+            .await
+            .expect("link request task")
+            .expect("link request task panicked")
+    })
+}
+
 pub(super) fn file_recipients(
     targets: Vec<crate::outbox::SendTarget>,
     device: Option<&pneu_proto::Id>,
@@ -268,6 +310,15 @@ impl ThemeRefresh {
         self.next = now + Duration::from_secs(5);
     }
 }
+/// "{device} joined" for each device another of your devices added.
+async fn post_joined(core: &Core, actions: &DesktopActions) {
+    for joined in super::window_setup::joined(core).await {
+        let result = actions
+            .notice(joined.notice.clone(), Vec::new(), None, 0, None)
+            .await;
+        joined.posted(core, result).await;
+    }
+}
 fn event_updates_tray(event: &Event) -> bool {
     matches!(
         event,
@@ -279,7 +330,7 @@ fn event_updates_tray(event: &Event) -> bool {
     )
 }
 
-async fn open_folder(folder: &std::path::Path) -> Result<()> {
+pub(crate) async fn open_folder(folder: &std::path::Path) -> Result<()> {
     tokio::fs::create_dir_all(folder).await?;
     let uri = url::Url::from_directory_path(folder)
         .map_err(|_| anyhow::anyhow!("folder is not absolute"))?;
@@ -336,12 +387,30 @@ pub(crate) fn clipboard_policy_event(core: &Core, event: &Event) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn dropping_unpolled_request_job_cancels_sync() -> Result<()> {
+        let (owned, dropped) = tokio::sync::oneshot::channel::<()>();
+        let job = spawn_request_job(async move {
+            let _owned = owned;
+            std::future::pending::<()>().await;
+            super::super::window_setup::Requests::default()
+        });
+        drop(job);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), dropped)
+                .await?
+                .is_err()
+        );
+        Ok(())
+    }
+
     #[test]
     fn all_connected_file_targets_exclude_offline_and_ineligible_devices() {
         use crate::outbox::SendTarget;
         use pneu_proto::{Hash, Id};
         let targets: Vec<_> = (1..=4)
             .map(|n| SendTarget {
+                folder_reason: None,
                 device: Id::from_bytes([n; 16]),
                 name: format!("Device {n}"),
                 generation: n as u64,

@@ -385,6 +385,7 @@ mod privacy_tests {
         let path = dir.path().join("state.sqlite3");
         let store = Store::open(&path)?;
         let text = Clipboard {
+            sensitive: false,
             transfer_id: Id::from_bytes([1; 16]),
             text: "1234".into(),
             created_at: 1,
@@ -482,6 +483,7 @@ mod privacy_tests {
             )
             .await?;
         let text = Clipboard {
+            sensitive: false,
             transfer_id: Id::from_bytes([5; 16]),
             text: "private".into(),
             created_at: 100,

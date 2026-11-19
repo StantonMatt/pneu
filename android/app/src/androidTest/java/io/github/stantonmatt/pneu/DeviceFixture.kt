@@ -33,6 +33,19 @@ import java.util.concurrent.atomic.AtomicBoolean
  * than erase the state whose creation is the subject of the test. Permissions are
  * managed by each fixture/host (the permanent-denial class must retain its denials). */
 internal object DeviceFixture {
+    /** The emulator may boot on mobile data alone. "Can't reach" offers Try again on Wi-Fi and
+     * Wi-Fi settings off it, so tests that depend on either set the network first. */
+    fun setWifi(instrumentation:android.app.Instrumentation,on:Boolean) {
+        val device=UiDevice.getInstance(instrumentation)
+        val cm=instrumentation.targetContext.getSystemService(android.net.ConnectivityManager::class.java)
+        @Suppress("DEPRECATION") fun onWifi()=cm.allNetworks.any {cm.getNetworkCapabilities(it)?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)==true}
+        if(onWifi()==on)return
+        if(on) {device.executeShellCommand("svc wifi enable");device.executeShellCommand("cmd wifi connect-network AndroidWifi open")}
+        else device.executeShellCommand("svc wifi disable")
+        val deadline=android.os.SystemClock.elapsedRealtime()+20000
+        while(onWifi()!=on && android.os.SystemClock.elapsedRealtime()<deadline)Thread.sleep(200)
+        assertEquals("Emulator Wi-Fi",on,onWifi())
+    }
     /** Home → a device's page. The row is the lowest match: the Link card's detail can repeat the name. */
     fun openDevice(instrumentation:android.app.Instrumentation,name:String) {
         val device=UiDevice.getInstance(instrumentation)
