@@ -245,6 +245,7 @@ impl Driver {
                 continue;
             };
             match effect {
+                Effect::Diagnostic { device, message } => core.error(Some(device), message),
                 Effect::ImageTooLarge { fingerprint, offer } => {
                     if offer
                         .recipients

@@ -19,7 +19,14 @@ internal class ReceiveJournal(private val queue:QueueDao,private val storage:Rec
             peerId=row.peerId;transferId=row.transferId;hash=metadata.hash;origin="file";state="reserved";
             createdAt=metadata.createdAt;hlc=metadata.hlc.orEmpty();sourceDevice=metadata.source.orEmpty()
         },peerLimit,globalLimit)
-        if(!reserved)throw ReceiveStorageException("storage_failed")
+        if(!reserved) {
+            // Count reads are diagnostic only; failure must preserve the refusal.
+            val counts=runCatching {
+                " peer_count=${queue.receivedFileCount(row.peerId)} peer_limit=$peerLimit global_count=${queue.receivedFileCount()} global_limit=$globalLimit"
+            }.getOrDefault(" peer_count=unavailable peer_limit=$peerLimit global_count=unavailable global_limit=$globalLimit")
+            ReceiveDiagnostics.warn(row.peerId,row.transferId,row.kind,"journal_capacity",counts=counts)
+            throw ReceiveStorageException("storage_failed")
+        }
     }
     fun verified(row:ReceivedFile) {row.state="verified";queue.updateReceivedFile(row)}
     /** The verified record and destination URI precede IS_PENDING=0. Recovery can
@@ -35,7 +42,10 @@ internal class ReceiveJournal(private val queue:QueueDao,private val storage:Rec
         when(pending(row)) {
             true->storage.publish(row.uri)
             false->Unit
-            null->throw ReceiveStorageException("storage_failed")
+            null->{
+                ReceiveDiagnostics.warn(row.peerId,row.transferId,row.kind,"publication_pending")
+                throw ReceiveStorageException("storage_failed")
+            }
         }
         queue.completeReceivedFile(row)
     }

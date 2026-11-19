@@ -138,7 +138,7 @@ pub async fn run(
                 }
             },
             event=events.recv()=>match event {
-                Ok(Event::Error {message,..})=>eprintln!("pneud: {message}"),
+                Ok(Event::Error {device,message})=>eprintln!("{}",crate::diagnostics::error_line(device.as_ref(),&message)),
                 Ok(Event::Blocked {address,..})=>{
                     if last_blocked.is_none_or(|time|time.elapsed()>=Duration::from_secs(3600)) {
                         last_blocked=Some(Instant::now());queue_notice(&mut notices,actions.clone(),Notice::blocked(&address));

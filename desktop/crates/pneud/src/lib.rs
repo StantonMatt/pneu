@@ -5,6 +5,7 @@ pub mod client;
 mod clipboard_fingerprint;
 pub mod config;
 pub mod core;
+mod diagnostics;
 mod discovery;
 mod file_recipients;
 mod folders;

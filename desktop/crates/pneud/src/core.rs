@@ -1691,6 +1691,25 @@ impl Core {
             message: message.into(),
         });
     }
+    fn clipboard_rejected(&self, peer: &Hello, id: &Id, kind: &str, nack: &Nack) {
+        self.error(Some(peer.device_id.clone()), format!(
+            "clipboard delivery rejected: peer_name={:?} transfer={id} kind={kind} phase=receipt code={:?} retryable={} action=dropped",
+            peer.name, nack.code, nack.retryable,
+        ));
+    }
+    fn clipboard_refused(&self, peer: &Id, id: &Id, kind: &str, phase: &str, code: NackCode) {
+        self.error(
+            Some(peer.clone()),
+            format!(
+                "clipboard receive refused: transfer={id} kind={kind} phase={phase} code={code:?}",
+            ),
+        );
+    }
+    fn image_refused(&self, peer: &Id, begin: &FileBegin, phase: &str, code: NackCode) {
+        if begin.kind == FileKind::ClipboardImage {
+            self.clipboard_refused(peer, &begin.transfer_id, "image", phase, code);
+        }
+    }
     pub async fn start_pairing(&self) -> Result<PairingUri> {
         let addresses: Vec<String> = crate::discovery::pairing_candidates()?
             .into_iter()
@@ -4311,8 +4330,12 @@ impl Core {
                             _ => None,
                         };
                         let mut refusal = None;
-                        if let Some(hlc) = stamp && let Err(error) = store.observe_hlc(hello.device_id.clone(),hlc).await {
-                            self.error(Some(hello.device_id.clone()),format!("clipboard clock persistence failed: {error}"));
+                        if let Some(hlc) = stamp && store.observe_hlc(hello.device_id.clone(),hlc).await.is_err() {
+                            match &message {
+                                Message::Clipboard(text) => self.clipboard_refused(&hello.device_id,&text.transfer_id,"text","observe_hlc",NackCode::StorageFailed),
+                                Message::FileBegin(begin) => self.clipboard_refused(&hello.device_id,&begin.transfer_id,if begin.kind==FileKind::ClipboardImage {"image"} else {"file"},"observe_hlc",NackCode::StorageFailed),
+                                _ => {},
+                            }
                             if let Message::Clipboard(text) = &message {
                                 if !enqueue(&write_tx,nack(text.transfer_id.clone(),NackCode::StorageFailed),&mut close,Some(receipt_deadline)).await? {break;}
                                 continue;
@@ -4464,7 +4487,7 @@ impl Core {
                                 if text_pending.as_ref().is_some_and(|p|p.id==nack.transfer_id) {
                                     let id=text_pending.take().unwrap().id;
                                     self.automatic.lock().expect("automatic clipboard").receipt(&hello.device_id,store.connection_id.expect("connection id"),&id);
-                                    self.error(Some(hello.device_id.clone()),format!("clipboard delivery rejected: {:?}",nack.code));continue;
+                                    self.clipboard_rejected(hello,&id,"text",&nack);continue;
                                 }
                                 ensure!(pending.as_ref().is_some_and(|p|p.id==nack.transfer_id),"wrong or unsolicited NACK ID");
                                 let id=pending.take().unwrap().id;
@@ -4475,7 +4498,7 @@ impl Core {
                                 }
                                 self.automatic.lock().expect("automatic clipboard").receipt(&hello.device_id,store.connection_id.expect("connection id"),&id);
 
-                                self.error(Some(hello.device_id.clone()),format!("clipboard delivery rejected: {:?}",nack.code));
+                                self.clipboard_rejected(hello,&id,"image",&nack);
                             },
                             Message::Cancel(cancel)=>{
                                 ensure!(store.file_resume,"unnegotiated CANCEL");
@@ -4729,7 +4752,15 @@ impl Core {
                                 state.receipt = Some(NackCode::IdConflict);
                             }
                         }
-                        Err(_) => state.receipt = Some(NackCode::StorageFailed),
+                        Err(_) => {
+                            self.image_refused(
+                                device,
+                                &begin,
+                                "receipt_lookup",
+                                NackCode::StorageFailed,
+                            );
+                            state.receipt = Some(NackCode::StorageFailed);
+                        }
                         Ok(None) => {
                             if let Some(code) = refusal {
                                 state.receipt = Some(code);
@@ -4740,6 +4771,12 @@ impl Core {
                                     .expect("pair settings")
                                     .contains_key(device)
                             {
+                                self.image_refused(
+                                    device,
+                                    &begin,
+                                    "policy_cache_missing",
+                                    NackCode::StorageFailed,
+                                );
                                 state.receipt = Some(NackCode::StorageFailed);
                             } else if !self.incoming_kind_allowed(store, device, begin.kind) {
                                 state.receipt = Some(NackCode::UnsupportedKind);
@@ -4769,7 +4806,10 @@ impl Core {
                                                             begin.transfer_id.clone(),
                                                         )
                                                         .await?;
-                                                    self.prepare_incoming(store, &mut state).await;
+                                                    self.prepare_incoming(
+                                                        store, device, &mut state,
+                                                    )
+                                                    .await;
                                                 } else {
                                                     state.config.save_to_folder = true;
                                                     state.config.save_path = root;
@@ -4797,7 +4837,9 @@ impl Core {
                                                 state.hash = hash;
                                             }
                                         }
-                                        Ok(None) => self.prepare_incoming(store, &mut state).await,
+                                        Ok(None) => {
+                                            self.prepare_incoming(store, device, &mut state).await
+                                        }
                                         Err(error) => {
                                             state.receipt = Some(
                                                 if error
@@ -4808,7 +4850,13 @@ impl Core {
                                                 } else {
                                                     crate::store::save_failure_code(&error)
                                                 },
-                                            )
+                                            );
+                                            self.image_refused(
+                                                device,
+                                                &begin,
+                                                "resume_stage",
+                                                state.receipt.unwrap(),
+                                            );
                                         }
                                     }
                                 } else {
@@ -4816,7 +4864,9 @@ impl Core {
                                         .discard_legacy_partial(device.clone(), begin.clone())
                                         .await
                                     {
-                                        Ok(()) => self.prepare_incoming(store, &mut state).await,
+                                        Ok(()) => {
+                                            self.prepare_incoming(store, device, &mut state).await
+                                        }
                                         Err(error) => {
                                             state.receipt = Some(
                                                 if error
@@ -4827,11 +4877,23 @@ impl Core {
                                                 } else {
                                                     crate::store::save_failure_code(&error)
                                                 },
-                                            )
+                                            );
+                                            self.image_refused(
+                                                device,
+                                                &begin,
+                                                "discard_partial",
+                                                state.receipt.unwrap(),
+                                            );
                                         }
                                     }
                                 }
                             } else {
+                                if begin.kind == FileKind::ClipboardImage {
+                                    self.error(Some(device.clone()), format!(
+                                        "clipboard receive refused: transfer={} kind=image phase=size_limit code=StorageFailed bytes={} limit={}",
+                                        begin.transfer_id, begin.size, state.config.max_file_bytes,
+                                    ));
+                                }
                                 state.receipt = Some(NackCode::StorageFailed);
                             }
                         }
@@ -4862,6 +4924,12 @@ impl Core {
                                 .await
                         {
                             state.receipt = Some(crate::store::save_failure_code(&error));
+                            self.image_refused(
+                                device,
+                                &begin,
+                                "initial_checkpoint",
+                                state.receipt.unwrap(),
+                            );
                         }
                         if let Some(code) = state.receipt {
                             tx.send(nack(begin.transfer_id.clone(), code)).await?;
@@ -4937,6 +5005,7 @@ impl Core {
                         .await;
                         if let Err(error) = written {
                             let code = crate::store::save_failure_code(&error);
+                            self.image_refused(device, &state.begin, "chunk_write_flush", code);
                             if state.config.save_to_folder
                                 && state.begin.folder.is_none()
                                 && state.save_error.is_none()
@@ -4988,6 +5057,12 @@ impl Core {
                             .await
                     {
                         state.receipt = Some(crate::store::save_failure_code(&error));
+                        self.image_refused(
+                            device,
+                            &state.begin,
+                            "chunk_checkpoint",
+                            state.receipt.unwrap(),
+                        );
                     }
                     self.connection_event(
                         store,
@@ -5118,6 +5193,7 @@ impl Core {
                         }
                         if let Err(error) = stored {
                             let code = crate::store::save_failure_code(&error);
+                            self.image_refused(device, &state.begin, "commit_file", code);
                             if state.config.save_to_folder
                                 && state.begin.folder.is_none()
                                 && state.save_error.is_none()
@@ -5300,10 +5376,13 @@ impl Core {
                             .await
                         {
                             Ok(receipt) => receipt,
-                            Err(error) => {
-                                self.error(
-                                    Some(device.clone()),
-                                    format!("clipboard receipt lookup failed: {error}"),
+                            Err(_) => {
+                                self.clipboard_refused(
+                                    device,
+                                    &text.transfer_id,
+                                    "text",
+                                    "receipt_lookup",
+                                    NackCode::StorageFailed,
                                 );
                                 tx.send(nack(text.transfer_id, NackCode::StorageFailed))
                                     .await?;
@@ -5323,6 +5402,13 @@ impl Core {
                                     deduplicated: true,
                                 })
                             } else {
+                                self.clipboard_refused(
+                                    device,
+                                    &text.transfer_id,
+                                    "text",
+                                    "incomplete_reservation",
+                                    NackCode::StorageFailed,
+                                );
                                 nack(text.transfer_id, NackCode::StorageFailed)
                             },
                         )
@@ -5336,6 +5422,13 @@ impl Core {
                             .expect("pair settings")
                             .contains_key(device)
                     {
+                        self.clipboard_refused(
+                            device,
+                            &text.transfer_id,
+                            "text",
+                            "policy_cache_missing",
+                            NackCode::StorageFailed,
+                        );
                         tx.send(nack(text.transfer_id, NackCode::StorageFailed))
                             .await?;
                         return Ok(());
@@ -5365,9 +5458,12 @@ impl Core {
                         }
                         Ok(Some(claim)) => claim,
                         Err(error) => {
-                            self.error(
-                                Some(device.clone()),
-                                format!("clipboard admission failed: {error}"),
+                            self.clipboard_refused(
+                                device,
+                                &text.transfer_id,
+                                "text",
+                                "admission",
+                                crate::store::save_failure_code(&error),
                             );
                             tx.send(nack(
                                 text.transfer_id,
@@ -5431,6 +5527,15 @@ impl Core {
                         Ok(outcome) => outcome,
                         Err(error) => {
                             let storage = error.is::<crate::store::ClipboardStorageFailure>();
+                            if storage {
+                                self.clipboard_refused(
+                                    device,
+                                    &text.transfer_id,
+                                    "text",
+                                    "actor_submit",
+                                    NackCode::StorageFailed,
+                                );
+                            }
                             if !storage {
                                 self.action_queue
                                     .receipt(scope, origin, ReceiptNotice::TextFailed);
@@ -5529,7 +5634,7 @@ impl Core {
         let _ = store.discard_stage(source).await;
         Ok(())
     }
-    async fn prepare_incoming(&self, store: &Store, state: &mut Incoming) {
+    async fn prepare_incoming(&self, store: &Store, device: &Id, state: &mut Incoming) {
         let result: Result<(Stage, tokio::fs::File, PathBuf)> = async {
             ensure!(
                 state.begin.size <= state.config.max_file_bytes,
@@ -5608,7 +5713,11 @@ impl Core {
                 state.file = Some(file);
                 state.destination = Some(path);
             }
-            Err(error) => state.receipt = Some(crate::store::save_failure_code(&error)),
+            Err(error) => {
+                let code = crate::store::save_failure_code(&error);
+                self.image_refused(device, &state.begin, "prepare_stage", code);
+                state.receipt = Some(code);
+            }
         }
     }
     fn queue_file_actions(
@@ -10254,7 +10363,8 @@ mod tests {
             admission: FileAdmission::New,
             config: core.config(),
         };
-        core.prepare_incoming(&core.store, &mut state).await;
+        core.prepare_incoming(&core.store, &core.identity.device_id, &mut state)
+            .await;
         assert!(state.receipt.is_none());
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
@@ -10443,6 +10553,57 @@ mod tests {
         Ok(())
     }
     include!("phone_control_tests.rs");
+    #[tokio::test]
+    async fn clipboard_nack_diagnostic_identifies_delivery_without_content() -> Result<()> {
+        let (_dir, core, device) = fixture(Arc::new(NoActions)).await?;
+        let mut peer = core.computer_hello();
+        peer.device_id = device.clone();
+        peer.name = "Fixture phone".into();
+        let clip_text = "PRIVATE clipboard fixture must never be logged";
+        let content = crate::ui::clipboard::Content::Text(clip_text.into());
+        let id = Id::from_bytes([42; 16]);
+        let Message::Nack(nack) = nack(id.clone(), NackCode::StorageFailed) else {
+            unreachable!();
+        };
+        let mut events = core.subscribe();
+        for kind in ["text", "image"] {
+            core.clipboard_rejected(&peer, &id, kind, &nack);
+            let Event::Error {
+                device: logged_peer,
+                message,
+            } = events.try_recv()?
+            else {
+                panic!("expected diagnostic event");
+            };
+            assert_eq!(logged_peer.as_ref(), Some(&device));
+            let line = crate::diagnostics::error_line(logged_peer.as_ref(), &message);
+            for field in [
+                format!("peer={device}"),
+                format!("transfer={id}"),
+                format!("kind={kind}"),
+                "peer_name=\"Fixture phone\"".into(),
+                "phase=receipt".into(),
+                "code=StorageFailed".into(),
+                "retryable=true".into(),
+                "action=dropped".into(),
+            ] {
+                assert!(line.contains(&field), "missing {field}: {line}");
+            }
+            let crate::ui::clipboard::Content::Text(private) = &content else {
+                unreachable!()
+            };
+            assert!(!line.contains(private));
+            #[cfg(target_os = "macos")]
+            assert!(
+                chrono::DateTime::parse_from_rfc3339(line.split_whitespace().nth(1).unwrap())
+                    .is_ok()
+            );
+            #[cfg(target_os = "linux")]
+            assert!(line.starts_with("pneud: peer="));
+        }
+        core.shutdown_actions().await?;
+        Ok(())
+    }
     async fn fixture(actions: Arc<dyn PcActions>) -> Result<(tempfile::TempDir, Arc<Core>, Id)> {
         let dir = crate::test_support::scratch()?;
         let core = Core::new(

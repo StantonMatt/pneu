@@ -50,10 +50,16 @@ internal class FileReceiveMachine(private val backend:ReceiveBackend,
     private val resumeBackend:suspend (ReceivedMetadata,()->Boolean)->ReceiveAdmission={meta,_->backend.admit(meta)},
     private val cancelPartial:suspend (String)->Unit={},
     private val legacyBackend:suspend (ReceivedMetadata,()->Boolean)->ReceiveAdmission={meta,_->backend.admit(meta)},
+    private val peerId:String="unknown",
     private val failure:(Exception)->String=ReceiveErrors::code) {
     private data class Slot(val metadata:ReceivedMetadata,var sink:ReceiveSink?,var reply:ReceiveReply?,
         var received:Long=0,val resumable:Boolean=false,val digest:MessageDigest=MessageDigest.getInstance("SHA-256"))
     private var slot:Slot?=null
+    private fun failureCode(metadata:ReceivedMetadata,phase:String,error:Exception):String {
+        val code=failure(error)
+        if(code=="storage_failed")ReceiveDiagnostics.warn(peerId,metadata.id,metadata.kind,phase,error)
+        return code
+    }
     private class Operation {
         @Volatile var cancelled=false
         @Volatile var failed=false
@@ -93,7 +99,7 @@ internal class FileReceiveMachine(private val backend:ReceiveBackend,
         val admission=try {if(resume)resumeBackend(meta) {operation.cancelled} else legacyBackend(meta) {operation.cancelled}}
             catch(e:CancellationException) {throw e}
             catch(e:ReceiveViolation) {throw e}
-            catch(e:Exception) {ReceiveAdmission(reply=ReceiveReply(failure(e)))}
+            catch(e:Exception) {ReceiveAdmission(reply=ReceiveReply(failureCode(meta,"admit",e)))}
         if(operation.cancelled) {admission.sink?.abort();return null}
         check((admission.sink==null)!=(admission.reply==null))
         if(resume && admission.reply?.code!=null) {retire(meta.id);return admission.reply.frame(meta.id)}
@@ -113,7 +119,7 @@ internal class FileReceiveMachine(private val backend:ReceiveBackend,
             try {sink.write(frame.data);current.digest.update(frame.data)}
             catch(e:CancellationException) {throw e}
             catch(e:Exception) {
-                current.reply=ReceiveReply(failure(e))
+                current.reply=ReceiveReply(failureCode(current.metadata,"write",e))
                 try {sink.abort()}catch(cancelled:CancellationException) {throw cancelled}catch(_:Exception) {}
             }
         }
@@ -124,6 +130,7 @@ internal class FileReceiveMachine(private val backend:ReceiveBackend,
         if(id!=current.metadata.id)throw ReceiveViolation()
         val sink=current.sink
         var preserve=false
+        var phase="seal"
         try {
             val result=when {
                 operations[id]?.failed==true->ReceiveReply("storage_failed")
@@ -132,12 +139,12 @@ internal class FileReceiveMachine(private val backend:ReceiveBackend,
                 current.received!=current.metadata.size->ReceiveReply("size_mismatch")
                 current.reply!=null->requireNotNull(current.reply)
                 current.digest.digest().hex()!=current.metadata.hash->ReceiveReply("hash_mismatch")
-                else->{requireNotNull(sink).seal();sink.commit()}
+                else->{requireNotNull(sink).seal();phase="commit";sink.commit()}
             }
             return result.frame(id)
         }catch(e:CancellationException) {preserve=true;throw e}
         catch(e:ReceiveViolation) {throw e}
-        catch(e:Exception) {return ReceiveReply(failure(e)).frame(id)}
+        catch(e:Exception) {return ReceiveReply(failureCode(current.metadata,phase,e)).frame(id)}
         finally {
             slot=null;retire(id)
             try {if(preserve)sink?.disconnect() else sink?.abort()}catch(e:CancellationException) {throw e}catch(_:Exception) {}

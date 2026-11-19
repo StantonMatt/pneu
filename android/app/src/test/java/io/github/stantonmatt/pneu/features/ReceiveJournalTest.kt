@@ -10,6 +10,7 @@ import org.junit.Assert.*
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
+import org.robolectric.shadows.ShadowLog
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
@@ -151,6 +152,7 @@ class ReceiveJournalTest {
         }finally {room.close()}
     }
     @Test fun durableCapacityKeepsReplaysAndConflictsAndRejectsFreshIdsAfterDatabaseReopen()=runBlocking<Unit>(Dispatchers.IO) {
+        ShadowLog.clear()
         val name="receive-capacity.db";context.deleteDatabase(name);val storage=Storage()
         fun open()=Room.databaseBuilder(context,QueueDatabase::class.java,name).build()
         fun add(q:QueueDao,journal:ReceiveJournal,peer:String,id:String,complete:Boolean=true):ReceivedFile {
@@ -176,6 +178,17 @@ class ReceiveJournalTest {
             assertEquals(FileAdmission.RETAINED_CONFLICT,journal.admission(a,metadata.copy(name="other")))
             try {add(q,journal,a,"5".repeat(32));fail("Durable cap after restart")}catch(_:ReceiveStorageException) {}
             assertEquals(3,q.receivedFileCount());assertEquals(3,q.receiptCount())
+            val logs=ShadowLog.getLogsForTag("PneuReceive").filter {it.msg.contains("phase=journal_capacity")}
+            assertEquals(3,logs.size)
+            assertTrue(logs[0].msg.contains("peer=$a transfer_id=${"2".repeat(32)} kind=photo"))
+            assertTrue(logs[0].msg.contains("peer_count=2 peer_limit=2 global_count=2 global_limit=3"))
+            assertTrue(logs[1].msg.contains("peer_count=0 peer_limit=2 global_count=3 global_limit=3"))
+            assertTrue(logs[2].msg.contains("peer_count=2 peer_limit=2 global_count=3 global_limit=3"))
+            for(log in logs) {
+                assertEquals(android.util.Log.WARN,log.type);assertNull(log.throwable)
+                assertFalse(log.msg.contains(metadata.name));assertFalse(log.msg.contains(metadata.hash))
+                assertFalse(log.msg.contains("content://"))
+            }
         }finally {second.close();context.deleteDatabase(name)}
     }
     @Test fun unpairPagesOnlyUnfinishedRowsAndNeverProbesCompletedHistory()=runBlocking<Unit>(Dispatchers.IO) {
