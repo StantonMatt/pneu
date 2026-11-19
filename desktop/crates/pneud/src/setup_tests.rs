@@ -32,6 +32,12 @@ impl Running {
             socket: dir.path().join("pneud.sock"),
         };
         let config = Config {
+            // Independent computers must not look like reinstalls of the same
+            // offline device while setup refreshes its HELLO connections.
+            name: format!(
+                "Computer {}",
+                dir.path().file_name().unwrap().to_string_lossy()
+            ),
             port: listener.local_addr()?.port(),
             save_path: dir.path().join("saved"),
             clipboard_mode: crate::config::ClipboardMode::Off,
@@ -82,6 +88,61 @@ async fn pair(a: &Core, b: &Core, scope: bool) -> Result<()> {
             && b.paired_devices().contains(&a.identity.device_id)
     })
     .await
+}
+
+// Matching IDs and ConnectionChanged(true) can precede setup's HELLO refresh.
+// Wait for MEMBERS receipts and settings on the current, reciprocal READY link
+// before capturing its authority or deliberately closing it.
+async fn synchronized_setup(a: &Core, b: &Core) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let mut received = true;
+            for (local, remote) in [(a, b), (b, a)] {
+                let device = remote.identity.device_id.clone();
+                received &= local
+                    .store
+                    .call(move |db| {
+                        Ok(db.query_row(
+                            concat!(
+                                "SELECT EXISTS(SELECT 1 FROM members_receipts WHERE device=? ",
+                                "AND generation=(SELECT generation FROM setup_state WHERE singleton=1))"
+                            ),
+                            [device.as_str()],
+                            |row| row.get::<_, bool>(0),
+                        )?)
+                    })
+                    .await?;
+            }
+            let ready = |local: &Core, remote: &Core| {
+                let sessions = local.sessions.lock().unwrap();
+                sessions
+                    .sessions
+                    .get(&remote.identity.device_id)
+                    .filter(|session| {
+                        session.close.borrow().is_none()
+                            && local
+                                .settings_ready
+                                .lock()
+                                .unwrap()
+                                .get(&remote.identity.device_id)
+                                == Some(&session.id)
+                    })
+                    .map(|session| session.outbound)
+            };
+            let setup = a.store.setup_state().setup_id;
+            if received
+                && setup.is_some()
+                && setup == b.store.setup_state().setup_id
+                && matches!((ready(a, b), ready(b, a)), (Some(x), Some(y)) if x != y)
+            {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("setup MEMBERS and current READY settings did not synchronize")??;
+    Ok(())
 }
 
 #[tokio::test]
@@ -798,17 +859,7 @@ async fn setup_partial_knowledge_refusals_and_established_unauthorized_retain_tr
         )
         .await
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    until(|| {
-        a.core
-            .connected_devices()
-            .contains(&b.core.identity.device_id)
-            && b.core
-                .connected_devices()
-                .contains(&a.core.identity.device_id)
-            && a.core.store.setup_state().setup_id.is_some()
-            && a.core.store.setup_state().setup_id == b.core.store.setup_state().setup_id
-    })
-    .await?;
+    synchronized_setup(&a.core, &b.core).await?;
     let generation = a.core.store.pairing_generation(&b.core.identity.device_id);
     let mut events = a.core.subscribe();
     b.core
@@ -950,6 +1001,7 @@ async fn setup_withdrawal_cancels_unrelated_preexisting_preview_without_reciproc
         .await?;
     let preview = b.core.join(&invitation.build()?).await?;
     let attempt = preview["attempt"].as_str().unwrap();
+    synchronized_setup(&a.core, &b.core).await?;
     let mut captured = b.core.store.with_current_pairing();
     captured.connection_id = Some(
         b.core
@@ -958,7 +1010,7 @@ async fn setup_withdrawal_cancels_unrelated_preexisting_preview_without_reciproc
             .unwrap()
             .sessions
             .get(&a.core.identity.device_id)
-            .unwrap()
+            .context("synchronized setup session")?
             .id,
     );
     captured.setup_generation = Some(b.core.store.setup_state().generation);

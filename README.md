@@ -160,3 +160,10 @@ The phone supports up to 16 paired computers. Each link is direct: pairing a pho
 ## License
 
 [MIT](LICENSE). The bundled Material Symbols assets are covered by their own [license](android/MATERIAL_SYMBOLS_LICENSE).
+
+## CI and releases
+
+GitHub Actions checks Linux, macOS, Windows and Android on pull requests and
+pushes to `main`. Pages deploys `site/` from `main`; `v*` tags build desktop
+artifacts and publish a GitHub Release. See [CI and releases](docs/ci.md) for
+checks, release assets and manual dry runs.
