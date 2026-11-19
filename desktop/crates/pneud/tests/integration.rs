@@ -3918,8 +3918,18 @@ async fn hello_peer_role(
     text: bool,
     role: DeviceRole,
 ) -> Result<PhoneTls> {
+    let tls = raw_connect(h, phone).await?;
+    exchange_peer_hello(h, phone, mesh, text, role, tls).await
+}
+async fn exchange_peer_hello(
+    h: &Harness,
+    phone: &Phone,
+    mesh: bool,
+    text: bool,
+    role: DeviceRole,
+    mut tls: PhoneTls,
+) -> Result<PhoneTls> {
     let mut events = h.core.subscribe();
-    let mut tls = raw_connect(h, phone).await?;
     write_frame(
         &mut tls,
         &Message::Hello(Hello {
@@ -5743,10 +5753,15 @@ async fn persisted_disabled_startup_policy_excludes_offers_before_settings_init(
         address,
         listener: h.listener,
     };
-    // Hold the new registration before settings cache initialization.
+    // Complete TLS before taking the write lock: serve's immediate maintenance
+    // tick can need the database before it accepts a connection. Send HELLO only
+    // under the lock, so registration still precedes settings initialization.
+    let tls = raw_connect(&h, &phone).await.context("startup TLS")?;
     let db = rusqlite::Connection::open(h.core.paths.data.join("state.sqlite3"))?;
     db.execute_batch("BEGIN IMMEDIATE")?;
-    let mut tls = hello_phone(&h, &phone, true, true).await?;
+    let mut tls = exchange_peer_hello(&h, &phone, true, true, DeviceRole::Phone, tls)
+        .await
+        .context("startup HELLO under settings lock")?;
     let offer = h.core.observe_clipboard_offer();
     assert!(
         offer.is_none(),
