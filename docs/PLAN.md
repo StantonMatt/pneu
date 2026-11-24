@@ -36,7 +36,7 @@ See [core.rs](../desktop/crates/pneud/src/core.rs),
 | Phone clipboard | Manual | A button, tile or share action is required |
 | Choose devices each time | Off | Otherwise use eligible connected recipients |
 | Queue for offline devices | Off | Optional on both phone and desktop; explicit file targets can queue offline |
-| Save received desktop files | On | Pictures/Pneu on Linux, Downloads/Pneu on Mac and Windows |
+| Save received desktop files | On | System pictures folder + Pneu on Linux (falling back to ~/Pictures/Pneu), Downloads/Pneu on Mac and Windows |
 | Receive notifications / copy images | On | Platform adapters apply supported actions |
 | Open images in viewer | Off | Optional |
 
