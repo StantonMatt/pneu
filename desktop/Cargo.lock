@@ -3659,6 +3659,7 @@ dependencies = [
  "block2 0.6.2",
  "cc",
  "chrono",
+ "dirs",
  "futures-util",
  "hex",
  "if-addrs 0.15.0",

@@ -47,6 +47,7 @@ rustix = { version = "1", features = ["fs", "process", "event", "system"] }
 libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+dirs = "6"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 wl-clipboard-rs = "=0.9.4"
 ksni = "0.3"
