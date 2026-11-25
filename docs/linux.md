@@ -73,6 +73,14 @@ and reinstalling restores them; it does not stop an already-running daemon. Befo
 `systemctl --user stop pneud.service` in your session. Neither uninstall route
 deletes pairings, configuration, caches or received files.
 
+## Received files
+
+The default save folder is `Pneu` inside the system pictures folder, as configured
+by `XDG_PICTURES_DIR` in `${XDG_CONFIG_HOME:-~/.config}/user-dirs.dirs` (for example,
+`~/Pictures/Pneu` or `~/Imágenes/Pneu`). If no usable pictures directory is
+configured, Pneu falls back to `~/Pictures/Pneu`. Existing saved `save_path`
+settings are preserved.
+
 ## Compositor support
 
 Supported: Plasma 6 Wayland; GNOME/Mutter lacks data-control, so file transfers can run but automatic clipboard sync and clipboard writes are unavailable.

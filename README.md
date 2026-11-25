@@ -113,7 +113,7 @@ Open **Settings** in the desktop window or Android app. Select a device to chang
 | Include images | On |
 | Choose devices each time | Off |
 | Queue for offline devices | Off |
-| Save to folder | On (`~/Pictures/Pneu` on Linux, `~/Downloads/Pneu` on Mac, `Downloads\Pneu` on Windows) |
+| Save to folder | On (Linux: system pictures folder + `Pneu`, e.g. `~/Pictures/Pneu` or `~/Imágenes/Pneu`; Mac: `~/Downloads/Pneu`; Windows: `Downloads\Pneu`) |
 | Show notifications | On |
 | Copy images to clipboard | On |
 | Open in image viewer / Open in Preview | Off |

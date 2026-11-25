@@ -139,7 +139,7 @@ A private leaf below a non-sticky writable shared directory is therefore refused
 Override every directory for private acceptance tests. The config's
 `save_path` and non-default `port` must also be explicit.
 
-Linux retains its original XDG layout, Pictures/Pneu receive default, Wayland,
+Linux retains its original XDG layout, a receive default that follows the system pictures folder, Wayland,
 D-Bus, ksni and Slint/Qt behavior. Linux-only dependencies are target-scoped;
 The daemon never creates an NSApplication or window. Its NSPasteboard adapter
 remains independent of the child; all rendered UI runs on the child's main thread.
