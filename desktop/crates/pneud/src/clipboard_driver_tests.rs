@@ -409,6 +409,8 @@ struct PayloadActions {
 }
 fn input_content(input: &ClipboardInput) -> Result<Content> {
     Ok(match input {
+        #[cfg(target_os = "linux")]
+        ClipboardInput::Files(_) => anyhow::bail!("file references cannot sync as image content"),
         ClipboardInput::Text(text) => Content::Text(text.clone()),
         ClipboardInput::Image(file, _) => Content::Image(file.read_bounded(16 * 1024 * 1024)?),
         ClipboardInput::Bytes { bytes, .. } => Content::Image(bytes.clone()),

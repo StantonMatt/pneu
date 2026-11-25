@@ -128,6 +128,8 @@ use platform_fs::unlinked_clipboard_file;
 pub enum ClipboardInput {
     Text(String),
     Image(ReceivedFile, String),
+    #[cfg(target_os = "linux")]
+    Files(Vec<ReceivedFile>),
     Bytes {
         bytes: Vec<u8>,
         mime: String,
@@ -169,6 +171,12 @@ impl PreparedClipboard {
             ClipboardInput::Text(text) => {
                 let hashes = vec![Sha256::digest(text.as_bytes()).into()];
                 (ClipboardInput::Text(text), hashes)
+            }
+            #[cfg(target_os = "linux")]
+            ClipboardInput::Files(files) => {
+                let bytes = linux::file_uri_list(&files)?;
+                let hashes = vec![Sha256::digest(&bytes).into()];
+                (ClipboardInput::Files(files), hashes)
             }
             ClipboardInput::Image(file, mime) => {
                 let hashes = vec![Sha256::digest(file.read_bounded(16 * 1024 * 1024)?).into()];

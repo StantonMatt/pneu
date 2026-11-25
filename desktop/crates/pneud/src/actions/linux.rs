@@ -124,6 +124,9 @@ impl DesktopActions {
                 "text/plain;charset=utf-8".to_owned(),
                 text.as_bytes().to_vec(),
             ),
+            ClipboardInput::Files(files) => {
+                ("application/x-pneu-files".into(), file_uri_list(files)?)
+            }
             ClipboardInput::Image(file, mime) => {
                 let file = file.clone();
                 let bytes = crate::work::blocking(self.jobs.clone(), move || {
@@ -994,11 +997,70 @@ async fn begin_open_uri_portal(
         Ok(())
     }))
 }
+// Enough for 128 Linux paths of up to PATH_MAX bytes, even if every byte is
+// percent-encoded. File references are independent of the protocol text limit.
+const MAX_CLIPBOARD_FILE_LIST_BYTES: usize = 2 * 1024 * 1024;
+
+// Do not expose a replaced file under an anchored descriptor's old pathname.
+pub(super) fn file_uri_list(files: &[ReceivedFile]) -> Result<Vec<u8>> {
+    use std::os::unix::fs::MetadataExt;
+    anyhow::ensure!(
+        !files.is_empty() && files.len() <= 128,
+        "invalid clipboard file count"
+    );
+    let mut uris = String::new();
+    for file in files {
+        let current = platform_fs::open_read(file.path())?.metadata()?;
+        let anchored = file.file.metadata()?;
+        anyhow::ensure!(
+            current.dev() == anchored.dev() && current.ino() == anchored.ino(),
+            FileUnavailable
+        );
+        let uri = url::Url::from_file_path(file.path())
+            .map_err(|_| anyhow::anyhow!("clipboard file path must be absolute"))?;
+        uris.push_str(uri.as_str());
+        uris.push_str("\r\n");
+    }
+    anyhow::ensure!(
+        uris.len() <= MAX_CLIPBOARD_FILE_LIST_BYTES,
+        "clipboard file list too large"
+    );
+    Ok(uris.into_bytes())
+}
 fn clipboard_sources(
     mime: String,
     bytes: Vec<u8>,
 ) -> Result<Vec<wl_clipboard_rs::copy::MimeSource>> {
     use wl_clipboard_rs::copy::{MimeSource, MimeType, Source};
+    if mime == "application/x-pneu-files" {
+        let uris = std::str::from_utf8(&bytes)?;
+        let entries: Vec<_> = uris.split("\r\n").filter(|s| !s.is_empty()).collect();
+        anyhow::ensure!(
+            !entries.is_empty() && entries.len() <= 128,
+            "invalid clipboard file list"
+        );
+        for entry in &entries {
+            let uri = url::Url::parse(entry)?;
+            anyhow::ensure!(
+                uri.scheme() == "file" && uri.to_file_path().is_ok(),
+                "invalid clipboard file URI"
+            );
+        }
+        let copied = format!("copy\n{}", entries.join("\n"));
+        return Ok([
+            ("text/uri-list", bytes.clone()),
+            ("application/x-kde4-urilist", bytes),
+            ("x-special/gnome-copied-files", copied.into_bytes()),
+            ("application/x-kde-cutselection", b"0".to_vec()),
+            (crate::ui::clipboard::ORIGIN_MIME, b"pneu".to_vec()),
+        ]
+        .into_iter()
+        .map(|(mime, bytes)| MimeSource {
+            source: Source::Bytes(bytes.into()),
+            mime_type: MimeType::Specific(mime.into()),
+        })
+        .collect());
+    }
     if mime == "application/x-pneu-formats" {
         anyhow::ensure!(bytes.len() >= 8, "invalid clipboard formats header");
         let length = u64::from_be_bytes(bytes[..8].try_into()?) as usize;
@@ -1037,6 +1099,32 @@ fn clipboard_sources(
     });
     Ok(sources)
 }
+fn clipboard_hashes(sources: &[wl_clipboard_rs::copy::MimeSource]) -> Vec<String> {
+    use sha2::{Digest, Sha256};
+    // Control bytes are not clipboard content: fingerprinting KDE's "0" copy
+    // marker would incorrectly suppress a later user text selection of "0".
+    sources
+        .iter()
+        .filter_map(|source| {
+            if source.mime_type
+                == wl_clipboard_rs::copy::MimeType::Specific(
+                    crate::ui::clipboard::ORIGIN_MIME.into(),
+                )
+                || source.mime_type
+                    == wl_clipboard_rs::copy::MimeType::Specific(
+                        "application/x-kde-cutselection".into(),
+                    )
+            {
+                return None;
+            }
+            if let wl_clipboard_rs::copy::Source::Bytes(bytes) = &source.source {
+                Some(hex::encode(Sha256::digest(bytes)))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
 pub fn clipboard_helper(mime: String, ticket: u128) -> Result<()> {
     use std::io::{Read, Write};
     let mut bytes = Vec::new();
@@ -1056,26 +1144,8 @@ pub fn clipboard_helper(mime: String, ticket: u128) -> Result<()> {
     );
     let mut options = wl_clipboard_rs::copy::Options::new();
     options.foreground(true);
-    use sha2::{Digest, Sha256};
     let mut sources = clipboard_sources(mime, bytes)?;
-    let hashes = sources
-        .iter()
-        .filter_map(|source| {
-            if source.mime_type
-                == wl_clipboard_rs::copy::MimeType::Specific(
-                    crate::ui::clipboard::ORIGIN_MIME.into(),
-                )
-            {
-                return None;
-            }
-            if let wl_clipboard_rs::copy::Source::Bytes(bytes) = &source.source {
-                Some(hex::encode(Sha256::digest(bytes)))
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
+    let hashes = clipboard_hashes(&sources).join(" ");
     // The daemon's ordered watcher is the sole installation witness.
     let marker = crate::ui::clipboard::install_marker(ticket);
     sources.push(wl_clipboard_rs::copy::MimeSource {
@@ -1097,6 +1167,86 @@ mod clipboard_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn received_clipboard_files_offer_escaped_uris_and_copy_semantics() -> Result<()> {
+        let dir = crate::test_support::scratch()?;
+        let mut files = Vec::new();
+        for name in ["one space.png", "two#?.jpg", "three-é.pdf"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"synthetic file")?;
+            files.push(ReceivedFile::open(&path)?);
+        }
+        let bytes = file_uri_list(&files)?;
+        let text = std::str::from_utf8(&bytes)?;
+        assert!(text.contains("one%20space.png\r\n"));
+        assert!(text.contains("two%23%3F.jpg\r\n"));
+        assert!(text.contains("three-%C3%A9.pdf\r\n"));
+        let sources = clipboard_sources("application/x-pneu-files".into(), bytes.clone())?;
+        let payload = |mime: &str| -> &[u8] {
+            let source = sources
+                .iter()
+                .find(|s| s.mime_type == wl_clipboard_rs::copy::MimeType::Specific(mime.into()))
+                .unwrap();
+            let wl_clipboard_rs::copy::Source::Bytes(bytes) = &source.source else {
+                panic!("expected bytes")
+            };
+            bytes
+        };
+        assert_eq!(sources.len(), 5);
+        let hashes = clipboard_hashes(&sources);
+        assert_eq!(hashes.len(), 3);
+        use sha2::{Digest, Sha256};
+        assert!(!hashes.contains(&hex::encode(Sha256::digest(b"0"))));
+        assert_eq!(payload("text/uri-list"), bytes);
+        assert_eq!(payload("application/x-kde4-urilist"), bytes);
+        assert_eq!(payload("application/x-kde-cutselection"), b"0");
+        assert_eq!(
+            payload("x-special/gnome-copied-files"),
+            format!(
+                "copy\n{}",
+                text.trim_end_matches("\r\n").replace("\r\n", "\n")
+            )
+            .as_bytes()
+        );
+        assert!(
+            !sources
+                .iter()
+                .any(|s| s.mime_type
+                    == wl_clipboard_rs::copy::MimeType::Specific("image/png".into()))
+        );
+        assert!(file_uri_list(&[]).is_err());
+        assert!(
+            clipboard_sources(
+                "application/x-pneu-files".into(),
+                b"https://example.invalid/\r\n".to_vec()
+            )
+            .is_err()
+        );
+        std::fs::rename(files[0].path(), dir.path().join("moved"))?;
+        std::fs::write(files[0].path(), b"replacement")?;
+        assert!(file_uri_list(&files).is_err());
+        Ok(())
+    }
+    #[test]
+    fn received_clipboard_files_fit_128_long_filenames() -> Result<()> {
+        let dir = crate::test_support::scratch()?;
+        let mut files = Vec::new();
+        for i in 0..128 {
+            let name = format!("{i:03}{}.pdf", "a".repeat(120));
+            assert_eq!(name.len(), 127);
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"synthetic file")?;
+            files.push(ReceivedFile::open(&path)?);
+        }
+        let bytes = file_uri_list(&files)?;
+        assert!(bytes.len() > pneu_proto::MAX_CLIPBOARD_BYTES);
+        assert_eq!(std::str::from_utf8(&bytes)?.lines().count(), 128);
+        assert_eq!(
+            clipboard_sources("application/x-pneu-files".into(), bytes)?.len(),
+            5
+        );
+        Ok(())
+    }
     #[test]
     fn anonymous_clipboard_backing_is_private_unlinked_and_descriptor_bound() -> Result<()> {
         use std::os::unix::fs::MetadataExt;

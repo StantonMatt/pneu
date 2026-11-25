@@ -57,6 +57,7 @@ pub struct Config {
     pub save_to_folder: bool,
     pub save_path: PathBuf,
     pub notification_preview: bool,
+    /// Linux also copies received file groups; retain the original config key.
     pub copy_image_to_clipboard: bool,
     pub open_in_viewer: bool,
     pub clipboard_sync_to_phone: bool,

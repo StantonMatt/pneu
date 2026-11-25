@@ -244,6 +244,12 @@ impl Driver {
                                 .file_io(move || {
                                     Ok(match payload.as_ref() {
                                         Payload::Content(content) => content.clone(),
+                                        #[cfg(target_os = "linux")]
+                                        Payload::Input(ClipboardInput::Files(_)) => {
+                                            anyhow::bail!(
+                                                "file references are not clipboard sync content"
+                                            )
+                                        }
                                         Payload::Input(ClipboardInput::Text(text)) => {
                                             Content::Text(text.clone())
                                         }
