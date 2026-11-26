@@ -48,6 +48,8 @@ pub(super) struct Operation {
     pub id: Id,
     pub source: Id,
     pub key: Option<Key>,
+    // Local expansion of the same received group, never a new clock.
+    pub file_group: Option<Id>,
     pub created_at: u64,
     pub content: Option<Content>,
     // Full physical payload, before outbound provenance filtering. Repairs use
@@ -123,6 +125,7 @@ pub(super) enum Event {
     Prepared {
         ticket: Ticket,
         hashes: Vec<[u8; 32]>,
+        payload: Option<Arc<Payload>>,
     },
     HistorySaved {
         ticket: Ticket,
@@ -738,6 +741,7 @@ impl State {
                     offer: None,
                     received: true,
                     legacy: false,
+                    file_group: None,
                     restore: false,
                     repair: false,
                     observation: None,
@@ -792,6 +796,7 @@ impl State {
             key: None,
             created_at: 0,
             hashes,
+            file_group: None,
             restore: content.is_some() && (observation.restore || token != self.os_token),
             content,
             payload: original.map(Payload::Content).map(Arc::new),
@@ -922,7 +927,16 @@ impl State {
                 && key
                     .as_ref()
                     .zip(self.register.as_ref())
-                    .is_some_and(|(key, current)| key <= current)
+                    .is_some_and(|(key, current)| {
+                        key < current
+                            || (key == current
+                                && !(self.os_current
+                                    && operation.file_group.is_some()
+                                    && self.current.as_ref().is_some_and(|old| {
+                                        old.file_group == operation.file_group
+                                            && old.source == operation.source
+                                    })))
+                    })
             {
                 self.finish(operation, true, false, effects);
                 continue;
@@ -1143,6 +1157,7 @@ impl State {
                         offer: Some(offer),
                         received: false,
                         legacy: false,
+                        file_group: None,
                         restore: false,
                         repair: false,
                         observation: None,
@@ -1583,7 +1598,11 @@ impl State {
                     }
                 }
             }
-            Event::Prepared { ticket, hashes } => {
+            Event::Prepared {
+                ticket,
+                hashes,
+                payload,
+            } => {
                 if self.installing.as_ref().is_some_and(|i| {
                     i.ticket == ticket
                         && i.phase == Phase::Preparing
@@ -1604,6 +1623,9 @@ impl State {
                     .as_mut()
                     .filter(|i| i.ticket == ticket && i.phase == Phase::Preparing)
                 {
+                    if let Some(payload) = payload {
+                        install.operation.payload = Some(payload);
+                    }
                     for hash in hashes {
                         if !install.operation.hashes.contains(&hash) {
                             install.operation.hashes.push(hash);

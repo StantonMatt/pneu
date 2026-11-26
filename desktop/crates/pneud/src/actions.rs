@@ -45,6 +45,10 @@ pub struct ReceivedFile {
     path: PathBuf,
     file: Arc<std::fs::File>,
     source: Option<ArrivalSource>,
+    #[cfg(target_os = "linux")]
+    clipboard_name: Option<String>,
+    #[cfg(target_os = "linux")]
+    clipboard_directory: Option<Arc<tempfile::TempDir>>,
 }
 impl ReceivedFile {
     pub(crate) fn from_file(path: PathBuf, file: std::fs::File) -> Result<Self> {
@@ -55,7 +59,16 @@ impl ReceivedFile {
             path,
             file: Arc::new(file),
             source: None,
+            #[cfg(target_os = "linux")]
+            clipboard_name: None,
+            #[cfg(target_os = "linux")]
+            clipboard_directory: None,
         })
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_clipboard_name(mut self, name: String) -> Self {
+        self.clipboard_name = Some(name);
+        self
     }
     pub(crate) fn with_source(mut self, source: ArrivalSource) -> Self {
         self.source = Some(source);

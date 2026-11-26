@@ -376,19 +376,27 @@ prevention. Choose Folder may also open behind other windows.
 ## Received files on the clipboard
 
 On Plasma 6 Wayland, **Copy received files to clipboard** copies a single image
-as image data and other files as file references. Consecutive completed transfers
-from the same device, connection and file kind form a group when each gap is
-less than four seconds, up to 30 seconds or 128 files. Every completion updates
-the clipboard with the entire group so far. Separate sends inside that window
-can combine; slow transfers can split. The wire protocol has no batch ID.
+as image data and other files as file references. Consecutive transfers
+from the same device, connection and file kind form a group when the next begins
+less than four seconds after the preceding completion, up to 30 seconds between
+starts or 128 files. Slow transfers keep the group captured when they began.
+Every completion updates the entire group while it remains the clipboard winner;
+newer copied content takes precedence. On mesh links, a group uses its first
+file's sender BEGIN stamp, or its receive-start time for an unclocked regular
+file. Images without a sender stamp are not copied. Group expansions retain
+that first ordering key. Legacy links retain their existing effect-boundary
+clock behavior. Separate sends inside that window can combine.
+The wire protocol has no batch ID.
 
 File groups offer `text/uri-list` (CRLF-separated, percent-encoded `file://` URLs),
 `application/x-kde4-urilist`, `x-special/gnome-copied-files` with `copy` semantics,
 and `application/x-kde-cutselection=0`. Chromium's Wayland
 [`ClipboardOzone::ReadFilenames`](https://source.chromium.org/chromium/chromium/src/+/main:ui/base/clipboard/clipboard_ozone.cc)
-reads `text/uri-list`. Files must remain at their received paths to paste.
-The existing `copy_image_to_clipboard` configuration key and saved choice are
-preserved. macOS and Windows retain their single-image behavior.
+reads `text/uri-list`. Saved files must remain at their received paths to paste.
+Cached files use private temporary links with the original filename until the
+clipboard offer closes. The existing `copy_image_to_clipboard` configuration key and saved choice are
+preserved. macOS and Windows retain **Copy images to clipboard** and their
+single-image behavior.
 
 The opt-in Chrome paste check runs in a private virtual KWin compositor with a
 throwaway browser profile and loopback test page (requires Chrome, Node 22+,

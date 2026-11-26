@@ -449,6 +449,15 @@ impl Driver {
                             handle.event(Event::Prepared {
                                 ticket,
                                 hashes: fingerprint_key.hashes(&prepared.hashes),
+                                // File aliases are part of the physical offer. Repairs
+                                // must retain these exact paths and their lifetime.
+                                payload: match prepared.input() {
+                                    #[cfg(target_os = "linux")]
+                                    ClipboardInput::Files(_) => {
+                                        Some(Arc::new(Payload::Input(prepared.input().clone())))
+                                    }
+                                    _ => None,
+                                },
                             });
                             let commit = tokio::select! {biased;
                                 _=stopped.changed()=>false,

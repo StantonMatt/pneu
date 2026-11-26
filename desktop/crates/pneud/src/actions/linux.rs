@@ -119,6 +119,18 @@ impl DesktopActions {
         *self.commands.lock().expect("UI commands") = Some(commands);
     }
     async fn prepare_copy(&self, input: ClipboardInput, ticket: u128) -> Result<PreparedClipboard> {
+        let input = match input {
+            ClipboardInput::Files(files) => {
+                let cache = self.cache.clone();
+                ClipboardInput::Files(
+                    crate::work::blocking(self.jobs.clone(), move || {
+                        named_clipboard_files(files, &cache)
+                    })
+                    .await??,
+                )
+            }
+            input => input,
+        };
         let (mime, bytes) = match &input {
             ClipboardInput::Text(text) => (
                 "text/plain;charset=utf-8".to_owned(),
@@ -997,12 +1009,57 @@ async fn begin_open_uri_portal(
         Ok(())
     }))
 }
+// File-list consumers display the URI basename. Keep cache names internal and
+// retain private hard links for exactly the lifetime of the prepared offer.
+pub(crate) fn named_clipboard_files(
+    files: Vec<ReceivedFile>,
+    cache: &Path,
+) -> Result<Vec<ReceivedFile>> {
+    use std::os::unix::fs::MetadataExt;
+    files
+        .into_iter()
+        .map(|mut file| {
+            let Some(name) = file.clipboard_name.take() else {
+                return Ok(file);
+            };
+            anyhow::ensure!(
+                Path::new(&name).file_name() == Some(std::ffi::OsStr::new(&name))
+                    && name != "."
+                    && name != "..",
+                "invalid clipboard filename"
+            );
+            // Startup already sweeps private staging directories, including
+            // aliases left by a crashed clipboard owner.
+            let folder = crate::storage::Folder::open(cache, false)?;
+            crate::storage::staging_directory(&folder)?;
+            let directory = Arc::new(
+                tempfile::Builder::new()
+                    .prefix(".pneu-clipboard-")
+                    .tempdir_in(cache.join(crate::storage::STAGING_DIR))?,
+            );
+            let path = directory
+                .path()
+                .join(crate::storage::local_name(&name, 255));
+            std::fs::hard_link(file.path(), &path)?;
+            let named = platform_fs::open_read(&path)?.metadata()?;
+            let anchored = file.file.metadata()?;
+            anyhow::ensure!(
+                named.dev() == anchored.dev() && named.ino() == anchored.ino(),
+                FileUnavailable
+            );
+            file.path = path;
+            file.clipboard_directory = Some(directory);
+            Ok(file)
+        })
+        .collect()
+}
+
 // Enough for 128 Linux paths of up to PATH_MAX bytes, even if every byte is
 // percent-encoded. File references are independent of the protocol text limit.
 const MAX_CLIPBOARD_FILE_LIST_BYTES: usize = 2 * 1024 * 1024;
 
 // Do not expose a replaced file under an anchored descriptor's old pathname.
-pub(super) fn file_uri_list(files: &[ReceivedFile]) -> Result<Vec<u8>> {
+pub(crate) fn file_uri_list(files: &[ReceivedFile]) -> Result<Vec<u8>> {
     use std::os::unix::fs::MetadataExt;
     anyhow::ensure!(
         !files.is_empty() && files.len() <= 128,
@@ -1167,6 +1224,27 @@ mod clipboard_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cached_clipboard_files_keep_real_names_and_release_private_links() -> Result<()> {
+        let dir = crate::test_support::scratch()?;
+        let path = dir.path().join(".pneu-cache-random-documento.pdf");
+        std::fs::write(&path, b"%PDF fixture")?;
+        let input = ReceivedFile::open(&path)?.with_clipboard_name("documento.pdf".into());
+        let files = named_clipboard_files(vec![input], dir.path())?;
+        let link = files[0].path().to_owned();
+        assert_eq!(link.file_name().unwrap(), "documento.pdf");
+        let list = String::from_utf8(file_uri_list(&files)?)?;
+        assert!(list.ends_with("/documento.pdf\r\n"));
+        assert!(!list.contains(".pneu-cache-"));
+        std::fs::remove_file(&path)?;
+        assert_eq!(std::fs::read(&link)?, b"%PDF fixture");
+        let clone = files.clone();
+        drop(files);
+        assert!(link.exists());
+        drop(clone);
+        assert!(!link.parent().unwrap().exists());
+        Ok(())
+    }
     #[test]
     fn received_clipboard_files_offer_escaped_uris_and_copy_semantics() -> Result<()> {
         let dir = crate::test_support::scratch()?;

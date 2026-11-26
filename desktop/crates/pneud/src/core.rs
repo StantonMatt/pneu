@@ -234,6 +234,8 @@ struct ActionJob {
     save_error: Option<NackCode>,
     #[cfg(target_os = "linux")]
     clipboard_files: Arc<Vec<ReceivedFile>>,
+    #[cfg(target_os = "linux")]
+    clipboard_order: Option<ReceivedClipboardOrder>,
 }
 impl ActionJob {
     fn saved(&self) -> bool {
@@ -260,7 +262,7 @@ struct ReceiptJob {
     notice: ReceiptNotice,
 }
 enum NotificationJob {
-    File(ActionJob, DesktopAction),
+    File(Box<ActionJob>, DesktopAction),
     Receipt(ReceiptJob),
     Delivery(crate::outbox::Transfer, String),
 }
@@ -283,8 +285,19 @@ const OUTBOUND_ADMISSION_LIMIT: usize = 4;
 const TRANSPORT_LIMIT: usize = SESSION_LIMIT + ADMISSION_LIMIT + OUTBOUND_ADMISSION_LIMIT;
 const NOTIFICATION_LIMIT: usize = 16;
 const EXPLICIT_IMAGE_LIMIT: usize = 8;
-// FILE_BEGIN has no batch id. Collect before latest-wins action coalescing.
+// FILE_BEGIN has no batch id. Freeze ordering and group membership at BEGIN,
+// before a slow transfer or latest-wins action coalescing can change either.
 #[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct ReceivedClipboardOrder {
+    id: Id,
+    key: clipboard_actor::Key,
+    began: Instant,
+    started: Instant,
+}
+// Retain only completed files; an in-flight continuation owns its own snapshot.
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
 struct ReceivedClipboardGroup {
     job: ActionJob,
     started: Instant,
@@ -298,11 +311,15 @@ impl ReceivedClipboardGroup {
             && self.job.origin.connection_id == job.origin.connection_id
             && self.job.metadata.kind == job.metadata.kind
             && job
-                .arrived
+                .clipboard_order
+                .as_ref()
+                .map_or(job.arrived, |o| o.began)
                 .checked_duration_since(self.job.arrived)
                 .is_some_and(|gap| gap < Duration::from_secs(4))
             && job
-                .arrived
+                .clipboard_order
+                .as_ref()
+                .map_or(job.arrived, |o| o.began)
                 .checked_duration_since(self.started)
                 .is_some_and(|span| span < Duration::from_secs(30))
             && self.job.clipboard_files.len() < 128
@@ -323,6 +340,75 @@ struct ActionQueue {
     changed: Notify,
 }
 impl ActionQueue {
+    #[cfg(target_os = "linux")]
+    async fn begin_clipboard_file(
+        &self,
+        store: &Store,
+        scope: &ActionScope,
+        origin: &ActionOrigin,
+        metadata: &FileBegin,
+    ) -> Result<(ReceivedClipboardOrder, Arc<Vec<ReceivedFile>>)> {
+        let now = Instant::now();
+        {
+            let pending = self.pending.lock().expect("pending actions");
+            let previous = pending.received_group.as_ref().filter(|g| {
+                g.job.scope.allows(&g.job.origin)
+                    && Arc::ptr_eq(&g.job.scope.active, &scope.active)
+                    && g.job.origin.device == origin.device
+                    && g.job.origin.connection_id == origin.connection_id
+                    && g.job.metadata.kind == metadata.kind
+                    && now.duration_since(g.job.arrived) < Duration::from_secs(4)
+                    && now.duration_since(g.started) < Duration::from_secs(30)
+                    && g.job.clipboard_files.len() < 128
+            });
+            if let Some(g) = previous
+                && let Some(order) = &g.job.clipboard_order
+            {
+                let mut order = order.clone();
+                order.began = now;
+                return Ok((order, g.job.clipboard_files.clone()));
+            }
+        }
+        // Reserve receiver order now, above the shared HLC (including an
+        // applied peer clock ahead of wall time), never at transfer completion.
+        let key = if let Some(hlc) = metadata.hlc {
+            clipboard_actor::Key {
+                hlc,
+                source: origin.device.clone(),
+            }
+        } else if origin.mesh && metadata.kind != FileKind::ClipboardImage {
+            store
+                .allocate_clipboard_clock(origin.device.clone(), None, |_| Ok(()))
+                .await?
+        } else {
+            clipboard_actor::Key {
+                hlc: crate::now_ms(),
+                source: origin.device.clone(),
+            }
+        };
+        Ok((
+            ReceivedClipboardOrder {
+                id: metadata.transfer_id.clone(),
+                key,
+                began: now,
+                started: now,
+            },
+            Arc::new(Vec::new()),
+        ))
+    }
+    #[cfg(target_os = "linux")]
+    fn expire_received_group(&self) -> Option<Instant> {
+        let mut pending = self.pending.lock().expect("pending actions");
+        let deadline = pending.received_group.as_ref().map(|g| {
+            (g.job.arrived + Duration::from_secs(4)).min(g.started + Duration::from_secs(30))
+        });
+        if deadline.is_some_and(|due| due <= Instant::now()) {
+            pending.received_group = None;
+            None
+        } else {
+            deadline
+        }
+    }
     /// False means the explicit request was rejected, with a best-effort
     /// failure notification queued instead. Never wait for desktop capacity.
     fn push(&self, job: ActionJob) -> bool {
@@ -333,10 +419,20 @@ impl ActionQueue {
             return true;
         }
         #[cfg(target_os = "linux")]
-        if job.metadata.kind != FileKind::ClipboardImage && job.config.copy_image_to_clipboard {
+        if job.metadata.kind != FileKind::ClipboardImage
+            && job.config.copy_image_to_clipboard
+            && !(job.origin.mesh
+                && supported_image_mime(&job.metadata.mime)
+                && job.metadata.hlc.is_none())
+        {
             let previous = pending.received_group.as_ref().filter(|g| g.accepts(&job));
-            let started = previous.map_or(job.arrived, |g| g.started);
-            if let Some(group) = previous {
+            let started = job.clipboard_order.as_ref().map_or_else(
+                || previous.map_or(job.arrived, |g| g.started),
+                |o| o.started,
+            );
+            if job.clipboard_order.is_none()
+                && let Some(group) = previous
+            {
                 job.clipboard_files = group.job.clipboard_files.clone();
             }
             Arc::make_mut(&mut job.clipboard_files).push(job.file.clone());
@@ -376,7 +472,7 @@ impl ActionQueue {
         accepted
     }
     fn notice(pending: &mut PendingActions, job: ActionJob, action: DesktopAction) {
-        Self::push_notice(pending, NotificationJob::File(job, action));
+        Self::push_notice(pending, NotificationJob::File(Box::new(job), action));
     }
     fn push_notice(pending: &mut PendingActions, job: NotificationJob) {
         if pending.notifications.len() == NOTIFICATION_LIMIT {
@@ -2417,6 +2513,7 @@ impl Core {
             offer: Some(offer),
             received: false,
             legacy: false,
+            file_group: None,
             restore: false,
             repair: false,
         };
@@ -3947,7 +4044,37 @@ impl Core {
                 Message::FileBegin(begin) => {
                     ensure!(incoming.is_none(), "second FILE_BEGIN");
                     let config = self.config();
+                    #[cfg(target_os = "linux")]
+                    let mut config = config;
+                    #[cfg(target_os = "linux")]
+                    let clipboard_receipt = if let Some(scope) = action_scope {
+                        match self
+                            .action_queue
+                            .begin_clipboard_file(
+                                store,
+                                scope,
+                                &ActionOrigin::captured(store, device),
+                                &begin,
+                            )
+                            .await
+                        {
+                            Ok(receipt) => Some(receipt),
+                            Err(error) => {
+                                // Optional clipboard ordering must not fail the file transfer.
+                                config.copy_image_to_clipboard = false;
+                                self.error(
+                                    Some(device.clone()),
+                                    format!("image clipboard unavailable: {error}"),
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let mut state = Incoming {
+                        #[cfg(target_os = "linux")]
+                        clipboard_receipt,
                         begin: begin.clone(),
                         received: 0,
                         hash: Sha256::new(),
@@ -4277,12 +4404,13 @@ impl Core {
                             let origin = ActionOrigin::captured(store, device);
                             if scope.allows(&origin) {
                                 self.queue_file_actions(
-                                    scope,
-                                    origin,
+                                    (scope, origin),
                                     file,
                                     state.begin.clone(),
                                     state.config.clone(),
                                     state.save_error,
+                                    #[cfg(target_os = "linux")]
+                                    state.clipboard_receipt.take(),
                                 );
                             }
                         }
@@ -4428,6 +4556,7 @@ impl Core {
                         offer: None,
                         received: true,
                         legacy: text.hlc.is_none(),
+                        file_group: None,
                         restore: false,
                         repair: false,
                         observation: None,
@@ -4630,20 +4759,37 @@ impl Core {
     }
     fn queue_file_actions(
         &self,
-        scope: &ActionScope,
-        origin: ActionOrigin,
+        authority: (&ActionScope, ActionOrigin),
         file: ReceivedFile,
         metadata: FileBegin,
         config: Config,
         save_error: Option<NackCode>,
+        #[cfg(target_os = "linux")] clipboard_receipt: Option<(
+            ReceivedClipboardOrder,
+            Arc<Vec<ReceivedFile>>,
+        )>,
     ) {
         // Scope is the one captured at session admission, never looked up again
         // by device ID. Enqueue cannot wait for any optional desktop action.
+        let (scope, origin) = authority;
         let error_device = origin.device.clone();
         let file = file.with_source(self.arrival_source(&origin.device));
+        #[cfg(target_os = "linux")]
+        let (clipboard_order, clipboard_files) = clipboard_receipt
+            .map_or((None, Arc::new(Vec::new())), |(order, files)| {
+                (Some(order), files)
+            });
+        #[cfg(target_os = "linux")]
+        let file = if !config.save_to_folder || save_error.is_some() {
+            file.with_clipboard_name(metadata.file_name.clone())
+        } else {
+            file
+        };
         if !self.action_queue.push(ActionJob {
             #[cfg(target_os = "linux")]
-            clipboard_files: Arc::new(Vec::new()),
+            clipboard_files,
+            #[cfg(target_os = "linux")]
+            clipboard_order,
             scope: scope.clone(),
             origin,
             path: file.path().to_owned(),
@@ -4721,31 +4867,23 @@ impl Core {
         let files = !explicit && (!image || job.clipboard_files.len() > 1);
         #[cfg(not(target_os = "linux"))]
         let files = false;
-        let local_receipt = cfg!(target_os = "linux") && !explicit;
         let copied = if (image || files) && (explicit || job.config.copy_image_to_clipboard) {
             if !job.scope.allows(&job.origin)
-                || (!local_receipt && job.origin.mesh && job.metadata.hlc.is_none())
+                || (image && job.origin.mesh && job.metadata.hlc.is_none())
             {
                 return;
             }
             let mut store = self.store.with_current_pairing();
             store.mesh = job.origin.mesh;
             let token = self.clipboard.token();
-            let operation = ClipboardOperation {
+            let mut operation = ClipboardOperation {
                 token,
                 id: job.metadata.transfer_id.clone(),
                 source: job.origin.device.clone(),
-                // Ordinary receipts use receiver order, including single images:
-                // a preceding file may have advanced past a reserved sender HLC.
-                // Explicit clipboard images retain their sender ordering.
-                key: if local_receipt {
-                    None
-                } else {
-                    job.metadata.hlc.map(|hlc| clipboard_actor::Key {
-                        hlc,
-                        source: job.origin.device.clone(),
-                    })
-                },
+                key: job.metadata.hlc.map(|hlc| clipboard_actor::Key {
+                    hlc,
+                    source: job.origin.device.clone(),
+                }),
                 created_at: job.metadata.created_at,
                 payload: None,
                 // A URI group is a different representation from the last file's
@@ -4764,11 +4902,20 @@ impl Core {
                 content: None,
                 offer: None,
                 received: true,
-                legacy: !job.origin.mesh || local_receipt,
+                legacy: !job.origin.mesh,
+                file_group: None,
                 restore: false,
                 repair: false,
                 observation: None,
             };
+            #[cfg(target_os = "linux")]
+            if !explicit
+                && job.origin.mesh
+                && let Some(order) = &job.clipboard_order
+            {
+                operation.key = Some(order.key.clone());
+                operation.file_group = Some(order.id.clone());
+            }
             let input =
                 crate::actions::ClipboardInput::Image(job.file.clone(), job.metadata.mime.clone());
             #[cfg(target_os = "linux")]
@@ -4809,7 +4956,7 @@ impl Core {
                 Err(error) => {
                     self.error(
                         Some(job.origin.device.clone()),
-                        format!("received file clipboard unavailable: {error}"),
+                        format!("image clipboard unavailable: {error}"),
                     );
                     false
                 }
@@ -4975,6 +5122,8 @@ async fn action_loop(
         if latest.as_ref().is_some_and(|j| !j.scope.allows(&j.origin)) {
             latest = None;
         }
+        #[cfg(target_os = "linux")]
+        let group_deadline = jobs.expire_received_group();
         let next = {
             let mut pending = jobs.pending.lock().expect("pending actions");
             pending
@@ -5058,6 +5207,8 @@ async fn action_loop(
             }
             continue;
         }
+        #[cfg(target_os = "linux")]
+        let deadline = deadline.into_iter().chain(group_deadline).min();
         let mut cancelled = latest.as_ref().map(|j| j.scope.cancelled.subscribe());
         tokio::select! { biased;
             _ = stop.changed() => break,
@@ -5232,6 +5383,8 @@ enum FileAdmission {
     RetainedConflict,
 }
 struct Incoming {
+    #[cfg(target_os = "linux")]
+    clipboard_receipt: Option<(ReceivedClipboardOrder, Arc<Vec<ReceivedFile>>)>,
     begin: FileBegin,
     received: u64,
     hash: Sha256,
@@ -5890,6 +6043,8 @@ mod tests {
         std::fs::write(&path, b"synthetic image")?;
         Ok(ActionJob {
             clipboard_files: Arc::new(Vec::new()),
+            #[cfg(target_os = "linux")]
+            clipboard_order: None,
             file: ReceivedFile::open(&path)?,
             path,
             scope: ActionScope::new(),
@@ -5900,6 +6055,7 @@ mod tests {
             },
             metadata: FileBegin {
                 kind: FileKind::File,
+                hlc: Some(1),
                 ..test_begin(b"synthetic image")
             },
             config: Config {
@@ -6027,113 +6183,103 @@ mod tests {
         }
     }
     #[cfg(target_os = "linux")]
+    async fn begin_received_job(store: &Store, queue: &ActionQueue, job: &mut ActionJob) {
+        let (order, files) = queue
+            .begin_clipboard_file(store, &job.scope, &job.origin, &job.metadata)
+            .await
+            .unwrap();
+        job.clipboard_order = Some(order);
+        job.clipboard_files = files;
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn received_clipboard_files_replace_identical_image_and_support_unclocked_files()
-    -> Result<()> {
-        let actions = Arc::new(ReceivedClipboardOffers::default());
-        let (dir, core, device) = fixture(actions.clone()).await?;
-        let mut job = received_clipboard_job(dir.path())?;
-        job.scope = core
-            .action_scope
-            .lock()
-            .unwrap()
-            .get(&device)
-            .unwrap()
-            .clone();
-        job.origin.device = device;
-        let queue = ActionQueue::default();
-        // Start with a clocked single image, then keep its old sender HLC to
-        // prove receipt groups still update after the receiver clock advances.
-        // Finally exercise an ordinary mesh file without any HLC.
-        job.origin.mesh = true;
-        job.metadata.hlc = Some(1);
-        for i in 0..3 {
-            let path = dir.path().join(format!("{i}.png"));
-            std::fs::write(&path, b"synthetic image")?;
-            job.file = ReceivedFile::open(&path)?;
-            job.path = path;
-            job.arrived += Duration::from_millis(100);
+    async fn received_clipboard_mixed_groups_keep_begin_order_through_slow_transfers() -> Result<()>
+    {
+        for image_first in [false, true] {
+            let actions = Arc::new(ReceivedClipboardOffers::default());
+            let (dir, core, device) = fixture(actions.clone()).await?;
+            let mut job = received_clipboard_job(dir.path())?;
+            job.scope = core.action_scope.lock().unwrap()[&device].clone();
+            job.origin.device = device;
+            let queue = ActionQueue::default();
+            let mut expected = Vec::new();
+            for index in 0..3 {
+                let image = if image_first { index != 1 } else { index != 0 };
+                job.metadata.transfer_id = Id::from_bytes([index + 10; 16]);
+                job.metadata.mime = if image {
+                    "image/png"
+                } else {
+                    "application/pdf"
+                }
+                .into();
+                // The image clock was reserved before the preceding slow PDF.
+                job.metadata.hlc = image.then_some(1);
+                let path = dir
+                    .path()
+                    .join(format!("{index}.{}", if image { "png" } else { "pdf" }));
+                std::fs::write(&path, b"synthetic image")?;
+                job.file = ReceivedFile::open(&path)?;
+                job.path = path.clone();
+                expected.push(path);
+                begin_received_job(&core.store, &queue, &mut job).await;
+                if index == 1 {
+                    // Expire the queue's idle snapshot during this transfer.
+                    tokio::time::pause();
+                    tokio::time::advance(Duration::from_secs(6)).await;
+                    assert!(queue.expire_received_group().is_none());
+                    tokio::time::resume();
+                }
+                job.arrived = Instant::now();
+                queue.push(job.clone());
+                let queued = queue.pending.lock().unwrap().automatic.take().unwrap();
+                core.file_actions(&queued, image, DesktopAction::Automatic)
+                    .await;
+                assert_eq!(actions.offers.lock().unwrap().last(), Some(&expected));
+            }
+            assert_eq!(actions.offers.lock().unwrap().len(), 3);
+            // A mesh image without a sender stamp is saved but never copied.
+            job.metadata.hlc = None;
+            job.metadata.mime = "image/png".into();
+            begin_received_job(&core.store, &queue, &mut job).await;
             queue.push(job.clone());
-            let queued = queue.pending.lock().unwrap().automatic.take().unwrap();
-            core.file_actions(&queued, true, DesktopAction::Automatic)
+            core.file_actions(&job, true, DesktopAction::Automatic)
                 .await;
+            assert_eq!(actions.offers.lock().unwrap().len(), 3);
+            core.shutdown_actions().await?;
         }
-        assert_eq!(
-            actions
-                .offers
-                .lock()
-                .unwrap()
-                .iter()
-                .map(Vec::len)
-                .collect::<Vec<_>>(),
-            [1, 2, 3]
-        );
-        job.origin.mesh = true;
-        job.metadata.hlc = None;
-        job.arrived += Duration::from_secs(5);
-        job.metadata.mime = "application/pdf".into();
-        queue.push(job.clone());
-        let queued = queue.pending.lock().unwrap().automatic.take().unwrap();
-        core.file_actions(&queued, false, DesktopAction::Automatic)
-            .await;
-        assert_eq!(actions.offers.lock().unwrap().last().unwrap().len(), 1);
-        assert_eq!(actions.offers.lock().unwrap().len(), 4);
-        // A mixed share can reserve its image HLC before a slow PDF transfer.
-        // The PDF's receiver clock must not suppress the following image group.
-        job.metadata.hlc = Some(1);
-        job.metadata.mime = "image/png".into();
-        job.arrived += Duration::from_millis(100);
-        queue.push(job);
-        let queued = queue.pending.lock().unwrap().automatic.take().unwrap();
-        core.file_actions(&queued, true, DesktopAction::Automatic)
-            .await;
-        assert_eq!(actions.offers.lock().unwrap().last().unwrap().len(), 2);
-        assert_eq!(actions.offers.lock().unwrap().len(), 5);
-        core.shutdown_actions().await?;
         Ok(())
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn received_clipboard_split_image_uses_receipt_order_but_explicit_keeps_sender_order()
-    -> Result<()> {
+    async fn received_clipboard_idle_group_releases_files_without_another_arrival() -> Result<()> {
         let actions = Arc::new(ReceivedClipboardOffers::default());
-        let (dir, core, device) = fixture(actions.clone()).await?;
+        let (dir, core, device) = fixture(actions).await?;
         let mut job = received_clipboard_job(dir.path())?;
         job.scope = core.action_scope.lock().unwrap()[&device].clone();
         job.origin.device = device;
-        job.metadata.mime = "application/pdf".into();
-        job.metadata.hlc = None;
-        let queue = ActionQueue::default();
-        queue.push(job.clone());
-        let pdf = queue.pending.lock().unwrap().automatic.take().unwrap();
-        core.file_actions(&pdf, false, DesktopAction::Automatic)
-            .await;
-        assert_eq!(actions.offers.lock().unwrap().len(), 1);
-
-        // Android reserved this HLC before transferring the preceding PDF.
-        // A four-second gap splits the image into its own single-image group.
-        job.arrived += Duration::from_secs(4);
-        job.metadata.transfer_id = Id::from_bytes([2; 16]);
-        job.metadata.mime = "image/png".into();
-        job.metadata.hlc = Some(1);
-        queue.push(job.clone());
-        let image = queue.pending.lock().unwrap().automatic.take().unwrap();
-        assert_eq!(image.clipboard_files.len(), 1);
-        core.file_actions(&image, true, DesktopAction::Automatic)
-            .await;
-        assert_eq!(actions.offers.lock().unwrap().len(), 2);
-
-        // Different bytes ensure an explicit send loses by sender ordering,
-        // rather than being skipped as an identical clipboard value.
-        job.path = dir.path().join("explicit.png");
-        std::fs::write(&job.path, b"different synthetic image")?;
-        job.file = ReceivedFile::open(&job.path)?;
-        job.metadata.kind = FileKind::ClipboardImage;
-        job.metadata.transfer_id = Id::from_bytes([3; 16]);
-        job.metadata.sha256 = test_begin(b"different synthetic image").sha256;
-        core.file_actions(&job, true, DesktopAction::Explicit).await;
-        assert_eq!(actions.offers.lock().unwrap().len(), 2);
+        // Track the idle group separately from the installed clipboard offer.
+        begin_received_job(&core.store, &core.action_queue, &mut job).await;
+        core.action_queue.push(job);
+        let files = {
+            let pending = core.action_queue.pending.lock().unwrap();
+            Arc::downgrade(&pending.received_group.as_ref().unwrap().job.clipboard_files)
+        };
+        tokio::time::timeout(Duration::from_secs(6), async {
+            while files.upgrade().is_some() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await?;
+        assert!(
+            core.action_queue
+                .pending
+                .lock()
+                .unwrap()
+                .received_group
+                .is_none()
+        );
         core.shutdown_actions().await?;
         Ok(())
     }
@@ -6165,6 +6311,7 @@ mod tests {
                 job.file = ReceivedFile::open(&path)?;
                 job.metadata = FileBegin {
                     kind: FileKind::File,
+                    hlc: Some(1),
                     mime: if i == 2 {
                         "application/pdf"
                     } else {
@@ -6173,6 +6320,7 @@ mod tests {
                     .into(),
                     ..test_begin(bytes)
                 };
+                begin_received_job(&core.store, &core.action_queue, &mut job).await;
                 core.action_queue.push(job.clone());
                 if !coalesced && i == 1 {
                     tokio::time::timeout(Duration::from_millis(500), async {
@@ -6466,6 +6614,8 @@ mod tests {
         let job = ActionJob {
             #[cfg(target_os = "linux")]
             clipboard_files: Arc::new(Vec::new()),
+            #[cfg(target_os = "linux")]
+            clipboard_order: None,
             file: ReceivedFile::from_file(dir.path().join("file"), tempfile::tempfile()?)?,
             scope: scope.clone(),
             origin: ActionOrigin {
@@ -6515,6 +6665,8 @@ mod tests {
         let current = ActionJob {
             #[cfg(target_os = "linux")]
             clipboard_files: Arc::new(Vec::new()),
+            #[cfg(target_os = "linux")]
+            clipboard_order: None,
             origin: ActionOrigin {
                 mesh: false,
                 connection_id: Some(1),
@@ -6533,6 +6685,8 @@ mod tests {
         let current = ActionJob {
             #[cfg(target_os = "linux")]
             clipboard_files: Arc::new(Vec::new()),
+            #[cfg(target_os = "linux")]
+            clipboard_order: None,
             scope: ActionScope::new(),
             origin: ActionOrigin {
                 mesh: false,
@@ -6564,6 +6718,8 @@ mod tests {
         let job = ActionJob {
             #[cfg(target_os = "linux")]
             clipboard_files: Arc::new(Vec::new()),
+            #[cfg(target_os = "linux")]
+            clipboard_order: None,
             file: ReceivedFile::open(&path)?,
             scope,
             origin: ActionOrigin {
@@ -6595,6 +6751,8 @@ mod tests {
         let explicit = ActionJob {
             #[cfg(target_os = "linux")]
             clipboard_files: Arc::new(Vec::new()),
+            #[cfg(target_os = "linux")]
+            clipboard_order: None,
             metadata: FileBegin {
                 kind: FileKind::ClipboardImage,
                 ..job.metadata.clone()
@@ -9546,6 +9704,8 @@ mod tests {
         let mut begin = test_begin(b"image");
         begin.kind = FileKind::ClipboardImage;
         let mut state = Incoming {
+            #[cfg(target_os = "linux")]
+            clipboard_receipt: None,
             begin,
             received: 0,
             hash: Sha256::new(),
@@ -10290,6 +10450,8 @@ mod tests {
         let job = ActionJob {
             #[cfg(target_os = "linux")]
             clipboard_files: Arc::new(Vec::new()),
+            #[cfg(target_os = "linux")]
+            clipboard_order: None,
             file: ReceivedFile::from_file(dir.path().join("image.png"), tempfile::tempfile()?)?,
             scope: scope.clone(),
             origin: ActionOrigin {
@@ -10347,6 +10509,8 @@ mod tests {
         let current = ActionJob {
             #[cfg(target_os = "linux")]
             clipboard_files: Arc::new(Vec::new()),
+            #[cfg(target_os = "linux")]
+            clipboard_order: None,
             origin: ActionOrigin {
                 mesh: false,
                 connection_id: Some(2),
@@ -10489,6 +10653,8 @@ mod tests {
         let job = ActionJob {
             #[cfg(target_os = "linux")]
             clipboard_files: Arc::new(Vec::new()),
+            #[cfg(target_os = "linux")]
+            clipboard_order: None,
             file: ReceivedFile::from_file(dir.path().join("image.png"), tempfile::tempfile()?)?,
             scope,
             origin: ActionOrigin::captured(&core.store, &device),
@@ -10625,11 +10791,12 @@ mod tests {
             metadata.mime = "image/png".into();
             metadata.kind = kind;
             core.queue_file_actions(
-                &admitted,
-                ActionOrigin::captured(&core.store, &device),
+                (&admitted, ActionOrigin::captured(&core.store, &device)),
                 ReceivedFile::from_file(dir.path().join("old.png"), tempfile::tempfile()?)?,
                 metadata,
                 core.config(),
+                None,
+                #[cfg(target_os = "linux")]
                 None,
             );
         }
@@ -11719,11 +11886,12 @@ mod tests {
             meta.mime = "image/png".into();
             meta.file_name = name.into();
             core.queue_file_actions(
-                &scope,
-                ActionOrigin::captured(&core.store, &device),
+                (&scope, ActionOrigin::captured(&core.store, &device)),
                 ReceivedFile::open(&path)?,
                 meta,
                 config.clone(),
+                None,
+                #[cfg(target_os = "linux")]
                 None,
             );
         }

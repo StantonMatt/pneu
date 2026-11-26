@@ -76,6 +76,7 @@ export global Ui {
     in-out property <int> drop-hover: -1;
     in-out property <[DropItem]> drop-items;
     in property <bool> is-mac: false;
+    in property <bool> is-linux: false;
     in property <bool> drop-supported: Ui.is-mac;
     in property <bool> login-available: Ui.is-mac;
     in property <bool> login-enabled;
@@ -825,7 +826,7 @@ export component PneuWindow inherits Window {
                                 }
                                 Divider {}
                                 SwitchRow {
-                                    label: "Copy received files to clipboard"; checked: Ui.copy-images;
+                                    label: Ui.is-linux ? "Copy received files to clipboard" : "Copy images to clipboard"; checked: Ui.copy-images;
                                     toggled(on) => { Ui.set-flag("copy_image_to_clipboard", on); }
                                 }
                                 Divider {}

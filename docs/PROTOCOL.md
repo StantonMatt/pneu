@@ -673,7 +673,13 @@ uses its BEGIN stamp when its deferred action runs, not FILE_END time or file
 mtime. File placement and file ACK remain durable even when its clipboard action
 is stale, disabled or fails. An image without an ordering stamp MUST NOT bypass
 this register by triggering an automatic clipboard write on a mesh link;
-non-clipboard file saving and notifications continue. For an image file that did
+non-clipboard file saving and notifications continue. This missing-stamp rule
+applies to images; ordinary files may be offered as local file references without
+a sender stamp. A Linux received-file group retains its first file's ordering
+key (the BEGIN stamp, or receive-start time for an unclocked regular file).
+Expanding that same group is allowed at the same key only while it remains the
+current clipboard value; it must never overwrite a newer local or remote copy.
+For an image file that did
 not originate as a local clipboard copy, assign its stamp once at operation
 creation using the local HLC formula, advancing `last_seen` but not the local
 applied clipboard register. This includes automatic screenshots/photos. It does

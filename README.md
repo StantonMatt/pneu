@@ -115,7 +115,7 @@ Open **Settings** in the desktop window or Android app. Select a device to chang
 | Queue for offline devices | Off |
 | Save to folder | On (Linux: system pictures folder + `Pneu`, e.g. `~/Pictures/Pneu` or `~/Imágenes/Pneu`; Mac: `~/Downloads/Pneu`; Windows: `Downloads\Pneu`) |
 | Show notifications | On |
-| Copy received files to clipboard | On (files on Linux; images on macOS/Windows) |
+| Copy received files to clipboard (Linux) / Copy images to clipboard (macOS/Windows) | On |
 | Open in image viewer / Open in Preview | Off |
 | Open at login (Mac / packaged Windows) | On at first installation/open on Mac; enabled in the Windows package |
 
