@@ -341,32 +341,23 @@ body:has([data-os=android][data-state=play]) .legal-ms{margin-top:4px}
           Coming soon</span></div>
       </article>
 
-      <!-- Linux: data-state="source" shows the build-from-source commands.
-           data-state="available" is ready for a release asset named pneu-linux-x86_64.tar.gz. -->
-      <article class="card plat" data-os="linux" data-state="source" aria-labelledby="p-linux">
+      <!-- Linux: data-state="available" downloads pneu-linux-amd64.deb from the latest GitHub release. -->
+      <article class="card plat" data-os="linux" data-state="available" aria-labelledby="p-linux">
         <div class="plat-head"><h3 id="p-linux">Linux</h3><span class="mine-tag">This device</span></div>
-        <p class="req">KDE Plasma 6 on Wayland · Tested on Kubuntu 26.04</p>
+        <p class="req">Ubuntu 24.04+ or Debian 13 · KDE Plasma 6 on Wayland · x64</p>
         <div class="act" data-when="available">
-          <a class="btn" href="https://github.com/StantonMatt/pneu/releases/latest/download/pneu-linux-x86_64.tar.gz">
+          <a class="btn" href="https://github.com/StantonMatt/pneu/releases/latest/download/pneu-linux-amd64.deb">
             <svg class="i" viewBox="0 -960 960 960" aria-hidden="true"><path d="M480-337q-8 0-15-2.5t-13-8.5L308-492q-12-12-11.5-28t11.5-28q12-12 28.5-12.5T365-549l75 75v-286q0-17 11.5-28.5T480-800q17 0 28.5 11.5T520-760v286l75-75q12-12 28.5-11.5T652-548q11 12 11.5 28T652-492L508-348q-6 6-13 8.5t-15 2.5ZM240-160q-33 0-56.5-23.5T160-240v-80q0-17 11.5-28.5T200-360q17 0 28.5 11.5T240-320v80h480v-80q0-17 11.5-28.5T760-360q17 0 28.5 11.5T800-320v80q0 33-23.5 56.5T720-160H240Z"/></svg>
             Download for Linux
           </a>
         </div>
-        <div data-when="source">
-          <div class="code">
-            <pre id="linux-cmd"><code>git clone https://github.com/StantonMatt/pneu
-cd pneu/desktop
-./install.sh</code></pre>
-            <button class="copy" type="button" data-copy="linux-cmd" aria-label="Copy commands">
-              <svg class="i cp" viewBox="0 -960 960 960" aria-hidden="true"><path d="M360-240q-33 0-56.5-23.5T280-320v-480q0-33 23.5-56.5T360-880h360q33 0 56.5 23.5T800-800v480q0 33-23.5 56.5T720-240H360Zm0-80h360v-480H360v480ZM200-80q-33 0-56.5-23.5T120-160v-520q0-17 11.5-28.5T160-720q17 0 28.5 11.5T200-680v520h400q17 0 28.5 11.5T640-120q0 17-11.5 28.5T600-80H200Zm160-240v-480 480Z"/></svg>
-              <svg class="i ok" viewBox="0 -960 960 960" aria-hidden="true"><path d="m382-354 339-339q12-12 28-12t28 12q12 12 12 28.5T777-636L410-268q-12 12-28 12t-28-12L182-440q-12-12-11.5-28.5T183-497q12-12 28.5-12t28.5 12l142 143Z"/></svg>
-            </button>
-          </div>
-          <p class="src-foot">Builds from source with Rust 1.93+ and Qt 6 development tools. <a href="https://github.com/StantonMatt/pneu#install">Build guide</a></p>
-        </div>
         <details class="more" data-when="available">
-          <summary>Build from source instead<svg class="i" viewBox="0 -960 960 960" aria-hidden="true"><path d="M480-362q-8 0-15-2.5t-13-8.5L268-557q-11-11-11-28t11-28q11-11 28-11t28 11l156 156 156-156q11-11 28-11t28 11q11 11 11 28t-11 28L508-373q-6 6-13 8.5t-15 2.5Z"/></svg></summary>
-          <p class="src-foot" style="margin:8px 4px 4px">Needs Rust 1.93+ and Qt 6 development tools. <a href="https://github.com/StantonMatt/pneu#install">Build guide</a></p>
+          <summary>Installing Pneu<svg class="i" viewBox="0 -960 960 960" aria-hidden="true"><path d="M480-362q-8 0-15-2.5t-13-8.5L268-557q-11-11-11-28t11-28q11-11 28-11t28 11l156 156 156-156q11-11 28-11t28 11q11 11 11 28t-11 28L508-373q-6 6-13 8.5t-15 2.5Z"/></svg></summary>
+          <ol class="steps">
+            <li><span>Open the .deb with your software installer or run <code>sudo apt install ./pneu-linux-amd64.deb</code>.</span></li>
+            <li><span>Open <strong>Pneu</strong> from the app menu.</span></li>
+          </ol>
+          <p class="src-foot" style="margin:8px 4px 4px">Other distributions: <a href="https://github.com/StantonMatt/pneu/releases/latest/download/pneu-linux-x86_64.tar.gz">tarball</a> or <a href="https://github.com/StantonMatt/pneu/blob/main/docs/linux.md#install">build from source</a>.</p>
         </details>
         <span class="sr-only" id="copy-status" aria-live="polite"></span>
       </article>
@@ -385,10 +376,10 @@ cd pneu/desktop
       <div class="how-grid">
         <div class="pair-block">
           <h3>Pair</h3>
-          <p>Install Pneu on your phone and computer. On the computer, choose <strong>Add device</strong> and scan the QR code with your phone.</p>
-          <p>Computers can pair with each other too.</p>
+          <p>Install Pneu on your phone and computer. On the computer, Pneu shows a QR code. Scan it with Pneu on your phone.</p>
+          <p>Pair each computer this way. Computers can also pair with each other.</p>
           <h3 class="h-connect">Connect</h3>
-          <p>Works on your home Wi-Fi. Away from home, it connects through <a href="https://tailscale.com">Tailscale</a>.</p>
+          <p>Works when your devices are on the same Wi-Fi. To connect away from home, install <a href="https://tailscale.com">Tailscale</a> on each device.</p>
         </div>
         <div>
           <h3>Send</h3>
