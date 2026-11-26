@@ -372,3 +372,37 @@ close on cancellation. Notification activation tokens are consumed for their
 associated action; missing tokens are not inherited from an earlier action.
 Tray launches have no activation token and remain subject to KWin focus
 prevention. Choose Folder may also open behind other windows.
+
+## Received files on the clipboard
+
+On Plasma 6 Wayland, **Copy received files to clipboard** copies a single image
+as image data and other files as file references. Consecutive transfers
+from the same device, connection and file kind form a group when the next begins
+less than four seconds after the preceding completion, up to 30 seconds between
+starts or 128 files. Slow transfers keep the group captured when they began.
+Every completion updates the entire group while it remains the clipboard winner;
+newer copied content takes precedence. On mesh links, a group uses its first
+file's sender BEGIN stamp, or its receive-start time for an unclocked regular
+file. Images without a sender stamp are not copied. Group expansions retain
+that first ordering key. Legacy links retain their existing effect-boundary
+clock behavior. Separate sends inside that window can combine.
+The wire protocol has no batch ID.
+
+File groups offer `text/uri-list` (CRLF-separated, percent-encoded `file://` URLs),
+`application/x-kde4-urilist`, `x-special/gnome-copied-files` with `copy` semantics,
+and `application/x-kde-cutselection=0`. Chromium's Wayland
+[`ClipboardOzone::ReadFilenames`](https://source.chromium.org/chromium/chromium/src/+/main:ui/base/clipboard/clipboard_ozone.cc)
+reads `text/uri-list`. Saved files must remain at their received paths to paste.
+Cached files use private temporary links with the original filename until the
+clipboard offer closes. The existing `copy_image_to_clipboard` configuration key and saved choice are
+preserved. macOS and Windows retain **Copy images to clipboard** and their
+single-image behavior.
+
+The opt-in Chrome paste check runs in a private virtual KWin compositor with a
+throwaway browser profile and loopback test page (requires Chrome, Node 22+,
+Python Pillow and `fusermount3`):
+
+```sh
+CARGO_TARGET_DIR="$HOME/.cache/agent-scratch/pneu/clipboard-target" cargo build -p pneud --example received_files_offer
+python3 crates/pneud/tests/linux/clipboard_files_chrome.py "$HOME/.cache/agent-scratch/pneu/clipboard-target/debug/examples/received_files_offer"
+```

@@ -44,6 +44,7 @@ fn remote(token: u64, source: u8, hlc: u64, value: &str) -> Operation {
         offer: None,
         received: true,
         legacy: false,
+        file_group: None,
         restore: false,
         repair: false,
         observation: None,
@@ -135,6 +136,7 @@ impl Compositor {
                     self.live.insert(ticket);
                     self.installed.insert(ticket, operation.clone());
                     self.pending.push_back(Event::Prepared {
+                        payload: None,
                         ticket,
                         hashes: match operation.payload.as_deref() {
                             Some(Payload::Content(content)) => self.state.hashes(content),
@@ -366,6 +368,7 @@ fn stale_read_clock_prepare_marker_and_timeout_tokens_have_no_effect() {
             }),
         },
         Event::Prepared {
+            payload: None,
             ticket: 999,
             hashes: vec![[1; 32]],
         },
@@ -557,6 +560,7 @@ fn filtered_and_targetless_local_observations_cancel_slow_preparation_and_fence_
         assert!(model.state.register.as_ref().unwrap().hlc > 100);
         let winner = model.state.register.clone();
         model.event(Event::Prepared {
+            payload: None,
             ticket: 1,
             hashes: vec![[0; 32]],
         });
@@ -940,6 +944,7 @@ fn review_stale_prepared_hashes_do_not_enter_history() {
         .map(|x| (x.id.clone(), x.hashes.clone()))
         .collect::<Vec<_>>();
     model.event(Event::Prepared {
+        payload: None,
         ticket: 1,
         hashes: vec![[99; 32]],
     });
@@ -1150,6 +1155,7 @@ fn randomized_interleavings(mut seed: u64, seconds: u64, case_limit: u64) {
                         .recipients,
                 },
                 9 => Event::Prepared {
+                    payload: None,
                     ticket: 1_000_000 + token as u128,
                     hashes: vec![[99; 32]],
                 },
@@ -1474,6 +1480,7 @@ fn probe_restart_at_each_install_and_finalize_stage() {
         let mut durable_key = None;
         if phase >= 1 {
             state.step(Event::Prepared {
+                payload: None,
                 ticket,
                 hashes: state.fingerprint_key.hashes(&op.hashes),
             });
@@ -1626,6 +1633,7 @@ fn every_install_terminal_path_retires_legacy_clock_and_ignores_late_results() {
                 }),
             },
             Event::Prepared {
+                payload: None,
                 ticket: 1,
                 hashes: vec![[99; 32]],
             },
@@ -1696,6 +1704,7 @@ fn saturated_admitted_receipts_and_local_burst_share_the_pending_cap() {
     let mut state = State::default();
     state.step(Event::Submit(remote(1, 2, 1, "same")));
     state.step(Event::Prepared {
+        payload: None,
         ticket: 1,
         hashes: vec![],
     });
@@ -1993,6 +2002,7 @@ fn repair_rejects_prepared_bytes_that_no_longer_match_the_winner() {
         .pending
         .retain(|event| !matches!(event, Event::Prepared { .. }));
     model.event(Event::Prepared {
+        payload: None,
         ticket,
         hashes: hashes(&content("changed file")),
     });
@@ -2948,4 +2958,49 @@ fn confirmed_marker_retires_provisional_observation_without_a_local_clock() {
         assert!(model.published.is_empty());
         model.consistent();
     }
+}
+
+#[test]
+fn received_file_group_expands_at_same_key_only_until_newer_content_wins() {
+    for local in [false, true] {
+        let mut c = Compositor::default();
+        let mut first = remote(1, 2, 100, "first file");
+        first.file_group = Some(id(90));
+        c.event(Event::Submit(first));
+        c.settle();
+        let key = c.state.register.clone();
+        let mut second = remote(2, 2, 100, "first and second files");
+        second.file_group = Some(id(90));
+        c.event(Event::Submit(second.clone()));
+        c.settle();
+        assert_eq!(c.os, Some(content("first and second files")));
+        assert_eq!(c.state.register, key, "expansion must not mint a new clock");
+        if local {
+            c.copy(3, Some(content("newer text")), &[2]);
+        } else {
+            c.event(Event::Submit(remote(3, 3, 101, "newer text")));
+        }
+        c.settle();
+        let current = c.state.register.clone();
+        let mut late = remote(4, 2, 100, "late third file");
+        late.file_group = Some(id(90));
+        c.event(Event::Submit(late));
+        c.settle();
+        assert_eq!(c.os, Some(content("newer text")));
+        assert_eq!(c.state.register, current);
+    }
+}
+
+#[test]
+fn unrelated_file_group_cannot_reuse_an_applied_key() {
+    let mut c = Compositor::default();
+    let mut first = remote(1, 2, 100, "first group");
+    first.file_group = Some(id(90));
+    c.event(Event::Submit(first));
+    c.settle();
+    let mut unrelated = remote(2, 2, 100, "unrelated group");
+    unrelated.file_group = Some(id(91));
+    c.event(Event::Submit(unrelated));
+    c.settle();
+    assert_eq!(c.os, Some(content("first group")));
 }

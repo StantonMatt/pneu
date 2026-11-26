@@ -244,6 +244,12 @@ impl Driver {
                                 .file_io(move || {
                                     Ok(match payload.as_ref() {
                                         Payload::Content(content) => content.clone(),
+                                        #[cfg(target_os = "linux")]
+                                        Payload::Input(ClipboardInput::Files(_)) => {
+                                            anyhow::bail!(
+                                                "file references are not clipboard sync content"
+                                            )
+                                        }
                                         Payload::Input(ClipboardInput::Text(text)) => {
                                             Content::Text(text.clone())
                                         }
@@ -443,6 +449,15 @@ impl Driver {
                             handle.event(Event::Prepared {
                                 ticket,
                                 hashes: fingerprint_key.hashes(&prepared.hashes),
+                                // File aliases are part of the physical offer. Repairs
+                                // must retain these exact paths and their lifetime.
+                                payload: match prepared.input() {
+                                    #[cfg(target_os = "linux")]
+                                    ClipboardInput::Files(_) => {
+                                        Some(Arc::new(Payload::Input(prepared.input().clone())))
+                                    }
+                                    _ => None,
+                                },
                             });
                             let commit = tokio::select! {biased;
                                 _=stopped.changed()=>false,

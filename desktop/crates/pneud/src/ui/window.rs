@@ -1126,6 +1126,8 @@ pub fn run(paths: Paths) -> Result<()> {
         let _ = c.send(Action::Close);
         slint::CloseRequestResponse::KeepWindowShown
     });
+    #[cfg(target_os = "linux")]
+    window.global::<Ui>().set_is_linux(true);
     #[cfg(target_os = "macos")]
     {
         window.global::<Ui>().set_is_mac(true);

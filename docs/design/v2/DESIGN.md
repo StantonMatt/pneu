@@ -482,7 +482,7 @@ Open Folder                         folder-open
 ──────────────
 ✓ Save to Folder
 ✓ Show Notifications
-✓ Copy Images to Clipboard
+✓ Copy Received Files to Clipboard
   Open in Image Viewer
 ──────────────
 ✓ Send Clipboard to Phone

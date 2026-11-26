@@ -24,6 +24,8 @@ struct Actions {
     install_release: tokio::sync::Notify,
     text: Mutex<Vec<String>>,
     images: Mutex<Vec<PathBuf>>,
+    #[cfg(target_os = "linux")]
+    files: Mutex<Vec<Vec<PathBuf>>>,
     image_bytes: Mutex<Vec<Vec<u8>>>,
     notices: Mutex<Vec<PathBuf>>,
     notice_mimes: Mutex<Vec<String>>,
@@ -137,6 +139,25 @@ impl PcActions for Actions {
                     "clipboard unavailable"
                 );
                 self.text.lock().unwrap().push(text.clone());
+            }
+            #[cfg(target_os = "linux")]
+            pneud::actions::ClipboardInput::Files(files) => {
+                anyhow::ensure!(
+                    !self.deny_image.load(std::sync::atomic::Ordering::SeqCst),
+                    "image copy denied"
+                );
+                self.files
+                    .lock()
+                    .unwrap()
+                    .push(files.iter().map(|f| f.path().to_owned()).collect());
+                // Existing image-action assertions observe the last image in
+                // a grouped offer; regular-file offers have their own log.
+                let file = files.last().expect("nonempty file group");
+                let bytes = file.read_bounded(16 * 1024 * 1024)?;
+                if image::guess_format(&bytes).is_ok() {
+                    self.images.lock().unwrap().push(file.path().into());
+                    self.image_bytes.lock().unwrap().push(bytes);
+                }
             }
             pneud::actions::ClipboardInput::Image(file, _) => {
                 anyhow::ensure!(
@@ -4073,6 +4094,154 @@ async fn mesh_file_images_from_computer_and_phone_use_the_same_clipboard_registe
     b.stop().await
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn unclocked_file_group_after_future_peer_copy_reserves_a_newer_begin_clock() -> Result<()> {
+    let h = Harness::mesh().await?;
+    let phone = h.phone("future-clock-phone")?;
+    h.pair(&phone).await?.close().await?;
+    let mut link = mesh_phone(&h, &phone).await?;
+    let future = pneud::now_ms() + 5_000;
+    let mut text = phone.text("earlier peer copy".into(), ClipboardOrigin::Clipboard)?;
+    text.hlc = Some(future);
+    text.source_device = Some(phone.identity.device_id.clone());
+    write_frame(&mut link, &Message::Clipboard(text)).await?;
+    assert!(matches!(wire_reply(&mut link).await?, Message::Ack(_)));
+    assert_eq!(
+        h.actions.text.lock().unwrap().last().map(String::as_str),
+        Some("earlier peer copy")
+    );
+    for index in 0..2 {
+        let bytes: &[u8] = if index == 0 {
+            b"%PDF synthetic"
+        } else {
+            b"\x89PNG\r\n\x1a\nsynthetic"
+        };
+        let mut meta = metadata(Id::from_bytes(rand::random()), bytes);
+        meta.kind = FileKind::File;
+        meta.file_name = if index == 0 {
+            "document.pdf"
+        } else {
+            "photo.png"
+        }
+        .into();
+        meta.mime = if index == 0 {
+            "application/pdf"
+        } else {
+            "image/png"
+        }
+        .into();
+        meta.hlc = (index == 1).then_some(future);
+        meta.source_device = (index == 1).then(|| phone.identity.device_id.clone());
+        assert!(matches!(
+            raw_file_reply(&mut link, &meta, bytes).await?,
+            Message::Ack(_)
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while h.actions.files.lock().unwrap().len() <= index {
+                h.actions.changed.notified().await;
+            }
+        })
+        .await?;
+        assert_eq!(
+            h.actions.files.lock().unwrap().last().unwrap().len(),
+            index + 1
+        );
+    }
+    drop(link);
+    h.stop().await
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn newer_clipboard_during_file_transfer_is_never_replaced_by_its_completion() -> Result<()> {
+    // Cover a stamped image and an unclocked regular file, including a group
+    // expansion after its first file has already reached the clipboard.
+    for image in [true, false] {
+        let h = Harness::mesh().await?;
+        let phone = h.phone("slow-file-phone")?;
+        h.pair(&phone).await?.close().await?;
+        let mut link = mesh_phone(&h, &phone).await?;
+        let bytes: &[u8] = if image {
+            b"\x89PNG\r\n\x1a\nslow image"
+        } else {
+            b"%PDF slow file"
+        };
+        for index in 0..2 {
+            let mut meta = metadata(Id::from_bytes(rand::random()), bytes);
+            meta.kind = FileKind::File;
+            meta.file_name = format!("slow-{index}.{}", if image { "png" } else { "pdf" });
+            meta.mime = if image {
+                "image/png"
+            } else {
+                "application/pdf"
+            }
+            .into();
+            meta.hlc = image.then(pneud::now_ms);
+            meta.source_device = image.then(|| phone.identity.device_id.clone());
+            let mut events = h.core.subscribe();
+            write_frame(&mut link, &Message::FileBegin(meta.clone())).await?;
+            event_matching(&mut events, |event| matches!(event,
+                pneud::Event::TransferStarted { metadata, .. } if metadata.transfer_id == meta.transfer_id)).await?;
+            if index == 1 {
+                let mut text =
+                    phone.text("copied while uploading".into(), ClipboardOrigin::Clipboard)?;
+                text.hlc = Some(pneud::now_ms().max(meta.hlc.unwrap_or(0)) + 1);
+                text.source_device = Some(phone.identity.device_id.clone());
+                write_frame(&mut link, &Message::Clipboard(text)).await?;
+                assert!(matches!(wire_reply(&mut link).await?, Message::Ack(_)));
+                assert_eq!(
+                    h.actions.text.lock().unwrap().last().map(String::as_str),
+                    Some("copied while uploading")
+                );
+            }
+            write_frame(
+                &mut link,
+                &Message::FileChunk(FileChunk {
+                    transfer_id: meta.transfer_id.clone(),
+                    offset: 0,
+                    data: bytes.to_vec(),
+                }),
+            )
+            .await?;
+            write_frame(
+                &mut link,
+                &Message::FileEnd(FileEnd {
+                    transfer_id: meta.transfer_id,
+                }),
+            )
+            .await?;
+            assert!(matches!(wire_reply(&mut link).await?, Message::Ack(_)));
+            if index == 0 {
+                if image {
+                    h.wait_images(1).await?;
+                } else {
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while h.actions.files.lock().unwrap().is_empty() {
+                            h.actions.changed.notified().await;
+                        }
+                    })
+                    .await?;
+                }
+            }
+        }
+        // Notifications run after automatic clipboard actions in the same
+        // worker, so this proves the stale completion was actually processed.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while h.actions.notices.lock().unwrap().len() < 2 {
+                h.actions.changed.notified().await;
+            }
+        })
+        .await?;
+        assert_eq!(h.actions.images.lock().unwrap().len(), usize::from(image));
+        assert_eq!(h.actions.files.lock().unwrap().len(), usize::from(!image));
+        assert_eq!(h.saved()?.len(), 2);
+        drop(link);
+        h.stop().await?;
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn mesh_three_way_near_simultaneous_local_copies_converge_without_forwarding() -> Result<()> {
     let a = Harness::mesh().await?;
@@ -4526,6 +4695,28 @@ async fn clock_exhaustion_prevents_legacy_text_and_image_os_writes() -> Result<(
     );
     drop(db);
     drop(c);
+    #[cfg(target_os = "linux")]
+    {
+        // A failed BEGIN reservation suppresses only the optional clipboard
+        // effect: an ordinary mesh file still receives its durable ACK.
+        let mut link = mesh_phone(&h, &phone).await?;
+        let bytes = b"%PDF exhausted clock";
+        let mut begin = metadata(Id::from_bytes(rand::random()), bytes);
+        begin.file_name = "document.pdf".into();
+        begin.mime = "application/pdf".into();
+        assert!(matches!(
+            raw_file_reply(&mut link, &begin, bytes).await?,
+            Message::Ack(_)
+        ));
+        event_matching(&mut events, |event| {
+            matches!(event,
+            pneud::Event::Error { message, .. } if message.contains("clock exhausted"))
+        })
+        .await?;
+        assert!(h.actions.files.lock().unwrap().is_empty());
+        assert_eq!(h.saved()?.len(), 1);
+        drop(link);
+    }
     h.stop().await
 }
 

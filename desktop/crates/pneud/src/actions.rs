@@ -45,6 +45,10 @@ pub struct ReceivedFile {
     path: PathBuf,
     file: Arc<std::fs::File>,
     source: Option<ArrivalSource>,
+    #[cfg(target_os = "linux")]
+    clipboard_name: Option<String>,
+    #[cfg(target_os = "linux")]
+    clipboard_directory: Option<Arc<tempfile::TempDir>>,
 }
 impl ReceivedFile {
     pub(crate) fn from_file(path: PathBuf, file: std::fs::File) -> Result<Self> {
@@ -55,7 +59,16 @@ impl ReceivedFile {
             path,
             file: Arc::new(file),
             source: None,
+            #[cfg(target_os = "linux")]
+            clipboard_name: None,
+            #[cfg(target_os = "linux")]
+            clipboard_directory: None,
         })
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_clipboard_name(mut self, name: String) -> Self {
+        self.clipboard_name = Some(name);
+        self
     }
     pub(crate) fn with_source(mut self, source: ArrivalSource) -> Self {
         self.source = Some(source);
@@ -128,6 +141,8 @@ use platform_fs::unlinked_clipboard_file;
 pub enum ClipboardInput {
     Text(String),
     Image(ReceivedFile, String),
+    #[cfg(target_os = "linux")]
+    Files(Vec<ReceivedFile>),
     Bytes {
         bytes: Vec<u8>,
         mime: String,
@@ -169,6 +184,12 @@ impl PreparedClipboard {
             ClipboardInput::Text(text) => {
                 let hashes = vec![Sha256::digest(text.as_bytes()).into()];
                 (ClipboardInput::Text(text), hashes)
+            }
+            #[cfg(target_os = "linux")]
+            ClipboardInput::Files(files) => {
+                let bytes = linux::file_uri_list(&files)?;
+                let hashes = vec![Sha256::digest(&bytes).into()];
+                (ClipboardInput::Files(files), hashes)
             }
             ClipboardInput::Image(file, mime) => {
                 let hashes = vec![Sha256::digest(file.read_bounded(16 * 1024 * 1024)?).into()];

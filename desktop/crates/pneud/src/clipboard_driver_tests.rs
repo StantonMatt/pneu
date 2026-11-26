@@ -80,6 +80,7 @@ async fn scenario(mode: u8) -> Result<()> {
         offer: None,
         received: true,
         legacy: false,
+        file_group: None,
         restore: false,
         repair: false,
         observation: None,
@@ -255,6 +256,7 @@ async fn queued_request_during_persistent_clock_failure_times_out_and_shutdown_d
         offer: None,
         received: true,
         legacy: false,
+        file_group: None,
         restore: false,
         repair: false,
         observation: None,
@@ -364,6 +366,7 @@ async fn retired_marker_scenario(legacy: bool) -> Result<()> {
                     offer: None,
                     received: true,
                     legacy,
+                    file_group: None,
                     restore: false,
                     repair: false,
                     observation: None,
@@ -409,6 +412,10 @@ struct PayloadActions {
 }
 fn input_content(input: &ClipboardInput) -> Result<Content> {
     Ok(match input {
+        #[cfg(target_os = "linux")]
+        ClipboardInput::Files(files) => {
+            Content::Text(String::from_utf8(crate::actions::file_uri_list(files)?)?)
+        }
         ClipboardInput::Text(text) => Content::Text(text.clone()),
         ClipboardInput::Image(file, _) => Content::Image(file.read_bounded(16 * 1024 * 1024)?),
         ClipboardInput::Bytes { bytes, .. } => Content::Image(bytes.clone()),
@@ -434,6 +441,14 @@ impl PcActions for PayloadActions {
         input: ClipboardInput,
         _: Ticket,
     ) -> Result<PreparedClipboard> {
+        #[cfg(target_os = "linux")]
+        let input = match input {
+            ClipboardInput::Files(files) => {
+                let cache = files[0].path().parent().unwrap();
+                ClipboardInput::Files(crate::actions::named_clipboard_files(files.clone(), cache)?)
+            }
+            input => input,
+        };
         self.prepared.lock().unwrap().push(input_content(&input)?);
         PreparedClipboard::immediate(input)
     }
@@ -506,6 +521,7 @@ async fn submit_payload(core: &Arc<Core>, content: &Content) -> Result<Outcome> 
         offer: None,
         received: true,
         legacy: false,
+        file_group: None,
         restore: false,
         repair: false,
         observation: None,
@@ -574,6 +590,72 @@ async fn repair_uses_local_winner_after_no_write_dedup_for_text_image_and_mixed(
     }
     Ok(())
 }
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn cached_file_winner_repair_reoffers_identical_named_uris() -> Result<()> {
+    let dir = crate::test_support::scratch()?;
+    let actions = Arc::new(PayloadActions::default());
+    let core = payload_core(dir.path(), actions.clone()).await?;
+    let older = Content::Text("older selection".into());
+    assert!(submit_payload(&core, &older).await?.applied);
+    let path = core.paths.cache.join(".pneu-cache-random-document.pdf");
+    std::fs::write(&path, b"%PDF synthetic")?;
+    let input = ClipboardInput::Files(vec![
+        crate::actions::ReceivedFile::open(&path)?.with_clipboard_name("document.pdf".into()),
+    ]);
+    let token = core.clipboard.token();
+    let source = Id::from_bytes([2; 16]);
+    let (reply, _) = oneshot::channel();
+    assert!(
+        core.clipboard
+            .submit(
+                Operation {
+                    token,
+                    id: Id::from_bytes([20; 16]),
+                    source: source.clone(),
+                    key: Some(Key { hlc: 200, source }),
+                    created_at: 200,
+                    content: None,
+                    payload: None,
+                    hashes: Vec::new(),
+                    offer: None,
+                    received: true,
+                    legacy: false,
+                    file_group: None,
+                    restore: false,
+                    repair: false,
+                    observation: None,
+                },
+                Request {
+                    input,
+                    claim: None,
+                    store: core.store.clone(),
+                    authority: None,
+                    kind: None,
+                    policy: vec![],
+                    reply,
+                },
+            )
+            .await?
+            .applied
+    );
+    let register = core.store.clipboard_snapshot().await?.0;
+    let winner = actions.installed.lock().unwrap()[1].clone();
+    assert!(
+        matches!(&winner, Content::Text(uri) if uri.ends_with("/document.pdf\r\n") && !uri.contains(".pneu-cache-"))
+    );
+    // Once installed, the winner itself must keep the private alias alive.
+    std::fs::remove_file(path)?;
+    observe_payload(&core, older.clone()).await?;
+    assert_eq!(
+        *actions.installed.lock().unwrap(),
+        vec![older, winner.clone(), winner]
+    );
+    assert_eq!(core.store.clipboard_snapshot().await?.0, register);
+    core.shutdown_actions().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn repair_declines_a_changed_file_backing_the_register_winner() -> Result<()> {
     let dir = crate::test_support::scratch()?;
@@ -639,6 +721,7 @@ fn receive_operation(token: Token, text: &pneu_proto::Clipboard) -> Operation {
         offer: None,
         received: true,
         legacy: false,
+        file_group: None,
         restore: false,
         repair: false,
         observation: None,

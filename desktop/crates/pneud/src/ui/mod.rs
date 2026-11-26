@@ -409,7 +409,7 @@ impl Toggle {
         match self {
             Self::Save => "Save to Folder",
             Self::Notifications => "Show Notifications",
-            Self::CopyImages => "Copy Images to Clipboard",
+            Self::CopyImages => "Copy Received Files to Clipboard",
             Self::Viewer => "Open in Image Viewer",
             Self::Clipboard => "Send Clipboard to Phone",
             Self::IncludeImages => "Include Images",
