@@ -324,6 +324,18 @@ impl Offer {
             thread: std::sync::Mutex::new(None),
         };
         match input {
+            ClipboardInput::SecretText(t) => {
+                offer.text(&t.0)?;
+                for (marker, bytes) in [
+                    (EXCLUDE, vec![0u8]),
+                    (HISTORY, 0u32.to_le_bytes().to_vec()),
+                    (CLOUD, 0u32.to_le_bytes().to_vec()),
+                ] {
+                    Arc::get_mut(&mut offer.payload)
+                        .unwrap()
+                        .push((format(marker)?, bytes));
+                }
+            }
             ClipboardInput::Text(t) => offer.text(t)?,
             ClipboardInput::Formats { text, png, .. } => {
                 offer.text(text)?;
@@ -401,6 +413,24 @@ impl Offer {
             guard.0.take();
         }
         result
+    }
+    pub(crate) async fn clear_if_owned(&mut self) {
+        let ticket = self.ticket;
+        let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+            let _clipboard = Clipboard::open(null_mut())?;
+            if writer_owns_clipboard()
+                && copy_memory(unsafe { GetClipboardData(format(INSTALL)?) }, 32)
+                    .ok()
+                    .and_then(|b| super::pasteboard_reader::ticket(&b))
+                    == Some(ticket)
+            {
+                unsafe {
+                    EmptyClipboard();
+                }
+            }
+            Ok(())
+        })
+        .await;
     }
     pub(crate) async fn stop(&mut self) {
         self.canceled.store(true, Ordering::SeqCst);
@@ -724,6 +754,11 @@ fn poll(
         };
         let initial = baseline.replace(sequence).is_none();
         if meta.class == Classification::Sensitive {
+            // Our native secret writer confirms its own successful transaction.
+            if owned && meta.formats.contains(&format(INSTALL)?) {
+                pending.take();
+                return Ok(());
+            }
             unavailable(core, pending);
             return Ok(());
         }
@@ -951,3 +986,25 @@ impl Drop for Watch {
 #[cfg(test)]
 #[path = "windows_clipboard_tests.rs"]
 mod tests;
+
+/// The secure/locked desktop is inaccessible to the user's input desktop.
+pub(crate) fn session_locked() -> bool {
+    unsafe {
+        let desktop = OpenInputDesktop(0, 0, DESKTOP_READOBJECTS);
+        if desktop.is_null() {
+            return true;
+        }
+        let mut name = [0u16; 256];
+        let mut needed = 0;
+        let ok = GetUserObjectInformationW(
+            desktop,
+            UOI_NAME,
+            name.as_mut_ptr().cast(),
+            512,
+            &mut needed,
+        ) != 0;
+        CloseDesktop(desktop);
+        ok && String::from_utf16_lossy(&name[..name.iter().position(|c| *c == 0).unwrap_or(256)])
+            != "Default"
+    }
+}

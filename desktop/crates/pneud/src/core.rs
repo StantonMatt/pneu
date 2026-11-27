@@ -44,6 +44,8 @@ mod file_sender;
 pub mod mesh;
 #[path = "peer_settings.rs"]
 mod peer_settings;
+#[path = "core_sms.rs"]
+mod sms_receive;
 use file_sender::{FileWrite, transmit_file};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -978,6 +980,8 @@ pub struct Core {
     config_gate: Arc<tokio::sync::Mutex<()>>,
     clipboard: clipboard_driver::Handle,
     clipboard_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    sms: Mutex<crate::sms::State>,
+    sms_gate: tokio::sync::Mutex<()>,
     settings_gate: tokio::sync::Mutex<()>,
     settings_ready: Mutex<HashMap<Id, u64>>,
     next_connection: AtomicU64,
@@ -1139,6 +1143,8 @@ impl Core {
             sessions: Arc::new(Mutex::new(Connections::default())),
             clipboard,
             clipboard_worker: Mutex::new(None),
+            sms: Mutex::new(crate::sms::State::default()),
+            sms_gate: tokio::sync::Mutex::new(()),
             settings_gate: tokio::sync::Mutex::new(()),
             settings_ready: Mutex::new(HashMap::new()),
             next_connection: AtomicU64::new(1),
@@ -1363,6 +1369,21 @@ impl Core {
         let mut ui = self.ui.lock().expect("UI state");
         select_display(&sessions, &admission, &mut ui);
         let mut snapshot = ui.snapshot.clone();
+        let activated = self
+            .store
+            .sms_activated
+            .lock()
+            .expect("SMS activation")
+            .clone();
+        snapshot.sms_available = self
+            .store
+            .pair_settings
+            .lock()
+            .expect("pair settings")
+            .iter()
+            .any(|(id, fields)| {
+                activated.contains(id) && fields.iter().any(|f| f.key.ends_with("/sms"))
+            });
         snapshot.devices = self.device_snapshots(&sessions, &admission, &ui);
         snapshot.send_targets = self.file_targets(&snapshot.devices, &sessions, &admission);
         snapshot.transfers = self.outbox.snapshot(&snapshot.connected_devices);
@@ -1599,8 +1620,20 @@ impl Core {
             .get(&device)
             .cloned();
         self.clipboard.event(ClipboardEvent::Revoke(device.clone()));
-        if let Some(scope) = &scope {
-            scope.cancelled.send_replace(true);
+        {
+            let mut sms = self.sms.lock().expect("SMS");
+            if let Some(scope) = &scope {
+                scope.cancelled.send_replace(true);
+            }
+            sms.messages.retain(|(target, _)| target.device != device);
+            sms.bursts.remove(&device);
+            self.store
+                .sms_activated
+                .lock()
+                .expect("SMS activation")
+                .remove(&device);
+        }
+        if scope.is_some() {
             self.action_queue.discard_invalid();
         }
         let admission = self.admission.clone();
@@ -1843,6 +1876,9 @@ impl Core {
             "save_to_folder" => config.save_to_folder = serde_json::from_value(value)?,
             "save_path" => config.save_path = serde_json::from_value(value)?,
             "notification_preview" => config.notification_preview = serde_json::from_value(value)?,
+            "copy_sms_codes" => {
+                config.copy_sms_codes = serde_json::from_value(value)?;
+            }
             "copy_image_to_clipboard" => {
                 config.copy_image_to_clipboard = serde_json::from_value(value)?
             }
@@ -2359,6 +2395,7 @@ impl Core {
             .submit(
                 operation,
                 clipboard_driver::Request {
+                    sms: false,
                     input,
                     claim: None,
                     store: self.store.clone(),
@@ -3050,6 +3087,15 @@ impl Core {
             .as_ref()
             .map(|scope| scope.connection_generation.load(Ordering::SeqCst));
         store.mesh = hello.capabilities.iter().any(|c| c == "mesh");
+        store.negotiated_sms = action_scope.as_ref().map(|scope| {
+            (
+                store.mesh
+                    && hello.role == Some(DeviceRole::Phone)
+                    && hello.capabilities.iter().any(|c| c == "sms"),
+                scope.registration_generation.clone(),
+                connection_id,
+            )
+        });
         store.local_device = Some(self.identity.device_id.clone());
         let result = if persisted {
             // The task's total transport permit remains held through READY
@@ -3724,6 +3770,9 @@ impl Core {
                                 self.error(Some(hello.device_id.clone()),format!("clipboard delivery rejected: {:?}",nack.code));
                             },
                             m @ (Message::FileBegin(_)|Message::FileChunk(_)|Message::FileEnd(_))=>{if !enqueue(&file_tx,ApplicationMessage { message: m, refusal },&mut close,pending.as_ref().and_then(|p|p.deadline)).await? {break;}},
+                            m @ Message::Sms(_) if store.mesh && hello.role==Some(DeviceRole::Phone) && hello.capabilities.iter().any(|c|c=="sms") && settings_received=>{
+                                if !enqueue(&text_tx,m,&mut close,pending.as_ref().and_then(|p|p.deadline)).await? {break;}
+                            },
                             m @ Message::Clipboard(_)=>{if !enqueue(&text_tx,m,&mut close,pending.as_ref().and_then(|p|p.deadline)).await? {break;}},
                             _=>bail!("unexpected READY frame"),
                         }
@@ -4259,6 +4308,10 @@ impl Core {
                     }
                     incoming.take();
                 }
+                Message::Sms(sms) => {
+                    self.receive_sms(store, device, sms, action_scope, tx)
+                        .await?;
+                }
                 Message::Clipboard(text) => {
                     let receipt = if store.mesh {
                         match store
@@ -4370,6 +4423,7 @@ impl Core {
                         .submit(
                             operation,
                             clipboard_driver::Request {
+                                sms: false,
                                 input: crate::actions::ClipboardInput::Text(text.text.clone()),
                                 claim: Some(claim),
                                 store: store.clone(),
@@ -4684,6 +4738,7 @@ impl Core {
                 .submit(
                     operation,
                     clipboard_driver::Request {
+                        sms: false,
                         input: crate::actions::ClipboardInput::Image(
                             job.file.clone(),
                             job.metadata.mime.clone(),
@@ -5883,6 +5938,7 @@ mod tests {
             &state,
             id,
             &Hello {
+                sms_activated: None,
                 role: None,
                 addresses: None,
                 version: 1,
@@ -7329,6 +7385,7 @@ mod tests {
             },
         );
         let current = Hello {
+            sms_activated: None,
             role: None,
             addresses: None,
             version: pneu_proto::PROTOCOL_VERSION,
@@ -7338,6 +7395,7 @@ mod tests {
             paused: Some(false),
         };
         let old = Hello {
+            sms_activated: None,
             name: "Obsolete phone".into(),
             capabilities: vec!["clipboard_text".into()],
             ..current.clone()
@@ -8258,6 +8316,7 @@ mod tests {
             .start_pairing_with_addresses(vec!["127.0.0.1:47821".into()])
             .await?;
         let hello = Hello {
+            sms_activated: None,
             version: 1,
             device_id: device.clone(),
             name: "Legacy phone".into(),
@@ -10805,7 +10864,7 @@ mod tests {
                     let mut tls = connector.connect(
                         rustls::pki_types::ServerName::try_from("pneu.local")?, stream,
                     ).await?;
-                    write_frame(&mut tls, &Message::Hello(Hello {
+                    write_frame(&mut tls, &Message::Hello(Hello { sms_activated: None,
                         role: Some(DeviceRole::Computer),
                         addresses: Some(vec![format!("127.0.0.1:{}", 10000 + index)]),
                         version: 1,
@@ -12556,6 +12615,7 @@ mod tests {
         core.shutdown_actions().await?;
         Ok(())
     }
+    include!("core_sms_tests.rs");
 }
 
 #[cfg(all(test, windows))]

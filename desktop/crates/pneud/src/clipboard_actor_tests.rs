@@ -2949,3 +2949,75 @@ fn confirmed_marker_retires_provisional_observation_without_a_local_clock() {
         model.consistent();
     }
 }
+
+#[test]
+fn sms_timer_clear_does_not_become_a_new_human_clipboard_change() {
+    let mut state = State::default();
+    let mut operation = remote(1, 1, 100, "482913");
+    operation.content = None;
+    operation.hashes.clear();
+    operation.payload = Some(Arc::new(Payload::Input(
+        crate::actions::ClipboardInput::SecretText(crate::sms::SecretText("482913".into(), true)),
+    )));
+    state.register = operation.key.clone();
+    state.current = Some(operation);
+    state.owner = Some(7);
+    state.last_marker = Some(7);
+    state.os_current = true;
+    state.step(Event::SecretClearing(7));
+    state.step(Event::Observe {
+        token: 2,
+        id: id(2),
+        offer: None,
+        origin: false,
+        clear: true,
+    });
+    assert!(state.observation.is_none());
+    assert_eq!(state.register.as_ref().unwrap().hlc, 100);
+    state.step(Event::Stopped(7));
+    assert!(state.current.is_none());
+    let effects = state.step(Event::Submit(remote(3, 1, 101, "773122")));
+    assert!(
+        effects.iter().any(|e| matches!(e, Effect::Prepare { .. })),
+        "a newer SMS still wins after the owned clear"
+    );
+}
+
+#[test]
+fn secret_manager_echo_is_removed_from_retained_mixed_payload_and_manual_recipients() {
+    let mut model = Compositor::default();
+    model.state.mode = ClipboardMode::Manual;
+    let secret = model.state.hashes(&content("482913"))[0];
+    model.state.secret_hashes.push_back(secret);
+    let mixed = Content::Formats("482913".into(), b"human image".to_vec());
+    let mut recipients = offer(1, &[2, 3]);
+    model
+        .state
+        .exclude_received_representations(&mixed, &mut recipients);
+    assert!(recipients.recipients.iter().all(|r| !r.text && r.image));
+    model.copy(20, Some(mixed), &[2, 3]);
+    model.settle();
+    let current = model.state.current.as_ref().unwrap();
+    assert!(
+        matches!(current.payload.as_deref(), Some(Payload::Content(Content::Image(bytes))) if bytes == b"human image")
+    );
+    model.event(Event::Share {
+        token: 30,
+        id: id(30),
+        source: id(1),
+        offer: offer(30, &[2, 3]),
+    });
+    model.settle();
+    assert_eq!(model.published.len(), 1);
+    let shared = &model.published[0];
+    assert!(matches!(&shared.content, Some(Content::Image(bytes)) if bytes == b"human image"));
+    assert!(
+        shared
+            .offer
+            .as_ref()
+            .unwrap()
+            .recipients
+            .iter()
+            .all(|r| !r.text && r.image)
+    );
+}

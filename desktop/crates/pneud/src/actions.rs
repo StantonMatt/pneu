@@ -127,6 +127,7 @@ use platform_fs::unlinked_clipboard_file;
 #[derive(Clone, Debug)]
 pub enum ClipboardInput {
     Text(String),
+    SecretText(crate::sms::SecretText),
     Image(ReceivedFile, String),
     Bytes {
         bytes: Vec<u8>,
@@ -166,6 +167,10 @@ impl PreparedClipboard {
         use sha2::{Digest, Sha256};
         use std::io::Write;
         let (input, hashes) = match input {
+            ClipboardInput::SecretText(text) => {
+                let hashes = vec![Sha256::digest(text.0.as_bytes()).into()];
+                (ClipboardInput::SecretText(text), hashes)
+            }
             ClipboardInput::Text(text) => {
                 let hashes = vec![Sha256::digest(text.as_bytes()).into()];
                 (ClipboardInput::Text(text), hashes)
@@ -237,6 +242,12 @@ impl PreparedClipboard {
             }
             self.helper.take();
         }
+        #[cfg(any(target_os = "macos", windows))]
+        if matches!(self.input, ClipboardInput::SecretText(_)) {
+            if let Some(native) = &mut self.native {
+                native.clear_if_owned().await;
+            }
+        }
         #[cfg(windows)]
         if let Some(native) = &mut self.native {
             native.stop().await;
@@ -276,6 +287,7 @@ pub trait PcActions: Send + Sync {
     async fn install_clipboard(&self, prepared: &mut PreparedClipboard) -> Result<()> {
         match &prepared.input {
             ClipboardInput::Text(text) => self.clipboard_text(text).await,
+            ClipboardInput::SecretText(text) => self.clipboard_text(&text.0).await,
             ClipboardInput::Image(file, mime) => self.clipboard_received(file, mime).await,
             _ => anyhow::bail!("unnormalized clipboard candidate"),
         }
@@ -406,6 +418,16 @@ pub trait PcActions: Send + Sync {
         _folder: &Path,
     ) -> Result<()> {
         Ok(())
+    }
+    async fn screen_locked(&self) -> bool {
+        false
+    }
+    async fn notify_sms(
+        &self,
+        _notice: crate::ui::notifications::Notice,
+        _replaces: u32,
+    ) -> Result<u32> {
+        Ok(0)
     }
     async fn notify_text(&self, _text: &str) -> Result<()> {
         Ok(())

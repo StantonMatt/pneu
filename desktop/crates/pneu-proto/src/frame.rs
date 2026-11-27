@@ -16,7 +16,7 @@ fn check_type_and_size(type_id: u8, payload_len: usize) -> Result<()> {
                 return Err(ProtocolError::InvalidLength(payload_len + 1));
             }
         }
-        0x01..=0x07 | 0x10 | 0x12..=0x14 | 0x20..=0x21 | 0x7f => {
+        0x01..=0x07 | 0x10 | 0x12..=0x14 | 0x20..=0x22 | 0x7f => {
             if payload_len > MAX_CONTROL_PAYLOAD {
                 return Err(ProtocolError::InvalidLength(payload_len + 1));
             }
@@ -60,6 +60,7 @@ fn decode_payload(type_id: u8, payload: &[u8]) -> Result<Message> {
         0x14 => Message::Nack(serde_json::from_slice(payload)?),
         0x20 => Message::Clipboard(serde_json::from_slice(payload)?),
         0x21 => Message::PeerSettings(serde_json::from_slice(payload)?),
+        0x22 => Message::Sms(serde_json::from_slice(payload)?),
         0x7f => Message::Error(serde_json::from_slice(payload)?),
         other => return Err(ProtocolError::UnknownType(other)),
     };
@@ -108,6 +109,7 @@ pub fn encode_frame(message: &Message) -> Result<Vec<u8>> {
         Message::Nack(m) => serde_json::to_vec(m)?,
         Message::Clipboard(m) => serde_json::to_vec(m)?,
         Message::PeerSettings(m) => serde_json::to_vec(m)?,
+        Message::Sms(m) => serde_json::to_vec(m)?,
         Message::Error(m) => serde_json::to_vec(m)?,
     };
     let type_id = message.type_id();

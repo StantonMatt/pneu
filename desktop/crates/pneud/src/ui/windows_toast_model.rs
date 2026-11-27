@@ -23,6 +23,8 @@ impl<T> Record<T> {
             "default"
         } else if self.notice.actions.iter().any(|(a, _)| *a == "show") {
             "show"
+        } else if self.notice.sms_target.is_some() || self.notice.summary.ends_with(" more SMS") {
+            "dismiss"
         } else {
             "window"
         };
@@ -131,7 +133,7 @@ impl<T> Targets<T> {
         }
     }
     pub fn take(&mut self, argument: &str) -> Result<(Arc<Record<T>>, String)> {
-        let parts: Vec<_> = argument.split('-').collect();
+        let parts: Vec<_> = argument.splitn(4, '-').collect();
         anyhow::ensure!(
             parts.len() == 4 && parts[0] == self.session,
             "notification belongs to another daemon session"
@@ -147,7 +149,9 @@ impl<T> Targets<T> {
         anyhow::ensure!(record.revision == parts[1], "notification was replaced");
         let action = parts[3];
         anyhow::ensure!(
-            action == "window" || record.notice.actions.iter().any(|(a, _)| *a == action),
+            action == "window"
+                || (action == "dismiss" && record.notice.sms_target.is_some())
+                || record.notice.actions.iter().any(|(a, _)| *a == action),
             "action not offered by notification"
         );
         let record = self.records.remove(&id).expect("validated notification");
@@ -321,6 +325,30 @@ mod tests {
                     assert!(xml.contains(&format!("content=\"{}\"", escape(label))));
                 }
             }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod sms_action_tests {
+    use super::*;
+    #[tokio::test]
+    async fn sms_buttons_remain_opaque_and_cold_or_replaced_actions_do_not_copy() -> Result<()> {
+        let mut targets = Targets::default();
+        let mut notice = Notice::new("Code copied from Bank");
+        notice.sms_target = Some(crate::sms::Target {
+            device: pneu_proto::Id::from_bytes([1; 16]),
+            id: pneu_proto::Id::from_bytes([2; 16]),
+        });
+        notice.actions = vec![("sms-code", "Copy Code"), ("sms-text", "Copy Text")];
+        for action in ["sms-code", "sms-text", "dismiss"] {
+            let (record, _) = targets.issue(notice.clone(), (), 0)?;
+            assert!(record.xml(None).contains(&record.argument("dismiss")));
+            let mut cold: Targets<()> = Targets::default();
+            assert!(cold.take(&record.argument(action)).is_err());
+            assert_eq!(targets.take(&record.argument(action))?.1, action);
+            assert!(targets.take(&record.argument(action)).is_err());
         }
         Ok(())
     }

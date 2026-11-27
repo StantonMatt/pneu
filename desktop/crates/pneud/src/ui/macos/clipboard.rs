@@ -84,12 +84,21 @@ fn combine(text: Option<String>, png: Option<Vec<u8>>) -> Option<Content> {
 pub(crate) struct Offer {
     representations: Vec<(String, Vec<u8>)>,
     ticket: u128,
+    secret: bool,
+    installed: std::cell::Cell<Option<isize>>,
 }
 impl Offer {
     pub(crate) fn prepare(input: &crate::actions::ClipboardInput, ticket: u128) -> Result<Self> {
         use crate::actions::ClipboardInput;
         let mut representations = Vec::new();
         match input {
+            ClipboardInput::SecretText(t) => {
+                ensure!(
+                    text(t.0.as_bytes().to_vec()).is_some(),
+                    "invalid clipboard text"
+                );
+                representations.push((TEXT.into(), t.0.as_bytes().to_vec()));
+            }
             ClipboardInput::Text(t) => {
                 ensure!(
                     text(t.as_bytes().to_vec()).is_some(),
@@ -117,6 +126,8 @@ impl Offer {
         Ok(Self {
             representations,
             ticket,
+            secret: matches!(input, ClipboardInput::SecretText(_)),
+            installed: std::cell::Cell::new(None),
         })
     }
     pub(crate) fn hashes(&self) -> Vec<[u8; 32]> {
@@ -124,6 +135,23 @@ impl Offer {
             .iter()
             .map(|(_, bytes)| Sha256::digest(bytes).into())
             .collect()
+    }
+    pub(crate) async fn clear_if_owned(&mut self) {
+        autoreleasepool(|_| {
+            let _publication = super::pasteboard_reader::PUBLICATION.lock().unwrap();
+            let pb = NSPasteboard::generalPasteboard();
+            if self.installed.get() == Some(pb.changeCount())
+                && pb
+                    .dataForType(&NSString::from_str(ORIGIN_MIME))
+                    .and_then(|d| ticket(&d.to_vec()))
+                    == Some(self.ticket)
+            {
+                // AppKit has no conditional clear; narrow the remaining race.
+                if self.installed.get() == Some(pb.changeCount()) {
+                    pb.clearContents();
+                }
+            }
+        });
     }
     pub(crate) fn install(&self) -> Result<()> {
         self.install_with(|| {})
@@ -142,6 +170,17 @@ impl Offer {
                     "cannot prepare pasteboard type"
                 );
             }
+            if self.secret {
+                for marker in [
+                    "org.nspasteboard.ConcealedType",
+                    "org.nspasteboard.TransientType",
+                ] {
+                    ensure!(
+                        item.setData_forType(&NSData::with_bytes(&[]), &NSString::from_str(marker)),
+                        "cannot prepare secret marker"
+                    );
+                }
+            }
             ensure!(
                 item.setData_forType(
                     &NSData::with_bytes(format!("{:032x}", self.ticket).as_bytes()),
@@ -158,6 +197,7 @@ impl Offer {
                 pb.writeObjects(&NSArray::from_slice(&[writing])),
                 "clipboard access not allowed or pasteboard write rejected"
             );
+            self.installed.set(Some(pb.changeCount()));
             Ok(())
         })
     }
@@ -324,6 +364,11 @@ fn poll(
     if let Some(initial) = snapshot {
         let class = classify(access, &types);
         if class == Classification::Sensitive {
+            // Secret writes report native success directly; never read payload.
+            if types.iter().any(|t| t == ORIGIN_MIME) {
+                pending.take();
+                return;
+            }
             pending.take();
             invalidate(core);
             return;

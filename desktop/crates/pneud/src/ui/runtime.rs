@@ -145,6 +145,7 @@ pub async fn run(
                     let core=core.clone();
                     sending.spawn(async move { if let Err(error)=core.set_setting("clipboard_mode".into(),serde_json::json!(mode)).await {eprintln!("pneud: clipboard setting: {error:#}");} });
                 },
+                Some(Command::CopySms {target,code})=>{let core=core.clone();sending.spawn(async move {core.copy_sms(target,code).await;});},
                 Some(Command::RetryTransfer {operation,artifact,device})=>{
                     let core=core.clone();
                     sending.spawn(async move { if let Err(error)=core.retry_transfer_artifact(operation,Some(artifact),device).await {eprintln!("pneud: retry: {error:#}"); if core.present_send_error(error.to_string()).is_err() {core.notify_send_admission_failure(&error.to_string()).await;}} });

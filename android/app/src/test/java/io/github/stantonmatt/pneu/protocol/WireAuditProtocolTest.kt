@@ -39,7 +39,7 @@ class WireAuditProtocolTest {
                 for ((field, value) in obj.entrySet()) {
                     if (isNested) nested.add(field) else covered.getOrPut(type) { mutableSetOf() }.add(field)
                     val optional = !isNested && when (type) {
-                        Type.HELLO -> field in setOf("paused", "role", "addresses")
+                        Type.HELLO -> field in setOf("paused", "role", "addresses", "sms_activated")
                         Type.PAIR_RESULT, Type.NACK, Type.ERROR -> field == "message"
                         Type.FILE_BEGIN -> field == "source_media_id"
                         Type.CLIPBOARD -> field == "origin"
@@ -67,14 +67,14 @@ class WireAuditProtocolTest {
             }
         }
         val expected = mapOf(
-            Type.HELLO to "version device_id name capabilities paused role addresses",
+            Type.HELLO to "version device_id name capabilities paused role addresses sms_activated",
             Type.PAIR_REQUEST to "token", Type.PAIR_RESULT to "accepted code message",
             Type.PING to "nonce", Type.PONG to "nonce", Type.STATUS to "paused",
             Type.FILE_BEGIN to "transfer_id file_name mime size sha256 kind created_at source_media_id hlc source_device",
             Type.FILE_END to "transfer_id", Type.ACK to "transfer_id deduplicated",
             Type.NACK to "transfer_id code retryable message",
             Type.CLIPBOARD to "transfer_id text created_at origin hlc source_device",
-            Type.PEER_SETTINGS to "transfer_id settings", Type.ERROR to "code message supported_version"
+            Type.PEER_SETTINGS to "transfer_id settings", Type.SMS to "transfer_id sender text received_at", Type.ERROR to "code message supported_version"
         )
         for ((type, fields) in expected) assertEquals(type.label, fields.split(' ').toSet(), covered[type])
         assertEquals(setOf("key", "enabled", "hlc", "writer_device"), nested)

@@ -329,3 +329,9 @@ records the physical-device boundary; the [Windows guide](../windows.md#known-ga
 records pending Store and physical-hardware work. Automated tests and VM checks
 do not establish every OEM background, network transition, permission or display
 configuration.
+
+### Optional Android SMS
+
+Settings → Send automatically adds SMS messages, off by default. A prominent disclosure precedes every RECEIVE_SMS request; a revoked grant keeps the preference on and adds a Permissions row, health banner and alert. Pause drops new SMS. Each supported phone/computer pair has a mirrored Send SMS / Receive SMS register, on by default; unsupported computers show the update state. SMS never enters Recent or the durable transfer queue. Each offline recipient has a two-minute in-memory window.
+
+Desktop Settings adds SMS → Copy codes to clipboard, on by default and visible only for supported paired phones. SMS notifications are independent of Received files → Show notifications. A single unambiguous code near a code keyword is copied with platform secret/history exclusion markers and masked in the notification. Amounts, dates, phone numbers, card/account fragments and postal codes are excluded; ambiguous messages stay ordinary SMS. The shared Rust detector and its examples apply to all desktop platforms. Copy actions use ephemeral daemon-scoped IDs; links have no action. Codes clear after 60 seconds only if ownership/sequence still matches (best-effort on macOS, where the change-count re-check and clear are separate AppKit operations), lose to newer clipboard content, skip locked sessions and never enter Pneu's clipboard sharing.

@@ -131,6 +131,8 @@ export global Ui {
     in property <string> folder;
     in property <bool> notifications;
     in property <bool> copy-images;
+    in property <bool> sms-available;
+    in property <bool> copy-sms-codes;
     in property <bool> viewer;
     in property <string> name;
 
@@ -835,6 +837,14 @@ export component PneuWindow inherits Window {
                                 }
                             }
                         }
+                    }
+                    if Ui.sms-available: VerticalLayout {
+                        spacing: 6px;
+                        SectionLabel { text: "SMS"; }
+                        Card { SwitchRow {
+                            label: "Copy codes to clipboard"; checked: Ui.copy-sms-codes;
+                            toggled(on) => { Ui.set-flag("copy_sms_codes", on); }
+                        } }
                     }
                     VerticalLayout {
                         spacing: 6px;

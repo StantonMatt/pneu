@@ -20,7 +20,7 @@ data class DeviceState(val peer:Peer,val connection:LinkState,val pendingSwitche
 internal object DeviceProjection {
     fun states(prefs:Prefs,links:Map<String,LinkState>)=prefs.devices.map {peer->
         DeviceState(peer,links[peer.deviceId] ?: LinkState(),
-            PairSettings.keys(prefs.deviceId,peer.deviceId).zip(listOf("sendClipboard","receiveClipboard","automaticMedia"))
+            PairSettings.keys(prefs.deviceId,peer.deviceId,peer.smsSupported).zip(listOf("sendClipboard","receiveClipboard","automaticMedia","sms"))
                 .filter {it.first in peer.localSettingsEdits}.map {it.second}.toSet(),peer.settingsSupported)
     }.sortedWith(compareByDescending<DeviceState> {it.connection.connectionStatus==ConnectionStatus.CONNECTED}.thenByDescending {it.lastSeen})
 }

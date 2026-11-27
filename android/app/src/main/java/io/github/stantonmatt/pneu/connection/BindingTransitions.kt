@@ -15,7 +15,7 @@ internal object BindingTransitions {
         p.peer?.let {it.deviceId==binding.pcId && it.pin==binding.pin && it.generation==binding.generation}==true
     fun restart(old:Prefs,p:Prefs,binding:DeliveryBinding?)=
         old.wifi!=p.wifi || old.tailscale!=p.tailscale ||
-        old.mobile!=p.mobile || old.selfName!=p.selfName || old.peer?.generation!=p.peer?.generation && !owns(p,binding)
+        old.mobile!=p.mobile || old.sms!=p.sms || old.smsActivated!=p.smsActivated || old.selfName!=p.selfName || old.peer?.generation!=p.peer?.generation && !owns(p,binding)
 }
 internal object SessionTasks {
     suspend fun settings(close:()->Unit,body:suspend ()->Unit) {try {body()}finally {close()}}

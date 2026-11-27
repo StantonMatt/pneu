@@ -689,6 +689,7 @@ async fn lifecycle_and_capability_transitions_cannot_resurrect_dropped_text() ->
                 s.settings_edit(local.clone(), peer.clone(), false, key.clone(), false)
                     .await?;
                 let mut hello = pneu_proto::Hello {
+                    sms_activated: None,
                     version: 1,
                     device_id: peer.clone(),
                     name: "peer".into(),
@@ -754,5 +755,89 @@ async fn retired_outbox_failure_does_not_block_local_or_remote_settings() -> Res
         assert_eq!(s.settings_generation(&peer), 1);
         assert_eq!(s.first_outgoing(peer).await?.unwrap().1, original);
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn sms_register_is_negotiated_and_downgrade_never_sends_it_to_legacy() -> Result<()> {
+    let (_dir, s, local, peer) = pair().await?;
+    let mut hello = pneu_proto::Hello {
+        sms_activated: None,
+        version: 1,
+        device_id: peer.clone(),
+        name: "SMS phone".into(),
+        capabilities: vec!["mesh".into(), "sms".into()],
+        paused: None,
+        role: Some(pneu_proto::DeviceRole::Phone),
+        addresses: None,
+    };
+    let current = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+    s.remember_peer_hello(hello.clone(), current.clone(), 1, false)
+        .await?;
+    let fields = s.settings_fields(local.clone(), peer.clone(), true).await?;
+    assert_eq!(fields.len(), 4);
+    let key = format!("{peer}/{local}/sms");
+    assert!(fields.iter().find(|f| f.key == key).unwrap().enabled);
+    s.settings_edit(local.clone(), peer.clone(), true, key.clone(), false)
+        .await?;
+    let snapshot = s
+        .settings_outgoing(local.clone(), peer.clone(), true)
+        .await?;
+    assert_eq!(snapshot.settings.len(), 4);
+    hello.capabilities.retain(|c| c != "sms");
+    s.remember_peer_hello(hello.clone(), current.clone(), 1, false)
+        .await?;
+    let legacy = s
+        .settings_outgoing(local.clone(), peer.clone(), true)
+        .await?;
+    assert_eq!(legacy.settings.len(), 3);
+    assert!(legacy.settings.iter().all(|f| !f.key.ends_with("/sms")));
+    assert!(
+        s.settings_merge(local.clone(), peer.clone(), true, snapshot)
+            .await
+            .is_err()
+    );
+    hello.capabilities.push("sms".into());
+    s.remember_peer_hello(hello, current, 1, false).await?;
+    let upgraded = s.settings_outgoing(local, peer, true).await?;
+    assert_eq!(upgraded.settings.len(), 4);
+    assert!(
+        !upgraded
+            .settings
+            .iter()
+            .find(|f| f.key == key)
+            .unwrap()
+            .enabled
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn current_session_sms_negotiation_precedes_delayed_hello_metadata() -> Result<()> {
+    let (_dir, s, local, peer) = pair().await?;
+    let mut session = s.clone();
+    let current = Arc::new(AtomicU64::new(1));
+    session.negotiated_sms = Some((true, current.clone(), 1));
+    let first = session
+        .settings_outgoing(local.clone(), peer.clone(), true)
+        .await?;
+    assert_eq!(first.settings.len(), 4);
+    session
+        .settings_ack(peer.clone(), first.transfer_id)
+        .await?;
+    session.negotiated_sms = Some((false, current.clone(), 1));
+    let legacy = session
+        .settings_outgoing(local.clone(), peer.clone(), true)
+        .await?;
+    assert_eq!(legacy.settings.len(), 3);
+    assert!(legacy.settings.iter().all(|f| !f.key.ends_with("/sms")));
+    // An unacknowledged legacy snapshot must also be replaced on upgrade.
+    session.negotiated_sms = Some((true, current.clone(), 1));
+    let upgraded = session
+        .settings_outgoing(local.clone(), peer.clone(), true)
+        .await?;
+    current.store(2, Ordering::SeqCst);
+    assert!(session.settings_outgoing(local, peer, true).await.is_err());
+    assert_eq!(upgraded.settings.len(), 4);
     Ok(())
 }

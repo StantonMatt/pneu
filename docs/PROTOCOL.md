@@ -292,6 +292,7 @@ objects are lowercase snake_case; these names are not carried on the wire.
 | `14` | NACK | Receipt failed |
 | `20` | CLIPBOARD | Clipboard text operation |
 | `21` | PEER_SETTINGS | Synced directional pair switches (`mesh` only) |
+| `22` | SMS | Ephemeral Android SMS (`sms` + `mesh` only) |
 | `7f` | ERROR | Fatal error or graceful close; then close TLS |
 
 The following JSON Schema (2020-12) defines the control payloads. Select the
@@ -315,7 +316,7 @@ unique known fields or filename safety).
         "device_id":{"$ref":"#/$defs/id"},
         "name":{"type":"string","minLength":1},
         "capabilities":{"type":"array","maxItems":16,"uniqueItems":true,"items":{"type":"string","minLength":1}},
-        "paused":{"type":"boolean"},
+        "paused":{"type":"boolean"},"sms_activated":{"type":"boolean"},
         "role":{"enum":["phone","computer"]},
         "addresses":{"type":"array","maxItems":8,"uniqueItems":true,"items":{"type":"string","minLength":1}}
       }
@@ -383,11 +384,15 @@ unique known fields or filename safety).
       "properties":{"transfer_id":{"$ref":"#/$defs/id"},"text":{"type":"string"},"created_at":{"$ref":"#/$defs/timestamp"},"origin":{"enum":["clipboard","share"]},"hlc":{"$ref":"#/$defs/hlc"},"source_device":{"$ref":"#/$defs/id"}},
       "dependentRequired":{"hlc":["source_device"],"source_device":["hlc"]}
     },
+    "sms": {
+      "type":"object","required":["transfer_id","sender","text","received_at"],
+      "properties":{"transfer_id":{"$ref":"#/$defs/id"},"sender":{"type":"string"},"text":{"type":"string"},"received_at":{"$ref":"#/$defs/timestamp"}}
+    },
     "hlc":{"type":"integer","minimum":0,"maximum":18446744073709551615},
     "peer_setting": {
       "type":"object","required":["key","enabled","hlc","writer_device"],
       "properties": {
-        "key":{"type":"string","pattern":"^[0-9a-f]{32}/[0-9a-f]{32}/(clipboard|automatic_media)$"},
+        "key":{"type":"string","pattern":"^[0-9a-f]{32}/[0-9a-f]{32}/(clipboard|automatic_media|sms)$"},
         "enabled":{"type":"boolean"},
         "hlc":{"$ref":"#/$defs/hlc"},
         "writer_device":{"$ref":"#/$defs/id"}
@@ -397,7 +402,7 @@ unique known fields or filename safety).
       "type":"object","required":["transfer_id","settings"],
       "properties": {
         "transfer_id":{"$ref":"#/$defs/id"},
-        "settings":{"type":"array","minItems":1,"maxItems":3,"items":{"$ref":"#/$defs/peer_setting"}}
+        "settings":{"type":"array","minItems":1,"maxItems":4,"items":{"$ref":"#/$defs/peer_setting"}}
       }
     },
     "error": {
@@ -414,7 +419,12 @@ unique known fields or filename safety).
 
 HELLO name is 1–128 UTF-8 bytes and is the device's display name shown by the
 other side. HELLO `paused` (phone only, default false when omitted) reports
-whether the phone's automatic sending is paused.
+whether the phone's automatic sending is paused. Optional phone-only
+`sms_activated` is a boolean, advertised only as an authenticated UI hint alongside
+`sms`: true once the phone has enabled SMS at least once, retained after disabling
+it. It makes the desktop SMS settings section visible; it grants no delivery
+permission and does not change the pair's SMS register. Missing means false for
+this visibility hint. Old HELLO decoders ignore this optional field.
 `name` remains required; it is already the display hint, so no second optional
 name is added. Optional `role` is `phone` or `computer`; mesh implementations
 MUST send it and require it from a mesh peer. It controls applicable pair settings
@@ -452,7 +462,7 @@ the same except for labelling.
 `disk_full` and `not_writable` NACKs mean the receiver could not store the file
 in its configured folder. The receiver does not keep a copy; the sender retries. Each capability is 1–64 UTF-8 bytes; at most 16
 unique entries. Defined capabilities are `files`, `clipboard_text`,
-`clipboard_image`, `mesh`. Advertising `clipboard_image` requires `files`. Capabilities
+`clipboard_image`, `mesh`, `sms`. Advertising `clipboard_image` requires `files`. Capabilities
 mean ability/willingness to receive that feature, not permission to bypass local
 settings. Send a feature only if the receiving HELLO advertises it. Both sides
 always implement ACK/NACK, HELLO, ERROR and keepalive. Unknown capabilities are
@@ -693,6 +703,24 @@ or restart drops unsent clipboard content; a reconnect does not replay it.
 Legacy wire messages strip the stamp and set `created_at` to the operation's HLC.
 Old durable legacy clipboard rows are discarded at migration/startup.
 
+## SMS (`22`, decimal 34)
+
+```json
+{"transfer_id":"00112233445566778899aabbccddeeff","sender":"BancoEstado","text":"Tu clave dinámica es 482913.","received_at":1800000000000}
+```
+
+SMS is valid only in READY from an authenticated phone to a computer when both HELLOs advertise `sms` and `mesh`, after the directional settings have synchronized. Both implementations understand it, but computers never originate or relay SMS. Never send SMS to an older peer or use CLIPBOARD/FILE_BEGIN as a fallback. `transfer_id` is an Id, sender is 1–256 UTF-8 bytes, text is 0–16,384 UTF-8 bytes, and `received_at` is the phone arrival time in Unix milliseconds (Timestamp). Strings and timestamps use the existing strict control rules. Unknown fields are ignored; known duplicates, nulls, invalid Unicode and oversized fields are rejected.
+
+When SMS keeps an Android connection alive on mobile data while ordinary mobile
+transfers are disabled, its HELLO omits `files`, `clipboard_text` and
+`clipboard_image`; it still advertises `mesh` and `sms`. It reconnects when that
+route policy changes. Thus peers must not send ordinary content on the SMS-only
+connection, and outgoing non-SMS frames retain the ordinary cost gate.
+
+Android joins multipart PDUs from one SMS_RECEIVED broadcast by sender, in order. It requires the global SMS preference, RECEIVE_SMS grant, unpaused state, current pairing and enabled pair SMS register at admission and again before transmission. SMS uses the available paired connection regardless of mobile-data/queue-offline preferences. It is held only in memory, per original recipient and pairing generation, for at most 120 seconds from arrival. Pause, disabling or losing permission/pairing revokes pending messages. No SMS sender/text/code enters durable queues, transfer receipts, Recent or diagnostics.
+
+ACK acknowledges SMS delivery rather than a durable receipt. Retries keep the same transfer ID and are deduplicated in a bounded in-memory receiver window. Disabled pair settings return unsupported_kind; no content is shown. Messages at least 120 seconds old are silently acknowledged and dropped. A timestamp over 60 seconds ahead is also dropped. Reconnect/restart does not create a durable SMS backlog. Receiver code detection, notification masking, lock checks and secret clipboard ownership are local desktop policies. SMS is never forwarded over a computer mesh or written to the phone clipboard.
+
 ## PEER_SETTINGS (`21`, decimal 33)
 
 This is the next unassigned control ID after CLIPBOARD (`20`); it remains inside
@@ -707,9 +735,9 @@ is introduced. Payload example, with A and B replaced by real 32-hex device IDs:
 ]}
 ```
 
-`settings` has 1–3 entries with unique keys. Key grammar is exactly
+`settings` has 1–4 entries with unique keys (at most 3 without negotiated `sms`). Key grammar is exactly
 `<from_device_id>/<to_device_id>/<feature>`: two distinct lowercase 32-hex IDs,
-two literal `/` separators, and feature `clipboard` or `automatic_media`. No
+two literal `/` separators, and feature `clipboard`, `automatic_media` or (only with negotiated `sms`) `sms`. No
 "you/me", names, whitespace, aliases or suffixes. Both IDs MUST be the two
 authenticated members of this pair. Each entry has a required boolean `enabled`,
 Hlc `hlc`, and Id `writer_device` naming either member of that pair. Known nested
@@ -722,7 +750,10 @@ membership; authenticated pair membership and roles are application checks.
 
 The full state is both clipboard directions, plus exactly one
 `<phone>/<computer>/automatic_media` entry for a phone/computer pair. Computer
-pairs have just the two clipboard entries. `clipboard` gates text and clipboard
+pairs have just the two clipboard entries. A phone/computer pair with `sms`
+negotiated adds exactly one `<phone>/<computer>/sms` entry, default enabled.
+Never send this key or a four-entry snapshot to a peer without `sms`; that
+peer retains the original three-entry snapshot, even after a capability downgrade. `clipboard` gates text and clipboard
 images. `automatic_media` gates that pair's automatic screenshots, photos and
 recordings together. This matches the pair's single Automatic sending / Receive
 automatic photos switch. The phone's existing global per-kind `screenshots`,

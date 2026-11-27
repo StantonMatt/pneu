@@ -12,10 +12,11 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 
 /** These checks also run after returning from OEM settings. Samsung does not expose its sleeping list. */
-data class Health(val photos: Boolean, val notifications: Boolean, val battery: Boolean, val sleeping: Boolean, val killed: Boolean = false, val channelBlocked:Boolean=false,val backgroundRestricted:Boolean=false,val localNetwork:Boolean=true) {
+data class Health(val photos: Boolean, val notifications: Boolean, val battery: Boolean, val sleeping: Boolean, val killed: Boolean = false, val channelBlocked:Boolean=false,val backgroundRestricted:Boolean=false,val localNetwork:Boolean=true,val sms:Boolean=true) {
     val issues: List<Int> get() = buildList {
         if(!localNetwork) add(R.string.banner_local_network)
         if(!photos) add(R.string.banner_photos)
+        if(!sms) add(R.string.banner_sms)
         if(killed) add(R.string.banner_killed)
         if(!battery) add(R.string.banner_battery)
         if(!sleeping) add(R.string.banner_never_sleeping)
@@ -36,5 +37,5 @@ fun Context.health(p:io.github.stantonmatt.pneu.data.Prefs=graph.prefs.value): H
     val killed=p.peer!=null && ServiceEvidence.killed(this)
     if(killed && p.neverSleeping)graph.invalidateSleeping()
     val sleeping=!Build.MANUFACTURER.equals("samsung",true) || PermissionPolicy.sleeping(p.neverSleeping,bucket<UsageStatsManager.STANDBY_BUCKET_RARE,killed,batteryExempt)
-    return Health(photos,notifications,battery,sleeping,killed,channelBlocked,am.isBackgroundRestricted,Build.VERSION.SDK_INT<37 || granted(Manifest.permission.ACCESS_LOCAL_NETWORK))
+    return Health(photos,notifications,battery,sleeping,killed,channelBlocked,am.isBackgroundRestricted,Build.VERSION.SDK_INT<37 || granted(Manifest.permission.ACCESS_LOCAL_NETWORK),!p.sms || granted(Manifest.permission.RECEIVE_SMS))
 }

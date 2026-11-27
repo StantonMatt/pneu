@@ -16,11 +16,40 @@ pub(crate) fn pair_keys(local: &Id, peer: &Id, phone: bool) -> Vec<String> {
     keys.sort();
     keys
 }
+pub(super) fn sms_supported(c: &Connection, peer: &Id) -> Result<bool> {
+    Ok(c.query_row(
+        "SELECT coalesce((SELECT supported FROM sms_support WHERE device=?),0)",
+        [peer.as_str()],
+        |r| r.get(0),
+    )?)
+}
+pub(super) fn negotiate_sms(tx: &Transaction<'_>, peer: &Id, supported: bool) -> Result<()> {
+    if sms_supported(tx, peer)? != supported {
+        tx.execute(
+            "DELETE FROM settings_outgoing WHERE device=?",
+            [peer.as_str()],
+        )?;
+        tx.execute(
+            "DELETE FROM settings_replay WHERE device=?",
+            [peer.as_str()],
+        )?;
+    }
+    tx.execute("INSERT INTO sms_support VALUES(?,?) ON CONFLICT(device) DO UPDATE SET supported=excluded.supported", params![peer.as_str(), supported])?;
+    Ok(())
+}
+fn supported_keys(c: &Connection, local: &Id, peer: &Id, phone: bool) -> Result<Vec<String>> {
+    let mut keys = pair_keys(local, peer, phone);
+    if phone && sms_supported(c, peer)? {
+        keys.push(format!("{peer}/{local}/sms"));
+        keys.sort();
+    }
+    Ok(keys)
+}
 pub(super) fn fields(c: &Connection, peer: &Id) -> Result<Vec<PeerSetting>> {
     let mut q = c.prepare(
-        "SELECT key,enabled,hlc,writer_device FROM peer_settings WHERE device=? ORDER BY key",
+        "SELECT key,enabled,hlc,writer_device FROM peer_settings WHERE device=? AND (key NOT LIKE '%/sms' OR coalesce((SELECT supported FROM sms_support WHERE device=?),0)) ORDER BY key",
     )?;
-    q.query_map([peer.as_str()], |r| {
+    q.query_map([peer.as_str(), peer.as_str()], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, bool>(1)?,
@@ -41,7 +70,7 @@ pub(super) fn fields(c: &Connection, peer: &Id) -> Result<Vec<PeerSetting>> {
 }
 fn initialize(tx: &Transaction<'_>, local: &Id, peer: &Id, phone: bool) -> Result<()> {
     ensure!(local != peer, SettingsUnexpected);
-    for key in pair_keys(local, peer, phone) {
+    for key in supported_keys(tx, local, peer, phone)? {
         tx.execute(
             "INSERT OR IGNORE INTO peer_settings VALUES(?,?,1,'0',?)",
             params![peer.as_str(), key, local.as_str().min(peer.as_str())],
@@ -70,6 +99,13 @@ impl Store {
         self.locked(|c| {
             let tx = c.transaction()?;
             epoch.check(&tx)?;
+            if let Some((supported, current, connection)) = &self.negotiated_sms {
+                ensure!(
+                    current.load(Ordering::SeqCst) == *connection,
+                    "connection changed"
+                );
+                negotiate_sms(&tx, peer, *supported)?;
+            }
             let previous = fields(&tx, peer)?;
             let result = f(&tx)?;
             let state = fields(&tx, peer)?;
@@ -259,7 +295,7 @@ impl Store {
         self.blocking(move |s| {
             s.settings_write(epoch, &peer, |tx| {
                 ensure!(
-                    pair_keys(&local, &peer, phone).contains(&key),
+                    supported_keys(tx, &local, &peer, phone)?.contains(&key),
                     "setting does not belong to this pair"
                 );
                 initialize(tx, &local, &peer, phone)?;
@@ -300,7 +336,7 @@ impl Store {
             s.settings_write(epoch, &peer, |tx| {
                 let snapshot = canonical(snapshot);
                 let keys: Vec<_> = snapshot.settings.iter().map(|f| f.key.clone()).collect();
-                ensure!(keys == pair_keys(&local, &peer, phone), SettingsUnexpected);
+                ensure!(keys == supported_keys(tx,&local, &peer, phone)?, SettingsUnexpected);
                 for f in &snapshot.settings {
                     f.validate().map_err(|_| SettingsMalformed)?;
                     validate_stamp(f.hlc, crate::now_ms()).map_err(|_| SettingsMalformed)?;

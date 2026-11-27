@@ -220,6 +220,7 @@ impl DesktopActions {
             Ok(target) => target,
             Err(_) => {
                 match activation.arguments.rsplit('-').next().unwrap_or("") {
+                    "dismiss" | "code" | "text" => {}
                     "pair" => core.request_add_device(),
                     "folder" => core.request_window(true),
                     "open" | "default" | "show" => open_folder(&core.config().save_path).await?,
@@ -234,6 +235,12 @@ impl DesktopActions {
         );
         let target = &record.target;
         match action.as_str() {
+            "dismiss" => {}
+            "sms-code" | "sms-text" => {
+                if let Some(target) = &record.notice.sms_target {
+                    core.copy_sms(target.clone(), action == "sms-code").await;
+                }
+            }
             "window" => core.request_window(false),
             "default" | "open" => {
                 if let Some(file) = target.files.last() {
@@ -274,6 +281,16 @@ fn file_attribution(metadata: &pneu_proto::FileBegin) -> Option<String> {
 
 #[async_trait]
 impl PcActions for DesktopActions {
+    async fn screen_locked(&self) -> bool {
+        crate::ui::clipboard::session_locked()
+    }
+    async fn notify_sms(
+        &self,
+        notice: crate::ui::notifications::Notice,
+        replaces: u32,
+    ) -> Result<u32> {
+        self.notice(notice, Vec::new(), None, replaces, None).await
+    }
     async fn clipboard_text(&self, _text: &str) -> Result<()> {
         anyhow::bail!("Windows clipboard writes require the clipboard actor")
     }
@@ -289,7 +306,7 @@ impl PcActions for DesktopActions {
             let native = crate::ui::clipboard::Offer::prepare(&input, ticket)?;
             Ok(PreparedClipboard {
                 hashes: native.hashes(),
-                marker_confirmation: true,
+                marker_confirmation: !matches!(input, ClipboardInput::SecretText(_)),
                 input,
                 native: Some(native),
                 #[cfg(test)]

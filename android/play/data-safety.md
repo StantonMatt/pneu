@@ -4,7 +4,7 @@ For version 2.2.0 (7), using ZXing core 3.5.4 for on-device QR decoding. Sources
 
 ## Scope and transfer content
 
-[Google's Data safety guidance](https://support.google.com/googleplay/android-developer/answer/10787469#collection) defines collection as transmitting data off the device. It excludes end-to-end encrypted data readable only by its sender and recipient. Pneu transfers clipboard content, photos, recordings, files and pairing metadata between the user's own paired devices over direct, certificate-pinned mutual TLS 1.3 connections. No transfer content reaches the developer or a third party; only the paired devices hold the keys. These transfers therefore do not count as collection or sharing. Transfer content is encrypted in transit, including over LAN or Tailscale.
+[Google's Data safety guidance](https://support.google.com/googleplay/android-developer/answer/10787469#collection) defines collection as transmitting data off the device. It excludes end-to-end encrypted data readable only by its sender and recipient. Pneu transfers clipboard content, photos, recordings, files, pairing metadata and optionally new SMS (sender and text) between the user's own paired devices over direct, certificate-pinned mutual TLS 1.3 connections. No transfer content reaches the developer or a third party; only the paired devices hold the keys. These transfers therefore do not count as collection or sharing. Transfer content is encrypted in transit, including over LAN or Tailscale.
 
 Local storage and on-device QR processing are also outside collection. ZXing core is pure Java, Apache-2.0 licensed, and has no network access or telemetry. Pneu has no analytics, advertising or telemetry SDK. User-directed opening/sharing to another app is an expected user action under Google's sharing exception. Tailscale is an optional separate app/service with its own policy.
 
@@ -22,6 +22,10 @@ Local storage and on-device QR processing are also outside collection. ZXing cor
 ## Data types and usage answers
 
 Select no data types, collection/sharing purposes or retention claims. The No answer should skip those sections. No location, personal/contact/financial/health/calendar information, messages, photos/videos, audio, files/docs, installed-app inventory, browsing/search history, identifiers, diagnostics or app interactions are collected or shared.
+
+## SMS access
+
+SMS messages is off by default and uses `RECEIVE_SMS` only, with prominent disclosure before every permission request. Pneu reads only new SMS broadcasts, not SMS history, contacts, MMS, RCS or other apps' notifications. Queued SMS stay in memory for at most two minutes, with no message database, transfer history or message logs. The encrypted device-to-device exception above also applies to these messages. This Data safety assessment is separate from the restricted SMS permission declaration.
 
 ## Before submitting
 

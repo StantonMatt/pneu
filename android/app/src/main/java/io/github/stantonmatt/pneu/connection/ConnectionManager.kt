@@ -85,6 +85,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
         if(target===socket)tcpSocket?.runCatching {close()}
         target?.runCatching {close()}
     }
+    @Volatile private var smsReceipt:Pair<String,CompletableDeferred<Frame.Control>>?=null
     @Volatile private var settingsReady=false
     private val settingsEvents=Channel<Unit>(Channel.CONFLATED)
     @Volatile private var settingsReceipt:Pair<String,CompletableDeferred<Frame.Control>>?=null
@@ -337,10 +338,11 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
     private fun networkAllowed(p: Prefs, network:RoutePolicy.Active=RoutePolicy.active(cm)): Boolean {
         if(!localNetworkGranted()) {state.update {it.copy(status="Local network access is off")};return false}
         if (!network.available) { state.update { it.copy(status="No network") }; return false }
-        if (network.mobile && !p.mobile) { state.update { it.copy(status="Waiting for Wi-Fi") }; return false }
+        if (network.mobile && !p.mobile && !p.sms) { state.update { it.copy(status="Waiting for Wi-Fi") }; return false }
         return true
     }
-    private fun endpointAllowed(p: Prefs,endpoint: Endpoint,network:RoutePolicy.Active=RoutePolicy.active(cm))=networkAllowed(p,network) && !p.deliveryReset && DeliveryPolicy.transport(endpoint.tailscale,p.wifi,p.tailscale,network.connectivity,p.mobile)
+    private fun endpointAllowed(p: Prefs,endpoint: Endpoint,network:RoutePolicy.Active=RoutePolicy.active(cm))=networkAllowed(p,network) && !p.deliveryReset && DeliveryPolicy.transport(endpoint.tailscale,p.wifi,p.tailscale,network.connectivity,p.mobile || p.sms)
+    private fun contentEndpointAllowed(p:Prefs,endpoint:Endpoint,network:RoutePolicy.Active=RoutePolicy.active(cm))=endpointAllowed(p,endpoint,network) && (!network.mobile || p.mobile)
     private suspend fun <T> phase(ssl:SSLSocket,timeout:Long,body:suspend ()->T):T=coroutineScope {
         val deadline=launch(Dispatchers.Default) {delay(timeout);closeSocket(ssl)}
         try {body()} finally {deadline.cancel();state.update {it.copy(incoming=null)}}
@@ -350,7 +352,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
         var sessionOutcome=outcome
         val name=p.selfName.ifEmpty {Settings.Global.getString(context.contentResolver,Settings.Global.DEVICE_NAME) ?: android.os.Build.MODEL}
         val hello=phase(ssl,10000) {
-        send(Frame.Control(Type.HELLO, json("version" to 1, "device_id" to p.deviceId, "name" to utf8Prefix(name,128).ifEmpty {"Pneu"}, "capabilities" to listOf("files","clipboard_text","clipboard_image","mesh"),"role" to "phone", "paused" to p.paused)))
+        send(Frame.Control(Type.HELLO, json("version" to 1, "device_id" to p.deviceId, "name" to utf8Prefix(name,128).ifEmpty {"Pneu"}, "capabilities" to SmsReceiveCapabilities.forRoute(RoutePolicy.active(cm).mobile,p.mobile),"role" to "phone", "sms_activated" to p.smsActivated, "paused" to p.paused)))
         readControl(ssl)
         }
         if (hello.type == Type.ERROR) throw RemoteError(hello.body["code"].asString)
@@ -426,7 +428,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
         val boundPeer=Peer(attempt?.invitation?.name ?: p.peer!!.name,sessionBinding.pin,pcId,emptyList(),generation=sessionBinding.generation)
         check(app.preferences.connected(sessionBinding,endpoint)) {"Binding changed"}
         capabilities=hello.body["capabilities"].asJsonArray.map {it.asString}.toSet()
-        app.preferences.hello(sessionBinding,hello.body["name"].asString,hello.body["addresses"]?.asJsonArray?.map {Endpoint.parse(it.asString)}.orEmpty(),mesh)
+        app.preferences.hello(sessionBinding,hello.body["name"].asString,hello.body["addresses"]?.asJsonArray?.map {Endpoint.parse(it.asString)}.orEmpty(),mesh,"sms" in capabilities)
         app.abandonClipboard(sessionBinding,sessionOnly=!mesh)
         settingsReady=!mesh
         app.queue.pendingPeer(pcId).filter {it.bindingGeneration==sessionBinding.generation && it.error=="unsupported_kind" && !it.rejectedCapabilities.startsWith("settings:") && it.rejectedCapabilities!=capabilities.sorted().joinToString(",") && (if(it.kind=="text")"clipboard_text" in capabilities else "files" in capabilities && (it.kind!="clipboard_image" || "clipboard_image" in capabilities))}.forEach {
@@ -552,7 +554,8 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                 if(!settingsReady) {waitMillis=1000;continue}
                 if(text && prefs.peer?.clipboardSend!=true)app.queueMutex.withLock {app.queue.supersedeBoundText(sessionBinding.pcId,sessionBinding.generation)}
                 val network=RoutePolicy.active(cm)
-                if(!endpointAllowed(prefs,endpoint,network))throw TransportFailure(java.io.IOException("Policy changed"))
+                if(network.mobile && !prefs.mobile) {waitMillis=1000;continue}
+                if(!contentEndpointAllowed(prefs,endpoint,network))throw TransportFailure(java.io.IOException("Policy changed"))
                 // This lane has no active transfer here. A failed completion AND
                 // failed fallback write can leave sending durable after the receipt.
                 app.recoverDeliveryLane(text,sessionBinding)
@@ -599,6 +602,30 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                         }
                     } else waitMillis=60000 // Read/recovery failed before selection; a new-work signal can retry it.
                 }
+            }} finally {events.cancel();work.close()}
+        }
+        val smsSender=launch {
+            val work=Channel<Unit>(Channel.CONFLATED)
+            val events=launch {combine(app.prefs,app.sms.changed) {_,_->Unit}.collect {work.trySend(Unit)}}
+            try {while(isActive) {
+                val entry=app.sms.queue.next(sessionBinding)
+                if(entry==null || "sms" !in capabilities) {work.receive();continue}
+                if(!settingsReady) {withTimeoutOrNull(1000) {work.receive()};continue}
+                val receipt=CompletableDeferred<Frame.Control>()
+                smsReceipt=entry.id to receipt
+                try {
+                    val sent=send(Frame.Control(Type.SMS,json("transfer_id" to entry.id,"sender" to entry.sender,"text" to entry.text,"received_at" to entry.receivedAt)))
+                    if(sent) {
+                        val response=withTimeoutOrNull((entry.expires-SystemClock.elapsedRealtime()).coerceAtLeast(1)) {receipt.await()}
+                        if(response!=null)app.sms.queue.delivered(entry.id,sessionBinding)
+                        else {closeSocket(ssl);throw RemoteError("timeout")}
+                    } else {
+                        // A reconnect/settings handshake is not a delivery. Keep
+                        // authorized recipients until their original RAM deadline.
+                        app.sms.queue.prune(app.preferences.read(),context.granted(android.Manifest.permission.RECEIVE_SMS))
+                        delay(250)
+                    }
+                } finally {smsReceipt=null}
             }} finally {events.cancel();work.close()}
         }
         val sender=launchSender(false)
@@ -656,7 +683,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                     Type.ACK, Type.NACK -> {
                         val receipt = activeReceipt
                         val id=frame.body["transfer_id"].asString
-                        val target=if(receiptReady && receipt?.first==id)receipt else textReceipt?.takeIf {it.first==id} ?: settingsReceipt?.takeIf {it.first==id}
+                        val target=if(receiptReady && receipt?.first==id)receipt else textReceipt?.takeIf {it.first==id} ?: settingsReceipt?.takeIf {it.first==id} ?: smsReceipt?.takeIf {it.first==id}
                         require(target != null && target.second.complete(frame))
                     }
                     Type.UNPAIR -> {
@@ -673,7 +700,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                     else -> { send(Frame.Control(Type.ERROR, json("code" to "unexpected_message"))); throw RemoteError("unexpected_message") }
                 }
             }
-        } finally { closeSocket(ssl); monitor.cancel(); sender.cancel(); textSender.cancel(); writeWatchdog.cancel();settingsSender?.cancel();receiveWatchdog.cancel();receiveWake.close()
+        } finally { closeSocket(ssl); monitor.cancel(); smsSender.cancel();smsReceipt=null; sender.cancel(); textSender.cancel(); writeWatchdog.cancel();settingsSender?.cancel();receiveWatchdog.cancel();receiveWake.close()
             withContext(NonCancellable) {
                 state.update {it.copy(incoming=null)}
                 runCatching {receiver.disconnect()}
@@ -783,7 +810,18 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
         if(unpairing)throw TransportFailure(java.io.IOException("Unpairing"))
         if(frame is Frame.Chunk || (frame is Frame.Control && frame.type in setOf(Type.FILE_BEGIN,Type.CLIPBOARD))) {
             val current=SendFailures.local("local_storage") {readPrefs()}
-            if(activeEndpoint?.let {endpointAllowed(current,it)}!=true || (pairingAttempt()?.invitation?.fingerprint ?: current.peer?.pin)!=activePin) {closeSocket(s);throw TransportFailure(java.io.IOException("Policy changed"))}
+            if(activeEndpoint?.let {contentEndpointAllowed(current,it)}!=true || (pairingAttempt()?.invitation?.fingerprint ?: current.peer?.pin)!=activePin) {closeSocket(s);throw TransportFailure(java.io.IOException("Policy changed"))}
+        }
+        if(frame is Frame.Control && frame.type==Type.SMS) {
+            val binding=authenticatedBinding ?: return@withLock false
+            val accepted=app.withBinding(binding) {app.preferences.policy.locked {
+                val current=app.preferences.read()
+                app.sms.queue.prune(current,context.granted(android.Manifest.permission.RECEIVE_SMS))
+                val entry=app.sms.queue.next(binding)
+                ready && settingsReady && "sms" in capabilities && entry?.id==frame.body["transfer_id"].asString &&
+                    SmsQueue.allowed(current,context.granted(android.Manifest.permission.RECEIVE_SMS),binding)
+            }} == true
+            if(!accepted)return@withLock false
         }
         if(emission!=null) {
             if(!settingsReady)return@withLock false
@@ -795,7 +833,7 @@ class ConnectionManager(private val app:AppGraph,private val peerPin:String?=nul
                 eligible={p,current,newer->
                     val network=RoutePolicy.active(cm)
                     EmissionPolicy.eligible(emission.row,current,p,emission.binding,
-                        activeEndpoint?.let {endpointAllowed(p,it,network)}==true,network.mobile,capabilities,newer)},
+                        activeEndpoint?.let {contentEndpointAllowed(p,it,network)}==true,network.mobile,capabilities,newer)},
                 begin={p->emission.begin(requireNotNull(p.devices.find {it.deviceId==emission.binding.pcId}),capabilities)})}
             if(!accepted)return@withLock false
             if(frame is Frame.Control && frame.type==Type.FILE_BEGIN) {

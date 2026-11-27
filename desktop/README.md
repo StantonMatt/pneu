@@ -114,6 +114,12 @@ An advisory lock prevents competing daemons from recovering the same store.
 A stale socket is reclaimed only under its runtime lock after an owner/type
 check and a refused connection.
 
+## SMS from Android
+
+Turn on **SMS messages** under Android Settings → Send automatically and allow SMS access. Each paired computer receives messages by default; **Send SMS** / **Receive SMS** controls each pair. Computers running an older Pneu must be updated first. Only new real SMS broadcasts are forwarded, not RCS, MMS or other notifications. Pause also pauses SMS; offline messages expire from phone memory after two minutes.
+
+SMS notices always show, even when **Show notifications** for received files is off. Detected one-time codes are masked; **Copy codes to clipboard** (on by default) copies only the code. **Copy Code** and **Copy Text** retry explicitly. Secret copies set the platform's history exclusion markers, are never forwarded by Pneu, and clear after 60 seconds only while the same copy still owns the clipboard. On macOS this is best-effort: a change-count re-check immediately precedes clearing, but AppKit cannot make those two operations atomic. A newer clipboard change wins over an arriving code. Automatic copy skips locked sessions. Linux queries logind, then the session screensaver; macOS checks the console lock property and Windows checks the input desktop. If a lock query is unavailable, the approved fallback permits copying. Clipboard managers must honor the platform markers to exclude history.
+
 ## UI API
 
 Construct `Arc<Core>` with `Paths`, `Config`, and `Arc<dyn PcActions>`, then call

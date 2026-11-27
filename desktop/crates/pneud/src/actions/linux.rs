@@ -30,11 +30,13 @@ pub struct DesktopActions {
 pub(super) struct ClipboardCandidate {
     pub(super) child: Option<Child>,
     input: Option<tokio::process::ChildStdin>,
+    parent_pipe: Option<tokio::process::ChildStdin>,
     jobs: Arc<crate::work::Work>,
 }
 impl ClipboardCandidate {
     pub(super) async fn stop(&mut self) {
         self.input.take();
+        self.parent_pipe.take();
         if let Some(mut child) = self.child.take() {
             let _ = child.kill().await;
             let _ = child.wait().await;
@@ -59,6 +61,7 @@ struct Target {
     paths: Vec<PathBuf>,
     link: Option<String>,
     retry: Option<(pneu_proto::Id, pneu_proto::Id, pneu_proto::Id)>,
+    sms: Option<crate::sms::Target>,
 }
 struct Burst {
     id: u32,
@@ -120,6 +123,10 @@ impl DesktopActions {
     }
     async fn prepare_copy(&self, input: ClipboardInput, ticket: u128) -> Result<PreparedClipboard> {
         let (mime, bytes) = match &input {
+            ClipboardInput::SecretText(text) => (
+                "application/x-pneu-secret-text".to_owned(),
+                text.0.as_bytes().to_vec(),
+            ),
             ClipboardInput::Text(text) => (
                 "text/plain;charset=utf-8".to_owned(),
                 text.as_bytes().to_vec(),
@@ -161,6 +168,7 @@ impl DesktopActions {
         let mut candidate = ClipboardCandidate {
             child: Some(child),
             input: Some(input_pipe),
+            parent_pipe: None,
             jobs: self.jobs.clone(),
         };
         #[cfg(not(test))]
@@ -284,6 +292,13 @@ impl DesktopActions {
                                         "default"|"open" => { if interactions.available() && let Some(file)=target.files.first() && let Some(wait)=notification_open(file,&action_connection,token.as_deref()).await { interactions.push(async move { let _=wait.await; }); } },
                                         "show" => { if let Ok(urls)=target.paths.iter().map(|path| file_uri(path)).collect::<Result<Vec<_>>>() { let _=show_files(&urls,&action_connection,token.as_deref()).await; } else { let _=file_unavailable_notice(&action_connection).await; } },
                                         "link" => { if interactions.available() && let Some(link)=target.link { let wait=begin_open_uri(&link,&action_connection,token.as_deref()).await; interactions.push(async move { let _=wait.await; }); } },
+                                        "sms-code"|"sms-text" => {
+                                            let sender={commands.lock().expect("UI commands").clone()};
+                                            if let Some(target)=target.sms && let Some(sender)=sender {
+                                                let _=sender.try_send(crate::ui::Command::CopySms {target,code:action=="sms-code"});
+                                                let _=action_connection.call_method(Some("org.freedesktop.Notifications"),"/org/freedesktop/Notifications",Some("org.freedesktop.Notifications"),"CloseNotification",&(id,)).await;
+                                            }
+                                        },
                                         "retry" => { if let Some((operation,artifact,device))=target.retry && let Some(commands)=commands.lock().expect("UI commands").clone() { let _=commands.try_send(crate::ui::Command::RetryTransfer {operation,artifact,device}); } },
                                         "folder"|"pair" => { if let Some(commands)=commands.lock().expect("UI commands").clone() { let _=commands.try_send(if action=="folder" { crate::ui::Command::ChooseFolder } else { crate::ui::Command::AddDevice { activation_token: token } }); } },
                                         _=>{},
@@ -347,6 +362,9 @@ impl DesktopActions {
         let mut hints = HashMap::<&str, zbus::zvariant::Value<'_>>::new();
         hints.insert("desktop-entry", zbus::zvariant::Value::from("pneu"));
         hints.insert("urgency", zbus::zvariant::Value::from(notice.urgency));
+        if notice.sms_target.is_some() || notice.summary.ends_with(" more SMS") {
+            hints.insert("category", zbus::zvariant::Value::from("im.received"));
+        }
         if notice.transient {
             hints.insert("transient", zbus::zvariant::Value::from(true));
         }
@@ -404,6 +422,7 @@ impl DesktopActions {
                 paths,
                 link,
                 retry,
+                sms: notice.sms_target,
             },
         );
         Ok(id)
@@ -411,6 +430,16 @@ impl DesktopActions {
 }
 #[async_trait]
 impl PcActions for DesktopActions {
+    async fn screen_locked(&self) -> bool {
+        session_locked().await.unwrap_or(false)
+    }
+    async fn notify_sms(
+        &self,
+        notice: crate::ui::notifications::Notice,
+        replaces: u32,
+    ) -> Result<u32> {
+        self.notice(notice, Vec::new(), None, replaces, None).await
+    }
     async fn clipboard_text(&self, _text: &str) -> Result<()> {
         anyhow::bail!("clipboard writes require the clipboard actor")
     }
@@ -428,15 +457,17 @@ impl PcActions for DesktopActions {
         self.prepare_copy(input, ticket).await
     }
     async fn install_clipboard(&self, prepared: &mut PreparedClipboard) -> Result<()> {
-        prepared
-            .helper
-            .as_mut()
-            .context("clipboard helper")?
+        let secret = matches!(prepared.input(), ClipboardInput::SecretText(_));
+        let helper = prepared.helper.as_mut().context("clipboard helper")?;
+        let mut pipe = helper
             .input
             .take()
-            .context("clipboard authorization already consumed")?
-            .write_all(b"G")
-            .await?;
+            .context("clipboard authorization already consumed")?;
+        pipe.write_all(b"G").await?;
+        if secret {
+            // Keep the parent-liveness writer open until this serving helper stops.
+            helper.parent_pipe = Some(pipe);
+        }
         Ok(())
     }
     async fn record_clipboard_copy(&self, file: &ReceivedFile) {
@@ -999,6 +1030,14 @@ fn clipboard_sources(
     bytes: Vec<u8>,
 ) -> Result<Vec<wl_clipboard_rs::copy::MimeSource>> {
     use wl_clipboard_rs::copy::{MimeSource, MimeType, Source};
+    if mime == "application/x-pneu-secret-text" {
+        let mut sources = clipboard_sources("text/plain;charset=utf-8".into(), bytes)?;
+        sources.push(MimeSource {
+            source: Source::Bytes(b"secret".to_vec().into()),
+            mime_type: MimeType::Specific("x-kde-passwordManagerHint".into()),
+        });
+        return Ok(sources);
+    }
     if mime == "application/x-pneu-formats" {
         anyhow::ensure!(bytes.len() >= 8, "invalid clipboard formats header");
         let length = u64::from_be_bytes(bytes[..8].try_into()?) as usize;
@@ -1037,8 +1076,24 @@ fn clipboard_sources(
     });
     Ok(sources)
 }
+// Only the dedicated helper process calls this: neither daemon death nor a
+// wedged daemon may leave a secret selection serving beyond its deadline.
+fn guard_secret_lifetime(
+    input: impl std::io::Read + Send + 'static,
+    lifetime: std::time::Duration,
+) {
+    std::thread::spawn(move || {
+        std::thread::sleep(lifetime);
+        std::process::exit(0);
+    });
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut { input }, &mut std::io::sink());
+        std::process::exit(0); // Parent pipe closed (including SIGKILL).
+    });
+}
 pub fn clipboard_helper(mime: String, ticket: u128) -> Result<()> {
     use std::io::{Read, Write};
+    let secret = mime == "application/x-pneu-secret-text";
     let mut bytes = Vec::new();
     let mut input = std::io::stdin().lock();
     let mut length = [0; 8];
@@ -1061,11 +1116,14 @@ pub fn clipboard_helper(mime: String, ticket: u128) -> Result<()> {
     let hashes = sources
         .iter()
         .filter_map(|source| {
-            if source.mime_type
-                == wl_clipboard_rs::copy::MimeType::Specific(
-                    crate::ui::clipboard::ORIGIN_MIME.into(),
-                )
-            {
+            if [
+                crate::ui::clipboard::ORIGIN_MIME,
+                "x-kde-passwordManagerHint",
+            ]
+            .iter()
+            .any(|mime| {
+                source.mime_type == wl_clipboard_rs::copy::MimeType::Specific((*mime).into())
+            }) {
                 return None;
             }
             if let wl_clipboard_rs::copy::Source::Bytes(bytes) = &source.source {
@@ -1088,6 +1146,13 @@ pub fn clipboard_helper(mime: String, ticket: u128) -> Result<()> {
     let mut commit = [0];
     input.read_exact(&mut commit)?;
     anyhow::ensure!(commit == *b"G", "clipboard helper canceled");
+    drop(input);
+    if secret {
+        guard_secret_lifetime(
+            std::io::stdin(),
+            std::time::Duration::from_secs(crate::sms::CLEAR_AFTER_SECS),
+        );
+    }
     selection.serve()?;
     Ok(())
 }
@@ -1097,6 +1162,55 @@ mod clipboard_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn secret_helper_exits_on_own_deadline_and_parent_pipe_eof() -> Result<()> {
+        use std::io::{BufRead, Write};
+        const CHILD: &str = "PNEU_TEST_SECRET_GUARD";
+        if let Ok(mode) = std::env::var(CHILD) {
+            let duration = if mode == "deadline" { 250 } else { 10_000 };
+            guard_secret_lifetime(std::io::stdin(), std::time::Duration::from_millis(duration));
+            println!("GUARD READY");
+            std::io::stdout().flush()?;
+            std::thread::park();
+            unreachable!();
+        }
+        for mode in ["deadline", "eof"] {
+            let mut child = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "actions::linux::tests::secret_helper_exits_on_own_deadline_and_parent_pipe_eof", "--nocapture"])
+                .env(CHILD, mode)
+                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+            let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if output.read_line(&mut line)? == 0 {
+                    break;
+                }
+                if line.contains("GUARD READY") {
+                    break;
+                }
+            }
+            assert!(line.contains("GUARD READY"));
+            assert!(child.try_wait()?.is_none());
+            if mode == "eof" {
+                drop(child.stdin.take());
+            }
+            let started = std::time::Instant::now();
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    assert!(status.success());
+                    break;
+                }
+                if started.elapsed() > std::time::Duration::from_secs(2) {
+                    child.kill()?;
+                    child.wait()?;
+                    panic!("secret guard did not exit on {mode}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        Ok(())
+    }
     #[test]
     fn anonymous_clipboard_backing_is_private_unlinked_and_descriptor_bound() -> Result<()> {
         use std::os::unix::fs::MetadataExt;
@@ -2305,6 +2419,76 @@ mod tests {
         drop(server);
         bus.kill().await?;
         bus.wait().await?;
+        Ok(())
+    }
+}
+
+/// Prefer logind; screensaver is the per-session fallback. Unknown permits copy.
+async fn session_locked() -> Option<bool> {
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        if let Ok(bus) = zbus::Connection::system().await {
+            if let Ok(manager) = zbus::Proxy::new(
+                &bus,
+                "org.freedesktop.login1",
+                "/org/freedesktop/login1",
+                "org.freedesktop.login1.Manager",
+            )
+            .await
+            {
+                let path: Result<zbus::zvariant::OwnedObjectPath, _> = manager
+                    .call("GetSessionByPID", &(std::process::id(),))
+                    .await;
+                if let Ok(path) = path {
+                    if let Ok(session) = zbus::Proxy::new(
+                        &bus,
+                        "org.freedesktop.login1",
+                        path,
+                        "org.freedesktop.login1.Session",
+                    )
+                    .await
+                    {
+                        if let Ok(locked) = session.get_property::<bool>("LockedHint").await {
+                            return Some(locked);
+                        }
+                    }
+                }
+            }
+        }
+        let bus = zbus::Connection::session().await.ok()?;
+        let proxy = zbus::Proxy::new(
+            &bus,
+            "org.freedesktop.ScreenSaver",
+            "/ScreenSaver",
+            "org.freedesktop.ScreenSaver",
+        )
+        .await
+        .ok()?;
+        proxy.call::<_, _, bool>("GetActive", &()).await.ok()
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+#[cfg(test)]
+mod sms_marker_tests {
+    use super::*;
+    #[test]
+    fn sms_secret_offer_carries_history_exclusion_and_origin() -> Result<()> {
+        use wl_clipboard_rs::copy::{MimeType, Source};
+        let sources =
+            clipboard_sources("application/x-pneu-secret-text".into(), b"482913".to_vec())?;
+        assert!(sources.iter().any(|s| s.mime_type
+            == MimeType::Specific("x-kde-passwordManagerHint".into())
+            && matches!(&s.source,Source::Bytes(b) if b.as_ref()==b"secret")));
+        assert!(
+            sources.iter().any(
+                |s| s.mime_type == MimeType::Specific(crate::ui::clipboard::ORIGIN_MIME.into())
+            )
+        );
+        assert!(sources.iter().any(|s| s.mime_type
+            == MimeType::Specific("text/plain;charset=utf-8".into())
+            && matches!(&s.source,Source::Bytes(b) if b.as_ref()==b"482913")));
         Ok(())
     }
 }

@@ -181,3 +181,10 @@ fn scalar_hex_types_reject_arrays() {
     assert!(serde_json::from_str::<Hash>(&format!("[\"{}\"]", "b".repeat(64))).is_err());
     assert!(serde_json::from_str::<Nonce>(r#"["0000000000000001"]"#).is_err());
 }
+
+object_only!(
+    sms_requires_object,
+    Sms,
+    "sms",
+    ["transfer_id", "sender", "text", "received_at"]
+);

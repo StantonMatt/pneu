@@ -15,7 +15,8 @@ data class Peer(val name: String, val pin: String, val deviceId: String, val add
     val settings:Map<String,PairField> = emptyMap(),val pendingSettings:String="",val confirmedSettings:String="",
     private val settingsReceipts:Map<String,String>? = null,
     @com.google.gson.annotations.SerializedName("localSettingsEdits") private val localEdits:Set<String>? = null,val settingsSupported:Boolean?=null,
-    private val acknowledgedSettings:String?=null) {
+    private val acknowledgedSettings:String?=null,val smsSupported:Boolean=false) {
+    val sendSms get()=settings.entries.find {it.key.endsWith("/sms")}?.value?.enabled ?: true
     internal val acknowledgedSnapshot get()=acknowledgedSettings.orEmpty()
     val localSettingsEdits get()=localEdits.orEmpty()
     internal val legacySettingsReceipts get()=settingsReceipts.orEmpty()
@@ -38,7 +39,7 @@ data class Prefs(
     val peers:List<Peer> = emptyList(), val resetPeers:Set<String> = emptySet(),
     val recentClipboardHashes:List<String> = emptyList(),val legacyQueuePeer:String="",val legacyQueueGeneration:Long=0,val selfName:String="",val chooseDevicesEachTime:Boolean=false,val lastReceivedSource:String="",
     val recentClipboardSources:Map<String,String> = emptyMap(),
-    val automaticRevocations:Map<String,Long> = emptyMap()
+    val automaticRevocations:Map<String,Long> = emptyMap(),val sms:Boolean=false,val smsEpoch:Long=0,val smsActivated:Boolean=false
 ) {
     fun automaticRevocation(kind:String)=automaticRevocations[when(kind) {"photo"->"photos";"recording"->"recordings";else->"screenshots"}] ?: 0
     // Compatibility projection for the existing single-computer screens/fixtures.
@@ -114,7 +115,7 @@ class Preferences(private val context:Context,internal val store:androidx.datast
             pairingRevision=l(p,"pairingRevision"),lastReceivedSource=s(p,"lastReceivedSource"),resetPeers=PeerRegistry.resets(p),
             legacyQueuePeer=s(p,"legacyQueuePeer"),legacyQueueGeneration=l(p,"legacyQueueGeneration"),
             recentClipboardHashes=s(p,"recentClipboardHashes").split('|').filter {it.isNotEmpty()},recentClipboardSources=ClipboardHistory.read(p),selfName=s(p,"selfName"),chooseDevicesEachTime=b(p,"chooseDevicesEachTime"),
-            automaticRevocations=listOf("screenshots","photos","recordings").associateWith {l(p,it+"AdmissionEpoch")}.filterValues {it!=0L})
+            sms=b(p,"sms"),smsEpoch=l(p,"smsEpoch"),smsActivated=b(p,"smsActivated"),automaticRevocations=listOf("screenshots","photos","recordings").associateWith {l(p,it+"AdmissionEpoch")}.filterValues {it!=0L})
     }
     val flow=raw.recoverReads()
     suspend fun read():Prefs=kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {storageDeadline {beforeReadStart();raw.first()}}
@@ -135,7 +136,7 @@ class Preferences(private val context:Context,internal val store:androidx.datast
         Unit
     }
     private fun advanceEpoch(p:MutablePreferences) {p[longPreferencesKey("mediaEpoch")]=AdmissionPolicy.next(l(p,"mediaEpoch"))}
-    private val policyKeys=setOf("paused","screenshots","photos","recordings","wifi","tailscale","mobile","originals","queue","deliveryReset")
+    private val policyKeys=setOf("paused","sms","screenshots","photos","recordings","wifi","tailscale","mobile","originals","queue","deliveryReset")
     suspend fun toggle(key:String,value:Boolean)=kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
         if(key=="clipboardFromPc") {read().peer?.let {setPairSwitch(it.deviceId,"receiveClipboard",value)};return@withContext}
         suspend fun apply() {
@@ -180,6 +181,8 @@ class Preferences(private val context:Context,internal val store:androidx.datast
                     val prefix=if(key=="recordings")"video" else "image"
                     it[longPreferencesKey(key+"AfterId")]=AdmissionPolicy.watermark(s(it,prefix+"Version"),l(it,key+"AfterId"),requireNotNull(snapshot).version,afterId)
                 }
+                if(key in setOf("paused","sms") && b(it,key)!=value)it[longPreferencesKey("smsEpoch")]=AdmissionPolicy.next(l(it,"smsEpoch"))
+                if(key=="sms" && value)it[booleanPreferencesKey("smsActivated")]=true
                 it[booleanPreferencesKey(key)]=value
             }
         }
@@ -229,7 +232,7 @@ class Preferences(private val context:Context,internal val store:androidx.datast
                 lastLan=prior?.takeIf {it.deviceId==pcId && it.pin==invitation.fingerprint}?.lastLan.orEmpty(),
                 lastConnected=prior?.takeIf {it.deviceId==pcId && it.pin==invitation.fingerprint}?.lastConnected ?: 0,
                 clipboardSend=prior?.clipboardSend ?: true,clipboardReceive=prior?.clipboardReceive ?: true,automaticMedia=prior?.automaticMedia ?: true,
-                settings=prior?.takeIf {it.deviceId==pcId}?.settings.orEmpty(),localEdits=prior?.takeIf {it.deviceId==pcId}?.localSettingsEdits.orEmpty(),settingsSupported=prior?.settingsSupported)
+                settings=prior?.takeIf {it.deviceId==pcId}?.settings.orEmpty(),localEdits=prior?.takeIf {it.deviceId==pcId}?.localSettingsEdits.orEmpty(),settingsSupported=prior?.settingsSupported,smsSupported=prior?.smsSupported ?: false)
             PeerRegistry.write(it,if(prior==null)peers+peer else peers.map {p->if(p==prior)peer else p})
             if(prior!=null && !unchanged)PeerRegistry.reset(it,prior.deviceId)
             it[booleanPreferencesKey("pairingLost")]=false;it.remove(stringPreferencesKey("lostPcName"))
@@ -336,7 +339,7 @@ class Preferences(private val context:Context,internal val store:androidx.datast
     internal suspend fun setPairSwitchLocked(peerId:String,feature:String,enabled:Boolean)=edit {p->
         beforeMutation("pairSwitch")
         val peers=PeerRegistry.read(p);val peer=requireNotNull(peers.find {it.deviceId==peerId})
-        val key=PairSettings.keys(s(p,"deviceId"),peerId)[when(feature) {"sendClipboard"->0;"receiveClipboard"->1;"automaticMedia"->2;else->error("Unknown pair switch")}]
+        val key=PairSettings.keys(s(p,"deviceId"),peerId,peer.smsSupported)[when(feature) {"sendClipboard"->0;"receiveClipboard"->1;"automaticMedia"->2;"sms"->3;else->error("Unknown pair switch")}]
         if(peer.settings.getValue(key).enabled!=enabled) {
             val stamp=MeshClock.next(p,s(p,"deviceId"),false)
             PeerRegistry.write(p,peers.map {if(it==peer)it.copy(settings=it.settings+(key to PairField(enabled,stamp.hlc.toString(),stamp.source)),localEdits=it.localSettingsEdits+key) else it})
@@ -406,9 +409,9 @@ class Preferences(private val context:Context,internal val store:androidx.datast
         }
     }
     internal class SettingsConflict:Exception()
-    internal suspend fun hello(binding:DeliveryBinding,name:String,addresses:List<Endpoint>,mesh:Boolean=true) {edit {p->
+    internal suspend fun hello(binding:DeliveryBinding,name:String,addresses:List<Endpoint>,mesh:Boolean=true,sms:Boolean=false) {edit {p->
         PeerRegistry.write(p,PeerRegistry.read(p).map {if(it.deviceId==binding.pcId && it.generation==binding.generation && it.pin==binding.pin)
-            it.copy(name=name,settingsSupported=mesh,addresses=if(addresses.isEmpty())it.addresses else (addresses+it.addresses).distinct().take(8)) else it})
+            it.copy(name=name,settingsSupported=mesh,smsSupported=mesh && sms,pendingSettings=if(it.smsSupported!=sms)"" else it.pendingSettings,confirmedSettings=if(it.smsSupported!=sms)"" else it.confirmedSettings,acknowledgedSettings=if(it.smsSupported!=sms)"" else it.acknowledgedSnapshot,addresses=if(addresses.isEmpty())it.addresses else (addresses+it.addresses).distinct().take(8)) else it})
     }}
     suspend fun finishPeerReset(peerId:String) {edit {PeerRegistry.finishReset(it,peerId)}}
     suspend fun forget(lostPcName:String?=null,peerId:String?=null):Unit=policy.locked {

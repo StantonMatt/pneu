@@ -75,7 +75,10 @@ fn every_known_field_rejects_wrong_types_null_and_duplicates() {
                 }
                 let optional = !is_nested
                     && match type_id {
-                        0x01 => matches!(field.as_str(), "paused" | "role" | "addresses"),
+                        0x01 => matches!(
+                            field.as_str(),
+                            "paused" | "role" | "addresses" | "sms_activated"
+                        ),
                         0x03 | 0x14 | 0x7f => field == "message",
                         0x10 => field == "source_media_id",
                         0x20 => field == "origin",
@@ -145,7 +148,7 @@ fn every_known_field_rejects_wrong_types_null_and_duplicates() {
     let expected = [
         (
             0x01,
-            "version device_id name capabilities paused role addresses",
+            "version device_id name capabilities paused role addresses sms_activated",
         ),
         (0x02, "token"),
         (0x03, "accepted code message"),

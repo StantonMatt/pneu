@@ -155,7 +155,8 @@ class PneuService : Service() {
             Triple(!h.photos,getString(R.string.alert_photos_title),getString(R.string.alert_photos_text)),
             Triple(h.killed,getString(R.string.alert_killed_title),if(android.os.Build.MANUFACTURER.equals("samsung",true) && !h.sleeping)getString(R.string.alert_killed_text) else getString(R.string.alert_killed_generic_text)),
             Triple(!h.battery,getString(R.string.alert_battery_title),getString(R.string.alert_battery_text)),
-            Triple(!h.localNetwork,getString(R.string.banner_local_network),getString(R.string.alert_local_network_text))
+            Triple(!h.localNetwork,getString(R.string.banner_local_network),getString(R.string.alert_local_network_text)),
+            Triple(!h.sms,getString(R.string.banner_sms),getString(R.string.alert_sms_text))
         )
         val times=getSharedPreferences("health_alerts",MODE_PRIVATE)
         alerts.forEachIndexed { i,(active,title,text) ->

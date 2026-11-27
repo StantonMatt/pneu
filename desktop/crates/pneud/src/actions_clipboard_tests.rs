@@ -59,6 +59,10 @@ if mode == 'partial_ack':
     sys.stdout.flush()
     hang()
 print('INSTALLED', flush=True)
+if mode == 'watch_parent':
+    sys.stdin.buffer.read()
+    mark('parent_closed')
+    sys.exit(0)
 if mode == 'ack_exit':
     sys.exit(0)
 if mode == 'ack_crash':
@@ -277,4 +281,30 @@ async fn clipboard_helper_that_never_reads_input_is_bounded_and_reaped() -> Resu
     assert!(actions.prepare_clipboard(helper.input(), 1).await.is_err());
     helper.reaped().await?;
     actions.shutdown().await
+}
+
+#[tokio::test]
+async fn secret_helper_parent_pipe_stays_open_after_install_until_stop() -> Result<()> {
+    let dir = crate::test_support::scratch()?;
+    let mut helper = FakeHelper::new(&dir.path().join("helper"), Payload::Text, "watch_parent")?;
+    helper.mime = "application/x-pneu-secret-text";
+    helper.bytes = b"482913".to_vec();
+    helper.offered = vec![helper.bytes.clone()];
+    let mut actions = DesktopActions::new(dir.path().into());
+    helper.configure(&mut actions);
+    let mut candidate = actions
+        .prepare_clipboard(
+            ClipboardInput::SecretText(crate::sms::SecretText("482913".into(), false)),
+            17,
+        )
+        .await?;
+    actions.install_clipboard(&mut candidate).await?;
+    helper.wait("installed").await?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(helper.alive(), "installation must retain the parent pipe");
+    assert!(!helper.root.join("parent_closed").exists());
+    candidate.stop().await;
+    helper.reaped().await?;
+    actions.shutdown().await?;
+    Ok(())
 }

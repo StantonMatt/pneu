@@ -27,7 +27,7 @@ internal object EmissionPolicy {
             // Capture only a version the peer has actually synchronized.
             ("mesh" !in capabilities || !PairSettings.syncing(peer)) &&
             (selected.kind !in setOf("text","clipboard_image") || peer.clipboardSend) && (!selected.automatic || peer.automaticMedia)
-        }==true && transportAllowed && current!=null &&
+        }==true && transportAllowed && (!mobile || p.mobile) && current!=null &&
         current.state in setOf("waiting","failed") && current.mediaId==selected.mediaId && current.transferId==selected.transferId &&
         current.revision==selected.revision && !newerText &&
         (if(current.kind=="text")"clipboard_text" in capabilities else

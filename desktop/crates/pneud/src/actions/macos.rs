@@ -19,6 +19,7 @@ struct Target {
     url: Option<String>,
     retry: Option<(pneu_proto::Id, pneu_proto::Id, pneu_proto::Id)>,
     actions: Vec<String>,
+    sms: Option<crate::sms::Target>,
 }
 struct NotificationRecord {
     target: Target,
@@ -123,6 +124,7 @@ impl DesktopActions {
                 url,
                 retry: None,
                 actions: Vec::new(),
+                sms: None,
             },
             replaces,
         )
@@ -143,6 +145,7 @@ impl DesktopActions {
             replaces
         };
         anyhow::ensure!(id != 0, "notification identifier exhausted");
+        target.sms = notice.sms_target.clone();
         target.actions = notice.actions.iter().map(|(id, _)| (*id).into()).collect();
         let notification = Notification {
             id,
@@ -302,6 +305,11 @@ impl DesktopActions {
                 )?
                 .await?
             }
+            "sms-code" | "sms-text" => {
+                if let Some(target) = target.sms {
+                    core.copy_sms(target, action == "sms-code").await;
+                }
+            }
             "link" => {
                 if let Some(url) = target.url {
                     bridge::begin(Request::OpenUrl(url), None)?.await?;
@@ -322,6 +330,28 @@ impl DesktopActions {
 }
 #[async_trait]
 impl PcActions for DesktopActions {
+    async fn screen_locked(&self) -> bool {
+        let query = tokio::process::Command::new("/usr/sbin/ioreg")
+            .args(["-n", "Root", "-d1"])
+            .kill_on_drop(true)
+            .output();
+        tokio::time::timeout(std::time::Duration::from_secs(1), query)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .is_some_and(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .replace(' ', "")
+                    .contains("\"CGSSessionScreenIsLocked\"=Yes")
+            })
+    }
+    async fn notify_sms(
+        &self,
+        notice: crate::ui::notifications::Notice,
+        replaces: u32,
+    ) -> Result<u32> {
+        self.notice(notice, Vec::new(), None, replaces, None).await
+    }
     async fn ui_test_notification(&self, transient: bool) -> Result<u32> {
         if transient {
             let mut notice = Notice::text("https://example.com/Pneu-test");
@@ -365,7 +395,7 @@ impl PcActions for DesktopActions {
             let native = Offer::prepare(&input, ticket)?;
             Ok(PreparedClipboard {
                 hashes: native.hashes(),
-                marker_confirmation: true,
+                marker_confirmation: !matches!(input, ClipboardInput::SecretText(_)),
                 input,
                 native: Some(native),
                 #[cfg(test)]
@@ -588,6 +618,7 @@ impl PcActions for DesktopActions {
                     url: None,
                     retry,
                     actions: Vec::new(),
+                    sms: None,
                 },
                 0,
             )
@@ -720,6 +751,7 @@ impl PcActions for DesktopActions {
                     url: None,
                     retry: None,
                     actions: Vec::new(),
+                    sms: None,
                 },
                 replaces,
             )

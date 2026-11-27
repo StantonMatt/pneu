@@ -2,6 +2,12 @@
 
 Drafts for version 2.2.0 (7), checked 2026-10-25. Paste the paragraphs matching the live form prompts. Replace video/contact placeholders before submission.
 
+## SMS permission (maintainer decision before Play submission)
+
+The manifest declares `RECEIVE_SMS` for optional device-to-device SMS synchronization. The feature is off by default and shows a prominent disclosure before requesting access. It forwards new SMS sender/text to allowed paired computers, including in the background; messages are never written to Pneu storage. Computers show the message, mask one-time codes, and optionally copy just the code with clipboard-history exclusion and a one-minute clear-if-unchanged timer. No SMS history, RCS, MMS, contacts or other notification access is requested.
+
+The upstream maintainer must decide whether to submit Google's SMS/Call Log Permissions Declaration Form, select the applicable permitted device synchronization use, and obtain acceptance before publishing this manifest to Play. Approval is not implied by the Data safety exception. The personal fork and upstream implementation use the same manifest; there is no Play-only build flag. Record the Console decision and supply the required review demonstration before release.
+
 ## Photo and video permissions
 
 Core function / `READ_MEDIA_IMAGES`:

@@ -122,5 +122,6 @@ Later history records the implemented expansion:
   [PR #21](https://github.com/StantonMatt/pneu/pull/21).
 - Google Play closed testing and broader Android/network/battery acceptance.
 - Developer ID signing and notarization for the Mac app.
-- Notification mirroring and screen mirroring remain outside the implemented
-  scope. Desktop → phone file sending is already implemented.
+- General notification mirroring and screen mirroring remain outside the implemented
+  scope. Optional Android SMS forwarding (with masked one-time codes and secret
+  clipboard copies) and desktop → phone file sending are implemented.

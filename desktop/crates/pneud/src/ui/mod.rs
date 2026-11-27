@@ -94,6 +94,8 @@ pub struct Snapshot {
     #[serde(default)]
     pub pairing_clipboard: Option<String>,
     #[serde(default)]
+    pub sms_available: bool,
+    #[serde(default)]
     pub pairing_clipboard_revision: u64,
     #[serde(default)]
     pub transfers: Vec<crate::outbox::Transfer>,
@@ -460,6 +462,10 @@ pub(crate) fn captured_authorities(snapshot: &Snapshot) -> Vec<crate::outbox::Au
 }
 #[derive(Clone, Debug)]
 pub enum Command {
+    CopySms {
+        target: crate::sms::Target,
+        code: bool,
+    },
     RetryTransfer {
         operation: pneu_proto::Id,
         artifact: pneu_proto::Id,
