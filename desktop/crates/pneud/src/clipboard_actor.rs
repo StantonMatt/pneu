@@ -62,6 +62,14 @@ pub(super) struct Operation {
     pub observation: Option<Token>,
 }
 impl Operation {
+    pub fn secret(&self) -> bool {
+        matches!(
+            self.payload.as_deref(),
+            Some(Payload::Input(crate::actions::ClipboardInput::SecretText(
+                _
+            )))
+        )
+    }
     fn fingerprint(&self) -> Fingerprint {
         Fingerprint {
             id: self.id.clone(),
@@ -88,6 +96,8 @@ pub(super) enum Failure {
 }
 #[derive(Clone, Debug)]
 pub(super) enum Event {
+    SecretClearing(Ticket),
+    Skip(Ticket),
     Mode(ClipboardMode),
     Share {
         token: Token,
@@ -259,6 +269,8 @@ pub(super) struct State {
     fingerprint_key: FingerprintKey,
     pub history: VecDeque<Fingerprint>,
     current_hashes: Vec<[u8; 32]>,
+    // Session-only fingerprints also suppress marker-stripped manager echoes.
+    secret_hashes: VecDeque<[u8; 32]>,
     physical: Vec<Representation>,
     os_current: bool,
     current: Option<Operation>,
@@ -321,6 +333,9 @@ impl State {
         }
     }
     fn known_hash(&self, hash: &[u8; 32]) -> bool {
+        if self.secret_hashes.contains(hash) {
+            return true;
+        }
         self.physical
             .iter()
             .any(|r| r.hash == *hash && r.received.is_some())
@@ -354,8 +369,19 @@ impl State {
             .all(|hash| self.known_hash(hash))
     }
     fn local_formats(&self, content: Option<Content>) -> Option<Content> {
+        self.filter_formats(content, false)
+    }
+    fn without_secrets(&self, content: Option<Content>) -> Option<Content> {
+        self.filter_formats(content, true)
+    }
+    fn filter_formats(&self, content: Option<Content>, secret_only: bool) -> Option<Content> {
         let known = |bytes: &[u8]| {
-            self.known_hash(&self.fingerprint_key.digest(&Sha256::digest(bytes).into()))
+            let hash = self.fingerprint_key.digest(&Sha256::digest(bytes).into());
+            if secret_only {
+                self.secret_hashes.contains(&hash)
+            } else {
+                self.known_hash(&hash)
+            }
         };
         match content {
             Some(Content::Text(text)) => (!known(text.as_bytes())).then_some(Content::Text(text)),
@@ -407,6 +433,15 @@ impl State {
             }))
     }
     fn persist(&mut self, pending: Persistence, effects: &mut Vec<Effect>) {
+        if pending.operation.secret() {
+            effects.push(Effect::Reply {
+                token: pending.operation.token,
+                applied: pending.applied,
+                deduplicated: pending.deduplicated,
+                failure: None,
+            });
+            return;
+        }
         effects.push(Effect::Persist {
             operation: pending.operation.clone(),
             applied: pending.applied,
@@ -703,6 +738,7 @@ impl State {
         {
             fingerprints = self.hashes(content);
         }
+        let original = self.without_secrets(original);
         let content = self.local_formats(original.clone());
         self.observe_physical(&fingerprints);
         if content.is_none()
@@ -838,12 +874,13 @@ impl State {
         for recipient in &mut offer.recipients {
             let received = |hash: Option<[u8; 32]>| {
                 hash.is_some_and(|h| {
-                    self.physical.iter().any(|r| {
-                        r.hash == h
-                            && r.received
-                                .as_ref()
-                                .is_some_and(|(peer, _)| peer == &recipient.target.device)
-                    })
+                    self.secret_hashes.contains(&h)
+                        || self.physical.iter().any(|r| {
+                            r.hash == h
+                                && r.received
+                                    .as_ref()
+                                    .is_some_and(|(peer, _)| peer == &recipient.target.device)
+                        })
                 })
             };
             recipient.text &= text.is_some() && !received(text);
@@ -1011,7 +1048,7 @@ impl State {
             };
             self.next_ticket = ticket;
             // Pending fingerprints are visible before helper authorization.
-            if operation.received && operation.key.is_some() {
+            if operation.received && operation.key.is_some() && !operation.secret() {
                 self.remember(operation.fingerprint());
             }
             effects.push(Effect::Prepare {
@@ -1164,7 +1201,7 @@ impl State {
                         && self.observation.is_none()
                         && self.held_observations.is_empty()
                         && self.os_current
-                        && let Some(content) = content
+                        && let Some(content) = self.without_secrets(content)
                     {
                         let fingerprints = self.hashes(&content);
                         // File-backed payloads may have been edited since the
@@ -1197,6 +1234,8 @@ impl State {
                                 });
                             } else {
                                 operation.hashes = hashes(&content);
+                                operation.payload =
+                                    Some(Arc::new(Payload::Content(content.clone())));
                                 operation.content = Some(content);
                                 effects.extend(self.step(Event::Submit(operation)));
                             }
@@ -1605,6 +1644,12 @@ impl State {
                     .filter(|i| i.ticket == ticket && i.phase == Phase::Preparing)
                 {
                     for hash in hashes {
+                        if install.operation.secret() && !self.secret_hashes.contains(&hash) {
+                            if self.secret_hashes.len() >= 128 {
+                                self.secret_hashes.pop_front();
+                            }
+                            self.secret_hashes.push_back(hash);
+                        }
                         if !install.operation.hashes.contains(&hash) {
                             install.operation.hashes.push(hash);
                         }
@@ -1615,7 +1660,7 @@ impl State {
                         // Store allocation has returned; never replace it.
                     } else {
                         install.phase = Phase::Saving;
-                        if install.operation.received {
+                        if install.operation.received && !install.operation.secret() {
                             let fingerprint = install.operation.fingerprint();
                             self.remember(fingerprint);
                         }
@@ -1663,12 +1708,32 @@ impl State {
             Event::Failed(ticket) | Event::Timeout(ticket) => {
                 self.terminate_install(ticket, Terminal::Failed(Failure::Clipboard), &mut effects);
             }
+            Event::SecretClearing(ticket) => {
+                if self.owner == Some(ticket)
+                    && self.current.as_ref().is_some_and(Operation::secret)
+                {
+                    self.stopping_markers.push_back(ticket);
+                    while self.stopping_markers.len() > 64 {
+                        self.stopping_markers.pop_front();
+                    }
+                }
+            }
+            Event::Skip(ticket) => {
+                self.terminate_install(ticket, Terminal::Superseded, &mut effects)
+            }
             Event::Stopped(ticket) => {
                 self.terminate_install(ticket, Terminal::Reaped, &mut effects);
                 if self.stopping == Some(ticket) {
                     self.stopping = None;
                 }
                 if self.owner == Some(ticket) {
+                    if self.current.as_ref().is_some_and(Operation::secret) {
+                        self.current = None;
+                        self.current_hashes.clear();
+                        self.physical.clear();
+                        self.os_current = false;
+                        self.pinned = None;
+                    }
                     self.owner = None;
                 }
             }

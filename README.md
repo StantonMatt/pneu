@@ -1,6 +1,6 @@
 # <img src="docs/design/v2/assets/pneu.svg" width="64" height="64" alt="Pneu icon"> Pneu
 
-Send files and share clipboard text between your phone and computers.
+Send files and share clipboard text between your phone and computers. Optionally forward new Android SMS and copy one-time codes on your computers.
 
 [Download Pneu](https://stantonmatt.github.io/pneu/).
 

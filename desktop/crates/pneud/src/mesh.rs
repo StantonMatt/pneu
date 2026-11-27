@@ -140,6 +140,7 @@ impl Core {
             .map(|i| SocketAddr::new(i.ip, self.bound_port()).to_string())
             .collect();
         Hello {
+            sms_activated: None,
             version: 1,
             device_id: self.identity.device_id.clone(),
             name: self.config().name,
@@ -151,6 +152,7 @@ impl Core {
                 "clipboard_text".into(),
                 "clipboard_image".into(),
                 "mesh".into(),
+                "sms".into(),
             ],
         }
     }

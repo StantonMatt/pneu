@@ -637,6 +637,7 @@ async fn unknown_clients_obey_provisional_and_total_connection_quotas() -> Resul
     write_frame(
         &mut provisional,
         &Message::Hello(Hello {
+            sms_activated: None,
             role: None,
             addresses: None,
             version: 1,
@@ -862,6 +863,7 @@ async fn missing_certificate_verify_private_key_is_rejected() -> Result<()> {
         Err(_) => true,
         Ok(mut stream) => {
             let hello = Message::Hello(Hello {
+                sms_activated: None,
                 role: None,
                 addresses: None,
                 version: 1,
@@ -1218,6 +1220,7 @@ async fn omitted_hello_paused_defaults_to_false() -> Result<()> {
     write_frame(
         &mut tls,
         &Message::Hello(Hello {
+            sms_activated: None,
             role: None,
             addresses: None,
             version: 1,
@@ -1827,6 +1830,7 @@ async fn shutdown_cancels_a_tls_connection_waiting_for_hello() -> Result<()> {
         .await?;
     h.core.request_shutdown();
     let hello = Message::Hello(Hello {
+        sms_activated: None,
         role: None,
         addresses: None,
         version: 1,
@@ -2693,6 +2697,7 @@ async fn outgoing_clipboard_images_require_capability_and_keep_latest_while_rece
     write_frame(
         &mut tls,
         &Message::Hello(Hello {
+            sms_activated: None,
             role: None,
             addresses: None,
             version: 1,
@@ -3762,6 +3767,7 @@ async fn hello_phone(h: &Harness, phone: &Phone, mesh: bool, text: bool) -> Resu
     write_frame(
         &mut tls,
         &Message::Hello(Hello {
+            sms_activated: None,
             version: 1,
             device_id: phone.identity.device_id.clone(),
             name: "Mesh phone".into(),

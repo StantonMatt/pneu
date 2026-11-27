@@ -110,6 +110,7 @@ pub struct Store {
     abandoned_claims: Arc<Mutex<HashMap<(Id, Id), AbandonedClaim>>>,
     #[cfg(test)]
     faults: Arc<Mutex<HashMap<&'static str, usize>>>,
+    pub(crate) sms_activated: Arc<Mutex<HashSet<Id>>>,
     pub(crate) pair_settings: Arc<Mutex<HashMap<Id, Vec<pneu_proto::PeerSetting>>>>,
     pub(crate) settings_changed: tokio::sync::watch::Sender<u64>,
     pub(crate) settings_generations: Arc<Mutex<HashMap<Id, u64>>>,
@@ -120,6 +121,8 @@ pub struct Store {
     pub(crate) connection_id: Option<u64>,
     pub(crate) action_connection_id: Option<u64>,
     pub(crate) mesh: bool,
+    // Current HELLO authority; root/UI stores retain persisted capabilities.
+    pub(crate) negotiated_sms: Option<(bool, Arc<AtomicU64>, u64)>,
     pub(crate) local_device: Option<Id>,
     generations: Arc<Mutex<HashMap<Id, u64>>>,
     peer_generations: Option<HashMap<Id, u64>>,
@@ -640,6 +643,8 @@ impl Store {
         tx.execute_batch("CREATE TABLE IF NOT EXISTS settings_support(device TEXT PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,supported INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS settings_receipts(device TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,id TEXT NOT NULL,meta TEXT NOT NULL,PRIMARY KEY(device,id));
             CREATE INDEX IF NOT EXISTS settings_receipts_sequence ON settings_receipts(device);
+            CREATE TABLE IF NOT EXISTS sms_activated(device TEXT PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE);
+            CREATE TABLE IF NOT EXISTS sms_support(device TEXT PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,supported INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS settings_outgoing(device TEXT PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS settings_replay(device TEXT PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS settings_confirmed(device TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,key TEXT NOT NULL,enabled INTEGER NOT NULL,hlc TEXT NOT NULL,writer_device TEXT NOT NULL,PRIMARY KEY(device,key));")?;
@@ -657,6 +662,12 @@ impl Store {
                     Ok((id, fields))
                 })
                 .collect::<Result<HashMap<_, _>>>()?
+        };
+        let sms_activated = {
+            let mut q = tx.prepare("SELECT device FROM sms_activated")?;
+            q.query_map([], |r| r.get::<_, String>(0))?
+                .map(|id| Ok(Id::new(id?)?))
+                .collect::<Result<HashSet<_>>>()?
         };
         #[cfg(unix)]
         let clipboard_fingerprint_key = {
@@ -680,6 +691,7 @@ impl Store {
         Ok(Self {
             connection: Arc::new(Mutex::new(conn)),
             pair_settings: Arc::new(Mutex::new(pair_settings)),
+            sms_activated: Arc::new(Mutex::new(sms_activated)),
             settings_changed: tokio::sync::watch::channel(0).0,
             settings_generations: Arc::new(Mutex::new(HashMap::new())),
             _ownership: Arc::new(StoreOwnership(lock)),
@@ -689,6 +701,7 @@ impl Store {
             connection_id: None,
             action_connection_id: None,
             mesh: false,
+            negotiated_sms: None,
             local_device: None,
             generations: Arc::new(Mutex::new(generations)),
             peer_generations: None,
@@ -1012,12 +1025,18 @@ impl Store {
             .blocking(move |store| {
                 #[cfg(test)]
                 store.fault("remember_peer_hello")?;
-                store.peer_write(epoch, |tx| {
+                let activated=hello.role==Some(pneu_proto::DeviceRole::Phone) && hello.sms_activated==Some(true) && hello.capabilities.iter().any(|c|c=="sms") && hello.capabilities.iter().any(|c|c=="mesh");
+                let activated_device=hello.device_id.clone();
+                let result=store.peer_write(epoch, |tx| {
                     if current.load(Ordering::SeqCst) != connection {
                         return Ok(());
                     }
                     tx.execute("INSERT INTO outbox_capabilities SELECT id,generation,? FROM peers WHERE id=? ON CONFLICT(device) DO UPDATE SET generation=excluded.generation,files=excluded.files",params![hello.capabilities.iter().any(|c|c=="files"),hello.device_id.as_str()])?;
                     tx.execute("INSERT INTO settings_support VALUES(?,?) ON CONFLICT(device) DO UPDATE SET supported=excluded.supported",params![hello.device_id.as_str(),hello.capabilities.iter().any(|c|c=="mesh")])?;
+                    let sms = hello.role == Some(pneu_proto::DeviceRole::Phone)
+                        && hello.capabilities.iter().any(|c| c=="sms") && hello.capabilities.iter().any(|c| c=="mesh");
+                    settings::negotiate_sms(tx, &hello.device_id, sms)?;
+                    if activated {tx.execute("INSERT OR IGNORE INTO sms_activated VALUES(?)",[hello.device_id.as_str()])?;}
                     let role = match hello.role {
                         Some(pneu_proto::DeviceRole::Computer) => "computer",
                         _ => "phone",
@@ -1058,7 +1077,11 @@ impl Store {
                         ],
                     )?;
                     Ok(())
-                })
+                });
+                if result.is_ok() && activated && current.load(Ordering::SeqCst)==connection {
+                    store.sms_activated.lock().expect("SMS activation").insert(activated_device);
+                }
+                result
             })
             .await;
         if let Err(error) = &result
@@ -2502,6 +2525,7 @@ mod tests {
             let captured = store.with_current_pairing();
             let current = Arc::new(AtomicU64::new(1));
             let hello = pneu_proto::Hello {
+                sms_activated: None,
                 version: 1,
                 device_id: device.clone(),
                 name: "Revoked computer".into(),

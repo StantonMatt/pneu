@@ -15,6 +15,7 @@ object PermissionRequests {
             Manifest.permission.POST_NOTIFICATIONS->"notificationsAsked"
             Manifest.permission.READ_MEDIA_IMAGES,Manifest.permission.READ_MEDIA_VIDEO->"photosAsked"
             Manifest.permission.CAMERA->"cameraAsked"
+            Manifest.permission.RECEIVE_SMS->Manifest.permission.RECEIVE_SMS
             else->"localNetworkAsked"
         }
         return prefs(context).getBoolean(permission,false) || prefs(context).getBoolean(legacy,false)

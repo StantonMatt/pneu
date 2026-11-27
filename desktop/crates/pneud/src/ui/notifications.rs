@@ -9,6 +9,7 @@ pub struct Notice {
     pub transient: bool,
     pub expires: i32,
     pub urls: Vec<String>,
+    pub sms_target: Option<crate::sms::Target>,
 }
 impl Notice {
     pub fn new(summary: impl Into<String>) -> Self {
@@ -20,6 +21,7 @@ impl Notice {
             transient: false,
             expires: -1,
             urls: Vec::new(),
+            sms_target: None,
         }
     }
     pub fn file(

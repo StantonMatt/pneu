@@ -16,7 +16,7 @@ const val CHUNK_SIZE = 262_144
 
 enum class Type(val wire: Int) {
     HELLO(1), PAIR_REQUEST(2), PAIR_RESULT(3), PING(4), PONG(5), STATUS(6), UNPAIR(7),
-    FILE_BEGIN(16), FILE_CHUNK(17), FILE_END(18), ACK(19), NACK(20), CLIPBOARD(32), PEER_SETTINGS(33), ERROR(127);
+    FILE_BEGIN(16), FILE_CHUNK(17), FILE_END(18), ACK(19), NACK(20), CLIPBOARD(32), PEER_SETTINGS(33), SMS(34), ERROR(127);
     val label get() = name.lowercase()
 }
 sealed interface Frame {
@@ -36,7 +36,7 @@ fun strictUtf8(bytes: ByteArray): String = Charsets.UTF_8.newDecoder()
 
 object Protocol {
     private val known = mapOf(
-        Type.HELLO to setOf("version", "device_id", "name", "capabilities", "paused", "role", "addresses"),
+        Type.HELLO to setOf("version", "device_id", "name", "capabilities", "paused", "role", "addresses", "sms_activated"),
         Type.PAIR_REQUEST to setOf("token"), Type.PAIR_RESULT to setOf("accepted", "code", "message"),
         Type.PING to setOf("nonce"), Type.PONG to setOf("nonce"), Type.STATUS to setOf("paused"), Type.UNPAIR to emptySet(),
         Type.FILE_BEGIN to setOf("transfer_id", "file_name", "mime", "size", "sha256", "kind", "created_at", "source_media_id", "hlc", "source_device"),
@@ -44,6 +44,7 @@ object Protocol {
         Type.NACK to setOf("transfer_id", "code", "retryable", "message"),
         Type.CLIPBOARD to setOf("transfer_id", "text", "created_at", "origin", "hlc", "source_device"),
         Type.PEER_SETTINGS to setOf("transfer_id", "settings"),
+        Type.SMS to setOf("transfer_id", "sender", "text", "received_at"),
         Type.ERROR to setOf("code", "message", "supported_version")
     )
     val nackCodes = setOf("hash_mismatch", "size_mismatch", "storage_failed", "disk_full", "not_writable", "unsupported_kind", "id_conflict", "clipboard_unavailable")
@@ -110,7 +111,7 @@ object Protocol {
         val fields=setOf("key", "enabled", "hlc", "writer_device")
         reader.beginArray()
         while(reader.hasNext()) {
-            require(result.size() < 3 && reader.peek() == JsonToken.BEGIN_OBJECT)
+            require(result.size() < 4 && reader.peek() == JsonToken.BEGIN_OBJECT)
             val item=JsonObject();val seen=mutableSetOf<String>()
             reader.beginObject()
             while(reader.hasNext()) {
@@ -173,6 +174,7 @@ object Protocol {
                 val names = caps.map { string(it,64) }
                 require(names.distinct().size == names.size && ("clipboard_image" !in names || "files" in names))
                 optional("paused") { bool("paused") }
+                optional("sms_activated") { bool("sms_activated") }
                 optional("role") { require(str("role",8) in setOf("phone","computer")) }
                 optional("addresses") {
                     val addresses=o.get("addresses");require(addresses is JsonArray && addresses.size() <= 8)
@@ -198,16 +200,17 @@ object Protocol {
             Type.ACK -> { hex("transfer_id", 32); bool("deduplicated") }
             Type.NACK -> { hex("transfer_id", 32); val code = str("code", 64); require(code in nackCodes); require(bool("retryable") == (code !in setOf("unsupported_kind", "id_conflict"))) }
             Type.CLIPBOARD -> { hex("transfer_id", 32); str("text", 16384, 0); num("created_at", MAX_TIMESTAMP); optional("origin") { require(str("origin", 16) in setOf("clipboard", "share")) };clipboardClock() }
+            Type.SMS -> { hex("transfer_id",32); str("sender",256); str("text",16384,0); num("received_at",MAX_TIMESTAMP) }
             Type.PEER_SETTINGS -> {
                 hex("transfer_id",32)
-                val settings=o.get("settings");require(settings is JsonArray && settings.size() in 1..3)
+                val settings=o.get("settings");require(settings is JsonArray && settings.size() in 1..4)
                 val keys=mutableSetOf<String>()
                 for(entry in settings) {
                     require(entry is JsonObject)
                     val key=string(entry.get("key"),81)
                     val parts=key.split('/')
                     require(parts.size == 3 && parts.take(2).all { it.matches(Regex("[0-9a-f]{32}")) } && parts[0] != parts[1])
-                    require(parts[2] in setOf("clipboard","automatic_media") && keys.add(key))
+                    require(parts[2] in setOf("clipboard","automatic_media","sms") && keys.add(key))
                     val enabled=entry.get("enabled");require(enabled is JsonPrimitive && enabled.isBoolean)
                     hlc(entry.get("hlc"))
                     require(string(entry.get("writer_device"),32) in parts.take(2))

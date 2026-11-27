@@ -78,7 +78,7 @@ fn every_frame_decodes_and_roundtrips() {
     }
     assert_eq!(
         ids.into_iter().collect::<Vec<_>>(),
-        [1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 32, 33, 127]
+        [1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 32, 33, 34, 127]
     );
 }
 

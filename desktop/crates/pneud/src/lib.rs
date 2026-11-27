@@ -13,6 +13,7 @@ pub mod ipc;
 pub mod macos_removal;
 pub mod net;
 mod platform;
+pub mod sms;
 mod storage;
 mod store;
 pub use store::outbox;

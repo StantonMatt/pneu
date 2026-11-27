@@ -93,6 +93,7 @@ class AppGraph(val context: Context,val preferences: Preferences=Preferences(con
     val receivedFiles = ReceivedFiles(this)
     val receivedRecent get()=receivedFiles.recent
     val connection = Connections(this)
+    val sms = SmsForwarder(this)
     internal val tileInputs=combine(prefs,connection.state,connection.devices) {p,s,devices->
         TilePolicy.inputs(p,s,devices,connection.clipboardAvailable(p))
     }.distinctUntilChanged().shareIn(scope,SharingStarted.Eagerly,replay=1)

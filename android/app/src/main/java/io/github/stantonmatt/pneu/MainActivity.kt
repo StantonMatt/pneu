@@ -309,7 +309,9 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
 @Composable internal fun SetupScreen(first: Boolean, health: Health, refresh: Int, back: () -> Unit, repair:()->Unit, next: () -> Unit) {
     val context=LocalContext.current;val resources=LocalResources.current; val scope=rememberCoroutineScope();val actions=LocalUiActions.current
     var recheck by remember { mutableIntStateOf(0) }; var returnedFromSleeping by remember { mutableStateOf(false) }
+    val permissionPrefs by context.graph.prefs.collectAsState()
     val checked=remember(health,refresh,recheck) { context.health() }
+    val requestSms=smsPermissionRequest(refresh) {recheck++;repair()}
     val permissions=rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         recheck++;context.graph.requestMediaScan()
     }
@@ -343,6 +345,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
                     if(notificationSettings)context.startActivity(Intent(if(checked.channelBlocked)Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS else Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE,context.packageName).putExtra(Settings.EXTRA_CHANNEL_ID,StatusNotificationChannel.id(context)))
                     else request(Manifest.permission.POST_NOTIFICATIONS)
                 }
+                if(permissionPrefs.sms)PermissionRow(resources.getString(R.string.perm_sms),R.drawable.ic_sms,checked.sms,resources.getString(if(PermissionRequests.settings(activity,Manifest.permission.RECEIVE_SMS))R.string.action_settings else R.string.action_allow),if(!checked.sms && PermissionRequests.settings(activity,Manifest.permission.RECEIVE_SMS))resources.getString(R.string.perm_denied) else null) {requestSms()}
                 val limited=context.granted(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED) && !checked.photos
                 val photoAction=PermissionPolicy.photoAction(limited,PermissionRequests.asked(context,Manifest.permission.READ_MEDIA_IMAGES),activity.shouldShowRequestPermissionRationale(Manifest.permission.READ_MEDIA_IMAGES) || activity.shouldShowRequestPermissionRationale(Manifest.permission.READ_MEDIA_VIDEO))
                 // Play's prominent disclosure: say what is sent automatically next to the button that requests media access.
@@ -617,6 +620,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
     val context=LocalContext.current;val resources=LocalResources.current;val app=context.graph;val scope=rememberCoroutineScope();val actions=LocalUiActions.current;val snackbar=remember {SnackbarHostState()}
     val devicesModel=remember(context) {androidx.lifecycle.ViewModelProvider(context as ComponentActivity)[DevicesViewModel::class.java]}
     var renaming by rememberSaveable {mutableStateOf(false)}
+    val requestSms=smsPermissionRequest(refresh) {scope.launch {actions.run(resources.getString(R.string.ui_error_setting)) {app.preferences.toggle("sms",true)}}}
     var pendingMedia by rememberSaveable {mutableStateOf("")}
     fun mediaPermissionFor(key:String)=if(key=="recordings")Manifest.permission.READ_MEDIA_VIDEO else Manifest.permission.READ_MEDIA_IMAGES
     LaunchedEffect(refresh,pendingMedia) {if(pendingMedia.isNotEmpty() && context.granted(mediaPermissionFor(pendingMedia))) {val key=pendingMedia;if(actions.run(resources.getString(R.string.ui_error_setting)) {app.preferences.toggle(key,true)})pendingMedia=""}}
@@ -626,6 +630,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
     }
     val tailscaleInstalled=remember {runCatching {context.packageManager.getPackageInfo("com.tailscale.ipn",0)}.isSuccess}
     fun toggle(key: String,value: Boolean) {
+        if(key=="sms" && value) {requestSms();return}
         if((key=="wifi" && !value && !p.tailscale)||(key=="tailscale" && !value && !p.wifi)) {scope.launch {snackbar.showSnackbar(resources.getString(R.string.snackbar_need_route))};return}
         if(!value && pendingMedia==key)pendingMedia=""
         if(value && key in listOf("screenshots","photos","recordings") && !context.granted(mediaPermissionFor(key))) {
@@ -643,6 +648,7 @@ internal fun PneuScreen(requested: String? = null, refresh: Int = 0, consume: ()
                     ToggleRow(resources.getString(R.string.pref_screenshots),p.screenshots,divider=false) {toggle("screenshots",it)}
                     ToggleRow(resources.getString(R.string.pref_photos),p.photos) {toggle("photos",it)}
                     ToggleRow(resources.getString(R.string.pref_recordings),p.recordings) {toggle("recordings",it)}
+                    ToggleRow(resources.getString(R.string.pref_sms),p.sms,detail=if(!health.sms)resources.getString(R.string.sms_access_off) else null) {toggle("sms",it)}
                 }
                 Header(resources.getString(R.string.group_sharing))
                 PneuCard {

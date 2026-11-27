@@ -648,6 +648,7 @@ fn device_settings(peer: &Peer, reply: &Value) -> (Vec<SettingItem>, String) {
                 "clipboard" if to == peer.id => (0, "Send clipboard"),
                 "clipboard" if from == peer.id => (1, "Receive clipboard"),
                 "automatic_media" if from == peer.id => (2, "Receive automatic photos"),
+                "sms" if from == peer.id => (3, "Receive SMS"),
                 _ => return None,
             };
             Some((
@@ -1011,6 +1012,8 @@ struct Frame {
     folder: String,
     notifications: bool,
     copy_images: bool,
+    sms_available: bool,
+    copy_sms_codes: bool,
     viewer: bool,
     name: String,
 }
@@ -2353,6 +2356,7 @@ impl Worker {
                     | "save_to_folder"
                     | "notification_preview"
                     | "copy_image_to_clipboard"
+                    | "copy_sms_codes"
                     | "open_in_viewer"
                     | "clipboard_include_images"
             ),
@@ -3441,6 +3445,10 @@ impl Worker {
             folder: middle_elide(&super::display_path(&config.save_path), 40),
             notifications: config.notification_preview,
             copy_images: config.copy_image_to_clipboard,
+            sms_available: contract::setting(&self.status, "sms_available")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            copy_sms_codes: config.copy_sms_codes,
             viewer: config.open_in_viewer,
             name: display_peer_text(&config.name),
         }
@@ -3478,6 +3486,8 @@ fn apply(w: &PneuWindow, frame: Frame) {
     ui.set_folder(frame.folder.into());
     ui.set_notifications(frame.notifications);
     ui.set_copy_images(frame.copy_images);
+    ui.set_sms_available(frame.sms_available);
+    ui.set_copy_sms_codes(frame.copy_sms_codes);
     ui.set_viewer(frame.viewer);
     ui.set_name(frame.name.into());
 }

@@ -261,4 +261,12 @@
     <string name="delivery_stopped">Stopped</string>
     <string name="delivery_superseded">Replaced by a newer item</string>
     <string name="delivery_skipped">Skipped</string>
+    <string name="pref_sms">SMS messages</string>
+    <string name="pref_send_sms">Send SMS</string>
+    <string name="perm_sms">SMS</string>
+    <string name="sms_access_off">SMS access is off</string>
+    <string name="banner_sms">Pneu can\'t read SMS</string>
+    <string name="alert_sms_text">SMS access was turned off</string>
+    <string name="sms_disclosure_title">Send SMS to your computers?</string>
+    <string name="sms_disclosure_text">Pneu reads new SMS and sends the sender and text to your paired computers, even in the background. Codes are copied to the computer\'s clipboard. Messages aren\'t saved.</string>
 </resources>

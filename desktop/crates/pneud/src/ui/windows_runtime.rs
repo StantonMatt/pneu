@@ -87,6 +87,7 @@ pub async fn run(
                     let core = core.clone();
                     jobs.spawn(async move {
                         let result = match command {
+                            Command::CopySms {target,code} => {core.copy_sms(target,code).await;Ok(())},
                             Command::Toggle(toggle) => core.toggle_setting(toggle).await,
                             Command::ClipboardMode(mode) => core.set_setting("clipboard_mode".into(), serde_json::json!(mode)).await,
                             Command::RetryTransfer { operation, artifact, device } => core.retry_transfer_artifact(operation, Some(artifact), device).await,

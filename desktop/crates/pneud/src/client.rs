@@ -186,6 +186,7 @@ impl Phone {
                 let sent = crate::transport::send(
                     &mut tls,
                     &Message::Hello(Hello {
+                        sms_activated: None,
                         role: None,
                         addresses: None,
                         version: 1,
@@ -651,6 +652,7 @@ mod tests {
                 write_frame(
                     &mut tls,
                     &Message::Hello(Hello {
+                        sms_activated: None,
                         version: 1,
                         device_id: local,
                         name: "forged PC".into(),
@@ -758,6 +760,7 @@ mod tests {
             crate::transport::send(
                 &mut tls,
                 &Message::Hello(Hello {
+                    sms_activated: None,
                     role: None,
                     addresses: None,
                     version: 1,

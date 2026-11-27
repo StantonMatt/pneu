@@ -145,6 +145,8 @@ where
 object_struct! {
     #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
     pub struct Hello {
+        #[serde(default,deserialize_with = "non_null",skip_serializing_if = "Option::is_none")]
+        pub sms_activated: Option<bool>,
         pub version: u32,
         pub device_id: Id,
         pub name: String,
@@ -362,6 +364,23 @@ object_struct! {
     }
 }
 
+// SMS content is intentionally absent from Debug diagnostics.
+object_struct! {
+    #[derive(Clone, PartialEq, Eq, Serialize)]
+    pub struct Sms {
+        pub transfer_id: Id,
+        pub sender: String,
+        pub text: String,
+        pub received_at: u64,
+    }
+}
+impl std::fmt::Debug for Sms {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sms")
+            .field("transfer_id", &self.transfer_id)
+            .finish_non_exhaustive()
+    }
+}
 object_struct! {
     #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
     pub struct PeerSettings {
@@ -392,7 +411,7 @@ impl PeerSetting {
             "settings direction must join distinct devices",
         )?;
         require(
-            matches!(parts[2], "clipboard" | "automatic_media"),
+            matches!(parts[2], "clipboard" | "automatic_media" | "sms"),
             "invalid settings feature",
         )?;
         require(
@@ -453,6 +472,7 @@ pub enum Message {
     Nack(Nack),
     Clipboard(Clipboard),
     PeerSettings(PeerSettings),
+    Sms(Sms),
     Error(ErrorMessage),
 }
 
@@ -473,6 +493,7 @@ impl Message {
             Self::Nack(_) => 0x14,
             Self::Clipboard(_) => 0x20,
             Self::PeerSettings(_) => 0x21,
+            Self::Sms(_) => 0x22,
             Self::Error(_) => 0x7f,
         }
     }
@@ -573,10 +594,15 @@ impl Message {
                     "incomplete clipboard clock",
                 )?;
             }
+            Self::Sms(m) => {
+                string_limit(&m.sender, 1, 256, "SMS sender")?;
+                string_limit(&m.text, 0, MAX_CLIPBOARD_BYTES, "SMS text")?;
+                require(m.received_at <= MAX_TIMESTAMP, "invalid timestamp")?;
+            }
             Self::PeerSettings(m) => {
                 require(
-                    (1..=3).contains(&m.settings.len()),
-                    "expected 1..=3 settings",
+                    (1..=4).contains(&m.settings.len()),
+                    "expected 1..=4 settings",
                 )?;
                 let mut seen = HashSet::new();
                 for setting in &m.settings {

@@ -149,6 +149,9 @@ private fun automaticKinds(context:android.content.Context,p:Prefs):String? {
                         SwitchRow(resources.getString(R.string.pref_receive_clipboard),peer.clipboardReceive,note("receiveClipboard")) {setSwitch("receiveClipboard",it)}
                         if(kinds==null)SwitchRow(resources.getString(R.string.pref_automatic_sending),false,resources.getString(R.string.auto_off_all),enabled=false) {}
                         else SwitchRow(resources.getString(R.string.pref_automatic_sending),peer.automaticMedia,note("automaticMedia") ?: kinds) {setSwitch("automaticMedia",it)}
+                        SwitchRow(resources.getString(R.string.pref_send_sms),peer.smsSupported && peer.sendSms,
+                            when { !peer.smsSupported->resources.getString(R.string.device_update_detail,peer.name);!p.sms->resources.getString(R.string.auto_off_all);else->note("sms") },
+                            enabled=p.sms && peer.smsSupported,divider=false) {setSwitch("sms",it)}
                     }
                     if(state.settingsSupported==false)Text(resources.getString(R.string.sharing_needs_update,peer.name),Modifier.padding(start=16.dp,end=16.dp,top=8.dp),style=PneuType.subhead,color=c.text2)
                 }
